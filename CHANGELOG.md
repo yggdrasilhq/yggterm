@@ -2,30 +2,48 @@
 
 This file tracks user-visible changes in `yggterm`.
 
-## 2.11.1
+## 2.11.2
 
-- **A local Claude Code row keeps its own identity — the fd scan can no longer
-  rename it to a stranger.** A live `claude` holds several project transcripts
-  open at once (the resume picker, `/resume` browsing, history reads, and a
-  coding agent reading sibling session logs as part of its task). Local
-  runtime-identity discovery picked the alphabetically-first open
-  `~/.claude/projects/.../<id>.jsonl`, so the row's identity flapped as fds
-  opened and closed. On one host a row was reassigned five foreign session ids
-  in 39 seconds and settled on one that already owned a real transcript, so the
-  rebuilt launch collided: "Session ID … is already in use." A foreign id with
-  no transcript instead gave "no conversation found" — so this one bug was
-  behind both restore-refusal shapes, and only on the local machine path
-  (remote Claude Code uses a separate identity path).
+- **The titlebar reveals ON TOP of a web surface, the page runs flush to the
+  viewport, and a browsing session's row blinks for the page — not the app.**
+  A batch of user-reported defects in the browser surface (2026-07-13).
 
-  Discovery now prefers Claude Code's own pid registry
-  (`~/.claude/sessions/<pid>.json`, the exact process→session binding it
-  publishes), and the fd-scan fallback takes the transcript being written
-  (newest) instead of the first by name. A row that was already poisoned heals
-  on its next relaunch: the launch command is rebuilt from on-disk truth, the
-  row's own id wins when it has a transcript, and the record's id and metadata
-  collapse back onto that single identity.
+  The titlebar reveal used to move into FLOW over a web surface, so every hover
+  re-laid-out the whole window. It is now the same floating overlay everywhere;
+  what moves instead is the native webview: the surface reconciler clamps its
+  rect below the titlebar's live bottom edge, so the collapsed 6px hover sensor
+  is real DOM and a revealed titlebar sits on top of everything with only the
+  page dipping under it.
 
-## Unreleased
+  The web overlay no longer takes the terminal frame's 4px inset — that inset,
+  painted in the chrome colour, WAS the "border around every page" (near-black
+  on a dark chrome, a light band on a light one). A page runs edge-to-edge now.
+
+  Ychrome's chrome (tab strip, address bar) borrowed the terminal's colour
+  theme; the light/dark choice is now browsing config Ychrome owns and yggterm
+  paints — a general default (ships LIGHT) presented as a Light ↔ Dark slider
+  in Ychrome's settings pane, plus per-site overrides, riding a stat-only
+  `appearance_version` exactly like per-site zoom.
+
+  Closing the right panel in vertical-tabs mode is a VIEW gesture now: the rail
+  hides, the vertical pref stays on, and the tab strip stays collapsed —
+  chromeless browsing, instead of the strip springing back. The ⊟ button hides
+  and re-raises the rail without touching the mode; leaving vertical mode lives
+  where a mode change belongs, in the settings pane's toggle.
+
+  The tab rail's tenancy is decided by surface LIVENESS, not map presence: a
+  defunct app (exited; the event-driven sweep never fired again) used to pin
+  its empty "Tabs" panel onto whatever session you switched to, hiding your own
+  sidebar. And a pane-contributed toggle's switch no longer shears apart beside
+  a long label (`flex:0 0 auto` on the track — the SponsorBlock / cookie-row
+  "UI corruption").
+
+  A session showing a web surface no longer blinks its working dot from launch
+  to quit (the browser is a perpetually-running foreground process, so the
+  shell "working" heuristic is meaningless there): the row's light is the
+  PAGE's — blinking while the active tab loads, steady once loaded. A load that
+  finishes while the session is backgrounded cannot strand the light ON (it is
+  snuffed when the surface is stashed).
 
 - **A web surface lives IN its viewport, and a popup is a real popup.** Six
   user-reported defects in the browser surface.
@@ -34,10 +52,10 @@ This file tracks user-visible changes in `yggterm`.
   above all DOM, and with the titlebar auto-hidden the titlebar is an overlay on
   the content, so the surface swallowed it whole along with the viewport's frame
   — and it could not even be hovered back, because the reveal sensor was under
-  the webview too. A visible native surface now pins the titlebar into flow (a
-  browser keeps its chrome), and the web overlay takes the same inset and radius
-  the terminal host takes. It is a tenant of the viewport, which is what makes it
-  survive a resize or a split.
+  the webview too. The titlebar now stays a floating overlay and the surface
+  reconciler clamps the native webview below its live rect (see the later
+  entry), and the web overlay is a tenant of the viewport, which is what makes
+  it survive a resize or a split.
 
   "Continue where you left off" restored the tab SET but not the PLACE: it
   stacked ychrome's start page on top of the session it had just restored. The
