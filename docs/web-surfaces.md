@@ -456,19 +456,22 @@ the current rect.
 ## A native surface is a TENANT of the viewport (2026-07-13)
 
 A native child webview paints above **all** DOM. Everything else follows from
-that, and two things were getting it wrong:
+that:
 
-- **The auto-hidden titlebar is `position:absolute` over the content**, so a web
-  surface swallowed it whole — along with the viewport's frame — and it could not
-  even be hovered back, because the reveal sensor was under the webview too. So
-  while a native surface is on screen the titlebar takes its space in **flow**
-  (`titlebar_auto_hide_enabled && !snapshot.native_web_surface_visible`). A
-  browser keeps its chrome.
-- **The web overlay takes the terminal frame's inset and radius**, so the
-  viewport's border is drawn around the page exactly as it is around a terminal.
-  The native rect is placed at the `[data-ws-page]` rect INSIDE that overlay; a
-  rect that ran to the viewport's edge put a native rectangle over the frame with
-  nothing to clip it.
+- **The auto-hidden titlebar is `position:absolute` over the content**, and a
+  web surface would swallow it whole — it could not even be hovered back,
+  because the reveal sensor was under the webview too. The titlebar stays the
+  same floating overlay everywhere (an in-flow variant re-laid-out the whole
+  window on every hover — rejected 2026-07-13); instead the reconciler's rect
+  eval **clamps the native webview below the titlebar's live bottom edge**
+  (`[data-titlebar-auto-hide-enabled="true"]`'s rect). Collapsed, that keeps
+  the 6px hover sensor real DOM; revealed, the titlebar sits on top of
+  everything and only the page dips under it.
+- **The web overlay takes NO inset and NO radius** (2026-07-13): the terminal
+  frame's 4px inset, painted in the chrome colour, was the "border around every
+  page" the user kept reporting. A page runs edge-to-edge in its viewport; a
+  native rect cannot be corner-clipped anyway, so the radius was already a
+  fiction at the page's corners.
 
 This is load-bearing, not cosmetic: the reconciler re-measures the placeholder
 every tick, so a surface that is a tenant of the viewport follows a window resize
