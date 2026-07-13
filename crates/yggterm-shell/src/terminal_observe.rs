@@ -7834,7 +7834,7 @@ So the current state is:
 
     #[test]
     fn transport_error_detector_keeps_wrapped_shared_connection_fragment() {
-        let data = "Shared connection to 192.168.\r\n";
+        let data = "Shared connection to 192.0.2.\r\n";
         assert!(terminal_chunk_is_transport_error(data));
     }
 
