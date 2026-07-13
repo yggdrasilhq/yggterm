@@ -289,6 +289,30 @@ and title, when a tab is closed, and on every folder edit. Filing used to be the
 only thing that persisted a tab, which meant a tab you opened and browsed was
 saved as the page you started on — or, at the root, never saved at all.
 
+**A restore is a PLACE, not just a set of rows (2026-07-13).** Restoring every tab
+and then landing the user on the app's start page is not continuing where they
+left off; it is stacking a page nobody asked for on top of their session. A saved
+tab therefore carries `active`, and `plan_web_tab_restore` (pure, unit-tested)
+decides:
+
+- restore OFF: filed tabs only, land on the app tab. There is no session to
+  return to, so a stale `active` must not drag the user into one.
+- restore ON, launch carried a URL (`ychrome <url>`): every saved tab comes back,
+  but the app tab keeps what was asked for and stays in front. A request outranks
+  a restore.
+- restore ON, launch carried NO URL (the app says so with `start_page` on the OSC
+  open — only the app knows the difference): land where the user was standing. If
+  that was a ROOT tab the app tab ADOPTS it, so no start page is opened at all. If
+  it was FILED, it is selected where it sits — adopting it onto the always-root
+  app tab would quietly pull it out of its folder.
+
+**A restored tab has no `effective_url`.** Egress (a SOCKS tunnel, an `ssh -L`
+forward) belongs to a run, not to a saved tree, so it cannot be persisted.
+Selecting a restored tab therefore has to resolve it exactly as the address bar
+would — `select_web_surface_tab` is the ONE door every tab home selects through,
+and it does. Without that, the reconciler built the tab's webview against an empty
+URL: a restored tab opened blank, which is the same as not restoring it.
+
 ### The settings file had a hand-written writer (fixed 2026-07-11)
 
 `web_surface_restore_tabs` did not persist, and neither did `vertical_tabs` — nor
@@ -428,3 +452,78 @@ over a live web surface left the page painted across the rail (a native child
 draws above all DOM); closing the rail left a blank gap. Recreating the surface
 (reload, profile or proxy change) hid the bug, because a fresh webview is born at
 the current rect.
+
+## A native surface is a TENANT of the viewport (2026-07-13)
+
+A native child webview paints above **all** DOM. Everything else follows from
+that, and two things were getting it wrong:
+
+- **The auto-hidden titlebar is `position:absolute` over the content**, so a web
+  surface swallowed it whole — along with the viewport's frame — and it could not
+  even be hovered back, because the reveal sensor was under the webview too. So
+  while a native surface is on screen the titlebar takes its space in **flow**
+  (`titlebar_auto_hide_enabled && !snapshot.native_web_surface_visible`). A
+  browser keeps its chrome.
+- **The web overlay takes the terminal frame's inset and radius**, so the
+  viewport's border is drawn around the page exactly as it is around a terminal.
+  The native rect is placed at the `[data-ws-page]` rect INSIDE that overlay; a
+  rect that ran to the viewport's edge put a native rectangle over the frame with
+  nothing to clip it.
+
+This is load-bearing, not cosmetic: the reconciler re-measures the placeholder
+every tick, so a surface that is a tenant of the viewport follows a window resize
+and a split; one that is a lid on top of it does not.
+
+## Popups: `window.opener` and `window.close()` (2026-07-13)
+
+A link opened with `target="_blank"`, a middle/ctrl-click, or `window.open`
+becomes a TAB — but the webview is built inside WebKit's `create` handler,
+**related to its opener**, and handed straight back
+(`NewWindowResponse::Create`). The shell then ADOPTS it
+(`web_surface_adopt_popup_tab`); it does not open one.
+
+This is not a detail. The old path denied the window and reopened the URL in a
+fresh webview, which produced a tab with no relation to its opener:
+`window.opener` was `null`, so an OAuth callback's `opener.postMessage(...)` went
+nowhere, and `window.close()` had nothing to close. Every popup-based sign-in
+(claude.ai -> Google) hung exactly there: the user authenticated, the popup sat
+there forever, and the page that started the flow never learned it had won. The
+cookie landed, so the NEXT launch was silently signed in — which is how a broken
+channel disguised itself as a flaky login.
+
+An adopted popup inherits the opener's profile and `socks_port`, because a
+related view shares the opener's WebContext (its jar, its proxy, its web
+process). Recording anything else would make the reconciler see a proxy change
+and destroy the very webview the opener relationship lives in. The egress rule
+therefore still holds: the popup rides the opener's tunnel.
+
+### Two things WebKitGTK does not do (proven on the harness, not read)
+
+1. **It never emits its `close` signal for a `window.close()`** — not even for a
+   window a script opened, the one case every browser honors. `load-changed`
+   fires on the very same webview object while `close` never does, so this is the
+   engine's refusal, not a missed connection. A browser that cannot close a popup
+   strands every OAuth sign-in ever written, so the PAGE reports it (a
+   `window.close` shim over a script-message channel) and the **host decides**:
+   only a tab a script opened may be closed this way (Chrome's rule). The engine's
+   native `close()` is deliberately not called through — it tears the page down
+   while telling the embedder nothing, so a refusal that called it would leave the
+   user staring at a white rectangle where their tab used to be.
+2. **A related view gets its OPENER's user-content manager**, so a popup's script
+   message arrives on the OPENER's channel (the popup was surface 2; its close
+   arrived as surface 1). The channel cannot say who is asking, so the page names
+   itself — `href` plus whether `window.opener` is live — and the shell resolves
+   which tab that is.
+
+## An open app pane follows the page (2026-07-13)
+
+The GUI reports the page context (host, live zoom, HTTPS) and the app renders its
+pane from it, so the moment the page moves, the pane the app drew describes
+somewhere the user no longer is. It used to be fetched only when the pane was
+OPENED, which is why the vault pane went on offering claude.ai's logins after a
+sign-in popup took the front on accounts.google.com. It was not wrong about its
+page; nobody had told it the page had changed.
+
+The refetch lives in the native-surface reconcile tick, which is the one place
+that sees every way a page can move: a navigation, a tab switch, a popup taking
+the front, a session switch.
