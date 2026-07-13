@@ -2,7 +2,7 @@
 
 This file tracks user-visible changes in `yggterm`.
 
-## Unreleased
+## 2.11.2
 
 - **The titlebar reveals ON TOP of a web surface, the page runs flush to the
   viewport, and a browsing session's row blinks for the page — not the app.**
