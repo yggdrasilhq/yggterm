@@ -26,3 +26,6 @@ target/
 tools/xterm-harness/node_modules/
 tools/xterm-harness/package-lock.json
 .gstack/
+
+# Local-only diagnostic ledgers (host-specific private details; never tracked)
+.docs/
