@@ -3916,6 +3916,17 @@ impl DaemonRuntime {
                 }),
             );
         }
+        // A dead local CC runtime must be relaunched from CURRENT on-disk truth,
+        // never by replaying the stored point-in-time command (birth-shaped
+        // `--session-id` collides with its own transcript; a mis-attributed
+        // identity rebind points it at a foreign id — "session id already in
+        // use", jojo 2026-07-13). Guarded on not-running so a live runtime's
+        // spec is never changed underneath it.
+        if !self.terminals.session_is_running(&runtime_path)
+            && self.server.refresh_local_cc_relaunch_launch_command(path)
+        {
+            let _ = self.persist_state_only();
+        }
         let Some((stored_launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
         };
