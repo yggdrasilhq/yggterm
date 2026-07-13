@@ -155,6 +155,13 @@ pub(crate) enum TerminalJsEvent {
         /// Host-owned profile name (ychrome `--profile`, default "default").
         /// Selects the surface's persistent storage jar.
         profile: Option<String>,
+        /// The `url` is the app's own START PAGE, not a URL the user asked for
+        /// (`ychrome` with no argument). Only the app knows the difference, and
+        /// it decides what the GUI's tab restore is allowed to displace: with
+        /// "continue where you left off" on, a start-page open lands on the tab
+        /// the user was last reading instead of stacking a start page over the
+        /// restored session. `ychrome <url>` is a REQUEST and always wins.
+        start_page: bool,
     },
     /// libyggterm SIDEBAR-CONTRIBUTION control, OSC 7717 with the `sidebar`
     /// verb. The app DECLARES which panes it offers plus a loopback control
@@ -330,6 +337,8 @@ enum TerminalJsEventWire {
         title: Option<String>,
         #[serde(default)]
         profile: Option<String>,
+        #[serde(default)]
+        start_page: bool,
     },
     SidebarContribution {
         action: String,
@@ -472,12 +481,14 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 url,
                 title,
                 profile,
+                start_page,
             } => TerminalJsEvent::WebSurface {
                 action,
                 session,
                 url,
                 title,
                 profile,
+                start_page,
             },
             TerminalJsEventWire::SidebarContribution {
                 action,
@@ -705,7 +716,9 @@ mod tests {
         assert!(matches!(
             event,
             TerminalJsEvent::WebSurface {
-                action, session, url: Some(url), title: Some(title), profile: Some(profile)
+                action, session, url: Some(url), title: Some(title), profile: Some(profile),
+                // An app that predates the flag is not claiming a start page.
+                start_page: false,
             }
                 if action == "open"
                     && session == "local/abc123"

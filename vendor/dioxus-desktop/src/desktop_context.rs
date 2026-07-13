@@ -305,9 +305,12 @@ impl DesktopService {
         let _ = id;
     }
 
-    /// Current (uri, title) of an open web surface's page, engine-reported.
-    /// Follows in-page navigation the shell's nav model can't see.
-    pub fn web_surface_page_state(&self, id: u64) -> Option<(String, String)> {
+    /// Current (uri, title, loading) of an open web surface's page,
+    /// engine-reported. Follows in-page navigation the shell's nav model can't
+    /// see, and carries the engine's own `is-loading` — the only honest source
+    /// for a tab's loading light (a shell-side "we navigated it" flag cannot
+    /// know when the page actually finished).
+    pub fn web_surface_page_state(&self, id: u64) -> Option<(String, String, bool)> {
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",
@@ -333,11 +336,48 @@ impl DesktopService {
         }
     }
 
-    /// Drain new-tab requests raised from inside surfaces (a link opened with
-    /// middle-click / ctrl-click / `target="_blank"` / `window.open`). Each is
-    /// `(surface_id, url, background)`; the shell opens the URL as a tab in the
-    /// originating surface's session. See `WebSurfaceHost::take_new_tab_requests`.
-    pub fn take_web_surface_new_tab_requests(&self) -> Vec<(u64, String, bool)> {
+    /// Drain the popups pages opened from inside surfaces (a link
+    /// middle-clicked, ctrl-clicked, `target="_blank"`, or `window.open`).
+    ///
+    /// Each popup's webview is ALREADY LIVE and already loading — it was built
+    /// related to its opener inside WebKit's `create` handler, which is the only
+    /// way `window.opener` and `window.close()` work. The shell adopts it as a
+    /// tab; it must not open one. See `WebSurfaceHost::popups`.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_popups(&self) -> Vec<crate::web_surface::SurfacePopup> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_popups())
+            .unwrap_or_default()
+    }
+
+    /// Drain the pages that called `window.close()`. Each names its own URL and
+    /// whether a script opened it, because the channel cannot: a popup shares its
+    /// opener's message handler. The shell resolves the tab and decides.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_close_requests(&self) -> Vec<crate::web_surface::SurfaceCloseRequest> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_close_requests())
+            .unwrap_or_default()
+    }
+
+    /// Take the next native surface id. The HOST allocates them: it is no longer
+    /// the only thing that creates surfaces (a popup is born inside a WebKit
+    /// signal handler), and two allocators would eventually collide.
+    pub fn next_web_surface_id(&self) -> u64 {
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",
@@ -349,8 +389,8 @@ impl DesktopService {
                 .web_surface_host
                 .borrow()
                 .as_ref()
-                .map(|host| host.take_new_tab_requests())
-                .unwrap_or_default();
+                .map(|host| host.allocate_id())
+                .unwrap_or(0);
         }
         #[cfg(any(
             target_os = "windows",
@@ -359,7 +399,7 @@ impl DesktopService {
             target_os = "android"
         ))]
         {
-            Vec::new()
+            0
         }
     }
 

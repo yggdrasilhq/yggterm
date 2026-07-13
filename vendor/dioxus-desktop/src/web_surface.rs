@@ -17,7 +17,7 @@
     target_os = "android"
 )))]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::rc::Rc;
@@ -35,14 +35,126 @@ use wry::{
 /// GUI-reachable control endpoint. See `app_control_proxy`.
 const APP_CONTROL_SCHEME: &str = "yggterm-appctl";
 
+/// The script-message channel every surface page can reach its host on
+/// (`window.webkit.messageHandlers.yggtermSurface`). Today it carries exactly
+/// one message: `"close"`.
+const SURFACE_MESSAGE_HANDLER: &str = "yggtermSurface";
+
+/// `window.close()`, reported to the host.
+///
+/// WebKitGTK does not emit its `close` signal for a `window.close()` call — not
+/// even for a window a script opened, which is the one case every browser
+/// honors. (Proven on the harness: `load-changed` fires on the very same
+/// webview object while `close` never does, so this is the engine's refusal, not
+/// a missed connection.) A browser that cannot close a popup strands every
+/// OAuth sign-in ever written: the callback page hands the token back to its
+/// opener and closes itself, and the window just sits there.
+///
+/// So the page tells us directly, and the HOST decides — which is also where the
+/// decision belongs. The shim only reports; the shell honors a close request
+/// only for a tab that a script actually opened (Chrome's rule: a page may close
+/// a window it opened, and nothing else). The native `close` signal is still
+/// connected alongside this, so if the engine ever starts emitting it, the same
+/// door is already open.
+///
+/// The native `close()` is deliberately NOT called. WebKitGTK's own
+/// `window.close()` tears the page down (the view goes blank) while telling the
+/// embedder nothing — so a refusal that still called it would leave the user
+/// staring at a white rectangle where their tab used to be. The request goes to
+/// the host and nowhere else: if the host agrees, it destroys the webview; if it
+/// refuses, the page is untouched, which is what "refused" has to mean.
+///
+/// The message carries WHO is asking, because the channel cannot say. A popup is
+/// built related to its opener, and WebKit gives a related view its opener's
+/// user-content manager — so the popup's message arrives on the OPENER's handler
+/// (proven on the harness: the popup was surface 2, its close arrived as surface
+/// 1). The page therefore states its own URL and whether a script opened it, and
+/// the shell resolves which tab that is.
+const CLOSE_SHIM_JS: &str = r#"(function(){
+  if (window.__yggtermCloseShim) { return; }
+  window.__yggtermCloseShim = true;
+  window.close = function() {
+    try {
+      window.webkit.messageHandlers.yggtermSurface.postMessage(JSON.stringify({
+        type: 'close',
+        href: String(location.href),
+        scriptOpened: !!window.opener,
+      }));
+    } catch (e) {}
+  };
+})();"#;
+
+/// A page asking to be closed. Which page is `href` + `script_opened`, said by
+/// the page itself — the channel cannot say (see `CLOSE_SHIM_JS`). `surface_id`
+/// is the surface whose channel it arrived on: the sender, or the sender's
+/// opener. The shell resolves the tab and decides.
+pub struct SurfaceCloseRequest {
+    /// The surface whose message channel carried this — the sender, or (for a
+    /// popup, which shares its opener's channel) the sender's opener.
+    pub surface_id: u64,
+    /// The page's own URL, as it reported it.
+    pub href: String,
+    /// The page says a script opened it (`window.opener` is live). A page that
+    /// says otherwise is asking to close a window the USER opened, which no
+    /// browser honors.
+    pub script_opened: bool,
+}
+
+/// Wire a surface's page->host channel: the `window.close()` shim plus the
+/// script-message handler it speaks to. Every surface gets it — a popup because
+/// it is the whole point, a normal tab because the shell must be able to tell
+/// the two apart and refuse the one it should refuse.
+fn attach_surface_message_channel(
+    webview: &wry::WebView,
+    surface_id: u64,
+    close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+) {
+    use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
+    use wry::WebViewExtUnix as _;
+    let webkit = webview.webview();
+    let Some(manager) = webkit.user_content_manager() else {
+        return;
+    };
+    // Connect BEFORE registering — WebKit's own documented order, and the order
+    // wry's ipc channel uses. Registering first can drop the first message.
+    let close_requests = close_requests.clone();
+    manager.connect_script_message_received(Some(SURFACE_MESSAGE_HANDLER), move |_, result| {
+        let Some(value) = result.js_value() else {
+            return;
+        };
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&value.to_string()) else {
+            return;
+        };
+        if message.get("type").and_then(|kind| kind.as_str()) != Some("close") {
+            return;
+        }
+        close_requests.borrow_mut().push(SurfaceCloseRequest {
+            surface_id,
+            href: message
+                .get("href")
+                .and_then(|href| href.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            script_opened: message
+                .get("scriptOpened")
+                .and_then(|flag| flag.as_bool())
+                .unwrap_or(false),
+        });
+    });
+    manager.register_script_message_handler(SURFACE_MESSAGE_HANDLER);
+}
+
 struct Surface {
     // The overlay child that positions the webview. wry `build_gtk`s the webview
     // into this Fixed (put at 0,0); the Fixed is placed in the overlay via
     // margin-start/top + size-request.
     container: gtk::Fixed,
     webview: wry::WebView,
-    // wry requires the WebContext to outlive the webview; co-own it here.
-    _ctx: WebContext,
+    // wry requires the WebContext to outlive the webview; co-own it here. A
+    // POPUP has none of its own: it is built RELATED to its opener, which means
+    // it shares the opener's context (its jar, its proxy, its web process) —
+    // that sharing is exactly what a popup is.
+    _ctx: Option<WebContext>,
 }
 
 /// Engine-native ad/tracker blocking (AdGuard-class network + cosmetic rules)
@@ -168,21 +280,54 @@ mod adblock {
     }
 }
 
+/// A window a page opened from inside a surface — `window.open`, a
+/// `target="_blank"` link, a middle/ctrl-click.
+///
+/// The webview ALREADY EXISTS by the time the shell hears about this: WebKit's
+/// `create` signal must be answered synchronously with the view that will run
+/// the new window, so the surface host builds it in the handler (RELATED to the
+/// opener, which is what gives it a live `window.opener`) and hands it back.
+/// The shell's job is to adopt it as a tab, not to open one.
+pub struct SurfacePopup {
+    /// The surface whose page asked for the window: the tab the popup belongs
+    /// beside, and whose profile/egress it shares.
+    pub opener_id: u64,
+    /// The already-built popup webview, registered in the host under this id.
+    pub popup_id: u64,
+    /// The URL the window was opened on. WebKit is already loading it into the
+    /// popup's webview — this is for the tab's model, not a navigation to make.
+    pub url: String,
+    /// A middle/ctrl-click means "open it, but do not go there" (Chrome's
+    /// grammar). A `window.open` is a foreground request.
+    pub background: bool,
+}
+
 /// Owns the main window's `gtk::Overlay` and the set of live surface webviews.
 /// Held (Linux only) on `DesktopService`; driven from the shell via the
 /// `open_web_surface` / `web_surface_*` methods on `DesktopContext`.
 pub struct WebSurfaceHost {
     overlay: gtk::Overlay,
-    surfaces: RefCell<HashMap<u64, Surface>>,
-    /// New-tab requests raised from inside a surface (a link opened with
-    /// middle-click / ctrl-click / `target="_blank"` / `window.open`). WebKit
-    /// would spawn a detached GTK window; instead the surface's create handler
-    /// pushes `(surface_id, url, background)` here and denies the native window,
-    /// and the shell drains this each reconcile tick to open the URL as a TAB
-    /// in the same surface's session. `background` (middle/ctrl-click) keeps the
-    /// current tab focused, matching Chrome. Shared with each surface's create
-    /// closure via `Rc`; GTK-main-thread only, like the rest of this module.
-    new_tab_requests: Rc<RefCell<Vec<(u64, String, bool)>>>,
+    surfaces: Rc<RefCell<HashMap<u64, Surface>>>,
+    /// Native surface ids. The HOST allocates them, because it is no longer the
+    /// only thing that creates surfaces: a popup is born inside a WebKit signal
+    /// handler, and two allocators would eventually hand out the same id.
+    next_id: Rc<Cell<u64>>,
+    /// Popups a page opened from inside a surface, drained by the shell each
+    /// reconcile tick and adopted as tabs of the opener's session.
+    ///
+    /// The webview is built here, in the `create` handler, and NOT by the shell.
+    /// That is the whole point: WebKit will only give a new window a live
+    /// `window.opener` if it is answered with a view RELATED to the opener, and
+    /// that answer has to be synchronous. Reopening the URL later in a fresh
+    /// webview (what this used to do) produced a popup with `window.opener ===
+    /// null` — so an OAuth callback's `opener.postMessage(...)` went nowhere and
+    /// its `window.close()` closed nothing: the sign-in completed, the popup sat
+    /// there forever, and the page that started it never learned it had won.
+    popups: Rc<RefCell<Vec<SurfacePopup>>>,
+    /// Pages that called `window.close()`. A script-opened window is allowed to
+    /// close itself, and a browser that ignores that strands every OAuth popup
+    /// ever written.
+    close_requests: Rc<RefCell<Vec<SurfaceCloseRequest>>>,
 }
 
 fn rect_logical(w: i32, h: i32) -> Rect {
@@ -217,20 +362,130 @@ fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
     let _ = surface.webview.set_bounds(rect_logical(w, h));
 }
 
+/// Build the webview for a popup: RELATED to its opener, parented into its own
+/// overlay child, and registered in `surfaces` under `popup_id`.
+///
+/// Related is the load-bearing word. `webkit_web_view_new_with_related_view`
+/// puts the new view in the opener's web process and context, which is what
+/// makes `window.opener` a live handle rather than `null`. Everything a popup
+/// needs to be a real browser window follows from that: the same cookie jar (so
+/// a sign-in it completes is a sign-in the opener has), the same proxy (so a
+/// remote session's egress rule still holds), and a channel home.
+///
+/// The page policy (userscripts, the passkey shim, the ad filter) is re-attached
+/// here, because a fresh view gets a fresh user-content manager. A popup with no
+/// passkey shim is precisely the window a passkey is needed in.
+fn build_popup_webview(
+    overlay: &gtk::Overlay,
+    surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
+    close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+    popup_id: u64,
+    opener: &webkit2gtk::WebView,
+    opener_bounds: (i32, i32, i32, i32),
+    visible: bool,
+    userscripts: &[String],
+    adblock_ruleset: Option<&std::path::Path>,
+) -> Option<webkit2gtk::WebView> {
+    use webkit2gtk::WebViewExt as _;
+    use wry::WebViewBuilderExtUnix as _;
+    use wry::WebViewExtUnix as _;
+
+    let (x, y, w, h) = opener_bounds;
+    let container = gtk::Fixed::new();
+    container.set_halign(gtk::Align::Start);
+    container.set_valign(gtk::Align::Start);
+    container.set_margin_start(x.max(0));
+    container.set_margin_top(y.max(0));
+    container.set_size_request(w.max(1), h.max(1));
+    overlay.add_overlay(&container);
+    container.show();
+
+    let mut builder = WebViewBuilder::new()
+        .with_bounds(rect_logical(w, h))
+        .with_devtools(true)
+        // NO url: WebKit loads the request that asked for this window into the
+        // view we hand back. Loading it ourselves would race that navigation.
+        .with_related_view(opener.clone())
+        .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true);
+    for script in userscripts {
+        builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
+    }
+    // The custom `yggterm-appctl://` scheme is registered on the WEB CONTEXT,
+    // which a related view shares — so the popup can reach the app's control
+    // endpoint (the passkey signer) without re-registering anything.
+    let webview = match builder.build_gtk(&container) {
+        Ok(webview) => webview,
+        Err(error) => {
+            tracing::warn!(?error, "web surface: popup webview build failed");
+            overlay.remove(&container);
+            return None;
+        }
+    };
+    if adblock_ruleset.is_some() {
+        adblock::attach(&webview);
+    }
+    // `window.close()`: the page's own report (the engine will not tell us), plus
+    // the native signal in case it ever does. A script-opened window may close
+    // itself, and the tab it became must go with it.
+    attach_surface_message_channel(&webview, popup_id, close_requests);
+    let webkit = webview.webview();
+    {
+        let close_requests = close_requests.clone();
+        webkit.connect_close(move |view| {
+            close_requests.borrow_mut().push(SurfaceCloseRequest {
+                surface_id: popup_id,
+                href: view.uri().map(|uri| uri.to_string()).unwrap_or_default(),
+                // The engine only ever emits this for a window a script opened.
+                script_opened: true,
+            });
+        });
+    }
+    if visible {
+        webkit.show_all();
+    } else {
+        container.hide();
+    }
+    surfaces.borrow_mut().insert(
+        popup_id,
+        Surface {
+            container,
+            webview,
+            _ctx: None,
+        },
+    );
+    Some(webkit)
+}
+
 impl WebSurfaceHost {
     pub(crate) fn new(overlay: gtk::Overlay) -> Self {
         Self {
             overlay,
-            surfaces: RefCell::new(HashMap::new()),
-            new_tab_requests: Rc::new(RefCell::new(Vec::new())),
+            surfaces: Rc::new(RefCell::new(HashMap::new())),
+            next_id: Rc::new(Cell::new(1)),
+            popups: Rc::new(RefCell::new(Vec::new())),
+            close_requests: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    /// Drain the new-tab requests raised from inside surfaces since the last
-    /// call. Each is `(surface_id, url, background)` — see `new_tab_requests`.
-    pub fn take_new_tab_requests(&self) -> Vec<(u64, String, bool)> {
-        std::mem::take(&mut self.new_tab_requests.borrow_mut())
+    /// The ONE allocator of native surface ids. The shell asks for one before
+    /// `open`; the create handler takes one for a popup it builds itself.
+    pub fn allocate_id(&self) -> u64 {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        id
     }
+
+    /// Drain the popups pages opened since the last call. Their webviews are
+    /// already live — see `WebSurfaceHost::popups`.
+    pub fn take_popups(&self) -> Vec<SurfacePopup> {
+        std::mem::take(&mut self.popups.borrow_mut())
+    }
+
+    /// Drain the pages that called `window.close()`.
+    pub fn take_close_requests(&self) -> Vec<SurfaceCloseRequest> {
+        std::mem::take(&mut self.close_requests.borrow_mut())
+    }
+
 
     /// Open (or replace) surface `id` at the given page-relative bounds, loading
     /// `url`. If `socks_port` is set the surface egresses through
@@ -293,6 +548,11 @@ impl WebSurfaceHost {
         let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
             .with_bounds(rect_logical(w, h))
             .with_devtools(true)
+            // Every surface reports `window.close()`. A normal tab's request is
+            // REFUSED by the shell (Chrome's rule), but the shell can only refuse
+            // what it hears — and it must hear it from the page, because the
+            // engine never says a word.
+            .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -307,22 +567,73 @@ impl WebSurfaceHost {
             builder = builder.with_user_agent(user_agent);
         }
 
-        // Route in-page "new window" requests (a link middle-clicked,
-        // ctrl-clicked, `target="_blank"`, or `window.open`) into yggterm's own
-        // tab model rather than a detached GTK window: record the URL for the
-        // shell to open as a tab in THIS surface's session, then deny the native
-        // window. Only real web pages (http/https) are routed — a `window.open`
-        // with no/blank URL or a custom scheme is left to WebKit's default.
+        // In-page "new window" requests (a link middle-clicked, ctrl-clicked,
+        // `target="_blank"`, or `window.open`) become TABS of this surface's
+        // session rather than detached GTK windows — but the webview is built
+        // HERE, related to this one, and handed straight back to WebKit.
+        //
+        // This used to deny the window and let the shell reopen the URL in a
+        // fresh webview. That produced a tab, but not a POPUP: with no relation
+        // to the opener, `window.opener` was `null` and `window.close()` had
+        // nothing to close. Every popup-based sign-in (claude.ai -> Google) hung
+        // there: the user authenticated, the callback tried to hand the result
+        // back through `opener.postMessage(...)`, hit `null`, and the page that
+        // started the flow waited forever while the "successful" popup refused
+        // to go away. (The cookie landed, so the NEXT launch was silently signed
+        // in — which is how a broken channel disguised itself as a flaky login.)
         {
-            let requests = self.new_tab_requests.clone();
+            let popups = self.popups.clone();
+            let surfaces = self.surfaces.clone();
+            let close_requests = self.close_requests.clone();
+            let overlay = self.overlay.clone();
+            let ids = self.next_id.clone();
+            let popup_scripts = userscripts.to_vec();
+            let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
             let surface_id = id;
             builder = builder.with_new_window_req_handler(move |url, features| {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    requests
-                        .borrow_mut()
-                        .push((surface_id, url, features.background));
+                let popup_id = {
+                    let next = ids.get();
+                    ids.set(next + 1);
+                    next
+                };
+                let bounds = surfaces
+                    .borrow()
+                    .get(&surface_id)
+                    .map(|surface| {
+                        let (w, h) = surface.container.size_request();
+                        (
+                            surface.container.margin_start(),
+                            surface.container.margin_top(),
+                            w,
+                            h,
+                        )
+                    })
+                    .unwrap_or((0, 0, 1, 1));
+                match build_popup_webview(
+                    &overlay,
+                    &surfaces,
+                    &close_requests,
+                    popup_id,
+                    &features.opener.webview,
+                    bounds,
+                    !features.background,
+                    &popup_scripts,
+                    popup_adblock.as_deref(),
+                ) {
+                    Some(webview) => {
+                        popups.borrow_mut().push(SurfacePopup {
+                            opener_id: surface_id,
+                            popup_id,
+                            url,
+                            background: features.background,
+                        });
+                        wry::NewWindowResponse::Create { webview }
+                    }
+                    // Refusing is the honest failure: a detached GTK window would
+                    // escape the viewport entirely, and a tab with no view is a
+                    // row that does nothing.
+                    None => wry::NewWindowResponse::Deny,
                 }
-                wry::NewWindowResponse::Deny
             });
         }
 
@@ -361,12 +672,28 @@ impl WebSurfaceHost {
             adblock::ensure_compiled(ruleset, &store_dir);
             adblock::attach(&webview);
         }
+        // `window.close()`: the page's report (the engine will not tell us) plus
+        // the native signal in case it ever does. What the shell DOES with it is
+        // the shell's call — a normal tab may not close itself.
+        attach_surface_message_channel(&webview, id, &self.close_requests);
+        {
+            use webkit2gtk::WebViewExt as _;
+            use wry::WebViewExtUnix as _;
+            let close_requests = self.close_requests.clone();
+            webview.webview().connect_close(move |view| {
+                close_requests.borrow_mut().push(SurfaceCloseRequest {
+                    surface_id: id,
+                    href: view.uri().map(|uri| uri.to_string()).unwrap_or_default(),
+                    script_opened: true,
+                });
+            });
+        }
         self.surfaces.borrow_mut().insert(
             id,
             Surface {
                 container,
                 webview,
-                _ctx: ctx,
+                _ctx: Some(ctx),
             },
         );
         Ok(())
@@ -408,12 +735,12 @@ impl WebSurfaceHost {
         }
     }
 
-    /// Current page (uri, title) as the ENGINE reports them. In-page
+    /// Current page (uri, title, loading) as the ENGINE reports them. In-page
     /// navigations (link clicks, redirects, pushState) never pass through the
     /// shell's nav model, so this is the only truth for "where is this tab
-    /// now"; the shell polls it to keep the address bar, tab titles and
-    /// history honest.
-    pub fn page_state(&self, id: u64) -> Option<(String, String)> {
+    /// now"; the shell polls it to keep the address bar, tab titles, history
+    /// and the tab's loading light honest.
+    pub fn page_state(&self, id: u64) -> Option<(String, String, bool)> {
         use webkit2gtk::WebViewExt as _;
         use wry::WebViewExtUnix as _;
         self.surfaces.borrow().get(&id).map(|s| {
@@ -421,6 +748,7 @@ impl WebSurfaceHost {
             (
                 webkit.uri().map(|u| u.to_string()).unwrap_or_default(),
                 webkit.title().map(|t| t.to_string()).unwrap_or_default(),
+                webkit.is_loading(),
             )
         })
     }
