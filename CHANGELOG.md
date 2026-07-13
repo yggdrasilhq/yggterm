@@ -4,6 +4,44 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A web surface lives IN its viewport, and a popup is a real popup.** Six
+  user-reported defects in the browser surface.
+
+  The native webview was pasted OVER the viewport: a native GTK child paints
+  above all DOM, and with the titlebar auto-hidden the titlebar is an overlay on
+  the content, so the surface swallowed it whole along with the viewport's frame
+  — and it could not even be hovered back, because the reveal sensor was under
+  the webview too. A visible native surface now pins the titlebar into flow (a
+  browser keeps its chrome), and the web overlay takes the same inset and radius
+  the terminal host takes. It is a tenant of the viewport, which is what makes it
+  survive a resize or a split.
+
+  "Continue where you left off" restored the tab SET but not the PLACE: it
+  stacked ychrome's start page on top of the session it had just restored. The
+  tab store now records which tab was in front, and a launch that carries no URL
+  of its own lands there instead. (A restored tab also opened BLANK when
+  selected: egress belongs to a run, not to a saved tree, so a restored tab has
+  no `effective_url` until it is asked for.)
+
+  The tab rail's new-tab and folder buttons are icons on the Tabs heading, and a
+  loading tab blinks green in both tab homes — the same traffic-signal vocabulary
+  the live-session rows use, driven by the engine's own `is-loading`.
+
+  And a popup was not a popup: the create handler denied the window and the shell
+  reopened the URL in a fresh webview, so `window.opener` was `null` and
+  `window.close()` had nothing to close. Every popup sign-in (claude.ai ->
+  Google) hung exactly there — the user authenticated, the popup sat forever, and
+  the page that started the flow never learned it had won. Popups are now built
+  RELATED to their opener and adopted as tabs, sharing the opener's jar and
+  tunnel. Two things WebKitGTK does not do, both proven rather than read: it
+  never emits `close` for a `window.close()` (so the page reports it and the host
+  decides — only a script-opened tab may be closed), and it hands a related view
+  its OPENER's user-content manager (so the page has to name itself).
+
+  An open app pane now follows the page, too: the vault pane was fetched only
+  when opened, so after a Google popup took the front it went on offering
+  claude.ai's logins on accounts.google.com.
+
 - **`ALT, E` opens a row's right-click menu, and every item in it has a letter.**
   The sidebar's context menu had no keyboard path at all. Now `ALT, E` opens it on
   the row you are on — measured onto that row, exactly where a right-click would
