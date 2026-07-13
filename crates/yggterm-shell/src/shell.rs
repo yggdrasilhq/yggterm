@@ -1071,6 +1071,17 @@ struct WebSurfaceTab {
     /// for a root tab. Filed = saved organization; root = the browsing session.
     /// The app tab (id 0) is always root: it belongs to the app, not the tree.
     folder: Option<String>,
+    /// A script opened this tab (`window.open`, `target="_blank"`), so a script
+    /// may close it — the rule every browser applies to `window.close()`. A tab
+    /// the USER opened is theirs, and a page asking to close it is ignored.
+    /// Not persisted: a restored tab is one the user chose to keep.
+    script_opened: bool,
+    /// Is this tab's page loading right now? Written from the ENGINE's
+    /// `is-loading` by the native-surface reconciler (the only source that knows
+    /// when a load actually ends), and rendered as the tab's blinking dot in
+    /// both tab homes. A tab with no webview yet (restored, never activated) is
+    /// never loading — it is a URL in the tree until it is selected.
+    loading: bool,
 }
 impl WebSurfaceTab {
     fn kill_forward(&self) {
@@ -1661,12 +1672,55 @@ struct WebSurfaceOverlayTabView {
     /// tabs with `None` (the root path); the filed ones live in its overflow
     /// menu, because a strip has nowhere to draw a folder.
     folder: Option<String>,
+    /// The page is loading right now — drawn as the blinking dot, in BOTH tab
+    /// homes (the rail rows and the classic strip's chips).
+    loading: bool,
 }
 /// Resolve and commit a user-driven tab navigation (address bar, back,
 /// forward). The blocking egress resolution (possible `ssh -L` setup) runs
 /// off the UI event loop; the result lands via
 /// `apply_web_surface_tab_navigation`, which also owns forward-child cleanup
 /// if the tab vanished meanwhile.
+/// Select a tab, and if it has never been shown, resolve its egress and load it.
+///
+/// A RESTORED tab is a URL in the tree with NO `effective_url`: egress (a SOCKS
+/// tunnel, an `ssh -L` forward) belongs to a run, not to a saved tree, so it
+/// cannot be persisted and has to be resolved the first time the tab is asked
+/// for. Selecting one therefore has to do exactly what the address bar does.
+/// Without this the reconciler created the tab's webview against an EMPTY url —
+/// a restored tab opened blank, which is the same as not restoring it.
+///
+/// This is the ONE way a tab is selected. Both tab homes (the rail rows, the
+/// classic strip), the folder overflow menu and the surface-open path go through
+/// it, so no caller can select a tab and forget to make it load.
+fn select_web_surface_tab(mut state: Signal<ShellState>, session_path: String, tab_id: u64) {
+    let pending = state.with_mut(|shell| {
+        shell.web_surface_select_tab(&session_path, tab_id);
+        let surface = shell.web_surfaces.get(&session_path)?;
+        let tab = surface.tabs.iter().find(|tab| tab.id == tab_id)?;
+        if !tab.effective_url.trim().is_empty() || tab.url.trim().is_empty() {
+            return None;
+        }
+        Some((
+            tab.url.clone(),
+            tab.history_index,
+            shell.web_surface_session_ssh_target(&session_path),
+        ))
+    });
+    if let Some((url, history_index, ssh_target)) = pending {
+        // The URL already IS `history[history_index]` (a restored tab is born
+        // with its own one-entry history), so pin the index rather than pushing
+        // the same page onto the stack a second time.
+        navigate_web_surface_tab(
+            state,
+            session_path,
+            tab_id,
+            url,
+            ssh_target,
+            Some(history_index),
+        );
+    }
+}
 fn navigate_web_surface_tab(
     mut state: Signal<ShellState>,
     session_path: String,
@@ -1820,6 +1874,10 @@ struct AppliedWebSurface {
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
     stashed_at_ms: Option<u64>,
+    /// Last engine-reported `is-loading` — the poll baseline for the tab's
+    /// loading light. Only a CHANGE is written through to the tab, so a page
+    /// that sits loaded does not re-render the rail every tick.
+    loading: bool,
     /// Last engine-reported page (uri, title) — the poll baseline for
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
@@ -1900,6 +1958,15 @@ struct SavedWebTab {
     /// survives a fresh start, a ROOT tab is the browsing session and does not.
     #[serde(default)]
     folder: Option<String>,
+    /// Was this the tab in FRONT when the surface was last saved? "Continue
+    /// where you left off" is not just the tab SET — it is the place the user
+    /// was standing. Without this, a restored session came back with every tab
+    /// present and the app's start page on top of them all.
+    ///
+    /// At most one saved tab carries it (the app tab is never saved, so a
+    /// surface that closed with the app tab in front saves none).
+    #[serde(default)]
+    active: bool,
 }
 /// The persisted tab tree for one profile.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1938,6 +2005,67 @@ impl WebTabStore {
                 tab.folder = None;
             }
         }
+    }
+}
+/// What a rehydrated surface opens with, and where it lands.
+///
+/// Pure, because this is the rule the user actually feels ("continue where you
+/// left off") and it must be testable without a disk store, a live surface or a
+/// GUI. `upsert_web_surface` does nothing to it but carry it out.
+#[derive(Debug, PartialEq)]
+struct WebTabRestorePlan {
+    /// The saved ROOT tab the app tab ADOPTS. It is not reopened as its own tab
+    /// — it becomes the app tab, which is why a restored session comes back with
+    /// exactly the tabs it had rather than with a start page stacked on top.
+    adopt: Option<SavedWebTab>,
+    /// The tabs opened after the app tab, in saved order. Tab ids follow the
+    /// index: the first is id 1.
+    tabs: Vec<SavedWebTab>,
+    /// Index into `tabs` of the tab to land on, or `None` for the app tab.
+    land_on: Option<usize>,
+}
+/// The restore rule, in one place.
+///
+/// - "Continue where you left off" OFF: the tabs are the FILED ones (saved
+///   organization); the browsing session is gone and there is nowhere to return
+///   to, so the app tab is what you land on.
+/// - ON, and the app had a URL of its own (`ychrome <url>`): the launch is a
+///   REQUEST. Every saved tab comes back, but the app tab shows what was asked
+///   for and stays in front.
+/// - ON, and the app had no URL (`ychrome`, `start_page`): land where the user
+///   was standing. If that tab was a ROOT tab the app tab adopts it (a start
+///   page nobody asked for is not worth a tab); if it was FILED, it is selected
+///   where it sits, because moving it onto the always-root app tab would quietly
+///   pull it out of the folder the user filed it in.
+fn plan_web_tab_restore(
+    mut saved: Vec<SavedWebTab>,
+    restore: bool,
+    start_page: bool,
+) -> WebTabRestorePlan {
+    if !(restore && start_page) {
+        return WebTabRestorePlan {
+            adopt: None,
+            tabs: saved,
+            land_on: None,
+        };
+    }
+    let active = saved.iter().position(|tab| tab.active);
+    match active {
+        Some(index) if saved[index].folder.is_none() => WebTabRestorePlan {
+            adopt: Some(saved.remove(index)),
+            tabs: saved,
+            land_on: None,
+        },
+        Some(index) => WebTabRestorePlan {
+            adopt: None,
+            tabs: saved,
+            land_on: Some(index),
+        },
+        None => WebTabRestorePlan {
+            adopt: None,
+            tabs: saved,
+            land_on: None,
+        },
     }
 }
 fn load_web_tab_store(profile: &str) -> WebTabStore {
@@ -2318,7 +2446,10 @@ async fn web_surface_native_reconcile_loop(
     trace_home: std::path::PathBuf,
 ) {
     let mut applied: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
-    let mut next_native_id: u64 = 1;
+    // (open pane, the page it was drawn for). A pane that is still the same pane
+    // but is now looking at a different page has to be redrawn — see the refetch
+    // below.
+    let mut last_app_pane_page: Option<(String, Option<String>)> = None;
     loop {
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
@@ -2434,6 +2565,35 @@ async fn web_surface_native_reconcile_loop(
                 zoom_overrides,
             )
         };
+        // An open app pane FOLLOWS THE PAGE.
+        //
+        // The GUI reports the page context (host, live zoom, HTTPS) and the app
+        // renders the pane from it — so the moment the page moves, the pane the
+        // app drew describes somewhere the user no longer is. It used to be
+        // fetched only when the pane was OPENED, which is exactly the bug the user
+        // hit signing in to claude.ai: a Google popup took the front, and the
+        // vault pane went on offering claude.ai's logins on accounts.google.com.
+        // It was not wrong about its page; nobody had told it the page had
+        // changed.
+        //
+        // This tick is the one place that sees every way a page can move — a
+        // navigation, a tab switch, a popup taking the front, a session switch —
+        // so the rule lives here rather than at each of them.
+        {
+            let page = state.peek().active_app_pane_page();
+            let pane_moved = last_app_pane_page
+                .as_ref()
+                .zip(page.as_ref())
+                .is_some_and(|(before, now)| before.0 == now.0 && before.1 != now.1);
+            last_app_pane_page = page;
+            if pane_moved
+                && let Some((pane_id, _)) = last_app_pane_page.clone()
+            {
+                let mut writable = state;
+                let seq = writable.with_mut(|shell| shell.app_pane_next_request());
+                spawn(app_pane_fetch_schema(state, pane_id, seq));
+            }
+        }
         // The WebKit zoom factor for one surface: the per-site override for the
         // host it is on (longest-suffix), else the global. One rule, used both
         // when a surface is placed and when it is created.
@@ -2704,13 +2864,26 @@ async fn web_surface_native_reconcile_loop(
                     // follow it — address bar, tab title, and per-profile
                     // history all track where the page ACTUALLY is.
                     if entry.stashed_at_ms.is_none()
-                        && let Some((page_url, page_title)) =
+                        && let Some((page_url, page_title, page_loading)) =
                             desktop.web_surface_page_state(entry.native_id)
                     {
                         let url_changed =
                             !page_url.is_empty() && page_url != entry.page_url;
                         let title_changed =
                             !page_title.is_empty() && page_title != entry.page_title;
+                        // The engine's own `is-loading` is the ONLY honest source
+                        // for the tab's loading light: a shell-side "we navigated
+                        // it" flag knows when a load STARTS but never when it
+                        // finishes, and an in-page navigation starts one the shell
+                        // never sees at all. Only the EDGE is written through, so a
+                        // page that sits loaded costs no re-render.
+                        if entry.loading != page_loading {
+                            entry.loading = page_loading;
+                            let mut writable = state;
+                            writable.with_mut(|shell| {
+                                shell.set_web_tab_loading(&key.0, key.1, page_loading);
+                            });
+                        }
                         if url_changed || title_changed {
                             entry.page_url = page_url.clone();
                             entry.page_title = page_title.clone();
@@ -2803,9 +2976,11 @@ async fn web_surface_native_reconcile_loop(
                         continue;
                     }
                     // Lazy-create on first visibility: no hidden-create flash,
-                    // and background tabs cost nothing until viewed.
-                    let native_id = next_native_id;
-                    next_native_id += 1;
+                    // and background tabs cost nothing until viewed. The id comes
+                    // from the HOST, which also mints one for every popup it
+                    // builds inside WebKit's create handler — one allocator, or
+                    // the two would eventually name the same surface.
+                    let native_id = desktop.next_web_surface_id();
                     // The persistent per-profile storage jar on THIS (GUI)
                     // host. None => engine-native ephemeral context (the
                     // reserved "temp" profile; also home-resolve failure).
@@ -2871,6 +3046,16 @@ async fn web_surface_native_reconcile_loop(
                             // opens on, else the global.
                             let open_zoom = surface_zoom_factor(&session_path, &effective_url);
                             desktop.set_web_surface_zoom(native_id, open_zoom);
+                            // A surface is born mid-navigation: light the tab's
+                            // loading dot now. Written ONCE, here — the poll below
+                            // only writes state on a CHANGE, so the light cannot
+                            // become a per-tick re-render.
+                            {
+                                let mut writable = state;
+                                writable.with_mut(|shell| {
+                                    shell.set_web_tab_loading(&key.0, key.1, true);
+                                });
+                            }
                             applied.insert(
                                 key,
                                 AppliedWebSurface {
@@ -2883,6 +3068,11 @@ async fn web_surface_native_reconcile_loop(
                                     profile,
                                     zoom_factor: open_zoom,
                                     stashed_at_ms: None,
+                                    // A surface is created BY a navigation, so it
+                                    // is loading from its first frame — start the
+                                    // light on rather than waiting a tick to
+                                    // discover it.
+                                    loading: true,
                                     page_url: effective_url,
                                     page_title: String::new(),
                                 },
@@ -2910,49 +3100,120 @@ async fn web_surface_native_reconcile_loop(
                 }
             }
         }
-        // Open tabs for links the pages asked to open in a new window
-        // (middle-click / ctrl-click / target="_blank" / window.open). The
-        // surface's create handler denied WebKit's detached window and recorded
-        // the URL against its native id; map that back to the session + tab it
-        // came from, mint a tab, and navigate it exactly as the address bar
-        // would (so egress is resolved the same way).
-        for (native_id, url, background) in desktop.take_web_surface_new_tab_requests() {
-            let Some((session_path, origin_tab_id)) = applied
+        // ADOPT the popups pages opened (middle-click / ctrl-click /
+        // target="_blank" / window.open). Their webviews already exist and are
+        // already loading: the host built each one RELATED to its opener inside
+        // WebKit's create handler, which is what gives it a live `window.opener`
+        // and a `window.close()` that means something. So this binds the live
+        // surface to a new tab — it does NOT open one, and it does not navigate:
+        // WebKit is already loading the URL, and re-navigating would restart a
+        // load that, for a POSTed OAuth callback, is not even repeatable.
+        for popup in desktop.take_web_surface_popups() {
+            let Some((session_path, opener_tab_id)) = applied
                 .iter()
-                .find(|(_, entry)| entry.native_id == native_id)
+                .find(|(_, entry)| entry.native_id == popup.opener_id)
+                .map(|(key, _)| key.clone())
+            else {
+                // The opener died between the create handler and this tick. The
+                // popup's webview would otherwise leak, so destroy it.
+                desktop.close_web_surface(popup.popup_id);
+                continue;
+            };
+            let opener_bounds = applied
+                .get(&(session_path.clone(), opener_tab_id))
+                .map(|entry| (entry.bounds, entry.zoom_factor));
+            let mut writable = state;
+            let adopted = writable.with_mut(|shell| {
+                shell.web_surface_adopt_popup_tab(
+                    &session_path,
+                    opener_tab_id,
+                    &popup.url,
+                    popup.background,
+                )
+            });
+            let Some((new_tab_id, profile, socks_port)) = adopted else {
+                desktop.close_web_surface(popup.popup_id);
+                continue;
+            };
+            let (bounds, zoom_factor) = opener_bounds.unwrap_or(((0, 0, 1, 1), 1.0));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "popup_adopted",
+                json!({
+                    "session_path": session_path,
+                    "opener_tab_id": opener_tab_id,
+                    "new_tab_id": new_tab_id,
+                    "native_id": popup.popup_id,
+                    "url": popup.url,
+                    "background": popup.background,
+                }),
+            );
+            // The popup is born where its opener sits and, if it is a foreground
+            // popup, already shown — so it is placed correctly for the tick before
+            // the reconciler's next pass, and that pass then finds nothing to
+            // change. Seeding `applied` is also what stops the create branch from
+            // building a SECOND webview for this tab.
+            applied.insert(
+                (session_path, new_tab_id),
+                AppliedWebSurface {
+                    native_id: popup.popup_id,
+                    url: popup.url.clone(),
+                    bounds,
+                    visible: !popup.background,
+                    reload_nonce: 0,
+                    socks_port,
+                    profile,
+                    zoom_factor,
+                    stashed_at_ms: None,
+                    loading: true,
+                    page_url: popup.url,
+                    page_title: String::new(),
+                },
+            );
+        }
+        // `window.close()`. A script-opened window may close itself, and a
+        // browser that ignores that strands every OAuth popup ever written: the
+        // sign-in completes, the callback closes the window, and the window just
+        // sits there. The tab goes; the reconciler destroys the webview with it.
+        //
+        // The page reports this (WebKitGTK never emits its own `close` signal for
+        // a `window.close()` — proven on the harness), so the SHELL decides:
+        // only a tab a script opened may be closed this way.
+        for request in desktop.take_web_surface_close_requests() {
+            let Some((session_path, receiving_tab)) = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == request.surface_id)
                 .map(|(key, _)| key.clone())
             else {
                 continue;
             };
             let mut writable = state;
-            let opened = writable.with_mut(|shell| {
-                let new_tab_id = shell.web_surface_open_tab_from_link(&session_path, background)?;
-                let ssh_target = shell.web_surface_session_ssh_target(&session_path);
-                Some((new_tab_id, ssh_target))
+            let closed = writable.with_mut(|shell| {
+                shell.web_surface_close_tab_on_page_request(
+                    &session_path,
+                    receiving_tab,
+                    &request.href,
+                    request.script_opened,
+                )
             });
-            let Some((new_tab_id, ssh_target)) = opened else {
-                continue;
-            };
             append_trace_event(
                 &trace_home,
                 "ui",
                 "web_surface",
-                "new_tab_from_link",
+                "window_close",
                 json!({
                     "session_path": session_path,
-                    "origin_tab_id": origin_tab_id,
-                    "new_tab_id": new_tab_id,
-                    "url": url,
-                    "background": background,
+                    "receiving_tab": receiving_tab,
+                    "native_id": request.surface_id,
+                    "href": request.href,
+                    "script_opened": request.script_opened,
+                    "closed_tab": closed,
+                    "reason": if closed.is_some() { Value::Null } else {
+                        Value::String("a page may only close a window a script opened".to_string())
+                    },
                 }),
-            );
-            navigate_web_surface_tab(
-                state,
-                session_path,
-                new_tab_id,
-                url,
-                ssh_target,
-                None,
             );
         }
         publish_web_surface_native_ids(&applied);
@@ -3957,6 +4218,12 @@ struct RenderSnapshot {
     /// Host of the active surface's ACTIVE tab URL (vault pane's "for this
     /// site" filter). None when no surface / no navigated tab.
     active_web_surface_host: Option<String>,
+    /// Is a NATIVE child webview painted over the window right now
+    /// (`native_web_surface_visible`)? A native child draws above ALL DOM, so
+    /// the chrome that would otherwise float over the viewport (the auto-hidden
+    /// titlebar) has to take its space in FLOW instead — see the titlebar
+    /// auto-hide resolution in `app()`.
+    native_web_surface_visible: bool,
     active_view_mode: WorkspaceViewMode,
     retained_terminal_sessions: Vec<ManagedSessionView>,
     /// All GUI-level split-view groups ([[campaign-split-view-groups]]). Drives
@@ -5928,6 +6195,7 @@ impl ShellState {
             active_web_surface_host: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_host_label(path)),
+            native_web_surface_visible: native_web_surface_visible(self),
             active_session_path,
             active_view_mode: render_active_view_mode,
             retained_terminal_sessions,
@@ -6073,6 +6341,7 @@ impl ShellState {
     /// URL). `effective_url`/`forward` are precomputed by the caller (forward
     /// setup blocks, so it must not run under the state lock). An existing
     /// surface keeps its user tabs; only the app tab (tabs[0]) retargets.
+    #[allow(clippy::too_many_arguments)]
     fn upsert_web_surface(
         &mut self,
         session_path: &str,
@@ -6082,6 +6351,7 @@ impl ShellState {
         forward_child: Option<std::process::Child>,
         socks_port: Option<u16>,
         profile: String,
+        start_page: bool,
         now_ms: u64,
     ) {
         // A surface still in its PICKER placeholder has no chosen profile and so
@@ -6150,7 +6420,7 @@ impl ShellState {
             }
             return;
         }
-        let app_tab = WebSurfaceTab {
+        let mut app_tab = WebSurfaceTab {
             id: 0,
             url: url.clone(),
             effective_url,
@@ -6162,6 +6432,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
+            loading: true,
+            script_opened: false,
         };
         // Rehydrate the profile's tab tree. The folders and everything filed in
         // them always come back — that is saved organization, like a cwd-tree
@@ -6174,9 +6446,32 @@ impl ShellState {
         // thirty rows, not thirty webviews.
         let store = load_web_tab_store(&profile);
         let restore = self.settings.web_surface_restore_tabs;
+        let plan = plan_web_tab_restore(store.tabs_to_open(restore), restore, start_page);
+        if let Some(saved) = &plan.adopt {
+            app_tab.url = saved.url.clone();
+            // The egress the caller resolved was for the START PAGE, and this is
+            // a different URL — so the adopted tab is unresolved exactly like any
+            // other restored tab, and `select_web_surface_tab` resolves it when
+            // the surface goes live. Keeping the old forward would point it at
+            // the wrong URL.
+            app_tab.effective_url = String::new();
+            app_tab.socks_port = None;
+            app_tab.kill_forward();
+            app_tab.forward_child = None;
+            app_tab.title = Some(saved.title.clone()).filter(|title| !title.is_empty());
+            app_tab.history = vec![saved.url.clone()];
+            app_tab.history_index = 0;
+        }
+        // Tab ids follow the plan's order, so the tab to land on is its index + 1
+        // (the app tab is id 0, and is the fallback: a session saved with the app
+        // tab in front, or a restore that is off, has nowhere else to return to).
+        let restore_active_tab = plan
+            .land_on
+            .map(|index| index as u64 + 1)
+            .unwrap_or(0);
         let mut tabs = vec![app_tab];
         let mut next_tab_id = 1;
-        for saved in store.tabs_to_open(restore) {
+        for saved in plan.tabs {
             tabs.push(WebSurfaceTab {
                 id: next_tab_id,
                 url: saved.url.clone(),
@@ -6191,6 +6486,10 @@ impl ShellState {
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: saved.folder,
+                // A restored tab has no webview until it is selected, so nothing
+                // is loading in it.
+                loading: false,
+                script_opened: false,
             });
             next_tab_id += 1;
         }
@@ -6202,10 +6501,12 @@ impl ShellState {
             WebSurfaceUiState {
                 tabs,
                 folders: store.folders,
-                // The app's own page, always. Even when continuing a session, the
-                // surface was just opened BY the app: landing the user on a
-                // restored background tab would hide the thing they launched.
-                active_tab: 0,
+                // Where the user was standing. `restore_active_tab` is the app tab
+                // (0) unless "continue where you left off" is on AND the app had no
+                // URL of its own to show — a launch that names a URL was asked for,
+                // and landing the user somewhere else would hide the thing they
+                // launched.
+                active_tab: restore_active_tab,
                 next_tab_id,
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
@@ -6284,6 +6585,8 @@ impl ShellState {
             reload_nonce: 0,
             profile: "default".to_string(),
             folder: None,
+            loading: false,
+            script_opened: false,
         };
         self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
@@ -6664,6 +6967,22 @@ impl ShellState {
         (!host.is_empty() && host != "New Tab")
             .then(|| host.split(':').next().unwrap_or(&host).to_lowercase())
     }
+    /// The open app pane and the page it is describing: `(pane_id, host)`.
+    ///
+    /// One owner for "what page context is this pane drawn for", so the refetch
+    /// that keeps the pane honest and the fetch that fills it in both ask the
+    /// same question. `None` = no app pane is open, and nothing to keep honest.
+    fn active_app_pane_page(&self) -> Option<(String, Option<String>)> {
+        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
+            return None;
+        };
+        let host = self
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .and_then(|path| self.web_surface_host_label(&path));
+        Some((pane_id.clone(), host))
+    }
     fn sidebar_control_url(&self, session_path: &str) -> Option<String> {
         self.sidebar_contributions
             .get(session_path)
@@ -6725,6 +7044,8 @@ impl ShellState {
                 reload_nonce: 0,
                 profile,
                 folder: None,
+                loading: false,
+                script_opened: false,
             });
             surface.active_tab = id;
             surface.address_draft = Some(String::new());
@@ -6742,46 +7063,143 @@ impl ShellState {
         }
         self.persist_web_tabs(session_path);
     }
-    /// Open a tab for a link the page asked to open in a new window
-    /// (middle-click / ctrl-click / `target="_blank"` / `window.open`). Unlike
-    /// the `+` new tab, the tab is created pointed at a URL (not blank, no
-    /// omnibox edit) and its selection follows browser grammar: a `background`
-    /// request (middle/ctrl-click) leaves the current tab focused, otherwise the
-    /// new tab is brought to the front. Returns the new tab id so the caller can
-    /// resolve egress and navigate it. `None` if the surface vanished.
-    fn web_surface_open_tab_from_link(
+    /// Adopt a POPUP a page opened (`window.open`, `target="_blank"`, a
+    /// middle/ctrl-click) as a tab of the same session.
+    ///
+    /// The webview already exists and is already loading: the surface host built
+    /// it RELATED to the opener inside WebKit's `create` handler, because that is
+    /// the only way the popup gets a live `window.opener` (and the only way its
+    /// `window.close()` can mean anything). So this mints the tab AROUND an
+    /// existing surface — it must not navigate it, and it must not let the
+    /// reconciler recreate it:
+    ///
+    /// - the URL is recorded as already-applied (`effective_url == url`), so the
+    ///   reconciler sees nothing to navigate. Re-navigating would restart the
+    ///   load WebKit already began, and for a POSTed OAuth callback that is not
+    ///   even repeatable.
+    /// - profile and `socks_port` are inherited from the OPENER, because a
+    ///   related view shares the opener's WebContext — the same jar and the same
+    ///   proxy, whatever the shell records. Recording anything else would make
+    ///   the reconciler destroy and recreate the webview (see its
+    ///   `socks_port != socks_port || profile != profile` guard) and the opener
+    ///   relationship would die with it.
+    ///
+    /// The egress rule therefore still holds for a remote session on SOCKS: the
+    /// popup egresses through the opener's tunnel. Returns the tab and the
+    /// (profile, socks_port) the caller must seed the applied entry with.
+    fn web_surface_adopt_popup_tab(
         &mut self,
         session_path: &str,
+        opener_tab_id: u64,
+        url: &str,
         background: bool,
-    ) -> Option<u64> {
+    ) -> Option<(u64, String, Option<u16>)> {
         let surface = self.web_surfaces.get_mut(session_path)?;
-        // Inherit the surface's (app-tab) profile so every tab of one ychrome
-        // invocation shares one identity/storage — same rule as `+` new tab.
-        let profile = surface
+        let opener = surface
             .tabs
-            .first()
-            .map(|tab| tab.profile.clone())
-            .unwrap_or_else(|| "default".to_string());
+            .iter()
+            .find(|tab| tab.id == opener_tab_id)
+            .or_else(|| surface.tabs.first())?;
+        let profile = opener.profile.clone();
+        let socks_port = opener.socks_port;
         let id = surface.next_tab_id;
         surface.next_tab_id += 1;
         surface.tabs.push(WebSurfaceTab {
             id,
-            url: String::new(),
-            effective_url: "about:blank".to_string(),
-            socks_port: None,
+            url: url.to_string(),
+            effective_url: url.to_string(),
+            socks_port,
             title: None,
+            // The popup rides the opener's tunnel — it has no forward of its own
+            // to own or to reap.
             forward_child: None,
-            history: Vec::new(),
+            history: vec![url.to_string()],
             history_index: 0,
             reload_nonce: 0,
-            profile,
+            profile: profile.clone(),
             folder: None,
+            // WebKit began the load the moment it made the view.
+            loading: true,
+            // A script opened it, so a script may close it.
+            script_opened: true,
         });
+        // Chrome's grammar: a middle/ctrl-click opens WITHOUT going there; a
+        // `window.open` is a foreground request and takes the front.
         if !background {
             surface.active_tab = id;
             surface.address_draft = None;
         }
-        Some(id)
+        Some((id, profile, socks_port))
+    }
+    /// A page called `window.close()`. Honor it only for a tab a SCRIPT opened —
+    /// the rule every browser applies, and the reason the decision is the host's:
+    /// a window a script opened is the script's to close, and a tab the USER
+    /// opened is not.
+    ///
+    /// `receiving_tab` is the tab whose message channel carried the request,
+    /// which is NOT necessarily the sender: a popup is built related to its
+    /// opener and WebKit hands a related view its opener's user-content manager,
+    /// so a popup's message arrives on the OPENER's channel. The page therefore
+    /// names itself (`href`, and whether `window.opener` is live), and this
+    /// resolves which of the session's tabs that is:
+    ///
+    /// 1. The page says no script opened it -> refuse. It is asking to close a
+    ///    window the user opened.
+    /// 2. Otherwise, among the session's script-opened tabs, take the one showing
+    ///    that URL — preferring the tab in FRONT, which is where a sign-in popup
+    ///    is by construction.
+    /// 3. If none matches the URL (the page navigated in the last poll gap), and
+    ///    the session has exactly ONE script-opened tab, it is that one. A popup
+    ///    that redirected on its way to closing is still the only popup there is.
+    ///
+    /// Returns the tab it closed. The reconciler destroys the webview on the next
+    /// tick, as it does for any closed tab; if the popup was the last tab, the
+    /// surface closes with it.
+    fn web_surface_close_tab_on_page_request(
+        &mut self,
+        session_path: &str,
+        receiving_tab: u64,
+        href: &str,
+        script_opened: bool,
+    ) -> Option<u64> {
+        if !script_opened {
+            return None;
+        }
+        let surface = self.web_surfaces.get(session_path)?;
+        let active = surface.active_tab;
+        let candidates: Vec<u64> = surface
+            .tabs
+            .iter()
+            .filter(|tab| tab.script_opened)
+            .map(|tab| tab.id)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let matches_url = |tab_id: u64| -> bool {
+            surface
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .is_some_and(|tab| !href.is_empty() && tab.url == href)
+        };
+        let target = candidates
+            .iter()
+            .copied()
+            .find(|id| *id == active && matches_url(*id))
+            .or_else(|| candidates.iter().copied().find(|id| matches_url(*id)))
+            .or_else(|| {
+                // The sender IS the receiver: a script-opened tab whose own
+                // channel carried the request.
+                candidates.iter().copied().find(|id| *id == receiving_tab)
+            })
+            .or_else(|| {
+                (candidates.len() == 1)
+                    .then(|| candidates[0])
+            })?;
+        self.web_surface_close_tab(session_path, target);
+        self.persist_web_tabs(session_path);
+        Some(target)
     }
     /// The ssh target (egress host) of a session by path, for resolving a web
     /// surface's egress the same way the address bar does. Searches the live
@@ -7017,6 +7435,7 @@ impl ShellState {
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
                 folder: tab.folder.clone(),
+                loading: tab.loading,
             })
             .collect();
         let back_target = active
@@ -7062,6 +7481,17 @@ impl ShellState {
             vertical_tabs: self.settings.web_surface_vertical_tabs,
             folders: surface.folders.clone(),
         })
+    }
+    /// Write the ENGINE's loading truth onto a tab. The ONE writer of
+    /// `WebSurfaceTab::loading`: the native-surface reconciler calls it on a
+    /// real edge (surface created, load started, load finished) and nowhere
+    /// else, so the tab's light can never disagree with the page.
+    fn set_web_tab_loading(&mut self, session_path: &str, tab_id: u64, loading: bool) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.loading = loading;
+        }
     }
     /// Ask for a vertical-tabs mode change — the entry point for every control
     /// that offers one (today: the app's settings pane).
@@ -7163,6 +7593,7 @@ impl ShellState {
         let Some(profile) = surface.tabs.first().map(|tab| tab.profile.clone()) else {
             return;
         };
+        let active_tab = surface.active_tab;
         let store = WebTabStore {
             folders: surface.folders.clone(),
             tabs: surface
@@ -7174,6 +7605,8 @@ impl ShellState {
                     url: tab.url.clone(),
                     title: tab.title.clone().unwrap_or_default(),
                     folder: tab.folder.clone(),
+                    // Where the user was standing, not just what was open.
+                    active: tab.id == active_tab,
                 })
                 .collect(),
         };
@@ -24566,6 +24999,24 @@ fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bo
 fn live_session_keep_alive_dot_style(palette: Palette) -> String {
     live_session_status_dot_style(palette, true, false)
 }
+/// A web tab's loading light — the SAME traffic-signal vocabulary the live
+/// session rows use (DESIGN.md "Status indicator vocabulary"): a hard step-end
+/// BLINK means work is in flight right now, and a tab carries no durability
+/// class of its own, so the carrier is GREEN. One home for the rule, drawn in
+/// both tab homes (the rail rows and the classic strip).
+///
+/// The slot is laid out whether or not it blinks: a dot that appears must not
+/// shove the tab's title sideways.
+fn web_tab_loading_dot_style(loading: bool) -> String {
+    let paint = if loading {
+        "background:#22c55e; animation: yggterm-status-dot-blink 1.1s step-end infinite;"
+    } else {
+        "background:transparent;"
+    };
+    format!(
+        "display:inline-block; flex:0 0 auto; width:7px; min-width:7px; height:7px; border-radius:999px; {paint}",
+    )
+}
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
 }
@@ -40694,7 +41145,7 @@ async fn web_surface_totp_for(
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    let Some((page_url, _)) = desktop.web_surface_page_state(native_id) else {
+    let Some((page_url, _, _)) = desktop.web_surface_page_state(native_id) else {
         return json!({
             "accepted": false,
             "session_path": session,
@@ -40898,7 +41349,7 @@ async fn web_surface_fill_for(
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    let Some((page_url, _)) = desktop.web_surface_page_state(native_id) else {
+    let Some((page_url, _, _)) = desktop.web_surface_page_state(native_id) else {
         return json!({
             "accepted": false,
             "session_path": session,
@@ -48846,7 +49297,15 @@ fn app() -> Element {
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
-    let titlebar_auto_hide_enabled = snapshot.settings.auto_hide_titlebar;
+    // A native child webview paints above ALL DOM. An auto-hidden titlebar is
+    // `position:absolute` OVER the content, so a web surface swallows it whole:
+    // the titlebar (with its app menu, the ychrome/incognito identity, the
+    // window buttons) vanishes, and it cannot even be hovered back — the reveal
+    // sensor is under the webview too. So while a native surface is on screen
+    // the titlebar takes its space in FLOW, which is also what pushes the
+    // surface's rect down below it. A browser keeps its chrome.
+    let titlebar_auto_hide_enabled =
+        snapshot.settings.auto_hide_titlebar && !snapshot.native_web_surface_visible;
     let titlebar_reveal_pinned = titlebar_autohide_pinned(&snapshot);
     let titlebar_revealed = titlebar_autohide_revealed(
         titlebar_auto_hide_enabled,
@@ -56738,6 +57197,15 @@ fn TerminalCanvas(
     let terminal_frame = terminal_frame_style(snapshot.fullscreen);
     let terminal_shell_padding = terminal_frame.padding.to_string();
     let terminal_shell_radius = terminal_frame.shell_radius.to_string();
+    // The web overlay is a TENANT of this viewport, not a lid on top of it: it
+    // takes the same inset and radius the terminal host takes, so the viewport's
+    // frame is drawn around the page exactly as it is around a terminal. This is
+    // load-bearing, not cosmetic — the native child webview is placed at the
+    // `[data-ws-page]` rect INSIDE this overlay, and a rect that ran to the
+    // viewport's edge put a native rectangle over the frame (and, with the
+    // titlebar auto-hidden, over the titlebar) with nothing to clip it.
+    let terminal_web_overlay_inset = terminal_frame.padding.to_string();
+    let terminal_web_overlay_radius = terminal_frame.host_radius.to_string();
     let terminal_host_chrome = format!(
         "border-radius:{}; box-shadow:none !important; outline:none !important; background:{};",
         terminal_frame.host_radius, theme.background,
@@ -59638,6 +60106,7 @@ fn TerminalCanvas(
                                 url,
                                 title: surface_title,
                                 profile: surface_profile,
+                                start_page,
                             }) => {
                                 // libyggterm web surface (OSC 7717, ychrome
                                 // pilot). Identity truth is the STREAM the OSC
@@ -59819,9 +60288,33 @@ fn TerminalCanvas(
                                                     forward_child,
                                                     socks_port,
                                                     profile,
+                                                    start_page,
                                                     now_ms,
                                                 );
                                             });
+                                            // The tab the restore landed on may be
+                                            // one that has never been shown (the app
+                                            // tab having ADOPTED a saved URL, or a
+                                            // filed tab selected where it sits), and
+                                            // egress belongs to a run, so it is
+                                            // unresolved. Select it through the one
+                                            // door that resolves: otherwise the
+                                            // reconciler builds its webview against
+                                            // an empty URL and the restore comes back
+                                            // blank.
+                                            let landed = state.with(|shell| {
+                                                shell
+                                                    .web_surfaces
+                                                    .get(&surface_session_path)
+                                                    .map(|surface| surface.active_tab)
+                                            });
+                                            if let Some(tab_id) = landed {
+                                                select_web_surface_tab(
+                                                    state,
+                                                    surface_session_path.clone(),
+                                                    tab_id,
+                                                );
+                                            }
                                         }
                                     }
                                     "close" => {
@@ -65202,8 +65695,8 @@ fn TerminalCanvas(
                             // picker's inputs keep keyboard focus.
                             "data-yggterm-web-picker": "1",
                             style: format!(
-                                "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
-                                theme.background, terminal_shell_radius,
+                                "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
+                                terminal_web_overlay_inset, theme.background, terminal_web_overlay_radius,
                             ),
                             WebSurfacePickerView {
                                 control_url: picker_control_url,
@@ -65214,9 +65707,11 @@ fn TerminalCanvas(
                     } else {
                     div {
                         style: format!(
-                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
-                            theme.background, terminal_shell_radius,
+                            "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
+                            terminal_web_overlay_inset, theme.background, terminal_web_overlay_radius,
                         ),
+                        // The tab loading dot's blink, declared where it is drawn.
+                        style { "{STATUS_DOT_BLINK_CSS}" }
                         // Tab strip: a translucent tint over the page
                         // background so the ACTIVE tab (painted solid page
                         // color) visibly merges into the nav bar below while
@@ -65245,6 +65740,8 @@ fn TerminalCanvas(
                                 let tab_label = tab.label.clone();
                                 let tab_active = tab.active;
                                 let is_app_tab = tab.is_app_tab;
+                                let tab_loading = tab.loading;
+                                let tab_loading_dot = web_tab_loading_dot_style(tab_loading);
                                 let select_path = web_surface_session_path.clone();
                                 let close_tab_path = web_surface_session_path.clone();
                                 let (tab_background, tab_opacity) = if tab_active {
@@ -65261,10 +65758,12 @@ fn TerminalCanvas(
                                             tab_background, theme.foreground, tab_opacity,
                                         ),
                                         onclick: move |_| {
-                                            state.with_mut(|shell| {
-                                                shell.web_surface_select_tab(&select_path, tab_id);
-                                            });
+                                            select_web_surface_tab(state, select_path.clone(), tab_id);
                                         },
+                                        span {
+                                            "data-web-tab-loading": if tab_loading { "true" } else { "false" },
+                                            style: "{tab_loading_dot}",
+                                        }
                                         span {
                                             style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
                                             "{tab_label}"
@@ -65412,10 +65911,8 @@ fn TerminalCanvas(
                                                                             if tab_active { "rgba(127,127,127,0.22)" } else { "transparent" },
                                                                         ),
                                                                         onclick: move |_| {
-                                                                            state.with_mut(|shell| {
-                                                                                shell.web_surface_select_tab(&select_path, tab_id);
-                                                                                shell.close_web_tab_overflow();
-                                                                            });
+                                                                            select_web_surface_tab(state, select_path.clone(), tab_id);
+                                                                            state.with_mut(|shell| shell.close_web_tab_overflow());
                                                                         },
                                                                         "{tab_label}"
                                                                     }
@@ -70491,6 +70988,9 @@ fn terminal_eval_script_with_canvas_renderer(
                             url: typeof payload.url === 'string' ? payload.url : null,
                             title: typeof payload.title === 'string' ? payload.title : null,
                             profile: typeof payload.profile === 'string' ? payload.profile : null,
+                            // A field the app declared and this forwarder drops is
+                            // a field that never existed. Forward every one.
+                            start_page: payload.start_page === true,
                         }});
                     }} catch (_webSurfaceError) {{}}
                     return true;
@@ -81844,6 +82344,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             let is_app_tab = tab.is_app_tab;
             let label = tab.label.clone();
             let active = tab.active;
+            let loading_dot = web_tab_loading_dot_style(tab.loading);
             let being_dragged = dragging == Some(tab_id);
             let hover_folder = tab.folder.clone();
             let (select_path, close_path) = (session_path.clone(), session_path.clone());
@@ -81873,8 +82374,12 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         }
                     },
                     onclick: move |_| {
-                        state.with_mut(|shell| shell.web_surface_select_tab(&select_path, tab_id));
+                        select_web_surface_tab(state, select_path.clone(), tab_id);
                     },
+                    span {
+                        "data-web-tab-loading": if tab.loading { "true" } else { "false" },
+                        style: "{loading_dot}",
+                    }
                     span {
                         style: "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         "{label}"
@@ -81915,6 +82420,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
     let new_tab_path = session_path.clone();
     let new_folder_path = session_path.clone();
     rsx! {
+        // The tab loading dot blinks with the same keyframes the live-session
+        // status dot does. Declared here too so the rail carries its own signal
+        // vocabulary even when the left sidebar (its other declaration site) is
+        // not mounted.
+        style { "{STATUS_DOT_BLINK_CSS}" }
         div {
             "data-web-tabs-rail": "1",
             style: "display:flex; flex-direction:column; gap:8px; min-height:0; flex:1 1 auto;",
@@ -81937,39 +82447,75 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                 background: omni_panel_bg.clone(),
                 compact: true,
             }
-            RailHeader { title: "Tabs".to_string(), color: palette.text.to_string() }
-            div {
-                style: "display:flex; gap:6px;",
-                button {
-                    "data-web-tab-new": "1",
-                    style: format!(
-                        "flex:1 1 auto; padding:6px 10px; border:0; border-radius:9px; background:{}; color:#fff; \
-                         font-size:11px; font-weight:700; cursor:pointer;",
-                        palette.accent,
-                    ),
-                    onclick: move |_| {
-                        state.with_mut(|shell| shell.web_surface_new_tab(&new_tab_path));
-                        // Chrome opens new tabs typing-ready: focus the rail omnibox
-                        // once the re-render commits.
-                        let _ = document::eval(
-                            "setTimeout(() => { const el = document.getElementById('ws-rail-address'); if (el) { el.focus(); if (el.select) { el.select(); } } }, 60);",
-                        );
-                    },
-                    "+ New tab"
-                }
-                button {
-                    "data-web-tab-new-folder": "1",
-                    style: format!(
-                        "flex:0 0 auto; padding:6px 10px; border:1px solid rgba(127,127,127,0.35); border-radius:9px; \
-                         background:transparent; color:{}; font-size:11px; font-weight:600; cursor:pointer;",
-                        palette.text,
-                    ),
-                    title: "New folder",
-                    onclick: move |_| {
-                        state.with_mut(|shell| shell.web_tab_new_folder(&new_folder_path));
-                    },
-                    "🗂 Folder"
-                }
+            // The two verbs that act on the tab tree ride the heading itself —
+            // an icon each, next to the noun they act on. The old full-width
+            // "+ New tab" pill and "🗂 Folder" button spent a whole band of the
+            // rail restating what a "+" says on its own.
+            RailHeader {
+                title: "Tabs".to_string(),
+                color: palette.text.to_string(),
+                actions: rsx! {
+                    button {
+                        "data-web-tab-new": "1",
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; \
+                             border:0; border-radius:7px; background:{}; color:#fff; cursor:pointer; padding:0;",
+                            palette.accent,
+                        ),
+                        title: "New tab",
+                        onclick: move |_| {
+                            state.with_mut(|shell| shell.web_surface_new_tab(&new_tab_path));
+                            // Chrome opens new tabs typing-ready: focus the rail omnibox
+                            // once the re-render commits.
+                            let _ = document::eval(
+                                "setTimeout(() => { const el = document.getElementById('ws-rail-address'); if (el) { el.focus(); if (el.select) { el.select(); } } }, 60);",
+                            );
+                        },
+                        svg {
+                            width: "12",
+                            height: "12",
+                            view_box: "0 0 12 12",
+                            fill: "none",
+                            path {
+                                d: "M6 1.75V10.25",
+                                stroke: "currentColor",
+                                stroke_width: "1.8",
+                                stroke_linecap: "round",
+                            }
+                            path {
+                                d: "M1.75 6H10.25",
+                                stroke: "currentColor",
+                                stroke_width: "1.8",
+                                stroke_linecap: "round",
+                            }
+                        }
+                    }
+                    button {
+                        "data-web-tab-new-folder": "1",
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; \
+                             border:1px solid rgba(127,127,127,0.35); border-radius:7px; background:transparent; \
+                             color:{}; cursor:pointer; padding:0;",
+                            palette.text,
+                        ),
+                        title: "New folder",
+                        onclick: move |_| {
+                            state.with_mut(|shell| shell.web_tab_new_folder(&new_folder_path));
+                        },
+                        svg {
+                            width: "13",
+                            height: "13",
+                            view_box: "0 0 14 14",
+                            fill: "none",
+                            path {
+                                d: "M1.9 4.05a1 1 0 0 1 1-1h2.35l1.2 1.4h4.65a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1H2.9a1 1 0 0 1-1-1V4.05Z",
+                                stroke: "currentColor",
+                                stroke_width: "1.2",
+                                stroke_linejoin: "round",
+                            }
+                        }
+                    }
+                },
             }
             div {
                 style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px;",
@@ -82157,14 +82703,6 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         }
                     }
                 }
-            }
-            div {
-                style: format!(
-                    "flex:0 0 auto; padding-top:8px; border-top:1px solid rgba(127,127,127,0.2); \
-                     font-size:10px; line-height:1.5; color:{};",
-                    palette.muted,
-                ),
-                "Drag a tab onto a folder to file it. Folders and the tabs in them are saved for this profile; the root tabs are this visit's session."
             }
         }
     }
@@ -88467,6 +89005,13 @@ mod tests {
             url: url.to_string(),
             title: String::new(),
             folder: folder.map(str::to_string),
+            active: false,
+        }
+    }
+    fn saved_active_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
+        SavedWebTab {
+            active: true,
+            ..saved_tab(url, folder)
         }
     }
 
@@ -88520,6 +89065,92 @@ mod tests {
         );
     }
 
+    // "Continue where you left off" restores a PLACE, not just a set of rows.
+    // The user reported the whole point of the feature missing: their session
+    // came back with every tab present and a brand-new start page ON TOP of it.
+    #[test]
+    fn continuing_lands_on_the_tab_that_was_in_front_and_opens_no_start_page() {
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_tab("https://a.example/", None),
+                saved_active_tab("https://b.example/", None),
+                saved_tab("https://c.example/", None),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(
+            plan.adopt.as_ref().map(|tab| tab.url.as_str()),
+            Some("https://b.example/"),
+            "the app tab becomes the tab the user was reading, so no start page is stacked over the session"
+        );
+        assert_eq!(
+            plan.tabs.iter().map(|tab| tab.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://a.example/", "https://c.example/"],
+            "the adopted tab is not ALSO reopened — a restored session comes back with exactly the tabs it had"
+        );
+        assert_eq!(plan.land_on, None, "the app tab IS the active tab now");
+    }
+
+    // A filed tab is organization. Adopting it onto the (always-root) app tab
+    // would quietly pull it out of the folder the user filed it in — so it is
+    // selected where it sits instead, start page and all.
+    #[test]
+    fn continuing_onto_a_filed_tab_selects_it_in_place_rather_than_unfiling_it() {
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_tab("https://a.example/", None),
+                saved_active_tab("https://b.example/", Some("f1")),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(plan.adopt, None, "a filed tab is never adopted");
+        assert_eq!(
+            plan.land_on,
+            Some(1),
+            "it is selected where it sits (index 1 -> tab id 2)"
+        );
+        assert_eq!(
+            plan.tabs[1].folder.as_deref(),
+            Some("f1"),
+            "and it is still in its folder"
+        );
+    }
+
+    // `ychrome <url>` is a REQUEST. Every saved tab still comes back, but landing
+    // the user somewhere other than the page they asked for would hide the thing
+    // they just launched.
+    #[test]
+    fn a_launch_with_a_url_keeps_the_app_tab_in_front() {
+        let plan = plan_web_tab_restore(
+            vec![saved_active_tab("https://b.example/", None)],
+            true,
+            false,
+        );
+        assert_eq!(plan.adopt, None);
+        assert_eq!(plan.land_on, None, "the requested URL stays in front");
+        assert_eq!(
+            plan.tabs.len(),
+            1,
+            "the saved tab is still restored, just not landed on"
+        );
+    }
+
+    // Restore OFF is "start fresh": the filed tabs come back as organization, but
+    // there is no session to return TO, so a stale active flag must not drag the
+    // user into one.
+    #[test]
+    fn a_fresh_start_never_lands_on_a_saved_tab() {
+        let plan = plan_web_tab_restore(
+            vec![saved_active_tab("https://b.example/", Some("f1"))],
+            false,
+            true,
+        );
+        assert_eq!(plan.adopt, None);
+        assert_eq!(plan.land_on, None, "a fresh start lands on the app tab");
+    }
+
     // Vertical mode IS the rail. A GUI that starts with the pref already on used
     // to collapse the tab strip and open nothing, so the tabs had NO home — the
     // invariant this test exists to hold. Caught live, on a restart, not by code
@@ -88541,6 +89172,7 @@ mod tests {
             // The ephemeral profile: this test must not read or write the user's
             // real tab store.
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
 
@@ -88567,6 +89199,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -88616,6 +89249,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -88659,6 +89293,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -88697,6 +89332,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -88767,6 +89403,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -88788,6 +89425,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             2_000,
         );
         let overlay = shell
@@ -88847,13 +89485,13 @@ mod tests {
             .is_some());
     }
 
-    // A link opened in a new window from inside a surface (middle-click,
-    // ctrl-click, target="_blank", window.open) mints a tab. `background`
-    // (middle/ctrl-click) leaves the current tab focused, matching Chrome; a
-    // foreground request selects the new tab. The tab inherits the app tab's
-    // profile so one ychrome invocation shares its identity across tabs.
+    // A popup a page opened (middle-click, ctrl-click, target="_blank",
+    // window.open) is ADOPTED as a tab: its webview already exists, built related
+    // to the opener so `window.opener` is live. `background` (middle/ctrl-click)
+    // leaves the current tab focused, matching Chrome; a foreground request
+    // selects the new tab.
     #[test]
-    fn web_surface_open_tab_from_link_respects_background() {
+    fn an_adopted_popup_inherits_the_openers_egress_and_needs_no_navigation() {
         let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
         let mut shell = ShellState::new(bootstrap);
         shell.upsert_web_surface(
@@ -88862,36 +89500,47 @@ mod tests {
             Some("app".to_string()),
             "http://localhost:8000/".to_string(),
             None,
-            None,
+            // A remote session's SOCKS tunnel: the popup shares the opener's
+            // WebContext, so it egresses through the SAME tunnel — and the shell
+            // must record that, or the reconciler would see a proxy change and
+            // destroy the very webview the opener relationship lives in.
+            Some(1080),
             "work".to_string(),
+            false,
             1_000,
         );
         // Background (middle-click): tab added, focus stays on the app tab.
-        let bg_id = shell
-            .web_surface_open_tab_from_link("local://ws", true)
+        let (bg_id, profile, socks) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://accounts.google.com/", true)
             .expect("surface is live");
+        assert_eq!(profile, "work", "inherits the opener's identity");
+        assert_eq!(socks, Some(1080), "inherits the opener's egress");
         {
             let surface = &shell.web_surfaces["local://ws"];
             assert_eq!(surface.tabs.len(), 2);
             assert_eq!(surface.active_tab, 0, "background tab must not steal focus");
             let opened = surface.tabs.iter().find(|tab| tab.id == bg_id).unwrap();
-            assert_eq!(opened.profile, "work", "inherits the app tab's profile");
+            assert_eq!(
+                opened.effective_url, "https://accounts.google.com/",
+                "the URL is already applied — WebKit is loading it, and re-navigating would restart a load that may not be repeatable"
+            );
+            assert!(opened.loading, "the popup is loading from its first frame");
         }
-        // Foreground (target=_blank / window.open): the new tab is selected.
-        let fg_id = shell
-            .web_surface_open_tab_from_link("local://ws", false)
+        // Foreground (window.open): the popup takes the front.
+        let (fg_id, _, _) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://accounts.google.com/", false)
             .expect("surface is live");
         {
             let surface = &shell.web_surfaces["local://ws"];
             assert_eq!(surface.tabs.len(), 3);
-            assert_eq!(surface.active_tab, fg_id, "foreground tab is selected");
-            // No omnibox edit draft — the tab is navigated to a URL, not opened
-            // blank for typing (the `+` new tab's behaviour differs on purpose).
+            assert_eq!(surface.active_tab, fg_id, "foreground popup is selected");
+            // No omnibox edit draft — the tab is showing a URL, not opened blank
+            // for typing (the `+` new tab's behaviour differs on purpose).
             assert_eq!(surface.address_draft, None);
         }
         // A vanished surface yields None instead of panicking.
         assert_eq!(
-            shell.web_surface_open_tab_from_link("local://gone", false),
+            shell.web_surface_adopt_popup_tab("local://gone", 0, "https://example.com/", false),
             None
         );
     }
@@ -89124,6 +89773,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         // User navigates the app tab via the address bar.
@@ -89145,6 +89795,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             2_000,
         );
         let overlay = shell
@@ -89160,6 +89811,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             3_000,
         );
         let overlay = shell
@@ -89182,6 +89834,7 @@ mod tests {
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             1_000,
         );
         shell.web_surface_set_address_draft("local://ws", Some("oi".to_string()));
@@ -107986,6 +108639,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             current_millis(),
         );
         assert!(
@@ -109750,6 +110404,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             None,
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
             current_millis(),
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -113244,6 +113899,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![session],
@@ -113878,6 +114534,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![stale_session, active_session],
@@ -114047,6 +114704,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -114216,6 +114874,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -114388,6 +115047,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -114564,6 +115224,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -114732,6 +115393,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -114900,6 +115562,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -115102,6 +115765,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![restored_remote, active_session.clone()],
@@ -115273,6 +115937,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -115476,6 +116141,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![live_session],
@@ -115856,6 +116522,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
+            native_web_surface_visible: false,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: Vec::new(),
