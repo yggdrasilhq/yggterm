@@ -195,6 +195,11 @@ pub(crate) enum TerminalJsEvent {
         /// `policy_version`: the GUI refetches `<control>/zoom` only when it
         /// moves. Absent ⇒ the app ships no per-site zoom.
         zoom_version: Option<String>,
+        /// Opaque stamp over the app's chrome-appearance choice (general default
+        /// + per-site overrides), same trick again: the GUI refetches
+        /// `<control>/appearance` only when it moves. Absent ⇒ the app ships no
+        /// appearance and the chrome falls back to Light.
+        appearance_version: Option<String>,
     },
     /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
     /// user's presence. The app carries only the rpId and a display label — no
@@ -353,6 +358,8 @@ enum TerminalJsEventWire {
         app_name: Option<String>,
         #[serde(default)]
         zoom_version: Option<String>,
+        #[serde(default)]
+        appearance_version: Option<String>,
     },
     Fido2Request {
         action: String,
@@ -498,6 +505,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 policy_version,
                 app_name,
                 zoom_version,
+                appearance_version,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
@@ -505,6 +513,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 policy_version,
                 app_name,
                 zoom_version,
+                appearance_version,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
@@ -764,6 +773,7 @@ mod tests {
             "app_name": "Ychrome",
             "policy_version": "abc",
             "zoom_version": "def",
+            "appearance_version": "ghi",
             "panes": [{"id": "settings", "icon": "⚙", "title": "Settings"}],
         }))
         .expect("a full sidebar declaration should deserialize");
@@ -771,11 +781,13 @@ mod tests {
             TerminalJsEvent::SidebarContribution {
                 app_name,
                 zoom_version,
+                appearance_version,
                 policy_version,
                 ..
             } => {
                 assert_eq!(app_name.as_deref(), Some("Ychrome"));
                 assert_eq!(zoom_version.as_deref(), Some("def"));
+                assert_eq!(appearance_version.as_deref(), Some("ghi"));
                 assert_eq!(policy_version.as_deref(), Some("abc"));
             }
             other => panic!("expected a sidebar contribution, got {other:?}"),
@@ -795,7 +807,12 @@ mod tests {
         .expect("a minimal declaration should still deserialize");
         assert!(matches!(
             event,
-            TerminalJsEvent::SidebarContribution { app_name: None, zoom_version: None, .. }
+            TerminalJsEvent::SidebarContribution {
+                app_name: None,
+                zoom_version: None,
+                appearance_version: None,
+                ..
+            }
         ));
     }
 }
