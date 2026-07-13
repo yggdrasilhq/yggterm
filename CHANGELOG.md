@@ -2,6 +2,29 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.1
+
+- **A local Claude Code row keeps its own identity — the fd scan can no longer
+  rename it to a stranger.** A live `claude` holds several project transcripts
+  open at once (the resume picker, `/resume` browsing, history reads, and a
+  coding agent reading sibling session logs as part of its task). Local
+  runtime-identity discovery picked the alphabetically-first open
+  `~/.claude/projects/.../<id>.jsonl`, so the row's identity flapped as fds
+  opened and closed. On one host a row was reassigned five foreign session ids
+  in 39 seconds and settled on one that already owned a real transcript, so the
+  rebuilt launch collided: "Session ID … is already in use." A foreign id with
+  no transcript instead gave "no conversation found" — so this one bug was
+  behind both restore-refusal shapes, and only on the local machine path
+  (remote Claude Code uses a separate identity path).
+
+  Discovery now prefers Claude Code's own pid registry
+  (`~/.claude/sessions/<pid>.json`, the exact process→session binding it
+  publishes), and the fd-scan fallback takes the transcript being written
+  (newest) instead of the first by name. A row that was already poisoned heals
+  on its next relaunch: the launch command is rebuilt from on-disk truth, the
+  row's own id wins when it has a transcript, and the record's id and metadata
+  collapse back onto that single identity.
+
 ## Unreleased
 
 - **A web surface lives IN its viewport, and a popup is a real popup.** Six
