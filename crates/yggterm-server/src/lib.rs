@@ -1135,13 +1135,60 @@ fn claude_code_storage_path_from_process_fds(pid: u32) -> Option<PathBuf> {
     let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return None;
     };
-    let mut candidates = entries
+    let candidates = entries
         .flatten()
         .filter_map(|entry| fs::read_link(entry.path()).ok())
         .filter_map(|target| normalize_proc_fd_target_path_for_claude_code(&target))
         .collect::<Vec<_>>();
+    select_claude_code_storage_candidate(candidates)
+}
+
+/// A CC process can hold SEVERAL project transcripts open at once (its resume
+/// picker and history reads open OTHER sessions' JSONLs). Alphabetical
+/// first-pick mis-attributed a foreign session as this runtime's identity
+/// (live-evidenced on jojo 2026-07-13: row `a8fab1f2-…` was repointed to
+/// `47919c4a-…` — digits sort before letters — and every relaunch then died
+/// with "session id already in use"). The transcript CC is WRITING is the
+/// freshest file, so newest-mtime wins; ties fall back to path order only to
+/// stay deterministic.
+fn select_claude_code_storage_candidate(mut candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.sort();
-    candidates.into_iter().next()
+    candidates.into_iter().max_by_key(|path| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    })
+}
+
+/// CC 2.1.x publishes a live-session registry keyed by PID:
+/// `~/.claude/sessions/<pid>.json` with `{"pid":…,"sessionId":"…","cwd":"…"}`,
+/// written by the process itself and removed on exit. When present it is the
+/// EXACT pid→session binding — no fd sampling, no ambiguity — so runtime
+/// identity discovery must prefer it over scanning `/proc/<pid>/fd` (which
+/// only sees a transcript while a write happens to be in flight, and can see
+/// a FOREIGN transcript the process opened to read history).
+fn local_cc_session_registry_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".claude").join("sessions"))
+}
+
+/// `local_cc_registry_session_id_in` against an explicit registry dir (test seam).
+/// Returns the registered session id for `pid`, verifying the entry's own
+/// `pid` field so a half-written or foreign file can't mis-bind.
+fn local_cc_registry_session_id_in(registry_dir: &Path, pid: u32) -> Option<String> {
+    let raw = fs::read_to_string(registry_dir.join(format!("{pid}.json"))).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    if value.get("pid").and_then(Value::as_u64) != Some(u64::from(pid)) {
+        return None;
+    }
+    value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1167,11 +1214,28 @@ pub(crate) struct ClaudeCodeRuntimeProcessIdentity {
 pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
     root_pid: u32,
 ) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+    let registry_dir = local_cc_session_registry_dir();
     let mut queue = VecDeque::from([root_pid]);
     let mut seen = HashSet::new();
     while let Some(pid) = queue.pop_front() {
         if !seen.insert(pid) {
             continue;
+        }
+        // The CC-published pid registry is the authoritative pid→session
+        // binding; a registry hit ends the search even when the session has
+        // no transcript yet (turn 0) — falling through to the fd scan there
+        // is exactly the foreign-transcript mis-attribution vector.
+        if let Some(session_id) = registry_dir
+            .as_deref()
+            .and_then(|dir| local_cc_registry_session_id_in(dir, pid))
+        {
+            let storage_path = yggterm_core::local_cc_session_jsonl_path(&session_id)?;
+            let (session_id, cwd) = read_cc_session_identity_fields(&storage_path).ok()??;
+            return Some(ClaudeCodeRuntimeProcessIdentity {
+                storage_path,
+                session_id,
+                cwd,
+            });
         }
         if let Some(storage_path) = claude_code_storage_path_from_process_fds(pid)
             && let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&storage_path)
@@ -2941,6 +3005,90 @@ impl YggtermServer {
             refresh_restored_remote_runtime_codex_launch_command(&key, session)
                 || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
         })
+    }
+
+    /// Rebuild a LOCAL Claude Code row's launch command from current on-disk
+    /// truth before a relaunch. Only call when the row has NO running runtime:
+    /// changing the stored command under a live runtime makes the next
+    /// `session_matches_spec` check restart a healthy session.
+    ///
+    /// The stored `launch_command` is a point-in-time artifact: at birth it is
+    /// `claude --session-id <uuid>`, and identity rebinds string-replace the id
+    /// inside it. Replaying it verbatim breaks two ways (both live-evidenced,
+    /// jojo 2026-07-13, row `a8fab1f2-…`): a birth-shaped command whose id now
+    /// HAS a transcript makes CC refuse with "session id already in use", and
+    /// a mis-attributed rebind leaves it pointing at a foreign, stale id. So a
+    /// relaunch derives the command instead: pick the row's current id (newest
+    /// transcript wins — `local_cc_current_session_id`), then resume-or-rebirth
+    /// via `stored_session_launch_command`, and re-collapse `session.id` +
+    /// Storage metadata onto that id so the record has ONE identity again.
+    pub fn refresh_local_cc_relaunch_launch_command(&mut self, path: &str) -> bool {
+        let Some(key) = self.resolve_terminal_session_key(path) else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return false;
+        };
+        if session.kind != SessionKind::ClaudeCode
+            || session
+                .ssh_target
+                .as_deref()
+                .is_some_and(|target| !is_loopback_ssh_target(target))
+        {
+            return false;
+        }
+        let stored_id = session.id.clone();
+        let row_id = local_runtime_id_from_key(&key)
+            .unwrap_or(stored_id.as_str())
+            .to_string();
+        let row_id = row_id.as_str();
+        let mut candidates = vec![row_id];
+        if !stored_id.trim().is_empty() && stored_id != row_id {
+            candidates.push(stored_id.as_str());
+        }
+        let current_id = local_cc_current_session_id(&candidates);
+        let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
+        let launch_command =
+            stored_session_launch_command(SessionKind::ClaudeCode, &cwd, &current_id);
+        let changed = session.launch_command != launch_command || session.id != current_id;
+        if !changed {
+            return false;
+        }
+        session.launch_command = launch_command;
+        session.id = current_id.clone();
+        upsert_session_metadata(&mut session.metadata, "UUID", current_id.clone());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Claude Code Session",
+            current_id.clone(),
+        );
+        if let Some(storage_path) = yggterm_core::local_cc_session_jsonl_path(&current_id) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Storage",
+                storage_path.display().to_string(),
+            );
+        }
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Launch",
+            user_visible_launch_command(&session.launch_command),
+        );
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "terminal_runtime",
+                "local_cc_relaunch_command_rebuilt",
+                serde_json::json!({
+                    "path": key,
+                    "row_id": row_id,
+                    "stored_id": stored_id,
+                    "current_id": current_id,
+                }),
+            );
+        }
+        true
     }
 
     pub fn remote_terminal_write_for_path(&self, path: &str, data: &str) -> anyhow::Result<bool> {
@@ -21098,6 +21246,42 @@ fn local_cc_resume_cwd(session_id: &str) -> Option<String> {
     yggterm_core::local_cc_session_cwd(session_id)
 }
 
+/// Which of a local CC row's candidate ids is the session's CURRENT identity,
+/// given in priority order (the caller passes `[row_id, stored_id]`).
+///
+/// A row can carry two ids that disagree: the row-path uuid it was born with
+/// and a `session.id` later rebound by runtime-identity discovery. When
+/// discovery mis-attributed a foreign transcript (jojo 2026-07-13, row
+/// `a8fab1f2-…` poisoned to `47919c4a-…`), the stored id points at a FOREIGN
+/// session while the row's real conversation lives under the row id.
+///
+/// For a local CC row the row id is authoritative: the row is born with
+/// `claude --session-id <row-uuid>`, so CC's transcript is named `<row-uuid>`.
+/// Therefore whichever candidate FIRST (row id before stored id) has a
+/// transcript on disk is the identity. Only when the row id has no transcript
+/// at all — the legacy bare-`claude` drift where CC minted its own id — does a
+/// later candidate win. No candidate has a transcript → first candidate (the
+/// row id), which the relaunch re-births. Ordering by presence, not mtime,
+/// avoids ever picking a foreign session just because it was used more
+/// recently (which would collide with that still-live session).
+fn local_cc_current_session_id(candidates: &[&str]) -> String {
+    match dirs::home_dir().map(|home| home.join(".claude").join("projects")) {
+        Some(projects_dir) => local_cc_current_session_id_in(&projects_dir, candidates),
+        None => candidates[0].to_string(),
+    }
+}
+
+/// `local_cc_current_session_id` against an explicit projects dir (test seam).
+fn local_cc_current_session_id_in(projects_dir: &Path, candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .find(|candidate| {
+            yggterm_core::local_cc_session_jsonl_path_in(projects_dir, candidate).is_some()
+        })
+        .unwrap_or(&candidates[0])
+        .to_string()
+}
+
 /// Launch command for a stored session. `is_local` says whether the row lives on THIS
 /// machine; it is passed explicitly rather than inferred, because the Claude Code arm
 /// consults the local transcript store and must not do so for a remote row.
@@ -21545,6 +21729,10 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::app_control_open_path_ready;
+    use super::{
+        local_cc_current_session_id_in, local_cc_registry_session_id_in,
+        select_claude_code_storage_candidate,
+    };
 
     // Remote protocol compatibility keys off `build_id` (a hash of the shipped
     // binary, stable across release-version bumps), NOT the release version
@@ -23352,6 +23540,134 @@ mod tests {
             "codex must not pin --session-id; got: {}",
             codex.launch_command
         );
+    }
+
+    // Identity mis-attribution (jojo 2026-07-13): a CC process holding SEVERAL
+    // project transcripts open (resume picker / history reads) must be identified
+    // by the transcript it is WRITING (newest mtime), never by alphabetical
+    // first-pick ('47…' sorts before 'a8…' and poisoned the row identity).
+    #[test]
+    fn claude_code_fd_candidate_selection_prefers_newest_transcript() {
+        let dir = std::env::temp_dir().join(format!("ygg-cc-fdsel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let older = dir.join("47919c4a-92f4-4edd-bc11-ab6a250d947f.jsonl");
+        let newer = dir.join("a8fab1f2-e2bb-47a9-9cf3-7cdfadc51b95.jsonl");
+        std::fs::write(&older, "{}\n").expect("write older");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&newer, "{}\n").expect("write newer");
+        assert_eq!(
+            select_claude_code_storage_candidate(vec![older.clone(), newer.clone()]),
+            Some(newer.clone()),
+            "newest-written transcript wins regardless of sort order"
+        );
+        assert_eq!(
+            select_claude_code_storage_candidate(vec![newer.clone(), older]),
+            Some(newer),
+            "selection is order-independent"
+        );
+        assert_eq!(select_claude_code_storage_candidate(Vec::new()), None);
+    }
+
+    // CC publishes `~/.claude/sessions/<pid>.json` (pid-keyed live registry);
+    // it is the exact pid→session binding and must beat fd sampling. A file
+    // whose own `pid` field disagrees with its name must not bind.
+    #[test]
+    fn claude_code_pid_registry_entry_binds_only_on_pid_match() {
+        let dir = std::env::temp_dir().join(format!("ygg-cc-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("123.json"),
+            r#"{"pid":123,"sessionId":"a8fab1f2-e2bb-47a9-9cf3-7cdfadc51b95","cwd":"/home/pi"}"#,
+        )
+        .expect("write registry");
+        assert_eq!(
+            local_cc_registry_session_id_in(&dir, 123).as_deref(),
+            Some("a8fab1f2-e2bb-47a9-9cf3-7cdfadc51b95")
+        );
+        std::fs::write(
+            dir.join("456.json"),
+            r#"{"pid":999,"sessionId":"deadbeef-0000-0000-0000-000000000000"}"#,
+        )
+        .expect("write mismatched registry");
+        assert_eq!(
+            local_cc_registry_session_id_in(&dir, 456),
+            None,
+            "an entry whose pid field disagrees with its filename must not bind"
+        );
+        assert_eq!(local_cc_registry_session_id_in(&dir, 789), None);
+        std::fs::write(dir.join("321.json"), "not json").expect("write junk");
+        assert_eq!(local_cc_registry_session_id_in(&dir, 321), None);
+    }
+
+    // A row carrying two ids (row-path uuid vs a rebind-poisoned session.id)
+    // must relaunch as the FIRST candidate with a transcript, and the caller
+    // passes [row_id, stored_id] — so a row id that has its own transcript
+    // always wins over a foreign poisoned id, regardless of which was written
+    // more recently (picking the foreign one would collide with its live use).
+    #[test]
+    fn local_cc_current_session_id_prefers_row_id_with_transcript() {
+        let dir = std::env::temp_dir().join(format!("ygg-cc-cur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let project = dir.join("-home-pi");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let foreign = "47919c4a-92f4-4edd-bc11-ab6a250d947f";
+        let row = "a8fab1f2-e2bb-47a9-9cf3-7cdfadc51b95";
+        // Write the row's OWN transcript OLDER than the foreign one, to prove
+        // presence-order (not mtime) decides.
+        std::fs::write(project.join(format!("{row}.jsonl")), "{}\n").expect("write row");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(project.join(format!("{foreign}.jsonl")), "{}\n").expect("write foreign");
+        assert_eq!(
+            local_cc_current_session_id_in(&dir, &[row, foreign]),
+            row,
+            "row id with its own transcript wins even though foreign is newer"
+        );
+        assert_eq!(
+            local_cc_current_session_id_in(&dir, &["no-transcript-row-id", foreign]),
+            foreign,
+            "legacy drift: row id has no transcript, so the id that does wins"
+        );
+        assert_eq!(
+            local_cc_current_session_id_in(&dir, &["row-id", "also-missing"]),
+            "row-id",
+            "no transcripts at all → row id, so re-birth keeps row identity"
+        );
+    }
+
+    // The relaunch rebuild collapses a poisoned split identity: a row whose
+    // session.id + launch_command were rebound to a foreign id (with no
+    // transcript of its own in this environment) must relaunch as its ROW id,
+    // with id/metadata re-collapsed onto that single identity.
+    #[test]
+    fn local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id() {
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/pi"), None);
+        let row_id = path.strip_prefix("local://").expect("local path").to_string();
+        let poisoned = "47919c4a-ffff-ffff-ffff-ffffffffffff";
+        {
+            let session = server.sessions.get_mut(&path).expect("session");
+            session.launch_command = session.launch_command.replace(&row_id, poisoned);
+            session.id = poisoned.to_string();
+        }
+        assert!(
+            server.refresh_local_cc_relaunch_launch_command(&path),
+            "poisoned record must be rebuilt"
+        );
+        let session = server.sessions.get(&path).expect("session");
+        assert_eq!(session.id, row_id, "identity collapses back to the row id");
+        assert!(
+            session
+                .launch_command
+                .contains(&format!("--session-id '{row_id}'")),
+            "no transcript → re-birth with the ROW id; got: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains(poisoned),
+            "the foreign id must be gone from the launch command"
+        );
+        // Second call is a no-op: the record already matches derived truth.
+        assert!(!server.refresh_local_cc_relaunch_launch_command(&path));
     }
 
     // XTERM-BUG: squish-and-bottom-paint-on-reresume — the PTY grid is recorded in
