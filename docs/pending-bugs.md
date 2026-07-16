@@ -120,6 +120,30 @@ fix) once the fix is verified live on jojo.
   working dot (`server app rows` → the `local` group row reports
   `busy: true, busy_reason: group_descendant_working`).
 
+- **Clipboard-staging dir grows forever — no autoclean anywhere (user-confirmed
+  2026-07-16).** `stage_local_clipboard_png` (shell.rs) and
+  `stage_remote_clipboard_png` (yggterm-server lib.rs, incl. the python ssh
+  fallback) write every image paste to `~/.yggterm/clipboard/` and nothing ever
+  prunes it: pi is at 204 files / 182 MB since April, files up to 15 MB each.
+  Left alone this fills the drive.
+  **The careful part — these files are NOT free to delete.** The staged PATH is
+  what gets pasted into agent CLIs (codex / Claude Code image attach), so agent
+  session transcripts reference these paths; resuming a 15-day-old session and
+  re-reading its image must not hit file-not-found. Design constraints for the
+  fix (deterministic, explicit thresholds, per the no-non-determinism rule):
+  1. Two-stage TTL, sweep in each host daemon's chore tick, oldest-first by
+     filename (names embed epoch millis, so name order = age order):
+     age > 45 days → move to `~/.yggterm/clipboard/.trash/`; trash age >
+     45 more days → delete. A "something not found" event then has a 90-day
+     recovery window and the trash hop is itself reversible.
+  2. Before trashing, reference-check the (unique) filename against that
+     host's agent transcript stores (`~/.codex/sessions`, `~/.claude/projects`
+     JSONLs); referenced files get their clock reset, never silently dropped.
+  3. Size backstop: if the live dir exceeds 1 GB, evict oldest-to-trash down
+     to the cap (same reference check applies).
+  4. Local and remote hosts each sweep their OWN dir (the daemon is per-host);
+     no cross-host deletion.
+
 ## Diagnostics available
 
 - `~/.yggterm/event-trace*.jsonl` — up to 3 days of trace generations (2.10.2).
