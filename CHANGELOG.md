@@ -2,6 +2,39 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.3
+
+- **A session no longer goes permanently untypeable after a daemon handoff**
+  ("the most helpless state": the viewport printed
+  `Error: terminal session not found: …` on the input line and only a manual
+  session restart recovered it). A keystroke whose runtime key no local PTY
+  holds now recovers instead of erroring into the PTY: the daemon first ADOPTS
+  the runtime if another reachable daemon actually owns it (the keystroke goes
+  through, nothing lost), else it RELAUNCHES the session exactly like a
+  user-initiated restart (that one keystroke is dropped — there was no PTY to
+  receive it). Relaunches are rate-limited per session so a held key cannot
+  storm the resume path.
+- **Hollow preserved-owner registry entries are detected and dropped.** A
+  predecessor daemon that merely re-preserves a runtime key toward an even
+  older, dead daemon LISTS the key but cannot serve it; such entries pinned
+  `hot_update_handoff_active` true for days (live-caught: 8 entries, 4 days),
+  deferring hot updates and routing keystrokes into a dead chain. Preserved
+  owners are now validated against what a daemon actually OWNS — on every
+  proxied-request error, on adoption, and in a new periodic registry
+  revalidation (5-minute cadence on the background chore thread).
+- **Opening or working across machines no longer stalls minutes behind a slow
+  host's first-time provisioning.** The remote-binary resolver took a
+  per-target lock BEFORE consulting its cache, so during one slow bootstrap
+  scp (live-measured: 263s to a slow host) every other resolve to that target
+  — including pure cache hits — queued behind it, surfacing as multi-minute
+  GUI startup syncs and daemon-request stalls (`terminal_ensure`, even
+  `shutdown`). Fresh cache entries now resolve lock-free (double-checked
+  locking); the perf span distinguishes `cache_hit` from
+  `cache_hit_after_lock_wait` so the wait is measurable if it ever returns.
+- **Resolving a remote binary no longer re-hashes the 17 MB local payload on
+  every call.** The local build id is memoized by file identity (path, size,
+  mtime); it re-reads only after a deploy actually changes the binary.
+
 ## 2.11.2
 
 - **The titlebar reveals ON TOP of a web surface, the page runs flush to the
