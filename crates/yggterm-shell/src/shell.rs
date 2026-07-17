@@ -7753,12 +7753,37 @@ impl ShellState {
     /// The bare host of the session's active web-surface tab, lowercased. One
     /// owner: the snapshot, the vault pane and an app-pane's page context all
     /// read it from here, so they cannot disagree about what site is open.
+    /// The tab the FOCUSED PANE is looking at for `session_path` — the
+    /// focus-tenancy derivation ([[campaign-libyggterm]] Phase 3: focus is
+    /// the arbiter of ALL singleton chrome). When the active split group's
+    /// focused pane is a Web{tab} pane of this session, that pinned tab;
+    /// otherwise the surface's own active tab. One owner, so every chrome
+    /// tenant that answers "which page is the user on" answers from the
+    /// same pane.
+    fn focused_web_tab_id(&self, session_path: &str) -> Option<u64> {
+        let group = self.active_split_group()?;
+        let focused = focused_pane_index(group, self.server.active_session_path())?;
+        match group.members.get(focused) {
+            Some(member)
+                if member.session == session_path =>
+            {
+                match member.view {
+                    SplitMemberView::Web { tab } => Some(tab),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
     fn web_surface_host_label(&self, session_path: &str) -> Option<String> {
         let surface = self.web_surfaces.get(session_path)?;
-        let tab = surface
-            .tabs
-            .iter()
-            .find(|tab| tab.id == surface.active_tab)?;
+        // Focused-pane tenancy: a pinned split-tab pane, when focused, IS the
+        // page the user is on — the vault's `values.host`, the pane refetch,
+        // and every other page-context consumer must follow it.
+        let looking_at = self
+            .focused_web_tab_id(session_path)
+            .unwrap_or(surface.active_tab);
+        let tab = surface.tabs.iter().find(|tab| tab.id == looking_at)?;
         let host = web_surface_tab_host_label(&tab.url);
         (!host.is_empty() && host != "New Tab")
             .then(|| host.split(':').next().unwrap_or(&host).to_lowercase())
@@ -47370,26 +47395,54 @@ async fn process_pending_app_control_requests(
                 error: (!existed).then(|| format!("no split group with id {group_id}")),
             }
         }
-        AppControlCommand::FocusSplitPane { session_path } => {
-            let grouped = state.with(|shell| {
-                shell.split_group_for_session(&session_path).is_some()
+        AppControlCommand::FocusSplitPane { session_path, pane } => {
+            // With a pane INDEX, validate it names a pane of the session's
+            // group (the only headless way to focus a pinned web pane —
+            // its native webview swallows pointer events).
+            let target = state.with(|shell| {
+                let group = shell.split_group_for_session(&session_path)?;
+                match pane {
+                    Some(index) => group
+                        .members
+                        .get(index)
+                        .map(|_| (group.group_id.clone(), Some(index))),
+                    None => Some((group.group_id.clone(), None)),
+                }
             });
-            if grouped {
-                focus_split_pane(state, &session_path);
+            match &target {
+                Some((group_id, Some(index))) => {
+                    focus_split_pane_by_index(state, group_id, *index);
+                }
+                Some((_, None)) => focus_split_pane(state, &session_path),
+                None => {}
             }
-            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            let accepted = target.is_some();
+            let (split_groups, focused_web_host) = state.with(|shell| {
+                (
+                    split_groups_debug_json(shell),
+                    // The focus-tenancy probe: which host the page-context
+                    // owner now answers with for this session.
+                    shell.web_surface_host_label(&session_path),
+                )
+            });
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
                 completed_at_ms: current_millis() as u128,
                 output_path: None,
                 data: Some(json!({
-                    "accepted": grouped,
+                    "accepted": accepted,
                     "session_path": session_path,
+                    "pane": pane,
+                    "focused_web_host": focused_web_host,
                     "split_groups": split_groups,
                 })),
-                error: (!grouped)
-                    .then(|| format!("session {session_path} is not in a split group")),
+                error: (!accepted).then(|| match pane {
+                    Some(index) => format!(
+                        "session {session_path} has no split pane {index}"
+                    ),
+                    None => format!("session {session_path} is not in a split group"),
+                }),
             }
         }
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
@@ -92532,6 +92585,63 @@ mod tests {
         assert!(
             shell.split_groups.is_empty(),
             "group must dissolve with its surface"
+        );
+    }
+
+    #[test]
+    fn page_context_host_follows_the_focused_split_pane() {
+        // Focus-tenancy rule 1 ([[campaign-libyggterm]] Phase 3: focus is the
+        // arbiter of ALL singleton chrome): `web_surface_host_label` — the one
+        // owner of page context (vault `values.host`, the app-pane refetch) —
+        // answers from the FOCUSED PANE's tab, not blindly from the surface's
+        // active tab.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            Some("app".to_string()),
+            "https://example.com/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            false,
+            1_000,
+        );
+        let (tab_id, _, _) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://docs.rs/", true)
+            .expect("surface is live");
+        shell.split_groups.push(SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://ws"),
+                SplitMember {
+                    session: "local://ws".to_string(),
+                    view: SplitMemberView::Web { tab: tab_id },
+                },
+            ],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        });
+        // Pane 0 focused: the surface's own view — active tab (example.com).
+        assert_eq!(
+            shell.web_surface_host_label("local://ws").as_deref(),
+            Some("example.com"),
+        );
+        // Pane 1 (the pinned docs.rs tab) focused: the page context follows.
+        shell.split_groups[0].active_pane = 1;
+        assert_eq!(
+            shell.web_surface_host_label("local://ws").as_deref(),
+            Some("docs.rs"),
+        );
+        // Outside a split (group gone) the surface's active tab rules again.
+        shell.split_groups.clear();
+        assert_eq!(
+            shell.web_surface_host_label("local://ws").as_deref(),
+            Some("example.com"),
         );
     }
 
