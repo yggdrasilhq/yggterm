@@ -1560,6 +1560,10 @@ enum AppPaneWidget {
         multiline: bool,
         #[serde(default)]
         rows: u32,
+        /// Document-surface editors only: draw a line-number gutter beside the
+        /// textarea. The gutter tracks the LIVE draft's line count.
+        #[serde(default)]
+        line_numbers: bool,
     },
     NumberInput {
         id: String,
@@ -1647,6 +1651,12 @@ struct AppPaneActionReply {
     /// declare to move `zoom_version`. The reconciler applies the fresh map.
     #[serde(default)]
     refetch_zoom: bool,
+    /// Re-fetch the DOCUMENT SURFACE's schema now: a rail action changed the
+    /// document (a save, a tab switch, a mode toggle) and waiting up to a
+    /// heartbeat for `document_version` to move would leave a stale viewport
+    /// under the user's click.
+    #[serde(default)]
+    refetch_document: bool,
     /// Re-read `<control>/appearance` now: the app changed the chrome's light/dark
     /// choice from its pane and wants the live chrome repainted at once, not at
     /// the next ~4s declare. Same immediate-refetch shape as `refetch_zoom`.
@@ -3948,6 +3958,11 @@ struct ShellState {
     /// terminal). The ~4s re-declare must never fight this — the same
     /// heartbeats-never-clobber-the-user rule the web surface learned.
     document_surface_hidden: HashSet<String>,
+    /// Sessions whose companion RAIL pane was already auto-opened once (a
+    /// document app's sidebar opens WITH its document — the ychrome tab-rail
+    /// shape). Once only: a user who closes the rail must not have the next
+    /// heartbeat reopen it.
+    document_rail_auto_opened: HashSet<String>,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -4446,6 +4461,14 @@ struct RenderSnapshot {
     document_pane: Option<(String, bool)>,
     document_pane_schema: Option<AppPaneSchemaState>,
     document_pane_error: Option<String>,
+    /// The document's draft values (live editor buffer) — the gutter's line
+    /// count and rows sizing track what the user is TYPING, not the last
+    /// schema the app declared.
+    document_pane_values: HashMap<String, String>,
+    /// The ACTIVE terminal theme's palette — the document surface paints in
+    /// it so yedit follows the user's terminal theme selection exactly
+    /// (user direction 2026-07-17).
+    terminal_palette: crate::terminal_themes::TerminalPaletteSpec,
     /// Host of the active surface's ACTIVE tab URL (vault pane's "for this
     /// site" filter). None when no surface / no navigated tab.
     active_web_surface_host: Option<String>,
@@ -5680,6 +5703,7 @@ impl ShellState {
             document_pane_error: None,
             document_pane_request_seq: 0,
             document_surface_hidden: HashSet::new(),
+            document_rail_auto_opened: HashSet::new(),
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -6463,6 +6487,10 @@ impl ShellState {
                 .filter(|owner| active_session_path.as_deref() == Some(*owner))
                 .and_then(|_| self.document_pane_schema.clone()),
             document_pane_error: self.document_pane_error.clone(),
+            document_pane_values: self.document_pane_values.clone(),
+            terminal_palette: terminal_theme_by_name(&self.effective_terminal_theme_name())
+                .map(|theme| theme.palette.clone())
+                .unwrap_or_default(),
             active_web_surface_host: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_host_label(path)),
@@ -7302,13 +7330,24 @@ impl ShellState {
     }
     /// The panes the active session's app currently offers. Empty when no app
     /// has declared, which is what keeps the rail free of app chrome.
+    /// The panes the RAIL offers buttons for. Viewport-placement panes are
+    /// excluded — they render in the main viewport (the document surface),
+    /// and offering them as rail buttons painted the whole document into a
+    /// 300px rail twice (live-caught 2026-07-17, the yedit duplication).
     fn active_sidebar_panes(&self, session_path: &str, now_ms: u64) -> Vec<SidebarPaneDeclaration> {
         self.sidebar_contributions
             .get(session_path)
             .filter(|contribution| {
                 now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
             })
-            .map(|contribution| contribution.panes.clone())
+            .map(|contribution| {
+                contribution
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.placement == PanePlacement::Rail)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
     /// The bare host of the session's active web-surface tab, lowercased. One
@@ -41326,14 +41365,23 @@ async fn app_pane_run_action(
             shell.settings.web_surface_vertical_tabs,
             shell.settings.web_surface_restore_tabs,
         );
-        (
-            control,
-            shell.app_pane_values_json(),
-            host,
-            live_zoom,
-            secure,
-            prefs,
-        )
+        let mut values = shell.app_pane_values_json();
+        // When the SAME contribution also runs a document surface, its live
+        // draft rides along under the document's widget ids (rail keys win a
+        // collision). This is what lets a rail Save flush the editor buffer
+        // the user is typing in the viewport — same app, same control
+        // endpoint, one action.
+        if active
+            .as_deref()
+            .is_some_and(|path| shell.viewport_pane_for_session(path).is_some())
+            && let Some(map) = values.as_object_mut()
+        {
+            for (id, value) in &shell.document_pane_values {
+                map.entry(id.clone())
+                    .or_insert_with(|| serde_json::Value::String(value.clone()));
+            }
+        }
+        (control, values, host, live_zoom, secure, prefs)
     };
     let Some(control_url) = control_url else {
         return;
@@ -41446,6 +41494,15 @@ async fn app_pane_run_action(
                 shell.set_web_surface_restore_tabs(restore);
             }
         });
+    }
+    if reply.refetch_document {
+        // The rail action changed the document; repaint the viewport now
+        // rather than a heartbeat later.
+        let session = state.peek().server.active_session_path().map(str::to_string);
+        if let Some(session) = session {
+            let seq = state.with_mut(|shell| shell.document_pane_next_request());
+            spawn(document_pane_fetch_schema(state, session, seq));
+        }
     }
     if reply.refetch_zoom {
         // A per-site zoom action wants its change on the live page NOW, not at
@@ -61197,6 +61254,44 @@ fn TerminalCanvas(
                                             let seq = state
                                                 .with_mut(|shell| shell.document_pane_next_request());
                                             spawn(document_pane_fetch_schema(state, session, seq));
+                                        }
+                                        // A document app's RAIL pane opens WITH
+                                        // its document (the ychrome tab-rail
+                                        // shape) — once. A user-closed rail
+                                        // stays closed; heartbeats never fight.
+                                        let auto_open_pane = state.with_mut(|shell| {
+                                            let is_active = shell.server.active_session_path()
+                                                == Some(contribution_session_path.as_str());
+                                            let has_document = shell
+                                                .viewport_pane_for_session(&contribution_session_path)
+                                                .is_some();
+                                            let rail_pane = shell
+                                                .sidebar_contributions
+                                                .get(&contribution_session_path)
+                                                .and_then(|contribution| {
+                                                    contribution.panes.iter().find(|pane| {
+                                                        pane.placement == PanePlacement::Rail
+                                                    })
+                                                })
+                                                .map(|pane| pane.id.clone());
+                                            match rail_pane {
+                                                Some(pane_id)
+                                                    if is_active
+                                                        && has_document
+                                                        && shell
+                                                            .document_rail_auto_opened
+                                                            .insert(
+                                                                contribution_session_path.clone(),
+                                                            ) =>
+                                                {
+                                                    let seq = shell.open_app_pane(&pane_id);
+                                                    Some((pane_id, seq))
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                        if let Some((pane_id, seq)) = auto_open_pane {
+                                            spawn(app_pane_fetch_schema(state, pane_id, seq));
                                         }
                                     }
                                     "close" => {
@@ -83755,12 +83850,12 @@ fn parse_markdown_blocks(source: &str) -> Vec<MdBlock> {
     root
 }
 
-fn md_inline_nodes(items: &[MdInline], palette: &Palette) -> Element {
+fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
     let code_style = format!(
-        "background:rgba(127,127,127,0.14); border:1px solid rgba(127,127,127,0.25); \
+        "background:{}; border:1px solid {}; \
          border-radius:4px; padding:1px 5px; font-family:ui-monospace, monospace; \
          font-size:0.88em; color:{};",
-        palette.text
+        palette.chrome, palette.border, palette.fg
     );
     let link_style = format!("color:{}; text-decoration:underline;", palette.accent);
     rsx! {
@@ -83787,8 +83882,8 @@ fn md_inline_nodes(items: &[MdInline], palette: &Palette) -> Element {
     }
 }
 
-fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
-    let border = "rgba(127,127,127,0.30)";
+fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
+    let border = palette.border.as_str();
     match block {
         MdBlock::Heading { level, children } => {
             let (size, weight, margin) = match level {
@@ -83800,7 +83895,7 @@ fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
             let style = format!(
                 "font-size:{size}; font-weight:{weight}; margin:{margin}; color:{}; \
                  border-bottom:{}; padding-bottom:{};",
-                palette.text,
+                palette.fg,
                 if *level <= 2 {
                     format!("1px solid {border}")
                 } else {
@@ -83813,7 +83908,7 @@ fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
         MdBlock::Paragraph(children) => rsx! {
             p {
                 key: "p{index}",
-                style: format!("margin:7px 0; line-height:1.6; color:{};", palette.text),
+                style: format!("margin:7px 0; line-height:1.6; color:{};", palette.fg),
                 {md_inline_nodes(children, palette)}
             }
         },
@@ -83821,10 +83916,10 @@ fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
             pre {
                 key: "pre{index}",
                 style: format!(
-                    "background:rgba(127,127,127,0.12); border:1px solid {border}; \
+                    "background:{}; border:1px solid {border}; \
                      border-radius:7px; padding:10px 14px; overflow-x:auto; margin:10px 0; \
                      font-family:ui-monospace, monospace; font-size:0.88em; line-height:1.5; color:{};",
-                    palette.text
+                    palette.chrome, palette.fg
                 ),
                 "{code}"
             }
@@ -83854,18 +83949,18 @@ fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
                 }
             };
             if *ordered {
-                rsx! { ol { key: "ol{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.text), {list_body} } }
+                rsx! { ol { key: "ol{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.fg), {list_body} } }
             } else {
-                rsx! { ul { key: "ul{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.text), {list_body} } }
+                rsx! { ul { key: "ul{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.fg), {list_body} } }
             }
         }
         MdBlock::Table { header, rows } => {
             let cell_style = format!(
                 "border:1px solid {border}; padding:5px 10px; text-align:left; \
                  vertical-align:top; line-height:1.45; color:{};",
-                palette.text
+                palette.fg
             );
-            let head_style = format!("{cell_style} background:rgba(127,127,127,0.12); font-weight:700;");
+            let head_style = format!("{cell_style} background:{}; font-weight:700;", palette.chrome);
             rsx! {
                 // Wide tables scroll inside their own container; the document
                 // never scrolls horizontally (the triage-board acceptance rule).
@@ -83904,7 +83999,7 @@ fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
 }
 
 /// The `markdown` widget's body: parse + render, document typography.
-fn markdown_widget_body(source: &str, palette: &Palette) -> Element {
+fn markdown_widget_body(source: &str, palette: &DocTheme) -> Element {
     let blocks = parse_markdown_blocks(source);
     rsx! {
         div {
@@ -83921,13 +84016,42 @@ fn markdown_widget_body(source: &str, palette: &Palette) -> Element {
 /// top bar; `markdown` and multiline `text-input` widgets are the scrolling
 /// body. Same ownership contract as the rail: the app declares, yggterm
 /// renders generic widgets and knows nothing about notes.
+/// The document surface's color system, derived from the ACTIVE TERMINAL
+/// theme so a document reads as part of the terminal workspace the user
+/// themed — not as a foreign light panel over a dark terminal (user
+/// direction 2026-07-17). `color-mix` derives the soft tones so any of the
+/// ~400 catalog themes works without per-theme tuning.
+struct DocTheme {
+    bg: String,
+    fg: String,
+    muted: String,
+    accent: String,
+    border: String,
+    chrome: String,
+}
+
+impl DocTheme {
+    fn from_terminal(palette: &crate::terminal_themes::TerminalPaletteSpec) -> Self {
+        let fg = palette.foreground.clone();
+        let bg = palette.background.clone();
+        Self {
+            muted: format!("color-mix(in srgb, {fg} 55%, {bg})"),
+            border: format!("color-mix(in srgb, {fg} 22%, transparent)"),
+            chrome: format!("color-mix(in srgb, {fg} 7%, {bg})"),
+            accent: palette.blue.clone(),
+            bg,
+            fg,
+        }
+    }
+}
+
 #[component]
 fn DocumentSurfaceBody(
     snapshot: SharedSnapshot,
     state: Signal<ShellState>,
     session_path: String,
 ) -> Element {
-    let palette = snapshot.palette;
+    let doc = DocTheme::from_terminal(&snapshot.terminal_palette);
     let Some((pane_id, _visible)) = snapshot.document_pane.clone() else {
         return rsx! {};
     };
@@ -83957,38 +84081,40 @@ fn DocumentSurfaceBody(
 
     let layer_style = format!(
         "position:absolute; inset:0; z-index:20; display:flex; flex-direction:column; \
-         min-width:0; min-height:0; overflow:hidden; background:{}; border-radius:11px;",
-        palette.panel
+         min-width:0; min-height:0; overflow:hidden; background:{}; color:{}; border-radius:11px;",
+        doc.bg, doc.fg
     );
     let bar_style = format!(
-        "display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 14px; \
-         border-bottom:1px solid rgba(127,127,127,0.25); background:{}; flex:0 0 auto;",
-        palette.panel
+        "display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:7px 14px; \
+         border-bottom:1px solid {}; background:{}; flex:0 0 auto;",
+        doc.border, doc.chrome
     );
     let bar_button_style = format!(
-        "padding:4px 11px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
+        "padding:4px 11px; border:1px solid {}; border-radius:7px; \
          background:transparent; color:{}; font-size:11px; font-weight:600; cursor:pointer;",
-        palette.text
+        doc.border, doc.fg
     );
     let bar_button_primary_style = format!(
-        "padding:4px 11px; border:0; border-radius:7px; background:{}; color:#fff; \
+        "padding:4px 11px; border:0; border-radius:7px; background:{}; color:{}; \
          font-size:11px; font-weight:700; cursor:pointer;",
-        palette.accent
+        doc.accent, doc.bg
     );
-    let bar_label_style = format!("font-size:11px; color:{};", palette.muted);
+    let bar_label_style = format!("font-size:11px; color:{};", doc.muted);
     let bar_title_style = format!(
         "font-size:12px; font-weight:700; color:{}; overflow:hidden; \
          text-overflow:ellipsis; white-space:nowrap; min-width:0;",
-        palette.text
+        doc.fg
     );
-    let editor_style = format!(
-        "flex:1 1 auto; min-height:0; width:100%; border:0; outline:none; resize:none; \
-         background:transparent; color:{}; padding:14px 20px; font-family:ui-monospace, monospace; \
-         font-size:12.5px; line-height:1.55; tab-size:4;",
-        palette.text
+    // The yggterm-owned way back to the terminal. In the bar when the app
+    // declared bar widgets; floating top-right when the viewport is pure body.
+    let terminal_toggle_style = format!(
+        "padding:4px 11px; border:1px solid {}; border-radius:7px; cursor:pointer; \
+         background:{}; color:{}; font-size:11px; font-weight:600;",
+        doc.border, doc.chrome, doc.fg
     );
 
-    // Chrome widgets go to the bar; markdown + multiline inputs are the body.
+    // Chrome widgets go to the bar; markdown, multiline inputs and rows are
+    // the body.
     let (bar_widgets, body_widgets): (Vec<AppPaneWidget>, Vec<AppPaneWidget>) = schema
         .as_ref()
         .map(|schema| {
@@ -84002,129 +84128,142 @@ fn DocumentSurfaceBody(
             })
         })
         .unwrap_or_default();
+    let has_bar = !bar_widgets.is_empty();
+
+    let on_hide_surface = {
+        let mut state = state;
+        let session_path = session_path.clone();
+        move |_| {
+            state.with_mut(|shell| {
+                shell.document_surface_hidden.insert(session_path.clone());
+            });
+        }
+    };
 
     rsx! {
         div {
             "data-document-surface": "{pane_id}",
             style: "{layer_style}",
-            div {
-                style: "{bar_style}",
-                for (index, widget) in bar_widgets.iter().enumerate() {
-                    {
-                        let widget_key = widget.key(index, &value_epochs);
-                        match widget {
-                            AppPaneWidget::Section { text } | AppPaneWidget::Label { text, muted: _ } => rsx! {
-                                span {
-                                    key: "{widget_key}",
-                                    style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
-                                    "{text}"
-                                }
-                            },
-                            AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
-                                div {
-                                    key: "{widget_key}",
-                                    style: "display:flex; gap:4px; flex-wrap:wrap; min-width:0;",
-                                    for tab in tabs.iter().cloned() {
-                                        button {
-                                            key: "{id}-{tab.id}",
-                                            style: if tab.id == *active { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                            title: "{tab.label}",
-                                            onclick: {
-                                                let run_action = run_action.clone();
-                                                let action = action.clone();
-                                                let tab_id = tab.id.clone();
-                                                move |_| run_action(action.clone(), Some(tab_id.clone()))
-                                            },
-                                            "{tab.label}"
-                                        }
+            if has_bar {
+                div {
+                    style: "{bar_style}",
+                    for (index, widget) in bar_widgets.iter().enumerate() {
+                        {
+                            let widget_key = widget.key(index, &value_epochs);
+                            match widget {
+                                AppPaneWidget::Section { text } | AppPaneWidget::Label { text, muted: _ } => rsx! {
+                                    span {
+                                        key: "{widget_key}",
+                                        style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
+                                        "{text}"
                                     }
-                                }
-                            },
-                            AppPaneWidget::Toggle { id: _, label, action, value } => rsx! {
-                                button {
-                                    key: "{widget_key}",
-                                    style: if *value { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                    onclick: {
-                                        let run_action = run_action.clone();
-                                        let action = action.clone();
-                                        let next = (!*value).to_string();
-                                        move |_| run_action(action.clone(), Some(next.clone()))
-                                    },
-                                    "{label}"
-                                }
-                            },
-                            AppPaneWidget::Button { id, label, action, primary } => rsx! {
-                                button {
-                                    key: "{widget_key}",
-                                    "data-document-button": "{id}",
-                                    style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
-                                    onclick: {
-                                        let run_action = run_action.clone();
-                                        let action = action.clone();
-                                        move |_| run_action(action.clone(), None)
-                                    },
-                                    "{label}"
-                                }
-                            },
-                            AppPaneWidget::TextInput { id, placeholder, value, action, .. } => rsx! {
-                                input {
-                                    key: "{widget_key}",
-                                    "data-document-input": "{id}",
-                                    style: format!(
-                                        "padding:4px 10px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
-                                         background:rgba(127,127,127,0.08); color:{}; font-size:11px; outline:none; \
-                                         min-width:200px; flex:0 1 340px;",
-                                        palette.text
-                                    ),
-                                    placeholder: "{placeholder}",
-                                    initial_value: "{value}",
-                                    oninput: {
-                                        let mut state = state;
-                                        let id = id.clone();
-                                        move |evt: FormEvent| {
-                                            state.with_mut(|shell| {
-                                                shell.set_document_pane_value(&id, evt.value());
-                                            });
-                                        }
-                                    },
-                                    onkeydown: {
-                                        let run_action = run_action.clone();
-                                        let action = action.clone();
-                                        move |evt: KeyboardEvent| {
-                                            if evt.key() == Key::Enter && !action.is_empty() {
-                                                run_action(action.clone(), None);
+                                },
+                                AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        style: "display:flex; gap:4px; flex-wrap:wrap; min-width:0;",
+                                        for tab in tabs.iter().cloned() {
+                                            button {
+                                                key: "{id}-{tab.id}",
+                                                style: if tab.id == *active { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                                title: "{tab.label}",
+                                                onclick: {
+                                                    let run_action = run_action.clone();
+                                                    let action = action.clone();
+                                                    let tab_id = tab.id.clone();
+                                                    move |_| run_action(action.clone(), Some(tab_id.clone()))
+                                                },
+                                                "{tab.label}"
                                             }
                                         }
-                                    },
-                                }
-                            },
-                            _ => rsx! { span { key: "{widget_key}" } },
+                                    }
+                                },
+                                AppPaneWidget::Toggle { id: _, label, action, value } => rsx! {
+                                    button {
+                                        key: "{widget_key}",
+                                        style: if *value { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                        onclick: {
+                                            let run_action = run_action.clone();
+                                            let action = action.clone();
+                                            let next = (!*value).to_string();
+                                            move |_| run_action(action.clone(), Some(next.clone()))
+                                        },
+                                        "{label}"
+                                    }
+                                },
+                                AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                                    button {
+                                        key: "{widget_key}",
+                                        "data-document-button": "{id}",
+                                        style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                        onclick: {
+                                            let run_action = run_action.clone();
+                                            let action = action.clone();
+                                            move |_| run_action(action.clone(), None)
+                                        },
+                                        "{label}"
+                                    }
+                                },
+                                AppPaneWidget::TextInput { id, placeholder, value, action, .. } => rsx! {
+                                    input {
+                                        key: "{widget_key}",
+                                        "data-document-input": "{id}",
+                                        style: format!(
+                                            "padding:4px 10px; border:1px solid {}; border-radius:7px; \
+                                             background:{}; color:{}; font-size:11px; outline:none; \
+                                             min-width:200px; flex:0 1 340px;",
+                                            doc.border, doc.bg, doc.fg
+                                        ),
+                                        placeholder: "{placeholder}",
+                                        initial_value: "{value}",
+                                        oninput: {
+                                            let mut state = state;
+                                            let id = id.clone();
+                                            move |evt: FormEvent| {
+                                                state.with_mut(|shell| {
+                                                    shell.set_document_pane_value(&id, evt.value());
+                                                });
+                                            }
+                                        },
+                                        onkeydown: {
+                                            let run_action = run_action.clone();
+                                            let action = action.clone();
+                                            move |evt: KeyboardEvent| {
+                                                if evt.key() == Key::Enter && !action.is_empty() {
+                                                    run_action(action.clone(), None);
+                                                }
+                                            }
+                                        },
+                                    }
+                                },
+                                _ => rsx! { span { key: "{widget_key}" } },
+                            }
                         }
                     }
+                    div { style: "flex:1 1 auto;" }
+                    button {
+                        style: "{terminal_toggle_style}",
+                        title: "Show the terminal (the app keeps running)",
+                        onclick: on_hide_surface.clone(),
+                        "⌨\u{fe0e} Terminal"
+                    }
                 }
-                // yggterm's own toggle back to the terminal — the one control
-                // the app cannot own, because it hides the app's surface.
-                div { style: "flex:1 1 auto;" }
+            } else {
+                // Pure-body document: the terminal toggle floats so the app's
+                // content owns the whole viewport.
                 button {
-                    style: "{bar_button_style}",
+                    style: format!(
+                        "position:absolute; top:10px; right:16px; z-index:30; opacity:0.75; {}",
+                        terminal_toggle_style
+                    ),
                     title: "Show the terminal (the app keeps running)",
-                    onclick: {
-                        let mut state = state;
-                        let session_path = session_path.clone();
-                        move |_| {
-                            state.with_mut(|shell| {
-                                shell
-                                    .document_surface_hidden
-                                    .insert(session_path.clone());
-                            });
-                        }
-                    },
+                    onclick: on_hide_surface.clone(),
                     "⌨\u{fe0e} Terminal"
                 }
             }
             if let Some(error) = error {
                 div {
-                    style: format!("padding:10px 16px; color:{}; font-size:12px;", palette.muted),
+                    style: format!("padding:10px 16px; color:{}; font-size:12px;", doc.muted),
                     "Document unavailable: {error}"
                 }
             }
@@ -84132,12 +84271,12 @@ fn DocumentSurfaceBody(
                 style: "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;",
                 if body_widgets.is_empty() && schema.is_some() {
                     div {
-                        style: format!("padding:26px; color:{}; font-size:13px;", palette.muted),
+                        style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
                         "The app declared no document body."
                     }
                 } else if schema.is_none() {
                     div {
-                        style: format!("padding:26px; color:{}; font-size:13px;", palette.muted),
+                        style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
                         "Loading document…"
                     }
                 }
@@ -84150,7 +84289,60 @@ fn DocumentSurfaceBody(
                                     key: "{widget_key}",
                                     "data-document-markdown": "{id}",
                                     style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
-                                    {markdown_widget_body(source, &palette)}
+                                    {markdown_widget_body(source, &doc)}
+                                }
+                            },
+                            AppPaneWidget::TextInput { id, value, line_numbers, .. } => {
+                                // The gutter tracks the LIVE draft, not the last
+                                // declared value, so typing a newline never
+                                // desyncs the numbers.
+                                let live = snapshot
+                                    .document_pane_values
+                                    .get(id)
+                                    .cloned()
+                                    .unwrap_or_else(|| value.clone());
+                                let line_count = live.split('\n').count().max(1);
+                                let editor_font = "font-family:ui-monospace, monospace; font-size:12.5px; line-height:1.55;";
+                                rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        style: "display:flex; align-items:flex-start; min-height:100%;",
+                                        if *line_numbers {
+                                            div {
+                                                "data-document-gutter": "{id}",
+                                                style: format!(
+                                                    "flex:0 0 auto; text-align:right; padding:14px 10px 40px 16px; \
+                                                     color:{}; border-right:1px solid {}; user-select:none; \
+                                                     -webkit-user-select:none; white-space:pre; {editor_font}",
+                                                    doc.muted, doc.border
+                                                ),
+                                                {(1..=line_count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n")}
+                                            }
+                                        }
+                                        textarea {
+                                            "data-document-editor": "{id}",
+                                            style: format!(
+                                                "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
+                                                 background:transparent; color:{}; caret-color:{}; \
+                                                 padding:14px 20px 40px 14px; white-space:pre; overflow-x:auto; \
+                                                 overflow-y:hidden; tab-size:4; {editor_font}",
+                                                doc.fg, doc.accent
+                                            ),
+                                            spellcheck: "false",
+                                            wrap: "off",
+                                            rows: "{line_count + 1}",
+                                            initial_value: "{value}",
+                                            oninput: {
+                                                let mut state = state;
+                                                let id = id.clone();
+                                                move |evt: FormEvent| {
+                                                    state.with_mut(|shell| {
+                                                        shell.set_document_pane_value(&id, evt.value());
+                                                    });
+                                                }
+                                            },
+                                        }
+                                    }
                                 }
                             },
                             AppPaneWidget::ListRow { id, title, subtitle, actions } => rsx! {
@@ -84159,8 +84351,8 @@ fn DocumentSurfaceBody(
                                     "data-document-row": "{id}",
                                     style: format!(
                                         "display:flex; align-items:center; gap:10px; margin:3px 26px; padding:9px 14px; \
-                                         border-radius:9px; background:rgba(127,127,127,0.08); color:{}; max-width:720px;",
-                                        palette.text
+                                         border-radius:9px; background:{}; color:{}; max-width:720px;",
+                                        doc.chrome, doc.fg
                                     ),
                                     div {
                                         style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
@@ -84170,7 +84362,7 @@ fn DocumentSurfaceBody(
                                         }
                                         if !subtitle.is_empty() {
                                             div {
-                                                style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", palette.muted),
+                                                style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
                                                 "{subtitle}"
                                             }
                                         }
@@ -84181,7 +84373,7 @@ fn DocumentSurfaceBody(
                                             style: format!(
                                                 "border:0; border-radius:7px; background:transparent; color:{}; \
                                                  font-size:13px; cursor:pointer; padding:3px 8px;",
-                                                palette.muted
+                                                doc.muted
                                             ),
                                             title: "{row_action.title}",
                                             onclick: {
@@ -84192,24 +84384,6 @@ fn DocumentSurfaceBody(
                                             "{row_action.label}"
                                         }
                                     }
-                                }
-                            },
-                            AppPaneWidget::TextInput { id, value, .. } => rsx! {
-                                textarea {
-                                    key: "{widget_key}",
-                                    "data-document-editor": "{id}",
-                                    style: "{editor_style}",
-                                    spellcheck: "false",
-                                    initial_value: "{value}",
-                                    oninput: {
-                                        let mut state = state;
-                                        let id = id.clone();
-                                        move |evt: FormEvent| {
-                                            state.with_mut(|shell| {
-                                                shell.set_document_pane_value(&id, evt.value());
-                                            });
-                                        }
-                                    },
                                 }
                             },
                             _ => rsx! { span { key: "{widget_key}" } },
@@ -84354,7 +84528,7 @@ fn AppPaneRailBody(
                                     },
                                 }
                             },
-                            AppPaneWidget::TextInput { id, label, placeholder, value, action, secret, multiline, rows } => rsx! {
+                            AppPaneWidget::TextInput { id, label, placeholder, value, action, secret, multiline, rows, .. } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     style: "display:flex; flex-direction:column; gap:4px;",
@@ -84517,7 +84691,7 @@ fn AppPaneRailBody(
                                     key: "{widget_key}",
                                     "data-app-pane-markdown": "{id}",
                                     style: "font-size:11px; min-width:0; overflow-wrap:anywhere;",
-                                    {markdown_widget_body(&source, &palette)}
+                                    {markdown_widget_body(&source, &DocTheme::from_terminal(&snapshot.terminal_palette))}
                                 }
                             },
                         }
@@ -96583,6 +96757,7 @@ mod tests {
         // An input's key carries its value epoch, so an app pushing a new value
         // rebuilds the node whose DOM value is otherwise uncontrolled.
         let field = AppPaneWidget::TextInput {
+            line_numbers: false,
             id: "password".into(),
             label: String::new(),
             placeholder: String::new(),
@@ -115614,6 +115789,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116253,6 +116430,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116427,6 +116606,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116601,6 +116782,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116778,6 +116961,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116959,6 +117144,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117132,6 +117319,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117305,6 +117494,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117512,6 +117703,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117688,6 +117881,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117896,6 +118091,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -118281,6 +118478,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             document_pane: None,
             document_pane_schema: None,
             document_pane_error: None,
+            document_pane_values: HashMap::new(),
+            terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
