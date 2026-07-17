@@ -84234,6 +84234,17 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                 title: "Tabs".to_string(),
                 color: palette.text.to_string(),
                 actions: rsx! {
+                    // The PROFILE pill's vertical-mode home (Phase 5): the
+                    // classic strip is collapsed here, so the surface-level
+                    // identity badge rides the rail header instead.
+                    if let Some(profile) = snapshot.web_surface_profiles.get(&session_path).cloned() {
+                        span {
+                            "data-ws-rail-profile-badge": "{profile}",
+                            title: "ychrome profile: {profile}",
+                            style: session_row_badge_style(palette.accent),
+                            "{profile}"
+                        }
+                    }
                     button {
                         "data-web-tab-new": "1",
                         style: format!(
