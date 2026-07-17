@@ -54165,6 +54165,251 @@ fn SplitGroupRow(
     }
 }
 
+// ─── THE SHARED ROW ENGINE ([[campaign-libyggterm]] Phase 1) ─────────────────
+// One visual vocabulary for every session-style list row in the product:
+// `[indent] [status-dot] [icon] [title(+subtitle)] [badge] [actions]`.
+// Three consumers — the cwdtree sidebar rows (the richest; its numbers ARE the
+// vocabulary), the ychrome WebTabs rail, and app-pane `list-row`s — draw from
+// ONE set of metrics/style functions, so a fourth consumer cannot drift.
+// DRY is renderer-level only (settled 2026-07-11): what a row MEANS (session,
+// tab, note) stays with its owner; only the look is shared.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SessionRowDensity {
+    /// The left sidebar's density (cwdtree Live Sessions / folders).
+    Sidebar,
+    /// The right rail's density (WebTabs rows, app-pane list-rows).
+    Rail,
+}
+
+struct SessionRowMetrics {
+    indent_base_px: u32,
+    indent_step_px: u32,
+    pad_v_px: u32,
+    pad_h_px: u32,
+    radius_px: u32,
+    gap_px: u32,
+    font_px: f32,
+    icon_box_px: u32,
+    dot_rail_px: u32,
+}
+
+const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
+    match density {
+        // The cwdtree main row's numbers (its outer container is a bespoke
+        // two-line column — SidebarRow consumes the indent/dot/icon/label
+        // pieces of the vocabulary rather than the container fn).
+        SessionRowDensity::Sidebar => SessionRowMetrics {
+            indent_base_px: 12,
+            indent_step_px: 12,
+            pad_v_px: 5,
+            pad_h_px: 9,
+            radius_px: 12,
+            gap_px: 8,
+            font_px: 12.0,
+            icon_box_px: 20,
+            dot_rail_px: 9,
+        },
+        SessionRowDensity::Rail => SessionRowMetrics {
+            indent_base_px: 10,
+            indent_step_px: 12,
+            pad_v_px: 6,
+            pad_h_px: 8,
+            radius_px: 8,
+            gap_px: 6,
+            font_px: 11.0,
+            icon_box_px: 16,
+            dot_rail_px: 9,
+        },
+    }
+}
+
+/// The row's outer box: indent, padding, radius, selection tint, drag dim.
+/// `selected_bg` is the palette's accent_soft (or a doc-theme equivalent) —
+/// ONE selection tint per surface, never a per-consumer mix.
+fn session_row_container_style(
+    density: SessionRowDensity,
+    depth: u32,
+    selected: bool,
+    dimmed: bool,
+    clickable: bool,
+    selected_bg: &str,
+    text_color: &str,
+) -> String {
+    let m = session_row_metrics(density);
+    let indent = m.indent_base_px + depth * m.indent_step_px;
+    format!(
+        "display:flex; align-items:center; gap:{gap}px; box-sizing:border-box; min-width:0; overflow:hidden; \
+         padding:{pv}px {ph}px {pv}px {indent}px; border-radius:{radius}px; font-size:{font}px; color:{text_color}; \
+         background:{bg}; opacity:{opacity}; cursor:{cursor}; user-select:none; -webkit-user-select:none;",
+        gap = m.gap_px,
+        pv = m.pad_v_px,
+        ph = m.pad_h_px,
+        radius = m.radius_px,
+        font = m.font_px,
+        bg = if selected { selected_bg } else { "transparent" },
+        opacity = if dimmed { "0.58" } else { "1" },
+        cursor = if clickable { "pointer" } else { "default" },
+    )
+}
+
+/// The fixed-width slot the status dot sits in (laid out even when empty, so
+/// an appearing dot never shoves the title sideways).
+fn session_row_dot_rail_style(density: SessionRowDensity) -> String {
+    let m = session_row_metrics(density);
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; \
+         width:{w}px; min-width:{w}px; height:{h}px; flex:0 0 auto;",
+        w = m.dot_rail_px,
+        h = m.icon_box_px,
+    )
+}
+
+fn session_row_icon_box_style(density: SessionRowDensity, color: &str) -> String {
+    let m = session_row_metrics(density);
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; \
+         width:{s}px; min-width:{s}px; height:{s}px; color:{color}; flex:0 0 auto;",
+        s = m.icon_box_px,
+    )
+}
+
+/// Title typography + ellipsis. Positioning (flex membership) stays with the
+/// consumer — the sidebar's label lives inside a space-between cluster, the
+/// rail's stretches.
+fn session_row_label_style(density: SessionRowDensity, color: &str, bold: bool) -> String {
+    let m = session_row_metrics(density);
+    format!(
+        "min-width:0; display:inline-block; font-size:{font}px; font-weight:{weight}; color:{color}; \
+         white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+        font = m.font_px,
+        weight = if bold { 600 } else { 500 },
+    )
+}
+
+/// The tiny trailing verbs (✕, rename, …) every row family shares.
+fn session_row_action_button_style(color: &str) -> String {
+    format!(
+        "border:none; background:transparent; color:{color}; cursor:pointer; font-size:11px; \
+         line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;"
+    )
+}
+
+/// A small trailing pill (Phase 5: ychrome profile badges live here).
+fn session_row_badge_style(color: &str) -> String {
+    format!(
+        "flex:0 0 auto; font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:999px; \
+         background:color-mix(in srgb, {color} 18%, transparent); color:{color};"
+    )
+}
+
+/// The shared row COMPONENT, for consumers whose interactivity fits the
+/// standard shape (click to select, a few trailing actions): WebTabs rail
+/// rows, app-pane list-rows. The cwdtree SidebarRow keeps its bespoke DOM
+/// (drag/rename/keytips/click-zones) and consumes the same style functions —
+/// one vocabulary either way. `depth` exists so a future `list-row` schema
+/// `depth`/`group` needs no component change.
+#[component]
+fn SessionStyleRow(
+    #[props(extends = div, extends = GlobalAttributes)] attributes: Vec<Attribute>,
+    density: SessionRowDensity,
+    #[props(default = 0)] depth: u32,
+    #[props(default = false)] selected: bool,
+    #[props(default = false)] dimmed: bool,
+    text_color: String,
+    selected_bg: String,
+    label: String,
+    #[props(default)] subtitle: Option<String>,
+    #[props(default)] subtitle_color: Option<String>,
+    #[props(default)] badge: Option<String>,
+    #[props(default)] badge_color: Option<String>,
+    #[props(default)] dot: Option<Element>,
+    #[props(default)] icon: Option<Element>,
+    #[props(default)] actions: Option<Element>,
+    #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
+    #[props(default)] onmousedown: Option<EventHandler<MouseEvent>>,
+    #[props(default)] onmouseenter: Option<EventHandler<MouseEvent>>,
+) -> Element {
+    let clickable = onclick.is_some();
+    let container = session_row_container_style(
+        density,
+        depth,
+        selected,
+        dimmed,
+        clickable,
+        &selected_bg,
+        &text_color,
+    );
+    let subtitle_text = subtitle.filter(|text| !text.is_empty());
+    let badge_text = badge.filter(|text| !text.is_empty());
+    let title_style = session_row_label_style(density, &text_color, selected);
+    rsx! {
+        div {
+            style: "{container}",
+            onclick: move |evt| {
+                if let Some(handler) = &onclick {
+                    handler.call(evt);
+                }
+            },
+            onmousedown: move |evt| {
+                if let Some(handler) = &onmousedown {
+                    handler.call(evt);
+                }
+            },
+            onmouseenter: move |evt| {
+                if let Some(handler) = &onmouseenter {
+                    handler.call(evt);
+                }
+            },
+            ..attributes,
+            if let Some(dot) = dot {
+                span {
+                    style: session_row_dot_rail_style(density),
+                    {dot}
+                }
+            }
+            if let Some(icon) = icon {
+                span {
+                    style: session_row_icon_box_style(density, &text_color),
+                    {icon}
+                }
+            }
+            if let Some(subtitle_text) = subtitle_text {
+                div {
+                    style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                    div {
+                        style: "{title_style}",
+                        "{label}"
+                    }
+                    div {
+                        style: format!(
+                            "font-size:10px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                            subtitle_color.as_deref().unwrap_or(&text_color),
+                        ),
+                        "{subtitle_text}"
+                    }
+                }
+            } else {
+                span {
+                    style: "flex:1 1 auto; {title_style}",
+                    "{label}"
+                }
+            }
+            if let Some(badge_text) = badge_text {
+                span {
+                    style: session_row_badge_style(
+                        badge_color.as_deref().unwrap_or(&text_color),
+                    ),
+                    "{badge_text}"
+                }
+            }
+            if let Some(actions) = actions {
+                {actions}
+            }
+        }
+    }
+}
+
 #[component]
 fn SidebarRow(
     row: BrowserRow,
@@ -54210,7 +54455,11 @@ fn SidebarRow(
     on_drop_into_row: EventHandler<()>,
     on_end_drag: EventHandler<()>,
 ) -> Element {
-    let indent = row.depth * 12 + 12;
+    // Indent math from the SHARED row engine — the cwdtree is the vocabulary's
+    // reference consumer, so its numbers and the engine's are one definition.
+    let sidebar_row_metrics = session_row_metrics(SessionRowDensity::Sidebar);
+    let indent =
+        row.depth as u32 * sidebar_row_metrics.indent_step_px + sidebar_row_metrics.indent_base_px;
     let draggable = is_tree_drag_source_row(&row);
     let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
@@ -54580,7 +54829,7 @@ fn SidebarRow(
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
-                            style: "display:inline-flex; align-items:center; justify-content:center; width:9px; min-width:9px; height:20px;",
+                            style: session_row_dot_rail_style(SessionRowDensity::Sidebar),
                             // Status dot for EVERY live row (DESIGN.md "Status
                             // indicator vocabulary"): green = keep-alive,
                             // blue = lives with the GUI, blinking = working.
@@ -54602,10 +54851,7 @@ fn SidebarRow(
                         "data-tree-icon": "1",
                         "data-tree-icon-kind": icon_kind.as_str(),
                         "data-sidebar-row-toggle-target": if row_is_group { "icon" } else { "none" },
-                        style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
-                            icon_color
-                        ),
+                        style: session_row_icon_box_style(SessionRowDensity::Sidebar, icon_color),
                         onmousedown: move |evt| {
                             if row_for_icon_mousedown.kind == BrowserRowKind::Group {
                                 claim_sidebar_focus_by_path(Some(&icon_focus_path));
@@ -54693,10 +54939,10 @@ fn SidebarRow(
                     } else {
                         span {
                             "data-sidebar-row-label-target": "1",
-                            style: format!(
-                                "min-width:0; display:inline-block; font-size:12px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            style: session_row_label_style(
+                                SessionRowDensity::Sidebar,
                                 label_color,
-                                if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
+                                row.kind == BrowserRowKind::Group && row.depth == 0,
                             ),
                             onmousedown: move |evt| {
                                 claim_sidebar_focus_by_path(Some(&label_focus_path));
@@ -83452,7 +83698,9 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         .cloned()
         .collect();
     // One row renderer for a tab wherever it sits — root or filed. A tab is the
-    // same thing in both places; only its indent differs.
+    // same thing in both places; only its indent differs. Rendered by the
+    // SHARED row engine (Phase 1): the anatomy and metrics are the same
+    // vocabulary the cwdtree rows draw with.
     let tab_row = {
         let session_path = session_path.clone();
         move |tab: WebSurfaceOverlayTabView, indent: u32| {
@@ -83460,23 +83708,28 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             let is_app_tab = tab.is_app_tab;
             let label = tab.label.clone();
             let active = tab.active;
-            let loading_dot = web_tab_loading_dot_style(tab.loading);
+            let loading = tab.loading;
             let being_dragged = dragging == Some(tab_id);
             let hover_folder = tab.folder.clone();
             let (select_path, close_path) = (session_path.clone(), session_path.clone());
             rsx! {
-                div {
+                SessionStyleRow {
                     key: "webtab-{tab_id}",
                     "data-web-tab-row": "{tab_id}",
                     "data-web-tab-active": if active { "true" } else { "false" },
-                    style: format!(
-                        "display:flex; align-items:center; gap:6px; margin:1px 0; padding:6px 8px 6px {}px; \
-                         border-radius:8px; cursor:pointer; font-size:11px; color:{}; background:{}; opacity:{};",
-                        10 + indent * 12,
-                        palette.text,
-                        if active { palette.accent_soft } else { "transparent" },
-                        if being_dragged { "0.55" } else { "1" },
-                    ),
+                    density: SessionRowDensity::Rail,
+                    depth: indent,
+                    selected: active,
+                    dimmed: being_dragged,
+                    text_color: palette.text.to_string(),
+                    selected_bg: palette.accent_soft.to_string(),
+                    label: label.clone(),
+                    dot: rsx! {
+                        span {
+                            "data-web-tab-loading": if loading { "true" } else { "false" },
+                            style: web_tab_loading_dot_style(loading),
+                        }
+                    },
                     onmousedown: move |_| {
                         state.with_mut(|shell| shell.web_tab_start_drag(tab_id));
                     },
@@ -83492,43 +83745,33 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     onclick: move |_| {
                         select_web_surface_tab(state, select_path.clone(), tab_id);
                     },
-                    span {
-                        "data-web-tab-loading": if tab.loading { "true" } else { "false" },
-                        style: "{loading_dot}",
-                    }
-                    span {
-                        style: "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                        "{label}"
-                    }
-                    button {
-                        "data-web-tab-close": "{tab_id}",
-                        style: format!(
-                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; \
-                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
-                            palette.text,
-                        ),
-                        title: if is_app_tab { "Close the app (Ctrl+C)" } else { "Close tab" },
-                        onclick: move |evt: MouseEvent| {
-                            evt.stop_propagation();
-                            if is_app_tab {
-                                // The app tab IS the app: closing it ends the
-                                // surface the terminal-native way.
-                                let close_path = close_path.clone();
-                                let endpoint = state.read().bootstrap.server_endpoint.clone();
-                                state.with_mut(|shell| shell.close_web_surface(&close_path));
-                                spawn(async move {
-                                    let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
-                                });
-                            } else {
-                                let close_path = close_path.clone();
-                                state.with_mut(|shell| {
-                                    shell.web_surface_close_tab(&close_path, tab_id);
-                                    shell.persist_web_tabs(&close_path);
-                                });
-                            }
-                        },
-                        "✕"
-                    }
+                    actions: rsx! {
+                        button {
+                            "data-web-tab-close": "{tab_id}",
+                            style: session_row_action_button_style(palette.text),
+                            title: if is_app_tab { "Close the app (Ctrl+C)" } else { "Close tab" },
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                if is_app_tab {
+                                    // The app tab IS the app: closing it ends the
+                                    // surface the terminal-native way.
+                                    let close_path = close_path.clone();
+                                    let endpoint = state.read().bootstrap.server_endpoint.clone();
+                                    state.with_mut(|shell| shell.close_web_surface(&close_path));
+                                    spawn(async move {
+                                        let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
+                                    });
+                                } else {
+                                    let close_path = close_path.clone();
+                                    state.with_mut(|shell| {
+                                        shell.web_surface_close_tab(&close_path, tab_id);
+                                        shell.persist_web_tabs(&close_path);
+                                    });
+                                }
+                            },
+                            "✕"
+                        }
+                    },
                 }
             }
         }
@@ -83634,7 +83877,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                 },
             }
             div {
-                style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px;",
+                // gap:2px replaces the old per-row margins — list rhythm is the
+                // LIST's job now that rows come from the shared engine.
+                style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px; \
+                        display:flex; flex-direction:column; gap:2px;",
                 // The root path: the live, unfiled tabs. In classic mode these
                 // are exactly the tabs the strip draws, which is why the modal
                 // can promise the strip keeps them.
@@ -84732,17 +84978,6 @@ fn AppPaneRailBody(
          font-weight:600; cursor:pointer;",
         palette.text
     );
-    let row_style = format!(
-        "display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:9px; \
-         background:rgba(127,127,127,0.10); color:{};",
-        palette.text
-    );
-    let row_action_style = format!(
-        "border:0; border-radius:7px; background:transparent; color:{}; font-size:12px; \
-         cursor:pointer; padding:2px 6px;",
-        palette.muted
-    );
-
     let pane_state = snapshot
         .app_pane_schema
         .as_ref()
@@ -85003,83 +85238,63 @@ fn AppPaneRailBody(
                                 }
                             },
                             AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions } => {
-                                // The Live-Sessions/cwdtree row shape: flat,
-                                // whole-row clickable, selected tinted, tiny
-                                // trailing actions.
+                                // The SHARED row engine (Phase 1): same anatomy
+                                // and metrics as the cwdtree rows and WebTabs
+                                // rail — whole-row clickable, selected tinted,
+                                // tiny trailing actions.
                                 let clickable = !row_action.is_empty();
-                                let session_row_style = format!(
-                                    "display:flex; align-items:center; gap:7px; padding:5px 8px; \
-                                     border-radius:7px; color:{}; {} {}",
-                                    palette.text,
-                                    if selected {
-                                        format!("background:color-mix(in srgb, {} 16%, transparent);", palette.accent)
-                                    } else {
-                                        "background:transparent;".to_string()
-                                    },
-                                    if clickable { "cursor:pointer;" } else { "" },
-                                );
                                 rsx! {
-                                    div {
+                                    SessionStyleRow {
                                         key: "{widget_key}",
                                         "data-app-pane-row": "{id}",
-                                        style: "{session_row_style}",
-                                        onclick: {
+                                        density: SessionRowDensity::Rail,
+                                        selected,
+                                        text_color: palette.text.to_string(),
+                                        selected_bg: palette.accent_soft.to_string(),
+                                        label: title.clone(),
+                                        subtitle: (!subtitle.is_empty()).then(|| subtitle.clone()),
+                                        subtitle_color: Some(palette.muted.to_string()),
+                                        icon: (!icon.is_empty()).then(|| rsx! {
+                                            span {
+                                                style: "font-size:12px; line-height:1;",
+                                                "{icon}"
+                                            }
+                                        }),
+                                        onclick: clickable.then(|| {
                                             let (pane_id, action, row_id) =
                                                 (pane_id.clone(), row_action.clone(), id.clone());
                                             let on_app_pane_action = on_app_pane_action.clone();
-                                            move |_| {
-                                                if !action.is_empty() {
-                                                    on_app_pane_action.call((
-                                                        pane_id.clone(),
-                                                        action.clone(),
-                                                        Some(row_id.clone()),
-                                                    ));
+                                            EventHandler::new(move |_| {
+                                                on_app_pane_action.call((
+                                                    pane_id.clone(),
+                                                    action.clone(),
+                                                    Some(row_id.clone()),
+                                                ));
+                                            })
+                                        }),
+                                        actions: rsx! {
+                                            for row_action in actions.iter().cloned() {
+                                                button {
+                                                    key: "{row_action.action}",
+                                                    style: session_row_action_button_style(palette.muted),
+                                                    title: "{row_action.title}",
+                                                    onclick: {
+                                                        let (pane_id, action, row_id) =
+                                                            (pane_id.clone(), row_action.action.clone(), id.clone());
+                                                        let on_app_pane_action = on_app_pane_action.clone();
+                                                        move |evt: MouseEvent| {
+                                                            evt.stop_propagation();
+                                                            on_app_pane_action.call((
+                                                                pane_id.clone(),
+                                                                action.clone(),
+                                                                Some(row_id.clone()),
+                                                            ))
+                                                        }
+                                                    },
+                                                    "{row_action.label}"
                                                 }
                                             }
                                         },
-                                        if !icon.is_empty() {
-                                            div {
-                                                style: "flex:0 0 auto; font-size:12px; line-height:1;",
-                                                "{icon}"
-                                            }
-                                        }
-                                        div {
-                                            style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
-                                            div {
-                                                style: format!(
-                                                    "font-size:11.5px; font-weight:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                                    if selected { "700" } else { "500" },
-                                                ),
-                                                "{title}"
-                                            }
-                                            if !subtitle.is_empty() {
-                                                div {
-                                                    style: "{muted_style} overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                                    "{subtitle}"
-                                                }
-                                            }
-                                        }
-                                        for row_action in actions.iter().cloned() {
-                                            button {
-                                                key: "{row_action.action}",
-                                                style: "{row_action_style}",
-                                                title: "{row_action.title}",
-                                                onclick: {
-                                                    let (pane_id, action, row_id) =
-                                                        (pane_id.clone(), row_action.action.clone(), id.clone());
-                                                    let on_app_pane_action = on_app_pane_action.clone();
-                                                    move |evt: MouseEvent| {
-                                                        evt.stop_propagation();
-                                                        on_app_pane_action.call((
-                                                            pane_id.clone(),
-                                                            action.clone(),
-                                                            Some(row_id.clone()),
-                                                        ))
-                                                    }
-                                                },
-                                                "{row_action.label}"
-                                            }
-                                        }
                                     }
                                 }
                             },
