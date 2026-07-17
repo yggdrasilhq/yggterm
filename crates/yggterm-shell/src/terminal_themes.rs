@@ -38,32 +38,45 @@ pub struct NamedTerminalTheme {
     pub palette: TerminalPaletteSpec,
 }
 
+/// The built-in light palette — also the [`Default`] for
+/// `TerminalPaletteSpec`, so snapshot fixtures and fallbacks never carry
+/// empty color strings into CSS.
+fn builtin_light_palette_spec() -> TerminalPaletteSpec {
+    TerminalPaletteSpec {
+        background: "#fbfbfd".to_string(),
+        foreground: "#151b23".to_string(),
+        cursor: "#0451a5".to_string(),
+        cursor_text: "#fbfbfd".to_string(),
+        selection: "rgba(9, 105, 218, 0.22)".to_string(),
+        black: "#1b1f24".to_string(),
+        red: "#a1260d".to_string(),
+        green: "#0c6428".to_string(),
+        yellow: "#7a4f00".to_string(),
+        blue: "#0451a5".to_string(),
+        magenta: "#6936aa".to_string(),
+        cyan: "#0e6570".to_string(),
+        white: "#364152".to_string(),
+        bright_black: "#5b6675".to_string(),
+        bright_red: "#a1260d".to_string(),
+        bright_green: "#0c6428".to_string(),
+        bright_yellow: "#744900".to_string(),
+        bright_blue: "#0451a5".to_string(),
+        bright_magenta: "#7340b3".to_string(),
+        bright_cyan: "#0e6570".to_string(),
+        bright_white: "#2d3642".to_string(),
+    }
+}
+
+impl Default for TerminalPaletteSpec {
+    fn default() -> Self {
+        builtin_light_palette_spec()
+    }
+}
+
 static TERMINAL_THEME_CATALOG: Lazy<Vec<NamedTerminalTheme>> = Lazy::new(|| {
     let mut themes = vec![NamedTerminalTheme {
         name: DEFAULT_LIGHT_TERMINAL_THEME.to_string(),
-        palette: TerminalPaletteSpec {
-            background: "#fbfbfd".to_string(),
-            foreground: "#151b23".to_string(),
-            cursor: "#0451a5".to_string(),
-            cursor_text: "#fbfbfd".to_string(),
-            selection: "rgba(9, 105, 218, 0.22)".to_string(),
-            black: "#1b1f24".to_string(),
-            red: "#a1260d".to_string(),
-            green: "#0c6428".to_string(),
-            yellow: "#7a4f00".to_string(),
-            blue: "#0451a5".to_string(),
-            magenta: "#6936aa".to_string(),
-            cyan: "#0e6570".to_string(),
-            white: "#364152".to_string(),
-            bright_black: "#5b6675".to_string(),
-            bright_red: "#a1260d".to_string(),
-            bright_green: "#0c6428".to_string(),
-            bright_yellow: "#744900".to_string(),
-            bright_blue: "#0451a5".to_string(),
-            bright_magenta: "#7340b3".to_string(),
-            bright_cyan: "#0e6570".to_string(),
-            bright_white: "#2d3642".to_string(),
-        },
+        palette: builtin_light_palette_spec(),
     }];
 
     for file in GHOSTTY_THEMES_DIR.files() {
