@@ -6,6 +6,7 @@ authors.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+pulldown-cmark = { version = "0.12", default-features = false }
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"

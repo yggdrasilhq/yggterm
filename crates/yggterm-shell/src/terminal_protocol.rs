@@ -200,6 +200,11 @@ pub(crate) enum TerminalJsEvent {
         /// `<control>/appearance` only when it moves. Absent ⇒ the app ships no
         /// appearance and the chrome falls back to Light.
         appearance_version: Option<String>,
+        /// Opaque stamp over the app's VIEWPORT pane content (the document
+        /// surface). The GUI refetches the viewport-placement pane's schema
+        /// only when it moves, so a ~4s re-declare never drags a document over
+        /// the wire. Absent ⇒ the app ships no viewport pane.
+        document_version: Option<String>,
     },
     /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
     /// user's presence. The app carries only the rpId and a display label — no
@@ -248,6 +253,29 @@ pub struct SidebarPaneDeclaration {
     pub id: String,
     pub icon: String,
     pub title: String,
+    pub placement: PanePlacement,
+}
+
+/// Where a contributed pane renders. `Rail` is the right-hand panel (the
+/// ychrome vault/settings shape). `Viewport` is the DOCUMENT SURFACE: the
+/// pane's schema takes over the main viewport as shell DOM — no child
+/// webview, no extra web processes, clipped and z-ordered like any DOM, and
+/// fully visible to `app screenshot`/dom-eval (a native child webview is
+/// visible to neither). yedit is the first consumer (2026-07-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanePlacement {
+    #[default]
+    Rail,
+    Viewport,
+}
+
+impl PanePlacement {
+    fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("viewport") => Self::Viewport,
+            _ => Self::Rail,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -360,6 +388,8 @@ enum TerminalJsEventWire {
         zoom_version: Option<String>,
         #[serde(default)]
         appearance_version: Option<String>,
+        #[serde(default)]
+        document_version: Option<String>,
     },
     Fido2Request {
         action: String,
@@ -397,6 +427,18 @@ pub struct SidebarPaneDeclarationWire {
     pub icon: String,
     #[serde(default)]
     pub title: String,
+    /// "rail" (default) or "viewport" — see [`PanePlacement`].
+    #[serde(default)]
+    pub placement: Option<String>,
+}
+
+/// Parse a wire-shaped JSON event into the typed event — test-only surface
+/// for asserting wire field mappings (e.g. `placement`) without a webview.
+#[cfg(test)]
+pub fn parse_terminal_js_event_for_test(value: serde_json::Value) -> TerminalJsEvent {
+    serde_json::from_value::<TerminalJsEventWire>(value)
+        .expect("wire event deserializes")
+        .into()
 }
 
 impl From<TerminalJsEventWire> for TerminalJsEvent {
@@ -506,6 +548,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 app_name,
                 zoom_version,
                 appearance_version,
+                document_version,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
@@ -514,12 +557,14 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 app_name,
                 zoom_version,
                 appearance_version,
+                document_version,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
                         id: pane.id,
                         icon: pane.icon,
                         title: pane.title,
+                        placement: PanePlacement::from_wire(pane.placement.as_deref()),
                     })
                     .collect(),
             },
