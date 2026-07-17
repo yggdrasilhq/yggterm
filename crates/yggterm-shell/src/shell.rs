@@ -4575,6 +4575,12 @@ struct RenderSnapshot {
     /// is not "working" because a browser process sits foreground (that is true
     /// the whole time it is open) — its light is the PAGE's loading state.
     web_surface_loading: HashMap<String, bool>,
+    /// Every session with a live web surface → the surface's PROFILE, when it
+    /// is not the default ([[campaign-libyggterm]] Phase 5). Multiple profile
+    /// browsers are categorization; the badge is what tells them apart on the
+    /// session row and the titlebar. Default-profile surfaces are absent —
+    /// badging "default" on every browser would be noise, not signal.
+    web_surface_profiles: HashMap<String, String>,
     /// Panes the ACTIVE session's libyggterm app has declared. Empty unless an
     /// app is live and declaring — which is what keeps app chrome out of the
     /// rail. yggterm never invents one of these.
@@ -6594,6 +6600,23 @@ impl ShellState {
                     })
                     .collect()
             },
+            web_surface_profiles: self
+                .web_surfaces
+                .iter()
+                .filter(|(_, surface)| surface.picker.is_none())
+                .filter_map(|(path, surface)| {
+                    surface
+                        .tabs
+                        .first()
+                        .map(|app_tab| app_tab.profile.clone())
+                        .filter(|profile| {
+                            !profile.is_empty()
+                                && profile != "default"
+                                && profile != WEB_SURFACE_TEMP_PROFILE
+                        })
+                        .map(|profile| (path.clone(), profile))
+                })
+                .collect(),
             active_web_surface_overlay: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_overlay_for_session(path, current_millis())),
@@ -53633,6 +53656,11 @@ fn Sidebar(
                                 rename_value: snapshot.tree_rename_value.clone(),
                                 show_live_close: live_group_member && row.kind == BrowserRowKind::Session,
                                 palette: snapshot.palette,
+                                web_profile: snapshot
+                                    .web_surface_profiles
+                                    .get(&row.full_path)
+                                    .cloned()
+                                    .unwrap_or_default(),
                                 // One badge each, on the row it means something on:
                                 // E on the "here" row (what ALT,E opens), J on the
                                 // Live Sessions row (the list ALT,J walks).
@@ -54738,6 +54766,11 @@ fn SidebarRow(
     rename_value: String,
     show_live_close: bool,
     palette: Palette,
+    /// The session's web-surface PROFILE when it is not the default — the
+    /// shared row vocabulary's badge slot ([[campaign-libyggterm]] Phase 5:
+    /// multiple profile browsers are categorization; the badge tells them
+    /// apart). Empty = no badge.
+    web_profile: String,
     /// `ALT,E`'s letter when THIS row is the "here" row the row menu would open on,
     /// else empty. A KeyTip is painted on the thing it acts on, and what `ALT,E`
     /// acts on is a row (spec §8: the layer's actions apply to the focused item).
@@ -55288,6 +55321,17 @@ fn SidebarRow(
                                 on_end_drag.call(());
                             },
                             "{visible_label}"
+                        }
+                    }
+                    // The web-surface PROFILE badge (Phase 5): the shared row
+                    // vocabulary's trailing pill. Only non-default profiles —
+                    // the badge is what tells categorization browsers apart.
+                    if !web_profile.is_empty() {
+                        span {
+                            "data-sidebar-web-profile": "{web_profile}",
+                            title: "ychrome profile: {web_profile}",
+                            style: session_row_badge_style(palette.accent),
+                            "{web_profile}"
                         }
                     }
                     // Machine row status dot (issue #3): the OLD haloed
@@ -67277,6 +67321,22 @@ fn TerminalCanvas(
     };
     let web_surface_close_session_path = session.session_path.clone();
     let web_surface_session_path = session.session_path.clone();
+    // The surface's PROFILE badge (Phase 5): non-default only — the pill is
+    // what tells categorization browsers ("work", "personal") apart at a
+    // glance. Read here, drawn in the strip's utility cluster.
+    let web_surface_profile_badge = state.with(|shell| {
+        shell
+            .web_surfaces
+            .get(&session.session_path)
+            .filter(|surface| surface.picker.is_none())
+            .and_then(|surface| surface.tabs.first())
+            .map(|app_tab| app_tab.profile.clone())
+            .filter(|profile| {
+                !profile.is_empty()
+                    && profile != "default"
+                    && profile != WEB_SURFACE_TEMP_PROFILE
+            })
+    });
     // The classic strip's folder-overflow menu. GUI-only state, read here so the
     // strip renders it without reaching back into the signal mid-tree.
     let web_tab_overflow_open = state.with(|shell| shell.web_tab_overflow_open);
@@ -67626,6 +67686,20 @@ fn TerminalCanvas(
                                         }
                                     }
                                 })
+                            }
+                            // The PROFILE pill (Phase 5): which identity this
+                            // browser is. Sits with the surface-level chrome —
+                            // it describes the surface, not a tab.
+                            if let Some(profile) = web_surface_profile_badge.clone() {
+                                span {
+                                    "data-ws-profile-badge": "{profile}",
+                                    title: "ychrome profile: {profile}",
+                                    style: format!(
+                                        "align-self:center; {}",
+                                        session_row_badge_style(&web_chrome_fg)
+                                    ),
+                                    "{profile}"
+                                }
                             }
                             // Standard libyggterm app chrome (top-right
                             // cluster): Zzz suspends the app to its terminal
@@ -117289,6 +117363,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -117927,6 +118002,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118100,6 +118176,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118273,6 +118350,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118449,6 +118527,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118629,6 +118708,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118801,6 +118881,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -118973,6 +119054,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -119179,6 +119261,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -119354,6 +119437,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -119561,6 +119645,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -119945,6 +120030,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
+            web_surface_profiles: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
