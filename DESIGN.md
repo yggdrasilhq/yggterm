@@ -339,6 +339,28 @@ Yggterm should be designed for sessions that stay alive for days, weeks, or mont
 - Performance work only counts if restore and interaction stay reliable over long runtimes. A faster shell that strands active sessions is not a win.
 - Smoke and proof coverage for terminal work should include long-running failure modes, especially daemon-loss recovery and bounded observability retention.
 
+### Session-style rows (the shared row engine)
+
+Every session-style list row — cwdtree sidebar rows, the WebTabs rail, app-pane
+`list-row`s — is drawn by ONE vocabulary: `[indent] [status-dot] [icon]
+[title(+subtitle)] [badge] [actions]`. The source of truth is
+`SessionRowDensity` + `session_row_metrics` + the `session_row_*_style`
+functions and the `SessionStyleRow` component in shell.rs.
+
+- Two densities of the same anatomy: `Sidebar` (the cwdtree main row's numbers
+  — 20px icon box, 9px dot rail, font 12, radius 12, 12px indent step) and
+  `Rail` (right-rail lists — font 11, radius 8, padding 6/8, same indent step).
+- Selection tint is the palette's `accent_soft` everywhere. Never a
+  per-consumer mix.
+- The status-dot SLOT is laid out even when empty, so an appearing dot never
+  shoves the title sideways. Dot paint comes from the status-indicator
+  vocabulary (`live_session_status_dot_style` / `web_tab_loading_dot_style`).
+- Trailing actions use `session_row_action_button_style`; a trailing pill uses
+  `session_row_badge_style` (ychrome profile badges live here).
+- New list surfaces MUST consume the engine (component, or the style functions
+  when the interactivity is bespoke, as the cwdtree row does). Do not write a
+  fourth row style.
+
 ### Drag and drop
 
 If a project has drag-and-drop tree or list reordering:
