@@ -1481,6 +1481,7 @@ impl AppPaneWidget {
             AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
             AppPaneWidget::Button { id, .. } => format!("button-{id}"),
             AppPaneWidget::ListRow { id, .. } => format!("row-{id}"),
+            AppPaneWidget::Toolbar { id, .. } => format!("toolbar-{id}"),
             AppPaneWidget::Markdown { id, .. } => format!("markdown-{id}"),
         }
     }
@@ -1501,6 +1502,7 @@ impl AppPaneWidget {
             | AppPaneWidget::Label { .. }
             | AppPaneWidget::Button { .. }
             | AppPaneWidget::ListRow { .. }
+            | AppPaneWidget::Toolbar { .. }
             | AppPaneWidget::Markdown { .. } => None,
         }
     }
@@ -1509,8 +1511,18 @@ impl AppPaneWidget {
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum AppPaneWidget {
-    /// A heading that groups what follows.
-    Section { text: String },
+    /// A heading that groups what follows. `action`/`action_label` add a
+    /// small trailing button on the heading row (the "Files +" shape — the
+    /// ychrome "Tabs +" header).
+    Section {
+        text: String,
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        action_label: String,
+        #[serde(default)]
+        action_title: String,
+    },
     /// Static text. `muted` renders it as secondary prose.
     Label {
         text: String,
@@ -1592,13 +1604,29 @@ enum AppPaneWidget {
         primary: bool,
     },
     /// A row of the app's own data, with optional trailing action buttons.
+    /// `row_action` makes the ROW BODY clickable (fires with the row id as
+    /// its value); `icon` leads the title; `selected` tints the row — the
+    /// Live-Sessions/cwdtree row shape.
     ListRow {
         id: String,
         title: String,
         #[serde(default)]
         subtitle: String,
         #[serde(default)]
+        icon: String,
+        #[serde(default)]
+        selected: bool,
+        #[serde(default)]
+        row_action: String,
+        #[serde(default)]
         actions: Vec<AppPaneRowAction>,
+    },
+    /// A compact horizontal row of icon buttons — the quick-actions strip
+    /// (MS-Office quick access shape) at the top of an app's sidebar.
+    Toolbar {
+        id: String,
+        #[serde(default)]
+        buttons: Vec<AppPaneToolbarButton>,
     },
     /// A block of markdown the GUI renders to native DOM — the document
     /// surface's body widget (yedit's reader). Rendered to VNodes, NEVER via
@@ -1608,7 +1636,22 @@ enum AppPaneWidget {
         id: String,
         #[serde(default)]
         source: String,
+        /// Render the LIVE draft of this sibling input widget instead of
+        /// `source` when the user has one — the split-view live preview:
+        /// the editor's keystrokes render without an app round trip.
+        #[serde(default)]
+        live_from: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneToolbarButton {
+    action: String,
+    label: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -84129,6 +84172,14 @@ fn DocumentSurfaceBody(
         })
         .unwrap_or_default();
     let has_bar = !bar_widgets.is_empty();
+    // Editor + markdown together = the SPLIT VIEW (markdown-mode editing):
+    // editor left, live preview right, each scrolling independently.
+    let split_view = body_widgets
+        .iter()
+        .any(|w| matches!(w, AppPaneWidget::TextInput { multiline: true, .. }))
+        && body_widgets
+            .iter()
+            .any(|w| matches!(w, AppPaneWidget::Markdown { .. }));
 
     let on_hide_surface = {
         let mut state = state;
@@ -84151,7 +84202,7 @@ fn DocumentSurfaceBody(
                         {
                             let widget_key = widget.key(index, &value_epochs);
                             match widget {
-                                AppPaneWidget::Section { text } | AppPaneWidget::Label { text, muted: _ } => rsx! {
+                                AppPaneWidget::Section { text, .. } | AppPaneWidget::Label { text, muted: _ } => rsx! {
                                     span {
                                         key: "{widget_key}",
                                         style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
@@ -84268,7 +84319,11 @@ fn DocumentSurfaceBody(
                 }
             }
             div {
-                style: "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;",
+                style: if split_view {
+                    "flex:1 1 auto; min-height:0; display:flex; flex-direction:row; overflow:hidden;"
+                } else {
+                    "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;"
+                },
                 if body_widgets.is_empty() && schema.is_some() {
                     div {
                         style: format!("padding:26px; color:{}; font-size:13px;", doc.muted),
@@ -84281,15 +84336,33 @@ fn DocumentSurfaceBody(
                     }
                 }
                 for (index, widget) in body_widgets.iter().enumerate() {
+                    div {
+                        key: "half-{widget.key(index, &value_epochs)}",
+                        style: if split_view {
+                            format!(
+                                "flex:1 1 50%; min-width:0; min-height:0; overflow:auto; {}",
+                                if index == 0 { format!("border-right:1px solid {};", doc.border) } else { String::new() },
+                            )
+                        } else {
+                            "display:contents;".to_string()
+                        },
                     {
                         let widget_key = widget.key(index, &value_epochs);
                         match widget {
-                            AppPaneWidget::Markdown { id, source } => rsx! {
+                            AppPaneWidget::Markdown { id, source, live_from } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     "data-document-markdown": "{id}",
                                     style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
-                                    {markdown_widget_body(source, &doc)}
+                                    {
+                                        // Live preview: the sibling editor's
+                                        // draft renders per keystroke, no app
+                                        // round trip.
+                                        let live = (!live_from.is_empty())
+                                            .then(|| snapshot.document_pane_values.get(live_from).cloned())
+                                            .flatten();
+                                        markdown_widget_body(live.as_deref().unwrap_or(source), &doc)
+                                    }
                                 }
                             },
                             AppPaneWidget::TextInput { id, value, line_numbers, .. } => {
@@ -84345,7 +84418,7 @@ fn DocumentSurfaceBody(
                                     }
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, actions } => rsx! {
+                            AppPaneWidget::ListRow { id, title, subtitle, actions, .. } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     "data-document-row": "{id}",
@@ -84388,6 +84461,7 @@ fn DocumentSurfaceBody(
                             },
                             _ => rsx! { span { key: "{widget_key}" } },
                         }
+                    }
                     }
                 }
             }
@@ -84465,8 +84539,56 @@ fn AppPaneRailBody(
                         {
                         let widget_key = widget.key(index, &value_epochs);
                         match widget {
-                            AppPaneWidget::Section { text } => rsx! {
-                                div { key: "{widget_key}", style: "{section_style}", "{text}" }
+                            AppPaneWidget::Section { text, action, action_label, action_title } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                                    div { style: "{section_style}", "{text}" }
+                                    if !action.is_empty() && !action_label.is_empty() {
+                                        button {
+                                            style: format!(
+                                                "border:0; border-radius:6px; background:{}; color:#fff; \
+                                                 font-size:12px; font-weight:700; cursor:pointer; \
+                                                 width:20px; height:20px; line-height:1; padding:0;",
+                                                palette.accent
+                                            ),
+                                            title: "{action_title}",
+                                            onclick: {
+                                                let (pane_id, action) = (pane_id.clone(), action.clone());
+                                                let on_app_pane_action = on_app_pane_action.clone();
+                                                move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
+                                            },
+                                            "{action_label}"
+                                        }
+                                    }
+                                }
+                            },
+                            AppPaneWidget::Toolbar { id, buttons } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    "data-app-pane-toolbar": "{id}",
+                                    style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
+                                    for toolbar_button in buttons.iter().cloned() {
+                                        button {
+                                            key: "{toolbar_button.action}",
+                                            "data-toolbar-action": "{toolbar_button.action}",
+                                            style: format!(
+                                                "border:1px solid rgba(127,127,127,0.30); border-radius:7px; \
+                                                 padding:5px 9px; font-size:12px; line-height:1; cursor:pointer; \
+                                                 background:{}; color:{}; font-weight:600;",
+                                                if toolbar_button.primary { palette.accent } else { "transparent" },
+                                                if toolbar_button.primary { "#fff" } else { palette.text },
+                                            ),
+                                            title: "{toolbar_button.title}",
+                                            onclick: {
+                                                let (pane_id, action) = (pane_id.clone(), toolbar_button.action.clone());
+                                                let on_app_pane_action = on_app_pane_action.clone();
+                                                move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
+                                            },
+                                            "{toolbar_button.label}"
+                                        }
+                                    }
+                                }
                             },
                             AppPaneWidget::Label { text, muted } => {
                                 let style = if muted { muted_style.clone() } else { text_style.clone() };
@@ -84648,45 +84770,88 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, actions } => rsx! {
-                                div {
-                                    key: "{widget_key}",
-                                    "data-app-pane-row": "{id}",
-                                    style: "{row_style}",
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions } => {
+                                // The Live-Sessions/cwdtree row shape: flat,
+                                // whole-row clickable, selected tinted, tiny
+                                // trailing actions.
+                                let clickable = !row_action.is_empty();
+                                let session_row_style = format!(
+                                    "display:flex; align-items:center; gap:7px; padding:5px 8px; \
+                                     border-radius:7px; color:{}; {} {}",
+                                    palette.text,
+                                    if selected {
+                                        format!("background:color-mix(in srgb, {} 16%, transparent);", palette.accent)
+                                    } else {
+                                        "background:transparent;".to_string()
+                                    },
+                                    if clickable { "cursor:pointer;" } else { "" },
+                                );
+                                rsx! {
                                     div {
-                                        style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
-                                        div {
-                                            style: "font-size:11px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                            "{title}"
-                                        }
-                                        if !subtitle.is_empty() {
+                                        key: "{widget_key}",
+                                        "data-app-pane-row": "{id}",
+                                        style: "{session_row_style}",
+                                        onclick: {
+                                            let (pane_id, action, row_id) =
+                                                (pane_id.clone(), row_action.clone(), id.clone());
+                                            let on_app_pane_action = on_app_pane_action.clone();
+                                            move |_| {
+                                                if !action.is_empty() {
+                                                    on_app_pane_action.call((
+                                                        pane_id.clone(),
+                                                        action.clone(),
+                                                        Some(row_id.clone()),
+                                                    ));
+                                                }
+                                            }
+                                        },
+                                        if !icon.is_empty() {
                                             div {
-                                                style: "{muted_style} overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                                                "{subtitle}"
+                                                style: "flex:0 0 auto; font-size:12px; line-height:1;",
+                                                "{icon}"
                                             }
                                         }
-                                    }
-                                    for row_action in actions.iter().cloned() {
-                                        button {
-                                            key: "{row_action.action}",
-                                            style: "{row_action_style}",
-                                            title: "{row_action.title}",
-                                            onclick: {
-                                                let (pane_id, action, row_id) =
-                                                    (pane_id.clone(), row_action.action.clone(), id.clone());
-                                                let on_app_pane_action = on_app_pane_action.clone();
-                                                move |_| on_app_pane_action.call((
-                                                    pane_id.clone(),
-                                                    action.clone(),
-                                                    Some(row_id.clone()),
-                                                ))
-                                            },
-                                            "{row_action.label}"
+                                        div {
+                                            style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                            div {
+                                                style: format!(
+                                                    "font-size:11.5px; font-weight:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                                    if selected { "700" } else { "500" },
+                                                ),
+                                                "{title}"
+                                            }
+                                            if !subtitle.is_empty() {
+                                                div {
+                                                    style: "{muted_style} overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                                    "{subtitle}"
+                                                }
+                                            }
+                                        }
+                                        for row_action in actions.iter().cloned() {
+                                            button {
+                                                key: "{row_action.action}",
+                                                style: "{row_action_style}",
+                                                title: "{row_action.title}",
+                                                onclick: {
+                                                    let (pane_id, action, row_id) =
+                                                        (pane_id.clone(), row_action.action.clone(), id.clone());
+                                                    let on_app_pane_action = on_app_pane_action.clone();
+                                                    move |evt: MouseEvent| {
+                                                        evt.stop_propagation();
+                                                        on_app_pane_action.call((
+                                                            pane_id.clone(),
+                                                            action.clone(),
+                                                            Some(row_id.clone()),
+                                                        ))
+                                                    }
+                                                },
+                                                "{row_action.label}"
+                                            }
                                         }
                                     }
                                 }
                             },
-                            AppPaneWidget::Markdown { id, source } => rsx! {
+                            AppPaneWidget::Markdown { id, source, .. } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     "data-app-pane-markdown": "{id}",
@@ -96740,12 +96905,20 @@ mod tests {
     #[test]
     fn app_pane_widget_keys_distinguish_kinds_at_the_same_index() {
         let epochs = HashMap::new();
-        let section = AppPaneWidget::Section { text: "Vault".into() };
+        let section = AppPaneWidget::Section {
+            text: "Vault".into(),
+            action: String::new(),
+            action_label: String::new(),
+            action_title: String::new(),
+        };
         let label = AppPaneWidget::Label { text: "unlocked".into(), muted: true };
         assert_ne!(section.key(1, &epochs), label.key(1, &epochs));
 
         // Identity, not position: the same row keeps its key as the list moves.
         let row = |id: &str| AppPaneWidget::ListRow {
+            icon: String::new(),
+            selected: false,
+            row_action: String::new(),
             id: id.to_string(),
             title: String::new(),
             subtitle: String::new(),
@@ -98009,7 +98182,7 @@ mod tests {
             "kind": "markdown", "id": "body", "source": "# hi"
         }))
         .expect("markdown widget deserializes");
-        assert!(matches!(&widget, AppPaneWidget::Markdown { id, source } if id == "body" && source == "# hi"));
+        assert!(matches!(&widget, AppPaneWidget::Markdown { id, source, .. } if id == "body" && source == "# hi"));
         assert_eq!(widget.key(3, &HashMap::new()), "markdown-body");
         assert!(widget.declared_value().is_none());
 
