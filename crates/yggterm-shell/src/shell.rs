@@ -4503,16 +4503,29 @@ struct PreviewSyncFailure {
     retry_count: u32,
     first_failed_at_ms: u64,
 }
-/// The active session's document surface as the renderer needs it. `stale`
-/// drives the "not responding" overlay (declares stopped while reads were
-/// live); `app_name` names the app in that overlay — the declaration owns the
-/// name, the shell never hardcodes one.
+/// A session's document surface as the renderer needs it. `stale` drives the
+/// "not responding" overlay (declares stopped while reads were live);
+/// `app_name` names the app in that overlay — the declaration owns the name,
+/// the shell never hardcodes one.
 #[derive(Clone, Debug, PartialEq)]
 struct DocumentPaneSnapshot {
     pane_id: String,
     visible: bool,
     stale: bool,
     app_name: Option<String>,
+}
+
+/// One session's complete document-surface render state: the pane identity
+/// plus its channel (schema, draft values, error). The snapshot carries one
+/// per CO-VISIBLE session — the active session and every member of the
+/// active split group — so a split can paint a document in one pane while a
+/// terminal runs in the other ([[campaign-libyggterm]] Phase 3).
+#[derive(Clone, PartialEq)]
+struct DocumentSurfaceSnapshot {
+    pane: DocumentPaneSnapshot,
+    schema: Option<AppPaneSchemaState>,
+    error: Option<String>,
+    values: HashMap<String, String>,
 }
 #[derive(Clone, PartialEq)]
 struct RenderSnapshot {
@@ -4567,17 +4580,13 @@ struct RenderSnapshot {
     /// error from fetching it.
     app_pane_schema: Option<AppPaneSchemaState>,
     app_pane_error: Option<String>,
-    /// The DOCUMENT SURFACE for the ACTIVE session: the viewport-placement
-    /// pane's id, whether the user has it visible, whether its app has stopped
-    /// declaring (the not-responding overlay), plus its fetched schema and any
-    /// fetch error. None when the active session declares none.
-    document_pane: Option<DocumentPaneSnapshot>,
-    document_pane_schema: Option<AppPaneSchemaState>,
-    document_pane_error: Option<String>,
-    /// The document's draft values (live editor buffer) — the gutter's line
-    /// count and rows sizing track what the user is TYPING, not the last
-    /// schema the app declared.
-    document_pane_values: HashMap<String, String>,
+    /// DOCUMENT SURFACES by session, one per CO-VISIBLE session (the active
+    /// session + the active split group's members) that declares a
+    /// viewport-placement pane. Values carry the live editor draft — the
+    /// gutter's line count and rows sizing track what the user is TYPING,
+    /// not the last schema the app declared. Empty when nothing co-visible
+    /// declares a document.
+    document_surfaces: HashMap<String, DocumentSurfaceSnapshot>,
     /// The ACTIVE terminal theme's palette — the document surface paints in
     /// it so yedit follows the user's terminal theme selection exactly
     /// (user direction 2026-07-17).
@@ -6584,34 +6593,49 @@ impl ShellState {
             apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
-            document_pane: active_session_path.as_deref().and_then(|path| {
-                self.viewport_pane_for_session(path).map(|pane| DocumentPaneSnapshot {
-                    pane_id: pane.id.clone(),
-                    visible: self.document_surface_visible_for(path),
-                    stale: self.document_surface_stale.as_deref() == Some(path),
-                    app_name: self
-                        .sidebar_contributions
-                        .get(path)
-                        .and_then(|contribution| contribution.app_name.clone()),
-                })
-            }),
-            // The document channel rides the snapshot keyed by the ACTIVE
-            // session — structural now (the key IS the session), so a
-            // background yedit's document cannot paint over the session the
-            // user is looking at.
-            document_pane_schema: active_session_path
-                .as_deref()
-                .and_then(|path| self.document_pane_channel(path))
-                .and_then(|channel| channel.schema.clone()),
-            document_pane_error: active_session_path
-                .as_deref()
-                .and_then(|path| self.document_pane_channel(path))
-                .and_then(|channel| channel.error.clone()),
-            document_pane_values: active_session_path
-                .as_deref()
-                .and_then(|path| self.document_pane_channel(path))
-                .map(|channel| channel.values.clone())
-                .unwrap_or_default(),
+            // Document surfaces for every CO-VISIBLE session: the active
+            // session plus the active split group's members ([[campaign-
+            // libyggterm]] Phase 3 — a doc pane beside a terminal pane).
+            // Keying by session is what keeps a background yedit's document
+            // from painting over the session the user is looking at.
+            document_surfaces: {
+                let mut co_visible: Vec<String> =
+                    active_session_path.iter().cloned().collect();
+                if let Some(group) = self.active_split_group() {
+                    for member in &group.members {
+                        if !co_visible.contains(member) {
+                            co_visible.push(member.clone());
+                        }
+                    }
+                }
+                co_visible
+                    .into_iter()
+                    .filter_map(|path| {
+                        let pane = self.viewport_pane_for_session(&path)?;
+                        let channel = self.document_pane_channel(&path);
+                        Some((
+                            path.clone(),
+                            DocumentSurfaceSnapshot {
+                                pane: DocumentPaneSnapshot {
+                                    pane_id: pane.id.clone(),
+                                    visible: self.document_surface_visible_for(&path),
+                                    stale: self.document_surface_stale.as_deref()
+                                        == Some(path.as_str()),
+                                    app_name: self
+                                        .sidebar_contributions
+                                        .get(&path)
+                                        .and_then(|contribution| contribution.app_name.clone()),
+                                },
+                                schema: channel.and_then(|channel| channel.schema.clone()),
+                                error: channel.and_then(|channel| channel.error.clone()),
+                                values: channel
+                                    .map(|channel| channel.values.clone())
+                                    .unwrap_or_default(),
+                            },
+                        ))
+                    })
+                    .collect()
+            },
             terminal_palette: terminal_theme_by_name(&self.effective_terminal_theme_name())
                 .map(|theme| theme.palette.clone())
                 .unwrap_or_default(),
@@ -55930,6 +55954,12 @@ fn MainSurface(
     // session exactly as before.
     let active_split_group = snapshot.active_split_group.clone();
     let split_focus_accent = snapshot.theme_accent.clone();
+    // A split member's document surface renders INSIDE its pane rect; the
+    // full-bleed layer would paint over the sibling pane (Phase 3).
+    let active_session_in_split = active_split_group
+        .as_ref()
+        .zip(snapshot.active_session_path.as_ref())
+        .is_some_and(|(group, active)| group.members.contains(active));
     let body = if let Some(session) = snapshot.active_session.clone() {
         if session.kind == SessionKind::Document {
             rsx! {
@@ -56088,6 +56118,26 @@ fn MainSurface(
                                             state,
                                             mount_epoch: session_mount_epoch,
                                         }
+                                        // A split member's DOCUMENT SURFACE lives
+                                        // INSIDE its pane rect (Phase 3): the doc
+                                        // covers this pane's terminal only, the
+                                        // sibling keeps painting, and the focus
+                                        // ring/divider stay in the gutter outside.
+                                        // DocumentSurfaceBody's own layer style is
+                                        // absolute inset:0, which here resolves
+                                        // against the pane container.
+                                        if is_split_pane
+                                            && snapshot
+                                                .document_surfaces
+                                                .get(&session_path_str)
+                                                .is_some_and(|surface| surface.pane.visible)
+                                        {
+                                            DocumentSurfaceBody {
+                                                snapshot: snapshot.clone(),
+                                                state,
+                                                session_path: session_path_str.clone(),
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -56220,13 +56270,22 @@ fn MainSurface(
                     // as shell DOM over the terminal layer. Ordinary DOM — it
                     // clips, z-orders, screenshots and dom-evals like the rest
                     // of the chrome (everything a native child webview cannot).
-                    if snapshot.document_pane.as_ref().is_some_and(|pane| pane.visible) {
+                    // FULL-BLEED only outside a split: a split member's
+                    // document renders INSIDE its pane rect (Phase 3), never
+                    // over the sibling.
+                    if active_session_in_split {
+                        // Split members own their panes; nothing full-bleed.
+                    } else if snapshot
+                        .document_surfaces
+                        .get(&session.session_path)
+                        .is_some_and(|surface| surface.pane.visible)
+                    {
                         DocumentSurfaceBody {
                             snapshot: snapshot.clone(),
                             state,
                             session_path: session.session_path.clone(),
                         }
-                    } else if snapshot.document_pane.is_some() {
+                    } else if snapshot.document_surfaces.contains_key(&session.session_path) {
                         // Hidden by the user's toggle: a floating chip is the
                         // way back (the app cannot draw one — its surface is
                         // exactly what is hidden).
@@ -84722,9 +84781,11 @@ fn DocumentSurfaceBody(
     session_path: String,
 ) -> Element {
     let doc = DocTheme::from_terminal(&snapshot.terminal_palette);
-    let Some(document_pane) = snapshot.document_pane.clone() else {
+    let Some(surface) = snapshot.document_surfaces.get(&session_path).cloned() else {
         return rsx! {};
     };
+    let document_pane = surface.pane.clone();
+    let document_values = surface.values.clone();
     let pane_id = document_pane.pane_id.clone();
     let surface_stale = document_pane.stale;
     let stale_app_name = document_pane
@@ -84732,15 +84793,15 @@ fn DocumentSurfaceBody(
         .clone()
         .unwrap_or_else(|| "The app".to_string());
     let stale_overlay_session_path = session_path.clone();
-    let pane_state = snapshot
-        .document_pane_schema
+    let pane_state = surface
+        .schema
         .as_ref()
         .filter(|state| state.pane_id == pane_id);
     let value_epochs = pane_state
         .map(|state| state.value_epochs.clone())
         .unwrap_or_default();
     let schema = pane_state.map(|state| state.schema.clone());
-    let error = snapshot.document_pane_error.clone();
+    let error = surface.error.clone();
 
     let run_action = {
         let session_path = session_path.clone();
@@ -84998,7 +85059,7 @@ fn DocumentSurfaceBody(
                                         // draft renders per keystroke, no app
                                         // round trip.
                                         let live = (!live_from.is_empty())
-                                            .then(|| snapshot.document_pane_values.get(live_from).cloned())
+                                            .then(|| document_values.get(live_from).cloned())
                                             .flatten();
                                         markdown_widget_body(live.as_deref().unwrap_or(source), &doc)
                                     }
@@ -85008,8 +85069,7 @@ fn DocumentSurfaceBody(
                                 // The gutter tracks the LIVE draft, not the last
                                 // declared value, so typing a newline never
                                 // desyncs the numbers.
-                                let live = snapshot
-                                    .document_pane_values
+                                let live = document_values
                                     .get(id)
                                     .cloned()
                                     .unwrap_or_else(|| value.clone());
@@ -116852,10 +116912,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -117493,10 +117550,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -117669,10 +117723,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -117845,10 +117896,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118024,10 +118072,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118207,10 +118252,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118382,10 +118424,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118557,10 +118596,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118766,10 +118802,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -118944,10 +118977,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -119154,10 +119184,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
@@ -119541,10 +119568,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
-            document_pane: None,
-            document_pane_schema: None,
-            document_pane_error: None,
-            document_pane_values: HashMap::new(),
+            document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
