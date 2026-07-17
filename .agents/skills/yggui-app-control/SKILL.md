@@ -278,6 +278,36 @@ Companion trace events (mine `~/.yggterm/event-trace.jsonl`):
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app dom-eval 'return {active: String(document.activeElement.tagName)}'"
 ```
 
+## Split groups (viewport panes — terminal, document, pinned web tab)
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+# Group two sessions into co-visible panes (forces keep-alive on members)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split create [--axis side-by-side|stacked] <path> <path>"
+# SPLIT-TABS (2.11.4+, libyggterm Phase 3): pin ONE web tab of a session's
+# surface into its own pane — pane 0 keeps the surface chrome + active tab,
+# pane 1 is the pinned tab, pure page. Tab ids from the surface's tab strip
+# (app tab = 0, user tabs count up).
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split web-tab <session_path> <tab_id> [--axis ...]"
+# Focus a pane. The PANE INDEX form is the ONLY way to focus a pinned web
+# pane (its native webview swallows pointer events). The response's
+# `focused_web_host` field is the focus-tenancy probe: which page the
+# chrome/page-context owner now answers with for that session.
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split focus <session_path> [pane_index]"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split ratio <group_id> <0.0..1.0>"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split ungroup <group_id>"
+# State: `server app state` → data.split_view (members are bare paths for
+# terminal panes, {session, view:{web:{tab}}} objects for pinned panes).
+```
+
+⚠ These verbs exist ONLY in the `yggterm-headless` CLI (the GUI binary's
+`server app` parser lacks `split`). ⚠ Split/document verification needs
+`--backend os` — the composite screenshot paints the active canvas
+full-bleed and is blind to both panes (trap 11) and to native webviews
+(trap 2). Pinned-pane geometry probe without pixels: dom-eval the
+`[data-ws-pinned-session]`/`[data-ws-pinned-tab]` placeholder rect against
+`[data-ws-page]`.
+
 ## Terminal Probe (type text into live terminal)
 
 ```bash

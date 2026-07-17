@@ -530,3 +530,39 @@ page; nobody had told it the page had changed.
 The refetch lives in the native-surface reconcile tick, which is the one place
 that sees every way a page can move: a navigation, a tab switch, a popup taking
 the front, a session switch.
+
+## Split-tabs: a tab pinned to its own pane (2026-07-17, libyggterm Phase 3)
+
+Every tab is already its own webview; the reconciler normally shows the active
+one and hides the rest. A split group member may now be `(session, Web{tab})` —
+a pane PINNED to one tab, independent of the surface's active tab — so one
+browsing session can show two of its tabs side by side ("two tab webviews, two
+rects"). No app involvement: tabs are GUI chrome by doctrine.
+
+- **Geometry**: the pinned pane renders pure page (no strip/omnibox — the
+  session's terminal-view pane keeps the chrome) with an inner
+  `[data-ws-pinned-session]` + `[data-ws-pinned-tab]` placeholder, the
+  (session, tab)-keyed twin of `[data-ws-page]`. The reconciler's placement
+  rule (`web_surface_tab_place_rect`): a pane pinned to exactly this tab wins
+  its rect; else the surface's page area shows the ACTIVE tab; on the
+  degenerate collision (the strip switched onto the pinned tab) the pinned
+  pane wins — one webview cannot sit at two rects.
+- **Creation**: `yggterm-headless server app split web-tab <session> <tab>
+  [--axis ...]`. Refused when the tab does not exist or the session is already
+  grouped.
+- **Focus**: pane-INDEX-keyed (`focused_pane_index`) — a session seated in two
+  panes rings only one. `server app split focus <session> [pane]` is the only
+  headless (and currently only reliable) way to focus a pinned pane: its
+  native webview swallows pointer events, so click-to-focus works only on
+  regions the webview does not cover. The focus ring stays an outward shadow
+  in the Phase-0 gutter, so it survives the webview painting above all DOM.
+- **Focus tenancy**: `web_surface_host_label` — the one owner of page context
+  (vault `values.host`, the app-pane refetch, chrome host) — answers from the
+  FOCUSED pane's tab via `focused_web_tab_id`. Focusing the pinned docs pane
+  makes an open vault pane refetch for the pinned page's host on the next
+  reconcile tick. (Omnibox/address-commit and keyboard tenancy are not yet
+  pane-keyed — the omnibox still shows and edits the surface's active tab.)
+- **Lifetime**: pinned panes are SESSION-LIFETIME. Tab restore re-mints tab
+  ids, so a persisted pin has no durable referent: `prune_web_view_panes`
+  drops a pin when its tab closes, its surface retires (close/sweep/Ctrl+Z),
+  or across a GUI restart, and a group below 2 panes dissolves.
