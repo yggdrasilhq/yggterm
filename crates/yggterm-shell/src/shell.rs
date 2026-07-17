@@ -635,6 +635,14 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 // animation so the keyframe values jump instead of interpolating (user
 // decision 2026-06-26: "blinking means full off and full on, no fading").
 const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }";
+/// Session-style rows reveal their trailing actions (✕ …) on ROW HOVER only —
+/// the cwdtree's rule, now shared: a column of always-visible close buttons
+/// reads as clutter next to the tree (user-caught 2026-07-17). Injected once
+/// per rail body that renders `SessionStyleRow`s.
+const SESSION_ROW_HOVER_CSS: &str =
+    "[data-session-row] [data-session-row-actions]{opacity:0; transition:opacity 120ms ease;} \
+     [data-session-row]:hover [data-session-row-actions]{opacity:1;} \
+     [data-session-row] [data-session-row-actions]:focus-within{opacity:1;}";
 /// The vertical-tabs left pane slides in from the edge as the top chrome
 /// collapses (max-height transition on the tab bar + nav bar).
 const WEB_SURFACE_VTAB_CSS: &str = "@keyframes ygg-vtab-slide-in { from { transform: translateX(-14px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }";
@@ -54624,7 +54632,7 @@ const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
         SessionRowDensity::Rail => SessionRowMetrics {
             indent_base_px: 10,
             indent_step_px: 12,
-            pad_v_px: 6,
+            pad_v_px: 5,
             pad_h_px: 8,
             radius_px: 8,
             gap_px: 6,
@@ -54758,6 +54766,7 @@ fn SessionStyleRow(
     let title_style = session_row_label_style(density, &text_color, false);
     rsx! {
         div {
+            "data-session-row": "1",
             style: "{container}",
             onclick: move |evt| {
                 if let Some(handler) = &onclick {
@@ -54817,9 +54826,73 @@ fn SessionStyleRow(
                 }
             }
             if let Some(actions) = actions {
-                {actions}
+                // Hover-revealed (SESSION_ROW_HOVER_CSS): trailing verbs show
+                // on row hover only, the cwdtree's rule.
+                span {
+                    "data-session-row-actions": "1",
+                    style: "display:inline-flex; align-items:center; gap:2px; flex:0 0 auto;",
+                    {actions}
+                }
             }
         }
+    }
+}
+
+/// A file-type badge for `list-row` icons of the form `file:<ext>` — a small
+/// outlined rectangle carrying the extension text ("md", "txt"), or "·" when
+/// the file has none. Generic vocabulary: any app can declare it; yggterm
+/// knows nothing about notes. Sized to the shared icon box.
+#[component]
+fn FileBadgeIcon(ext: String) -> Element {
+    let label = if ext.is_empty() {
+        "·".to_string()
+    } else {
+        let mut text = ext.to_lowercase();
+        text.truncate(4);
+        text
+    };
+    rsx! {
+        svg {
+            width: "18",
+            height: "16",
+            view_box: "0 0 18 16",
+            fill: "none",
+            rect {
+                x: "1",
+                y: "1",
+                width: "16",
+                height: "14",
+                rx: "3",
+                stroke: "currentColor",
+                stroke_width: "1.2",
+            }
+            text {
+                x: "9",
+                y: "8.5",
+                text_anchor: "middle",
+                dominant_baseline: "middle",
+                fill: "currentColor",
+                font_size: "6.5",
+                font_weight: "700",
+                font_family: "inherit",
+                letter_spacing: "0.02em",
+                "{label}"
+            }
+        }
+    }
+}
+
+/// Render a `list-row` icon string: the `file:<ext>` vocabulary gets the
+/// badge; anything else (an emoji glyph) renders as text.
+fn app_pane_row_icon(icon: &str) -> Element {
+    match icon.strip_prefix("file:") {
+        Some(ext) => rsx! { FileBadgeIcon { ext: ext.to_string() } },
+        None => rsx! {
+            span {
+                style: "font-size:12px; line-height:1;",
+                "{icon}"
+            }
+        },
     }
 }
 
@@ -85747,6 +85820,7 @@ fn AppPaneRailBody(
 
     rsx! {
         RailHeader { title: title, color: palette.text.to_string() }
+        style { "{SESSION_ROW_HOVER_CSS}" }
         RailScrollBody {
             content: rsx!{
             div {
@@ -85757,6 +85831,14 @@ fn AppPaneRailBody(
                     for (index, widget) in schema.widgets.iter().cloned().enumerate() {
                         {
                         let widget_key = widget.key(index, &value_epochs);
+                        // Consecutive list-rows form one tight LIST: the 10px
+                        // widget gap between them collapses to ~2px, so a file
+                        // list has the cwdtree's rhythm, not a stack of cards.
+                        let follows_row = index > 0
+                            && matches!(
+                                (&schema.widgets[index - 1], &widget),
+                                (AppPaneWidget::ListRow { .. }, AppPaneWidget::ListRow { .. })
+                            );
                         match widget {
                             AppPaneWidget::Section { text, action, action_label, action_title } => rsx! {
                                 div {
@@ -85996,8 +86078,10 @@ fn AppPaneRailBody(
                                 // tiny trailing actions.
                                 let clickable = !row_action.is_empty();
                                 rsx! {
-                                    SessionStyleRow {
+                                    div {
                                         key: "{widget_key}",
+                                        style: if follows_row { "margin-top:-8px;" } else { "" },
+                                    SessionStyleRow {
                                         "data-app-pane-row": "{id}",
                                         density: SessionRowDensity::Rail,
                                         selected,
@@ -86006,12 +86090,7 @@ fn AppPaneRailBody(
                                         label: title.clone(),
                                         subtitle: (!subtitle.is_empty()).then(|| subtitle.clone()),
                                         subtitle_color: Some(palette.muted.to_string()),
-                                        icon: (!icon.is_empty()).then(|| rsx! {
-                                            span {
-                                                style: "font-size:12px; line-height:1;",
-                                                "{icon}"
-                                            }
-                                        }),
+                                        icon: (!icon.is_empty()).then(|| app_pane_row_icon(&icon)),
                                         onclick: clickable.then(|| {
                                             let (pane_id, action, row_id) =
                                                 (pane_id.clone(), row_action.clone(), id.clone());
@@ -86047,6 +86126,7 @@ fn AppPaneRailBody(
                                                 }
                                             }
                                         },
+                                    }
                                     }
                                 }
                             },
