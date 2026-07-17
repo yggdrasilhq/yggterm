@@ -47,7 +47,7 @@ use crate::terminal_observe::{
     summarize_terminal_surface_for_app_control, terminal_chunk_is_launcher_boilerplate,
 };
 use crate::terminal_protocol::{
-    Fido2Account, SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent,
+    Fido2Account, PanePlacement, SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent,
 };
 use crate::terminal_retained_replay_policy::{
     RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
@@ -1287,17 +1287,32 @@ struct SidebarContributionState {
     /// Failed `<control>/appearance` fetches for the current stamp. Capped like
     /// the zoom attempts; on exhaustion the chrome just stays at the last map.
     appearance_attempts: u32,
+    /// The app's stamp over its VIEWPORT pane content (the document surface).
+    /// Empty ⇒ the app declares no viewport pane content changes. Refetched
+    /// only when it moves, exactly like `zoom_version`; non-gating (the old
+    /// schema stays on screen while the refetch is in flight).
+    document_version: String,
+    /// Whether the document pane's schema corresponds to `document_version`.
+    document_loaded: bool,
+    /// Failed document-schema fetches for the current stamp, capped.
+    document_attempts: u32,
     last_seen_ms: u64,
 }
 
 /// What a re-declare tells the reconciler to refetch. Independent stamps
-/// (policy, zoom, appearance) so one edit does not drag the others over the wire.
+/// (policy, zoom, appearance, document) so one edit does not drag the others
+/// over the wire.
 #[derive(Debug, Clone, Copy, Default)]
 struct SidebarRefetch {
     policy: bool,
     zoom: bool,
     appearance: bool,
+    document: bool,
 }
+
+/// Attempts at a document-pane schema for one stamp before the reconciler
+/// stops asking and leaves the last schema on screen.
+const MAX_DOCUMENT_FETCH_ATTEMPTS: u32 = 3;
 
 /// Attempts at `<control>/zoom` for one stamp before the reconciler stops asking
 /// and leaves the surfaces on the global zoom.
@@ -1466,6 +1481,7 @@ impl AppPaneWidget {
             AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
             AppPaneWidget::Button { id, .. } => format!("button-{id}"),
             AppPaneWidget::ListRow { id, .. } => format!("row-{id}"),
+            AppPaneWidget::Markdown { id, .. } => format!("markdown-{id}"),
         }
     }
 
@@ -1484,7 +1500,8 @@ impl AppPaneWidget {
             AppPaneWidget::Section { .. }
             | AppPaneWidget::Label { .. }
             | AppPaneWidget::Button { .. }
-            | AppPaneWidget::ListRow { .. } => None,
+            | AppPaneWidget::ListRow { .. }
+            | AppPaneWidget::Markdown { .. } => None,
         }
     }
 }
@@ -1578,6 +1595,15 @@ enum AppPaneWidget {
         subtitle: String,
         #[serde(default)]
         actions: Vec<AppPaneRowAction>,
+    },
+    /// A block of markdown the GUI renders to native DOM — the document
+    /// surface's body widget (yedit's reader). Rendered to VNodes, NEVER via
+    /// innerHTML: note-derived content must not reach the shell's JS context,
+    /// so raw HTML blocks inside the source are dropped by construction.
+    Markdown {
+        id: String,
+        #[serde(default)]
+        source: String,
     },
 }
 
@@ -3904,6 +3930,24 @@ struct ShellState {
     /// Bumped on every pane open / action so a late reply from a superseded
     /// fetch cannot overwrite a newer schema.
     app_pane_request_seq: u64,
+    /// The DOCUMENT SURFACE's schema — the viewport-placement pane of the
+    /// session that declared it (yedit's reader). Its own channel, deliberately
+    /// separate from the rail's `app_pane_schema`: both can be open at once,
+    /// and a rail search must never clobber a document draft.
+    document_pane_schema: Option<AppPaneSchemaState>,
+    /// Which session's contribution `document_pane_schema` belongs to.
+    document_pane_session: Option<String>,
+    /// Draft values for the document's inputs (the plain-mode editor buffer),
+    /// same ownership rule as `app_pane_values`: the app owns every value.
+    document_pane_values: HashMap<String, String>,
+    document_pane_error: Option<String>,
+    /// Bumped on every document fetch / action so a late reply from a
+    /// superseded fetch cannot overwrite a newer schema.
+    document_pane_request_seq: u64,
+    /// Sessions where the user toggled the document surface OFF (to the
+    /// terminal). The ~4s re-declare must never fight this — the same
+    /// heartbeats-never-clobber-the-user rule the web surface learned.
+    document_surface_hidden: HashSet<String>,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -4396,6 +4440,12 @@ struct RenderSnapshot {
     /// error from fetching it.
     app_pane_schema: Option<AppPaneSchemaState>,
     app_pane_error: Option<String>,
+    /// The DOCUMENT SURFACE for the ACTIVE session: the viewport-placement
+    /// pane's id, whether the user has it visible, plus its fetched schema
+    /// and any fetch error. None when the active session declares none.
+    document_pane: Option<(String, bool)>,
+    document_pane_schema: Option<AppPaneSchemaState>,
+    document_pane_error: Option<String>,
     /// Host of the active surface's ACTIVE tab URL (vault pane's "for this
     /// site" filter). None when no surface / no navigated tab.
     active_web_surface_host: Option<String>,
@@ -5624,6 +5674,12 @@ impl ShellState {
             right_panel_mode_before_web_tabs: None,
             app_pane_error: None,
             app_pane_request_seq: 0,
+            document_pane_schema: None,
+            document_pane_session: None,
+            document_pane_values: HashMap::new(),
+            document_pane_error: None,
+            document_pane_request_seq: 0,
+            document_surface_hidden: HashSet::new(),
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -6393,6 +6449,20 @@ impl ShellState {
             apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
+            document_pane: active_session_path.as_deref().and_then(|path| {
+                self.viewport_pane_for_session(path).map(|pane| {
+                    (pane.id.clone(), self.document_surface_visible_for(path))
+                })
+            }),
+            // The document schema rides the snapshot only when it belongs to
+            // the ACTIVE session — a background yedit's document must not
+            // paint over the session the user is looking at.
+            document_pane_schema: self
+                .document_pane_session
+                .as_deref()
+                .filter(|owner| active_session_path.as_deref() == Some(*owner))
+                .and_then(|_| self.document_pane_schema.clone()),
+            document_pane_error: self.document_pane_error.clone(),
             active_web_surface_host: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_host_label(path)),
@@ -6899,6 +6969,7 @@ impl ShellState {
         app_name: Option<String>,
         zoom_version: Option<String>,
         appearance_version: Option<String>,
+        document_version: Option<String>,
         now_ms: u64,
         resolved: Option<(
             String,
@@ -6908,6 +6979,7 @@ impl ShellState {
         let policy_version = policy_version.unwrap_or_default();
         let zoom_version = zoom_version.unwrap_or_default();
         let appearance_version = appearance_version.unwrap_or_default();
+        let document_version = document_version.unwrap_or_default();
         if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
             existing.last_seen_ms = now_ms;
             // Panes may change between declares (an app can add one); the
@@ -6941,6 +7013,14 @@ impl ShellState {
                 existing.appearance_loaded = false;
                 existing.appearance_attempts = 0;
             }
+            // The document surface is non-gating too: the OLD schema stays on
+            // screen while the refetch is in flight, so a save that bumps the
+            // stamp never blanks the page under the user.
+            if existing.document_version != document_version {
+                existing.document_version = document_version.clone();
+                existing.document_loaded = false;
+                existing.document_attempts = 0;
+            }
             // Retry a failed fetch on the next heartbeat, but only until the
             // attempts run out — a permanently broken endpoint must not mean one
             // fetch every 4s for the life of the session.
@@ -6954,6 +7034,9 @@ impl ShellState {
                 appearance: !appearance_version.is_empty()
                     && !existing.appearance_loaded
                     && existing.appearance_attempts < MAX_APPEARANCE_FETCH_ATTEMPTS,
+                document: !document_version.is_empty()
+                    && !existing.document_loaded
+                    && existing.document_attempts < MAX_DOCUMENT_FETCH_ATTEMPTS,
             };
         }
         let Some((control_url, forward_child)) = resolved else {
@@ -6978,6 +7061,9 @@ impl ShellState {
                 appearance_overrides: HashMap::new(),
                 appearance_loaded: false,
                 appearance_attempts: 0,
+                document_version: document_version.clone(),
+                document_loaded: false,
+                document_attempts: 0,
                 last_seen_ms: now_ms,
             },
         );
@@ -6985,6 +7071,7 @@ impl ShellState {
             policy: !policy_version.is_empty(),
             zoom: !zoom_version.is_empty(),
             appearance: !appearance_version.is_empty(),
+            document: !document_version.is_empty(),
         }
     }
     /// Store the policy the app served for `policy_version`. A reply for a stale
@@ -8494,6 +8581,104 @@ impl ShellState {
     }
     fn set_app_pane_value(&mut self, widget_id: &str, value: String) {
         self.app_pane_values.insert(widget_id.to_string(), value);
+    }
+    // ===== the DOCUMENT SURFACE's schema channel =====
+    // A viewport-placement pane rendered as shell DOM in the main viewport.
+    // Same contract as the rail channel (the app owns every value, epochs
+    // rebuild only pushed values, a stale seq is dropped) on separate state,
+    // so a document draft and a rail search can never clobber each other.
+    fn document_pane_next_request(&mut self) -> u64 {
+        self.document_pane_request_seq = self.document_pane_request_seq.wrapping_add(1);
+        self.document_pane_request_seq
+    }
+    fn document_pane_apply_schema(
+        &mut self,
+        seq: u64,
+        session_path: &str,
+        pane_id: &str,
+        schema: AppPaneSchema,
+    ) {
+        if seq != self.document_pane_request_seq {
+            return;
+        }
+        let previous_epochs = self
+            .document_pane_schema
+            .as_ref()
+            .filter(|state| state.pane_id == pane_id)
+            .map(|state| state.value_epochs.clone())
+            .unwrap_or_default();
+        let mut value_epochs: HashMap<String, u64> = HashMap::new();
+        let mut values: HashMap<String, String> = HashMap::new();
+        for widget in &schema.widgets {
+            let Some((id, declared)) = widget.declared_value() else {
+                continue;
+            };
+            let epoch = previous_epochs.get(id).copied().unwrap_or(0);
+            let unchanged = self
+                .document_pane_values
+                .get(id)
+                .is_some_and(|shown| *shown == declared);
+            value_epochs.insert(
+                id.to_string(),
+                if unchanged { epoch } else { epoch.wrapping_add(1) },
+            );
+            values.insert(id.to_string(), declared);
+        }
+        self.document_pane_values = values;
+        self.document_pane_error = None;
+        self.document_pane_session = Some(session_path.to_string());
+        self.document_pane_schema = Some(AppPaneSchemaState {
+            pane_id: pane_id.to_string(),
+            schema,
+            value_epochs,
+        });
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path) {
+            contribution.document_loaded = true;
+            contribution.document_attempts = 0;
+        }
+    }
+    fn document_pane_apply_error(&mut self, seq: u64, session_path: &str, error: String) {
+        if seq != self.document_pane_request_seq {
+            return;
+        }
+        self.document_pane_error = Some(error);
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path) {
+            contribution.document_attempts = contribution.document_attempts.saturating_add(1);
+        }
+    }
+    fn clear_document_pane(&mut self) {
+        self.document_pane_schema = None;
+        self.document_pane_session = None;
+        self.document_pane_values.clear();
+        self.document_pane_error = None;
+        self.document_pane_request_seq = self.document_pane_request_seq.wrapping_add(1);
+    }
+    fn set_document_pane_value(&mut self, widget_id: &str, value: String) {
+        self.document_pane_values.insert(widget_id.to_string(), value);
+    }
+    fn document_pane_values_json(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.document_pane_values
+                .iter()
+                .map(|(id, value)| (id.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        )
+    }
+    /// The viewport-placement pane a session's contribution declares, if any.
+    /// First one wins; one document surface per session.
+    fn viewport_pane_for_session(&self, session_path: &str) -> Option<&SidebarPaneDeclaration> {
+        self.sidebar_contributions
+            .get(session_path)?
+            .panes
+            .iter()
+            .find(|pane| pane.placement == PanePlacement::Viewport)
+    }
+    /// Visible = the active session declares a viewport pane AND the user has
+    /// not toggled it off. Pure derivation — the ~4s re-declare mutates
+    /// nothing, so it can never fight the user's toggle.
+    fn document_surface_visible_for(&self, session_path: &str) -> bool {
+        self.viewport_pane_for_session(session_path).is_some()
+            && !self.document_surface_hidden.contains(session_path)
     }
     /// The pane's draft input values, as the action POST carries them. These
     /// leave the GUI only when the user fires an action.
@@ -40785,6 +40970,106 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
     }
 }
 
+/// Fetch the DOCUMENT SURFACE's schema — the viewport-placement pane of
+/// `session_path`'s contribution. Session-scoped (not active-session-scoped):
+/// a declare from a background session must refresh ITS document, not steal
+/// whatever session the user is looking at.
+async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path: String, seq: u64) {
+    let target = {
+        let shell = state.read();
+        shell
+            .viewport_pane_for_session(&session_path)
+            .map(|pane| pane.id.clone())
+            .and_then(|pane_id| {
+                shell
+                    .sidebar_control_url(&session_path)
+                    .map(|control| (pane_id, control))
+            })
+    };
+    let Some((pane_id, control_url)) = target else {
+        return;
+    };
+    let url = app_pane_schema_url(&control_url, &pane_id);
+    let fetched = task::spawn_blocking(move || control_request(&url, None))
+        .await
+        .unwrap_or_else(|error| Err(format!("document schema fetch panicked: {error}")));
+    match fetched.and_then(|value| {
+        serde_json::from_value::<AppPaneSchema>(value)
+            .map_err(|error| format!("document schema is malformed: {error}"))
+    }) {
+        Ok(schema) => state.with_mut(|shell| {
+            shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
+        }),
+        Err(error) => {
+            state.with_mut(|shell| shell.document_pane_apply_error(seq, &session_path, error))
+        }
+    }
+}
+
+/// POST a document-surface action to the app and apply the reply to the
+/// DOCUMENT channel. The rail's `app_pane_run_action` twin, kept separate so
+/// the two channels' seq/values can never cross; toast handling is shared
+/// behaviour by contract (the app names its own pane).
+async fn document_pane_run_action(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    pane_id: String,
+    action: String,
+    value: Option<String>,
+) {
+    let (control_url, mut values) = {
+        let shell = state.read();
+        (
+            shell.sidebar_control_url(&session_path),
+            shell.document_pane_values_json(),
+        )
+    };
+    let Some(control_url) = control_url else {
+        return;
+    };
+    if let (Some(value), Some(map)) = (value, values.as_object_mut()) {
+        map.insert("value".to_string(), serde_json::Value::String(value));
+    }
+    let seq = state.with_mut(|shell| shell.document_pane_next_request());
+    let url = app_pane_action_url(&control_url);
+    let body = json!({ "pane": pane_id, "action": action, "values": values });
+    let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
+        .await
+        .unwrap_or_else(|error| Err(format!("document action panicked: {error}")));
+    let reply = match replied.and_then(|value| {
+        if value.is_null() {
+            return Ok(AppPaneActionReply::default());
+        }
+        serde_json::from_value::<AppPaneActionReply>(value)
+            .map_err(|error| format!("document action reply is malformed: {error}"))
+    }) {
+        Ok(reply) => reply,
+        Err(error) => {
+            state.with_mut(|shell| {
+                shell.push_notification(NotificationTone::Error, "App action failed", error);
+            });
+            return;
+        }
+    };
+    if let Some(schema) = reply.schema {
+        state.with_mut(|shell| {
+            shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
+        });
+    }
+    if let Some(toast) = reply.toast {
+        state.with_mut(|shell| {
+            let title = shell
+                .document_pane_schema
+                .as_ref()
+                .filter(|s| s.pane_id == pane_id)
+                .map(|s| s.schema.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| pane_id.clone());
+            shell.push_notification(NotificationTone::Info, title, toast);
+        });
+    }
+}
+
 /// GET `<control>/policy` — the app's effective adblock ruleset + userscripts
 /// for the profile it is running — and hand it to the surface reconciler, which
 /// is blocking a lazy create until it lands.
@@ -55212,6 +55497,40 @@ fn MainSurface(
                             }
                         }
                     }
+                    // The DOCUMENT SURFACE: a viewport-placement pane rendered
+                    // as shell DOM over the terminal layer. Ordinary DOM — it
+                    // clips, z-orders, screenshots and dom-evals like the rest
+                    // of the chrome (everything a native child webview cannot).
+                    if snapshot.document_pane.as_ref().is_some_and(|(_, visible)| *visible) {
+                        DocumentSurfaceBody {
+                            snapshot: snapshot.clone(),
+                            state,
+                            session_path: session.session_path.clone(),
+                        }
+                    } else if snapshot.document_pane.is_some() {
+                        // Hidden by the user's toggle: a floating chip is the
+                        // way back (the app cannot draw one — its surface is
+                        // exactly what is hidden).
+                        button {
+                            style: format!(
+                                "position:absolute; top:10px; right:14px; z-index:30; padding:5px 12px; \
+                                 border:1px solid rgba(127,127,127,0.4); border-radius:8px; cursor:pointer; \
+                                 background:{}; color:{}; font-size:11px; font-weight:600;",
+                                snapshot.palette.panel, snapshot.palette.text
+                            ),
+                            title: "Show the app's document view",
+                            onclick: {
+                                let mut state = state;
+                                let session_path = session.session_path.clone();
+                                move |_| {
+                                    state.with_mut(|shell| {
+                                        shell.document_surface_hidden.remove(&session_path);
+                                    });
+                                }
+                            },
+                            "📄\u{fe0e} Document"
+                        }
+                    }
                 }
             }
         }
@@ -60753,6 +61072,7 @@ fn TerminalCanvas(
                                 app_name,
                                 zoom_version,
                                 appearance_version,
+                                document_version,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -60776,6 +61096,7 @@ fn TerminalCanvas(
                                                     app_name.clone(),
                                                     zoom_version.clone(),
                                                     appearance_version.clone(),
+                                                    document_version.clone(),
                                                     now_ms,
                                                     None,
                                                 )
@@ -60813,6 +61134,7 @@ fn TerminalCanvas(
                                                     app_name.clone(),
                                                     zoom_version.clone(),
                                                     appearance_version.clone(),
+                                                    document_version.clone(),
                                                     now_ms,
                                                     Some((effective_control.clone(), forward_child)),
                                                 )
@@ -60865,6 +61187,17 @@ fn TerminalCanvas(
                                             let session = contribution_session_path.clone();
                                             spawn(app_appearance_fetch(state, session, version, trace_home));
                                         }
+                                        // The document surface's content moved (a
+                                        // save/edit on the app's host) or this is
+                                        // its first declare. Non-gating: the old
+                                        // schema stays painted until the fresh one
+                                        // lands.
+                                        if refetch.document {
+                                            let session = contribution_session_path.clone();
+                                            let seq = state
+                                                .with_mut(|shell| shell.document_pane_next_request());
+                                            spawn(document_pane_fetch_schema(state, session, seq));
+                                        }
                                     }
                                     "close" => {
                                         state.with_mut(|shell| {
@@ -60883,6 +61216,13 @@ fn TerminalCanvas(
                                             shell.app_pane_schema = None;
                                             shell.app_pane_values.clear();
                                             shell.app_pane_error = None;
+                                            // The document surface is the same
+                                            // app's tenant in the viewport.
+                                            if shell.document_pane_session.as_deref()
+                                                == Some(contribution_session_path.as_str())
+                                            {
+                                                shell.clear_document_pane();
+                                            }
                                         });
                                         append_trace_event(
                                             &trace_home,
@@ -71399,12 +71739,16 @@ fn terminal_eval_script_with_canvas_renderer(
                                 appearance_version: typeof payload.appearance_version === 'string'
                                     ? payload.appearance_version
                                     : null,
+                                document_version: typeof payload.document_version === 'string'
+                                    ? payload.document_version
+                                    : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
                                     .map((pane) => ({{
                                         id: pane.id,
                                         icon: typeof pane.icon === 'string' ? pane.icon : '',
                                         title: typeof pane.title === 'string' ? pane.title : '',
+                                        placement: typeof pane.placement === 'string' ? pane.placement : null,
                                     }})),
                             }});
                             return true;
@@ -83167,6 +83511,716 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
 ///
 /// This component is the whole reason `RightPanelMode::Vault` and `::AppSidebar`
 /// are gone. Adding an app-specific branch here defeats it.
+// ===== markdown → native DOM (the document surface's body widget) =====
+//
+// Parsed with pulldown-cmark into a small block tree, rendered to VNodes.
+// NEVER innerHTML: note-derived content must not reach the shell's JS context.
+// Raw HTML blocks/spans in the source are dropped by construction; images
+// render as their alt text + a link (asset transport is a follow-up; the GUI
+// cannot assume a note's relative path is fetchable from its own host).
+
+#[derive(Debug, Clone, PartialEq)]
+enum MdInline {
+    Text(String),
+    Code(String),
+    Strong(Vec<MdInline>),
+    Emphasis(Vec<MdInline>),
+    Strikethrough(Vec<MdInline>),
+    Link {
+        href: String,
+        children: Vec<MdInline>,
+    },
+    HardBreak,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MdBlock {
+    Heading {
+        level: u8,
+        children: Vec<MdInline>,
+    },
+    Paragraph(Vec<MdInline>),
+    CodeBlock(String),
+    BlockQuote(Vec<MdBlock>),
+    List {
+        ordered: bool,
+        items: Vec<Vec<MdBlock>>,
+    },
+    Table {
+        header: Vec<Vec<MdInline>>,
+        rows: Vec<Vec<Vec<MdInline>>>,
+    },
+    Rule,
+}
+
+fn parse_markdown_blocks(source: &str) -> Vec<MdBlock> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(source, options);
+
+    // One growing tree, folded from the event stream. `block_stack` holds the
+    // containers currently open (quote bodies, list items); `inline_stack`
+    // the inline spans (strong/emphasis/link).
+    let mut root: Vec<MdBlock> = Vec::new();
+    let mut block_stack: Vec<Vec<MdBlock>> = Vec::new();
+    let mut inline: Vec<MdInline> = Vec::new();
+    let mut inline_stack: Vec<(u8, String, Vec<MdInline>)> = Vec::new(); // (kind, href, saved)
+    let mut list_stack: Vec<(bool, Vec<Vec<MdBlock>>)> = Vec::new();
+    let mut table_header: Vec<Vec<MdInline>> = Vec::new();
+    let mut table_rows: Vec<Vec<Vec<MdInline>>> = Vec::new();
+    let mut table_cells: Vec<Vec<MdInline>> = Vec::new();
+    let mut in_table_head = false;
+    let mut in_table = false;
+    let mut code_block: Option<String> = None;
+    let mut heading_level: Option<u8> = None;
+
+    let heading_number = |level: HeadingLevel| -> u8 {
+        match level {
+            HeadingLevel::H1 => 1,
+            HeadingLevel::H2 => 2,
+            HeadingLevel::H3 => 3,
+            HeadingLevel::H4 => 4,
+            HeadingLevel::H5 => 5,
+            HeadingLevel::H6 => 6,
+        }
+    };
+    fn sink<'a>(
+        root: &'a mut Vec<MdBlock>,
+        block_stack: &'a mut Vec<Vec<MdBlock>>,
+    ) -> &'a mut Vec<MdBlock> {
+        block_stack.last_mut().unwrap_or(root)
+    }
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading_level = Some(heading_number(level));
+                inline.clear();
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                let children = std::mem::take(&mut inline);
+                let level = heading_level.take().unwrap_or(1);
+                sink(&mut root, &mut block_stack).push(MdBlock::Heading { level, children });
+            }
+            Event::Start(Tag::Paragraph) => inline.clear(),
+            Event::End(TagEnd::Paragraph) => {
+                let children = std::mem::take(&mut inline);
+                if in_table {
+                    // Loose table cells parse as paragraphs; fold into the cell.
+                    table_cells.last_mut().map(|cell| cell.extend(children));
+                } else {
+                    sink(&mut root, &mut block_stack).push(MdBlock::Paragraph(children));
+                }
+            }
+            Event::Start(Tag::CodeBlock(_)) => code_block = Some(String::new()),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(text) = code_block.take() {
+                    sink(&mut root, &mut block_stack).push(MdBlock::CodeBlock(text));
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => block_stack.push(Vec::new()),
+            Event::End(TagEnd::BlockQuote(_)) => {
+                let body = block_stack.pop().unwrap_or_default();
+                sink(&mut root, &mut block_stack).push(MdBlock::BlockQuote(body));
+            }
+            Event::Start(Tag::List(start)) => list_stack.push((start.is_some(), Vec::new())),
+            Event::End(TagEnd::List(_)) => {
+                if let Some((ordered, items)) = list_stack.pop() {
+                    sink(&mut root, &mut block_stack).push(MdBlock::List { ordered, items });
+                }
+            }
+            Event::Start(Tag::Item) => block_stack.push(Vec::new()),
+            Event::End(TagEnd::Item) => {
+                let mut body = block_stack.pop().unwrap_or_default();
+                // A tight list item's text arrives as bare inlines, not a
+                // paragraph — flush whatever inline content is pending.
+                if !inline.is_empty() {
+                    body.insert(0, MdBlock::Paragraph(std::mem::take(&mut inline)));
+                }
+                if let Some((_ordered, items)) = list_stack.last_mut() {
+                    items.push(body);
+                }
+            }
+            Event::Start(Tag::Table(_)) => {
+                in_table = true;
+                table_header.clear();
+                table_rows.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                sink(&mut root, &mut block_stack).push(MdBlock::Table {
+                    header: std::mem::take(&mut table_header),
+                    rows: std::mem::take(&mut table_rows),
+                });
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                table_cells.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                in_table_head = false;
+                table_header = std::mem::take(&mut table_cells);
+            }
+            Event::Start(Tag::TableRow) => table_cells.clear(),
+            Event::End(TagEnd::TableRow) => {
+                table_rows.push(std::mem::take(&mut table_cells));
+            }
+            Event::Start(Tag::TableCell) => {
+                table_cells.push(Vec::new());
+                inline.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                let content = std::mem::take(&mut inline);
+                if let Some(cell) = table_cells.last_mut() {
+                    cell.extend(content);
+                }
+            }
+            Event::Start(Tag::Strong) => {
+                inline_stack.push((0, String::new(), std::mem::take(&mut inline)));
+            }
+            Event::End(TagEnd::Strong) => {
+                if let Some((_, _, saved)) = inline_stack.pop() {
+                    let children = std::mem::replace(&mut inline, saved);
+                    inline.push(MdInline::Strong(children));
+                }
+            }
+            Event::Start(Tag::Emphasis) => {
+                inline_stack.push((1, String::new(), std::mem::take(&mut inline)));
+            }
+            Event::End(TagEnd::Emphasis) => {
+                if let Some((_, _, saved)) = inline_stack.pop() {
+                    let children = std::mem::replace(&mut inline, saved);
+                    inline.push(MdInline::Emphasis(children));
+                }
+            }
+            Event::Start(Tag::Strikethrough) => {
+                inline_stack.push((2, String::new(), std::mem::take(&mut inline)));
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                if let Some((_, _, saved)) = inline_stack.pop() {
+                    let children = std::mem::replace(&mut inline, saved);
+                    inline.push(MdInline::Strikethrough(children));
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                inline_stack.push((3, dest_url.to_string(), std::mem::take(&mut inline)));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((_, href, saved)) = inline_stack.pop() {
+                    let children = std::mem::replace(&mut inline, saved);
+                    inline.push(MdInline::Link { href, children });
+                }
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                inline_stack.push((4, dest_url.to_string(), std::mem::take(&mut inline)));
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((_, href, saved)) = inline_stack.pop() {
+                    let mut children = std::mem::replace(&mut inline, saved);
+                    if children.is_empty() {
+                        children.push(MdInline::Text("image".to_string()));
+                    }
+                    inline.push(MdInline::Text("🖼 ".to_string()));
+                    inline.push(MdInline::Link { href, children });
+                }
+            }
+            Event::Text(text) => {
+                if let Some(code) = code_block.as_mut() {
+                    code.push_str(&text);
+                } else {
+                    inline.push(MdInline::Text(text.to_string()));
+                }
+            }
+            Event::Code(code) => inline.push(MdInline::Code(code.to_string())),
+            Event::SoftBreak => inline.push(MdInline::Text(" ".to_string())),
+            Event::HardBreak => inline.push(MdInline::HardBreak),
+            Event::Rule => sink(&mut root, &mut block_stack).push(MdBlock::Rule),
+            Event::TaskListMarker(done) => {
+                inline.push(MdInline::Text(if done { "☑ " } else { "☐ " }.to_string()));
+            }
+            // Raw HTML never reaches the DOM — dropped, not escaped-and-shown.
+            Event::Html(_) | Event::InlineHtml(_) => {}
+            Event::FootnoteReference(name) => {
+                inline.push(MdInline::Text(format!("[{name}]")));
+            }
+            _ => {}
+        }
+    }
+    if !inline.is_empty() {
+        root.push(MdBlock::Paragraph(inline));
+    }
+    root
+}
+
+fn md_inline_nodes(items: &[MdInline], palette: &Palette) -> Element {
+    let code_style = format!(
+        "background:rgba(127,127,127,0.14); border:1px solid rgba(127,127,127,0.25); \
+         border-radius:4px; padding:1px 5px; font-family:ui-monospace, monospace; \
+         font-size:0.88em; color:{};",
+        palette.text
+    );
+    let link_style = format!("color:{}; text-decoration:underline;", palette.accent);
+    rsx! {
+        for (index, item) in items.iter().enumerate() {
+            match item {
+                MdInline::Text(text) => rsx! { span { key: "t{index}", "{text}" } },
+                MdInline::Code(code) => rsx! { code { key: "c{index}", style: "{code_style}", "{code}" } },
+                MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes(children, palette)} } },
+                MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes(children, palette)} } },
+                MdInline::Strikethrough(children) => rsx! { s { key: "s{index}", {md_inline_nodes(children, palette)} } },
+                MdInline::Link { href, children } => rsx! {
+                    a {
+                        key: "a{index}",
+                        style: "{link_style}",
+                        title: "{href}",
+                        href: "{href}",
+                        prevent_default: "onclick",
+                        {md_inline_nodes(children, palette)}
+                    }
+                },
+                MdInline::HardBreak => rsx! { br { key: "br{index}" } },
+            }
+        }
+    }
+}
+
+fn md_block_node(block: &MdBlock, palette: &Palette, index: usize) -> Element {
+    let border = "rgba(127,127,127,0.30)";
+    match block {
+        MdBlock::Heading { level, children } => {
+            let (size, weight, margin) = match level {
+                1 => ("1.55em", "800", "18px 0 10px 0"),
+                2 => ("1.32em", "750", "16px 0 8px 0"),
+                3 => ("1.16em", "700", "14px 0 6px 0"),
+                _ => ("1.02em", "700", "12px 0 4px 0"),
+            };
+            let style = format!(
+                "font-size:{size}; font-weight:{weight}; margin:{margin}; color:{}; \
+                 border-bottom:{}; padding-bottom:{};",
+                palette.text,
+                if *level <= 2 {
+                    format!("1px solid {border}")
+                } else {
+                    "none".to_string()
+                },
+                if *level <= 2 { "4px" } else { "0" },
+            );
+            rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes(children, palette)} } }
+        }
+        MdBlock::Paragraph(children) => rsx! {
+            p {
+                key: "p{index}",
+                style: format!("margin:7px 0; line-height:1.6; color:{};", palette.text),
+                {md_inline_nodes(children, palette)}
+            }
+        },
+        MdBlock::CodeBlock(code) => rsx! {
+            pre {
+                key: "pre{index}",
+                style: format!(
+                    "background:rgba(127,127,127,0.12); border:1px solid {border}; \
+                     border-radius:7px; padding:10px 14px; overflow-x:auto; margin:10px 0; \
+                     font-family:ui-monospace, monospace; font-size:0.88em; line-height:1.5; color:{};",
+                    palette.text
+                ),
+                "{code}"
+            }
+        },
+        MdBlock::BlockQuote(body) => rsx! {
+            div {
+                key: "q{index}",
+                style: format!(
+                    "border-left:3px solid {}; margin:8px 0; padding:2px 0 2px 14px; color:{};",
+                    palette.accent, palette.muted
+                ),
+                for (child_index, child) in body.iter().enumerate() {
+                    {md_block_node(child, palette, child_index)}
+                }
+            }
+        },
+        MdBlock::List { ordered, items } => {
+            let list_body = rsx! {
+                for (item_index, item) in items.iter().enumerate() {
+                    li {
+                        key: "li{item_index}",
+                        style: "margin:3px 0; line-height:1.55;",
+                        for (child_index, child) in item.iter().enumerate() {
+                            {md_block_node(child, palette, child_index)}
+                        }
+                    }
+                }
+            };
+            if *ordered {
+                rsx! { ol { key: "ol{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.text), {list_body} } }
+            } else {
+                rsx! { ul { key: "ul{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.text), {list_body} } }
+            }
+        }
+        MdBlock::Table { header, rows } => {
+            let cell_style = format!(
+                "border:1px solid {border}; padding:5px 10px; text-align:left; \
+                 vertical-align:top; line-height:1.45; color:{};",
+                palette.text
+            );
+            let head_style = format!("{cell_style} background:rgba(127,127,127,0.12); font-weight:700;");
+            rsx! {
+                // Wide tables scroll inside their own container; the document
+                // never scrolls horizontally (the triage-board acceptance rule).
+                div {
+                    key: "tw{index}",
+                    style: "overflow-x:auto; margin:10px 0;",
+                    table {
+                        style: "border-collapse:collapse; font-size:0.94em;",
+                        if !header.is_empty() {
+                            thead {
+                                tr {
+                                    for (cell_index, cell) in header.iter().enumerate() {
+                                        th { key: "th{cell_index}", style: "{head_style}", {md_inline_nodes(cell, palette)} }
+                                    }
+                                }
+                            }
+                        }
+                        tbody {
+                            for (row_index, row) in rows.iter().enumerate() {
+                                tr {
+                                    key: "tr{row_index}",
+                                    for (cell_index, cell) in row.iter().enumerate() {
+                                        td { key: "td{cell_index}", style: "{cell_style}", {md_inline_nodes(cell, palette)} }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MdBlock::Rule => rsx! {
+            div { key: "hr{index}", style: format!("border-top:1px solid {border}; margin:14px 0;") }
+        },
+    }
+}
+
+/// The `markdown` widget's body: parse + render, document typography.
+fn markdown_widget_body(source: &str, palette: &Palette) -> Element {
+    let blocks = parse_markdown_blocks(source);
+    rsx! {
+        div {
+            style: "font-size:13.5px;",
+            for (index, block) in blocks.iter().enumerate() {
+                {md_block_node(block, palette, index)}
+            }
+        }
+    }
+}
+
+/// The DOCUMENT SURFACE body: the viewport-placement pane's schema rendered
+/// at document scale. Chrome widgets (tabs, buttons, toggles, labels) form a
+/// top bar; `markdown` and multiline `text-input` widgets are the scrolling
+/// body. Same ownership contract as the rail: the app declares, yggterm
+/// renders generic widgets and knows nothing about notes.
+#[component]
+fn DocumentSurfaceBody(
+    snapshot: SharedSnapshot,
+    state: Signal<ShellState>,
+    session_path: String,
+) -> Element {
+    let palette = snapshot.palette;
+    let Some((pane_id, _visible)) = snapshot.document_pane.clone() else {
+        return rsx! {};
+    };
+    let pane_state = snapshot
+        .document_pane_schema
+        .as_ref()
+        .filter(|state| state.pane_id == pane_id);
+    let value_epochs = pane_state
+        .map(|state| state.value_epochs.clone())
+        .unwrap_or_default();
+    let schema = pane_state.map(|state| state.schema.clone());
+    let error = snapshot.document_pane_error.clone();
+
+    let run_action = {
+        let session_path = session_path.clone();
+        let pane_id = pane_id.clone();
+        move |action: String, value: Option<String>| {
+            spawn(document_pane_run_action(
+                state,
+                session_path.clone(),
+                pane_id.clone(),
+                action,
+                value,
+            ));
+        }
+    };
+
+    let layer_style = format!(
+        "position:absolute; inset:0; z-index:20; display:flex; flex-direction:column; \
+         min-width:0; min-height:0; overflow:hidden; background:{}; border-radius:11px;",
+        palette.panel
+    );
+    let bar_style = format!(
+        "display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 14px; \
+         border-bottom:1px solid rgba(127,127,127,0.25); background:{}; flex:0 0 auto;",
+        palette.panel
+    );
+    let bar_button_style = format!(
+        "padding:4px 11px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
+         background:transparent; color:{}; font-size:11px; font-weight:600; cursor:pointer;",
+        palette.text
+    );
+    let bar_button_primary_style = format!(
+        "padding:4px 11px; border:0; border-radius:7px; background:{}; color:#fff; \
+         font-size:11px; font-weight:700; cursor:pointer;",
+        palette.accent
+    );
+    let bar_label_style = format!("font-size:11px; color:{};", palette.muted);
+    let bar_title_style = format!(
+        "font-size:12px; font-weight:700; color:{}; overflow:hidden; \
+         text-overflow:ellipsis; white-space:nowrap; min-width:0;",
+        palette.text
+    );
+    let editor_style = format!(
+        "flex:1 1 auto; min-height:0; width:100%; border:0; outline:none; resize:none; \
+         background:transparent; color:{}; padding:14px 20px; font-family:ui-monospace, monospace; \
+         font-size:12.5px; line-height:1.55; tab-size:4;",
+        palette.text
+    );
+
+    // Chrome widgets go to the bar; markdown + multiline inputs are the body.
+    let (bar_widgets, body_widgets): (Vec<AppPaneWidget>, Vec<AppPaneWidget>) = schema
+        .as_ref()
+        .map(|schema| {
+            schema.widgets.iter().cloned().partition(|widget| {
+                !matches!(
+                    widget,
+                    AppPaneWidget::Markdown { .. }
+                        | AppPaneWidget::TextInput { multiline: true, .. }
+                        | AppPaneWidget::ListRow { .. }
+                )
+            })
+        })
+        .unwrap_or_default();
+
+    rsx! {
+        div {
+            "data-document-surface": "{pane_id}",
+            style: "{layer_style}",
+            div {
+                style: "{bar_style}",
+                for (index, widget) in bar_widgets.iter().enumerate() {
+                    {
+                        let widget_key = widget.key(index, &value_epochs);
+                        match widget {
+                            AppPaneWidget::Section { text } | AppPaneWidget::Label { text, muted: _ } => rsx! {
+                                span {
+                                    key: "{widget_key}",
+                                    style: if matches!(widget, AppPaneWidget::Section { .. }) { bar_title_style.clone() } else { bar_label_style.clone() },
+                                    "{text}"
+                                }
+                            },
+                            AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    style: "display:flex; gap:4px; flex-wrap:wrap; min-width:0;",
+                                    for tab in tabs.iter().cloned() {
+                                        button {
+                                            key: "{id}-{tab.id}",
+                                            style: if tab.id == *active { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                            title: "{tab.label}",
+                                            onclick: {
+                                                let run_action = run_action.clone();
+                                                let action = action.clone();
+                                                let tab_id = tab.id.clone();
+                                                move |_| run_action(action.clone(), Some(tab_id.clone()))
+                                            },
+                                            "{tab.label}"
+                                        }
+                                    }
+                                }
+                            },
+                            AppPaneWidget::Toggle { id: _, label, action, value } => rsx! {
+                                button {
+                                    key: "{widget_key}",
+                                    style: if *value { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                    onclick: {
+                                        let run_action = run_action.clone();
+                                        let action = action.clone();
+                                        let next = (!*value).to_string();
+                                        move |_| run_action(action.clone(), Some(next.clone()))
+                                    },
+                                    "{label}"
+                                }
+                            },
+                            AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                                button {
+                                    key: "{widget_key}",
+                                    "data-document-button": "{id}",
+                                    style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
+                                    onclick: {
+                                        let run_action = run_action.clone();
+                                        let action = action.clone();
+                                        move |_| run_action(action.clone(), None)
+                                    },
+                                    "{label}"
+                                }
+                            },
+                            AppPaneWidget::TextInput { id, placeholder, value, action, .. } => rsx! {
+                                input {
+                                    key: "{widget_key}",
+                                    "data-document-input": "{id}",
+                                    style: format!(
+                                        "padding:4px 10px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
+                                         background:rgba(127,127,127,0.08); color:{}; font-size:11px; outline:none; \
+                                         min-width:200px; flex:0 1 340px;",
+                                        palette.text
+                                    ),
+                                    placeholder: "{placeholder}",
+                                    initial_value: "{value}",
+                                    oninput: {
+                                        let mut state = state;
+                                        let id = id.clone();
+                                        move |evt: FormEvent| {
+                                            state.with_mut(|shell| {
+                                                shell.set_document_pane_value(&id, evt.value());
+                                            });
+                                        }
+                                    },
+                                    onkeydown: {
+                                        let run_action = run_action.clone();
+                                        let action = action.clone();
+                                        move |evt: KeyboardEvent| {
+                                            if evt.key() == Key::Enter && !action.is_empty() {
+                                                run_action(action.clone(), None);
+                                            }
+                                        }
+                                    },
+                                }
+                            },
+                            _ => rsx! { span { key: "{widget_key}" } },
+                        }
+                    }
+                }
+                // yggterm's own toggle back to the terminal — the one control
+                // the app cannot own, because it hides the app's surface.
+                div { style: "flex:1 1 auto;" }
+                button {
+                    style: "{bar_button_style}",
+                    title: "Show the terminal (the app keeps running)",
+                    onclick: {
+                        let mut state = state;
+                        let session_path = session_path.clone();
+                        move |_| {
+                            state.with_mut(|shell| {
+                                shell
+                                    .document_surface_hidden
+                                    .insert(session_path.clone());
+                            });
+                        }
+                    },
+                    "⌨\u{fe0e} Terminal"
+                }
+            }
+            if let Some(error) = error {
+                div {
+                    style: format!("padding:10px 16px; color:{}; font-size:12px;", palette.muted),
+                    "Document unavailable: {error}"
+                }
+            }
+            div {
+                style: "flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:auto;",
+                if body_widgets.is_empty() && schema.is_some() {
+                    div {
+                        style: format!("padding:26px; color:{}; font-size:13px;", palette.muted),
+                        "The app declared no document body."
+                    }
+                } else if schema.is_none() {
+                    div {
+                        style: format!("padding:26px; color:{}; font-size:13px;", palette.muted),
+                        "Loading document…"
+                    }
+                }
+                for (index, widget) in body_widgets.iter().enumerate() {
+                    {
+                        let widget_key = widget.key(index, &value_epochs);
+                        match widget {
+                            AppPaneWidget::Markdown { id, source } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    "data-document-markdown": "{id}",
+                                    style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
+                                    {markdown_widget_body(source, &palette)}
+                                }
+                            },
+                            AppPaneWidget::ListRow { id, title, subtitle, actions } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    "data-document-row": "{id}",
+                                    style: format!(
+                                        "display:flex; align-items:center; gap:10px; margin:3px 26px; padding:9px 14px; \
+                                         border-radius:9px; background:rgba(127,127,127,0.08); color:{}; max-width:720px;",
+                                        palette.text
+                                    ),
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                        div {
+                                            style: "font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                            "{title}"
+                                        }
+                                        if !subtitle.is_empty() {
+                                            div {
+                                                style: format!("font-size:11px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", palette.muted),
+                                                "{subtitle}"
+                                            }
+                                        }
+                                    }
+                                    for row_action in actions.iter().cloned() {
+                                        button {
+                                            key: "{row_action.action}",
+                                            style: format!(
+                                                "border:0; border-radius:7px; background:transparent; color:{}; \
+                                                 font-size:13px; cursor:pointer; padding:3px 8px;",
+                                                palette.muted
+                                            ),
+                                            title: "{row_action.title}",
+                                            onclick: {
+                                                let run_action = run_action.clone();
+                                                let (action, row_id) = (row_action.action.clone(), id.clone());
+                                                move |_| run_action(action.clone(), Some(row_id.clone()))
+                                            },
+                                            "{row_action.label}"
+                                        }
+                                    }
+                                }
+                            },
+                            AppPaneWidget::TextInput { id, value, .. } => rsx! {
+                                textarea {
+                                    key: "{widget_key}",
+                                    "data-document-editor": "{id}",
+                                    style: "{editor_style}",
+                                    spellcheck: "false",
+                                    initial_value: "{value}",
+                                    oninput: {
+                                        let mut state = state;
+                                        let id = id.clone();
+                                        move |evt: FormEvent| {
+                                            state.with_mut(|shell| {
+                                                shell.set_document_pane_value(&id, evt.value());
+                                            });
+                                        }
+                                    },
+                                }
+                            },
+                            _ => rsx! { span { key: "{widget_key}" } },
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
@@ -83456,6 +84510,14 @@ fn AppPaneRailBody(
                                             "{row_action.label}"
                                         }
                                     }
+                                }
+                            },
+                            AppPaneWidget::Markdown { id, source } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    "data-app-pane-markdown": "{id}",
+                                    style: "font-size:11px; min-width:0; overflow-wrap:anywhere;",
+                                    {markdown_widget_body(&source, &palette)}
                                 }
                             },
                         }
@@ -95670,7 +96732,9 @@ mod tests {
                 id: pane_id.to_string(),
                 icon: "🔑".to_string(),
                 title: "Vault".to_string(),
-            }],
+                placement: PanePlacement::Rail,
+                }],
+            None,
             None,
             None,
             None,
@@ -95693,8 +96757,10 @@ mod tests {
                     id: "settings".to_string(),
                     icon: "⚙".to_string(),
                     title: "Settings".to_string(),
+                    placement: PanePlacement::Rail,
                 }],
                 policy_version.map(str::to_string),
+                None,
                 None,
                 None,
                 None,
@@ -96728,6 +97794,76 @@ mod tests {
     // and no userscripts. That is exactly what shipped before a live probe caught
     // it; this test is the tripwire.
     #[test]
+    /// The document surface's markdown renderer: structure lands as typed
+    /// blocks (the triage-board acceptance shape — a wide table), and raw
+    /// HTML is DROPPED, never forwarded toward the DOM.
+    #[test]
+    fn markdown_blocks_parse_tables_and_drop_raw_html() {
+        let source = "# Title\n\n<script>alert(1)</script>\n\n\
+                      | a | b |\n|---|---|\n| 1 | **2** |\n\n- item one\n- item two\n";
+        let blocks = super::parse_markdown_blocks(source);
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, super::MdBlock::Heading { level: 1, .. })),
+            "heading missing: {blocks:?}"
+        );
+        let table = blocks.iter().find_map(|b| match b {
+            super::MdBlock::Table { header, rows } => Some((header.len(), rows.len())),
+            _ => None,
+        });
+        assert_eq!(table, Some((2, 1)), "2-col 1-row table expected: {blocks:?}");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, super::MdBlock::List { ordered: false, items } if items.len() == 2)),
+            "list missing: {blocks:?}"
+        );
+        let flat = format!("{blocks:?}");
+        assert!(
+            !flat.contains("script") && !flat.contains("alert"),
+            "raw HTML must be dropped, not carried: {flat}"
+        );
+    }
+
+    /// A `markdown` widget deserializes and keys by identity; the `placement`
+    /// wire field maps "viewport" / absent to the right enum.
+    #[test]
+    fn markdown_widget_and_placement_wire_shapes() {
+        let widget: AppPaneWidget = serde_json::from_value(serde_json::json!({
+            "kind": "markdown", "id": "body", "source": "# hi"
+        }))
+        .expect("markdown widget deserializes");
+        assert!(matches!(&widget, AppPaneWidget::Markdown { id, source } if id == "body" && source == "# hi"));
+        assert_eq!(widget.key(3, &HashMap::new()), "markdown-body");
+        assert!(widget.declared_value().is_none());
+
+        use crate::terminal_protocol::parse_terminal_js_event_for_test as parse;
+        let event = parse(serde_json::json!({
+            "kind": "sidebar_contribution",
+            "action": "declare",
+            "session": "s1",
+            "control": "http://127.0.0.1:1",
+            "document_version": "v7",
+            "panes": [
+                {"id": "doc", "icon": "d", "title": "Doc", "placement": "viewport"},
+                {"id": "rail", "icon": "r", "title": "Rail"},
+            ],
+        }));
+        let TerminalJsEvent::SidebarContribution {
+            panes,
+            document_version,
+            ..
+        } = event
+        else {
+            panic!("not a sidebar contribution");
+        };
+        assert_eq!(document_version.as_deref(), Some("v7"));
+        assert_eq!(panes[0].placement, PanePlacement::Viewport);
+        assert_eq!(panes[1].placement, PanePlacement::Rail);
+    }
+
+    #[test]
     fn terminal_eval_script_forwards_every_sidebar_declaration_field() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
@@ -96737,6 +97873,8 @@ mod tests {
             "policy_version:",
             "app_name:",
             "zoom_version:",
+            "document_version:",
+            "placement:",
             "panes:",
         ] {
             assert!(
@@ -114473,6 +115611,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115109,6 +116250,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115280,6 +116424,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115451,6 +116598,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115625,6 +116775,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115803,6 +116956,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -115973,6 +117129,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116143,6 +117302,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116347,6 +117509,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116520,6 +117685,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -116725,6 +117893,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -117107,6 +118278,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            document_pane: None,
+            document_pane_schema: None,
+            document_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,

@@ -6,6 +6,7 @@ authors.workspace = true
 license = "GPL-3.0-or-later"
 
 [dependencies]
+pulldown-cmark = { version = "0.12", default-features = false }
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
