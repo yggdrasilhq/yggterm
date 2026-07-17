@@ -181,6 +181,93 @@ impl Default for SplitAxis {
     }
 }
 
+/// Which of its member session's surfaces a split pane shows
+/// ([[campaign-libyggterm]] Phase 3). This is PANE state, not session state:
+/// a session already knows its own surfaces, but "this pane shows tab 4" is a
+/// fact about the pane — the session has ONE active tab, and two panes may
+/// show the same session through different views (split-tabs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitMemberView {
+    /// The session's own surface: terminal pixels, or whatever viewport
+    /// surface the session's app currently declares (document / web active
+    /// tab). The entire pre-3.x split world is this variant — it FOLLOWS the
+    /// session rather than pinning anything, so an app opening or closing its
+    /// surface inside a split pane behaves exactly like full-bleed.
+    #[default]
+    Terminal,
+    /// Pinned to one document-pane view context (`?view=<context>` on the
+    /// schema GET). Apps today declare only the default context; the variant
+    /// exists so a second view lands as data, not a new mechanism.
+    Document { context: String },
+    /// Pinned to one web tab of the session's surface, independent of the
+    /// surface's active tab (split-tabs: two tab webviews, two rects).
+    Web { tab: u64 },
+}
+
+impl SplitMemberView {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, SplitMemberView::Terminal)
+    }
+}
+
+/// One pane of a [`SplitGroup`]: which session, seen through which view.
+///
+/// Wire/disk compatibility: a `Terminal`-view member serializes as the BARE
+/// session-path string (the pre-3.x format), so persisted settings and
+/// app-control JSON stay byte-identical until a pinned view actually exists;
+/// deserialization accepts both forms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitMember {
+    /// The member session's path (the daemon-owned PTY identity).
+    pub session: String,
+    /// Which of the session's surfaces this pane shows.
+    pub view: SplitMemberView,
+}
+
+impl SplitMember {
+    /// The default member: the session seen through its own surface.
+    pub fn terminal(session: impl Into<String>) -> Self {
+        SplitMember {
+            session: session.into(),
+            view: SplitMemberView::Terminal,
+        }
+    }
+}
+
+impl Serialize for SplitMember {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.view.is_terminal() {
+            serializer.serialize_str(&self.session)
+        } else {
+            use serde::ser::SerializeStruct as _;
+            let mut out = serializer.serialize_struct("SplitMember", 2)?;
+            out.serialize_field("session", &self.session)?;
+            out.serialize_field("view", &self.view)?;
+            out.end()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SplitMember {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Path(String),
+            Full {
+                session: String,
+                #[serde(default)]
+                view: SplitMemberView,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Path(session) => SplitMember::terminal(session),
+            Repr::Full { session, view } => SplitMember { session, view },
+        })
+    }
+}
+
 /// A GUI-level split-view group — the single source of truth for a split
 /// ([[campaign-split-view-groups]]). Members keep their own daemon-owned PTYs
 /// (possibly on different machines: cross-host split is the differentiator tmux
@@ -200,8 +287,8 @@ pub struct SplitGroup {
     /// draggable divider writes this; persisted so a workspace reopens as built.
     #[serde(default = "default_split_ratio")]
     pub ratio: f32,
-    /// Member session paths in pane order. MVP length is 2.
-    pub members: Vec<String>,
+    /// Member panes in order: `(session, view)` each. MVP length is 2.
+    pub members: Vec<SplitMember>,
     /// The last-focused pane index — which member gets input focus when the
     /// group is (re)activated. When the group is the active surface this stays
     /// in sync with `active_session_path`; it is genuinely distinct state only
@@ -231,8 +318,18 @@ impl SplitGroup {
         Self::path_for_id(&self.group_id)
     }
 
+    /// Does any pane of this group show `session_path` (through ANY view)?
     pub fn contains(&self, session_path: &str) -> bool {
-        self.members.iter().any(|member| member == session_path)
+        self.members
+            .iter()
+            .any(|member| member.session == session_path)
+    }
+
+    /// The member session paths in pane order. May repeat a session when two
+    /// panes show it through different views — dedup at the call site when the
+    /// consumer is per-session rather than per-pane.
+    pub fn member_sessions(&self) -> impl Iterator<Item = &str> {
+        self.members.iter().map(|member| member.session.as_str())
     }
 
     /// Clamp `active_pane` and `ratio` into valid ranges (defensive against a
@@ -2382,20 +2479,70 @@ mod tests {
             group_id: "g1".to_string(),
             axis: SplitAxis::Stacked,
             ratio: 0.42,
-            members: vec!["local://a".to_string(), "local://b".to_string()],
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
             active_pane: 1,
             prior_keep_alive: prior.clone(),
         }];
         let value = serialize_settings_value(&settings);
+        // Terminal-view members keep the pre-3.x bare-string wire format, so a
+        // built workspace's settings file is byte-identical until a pinned
+        // view exists (and an older build can still read it).
+        assert_eq!(
+            value["split_groups"][0]["members"],
+            serde_json::json!(["local://a", "local://b"]),
+        );
         let parsed = parse_settings_value(&value).expect("parse split_groups");
         assert_eq!(parsed.split_groups.len(), 1);
         let group = &parsed.split_groups[0];
         assert_eq!(group.group_id, "g1");
         assert_eq!(group.axis, SplitAxis::Stacked);
         assert!((group.ratio - 0.42).abs() < 1e-4);
-        assert_eq!(group.members, vec!["local://a", "local://b"]);
+        assert_eq!(
+            group.members,
+            vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
+        );
         assert_eq!(group.active_pane, 1);
         assert_eq!(group.prior_keep_alive, prior);
+    }
+
+    #[test]
+    fn split_member_views_round_trip_and_accept_the_legacy_string_form() {
+        // The explicit (session, view) member ([[campaign-libyggterm]] Phase
+        // 3): a pinned view serializes as a struct and round-trips; the
+        // legacy bare-string form still deserializes as a Terminal view.
+        let members = vec![
+            SplitMember::terminal("local://a"),
+            SplitMember {
+                session: "local://a".to_string(),
+                view: SplitMemberView::Web { tab: 4 },
+            },
+            SplitMember {
+                session: "local://d".to_string(),
+                view: SplitMemberView::Document {
+                    context: "diff".to_string(),
+                },
+            },
+        ];
+        let wire = serde_json::to_value(&members).expect("serialize members");
+        assert_eq!(
+            wire,
+            serde_json::json!([
+                "local://a",
+                {"session": "local://a", "view": {"web": {"tab": 4}}},
+                {"session": "local://d", "view": {"document": {"context": "diff"}}},
+            ]),
+        );
+        let parsed: Vec<SplitMember> = serde_json::from_value(wire).expect("parse members");
+        assert_eq!(parsed, members);
+        let legacy: Vec<SplitMember> =
+            serde_json::from_value(serde_json::json!(["local://old"])).expect("parse legacy");
+        assert_eq!(legacy, vec![SplitMember::terminal("local://old")]);
     }
 
     #[test]
@@ -2406,7 +2553,7 @@ mod tests {
             group_id: "g".to_string(),
             axis: SplitAxis::SideBySide,
             ratio: 5.0,
-            members: vec!["a".to_string(), "b".to_string()],
+            members: vec![SplitMember::terminal("a"), SplitMember::terminal("b")],
             active_pane: 9,
             prior_keep_alive: BTreeMap::new(),
         }
