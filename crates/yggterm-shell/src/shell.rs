@@ -4041,6 +4041,13 @@ struct ShellState {
     /// `document_pane_next_request` (a fetch beginning) and by a draft edit;
     /// replies never create — a late reply after a clear stays dead.
     document_panes: HashMap<DocumentPaneKey, DocumentPaneChannel>,
+    /// Draft-sync bookkeeping per session ([[campaign-libyggterm]] Phase 4):
+    /// `(last_seen_hash, synced_hash)` — the draft's hash at the previous
+    /// poll tick, and the last hash actually POSTed. A sync fires only when
+    /// the draft is dirty AND unchanged for a full tick (typing has paused)
+    /// AND not already synced — an in-flight sync racing live keystrokes
+    /// would clobber them when its reply's schema applies.
+    document_draft_sync: HashMap<String, (u64, u64)>,
     /// Sessions where the user toggled the document surface OFF (to the
     /// terminal). The ~4s re-declare must never fight this — the same
     /// heartbeats-never-clobber-the-user rule the web surface learned.
@@ -5820,6 +5827,7 @@ impl ShellState {
             app_pane_error: None,
             app_pane_request_seq: 0,
             document_panes: HashMap::new(),
+            document_draft_sync: HashMap::new(),
             document_surface_hidden: HashSet::new(),
             document_rail_auto_opened: HashSet::new(),
             document_surface_stale: None,
@@ -9000,6 +9008,47 @@ impl ShellState {
             .or_default()
             .values
             .insert(widget_id.to_string(), value);
+    }
+    /// The debounced GUI→app draft sync's decision fn, run once per poll
+    /// tick per co-visible session. Returns the pane to POST `draft` to iff:
+    /// the draft differs from the schema's declared values (dirty), it has
+    /// NOT changed since the previous tick (typing paused — syncing under a
+    /// moving draft loses the keystrokes typed while the POST is in flight),
+    /// and this exact draft has not already been synced.
+    fn document_draft_sync_due(&mut self, session_path: &str) -> Option<String> {
+        let channel = self.document_pane_channel(session_path)?;
+        let schema_state = channel.schema.as_ref()?;
+        let pane_id = schema_state.pane_id.clone();
+        let mut dirty = false;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash as _, Hasher as _};
+        let mut ordered: Vec<(&String, &String)> = channel.values.iter().collect();
+        ordered.sort();
+        for (id, value) in ordered {
+            id.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        for widget in &schema_state.schema.widgets {
+            let Some((id, declared)) = widget.declared_value() else {
+                continue;
+            };
+            if channel.values.get(id).is_some_and(|shown| *shown != declared) {
+                dirty = true;
+            }
+        }
+        let entry = self
+            .document_draft_sync
+            .entry(session_path.to_string())
+            .or_insert((0, 0));
+        let settled = entry.0 == hash;
+        entry.0 = hash;
+        if dirty && settled && entry.1 != hash {
+            entry.1 = hash;
+            Some(pane_id)
+        } else {
+            None
+        }
     }
     fn document_pane_values_json(&self, session_path: &str) -> serde_json::Value {
         serde_json::Value::Object(
@@ -17295,7 +17344,7 @@ async fn sidebar_endpoint_ping_tick(
     }
 }
 
-fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
+fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let trace_home = resolve_yggterm_home().unwrap_or_default();
     spawn(async move {
@@ -17333,6 +17382,43 @@ fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
             // Endpoint-ping liveness rides the same tick (Phase 2): fire and
             // forget — the ping task owns its own short timeout.
             spawn(sidebar_endpoint_ping_tick(state, trace_home.clone()));
+            // Debounced GUI→app draft sync (Phase 4): a settled dirty draft
+            // POSTs `draft` to its app, so the buffer reaches the daemon's
+            // sqlite row — the crash story — without waiting for a Save.
+            // Co-visible sessions only (the ones whose editors can be typed
+            // in): the active session and the active split group's members.
+            let draft_syncs = state.with_mut(|shell| {
+                let mut co_visible: Vec<String> = shell
+                    .server
+                    .active_session_path()
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect();
+                if let Some(group) = shell.active_split_group() {
+                    for member in &group.members {
+                        if !co_visible.contains(member) {
+                            co_visible.push(member.clone());
+                        }
+                    }
+                }
+                co_visible
+                    .into_iter()
+                    .filter_map(|session| {
+                        shell
+                            .document_draft_sync_due(&session)
+                            .map(|pane_id| (session, pane_id))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (session, pane_id) in draft_syncs {
+                spawn(document_pane_run_action(
+                    state,
+                    session,
+                    pane_id,
+                    "draft".to_string(),
+                    None,
+                ));
+            }
             if !has_flagged_sessions {
                 continue;
             }
