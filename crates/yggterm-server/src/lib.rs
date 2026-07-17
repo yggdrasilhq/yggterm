@@ -17803,6 +17803,7 @@ pub fn run_app_control_set_split_group_ratio(
 
 pub fn run_app_control_focus_split_pane(
     session_path: &str,
+    pane: Option<usize>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -17810,6 +17811,7 @@ pub fn run_app_control_focus_split_pane(
         &home,
         AppControlCommand::FocusSplitPane {
             session_path: session_path.to_string(),
+            pane,
         },
         timeout_ms,
     )?;

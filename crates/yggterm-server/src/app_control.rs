@@ -499,8 +499,13 @@ pub enum AppControlCommand {
         ratio: f32,
     },
     /// Focus a pane (make its session the input target) within its split group.
+    /// `pane` names the pane INDEX for groups where a session seats two panes
+    /// (split-tabs) — and is the ONLY way to focus a pinned web pane headlessly,
+    /// since its native webview swallows pointer events.
     FocusSplitPane {
         session_path: String,
+        #[serde(default)]
+        pane: Option<usize>,
     },
     SetRowExpanded {
         row_path: String,
