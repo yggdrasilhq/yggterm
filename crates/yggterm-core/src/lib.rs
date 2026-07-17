@@ -186,7 +186,7 @@ impl Default for SplitAxis {
 /// a session already knows its own surfaces, but "this pane shows tab 4" is a
 /// fact about the pane — the session has ONE active tab, and two panes may
 /// show the same session through different views (split-tabs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitMemberView {
     /// The session's own surface: terminal pixels, or whatever viewport

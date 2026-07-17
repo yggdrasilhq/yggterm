@@ -17747,6 +17747,26 @@ pub fn run_app_control_create_split_group(
     Ok(())
 }
 
+pub fn run_app_control_split_web_tab(
+    session_path: &str,
+    tab: u64,
+    axis: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SplitWebTab {
+            session_path: session_path.to_string(),
+            tab,
+            axis,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_ungroup_split_group(
     group_id: &str,
     timeout_ms: u64,
