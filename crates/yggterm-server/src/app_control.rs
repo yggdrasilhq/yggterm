@@ -478,6 +478,17 @@ pub enum AppControlCommand {
         #[serde(default)]
         axis: Option<String>,
     },
+    /// Split one of a web-surface session's tabs into its own pane — split-tabs
+    /// ([[campaign-libyggterm]] Phase 3): pane 0 keeps the session's own
+    /// surface, pane 1 is PINNED to `tab`. Tabs are GUI chrome, so this is a
+    /// GUI-side act with no app involvement.
+    SplitWebTab {
+        session_path: String,
+        tab: u64,
+        /// "side-by-side" (default) or "stacked".
+        #[serde(default)]
+        axis: Option<String>,
+    },
     /// Dissolve a split-view group, restoring each member's pre-group keep-alive.
     UngroupSplitGroup {
         group_id: String,
@@ -649,6 +660,7 @@ impl AppControlCommand {
             Self::RestartSession { .. } => "restart_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::CreateSplitGroup { .. } => "create_split_group",
+            Self::SplitWebTab { .. } => "split_web_tab",
             Self::UngroupSplitGroup { .. } => "ungroup_split_group",
             Self::SetSplitGroupRatio { .. } => "set_split_group_ratio",
             Self::FocusSplitPane { .. } => "focus_split_pane",
