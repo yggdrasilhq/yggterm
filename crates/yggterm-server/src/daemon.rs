@@ -2037,6 +2037,9 @@ struct DaemonRuntime {
     /// 30.7s, deafening the daemon while the user stared at the shadow.
     /// endpoint label → epoch-ms until which it is treated unreachable.
     preserved_owner_unreachable_until_ms: HashMap<String, u64>,
+    // Last relaunch-recovery attempt per runtime key (terminal-write path);
+    // bounds ensure_terminal_for_path to one attempt per cooldown window.
+    terminal_write_relaunch_attempted_at_ms: HashMap<String, u64>,
     /// Set once the update-restart snapshot has been written during retire.
     /// LIVE INCIDENT (2026-06-11, every swap): the retiring daemon keeps
     /// serving briefly after writing the protected update-restart state, and
@@ -2056,7 +2059,7 @@ struct DaemonRuntime {
     duplicate_runtime_prune_in_flight: Arc<AtomicBool>,
     /// Preserved-owner registry removals discovered by the background prune,
     /// applied on the request loop (the registry is not thread-shared).
-    pending_preserved_owner_removals: Arc<Mutex<Vec<String>>>,
+    pending_preserved_owner_removals: Arc<Mutex<Vec<(String, &'static str)>>>,
     /// GATE #8 (persistence saga root): multiple daemons share ONE
     /// server-state.json, and a superseded daemon's routine persist clobbers
     /// the successor's file with its stale in-memory view (live-caught: a
@@ -2187,6 +2190,7 @@ impl DaemonRuntime {
             restored_live_sessions,
             restored_remote_machines,
             preserved_owner_unreachable_until_ms: HashMap::new(),
+            terminal_write_relaunch_attempted_at_ms: HashMap::new(),
             update_restart_state_written: false,
             duplicate_runtime_prune_in_flight: Arc::new(AtomicBool::new(false)),
             pending_preserved_owner_removals: Arc::new(Mutex::new(Vec::new())),
@@ -3545,11 +3549,8 @@ impl DaemonRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *pending)
         };
-        for runtime_key in drained {
-            self.remove_preserved_owner(
-                &runtime_key,
-                "duplicate_legacy_owned_runtime_pruned_current_owned",
-            );
+        for (runtime_key, reason) in drained {
+            self.remove_preserved_owner(&runtime_key, reason);
         }
     }
     fn preserved_owner_status_for_runtime_key(
@@ -3558,12 +3559,7 @@ impl DaemonRuntime {
     ) -> Option<(ServerEndpoint, ServerRuntimeStatus)> {
         let endpoint = self.preserved_owner_for_runtime_key(runtime_key)?;
         match status(&endpoint) {
-            Ok(status)
-                if status
-                    .terminal_session_keys
-                    .iter()
-                    .any(|key| key == runtime_key) =>
-            {
+            Ok(status) if preserved_owner_status_serves_runtime_key(&status, runtime_key) => {
                 Some((endpoint, status))
             }
             Ok(status) => {
@@ -3715,17 +3711,147 @@ impl DaemonRuntime {
             return;
         }
         match status(owner_endpoint) {
-            Ok(status)
-                if status
-                    .terminal_session_keys
-                    .iter()
-                    .any(|key| key == runtime_key) => {}
+            Ok(status) if preserved_owner_status_serves_runtime_key(&status, runtime_key) => {}
             Ok(_) => self.remove_preserved_owner(runtime_key, "owner_missing_runtime_after_error"),
             Err(_) => {
                 self.mark_preserved_owner_unreachable(owner_endpoint);
                 self.remove_preserved_owner(runtime_key, "owner_unreachable_after_error")
             }
         }
+    }
+
+    /// Local write for a client keystroke, with recovery when no runtime
+    /// holds the key ("the most helpless state", telemetry campaign
+    /// 2026-07-17): after a daemon handoff the successor may never have
+    /// created the runtime; surfacing the raw error printed
+    /// "terminal session not found" into the PTY and left the session
+    /// permanently untypeable — the user's only recovery was a manual
+    /// session restart.
+    fn write_local_terminal_with_lost_runtime_recovery(
+        &mut self,
+        path: &str,
+        runtime_key: &str,
+        data: &str,
+    ) -> Result<ServerResponse> {
+        match self.terminals.write(runtime_key, data) {
+            Ok(()) => Ok(ServerResponse::Ack { message: None }),
+            Err(error) if Self::preserved_owner_error_means_missing_runtime(runtime_key, &error) => {
+                self.recover_terminal_write_lost_runtime(path, runtime_key, data, error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Recovery order: (1) ADOPT — another reachable daemon actually OWNS
+    /// the runtime; register it as preserved owner and retry the write there
+    /// (keystroke preserved). (2) RELAUNCH — this daemon represents the
+    /// session, so re-create the runtime exactly like a user-initiated
+    /// restart; the triggering keystroke is dropped (there was no PTY to
+    /// receive it). (3) surface the original error.
+    fn recover_terminal_write_lost_runtime(
+        &mut self,
+        path: &str,
+        runtime_key: &str,
+        data: &str,
+        original_error: anyhow::Error,
+    ) -> Result<ServerResponse> {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        );
+        if let Some((owner_endpoint, owner_status)) =
+            preserved_owner_candidate_for_runtime_key(statuses, runtime_key, std::process::id())
+        {
+            let registered = self.preserved_terminal_owners.upsert_runtime_owner(
+                self.store.home_dir(),
+                runtime_key,
+                &owner_endpoint,
+                &owner_status,
+                Some(SERVER_PROTOCOL_VERSION.to_string()),
+            );
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "hot_update",
+                "terminal_write_adopted_preserved_owner",
+                serde_json::json!({
+                    "path": path,
+                    "runtime_key": runtime_key,
+                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "owner_server_version": owner_status.server_version,
+                    "owner_server_pid": owner_status.server_pid,
+                    "registered": registered.is_ok(),
+                }),
+            );
+            match terminal_write(&owner_endpoint, runtime_key, data) {
+                Ok(_) => return Ok(ServerResponse::Ack { message: None }),
+                Err(error) => {
+                    self.handle_preserved_owner_request_error(
+                        runtime_key,
+                        &owner_endpoint,
+                        &error,
+                    );
+                }
+            }
+        }
+        if self.server.represents_terminal_runtime_key(runtime_key)
+            && self.terminal_write_relaunch_recovery_is_due(runtime_key)
+        {
+            match self.ensure_terminal_for_path(path) {
+                Ok(prepare_message) => {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "terminal_io",
+                        "terminal_write_relaunch_recovery",
+                        serde_json::json!({
+                            "path": path,
+                            "runtime_key": runtime_key,
+                            "dropped_bytes": data.len(),
+                            "prepare_message": prepare_message,
+                        }),
+                    );
+                    return Ok(ServerResponse::Ack {
+                        message: Some(format!(
+                            "terminal session {runtime_key} relaunched after lost runtime; keystroke dropped"
+                        )),
+                    });
+                }
+                Err(error) => {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "terminal_io",
+                        "terminal_write_relaunch_recovery_failed",
+                        serde_json::json!({
+                            "path": path,
+                            "runtime_key": runtime_key,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
+        }
+        Err(original_error)
+    }
+
+    /// One relaunch attempt per key per cooldown window, so a held key or
+    /// autorepeat burst cannot storm `ensure_terminal_for_path`.
+    fn terminal_write_relaunch_recovery_is_due(&mut self, runtime_key: &str) -> bool {
+        const RELAUNCH_RECOVERY_COOLDOWN_MS: u64 = 30_000;
+        let now_ms = current_millis_u64();
+        let due = self
+            .terminal_write_relaunch_attempted_at_ms
+            .get(runtime_key)
+            .is_none_or(|attempted| {
+                now_ms.saturating_sub(*attempted) >= RELAUNCH_RECOVERY_COOLDOWN_MS
+            });
+        if due {
+            self.terminal_write_relaunch_attempted_at_ms
+                .insert(runtime_key.to_string(), now_ms);
+        }
+        due
     }
 
     fn reject_preserved_owner_saved_session_mismatch(
@@ -5838,15 +5964,31 @@ impl DaemonRuntime {
                                 &owner_endpoint,
                                 &error,
                             );
-                            return Err(error);
+                            // Entry kept => the owner is healthy and the
+                            // failure is this request's to surface. Entry
+                            // REMOVED => fall through: the local/adopt/
+                            // relaunch path below is now the only route that
+                            // can serve this key, and erroring here is what
+                            // printed "terminal session not found" into the
+                            // PTY and left the session untypeable after a
+                            // daemon handoff (the manual-restart-only state).
+                            if self
+                                .preserved_owner_for_runtime_key(&runtime_path)
+                                .is_some()
+                            {
+                                return Err(error);
+                            }
                         }
                     }
                 }
                 let local_runtime_running = self.terminals.session_is_running(&runtime_path);
                 let write_strategy = terminal_write_strategy_for_path(&path, local_runtime_running);
                 if matches!(write_strategy, TerminalWriteStrategy::LocalRuntime) {
-                    self.terminals.write(&runtime_path, &data)?;
-                    return Ok(ServerResponse::Ack { message: None });
+                    return self.write_local_terminal_with_lost_runtime_recovery(
+                        &path,
+                        &runtime_path,
+                        &data,
+                    );
                 }
                 if matches!(write_strategy, TerminalWriteStrategy::RemoteDirectFallback) {
                     match self.server.remote_terminal_write_for_path(&path, &data) {
@@ -5895,8 +6037,11 @@ impl DaemonRuntime {
                         }
                     }
                 }
-                self.terminals.write(&runtime_path, &data)?;
-                ServerResponse::Ack { message: None }
+                return self.write_local_terminal_with_lost_runtime_recovery(
+                    &path,
+                    &runtime_path,
+                    &data,
+                );
             }
             ServerRequest::TerminalResize { path, cols, rows } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
@@ -6320,6 +6465,23 @@ fn duplicate_legacy_owned_runtime_keys(
     duplicate_runtime_keys
 }
 
+/// A preserved owner can only SERVE a runtime it actually OWNS. Trusting the
+/// represented set (`terminal_session_keys`) let hollow chains survive: a
+/// predecessor that merely re-preserves a key toward an even older, dead
+/// daemon still LISTS the key but cannot serve a single byte of it. Live-
+/// caught 2026-07-17: 8 registry entries pointed at a 2.11.1 daemon that
+/// owned exactly 1 of its 15 represented keys, pinning
+/// `hot_update_handoff_active` true for four days.
+fn preserved_owner_status_serves_runtime_key(
+    status: &ServerRuntimeStatus,
+    runtime_key: &str,
+) -> bool {
+    status
+        .owned_terminal_session_keys
+        .iter()
+        .any(|key| key == runtime_key)
+}
+
 fn preserved_owner_candidate_for_runtime_key(
     statuses: Vec<(ServerEndpoint, ServerRuntimeStatus)>,
     runtime_key: &str,
@@ -6329,17 +6491,10 @@ fn preserved_owner_candidate_for_runtime_key(
         .into_iter()
         .filter(|(_endpoint, status)| status.server_pid != current_pid)
         .filter(|(_endpoint, status)| {
-            status
-                .terminal_session_keys
-                .iter()
-                .any(|key| key == runtime_key)
+            preserved_owner_status_serves_runtime_key(status, runtime_key)
         })
         .max_by_key(|(_endpoint, status)| {
             (
-                status
-                    .owned_terminal_session_keys
-                    .iter()
-                    .any(|key| key == runtime_key),
                 daemon_status_version_triplet(&status.server_version),
                 status.server_build_id,
                 status.server_pid,
@@ -7818,12 +7973,99 @@ pub fn working_flags(endpoint: &ServerEndpoint) -> Result<Vec<(String, bool)>> {
 /// an owner left empty, and queue preserved-owner registry removals for the
 /// request loop to apply. Talks ONLY to other daemons' sockets + the trace
 /// file — never to this daemon's in-memory state.
+const PRESERVED_OWNER_REVALIDATE_INTERVAL_MS: u64 = 5 * 60_000;
+static PRESERVED_OWNER_LAST_REVALIDATE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Periodic preserved-owner registry revalidation (background chore thread).
+///
+/// Registry entries are otherwise checked only when a REQUEST touches them,
+/// so an idle hollow entry — owner alive but no longer OWNING the runtime,
+/// e.g. a predecessor that merely re-preserves the key toward an even older,
+/// dead daemon — survives indefinitely. Live-caught 2026-07-17: 8 such
+/// entries pinned `hot_update_handoff_active` true for four days, deferring
+/// hot updates the whole time. One status probe per distinct owner endpoint;
+/// removals are queued and applied on the request loop (registry owner).
+fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {
+    let now_ms = current_millis_u64();
+    let last_ms = PRESERVED_OWNER_LAST_REVALIDATE_MS.load(Ordering::SeqCst);
+    if now_ms.saturating_sub(last_ms) < PRESERVED_OWNER_REVALIDATE_INTERVAL_MS {
+        return;
+    }
+    if PRESERVED_OWNER_LAST_REVALIDATE_MS
+        .compare_exchange(last_ms, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let (home_dir, entries, pending_removals) = {
+        let runtime = lock_daemon_runtime(runtime, "preserved_owner_revalidation");
+        (
+            runtime.store.home_dir().to_path_buf(),
+            runtime.preserved_terminal_owners.entries.clone(),
+            Arc::clone(&runtime.pending_preserved_owner_removals),
+        )
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut owner_statuses: HashMap<String, Option<ServerRuntimeStatus>> = HashMap::new();
+    let mut dropped: Vec<(String, &'static str)> = Vec::new();
+    for entry in &entries {
+        let endpoint = entry.endpoint.to_endpoint();
+        let label = owner_endpoint_label(&endpoint);
+        let owner_status = owner_statuses
+            .entry(label)
+            .or_insert_with(|| status(&endpoint).ok());
+        match owner_status {
+            None => dropped.push((
+                entry.runtime_key.clone(),
+                "revalidate_owner_unreachable",
+            )),
+            Some(owner_status)
+                if !preserved_owner_status_serves_runtime_key(
+                    owner_status,
+                    &entry.runtime_key,
+                ) =>
+            {
+                dropped.push((
+                    entry.runtime_key.clone(),
+                    "revalidate_owner_does_not_own_runtime",
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if dropped.is_empty() {
+        return;
+    }
+    append_trace_event(
+        &home_dir,
+        "daemon",
+        "hot_update",
+        "preserved_owner_revalidation_dropped",
+        serde_json::json!({
+            "checked_entries": entries.len(),
+            "dropped": dropped
+                .iter()
+                .map(|(key, reason)| serde_json::json!({
+                    "runtime_key": key,
+                    "reason": reason,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    let mut pending = pending_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.extend(dropped);
+}
+
 fn run_duplicate_legacy_owned_runtime_prune(
     home_dir: &Path,
     reason: &'static str,
     current_runtime_keys: &HashSet<String>,
     registry_owner_endpoints: &HashMap<String, ServerEndpoint>,
-    pending_preserved_owner_removals: &Mutex<Vec<String>>,
+    pending_preserved_owner_removals: &Mutex<Vec<(String, &'static str)>>,
 ) {
     let current_pid = std::process::id();
     let current_build_id = current_build_id();
@@ -7859,7 +8101,10 @@ fn run_duplicate_legacy_owned_runtime_prune(
                         let mut pending = pending_preserved_owner_removals
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        pending.push(runtime_key.clone());
+                        pending.push((
+                            runtime_key.clone(),
+                            "duplicate_legacy_owned_runtime_pruned_current_owned",
+                        ));
                     }
                     removed_runtime_keys.push(runtime_key);
                 }
@@ -10150,6 +10395,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             let mut remote_cc_confirmed: HashSet<String> = HashSet::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                run_preserved_owner_revalidation_if_due(&runtime);
                 match run_background_copy_chore(
                     &runtime,
                     generation_enabled,
@@ -16473,6 +16719,71 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 26100,
             }
+        );
+    }
+
+    /// Regression (telemetry campaign 2026-07-17): a daemon that merely
+    /// REPRESENTS a runtime key (terminal_session_keys) without OWNING it
+    /// (owned_terminal_session_keys) is a hollow bridge — it re-preserves the
+    /// key toward an even older daemon and cannot serve a byte of it. It must
+    /// never be selected as a preserved-owner candidate: 8 such entries kept
+    /// `hot_update_handoff_active` pinned true for four days on the live host.
+    #[test]
+    fn preserved_owner_candidate_requires_actual_ownership() {
+        fn status(
+            version: &str,
+            build_id: u64,
+            pid: u32,
+            owned_keys: &[&str],
+            terminal_keys: &[&str],
+        ) -> ServerRuntimeStatus {
+            serde_json::from_value(serde_json::json!({
+                "server_version": version,
+                "server_build_id": build_id,
+                "server_pid": pid,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": owned_keys.len(),
+                "owned_terminal_session_keys": owned_keys,
+                "terminal_session_count": terminal_keys.len(),
+                "terminal_session_keys": terminal_keys,
+            }))
+            .expect("runtime status")
+        }
+
+        let runtime_key = "local://217cb4a6-hollow-chain";
+        let represented_only = status("2.11.1", 11, 111, &[], &[runtime_key]);
+        assert!(!super::preserved_owner_status_serves_runtime_key(
+            &represented_only,
+            runtime_key
+        ));
+        let owned = status("2.11.1", 11, 112, &[runtime_key], &[runtime_key]);
+        assert!(super::preserved_owner_status_serves_runtime_key(
+            &owned,
+            runtime_key
+        ));
+
+        let statuses = vec![
+            (
+                super::ServerEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 26110,
+                },
+                represented_only,
+            ),
+            (
+                super::ServerEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 26111,
+                },
+                status("2.11.0", 10, 110, &[], &[runtime_key]),
+            ),
+        ];
+        assert!(
+            preserved_owner_candidate_for_runtime_key(statuses, runtime_key, 999).is_none(),
+            "daemons that only represent (never own) the key must not be adopted as owners"
         );
     }
 
