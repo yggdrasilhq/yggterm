@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.4
+
+- **Two machines that each build their own yggterm stop re-provisioning each
+  other's binaries** (the "ping-pong" that left a host's running daemons
+  mismatched with its on-disk CLI and caused the stale-daemon verdict storm).
+  Remote protocol compatibility is now VERSION-ordered, not binary-hash
+  equality: a same-or-newer remote binary is served as-is — a peer's binary is
+  never overwritten sideways or downgraded — and an older remote is upgraded,
+  which is the only direction provisioning now moves. The invariant the old
+  binary-hash gate protected (no wire change without a new version) moved into
+  the repo: a protocol shape-stamp test fails any change to the daemon
+  request/response enums until the version is bumped and the stamp re-taken in
+  the same commit.
+
 ## 2.11.3
 
 - **A session no longer goes permanently untypeable after a daemon handoff**

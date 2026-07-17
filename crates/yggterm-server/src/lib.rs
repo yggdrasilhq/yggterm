@@ -12143,21 +12143,36 @@ fn is_remote_protocol_probe_recoverable(output: &str) -> bool {
     false
 }
 
-/// A remote yggterm binary is protocol-compatible when its `build_id` — an FNV
-/// hash of the shipped bootstrap binary, stable across release-version bumps
-/// that don't change the wire protocol — matches ours. The release VERSION
-/// STRING (`SERVER_PROTOCOL_VERSION` = `CARGO_PKG_VERSION`) is deliberately NOT
-/// part of this check. Gating remote commands (clipboard image staging, resume,
-/// scans) on an exact version match is self-defeating: after any GUI-only deploy
-/// the checking process runs a newer version string while the remote runs the
-/// IDENTICAL protocol (same `build_id`), so image paste / resume failed with a
-/// "protocol mismatch" even though nothing was incompatible. Only a differing
-/// `build_id` signals an actual backward-incompatible change.
-fn remote_descriptor_is_protocol_compatible(
-    descriptor: &RemoteProtocolDescriptor,
-    local_build_id: u64,
-) -> bool {
-    descriptor.build_id == local_build_id
+/// A remote yggterm binary is protocol-compatible when its VERSION is the same
+/// as or newer than ours (deploy semantics settled with the user 2026-07-17).
+///
+/// History, because this check has now flipped twice:
+/// - An exact VERSION match failed benign skew (a GUI-only deploy left the
+///   local version newer while the remote ran the identical protocol, and
+///   image paste / resume bailed with a false "protocol mismatch").
+/// - The fix — exact BUILD-ID (FNV of binary bytes) equality — made two
+///   machines that each self-build the same source mutually "incompatible"
+///   (same source, different bytes), so each re-provisioned the other's
+///   binary on sight. Live-caught 2026-07-17: jojo clobbered dev's self-built
+///   2.11.2, leaving dev's RUNNING daemons mismatched with dev's on-disk CLI
+///   → "stale daemon" verdicts → the lost-PTY latch storm.
+///
+/// Version-ordering resolves both: a SAME-OR-NEWER remote is served as-is
+/// (never overwrite a peer's equal/newer binary — the AGENTS.md never-install-
+/// older rule), and an OLDER remote falls through to bootstrap, which is a
+/// benign monotonic upgrade rather than a bail. Adjacent versions interop by
+/// contract: new request fields are `#[serde(default)]`, new variants are
+/// never sent unprompted, and any wire change MUST bump the version — enforced
+/// by `protocol_shape_stamp_forces_version_bump` in `daemon.rs`. `build_id`
+/// stays in the descriptor for freshness telemetry only.
+fn remote_descriptor_is_protocol_compatible(descriptor: &RemoteProtocolDescriptor) -> bool {
+    let Some(remote) = daemon::parse_daemon_version_triple(descriptor.version.trim()) else {
+        return false;
+    };
+    let Some(local) = daemon::parse_daemon_version_triple(daemon::SERVER_PROTOCOL_VERSION) else {
+        return false;
+    };
+    remote >= local
 }
 
 fn check_remote_protocol_version(
@@ -12167,33 +12182,22 @@ fn check_remote_protocol_version(
 ) -> anyhow::Result<()> {
     let descriptor = remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, binary_expr)?;
     let normalized = descriptor.version.trim();
-    let local_build_id = current_local_build_id();
-    if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) {
+    if remote_descriptor_is_protocol_compatible(&descriptor) {
         return Ok(());
     }
-    if is_remote_protocol_probe_recoverable(normalized) {
-        anyhow::bail!(
-            "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}, got {}",
-            ssh_target,
-            daemon::SERVER_PROTOCOL_VERSION,
-            if normalized.is_empty() {
-                "<empty>"
-            } else {
-                normalized
-            }
-        );
-    }
     anyhow::bail!(
-        "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}@{}, got {}@{}",
+        "remote yggterm protocol mismatch for {} with {binary_expr}: expected {} or newer, got {}",
         ssh_target,
         daemon::SERVER_PROTOCOL_VERSION,
-        local_build_id,
-        normalized,
-        descriptor.build_id,
+        if normalized.is_empty() {
+            "<empty>"
+        } else {
+            normalized
+        }
     )
 }
 
-fn fnv1a_build_id(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_build_id(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET;
@@ -12561,7 +12565,7 @@ fn resolve_remote_yggterm_binary(
 
     match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, installed_binary) {
         Ok(descriptor)
-            if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) =>
+            if remote_descriptor_is_protocol_compatible(&descriptor) =>
         {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
@@ -12583,7 +12587,7 @@ fn resolve_remote_yggterm_binary(
             return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
         }
         Ok(descriptor) => {
-            if !remote_descriptor_is_protocol_compatible(&descriptor, local_build_id)
+            if !remote_descriptor_is_protocol_compatible(&descriptor)
                 && !is_remote_protocol_probe_recoverable(&descriptor.version)
             {
                 anyhow::bail!(
@@ -12602,7 +12606,7 @@ fn resolve_remote_yggterm_binary(
 
     match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, "yggterm") {
         Ok(descriptor)
-            if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) =>
+            if remote_descriptor_is_protocol_compatible(&descriptor) =>
         {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
@@ -12624,7 +12628,7 @@ fn resolve_remote_yggterm_binary(
             return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
         Ok(descriptor) => {
-            if !remote_descriptor_is_protocol_compatible(&descriptor, local_build_id)
+            if !remote_descriptor_is_protocol_compatible(&descriptor)
                 && !is_remote_protocol_probe_recoverable(&descriptor.version)
             {
                 anyhow::bail!(
@@ -12644,7 +12648,7 @@ fn resolve_remote_yggterm_binary(
     let installed = bootstrap_remote_yggterm(ssh_target, exec_prefix)?;
     let installed_descriptor =
         remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, &installed)?;
-    if !remote_descriptor_is_protocol_compatible(&installed_descriptor, local_build_id) {
+    if !remote_descriptor_is_protocol_compatible(&installed_descriptor) {
         anyhow::bail!(
             "remote yggterm protocol mismatch for {}: expected {}@{}, got {}@{}",
             ssh_target,
@@ -21822,36 +21826,39 @@ mod tests {
     // the remote runs the identical protocol — image paste / resume must keep
     // working. Only a differing build_id is a real (breaking) mismatch.
     #[test]
-    fn remote_descriptor_compatible_by_build_id_ignores_version_string() {
+    fn remote_descriptor_compatible_by_version_order_never_by_build_id() {
         use super::RemoteProtocolDescriptor;
-        let local_build_id = 11570104518281042630_u64;
-        // Same protocol (build_id), different release version string → COMPATIBLE.
-        let newer_gui_vs_older_remote = RemoteProtocolDescriptor {
-            version: "2.9.26".to_string(),
-            build_id: local_build_id,
+        let descriptor = |version: &str, build_id: u64| RemoteProtocolDescriptor {
+            version: version.to_string(),
+            build_id,
         };
+        let local = crate::daemon::SERVER_PROTOCOL_VERSION;
+        // THE regression (deploy semantics 2026-07-17): identical version,
+        // DIFFERENT build id (two machines each self-built the same source)
+        // → COMPATIBLE. Build-id equality here is what made jojo clobber
+        // dev's self-built binary and re-arm the re-provision ping-pong.
         assert!(super::remote_descriptor_is_protocol_compatible(
-            &newer_gui_vs_older_remote,
-            local_build_id
+            &descriptor(local, 0xDEAD)
         ));
-        // Identical version + build_id → COMPATIBLE.
-        let exact = RemoteProtocolDescriptor {
-            version: "2.9.35".to_string(),
-            build_id: local_build_id,
-        };
         assert!(super::remote_descriptor_is_protocol_compatible(
-            &exact,
-            local_build_id
+            &descriptor(local, 0xBEEF)
         ));
-        // Differing build_id (an actual protocol change) → INCOMPATIBLE, even if
-        // the version string happens to match.
-        let breaking = RemoteProtocolDescriptor {
-            version: "2.9.35".to_string(),
-            build_id: local_build_id ^ 0x1,
-        };
+        // A NEWER remote is served as-is — never overwritten with an older
+        // local artifact (AGENTS.md never-install-older rule).
+        assert!(super::remote_descriptor_is_protocol_compatible(
+            &descriptor("99.0.0", 0)
+        ));
+        // An OLDER remote is incompatible → falls through to bootstrap,
+        // which is the sanctioned monotonic upgrade.
         assert!(!super::remote_descriptor_is_protocol_compatible(
-            &breaking,
-            local_build_id
+            &descriptor("2.0.0", 0)
+        ));
+        // Garbage output is never compatible.
+        assert!(!super::remote_descriptor_is_protocol_compatible(
+            &descriptor("command not found", 0)
+        ));
+        assert!(!super::remote_descriptor_is_protocol_compatible(
+            &descriptor("", 0)
         ));
     }
 

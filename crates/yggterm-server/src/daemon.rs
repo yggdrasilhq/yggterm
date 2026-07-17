@@ -7530,7 +7530,7 @@ fn mark_daemon_activity(last_activity_ms: &AtomicU64) {
 
 /// Parse a dotted version string ("2.8.6") into a comparable triple. A missing
 /// patch component is treated as 0.
-fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.');
     let major = parts.next()?.trim().parse::<u64>().ok()?;
     let minor = parts.next()?.trim().parse::<u64>().ok()?;
@@ -16821,6 +16821,70 @@ mod tests {
         assert_eq!(
             linux_yggterm_home_from_environ_bytes(env),
             Some(std::path::PathBuf::from("/home/pi/.yggterm"))
+        );
+    }
+
+    /// The source text of `pub enum Name {` through its matching close brace.
+    fn extract_enum_block(source: &str, opener: &str) -> String {
+        let start = source
+            .find(opener)
+            .unwrap_or_else(|| panic!("{opener} not found in daemon.rs"));
+        let mut depth = 0usize;
+        for (offset, ch) in source[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[start..=start + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after {opener}");
+    }
+
+    /// The wire-protocol SHAPE STAMP — the repo-side replacement for the
+    /// runtime build-id compatibility gate (deploy semantics 2026-07-17).
+    ///
+    /// Protocol compatibility across machines is now version-ordered, which is
+    /// only sound if every wire change ships under a NEW version. This test
+    /// enforces that at the moment of the change: it hashes the source text of
+    /// `ServerRequest` + `ServerResponse` and compares against a stamp taken
+    /// when the protocol last changed. If you edited either enum, this fails —
+    /// bump the workspace version (Cargo.toml) AND re-stamp BOTH constants
+    /// below in the SAME commit. Re-stamping without bumping defeats the fleet
+    /// deploy semantics (two builds of one version with different wire shapes),
+    /// so the stamped version must be the bumped one.
+    ///
+    /// Formatting/comment edits inside the enums re-trigger this; that
+    /// over-trigger is deliberate — a spare version bump is cheap, a silent
+    /// wire divergence is the lost-PTY latch storm of 2026-07-17.
+    #[test]
+    fn protocol_shape_stamp_forces_version_bump() {
+        const STAMPED_AT_VERSION: &str = "2.11.4";
+        const STAMPED_SHAPE_HASH: u64 = 0xb513bed5b007ef21;
+        let source = include_str!("daemon.rs");
+        let shape = format!(
+            "{}\n{}",
+            extract_enum_block(source, "pub enum ServerRequest {"),
+            extract_enum_block(source, "pub enum ServerResponse {"),
+        );
+        let hash = crate::fnv1a_build_id(shape.as_bytes());
+        assert_eq!(
+            hash, STAMPED_SHAPE_HASH,
+            "ServerRequest/ServerResponse source changed (computed hash {hash:#018x}). \
+             Bump the workspace version in Cargo.toml and update STAMPED_AT_VERSION + \
+             STAMPED_SHAPE_HASH to the new version and this hash IN THE SAME COMMIT.",
+        );
+        let stamped = parse_daemon_version_triple(STAMPED_AT_VERSION).expect("stamp parses");
+        let current =
+            parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).expect("current parses");
+        assert!(
+            stamped <= current,
+            "STAMPED_AT_VERSION {STAMPED_AT_VERSION} is ahead of CARGO_PKG_VERSION \
+             {SERVER_PROTOCOL_VERSION} — the stamp must be taken at (not beyond) the shipped version",
         );
     }
 }
