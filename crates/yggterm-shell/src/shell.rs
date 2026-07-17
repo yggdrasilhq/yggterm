@@ -84665,6 +84665,59 @@ fn parse_markdown_blocks(source: &str) -> Vec<MdBlock> {
     root
 }
 
+/// Source byte range of every TOP-LEVEL markdown block, in document order —
+/// the substrate for block click-to-edit ([[campaign-libyggterm]] Phase 4):
+/// clicking block N swaps in a mini-editor over `source[ranges[N]]`, and the
+/// commit splices exactly that range. A second offset-iter pass rather than
+/// threading ranges through the fold: the fold's shape stays untouched, and
+/// the zip is checked (len mismatch ⇒ editing disabled, never a wrong splice).
+fn top_level_block_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    // Depth over the container tags that produce ROOT blocks in the fold.
+    // Item/TableRow/etc. never occur at top level, so they need no counting:
+    // anything inside them is already under an open List/Table.
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::Heading { .. }
+                | Tag::Paragraph
+                | Tag::CodeBlock(_)
+                | Tag::BlockQuote(_)
+                | Tag::List(_)
+                | Tag::Table(_),
+            ) => {
+                if depth == 0 {
+                    ranges.push(range.clone());
+                }
+                depth += 1;
+            }
+            Event::End(
+                TagEnd::Heading(_)
+                | TagEnd::Paragraph
+                | TagEnd::CodeBlock
+                | TagEnd::BlockQuote(_)
+                | TagEnd::List(_)
+                | TagEnd::Table,
+            ) => {
+                depth = depth.saturating_sub(1);
+            }
+            Event::Rule => {
+                if depth == 0 {
+                    ranges.push(range.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
 fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
     let code_style = format!(
         "background:{}; border:1px solid {}; \
@@ -84826,6 +84879,141 @@ fn markdown_widget_body(source: &str, palette: &DocTheme) -> Element {
     }
 }
 
+/// The pure-Markdown reader with BLOCK CLICK-TO-EDIT ([[campaign-libyggterm]]
+/// Phase 4, Typora-lite — full WYSIWYG is out of scope, settled): click a
+/// block and exactly that block's source swaps in as a mini-editor; commit on
+/// Ctrl+Enter or blur splices it back and rides the draft channel to the app
+/// (so the sqlite draft row updates and the schema refetch repaints); Esc
+/// cancels. If the fold's block count and the offset-iter's range count ever
+/// disagree, editing silently disables — a wrong splice is worse than none.
+#[component]
+fn EditableMarkdownBody(
+    source: String,
+    doc: DocTheme,
+    state: Signal<ShellState>,
+    session_path: String,
+    pane_id: String,
+) -> Element {
+    let blocks = parse_markdown_blocks(&source);
+    let ranges = top_level_block_ranges(&source);
+    let editable = blocks.len() == ranges.len();
+    let mut editing = use_signal(|| None::<usize>);
+    let mut edit_text = use_signal(String::new);
+    // A schema change (new source) invalidates any open block index.
+    let mut editing_source_key = use_signal(String::new);
+    if *editing_source_key.read() != source {
+        editing_source_key.set(source.clone());
+        editing.set(None);
+    }
+    let commit = {
+        let source = source.clone();
+        let ranges = ranges.clone();
+        let session_path = session_path.clone();
+        let pane_id = pane_id.clone();
+        move |index: usize, new_text: String| {
+            let Some(range) = ranges.get(index).cloned() else {
+                return;
+            };
+            let mut spliced =
+                String::with_capacity(source.len() + new_text.len().saturating_sub(range.len()));
+            spliced.push_str(&source[..range.start]);
+            spliced.push_str(&new_text);
+            spliced.push_str(&source[range.end..]);
+            let mut state = state;
+            let (session_path, pane_id) = (session_path.clone(), pane_id.clone());
+            state.with_mut(|shell| {
+                // The splice IS an editor draft: same value id, same channel,
+                // same draft action the split editor uses — one write path.
+                shell.set_document_pane_value(&session_path, "editor", spliced);
+            });
+            spawn(document_pane_run_action(
+                state,
+                session_path,
+                pane_id,
+                "draft".to_string(),
+                None,
+            ));
+        }
+    };
+    let block_hover_css = format!(
+        "[data-md-editable-block]:hover {{ box-shadow: inset 2px 0 0 {}; cursor:text; }}",
+        doc.accent
+    );
+    rsx! {
+        style { "{block_hover_css}" }
+        div {
+            style: "font-size:13.5px;",
+            for (index, block) in blocks.iter().enumerate() {
+                if editable && *editing.read() == Some(index) {
+                    {
+                    let edit_rows = edit_text.read().lines().count().max(3) + 1;
+                    rsx! {
+                    textarea {
+                        key: "md-edit-{index}",
+                        "data-md-block-editor": "{index}",
+                        style: format!(
+                            "display:block; width:100%; min-height:64px; box-sizing:border-box; margin:6px 0; \
+                             padding:10px 12px; border:1px solid {}; border-radius:8px; background:{}; \
+                             color:{}; caret-color:{}; font-family:ui-monospace, monospace; font-size:12.5px; \
+                             line-height:1.55; resize:vertical; outline:none;",
+                            doc.accent, doc.chrome, doc.fg, doc.accent
+                        ),
+                        rows: "{edit_rows}",
+                        autofocus: true,
+                        initial_value: "{edit_text.read()}",
+                        oninput: move |evt: FormEvent| edit_text.set(evt.value()),
+                        onkeydown: {
+                            let commit = commit.clone();
+                            move |evt: KeyboardEvent| {
+                                if evt.key() == Key::Escape {
+                                    evt.prevent_default();
+                                    editing.set(None);
+                                } else if evt.key() == Key::Enter
+                                    && evt.modifiers().contains(Modifiers::CONTROL)
+                                {
+                                    evt.prevent_default();
+                                    commit(index, edit_text.peek().clone());
+                                    editing.set(None);
+                                }
+                            }
+                        },
+                        onblur: {
+                            let commit = commit.clone();
+                            move |_| {
+                                if editing.peek().is_some() {
+                                    commit(index, edit_text.peek().clone());
+                                    editing.set(None);
+                                }
+                            }
+                        },
+                    }
+                    }
+                    }
+                } else {
+                    div {
+                        key: "md-block-{index}",
+                        "data-md-editable-block": if editable { "{index}" },
+                        onclick: {
+                            let source = source.clone();
+                            let ranges = ranges.clone();
+                            move |_| {
+                                if !editable {
+                                    return;
+                                }
+                                if let Some(range) = ranges.get(index) {
+                                    edit_text.set(source[range.clone()].to_string());
+                                    editing.set(Some(index));
+                                }
+                            }
+                        },
+                        {md_block_node(block, &doc, index)}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The DOCUMENT SURFACE body: the viewport-placement pane's schema rendered
 /// at document scale. Chrome widgets (tabs, buttons, toggles, labels) form a
 /// top bar; `markdown` and multiline `text-input` widgets are the scrolling
@@ -84836,6 +85024,7 @@ fn markdown_widget_body(source: &str, palette: &DocTheme) -> Element {
 /// themed — not as a foreign light panel over a dark terminal (user
 /// direction 2026-07-17). `color-mix` derives the soft tones so any of the
 /// ~400 catalog themes works without per-theme tuning.
+#[derive(Clone, PartialEq)]
 struct DocTheme {
     bg: String,
     fg: String,
@@ -85161,14 +85350,26 @@ fn DocumentSurfaceBody(
                                     key: "{widget_key}",
                                     "data-document-markdown": "{id}",
                                     style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
-                                    {
-                                        // Live preview: the sibling editor's
-                                        // draft renders per keystroke, no app
-                                        // round trip.
-                                        let live = (!live_from.is_empty())
-                                            .then(|| document_values.get(live_from).cloned())
-                                            .flatten();
-                                        markdown_widget_body(live.as_deref().unwrap_or(source), &doc)
+                                    if live_from.is_empty() {
+                                        // The pure READER: no sibling editor, so
+                                        // blocks are click-to-edit in place
+                                        // (Phase 4 — Typora-lite, not WYSIWYG).
+                                        EditableMarkdownBody {
+                                            source: source.clone(),
+                                            doc: doc.clone(),
+                                            state,
+                                            session_path: session_path.clone(),
+                                            pane_id: pane_id.clone(),
+                                        }
+                                    } else {
+                                        // Live preview beside an editor: the
+                                        // sibling's draft renders per keystroke,
+                                        // no app round trip — and edits belong
+                                        // in the editor, not here.
+                                        {
+                                            let live = document_values.get(live_from).cloned();
+                                            markdown_widget_body(live.as_deref().unwrap_or(source), &doc)
+                                        }
                                     }
                                 }
                             },
@@ -91964,6 +92165,42 @@ mod tests {
             shell.sidebar_reads_live_since,
             Some(("local://ws".to_string(), switch_tick))
         );
+    }
+
+    // Block click-to-edit (Phase 4): the offset-iter pass must yield exactly
+    // one source range per folded root block — the zip is what makes a
+    // splice safe — and each range must slice the block's own source.
+    #[test]
+    fn top_level_block_ranges_align_with_the_folded_blocks() {
+        let source = "# Title\n\nA paragraph with **bold**.\n\n- one\n- two\n\n```\ncode here\n```\n\n> quoted\n\n---\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = parse_markdown_blocks(source);
+        let ranges = top_level_block_ranges(source);
+        assert_eq!(
+            blocks.len(),
+            ranges.len(),
+            "one range per root block: {blocks:?} vs {ranges:?}"
+        );
+        assert_eq!(&source[ranges[0].clone()], "# Title\n");
+        assert_eq!(&source[ranges[1].clone()], "A paragraph with **bold**.\n");
+        // pulldown extends a list's span through its trailing blank line.
+        assert_eq!(source[ranges[2].clone()].trim_end(), "- one\n- two");
+        assert!(source[ranges[3].clone()].contains("code here"));
+        assert!(source[ranges[4].clone()].contains("quoted"));
+        assert_eq!(&source[ranges[5].clone()], "---\n");
+        assert!(source[ranges[5].end..].contains("| a | b |"));
+
+        // The splice a commit performs: replacing block 1 touches nothing else.
+        let range = ranges[1].clone();
+        let spliced = format!(
+            "{}{}{}",
+            &source[..range.start],
+            "Rewritten paragraph.\n",
+            &source[range.end..]
+        );
+        assert!(spliced.contains("# Title"));
+        assert!(spliced.contains("Rewritten paragraph."));
+        assert!(!spliced.contains("A paragraph with"));
+        assert!(spliced.contains("code here"));
     }
 
     // The keyed document channel (Phase 3.1): each (session, view) owns its
