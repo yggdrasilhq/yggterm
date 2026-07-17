@@ -7368,6 +7368,11 @@ impl ShellState {
             if !live {
                 kill_control_forward(contribution);
             }
+            if !live {
+                // Expired like a close: a future instance re-earns its rail
+                // auto-open.
+                self.document_rail_auto_opened.remove(session_path);
+            }
             live
         });
     }
@@ -61361,6 +61366,15 @@ fn TerminalCanvas(
                                             {
                                                 shell.clear_document_pane();
                                             }
+                                            // The app retired: a NEW instance in
+                                            // this session earns a fresh rail
+                                            // auto-open. (The once-guard exists
+                                            // to respect a USER-closed rail
+                                            // against heartbeats, not to outlive
+                                            // the app.)
+                                            shell
+                                                .document_rail_auto_opened
+                                                .remove(&contribution_session_path);
                                         });
                                         append_trace_event(
                                             &trace_home,
