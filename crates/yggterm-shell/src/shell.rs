@@ -153,7 +153,8 @@ use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
-    SessionStore, SessionSummaryTimelineEntry, SplitAxis, SplitGroup, TerminalTelemetryEvent,
+    SessionStore, SessionSummaryTimelineEntry, SplitAxis, SplitGroup, SplitMember,
+    TerminalTelemetryEvent,
     WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_perf_event,
     append_trace_event, best_effort_precis_from_context, best_effort_summary_from_context,
@@ -6325,7 +6326,9 @@ impl ShellState {
             // focused pane is already retained above; this guarantees the
             // sibling is too, independent of the activation-MRU keep-set.
             if let Some(group) = self.active_split_group() {
-                for member_path in group.members.clone() {
+                let member_paths: Vec<String> =
+                    group.member_sessions().map(str::to_string).collect();
+                for member_path in member_paths {
                     if retained_terminal_sessions
                         .iter()
                         .any(|session| session.session_path == member_path)
@@ -6655,9 +6658,9 @@ impl ShellState {
                 let mut co_visible: Vec<String> =
                     active_session_path.iter().cloned().collect();
                 if let Some(group) = self.active_split_group() {
-                    for member in &group.members {
-                        if !co_visible.contains(member) {
-                            co_visible.push(member.clone());
+                    for member in group.member_sessions() {
+                        if !co_visible.iter().any(|path| path == member) {
+                            co_visible.push(member.to_string());
                         }
                     }
                 }
@@ -11638,7 +11641,9 @@ impl ShellState {
         let mut restore: Vec<(String, bool)> = Vec::new();
         self.split_groups.retain_mut(|group| {
             let before = group.members.len();
-            group.members.retain(|member| known_paths.contains(member));
+            group
+                .members
+                .retain(|member| known_paths.contains(member.session.as_str()));
             if group.members.len() != before {
                 changed = true;
                 if group.active_pane >= group.members.len() {
@@ -11650,8 +11655,8 @@ impl ShellState {
             } else {
                 // Dissolving: hand back the survivor's pre-group keep-alive.
                 for member in &group.members {
-                    if let Some(prior) = group.prior_keep_alive.get(member) {
-                        restore.push((member.clone(), *prior));
+                    if let Some(prior) = group.prior_keep_alive.get(&member.session) {
+                        restore.push((member.session.clone(), *prior));
                     }
                 }
                 changed = true;
@@ -17493,9 +17498,9 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                     .into_iter()
                     .collect();
                 if let Some(group) = shell.active_split_group() {
-                    for member in &group.members {
-                        if !co_visible.contains(member) {
-                            co_visible.push(member.clone());
+                    for member in group.member_sessions() {
+                        if !co_visible.iter().any(|path| path == member) {
+                            co_visible.push(member.to_string());
                         }
                     }
                 }
@@ -18007,7 +18012,9 @@ fn create_split_group(
             group_id: group_id.clone(),
             axis,
             ratio: 0.5,
-            members,
+            // Creation is session-based, so every pane starts as the session's
+            // own surface; pinned views (split-tabs) are set post-create.
+            members: members.into_iter().map(SplitMember::terminal).collect(),
             active_pane: 0,
             prior_keep_alive,
         });
@@ -18026,7 +18033,7 @@ fn create_split_group(
     let members = state.with(|shell| {
         shell
             .split_group_for_session(&first_member)
-            .map(|group| group.members.clone())
+            .map(|group| group.member_sessions().map(str::to_string).collect())
             .unwrap_or_default()
     });
     spawn_heal_split_panes(members);
@@ -18081,7 +18088,7 @@ fn focus_split_pane(mut state: Signal<ShellState>, member: &str) {
             .iter_mut()
             .find(|group| group.contains(member))
         {
-            if let Some(index) = group.members.iter().position(|m| m == member) {
+            if let Some(index) = group.members.iter().position(|m| m.session == member) {
                 if group.active_pane != index {
                     group.active_pane = index;
                     shell.settings.split_groups = shell.split_groups.clone();
@@ -18111,7 +18118,7 @@ fn set_split_group_ratio(mut state: Signal<ShellState>, group_id: &str, ratio: f
             };
             if (group.ratio - clamped).abs() > f32::EPSILON {
                 group.ratio = clamped;
-                changed_members = group.members.clone();
+                changed_members = group.member_sessions().map(str::to_string).collect();
                 shell.persist_split_groups();
             }
         }
@@ -18134,11 +18141,11 @@ fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
         };
         let group = shell.split_groups.remove(pos);
         let mut restore: Vec<(String, bool)> = Vec::new();
-        for member in &group.members {
+        for member in group.member_sessions() {
             let prior = group.prior_keep_alive.get(member).copied().unwrap_or(true);
-            if !prior {
+            if !prior && !restore.iter().any(|(path, _)| path == member) {
                 mark_live_session_keep_alive_locally(shell, member, false);
-                restore.push((member.clone(), false));
+                restore.push((member.to_string(), false));
             }
         }
         shell.persist_split_groups();
@@ -18160,17 +18167,22 @@ fn remove_split_pane(mut state: Signal<ShellState>, group_id: &str, member: &str
         let Some(group) = shell.split_group_by_id_mut(group_id) else {
             return Vec::new();
         };
-        let Some(index) = group.members.iter().position(|m| m == member) else {
+        let Some(index) = group.members.iter().position(|m| m.session == member) else {
             return Vec::new();
         };
         let prior = group.prior_keep_alive.get(member).copied().unwrap_or(true);
         group.members.remove(index);
-        group.prior_keep_alive.remove(member);
+        // A session may occupy two panes through different views (split-tabs);
+        // its keep-alive memory leaves with its LAST pane, not its first.
+        let session_still_paned = group.contains(member);
+        if !session_still_paned {
+            group.prior_keep_alive.remove(member);
+        }
         if group.active_pane >= group.members.len() {
             group.active_pane = group.members.len().saturating_sub(1);
         }
         let mut restore: Vec<(String, bool)> = Vec::new();
-        if !prior {
+        if !prior && !session_still_paned {
             restore.push((member.to_string(), false));
         }
         // Collapsing to a single member dissolves the group.
@@ -18184,14 +18196,14 @@ fn remove_split_pane(mut state: Signal<ShellState>, group_id: &str, member: &str
                 .position(|group| group.group_id == group_id)
             {
                 let dissolved = shell.split_groups.remove(pos);
-                for survivor in &dissolved.members {
+                for survivor in dissolved.member_sessions() {
                     let survivor_prior = dissolved
                         .prior_keep_alive
                         .get(survivor)
                         .copied()
                         .unwrap_or(true);
-                    if !survivor_prior {
-                        restore.push((survivor.clone(), false));
+                    if !survivor_prior && !restore.iter().any(|(path, _)| path == survivor) {
+                        restore.push((survivor.to_string(), false));
                     }
                 }
             }
@@ -29940,14 +29952,14 @@ fn split_group_cells_for_row(
             let label = snapshot
                 .live_sessions
                 .iter()
-                .find(|session| &session.session_path == member)
+                .find(|session| session.session_path == member.session)
                 .map(|session| session.title.clone())
                 .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| split_pane_fallback_label(member));
+                .unwrap_or_else(|| split_pane_fallback_label(&member.session));
             SplitPaneCell {
-                path: member.clone(),
+                path: member.session.clone(),
                 label,
-                focused: snapshot.active_session_path.as_deref() == Some(member.as_str()),
+                focused: snapshot.active_session_path.as_deref() == Some(member.session.as_str()),
             }
         })
         .collect();
@@ -29982,7 +29994,7 @@ fn collapse_live_sessions_into_split_rows(rows: &mut Vec<BrowserRow>, groups: &[
     for group in groups {
         let member_positions: Vec<usize> = ((start + 1)..region_end)
             .filter(|idx| !drop_indices.contains(idx))
-            .filter(|idx| group.members.iter().any(|member| member == &rows[*idx].full_path))
+            .filter(|idx| group.contains(&rows[*idx].full_path))
             .collect();
         // Only compound when at least two members are actually present in Live
         // Sessions; a partial group falls back to plain rows.
@@ -56242,7 +56254,7 @@ fn MainSurface(
     let active_session_in_split = active_split_group
         .as_ref()
         .zip(snapshot.active_session_path.as_ref())
-        .is_some_and(|(group, active)| group.members.contains(active));
+        .is_some_and(|(group, active)| group.contains(active));
     let body = if let Some(session) = snapshot.active_session.clone() {
         if session.kind == SessionKind::Document {
             rsx! {
@@ -56332,7 +56344,7 @@ fn MainSurface(
                                         group
                                             .members
                                             .iter()
-                                            .position(|member| member == &session_path_str)
+                                            .position(|member| member.session == session_path_str)
                                     });
                                 let is_split_pane = pane_index.is_some();
                                 // A split pane is always co-visible; a lone
@@ -87280,11 +87292,11 @@ fn split_group_member_labels(
         .map(|member| {
             let label = live_sessions
                 .iter()
-                .find(|session| &session.session_path == member)
+                .find(|session| session.session_path == member.session)
                 .map(|session| session.title.clone())
                 .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| member.clone());
-            (member.clone(), label)
+                .unwrap_or_else(|| member.session.clone());
+            (member.session.clone(), label)
         })
         .collect()
 }
@@ -91993,7 +92005,10 @@ mod tests {
             group_id: "g1".to_string(),
             axis: SplitAxis::SideBySide,
             ratio: 0.5,
-            members: vec!["local://a".to_string(), "local://b".to_string()],
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
             active_pane: 0,
             prior_keep_alive: std::collections::BTreeMap::new(),
         };
@@ -92026,7 +92041,10 @@ mod tests {
             group_id: "g1".to_string(),
             axis: SplitAxis::SideBySide,
             ratio: 0.5,
-            members: vec!["local://a".to_string(), "local://b".to_string()],
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
             active_pane: 0,
             prior_keep_alive: std::collections::BTreeMap::new(),
         };
