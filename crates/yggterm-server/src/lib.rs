@@ -146,6 +146,15 @@ static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<
 static REMOTE_YGGTERM_COMMAND_RESOLVE_LOCKS: OnceLock<
     Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
 > = OnceLock::new();
+static LOCAL_BUILD_ID_MEMO: OnceLock<Mutex<Option<LocalBuildIdMemo>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalBuildIdMemo {
+    path: std::path::PathBuf,
+    len: u64,
+    modified_ms: u64,
+    build_id: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -11906,6 +11915,22 @@ fn remote_command_resolve_locks()
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Fresh (same local build, inside the verify TTL) cached binary expression
+/// for a target, or None. Read-only: safe to consult WITHOUT holding the
+/// per-target resolve lock, which serializes actual remote work only.
+fn fresh_cached_remote_binary_expr(cache_key: &str, local_build_id: u64) -> Option<String> {
+    let cache = remote_command_cache().lock().ok()?;
+    let cached = cache.get(cache_key)?;
+    if cached.local_build_id != local_build_id {
+        return None;
+    }
+    let now_ms = current_millis_u64();
+    if now_ms.saturating_sub(cached.verified_at_ms) > REMOTE_COMMAND_CACHE_VERIFY_TTL_MS {
+        return None;
+    }
+    Some(cached.binary_expr.clone())
+}
+
 fn remote_command_resolve_lock(cache_key: &str) -> Arc<Mutex<()>> {
     remote_command_resolve_locks()
         .lock()
@@ -12168,21 +12193,62 @@ fn check_remote_protocol_version(
     )
 }
 
+fn fnv1a_build_id(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn build_id_file_identity(path: &Path) -> (u64, u64) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (0, 0);
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    (metadata.len(), modified_ms)
+}
+
 fn current_local_build_id() -> u64 {
-    local_remote_bootstrap_executable()
-        .or_else(|| std::env::current_exe().ok())
-        .and_then(|path| fs::read(path).ok())
-        .map(|bytes| {
-            const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-            const FNV_PRIME: u64 = 0x100000001b3;
-            let mut hash = FNV_OFFSET;
-            for byte in bytes {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(FNV_PRIME);
+    let Some(path) = local_remote_bootstrap_executable().or_else(|| std::env::current_exe().ok())
+    else {
+        return 0;
+    };
+    // Memoized by file identity: hashing the ~17 MB payload binary on EVERY
+    // resolve showed up as a 30-50 ms floor per resolve span (perf telemetry
+    // 2026-07-17), and the binary only changes on deploy.
+    let (len, modified_ms) = build_id_file_identity(&path);
+    let memo_cell = LOCAL_BUILD_ID_MEMO.get_or_init(|| Mutex::new(None));
+    if let Ok(memo) = memo_cell.lock() {
+        if let Some(memo) = memo.as_ref() {
+            if memo.path == path && memo.len == len && memo.modified_ms == modified_ms {
+                return memo.build_id;
             }
-            hash
-        })
-        .unwrap_or_default()
+        }
+    }
+    // A transient read failure is returned as the legacy 0 sentinel but NOT
+    // memoized, so the next call re-reads instead of pinning 0 until deploy.
+    let Ok(bytes) = fs::read(&path) else {
+        return 0;
+    };
+    let build_id = fnv1a_build_id(&bytes);
+    if let Ok(mut memo) = memo_cell.lock() {
+        *memo = Some(LocalBuildIdMemo {
+            path,
+            len,
+            modified_ms,
+            build_id,
+        });
+    }
+    build_id
 }
 
 fn parse_remote_protocol_descriptor(text: &str) -> RemoteProtocolDescriptor {
@@ -12429,28 +12495,44 @@ fn resolve_remote_yggterm_binary(
     };
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
     let local_build_id = current_local_build_id();
+    // Fresh-cache fast path BEFORE the per-target resolve lock: a valid cache
+    // entry needs no serialization with an in-flight resolve. Waiting on the
+    // lock here is what turned "cache_hit" spans into 200s+ stalls queued
+    // behind a slow host's first bootstrap scp (perf incidents 2026-07-17:
+    // practice bootstrapped=263.6s, cache_hit=218.6s in the same window),
+    // and those stalls surfaced as multi-minute daemon_request/startup hangs.
+    if let Some(binary_expr) = fresh_cached_remote_binary_expr(&cache_key, local_build_id) {
+        finish_span(serde_json::json!({
+            "ssh_target": ssh_target,
+            "result": "cache_hit",
+            "binary_expr": binary_expr.clone(),
+            "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+            "build_id": local_build_id,
+        }));
+        return Ok((binary_expr, RemoteDeployState::Ready));
+    }
     let resolve_lock = remote_command_resolve_lock(&cache_key);
     let _resolve_guard = resolve_lock
         .lock()
         .expect("remote command resolve guard poisoned");
+    // Double-checked: the resolve this call waited behind usually populated
+    // the cache, so a second miss here means real remote work is needed.
+    if let Some(binary_expr) = fresh_cached_remote_binary_expr(&cache_key, local_build_id) {
+        finish_span(serde_json::json!({
+            "ssh_target": ssh_target,
+            "result": "cache_hit_after_lock_wait",
+            "binary_expr": binary_expr.clone(),
+            "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+            "build_id": local_build_id,
+        }));
+        return Ok((binary_expr, RemoteDeployState::Ready));
+    }
     if let Some(cached) = remote_command_cache()
         .lock()
         .ok()
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
         let now_ms = current_millis_u64();
-        if cached.local_build_id == local_build_id
-            && now_ms.saturating_sub(cached.verified_at_ms) <= REMOTE_COMMAND_CACHE_VERIFY_TTL_MS
-        {
-            finish_span(serde_json::json!({
-                "ssh_target": ssh_target,
-                "result": "cache_hit",
-                "binary_expr": cached.binary_expr.clone(),
-                "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
-                "build_id": cached.local_build_id,
-            }));
-            return Ok((cached.binary_expr, RemoteDeployState::Ready));
-        }
         if check_remote_protocol_version(ssh_target, exec_prefix, &cached.binary_expr).is_ok() {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
@@ -25888,6 +25970,71 @@ terminal_window_id: None,
     fn strip_remote_payload_noise_discards_shell_preamble() {
         let raw = format!("alias chicago='ssh'\nwelcome\n{REMOTE_OUTPUT_SENTINEL}\n2.0.12\n");
         assert_eq!(strip_remote_payload_noise(raw.as_bytes()), "2.0.12");
+    }
+
+    /// Regression (telemetry campaign 2026-07-17): a FRESH cache entry must
+    /// resolve without waiting on the per-target resolve lock. The old order
+    /// (lock, then cache) queued every "cache_hit" behind an in-flight
+    /// bootstrap scp — live-measured as a 218.6s cache_hit span behind a
+    /// 263.6s first provision, stalling daemon requests for minutes.
+    #[test]
+    fn resolve_serves_fresh_cache_entry_while_resolve_lock_is_held() {
+        let target = "unit-test-resolve-lock-independence";
+        let cache_key = remote_cache_key(target, None);
+        let build_id = super::current_local_build_id();
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.insert(
+                cache_key.clone(),
+                RemoteCommandCacheEntry {
+                    binary_expr: "$HOME/.yggterm/bin/yggterm".to_string(),
+                    verified_at_ms: current_millis_u64(),
+                    local_build_id: build_id,
+                },
+            );
+        }
+        let resolve_lock = super::remote_command_resolve_lock(&cache_key);
+        let _held_elsewhere = resolve_lock.lock().expect("test holds the resolve lock");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let resolved = super::resolve_remote_yggterm_binary(
+                "unit-test-resolve-lock-independence",
+                None,
+            )
+            .map(|(binary_expr, _state)| binary_expr);
+            let _ = sender.send(resolved);
+        });
+        let resolved = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fresh cache entry must resolve without waiting on the resolve lock");
+        assert_eq!(resolved.expect("cache hit"), "$HOME/.yggterm/bin/yggterm");
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.remove(&cache_key);
+        }
+    }
+
+    #[test]
+    fn local_build_id_hash_is_stable_and_content_sensitive() {
+        assert_eq!(super::fnv1a_build_id(b""), 0xcbf29ce484222325);
+        assert_eq!(super::fnv1a_build_id(b"abc"), super::fnv1a_build_id(b"abc"));
+        assert_ne!(super::fnv1a_build_id(b"abc"), super::fnv1a_build_id(b"abd"));
+    }
+
+    #[test]
+    fn build_id_file_identity_tracks_length_change() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-build-id-identity-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&root)?;
+        let path = root.join("payload");
+        fs::write(&path, b"one")?;
+        let before = super::build_id_file_identity(&path);
+        fs::write(&path, b"grown-payload")?;
+        let after = super::build_id_file_identity(&path);
+        assert_ne!(before.0, after.0, "length must change the file identity");
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     // Removed 2026-06-05: parse_screen_session_ref + remote_multiplexer session
