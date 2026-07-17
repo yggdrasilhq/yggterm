@@ -2069,6 +2069,13 @@ fn navigate_web_surface_tab(
 }
 /// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
 const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
+/// How long a sidebar contribution outlives its last declare (while its
+/// session's reads are live) before the sweep tears it down. Deliberately
+/// LONGER than the stale window: between stale and expiry the document surface
+/// stays up under a "not responding" overlay, so a Ctrl+Z'd app reads as
+/// suspended instead of silently freezing (fg within the window recovers
+/// instantly) — and a truly dead app's surface still closes on its own.
+const SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS: u64 = 2 * WEB_SURFACE_STALE_AFTER_MS;
 /// How long after a DELIBERATE close (✕ / suspend / the app's own close OSC) a
 /// heartbeat is still barred from recreating the surface — long enough to cover
 /// the app's own close OSC arriving after the GUI sent Ctrl+C, short enough that
@@ -4006,6 +4013,20 @@ struct ShellState {
     /// shape). Once only: a user who closes the rail must not have the next
     /// heartbeat reopen it.
     document_rail_auto_opened: HashSet<String>,
+    /// The session whose document surface is STALE-BUT-PRESENT: its declares
+    /// stopped while its reads were live (a Ctrl+Z'd app), but the contribution
+    /// has not yet hit SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS. The surface paints
+    /// a "not responding" overlay instead of silently stale pixels. Set by the
+    /// sweep; cleared the instant a declare arrives (fg recovers immediately).
+    document_surface_stale: Option<String>,
+    /// (session, since_ms) — when the CURRENT active-visible session's OSC
+    /// reads became live. A just-foregrounded session's declares were not being
+    /// read while it was backgrounded, so its `last_seen_ms` says nothing about
+    /// the app's health until a full stale window of live listening has passed;
+    /// the sweep judges on max(last_seen, since). Without this, the timer sweep
+    /// could tear down a healthy surface on the first tick after a session
+    /// switch, before the app's next ~4s declare lands.
+    sidebar_reads_live_since: Option<(String, u64)>,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -4445,6 +4466,17 @@ struct PreviewSyncFailure {
     retry_count: u32,
     first_failed_at_ms: u64,
 }
+/// The active session's document surface as the renderer needs it. `stale`
+/// drives the "not responding" overlay (declares stopped while reads were
+/// live); `app_name` names the app in that overlay — the declaration owns the
+/// name, the shell never hardcodes one.
+#[derive(Clone, Debug, PartialEq)]
+struct DocumentPaneSnapshot {
+    pane_id: String,
+    visible: bool,
+    stale: bool,
+    app_name: Option<String>,
+}
 #[derive(Clone, PartialEq)]
 struct RenderSnapshot {
     palette: Palette,
@@ -4499,9 +4531,10 @@ struct RenderSnapshot {
     app_pane_schema: Option<AppPaneSchemaState>,
     app_pane_error: Option<String>,
     /// The DOCUMENT SURFACE for the ACTIVE session: the viewport-placement
-    /// pane's id, whether the user has it visible, plus its fetched schema
-    /// and any fetch error. None when the active session declares none.
-    document_pane: Option<(String, bool)>,
+    /// pane's id, whether the user has it visible, whether its app has stopped
+    /// declaring (the not-responding overlay), plus its fetched schema and any
+    /// fetch error. None when the active session declares none.
+    document_pane: Option<DocumentPaneSnapshot>,
     document_pane_schema: Option<AppPaneSchemaState>,
     document_pane_error: Option<String>,
     /// The document's draft values (live editor buffer) — the gutter's line
@@ -5747,6 +5780,8 @@ impl ShellState {
             document_pane_request_seq: 0,
             document_surface_hidden: HashSet::new(),
             document_rail_auto_opened: HashSet::new(),
+            document_surface_stale: None,
+            sidebar_reads_live_since: None,
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -6517,8 +6552,14 @@ impl ShellState {
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
             document_pane: active_session_path.as_deref().and_then(|path| {
-                self.viewport_pane_for_session(path).map(|pane| {
-                    (pane.id.clone(), self.document_surface_visible_for(path))
+                self.viewport_pane_for_session(path).map(|pane| DocumentPaneSnapshot {
+                    pane_id: pane.id.clone(),
+                    visible: self.document_surface_visible_for(path),
+                    stale: self.document_surface_stale.as_deref() == Some(path),
+                    app_name: self
+                        .sidebar_contributions
+                        .get(path)
+                        .and_then(|contribution| contribution.app_name.clone()),
                 })
             }),
             // The document schema rides the snapshot only when it belongs to
@@ -7005,10 +7046,7 @@ impl ShellState {
         // which keeps them stashed-alive and reclaims memory on its own timer.
         // Only the ACTIVE-VISIBLE session's reads are live, so only it is a
         // reliable dead-app signal here.
-        let active_visible_path = (!self.app_control_backgrounded
-            && self.server.active_view_mode() == WorkspaceViewMode::Terminal)
-            .then(|| self.server.active_session_path().map(str::to_string))
-            .flatten();
+        let active_visible_path = self.sidebar_reads_live_path();
         self.web_surfaces.retain(|session_path, surface| {
             let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
             if !reads_live {
@@ -7051,6 +7089,12 @@ impl ShellState {
         let zoom_version = zoom_version.unwrap_or_default();
         let appearance_version = appearance_version.unwrap_or_default();
         let document_version = document_version.unwrap_or_default();
+        // A declare is proof of life: clear the not-responding overlay the
+        // instant one arrives, so fg after Ctrl+Z recovers without waiting for
+        // the next sweep.
+        if self.document_surface_stale.as_deref() == Some(session_path) {
+            self.document_surface_stale = None;
+        }
         if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
             existing.last_seen_ms = now_ms;
             // Panes may change between declares (an app can add one); the
@@ -7341,10 +7385,28 @@ impl ShellState {
         if let Some(contribution) = self.sidebar_contributions.remove(session_path) {
             kill_control_forward(&contribution);
         }
+        if self.document_surface_stale.as_deref() == Some(session_path) {
+            self.document_surface_stale = None;
+        }
     }
-    /// Contributions expire on the same rule as surfaces: no declare within
-    /// WEB_SURFACE_STALE_AFTER_MS and the app is presumed gone, so its buttons
-    /// leave the rail rather than dangling at a dead control endpoint.
+    /// The one session whose OSC reads are live right now (active, visible,
+    /// terminal view). Only ITS `last_seen_ms` is a trustworthy liveness
+    /// signal — both stale sweeps and the sweep-due precheck judge from this.
+    fn sidebar_reads_live_path(&self) -> Option<String> {
+        (!self.app_control_backgrounded
+            && self.server.active_view_mode() == WorkspaceViewMode::Terminal)
+            .then(|| self.server.active_session_path().map(str::to_string))
+            .flatten()
+    }
+    /// Contributions expire when no declare arrives within
+    /// SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS of live listening: the app is
+    /// presumed gone, so its buttons leave the rail rather than dangling at a
+    /// dead control endpoint. Runs on the WorkingFlags poll tick AND on declare
+    /// arrival — a suspended (Ctrl+Z) app stops declaring entirely, so a sweep
+    /// that only ran on declares never noticed it ([[campaign-libyggterm]]
+    /// Phase 0.2, the zombie surface). Between WEB_SURFACE_STALE_AFTER_MS and
+    /// expiry the document surface stays up under a "not responding" overlay
+    /// (`document_surface_stale`), so fg-within-the-window recovers instantly.
     fn sweep_stale_sidebar_contributions(&mut self, now_ms: u64) {
         // Same background-read caveat as sweep_stale_web_surfaces: a backgrounded
         // session's declares stop being read, so its contribution goes stale even
@@ -7354,17 +7416,32 @@ impl ShellState {
         // Only the active-visible session's reads are a reliable liveness signal.
         // `active_sidebar_panes` still gates DISPLAY on freshness, so a truly
         // dead app's rail hides within the stale window regardless.
-        let active_visible_path = (!self.app_control_backgrounded
-            && self.server.active_view_mode() == WorkspaceViewMode::Terminal)
-            .then(|| self.server.active_session_path().map(str::to_string))
-            .flatten();
+        let active_visible_path = self.sidebar_reads_live_path();
+        // Reset the listening clock when the active-visible session changes:
+        // reads for the new session start NOW, so its aged `last_seen_ms`
+        // proves nothing until a full window of live listening has passed.
+        let clock_matches = match (&self.sidebar_reads_live_since, &active_visible_path) {
+            (Some((path, _)), Some(active)) => path == active,
+            (None, None) => true,
+            _ => false,
+        };
+        if !clock_matches {
+            self.sidebar_reads_live_since =
+                active_visible_path.clone().map(|path| (path, now_ms));
+        }
+        let reads_since = self
+            .sidebar_reads_live_since
+            .as_ref()
+            .map(|(_, since)| *since)
+            .unwrap_or(now_ms);
         self.sidebar_contributions.retain(|session_path, contribution| {
             let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
             if !reads_live {
                 return true;
             }
-            let live =
-                now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
+            let effective_last_seen = contribution.last_seen_ms.max(reads_since);
+            let live = now_ms.saturating_sub(effective_last_seen)
+                <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
             if !live {
                 kill_control_forward(contribution);
             }
@@ -7375,6 +7452,50 @@ impl ShellState {
             }
             live
         });
+        // The not-responding overlay marker: the active-visible session whose
+        // contribution SURVIVED the retain but is past the stale window. One
+        // owner (this sweep) and one clearer (a declare arriving), so the
+        // overlay can never disagree with the sweep about staleness.
+        self.document_surface_stale = active_visible_path.filter(|path| {
+            self.sidebar_contributions.get(path).is_some_and(|contribution| {
+                now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since))
+                    > WEB_SURFACE_STALE_AFTER_MS
+            })
+        });
+    }
+    /// Read-only precheck for the timer-driven sweep: true when running the
+    /// sweep would actually change state (clock reset, overlay flip, or an
+    /// expiry). Lets the poll tick skip the write lock — and the re-render a
+    /// Signal write schedules — in the idle no-contributions case.
+    fn sidebar_sweep_due(&self, now_ms: u64) -> bool {
+        let active_visible_path = self.sidebar_reads_live_path();
+        let clock_matches = match (&self.sidebar_reads_live_since, &active_visible_path) {
+            (Some((path, _)), Some(active)) => path == active,
+            (None, None) => true,
+            _ => false,
+        };
+        if !clock_matches {
+            // A clock reset only matters if there is anything it could judge.
+            return !self.sidebar_contributions.is_empty()
+                || self.document_surface_stale.is_some();
+        }
+        let reads_since = self
+            .sidebar_reads_live_since
+            .as_ref()
+            .map(|(_, since)| *since)
+            .unwrap_or(now_ms);
+        let Some(active) = active_visible_path else {
+            return self.document_surface_stale.is_some();
+        };
+        let Some(contribution) = self.sidebar_contributions.get(&active) else {
+            return self.document_surface_stale.is_some();
+        };
+        let age = now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since));
+        if age > SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS {
+            return true;
+        }
+        let stale = age > WEB_SURFACE_STALE_AFTER_MS;
+        stale != (self.document_surface_stale.as_deref() == Some(active.as_str()))
     }
     /// The panes the active session's app currently offers. Empty when no app
     /// has declared, which is what keeps the rail free of app chrome.
@@ -16974,6 +17095,18 @@ fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
             });
             if closing {
                 return;
+            }
+            // Zombie-surface fix ([[campaign-libyggterm]] Phase 0.2): the
+            // contribution stale sweep rides this tick so it runs on TIME, not
+            // only when a declare arrives — a suspended (Ctrl+Z) app stops
+            // declaring entirely, and nothing else would ever notice. The
+            // read-only precheck keeps the idle tick free of Signal writes
+            // (a write schedules a re-render).
+            let sweep_due = state.with(|shell| shell.sidebar_sweep_due(current_millis()));
+            if sweep_due {
+                let _ = safe_shell_mut(state, "sidebar_stale_sweep", |shell| {
+                    shell.sweep_stale_sidebar_contributions(current_millis());
+                });
             }
             if !has_flagged_sessions {
                 continue;
@@ -55054,26 +55187,35 @@ fn BellIcon() -> Element {
         }
     }
 }
+/// Width of the gap between split pane rects. The gutter is load-bearing, not
+/// cosmetic: it is the ONLY strip where the divider line and the focus ring can
+/// live once split members include web panes — a native webview paints above
+/// all DOM inside its rect, so nothing drawn INSIDE a pane rect is guaranteed
+/// visible. Half the gutter is carved off each pane at the seam.
+const SPLIT_GUTTER_PX: u32 = 6;
+
 /// CSS geometry (`position`/`left`/`top`/`width`/`height`) for pane `index` of
 /// a 2-pane split ([[campaign-split-view-groups]] MVP). `ratio` is the fraction
-/// the first pane occupies along the split axis. Index 0 is the first pane; any
-/// other index is treated as the second — 2×2 (drop-onto-cell) is phase 2.
+/// the first pane occupies along the split axis; both panes shrink toward the
+/// seam by half of SPLIT_GUTTER_PX. Index 0 is the first pane; any other index
+/// is treated as the second — 2×2 (drop-onto-cell) is phase 2.
 fn split_pane_rect_css(axis: SplitAxis, ratio: f32, index: usize) -> String {
     let ratio = ratio.clamp(0.05, 0.95);
     let first_pct = ratio * 100.0;
     let second_pct = 100.0 - first_pct;
+    let half = SPLIT_GUTTER_PX / 2;
     match (axis, index) {
         (SplitAxis::SideBySide, 0) => {
-            format!("position:absolute; left:0; top:0; width:{first_pct:.4}%; height:100%;")
+            format!("position:absolute; left:0; top:0; width:calc({first_pct:.4}% - {half}px); height:100%;")
         }
         (SplitAxis::SideBySide, _) => {
-            format!("position:absolute; left:{first_pct:.4}%; top:0; width:{second_pct:.4}%; height:100%;")
+            format!("position:absolute; left:calc({first_pct:.4}% + {half}px); top:0; width:calc({second_pct:.4}% - {half}px); height:100%;")
         }
         (SplitAxis::Stacked, 0) => {
-            format!("position:absolute; left:0; top:0; width:100%; height:{first_pct:.4}%;")
+            format!("position:absolute; left:0; top:0; width:100%; height:calc({first_pct:.4}% - {half}px);")
         }
         (SplitAxis::Stacked, _) => {
-            format!("position:absolute; left:0; top:{first_pct:.4}%; width:100%; height:{second_pct:.4}%;")
+            format!("position:absolute; left:0; top:calc({first_pct:.4}% + {half}px); width:100%; height:calc({second_pct:.4}% - {half}px);")
         }
     }
 }
@@ -55087,6 +55229,7 @@ fn split_pane_rect_css(axis: SplitAxis, ratio: f32, index: usize) -> String {
 /// divider carries `data-split-divider`.
 fn split_divider_drag_script(axis: SplitAxis, ratio: f32) -> String {
     let vertical = matches!(axis, SplitAxis::Stacked);
+    let half = SPLIT_GUTTER_PX / 2;
     format!(
         r#"
         (async () => {{
@@ -55101,16 +55244,19 @@ fn split_divider_drag_script(axis: SplitAxis, ratio: f32) -> String {
             const apply = (r) => {{
                 const pct = (r * 100).toFixed(3) + '%';
                 const rest = ((1 - r) * 100).toFixed(3) + '%';
+                const firstEdge = 'calc(' + pct + ' - {half}px)';
+                const secondEdge = 'calc(' + pct + ' + {half}px)';
+                const restSize = 'calc(' + rest + ' - {half}px)';
                 if (first) {{
-                    if (vertical) {{ first.style.height = pct; first.style.top = '0px'; }}
-                    else {{ first.style.width = pct; first.style.left = '0px'; }}
+                    if (vertical) {{ first.style.height = firstEdge; first.style.top = '0px'; }}
+                    else {{ first.style.width = firstEdge; first.style.left = '0px'; }}
                 }}
                 if (second) {{
-                    if (vertical) {{ second.style.height = rest; second.style.top = pct; }}
-                    else {{ second.style.width = rest; second.style.left = pct; }}
+                    if (vertical) {{ second.style.height = restSize; second.style.top = secondEdge; }}
+                    else {{ second.style.width = restSize; second.style.left = secondEdge; }}
                 }}
                 if (divider) {{
-                    const seam = 'calc(' + pct + ' - 3px)';
+                    const seam = 'calc(' + pct + ' - {half}px)';
                     if (vertical) {{ divider.style.top = seam; }}
                     else {{ divider.style.left = seam; }}
                 }}
@@ -55448,14 +55594,17 @@ fn MainSurface(
                                 } else {
                                     "0"
                                 };
-                                // Focus ring: a bright inset border on the
-                                // focused pane, a hairline on the sibling, so the
-                                // input target reads at a glance.
+                                // Focus ring: an OUTWARD shadow so the ring
+                                // lands in the gutter, never inside the pane
+                                // rect — a future web pane's native webview
+                                // paints above all DOM in its rect, so an inset
+                                // ring would vanish there. Bright on the focused
+                                // pane, hairline on the sibling.
                                 let focus_ring = if is_split_pane {
                                     if is_focused_session {
-                                        format!("box-shadow: inset 0 0 0 2px {};", split_focus_accent)
+                                        format!("box-shadow: 0 0 0 2px {};", split_focus_accent)
                                     } else {
-                                        "box-shadow: inset 0 0 0 1px rgba(128,128,128,0.35);"
+                                        "box-shadow: 0 0 0 1px rgba(128,128,128,0.35);"
                                             .to_string()
                                     }
                                 } else {
@@ -55501,14 +55650,28 @@ fn MainSurface(
                                 let ratio = group.ratio;
                                 let group_id = group.group_id.clone();
                                 let first_pct = (ratio.clamp(0.05, 0.95)) * 100.0;
+                                let half = SPLIT_GUTTER_PX / 2;
+                                // The divider owns the whole gutter as its drag
+                                // hit-area and centers a 1px chrome-color line
+                                // in it, so the seam is visible and grabbable.
                                 let divider_style = match axis {
                                     SplitAxis::SideBySide => format!(
-                                        "position:absolute; top:0; height:100%; left:calc({first_pct:.4}% - 3px); width:6px; \
-                                         z-index:5; cursor:col-resize; background:transparent;"
+                                        "position:absolute; top:0; height:100%; left:calc({first_pct:.4}% - {half}px); width:{SPLIT_GUTTER_PX}px; \
+                                         z-index:5; cursor:col-resize; background:transparent; \
+                                         display:flex; justify-content:center; align-items:stretch;"
                                     ),
                                     SplitAxis::Stacked => format!(
-                                        "position:absolute; left:0; width:100%; top:calc({first_pct:.4}% - 3px); height:6px; \
-                                         z-index:5; cursor:row-resize; background:transparent;"
+                                        "position:absolute; left:0; width:100%; top:calc({first_pct:.4}% - {half}px); height:{SPLIT_GUTTER_PX}px; \
+                                         z-index:5; cursor:row-resize; background:transparent; \
+                                         display:flex; flex-direction:column; justify-content:center; align-items:stretch;"
+                                    ),
+                                };
+                                let divider_line_style = match axis {
+                                    SplitAxis::SideBySide => format!(
+                                        "width:1px; background:{};", snapshot.palette.border
+                                    ),
+                                    SplitAxis::Stacked => format!(
+                                        "height:1px; background:{};", snapshot.palette.border
                                     ),
                                 };
                                 rsx! {
@@ -55535,6 +55698,9 @@ fn MainSurface(
                                                 }
                                             });
                                         },
+                                        div {
+                                            style: "{divider_line_style}",
+                                        }
                                     }
                                 }
                             }
@@ -55606,7 +55772,7 @@ fn MainSurface(
                     // as shell DOM over the terminal layer. Ordinary DOM — it
                     // clips, z-orders, screenshots and dom-evals like the rest
                     // of the chrome (everything a native child webview cannot).
-                    if snapshot.document_pane.as_ref().is_some_and(|(_, visible)| *visible) {
+                    if snapshot.document_pane.as_ref().is_some_and(|pane| pane.visible) {
                         DocumentSurfaceBody {
                             snapshot: snapshot.clone(),
                             state,
@@ -84109,9 +84275,16 @@ fn DocumentSurfaceBody(
     session_path: String,
 ) -> Element {
     let doc = DocTheme::from_terminal(&snapshot.terminal_palette);
-    let Some((pane_id, _visible)) = snapshot.document_pane.clone() else {
+    let Some(document_pane) = snapshot.document_pane.clone() else {
         return rsx! {};
     };
+    let pane_id = document_pane.pane_id.clone();
+    let surface_stale = document_pane.stale;
+    let stale_app_name = document_pane
+        .app_name
+        .clone()
+        .unwrap_or_else(|| "The app".to_string());
+    let stale_overlay_session_path = session_path.clone();
     let pane_state = snapshot
         .document_pane_schema
         .as_ref()
@@ -84476,6 +84649,51 @@ fn DocumentSurfaceBody(
                             _ => rsx! { span { key: "{widget_key}" } },
                         }
                     }
+                    }
+                }
+            }
+            // The NOT-RESPONDING overlay: the app's declares stopped while
+            // this session's reads were live (a Ctrl+Z'd app is the canonical
+            // case). It covers the whole surface — actions would only hang at
+            // the frozen control endpoint — and offers the terminal back,
+            // which is where `fg` gets typed. A declare arriving clears it
+            // instantly; contribution expiry closes the surface entirely.
+            if surface_stale {
+                div {
+                    "data-document-surface-stale": "1",
+                    style: format!(
+                        "position:absolute; inset:0; z-index:40; display:flex; align-items:center; \
+                         justify-content:center; background:color-mix(in srgb, {} 65%, transparent);",
+                        doc.bg
+                    ),
+                    div {
+                        style: format!(
+                            "display:flex; flex-direction:column; gap:8px; align-items:center; \
+                             padding:18px 26px; border-radius:11px; border:1px solid {}; \
+                             background:{}; color:{}; max-width:420px; text-align:center;",
+                            doc.border, doc.chrome, doc.fg
+                        ),
+                        div {
+                            style: "font-size:13px; font-weight:700;",
+                            "{stale_app_name} is not responding"
+                        }
+                        div {
+                            style: format!("font-size:11px; line-height:1.5; color:{};", doc.muted),
+                            "Suspended (Ctrl+Z)? Resume it with fg — this surface closes on its own if the app is gone."
+                        }
+                        button {
+                            style: "{terminal_toggle_style}",
+                            onclick: {
+                                let mut state = state;
+                                move |_| {
+                                    let session_path = stale_overlay_session_path.clone();
+                                    state.with_mut(|shell| {
+                                        shell.document_surface_hidden.insert(session_path);
+                                    });
+                                }
+                            },
+                            "Show terminal"
+                        }
                     }
                 }
             }
@@ -90676,19 +90894,28 @@ mod tests {
 
     #[test]
     fn split_pane_rect_css_mirrors_axis_and_ratio() {
-        // Side-by-side: pane 0 takes `ratio` of the WIDTH; pane 1 takes the rest.
+        // Side-by-side: pane 0 takes `ratio` of the WIDTH; pane 1 takes the
+        // rest. Each pane gives up half of SPLIT_GUTTER_PX at the seam so the
+        // divider/focus ring have a strip no pane (or future webview) covers.
         let left = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 0);
-        assert!(left.contains("width:30"), "left width: {left}");
+        assert!(left.contains("width:calc(30.0000% - 3px)"), "left width: {left}");
         assert!(left.contains("height:100%"), "left full height: {left}");
         assert!(left.contains("left:0"));
         let right = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 1);
-        assert!(right.contains("width:70"), "right width: {right}");
-        assert!(right.contains("left:30"), "right offset: {right}");
+        assert!(right.contains("width:calc(70.0000% - 3px)"), "right width: {right}");
+        assert!(right.contains("left:calc(30.0000% + 3px)"), "right offset: {right}");
         // Stacked: pane 0 takes `ratio` of the HEIGHT, full width.
         let top = split_pane_rect_css(SplitAxis::Stacked, 0.3, 0);
-        assert!(top.contains("width:100%") && top.contains("height:30"), "top: {top}");
+        assert!(
+            top.contains("width:100%") && top.contains("height:calc(30.0000% - 3px)"),
+            "top: {top}"
+        );
         let bottom = split_pane_rect_css(SplitAxis::Stacked, 0.3, 1);
-        assert!(bottom.contains("height:70") && bottom.contains("top:30"), "bottom: {bottom}");
+        assert!(
+            bottom.contains("height:calc(70.0000% - 3px)")
+                && bottom.contains("top:calc(30.0000% + 3px)"),
+            "bottom: {bottom}"
+        );
     }
 
     #[test]
@@ -91022,6 +91249,128 @@ mod tests {
         );
         assert_eq!(plan.adopt, None);
         assert_eq!(plan.land_on, None, "a fresh start lands on the app tab");
+    }
+
+    /// Build a shell with an active-visible terminal session that owns a
+    /// sidebar contribution declared at `declared_ms` — the zombie-surface
+    /// sweep fixture ([[campaign-libyggterm]] Phase 0.2).
+    fn shell_with_contribution(session_path: &str, declared_ms: u64) -> ShellState {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.upsert_sidebar_contribution(
+            session_path,
+            Vec::new(),
+            None,
+            Some("yedit".to_string()),
+            None,
+            None,
+            None,
+            declared_ms,
+            Some(("http://127.0.0.1:1/".to_string(), None)),
+        );
+        shell
+    }
+
+    // The Ctrl+Z zombie surface (user-hit, live-caught): a suspended app stops
+    // declaring, and a sweep that only ran when declares ARRIVED never noticed.
+    // On the timer the surface must go stale (overlay), then expire (teardown),
+    // with the rail auto-open re-earned for the next instance.
+    #[test]
+    fn a_suspended_apps_surface_goes_stale_then_expires_on_the_timer() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        shell
+            .document_rail_auto_opened
+            .insert("local://ws".to_string());
+
+        // First tick: fresh contribution, listening clock starts.
+        shell.sweep_stale_sidebar_contributions(2_000);
+        assert!(shell.sidebar_contributions.contains_key("local://ws"));
+        assert_eq!(shell.document_surface_stale, None);
+
+        // Past the stale window (measured from when listening began): the
+        // contribution SURVIVES but the not-responding overlay marker is set.
+        let stale_at = 2_000 + WEB_SURFACE_STALE_AFTER_MS + 1;
+        assert!(shell.sidebar_sweep_due(stale_at), "overlay flip is due");
+        shell.sweep_stale_sidebar_contributions(stale_at);
+        assert!(
+            shell.sidebar_contributions.contains_key("local://ws"),
+            "stale-but-present: the overlay window, not a teardown"
+        );
+        assert_eq!(shell.document_surface_stale.as_deref(), Some("local://ws"));
+        assert!(
+            !shell.sidebar_sweep_due(stale_at),
+            "the sweep is idempotent at the same instant"
+        );
+
+        // Past the expiry horizon: torn down, marker cleared, auto-open re-earned.
+        let expired_at = 2_000 + SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS + 1;
+        assert!(shell.sidebar_sweep_due(expired_at), "expiry is due");
+        shell.sweep_stale_sidebar_contributions(expired_at);
+        assert!(!shell.sidebar_contributions.contains_key("local://ws"));
+        assert_eq!(shell.document_surface_stale, None);
+        assert!(
+            !shell.document_rail_auto_opened.contains("local://ws"),
+            "expiry counts as a close: the next instance re-earns its rail"
+        );
+    }
+
+    // fg after Ctrl+Z: the very next declare is proof of life and must clear
+    // the overlay immediately — not on the next sweep tick.
+    #[test]
+    fn a_declare_clears_the_not_responding_overlay_instantly() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        shell.sweep_stale_sidebar_contributions(2_000);
+        let stale_at = 2_000 + WEB_SURFACE_STALE_AFTER_MS + 1;
+        shell.sweep_stale_sidebar_contributions(stale_at);
+        assert_eq!(shell.document_surface_stale.as_deref(), Some("local://ws"));
+
+        shell.upsert_sidebar_contribution(
+            "local://ws",
+            Vec::new(),
+            None,
+            Some("yedit".to_string()),
+            None,
+            None,
+            None,
+            stale_at + 100,
+            None,
+        );
+        assert_eq!(
+            shell.document_surface_stale, None,
+            "a declare is proof of life; fg recovers without waiting"
+        );
+        // And the refreshed clock keeps the surface alive on the next tick.
+        shell.sweep_stale_sidebar_contributions(stale_at + 200);
+        assert!(shell.sidebar_contributions.contains_key("local://ws"));
+    }
+
+    // A backgrounded session's declares are not being read, so its last_seen
+    // ages while the app is healthy. The first timer tick after switching back
+    // must NOT reap it — the listening clock restarts on the switch and the
+    // app gets a full stale window to heartbeat.
+    #[test]
+    fn a_session_switch_gives_a_healthy_surface_a_fresh_listening_window() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        // The clock last belonged to a different session (the one the user
+        // just switched away from).
+        shell.sidebar_reads_live_since = Some(("local://other".to_string(), 500));
+
+        let switch_tick = 50_000;
+        assert!(
+            shell.sidebar_sweep_due(switch_tick),
+            "the clock reset itself is due"
+        );
+        shell.sweep_stale_sidebar_contributions(switch_tick);
+        assert!(
+            shell.sidebar_contributions.contains_key("local://ws"),
+            "an aged last_seen proves nothing until we have listened"
+        );
+        assert_eq!(shell.document_surface_stale, None);
+        assert_eq!(
+            shell.sidebar_reads_live_since,
+            Some(("local://ws".to_string(), switch_tick))
+        );
     }
 
     // Vertical mode IS the rail. A GUI that starts with the pref already on used
