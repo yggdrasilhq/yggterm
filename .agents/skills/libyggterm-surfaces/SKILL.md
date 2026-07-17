@@ -44,9 +44,26 @@ is a feature of that app until a second app wants sidebars.
 
 Build each only when an app truly needs it.
 
-1. **Viewport surface** — the main pane becomes the app's view. SHIPPED for
-   ychrome (a WebKitGTK child webview). Includes a viewport-mode toggle
-   (Web ↔ Terminal), which should generalize so any app registers modes.
+1. **Viewport surface** — the main pane becomes the app's view. TWO substrates:
+   - **Web surface** (SHIPPED, ychrome): a WebKitGTK child webview — for real
+     BROWSING (arbitrary origins, JS, cookie jars, per-tab isolation). Costs
+     two web processes per surface and paints above ALL DOM (no clipping, no
+     z-order, screenshot-blind without `--backend os`) until the Phase-F
+     compositing campaign lands.
+   - **Document surface** (SHIPPED 2026-07-17, yedit pilot): the app declares a
+     pane with `"placement": "viewport"` and the GUI renders its SCHEMA as
+     ordinary shell DOM in the main viewport — no child webview, no extra
+     processes, instant create/switch, faithful to `app screenshot`/dom-eval by
+     construction. The pane vocabulary gains a `markdown` widget (rendered to
+     native DOM via typed blocks — raw HTML in the source is DROPPED, never
+     forwarded); multiline `text-input` and `list-row` widgets render at
+     document scale; other widgets form a top bar. The declaration carries a
+     `document_version` stamp — the GUI refetches the pane's schema only when
+     it moves (non-gating: the old schema stays painted while a refetch is in
+     flight). yggterm owns ONE control the app cannot: the "⌨ Terminal" toggle
+     (and the "📄 Document" chip to come back) — heartbeat re-declares never
+     fight the user's toggle. Pick the document surface unless the app is a
+     browser: markdown, dashboards, forms, pickers all belong here.
 2. **cwd-tree document surface** — an app document appears as a node in the
    host's cwd tree, with open/export/share affordances. First real need:
    Cellulose (a sqlite spreadsheet shareable as .xlsx). NOT built.
