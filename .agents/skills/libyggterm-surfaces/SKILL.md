@@ -175,6 +175,39 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
   render secrets inside a webview, and adds moving parts. Grow the vocabulary
   instead. Keep v2 in reserve for a pane that is genuinely a document.
 
+### Two-tier app shape + endpoint-ping liveness (SHIPPED 2026-07-17, Phase 2)
+
+**Doctrine (the emacsclient model): the view client is disposable; the daemon
+is durable.** A serious libyggterm app splits into a per-host DAEMON that owns
+state, the sqlite store, and the control endpoint, and a thin VIEW CLIENT that
+anchors the surface in a session and forwards OSC. The client may
+declare-then-EXIT — the shell comes back — because liveness no longer requires
+the PTY.
+
+- **Endpoint-ping liveness:** an app that declares a control endpoint is alive
+  iff `GET <control>/ping` ANSWERS. The GUI pings the ACTIVE session's
+  contribution every poll tick (~2.5s, 1500ms budget). A reply is the PTY
+  declare's equal: it refreshes liveness, clears the "not responding" overlay,
+  and may carry `{app_name, policy_version, zoom_version, appearance_version,
+  document_version}` — any stamp that moved dispatches the same refetch a
+  declare would, so a DETACHED app's content changes still propagate. Stamps
+  the reply omits read "unchanged". A ping only ever REFRESHES; creation stays
+  declare-only.
+- **PTY-declare mode remains** for endpoint-less apps: re-declaring every ~4s
+  is still sufficient liveness. The degradation story is unchanged.
+- **Zombie pipeline (Phase 0, both modes):** liveness silent for 15s while the
+  session is active-visible → "«App» is not responding (Suspended (Ctrl+Z)?
+  Resume it with fg)" overlay over the document surface; 30s → contribution
+  torn down (forward killed, rail auto-open re-earned), terminal revealed. Any
+  declare or ping reply clears the overlay instantly.
+- **Surface close is explicit:** ✕ chrome, the app's `sidebar ; close`, or
+  daemon exit (pings fail → expiry). Orphan safety holds: daemon dies → pings
+  fail → surface expires.
+- **Remote caveat:** the ping rides the contribution's `ssh -L` control
+  forward, so a dropped forward reads as not-responding → expiry (grace, not
+  instant death). Automatic forward re-resolve on ping failure is DEFERRED
+  until a remote document app exists.
+
 ### Trap: key contributed widgets by identity, never by index
 
 Keying rendered widgets on their position let Dioxus patch a `section` node into
