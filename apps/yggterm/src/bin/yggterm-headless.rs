@@ -1863,13 +1863,18 @@ fn main() -> Result<()> {
                         run_app_control_set_split_group_ratio(&group_id, ratio, timeout_ms)
                     }
                     "focus" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("missing session path for server app split focus")
-                            })?;
-                        run_app_control_focus_split_pane(&session_path, timeout_ms)
+                        // server app split focus <session_path> [pane_index]
+                        let mut positionals = cli_positional_args(&args, 4).into_iter();
+                        let session_path = positionals.next().ok_or_else(|| {
+                            anyhow::anyhow!("missing session path for server app split focus")
+                        })?;
+                        let pane: Option<usize> = match positionals.next() {
+                            Some(raw) => Some(raw.parse().map_err(|_| {
+                                anyhow::anyhow!("pane index must be a number")
+                            })?),
+                            None => None,
+                        };
+                        run_app_control_focus_split_pane(&session_path, pane, timeout_ms)
                     }
                     other => anyhow::bail!(
                         "unknown server app split action {other:?} (create|web-tab|ungroup|ratio|focus)"
