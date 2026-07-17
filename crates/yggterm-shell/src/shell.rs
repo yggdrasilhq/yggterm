@@ -154,7 +154,7 @@ use yggterm_core::{
     InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
     SessionStore, SessionSummaryTimelineEntry, SplitAxis, SplitGroup, SplitMember,
-    TerminalTelemetryEvent,
+    SplitMemberView, TerminalTelemetryEvent,
     WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_perf_event,
     append_trace_event, best_effort_precis_from_context, best_effort_summary_from_context,
@@ -2720,6 +2720,21 @@ fn web_surface_native_id_for(session_path: &str, tab_id: u64) -> Option<u64> {
         .get(&(session_path.to_string(), tab_id))
         .copied()
 }
+/// Placement rule for one (session, tab) webview ([[campaign-libyggterm]]
+/// Phase 3): a split pane PINNED to exactly this tab wins its rect
+/// (split-tabs); otherwise the surface's own page area shows the ACTIVE tab.
+/// When the active tab IS the pinned tab (degenerate but reachable — the user
+/// can switch the strip onto the pinned tab), the pinned pane wins and the
+/// page area paints its background; one webview cannot sit at two rects.
+fn web_surface_tab_place_rect(
+    pinned_rect: Option<(i32, i32, i32, i32)>,
+    page_rect: Option<(i32, i32, i32, i32)>,
+    tab_id: u64,
+    active_tab: u64,
+) -> Option<(i32, i32, i32, i32)> {
+    pinned_rect.or(if tab_id == active_tab { page_rect } else { None })
+}
+
 /// The ONE writer of native surface webviews: a declarative reconciler that
 /// diffs desired state (`ShellState::web_surfaces`) + the DOM geometry oracle
 /// (`[data-ws-page]` placeholder rects) against what was last applied, and
@@ -3027,34 +3042,71 @@ async fn web_surface_native_reconcile_loop(
                         ];
                     }
                 }
-                dioxus.send(out);
+                // Pinned split-tab panes: the (session, tab)-keyed twin of
+                // [data-ws-page] — a rect that places ONE specific tab's
+                // webview regardless of the surface's active tab.
+                const pinned = [];
+                for (const el of document.querySelectorAll('[data-ws-pinned-session]')) {
+                    const r = el.getBoundingClientRect();
+                    const top = Math.max(Math.round(r.top), clampTop);
+                    const height = Math.round(r.bottom) - top;
+                    if (r.width > 1 && height > 1) {
+                        pinned.push([
+                            el.getAttribute('data-ws-pinned-session') || '',
+                            Number(el.getAttribute('data-ws-pinned-tab') || '0'),
+                            [Math.round(r.left), top, Math.round(r.width), height],
+                        ]);
+                    }
+                }
+                dioxus.send({pages: out, pinned: pinned});
             })();"#,
         );
-        let rects: HashMap<String, (i32, i32, i32, i32)> = match tokio::time::timeout(
-            Duration::from_millis(1500),
-            eval.recv::<Value>(),
-        )
-        .await
-        {
-            Ok(Ok(value)) => value
-                .as_object()
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(session, rect)| {
-                            let rect = rect.as_array()?;
-                            Some((
-                                session.clone(),
-                                (
-                                    rect.first()?.as_i64()? as i32,
-                                    rect.get(1)?.as_i64()? as i32,
-                                    rect.get(2)?.as_i64()? as i32,
-                                    rect.get(3)?.as_i64()? as i32,
-                                ),
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+        let (rects, pinned_rects): (
+            HashMap<String, (i32, i32, i32, i32)>,
+            HashMap<(String, u64), (i32, i32, i32, i32)>,
+        ) = match tokio::time::timeout(Duration::from_millis(1500), eval.recv::<Value>()).await {
+            Ok(Ok(value)) => {
+                let parse_rect = |rect: &Value| -> Option<(i32, i32, i32, i32)> {
+                    let rect = rect.as_array()?;
+                    Some((
+                        rect.first()?.as_i64()? as i32,
+                        rect.get(1)?.as_i64()? as i32,
+                        rect.get(2)?.as_i64()? as i32,
+                        rect.get(3)?.as_i64()? as i32,
+                    ))
+                };
+                let pages = value
+                    .get("pages")
+                    .and_then(Value::as_object)
+                    .map(|map| {
+                        map.iter()
+                            .filter_map(|(session, rect)| {
+                                Some((session.clone(), parse_rect(rect)?))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let pinned = value
+                    .get("pinned")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let entry = entry.as_array()?;
+                                Some((
+                                    (
+                                        entry.first()?.as_str()?.to_string(),
+                                        entry.get(1)?.as_u64()?,
+                                    ),
+                                    parse_rect(entry.get(2)?)?,
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (pages, pinned)
+            }
             _ => {
                 // Eval blind (webview busy / not yet ready): backgrounded-session
                 // surfaces were ALREADY destroyed above (state-authoritative, no
@@ -3071,12 +3123,20 @@ async fn web_surface_native_reconcile_loop(
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
+                // Where THIS tab's webview paints: a split pane PINNED to it
+                // wins (split-tabs); else the surface's own page area iff the
+                // tab is active ([[campaign-libyggterm]] Phase 3).
+                let place_rect = web_surface_tab_place_rect(
+                    pinned_rects.get(&(session_path.clone(), tab_id)).copied(),
+                    rect,
+                    tab_id,
+                    active_tab,
+                );
                 // Visibility is gated on ShellState's active-visible authority in
                 // addition to the (starvable) DOM rect: a stale rect returned for
                 // a session that is no longer active-visible must not keep its
                 // backgrounded surface shown. Positioning still uses the rect.
-                let want_visible = rect.is_some()
-                    && tab_id == active_tab
+                let want_visible = place_rect.is_some()
                     && active_visible_sessions.contains(session_path.as_str())
                     // Hide the surface under any over-viewport modal (it draws
                     // above the DOM the modal lives in). The reconciler re-shows it
@@ -3125,7 +3185,7 @@ async fn web_surface_native_reconcile_loop(
                     // page state intact, no reload.
                     if entry.stashed_at_ms.is_some()
                         && want_visible
-                        && let Some(rect) = rect
+                        && let Some(rect) = place_rect
                     {
                         let _ = desktop.unstash_web_surface(
                             entry.native_id,
@@ -3155,7 +3215,7 @@ async fn web_surface_native_reconcile_loop(
                     }
                     // Bounds before visibility: a surface being revealed must
                     // not flash at its stale rect.
-                    if let Some(rect) = rect
+                    if let Some(rect) = place_rect
                         && want_visible
                         && entry.bounds != rect
                     {
@@ -3279,7 +3339,7 @@ async fn web_surface_native_reconcile_loop(
                         entry.zoom_factor = want_zoom;
                     }
                 } else if want_visible
-                    && let Some(rect) = rect
+                    && let Some(rect) = place_rect
                 {
                     // The app's policy has not landed yet. Userscripts only
                     // inject at document-start, so a surface created now would
@@ -7138,6 +7198,11 @@ impl ShellState {
         } else {
             false
         };
+        if closed {
+            // The surface owned the tab-id namespace; panes pinned to its
+            // tabs die with it ([[campaign-libyggterm]] Phase 3).
+            self.prune_web_view_panes();
+        }
         closed
     }
     /// True while a heartbeat must NOT recreate a gone surface: the GUI closed it
@@ -7180,6 +7245,9 @@ impl ShellState {
             }
             live
         });
+        // A swept surface takes its tab-id namespace with it; drop panes
+        // pinned to it ([[campaign-libyggterm]] Phase 3).
+        self.prune_web_view_panes();
     }
     /// Record (or refresh) an app's declared panes. `control_url` is only
     /// supplied on the first declare, when the resolver has produced a
@@ -7950,6 +8018,7 @@ impl ShellState {
     /// Close a user tab. The app tab (tabs[0]) is not closable here — closing
     /// the app is the overlay ✕, which sends a real Ctrl+C.
     fn web_surface_close_tab(&mut self, session_path: &str, tab_id: u64) {
+        let mut removed_tab = false;
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             let Some(index) = surface.tabs.iter().position(|tab| tab.id == tab_id) else {
                 return;
@@ -7959,10 +8028,16 @@ impl ShellState {
             }
             let removed = surface.tabs.remove(index);
             removed.kill_forward();
+            removed_tab = true;
             if surface.active_tab == tab_id {
                 surface.active_tab = surface.tabs[index - 1].id;
                 surface.address_draft = None;
             }
+        }
+        if removed_tab {
+            // A pane pinned to the closed tab has nothing left to show
+            // ([[campaign-libyggterm]] Phase 3).
+            self.prune_web_view_panes();
         }
         // Closing a FILED tab removes it from the saved tree — a folder must not
         // resurrect a tab the user closed on the next visit.
@@ -11676,6 +11751,65 @@ impl ShellState {
         changed
     }
 
+    /// Drop split panes PINNED to a web view that no longer exists — the tab
+    /// was closed or the whole surface retired ([[campaign-libyggterm]] Phase
+    /// 3). Terminal-view panes are untouched (session liveness is
+    /// `prune_stale_split_groups`' job). A group collapsing below 2 panes
+    /// dissolves; keep-alive restore mirrors the stale-prune path (local-only
+    /// step-down — grouping only ever forced keep-alive ON).
+    fn prune_web_view_panes(&mut self) {
+        if self.split_groups.is_empty() {
+            return;
+        }
+        let live_web_tabs: HashMap<String, Vec<u64>> = self
+            .web_surfaces
+            .iter()
+            .filter(|(_, surface)| surface.picker.is_none())
+            .map(|(path, surface)| {
+                (
+                    path.clone(),
+                    surface.tabs.iter().map(|tab| tab.id).collect(),
+                )
+            })
+            .collect();
+        let mut changed = false;
+        let mut restore: Vec<(String, bool)> = Vec::new();
+        self.split_groups.retain_mut(|group| {
+            let before = group.members.len();
+            group.members.retain(|member| match &member.view {
+                SplitMemberView::Web { tab } => live_web_tabs
+                    .get(&member.session)
+                    .is_some_and(|tabs| tabs.contains(tab)),
+                _ => true,
+            });
+            if group.members.len() != before {
+                changed = true;
+                if group.active_pane >= group.members.len() {
+                    group.active_pane = group.members.len().saturating_sub(1);
+                }
+            }
+            if group.members.len() >= 2 {
+                true
+            } else {
+                for member in group.member_sessions() {
+                    if let Some(prior) = group.prior_keep_alive.get(member) {
+                        restore.push((member.to_string(), *prior));
+                    }
+                }
+                changed = true;
+                false
+            }
+        });
+        for (path, prior) in restore {
+            if !prior {
+                mark_live_session_keep_alive_locally(self, &path, false);
+            }
+        }
+        if changed {
+            self.persist_split_groups();
+        }
+    }
+
     /// Prune split groups against the sessions this GUI currently knows about.
     /// The "known" set is generous on purpose — live + retained + cached-hot +
     /// active — so a member merely absent from ONE partial snapshot is not
@@ -11700,6 +11834,10 @@ impl ShellState {
             known.insert(active.to_string());
         }
         self.prune_stale_split_groups(&known);
+        // Pinned web panes are SESSION-LIFETIME (tab restore re-mints ids, so
+        // a persisted pin has no durable referent): a pin whose surface or
+        // tab is gone — including across a GUI restart — dissolves here.
+        self.prune_web_view_panes();
     }
 
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
@@ -17971,22 +18109,39 @@ fn spawn_close_session_runtime(state: Signal<ShellState>, path: String) {
 /// remembers each member's prior setting for ungroup; the new group becomes the
 /// active surface, focused on its first pane.
 fn create_split_group(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     members: Vec<String>,
+    axis: SplitAxis,
+) -> Option<String> {
+    create_split_group_from_members(
+        state,
+        members.into_iter().map(SplitMember::terminal).collect(),
+        axis,
+    )
+}
+
+/// The member-typed creation core ([[campaign-libyggterm]] Phase 3): panes are
+/// `(session, view)`, so one SESSION may legally hold two panes when the views
+/// differ (split-tabs). Distinctness is per-pane — same `(session, view)` twice
+/// is refused; a session grouped in ANOTHER group is refused; keep-alive is
+/// forced once per unique session.
+fn create_split_group_from_members(
+    mut state: Signal<ShellState>,
+    members: Vec<SplitMember>,
     axis: SplitAxis,
 ) -> Option<String> {
     let outcome = state.with_mut(|shell| {
         let mut seen = HashSet::new();
-        let members: Vec<String> = members
+        let members: Vec<SplitMember> = members
             .into_iter()
-            .filter(|path| seen.insert(path.clone()))
+            .filter(|member| seen.insert((member.session.clone(), member.view.clone())))
             .collect();
         if members.len() < 2 {
             return None;
         }
         if members
             .iter()
-            .any(|member| shell.split_group_for_session(member).is_some())
+            .any(|member| shell.split_group_for_session(&member.session).is_some())
         {
             return None;
         }
@@ -17994,27 +18149,28 @@ fn create_split_group(
         let mut prior_keep_alive = BTreeMap::new();
         let mut keep_alive_calls: Vec<String> = Vec::new();
         for member in &members {
+            if prior_keep_alive.contains_key(&member.session) {
+                continue;
+            }
             let was = live
                 .iter()
-                .find(|session| &session.session_path == member)
+                .find(|session| session.session_path == member.session)
                 .map(live_session_keep_alive)
                 .unwrap_or(false);
-            prior_keep_alive.insert(member.clone(), was);
+            prior_keep_alive.insert(member.session.clone(), was);
             if !was {
-                mark_live_session_keep_alive_locally(shell, member, true);
-                keep_alive_calls.push(member.clone());
+                mark_live_session_keep_alive_locally(shell, &member.session, true);
+                keep_alive_calls.push(member.session.clone());
             }
         }
         let seq = NEXT_SPLIT_GROUP_SEQ.fetch_add(1, Ordering::Relaxed);
         let group_id = format!("{}-{seq}", current_millis());
-        let first_member = members[0].clone();
+        let first_member = members[0].session.clone();
         shell.split_groups.push(SplitGroup {
             group_id: group_id.clone(),
             axis,
             ratio: 0.5,
-            // Creation is session-based, so every pane starts as the session's
-            // own surface; pinned views (split-tabs) are set post-create.
-            members: members.into_iter().map(SplitMember::terminal).collect(),
+            members,
             active_pane: 0,
             prior_keep_alive,
         });
@@ -18033,11 +18189,50 @@ fn create_split_group(
     let members = state.with(|shell| {
         shell
             .split_group_for_session(&first_member)
-            .map(|group| group.member_sessions().map(str::to_string).collect())
+            .map(|group| {
+                let mut sessions: Vec<String> =
+                    group.member_sessions().map(str::to_string).collect();
+                sessions.dedup();
+                sessions
+            })
             .unwrap_or_default()
     });
     spawn_heal_split_panes(members);
     Some(group_id)
+}
+
+/// Split one of a web-surface session's tabs into its own pane — split-tabs
+/// ([[campaign-libyggterm]] Phase 3): two tab webviews, two rects, no app
+/// involvement (tabs are GUI chrome by doctrine). Pane 0 stays the session's
+/// own surface (active tab + strip/omnibox chrome); pane 1 is PINNED to `tab`.
+/// Refused when the session has no web surface, the tab does not exist, or
+/// the session is already grouped.
+fn split_web_tab_into_pane(
+    state: Signal<ShellState>,
+    session_path: &str,
+    tab: u64,
+    axis: SplitAxis,
+) -> Option<String> {
+    let tab_exists = state.with(|shell| {
+        shell
+            .web_surfaces
+            .get(session_path)
+            .is_some_and(|surface| surface.picker.is_none() && surface.tabs.iter().any(|t| t.id == tab))
+    });
+    if !tab_exists {
+        return None;
+    }
+    create_split_group_from_members(
+        state,
+        vec![
+            SplitMember::terminal(session_path),
+            SplitMember {
+                session: session_path.to_string(),
+                view: SplitMemberView::Web { tab },
+            },
+        ],
+        axis,
+    )
 }
 
 fn axis_label(axis: SplitAxis) -> &'static str {
@@ -18100,6 +18295,48 @@ fn focus_split_pane(mut state: Signal<ShellState>, member: &str) {
             }
         }
         resolve_app_control_row(shell, member)
+    });
+    if let Some(row) = row {
+        spawn_open_session_row(state, row);
+    }
+}
+
+/// Which pane index wears the focus ring / carries input affordance. Panes
+/// are session-keyed until one session seats TWO panes (split-tabs), where
+/// the group's remembered `active_pane` disambiguates — falling back to the
+/// session's first seat when `active_pane` points elsewhere. Pure, so the
+/// renderer and tests share one rule ([[campaign-libyggterm]] Phase 3).
+fn focused_pane_index(group: &SplitGroup, active_session: Option<&str>) -> Option<usize> {
+    let active = active_session?;
+    let mut seats = group
+        .members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.session == active)
+        .map(|(index, _)| index);
+    let first = seats.next()?;
+    let mut rest = std::iter::once(first).chain(seats);
+    rest.find(|index| *index == group.active_pane).or(Some(first))
+}
+
+/// Focus a pane by INDEX: remember it as the group's `active_pane` and make
+/// its session the active (input) session. The index form exists because a
+/// split-tabs session seats two panes — a session path alone cannot name
+/// which one the user meant.
+fn focus_split_pane_by_index(mut state: Signal<ShellState>, group_id: &str, index: usize) {
+    let row = state.with_mut(|shell| {
+        let member_session = {
+            let group = shell.split_group_by_id_mut(group_id)?;
+            let member = group.members.get(index)?.clone();
+            if group.active_pane != index {
+                group.active_pane = index;
+                shell.settings.split_groups = shell.split_groups.clone();
+                // Same lazy-persist rule as focus_split_pane: disk write rides
+                // the next structural change.
+            }
+            member.session
+        };
+        resolve_app_control_row(shell, &member_session)
     });
     if let Some(row) = row {
         spawn_open_session_row(state, row);
@@ -47061,6 +47298,33 @@ async fn process_pending_app_control_requests(
                 }),
             }
         }
+        AppControlCommand::SplitWebTab {
+            session_path,
+            tab,
+            axis,
+        } => {
+            let axis = parse_split_axis(axis.as_deref());
+            let group_id = split_web_tab_into_pane(state, &session_path, tab, axis);
+            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": group_id.is_some(),
+                    "group_id": group_id,
+                    "session_path": session_path,
+                    "tab": tab,
+                    "axis": axis_label(axis),
+                    "split_groups": split_groups,
+                })),
+                error: group_id.is_none().then(|| {
+                    "could not split web tab (session needs a live web surface with that tab, and no existing group)"
+                        .to_string()
+                }),
+            }
+        }
         AppControlCommand::UngroupSplitGroup { group_id } => {
             let existed = state.with(|shell| {
                 shell
@@ -56255,6 +56519,30 @@ fn MainSurface(
         .as_ref()
         .zip(snapshot.active_session_path.as_ref())
         .is_some_and(|(group, active)| group.contains(active));
+    // Which pane wears the focus ring. Session-keyed until one session seats
+    // TWO panes (split-tabs), where the group's remembered active_pane
+    // disambiguates ([[campaign-libyggterm]] Phase 3).
+    let split_focused_pane_index = active_split_group
+        .as_ref()
+        .and_then(|group| focused_pane_index(group, snapshot.active_session_path.as_deref()));
+    // Pinned WEB panes of the active group (split-tabs): (index, session, tab)
+    // triples, precomputed so the rsx loop below stays a plain iteration.
+    let pinned_web_panes: Vec<(usize, String, u64)> = active_split_group
+        .as_ref()
+        .map(|group| {
+            group
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, member)| match member.view {
+                    SplitMemberView::Web { tab } => {
+                        Some((index, member.session.clone(), tab))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let body = if let Some(session) = snapshot.active_session.clone() {
         if session.kind == SessionKind::Document {
             rsx! {
@@ -56338,15 +56626,24 @@ fn MainSurface(
                                     );
                                 let is_focused_session = snapshot.active_session_path.as_deref()
                                     == Some(session_path_str.as_str());
+                                // A session's TerminalCanvas belongs to its
+                                // NON-web pane: a Web{tab} member is its own
+                                // pinned pane (rendered below), never a host
+                                // for this session's terminal.
                                 let pane_index = active_split_group
                                     .as_ref()
                                     .and_then(|group| {
-                                        group
-                                            .members
-                                            .iter()
-                                            .position(|member| member.session == session_path_str)
+                                        group.members.iter().position(|member| {
+                                            member.session == session_path_str
+                                                && !matches!(
+                                                    member.view,
+                                                    SplitMemberView::Web { .. }
+                                                )
+                                        })
                                     });
                                 let is_split_pane = pane_index.is_some();
+                                let is_focused_pane =
+                                    is_split_pane && pane_index == split_focused_pane_index;
                                 // A split pane is always co-visible; a lone
                                 // session shows only when it is the focused one.
                                 let terminal_visible = if is_split_pane {
@@ -56361,7 +56658,7 @@ fn MainSurface(
                                     _ => "position:absolute; inset:0; width:100%;".to_string(),
                                 };
                                 let z_index = if is_split_pane {
-                                    if is_focused_session { "3" } else { "2" }
+                                    if is_focused_pane { "3" } else { "2" }
                                 } else if terminal_visible {
                                     "2"
                                 } else {
@@ -56369,12 +56666,14 @@ fn MainSurface(
                                 };
                                 // Focus ring: an OUTWARD shadow so the ring
                                 // lands in the gutter, never inside the pane
-                                // rect — a future web pane's native webview
-                                // paints above all DOM in its rect, so an inset
-                                // ring would vanish there. Bright on the focused
-                                // pane, hairline on the sibling.
+                                // rect — a web pane's native webview paints
+                                // above all DOM in its rect, so an inset ring
+                                // would vanish there. Bright on the focused
+                                // PANE (pane-keyed, so a split-tabs session
+                                // seated in two panes rings only one),
+                                // hairline on the sibling.
                                 let focus_ring = if is_split_pane {
-                                    if is_focused_session {
+                                    if is_focused_pane {
                                         format!("box-shadow: 0 0 0 2px {};", split_focus_accent)
                                     } else {
                                         "box-shadow: 0 0 0 1px rgba(128,128,128,0.35);"
@@ -56390,7 +56689,10 @@ fn MainSurface(
                                     if terminal_visible { "visible" } else { "hidden" },
                                     if terminal_visible { "auto" } else { "none" },
                                 );
-                                let focus_session_path = session_path_str.clone();
+                                let focus_group_id = active_split_group
+                                    .as_ref()
+                                    .map(|group| group.group_id.clone())
+                                    .unwrap_or_default();
                                 rsx! {
                                     div {
                                         key: "{terminal_session.session_path}:{session_mount_epoch}",
@@ -56401,9 +56703,18 @@ fn MainSurface(
                                         // acts when this is NOT already the focused
                                         // pane, so a click inside the active
                                         // terminal (selection, scroll) is untouched.
+                                        // Index-based, so a split-tabs session
+                                        // seated in two panes moves the RING, not
+                                        // just the session.
                                         onmousedown: move |_| {
-                                            if is_split_pane && !is_focused_session {
-                                                focus_split_pane(state, &focus_session_path);
+                                            if let Some(idx) = pane_index
+                                                && !is_focused_pane
+                                            {
+                                                focus_split_pane_by_index(
+                                                    state,
+                                                    &focus_group_id,
+                                                    idx,
+                                                );
                                             }
                                         },
                                         TerminalCanvas {
@@ -56432,6 +56743,70 @@ fn MainSurface(
                                                 state,
                                                 session_path: session_path_str.clone(),
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Pinned WEB panes (split-tabs, [[campaign-libyggterm]]
+                        // Phase 3): a Web{tab} member is a pane of its own —
+                        // pure page, no strip/omnibox chrome (the session's
+                        // terminal-view pane carries the chrome). The inner
+                        // placeholder is the native-surface reconciler's
+                        // geometry oracle for exactly this (session, tab), the
+                        // pinned twin of `[data-ws-page]`.
+                        for (pinned_idx, pinned_session, pinned_tab) in
+                            pinned_web_panes.iter().cloned()
+                        {
+                            {
+                                let (pane_axis, pane_ratio, pinned_group_id) = active_split_group
+                                    .as_ref()
+                                    .map(|group| {
+                                        (group.axis, group.ratio, group.group_id.clone())
+                                    })
+                                    .unwrap_or((SplitAxis::SideBySide, 0.5, String::new()));
+                                let geometry_css =
+                                    split_pane_rect_css(pane_axis, pane_ratio, pinned_idx);
+                                let is_focused_pane =
+                                    split_focused_pane_index == Some(pinned_idx);
+                                let focus_ring = if is_focused_pane {
+                                    format!("box-shadow: 0 0 0 2px {};", split_focus_accent)
+                                } else {
+                                    "box-shadow: 0 0 0 1px rgba(128,128,128,0.35);".to_string()
+                                };
+                                let pane_style = format!(
+                                    "{geometry_css} display:flex; flex-direction:column; min-width:0; min-height:0; \
+                                     overflow:hidden; z-index:{}; opacity:{}; visibility:{}; pointer-events:{}; {focus_ring}",
+                                    if is_focused_pane { "3" } else { "2" },
+                                    if terminal_surface_visible { "1" } else { "0" },
+                                    if terminal_surface_visible { "visible" } else { "hidden" },
+                                    if terminal_surface_visible { "auto" } else { "none" },
+                                );
+                                let focus_group_id = pinned_group_id.clone();
+                                rsx! {
+                                    div {
+                                        key: "split-web-pane:{pinned_group_id}:{pinned_idx}",
+                                        "data-split-pane-index": "{pinned_idx}",
+                                        "data-split-web-pane": "{pinned_session}",
+                                        style: "{pane_style}",
+                                        // Chrome-region click-to-focus. Clicks on
+                                        // the PAGE never reach the DOM (the native
+                                        // webview swallows them) — focusing the
+                                        // pinned pane needs this border strip, the
+                                        // sidebar, or app-control.
+                                        onmousedown: move |_| {
+                                            if !is_focused_pane {
+                                                focus_split_pane_by_index(
+                                                    state,
+                                                    &focus_group_id,
+                                                    pinned_idx,
+                                                );
+                                            }
+                                        },
+                                        div {
+                                            style: "flex:1 1 auto; min-height:0; background:#ffffff;",
+                                            "data-ws-pinned-session": "{pinned_session}",
+                                            "data-ws-pinned-tab": "{pinned_tab}",
                                         }
                                     }
                                 }
@@ -92051,6 +92426,113 @@ mod tests {
         collapse_live_sessions_into_split_rows(&mut rows, std::slice::from_ref(&group));
         assert!(rows.iter().all(|row| !row.full_path.starts_with("split://")));
         assert!(rows.iter().any(|row| row.full_path == "local://a"));
+    }
+
+    #[test]
+    fn focused_pane_index_disambiguates_a_split_tabs_session_by_active_pane() {
+        // Session-keyed until one session seats TWO panes (split-tabs), where
+        // the group's remembered active_pane picks the ring
+        // ([[campaign-libyggterm]] Phase 3).
+        let mut group = SplitGroup {
+            group_id: "g".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://ws"),
+                SplitMember {
+                    session: "local://ws".to_string(),
+                    view: SplitMemberView::Web { tab: 4 },
+                },
+            ],
+            active_pane: 1,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(focused_pane_index(&group, Some("local://ws")), Some(1));
+        group.active_pane = 0;
+        assert_eq!(focused_pane_index(&group, Some("local://ws")), Some(0));
+        // active_pane pointing at a pane of ANOTHER session falls back to the
+        // session's first seat rather than ringing a foreign pane.
+        group.members[1] = SplitMember::terminal("local://other");
+        group.active_pane = 1;
+        assert_eq!(focused_pane_index(&group, Some("local://ws")), Some(0));
+        assert_eq!(focused_pane_index(&group, Some("local://other")), Some(1));
+        assert_eq!(focused_pane_index(&group, Some("local://absent")), None);
+        assert_eq!(focused_pane_index(&group, None), None);
+    }
+
+    #[test]
+    fn web_surface_tab_placement_prefers_a_pinned_pane_over_the_page_area() {
+        // The reconciler's placement rule ([[campaign-libyggterm]] Phase 3):
+        // a pane pinned to the tab wins; else the page area shows the ACTIVE
+        // tab; an inactive unpinned tab paints nowhere.
+        let page = Some((0, 0, 800, 600));
+        let pinned = Some((800, 0, 400, 600));
+        assert_eq!(web_surface_tab_place_rect(None, page, 2, 2), page);
+        assert_eq!(web_surface_tab_place_rect(None, page, 3, 2), None);
+        assert_eq!(web_surface_tab_place_rect(pinned, page, 3, 2), pinned);
+        // Degenerate collision (the strip switched onto the pinned tab): the
+        // pinned pane wins — one webview cannot sit at two rects.
+        assert_eq!(web_surface_tab_place_rect(pinned, page, 2, 2), pinned);
+        assert_eq!(web_surface_tab_place_rect(None, None, 2, 2), None);
+    }
+
+    #[test]
+    fn a_pinned_web_pane_dies_with_its_tab_and_its_group_dissolves() {
+        // Pinned web panes are SESSION-LIFETIME ([[campaign-libyggterm]] Phase
+        // 3): closing the pinned tab (or the whole surface) prunes the pane,
+        // and a group below 2 panes dissolves.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/".to_string(),
+            Some("app".to_string()),
+            "http://localhost:8000/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            false,
+            1_000,
+        );
+        let (tab_id, _, _) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://docs.rs/", true)
+            .expect("surface is live");
+        let split_tab_group = |tab: u64| SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://ws"),
+                SplitMember {
+                    session: "local://ws".to_string(),
+                    view: SplitMemberView::Web { tab },
+                },
+            ],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        };
+        shell.split_groups.push(split_tab_group(tab_id));
+        // While the tab lives, the prune keeps the group intact.
+        shell.prune_web_view_panes();
+        assert_eq!(shell.split_groups.len(), 1);
+        assert_eq!(shell.split_groups[0].members.len(), 2);
+        // Closing the pinned tab prunes the pane; 1 pane left ⇒ dissolve.
+        shell.web_surface_close_tab("local://ws", tab_id);
+        assert!(
+            shell.split_groups.is_empty(),
+            "group must dissolve with its pinned tab"
+        );
+        // Same via the WHOLE surface retiring (close/sweep): the tab-id
+        // namespace dies with it.
+        let (tab_id, _, _) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://docs.rs/", true)
+            .expect("surface is live");
+        shell.split_groups.push(split_tab_group(tab_id));
+        shell.close_web_surface("local://ws");
+        assert!(
+            shell.split_groups.is_empty(),
+            "group must dissolve with its surface"
+        );
     }
 
     #[test]
