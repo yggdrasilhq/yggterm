@@ -85078,24 +85078,45 @@ fn DocumentSurfaceBody(
                         }
                     }
                     div { style: "flex:1 1 auto;" }
+                    // The Document↔Terminal switch on the ONE standard
+                    // segmented control (DESIGN.md "Control language") —
+                    // Document is where you are; Terminal hides the surface.
+                    div {
+                        style: segmented_control_track_style(snapshot.palette),
+                        button {
+                            style: segmented_control_segment_style(snapshot.palette, true, false, false),
+                            title: "The app's document view (you are here)",
+                            "📄\u{fe0e} Document"
+                        }
+                        button {
+                            "data-document-terminal-toggle": "1",
+                            style: segmented_control_segment_style(snapshot.palette, false, false, false),
+                            title: "Show the terminal (the app keeps running)",
+                            onclick: on_hide_surface.clone(),
+                            "⌨\u{fe0e} Terminal"
+                        }
+                    }
+                }
+            } else {
+                // Pure-body document: the switch floats so the app's
+                // content owns the whole viewport.
+                div {
+                    style: format!(
+                        "position:absolute; top:10px; right:16px; z-index:30; opacity:0.9; {}",
+                        segmented_control_track_style(snapshot.palette)
+                    ),
                     button {
-                        style: "{terminal_toggle_style}",
+                        style: segmented_control_segment_style(snapshot.palette, true, false, false),
+                        title: "The app's document view (you are here)",
+                        "📄\u{fe0e} Document"
+                    }
+                    button {
+                        "data-document-terminal-toggle": "1",
+                        style: segmented_control_segment_style(snapshot.palette, false, false, false),
                         title: "Show the terminal (the app keeps running)",
                         onclick: on_hide_surface.clone(),
                         "⌨\u{fe0e} Terminal"
                     }
-                }
-            } else {
-                // Pure-body document: the terminal toggle floats so the app's
-                // content owns the whole viewport.
-                button {
-                    style: format!(
-                        "position:absolute; top:10px; right:16px; z-index:30; opacity:0.75; {}",
-                        terminal_toggle_style
-                    ),
-                    title: "Show the terminal (the app keeps running)",
-                    onclick: on_hide_surface.clone(),
-                    "⌨\u{fe0e} Terminal"
                 }
             }
             if let Some(error) = error {
