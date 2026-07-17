@@ -4408,6 +4408,19 @@ enum CloseAppMode {
     CloseClientOnly { remaining_clients: usize },
     ShutdownDaemon,
 }
+/// The `last_action` line a rail mode change writes — one home so the
+/// direct-set path and the displaced base-edit path cannot word it apart.
+fn right_panel_last_action(mode: &RightPanelMode) -> String {
+    match mode {
+        RightPanelMode::Settings => "settings opened".to_string(),
+        RightPanelMode::Hidden => "right panel hidden".to_string(),
+        RightPanelMode::Metadata => "metadata opened".to_string(),
+        RightPanelMode::Connect => "ssh connect opened".to_string(),
+        RightPanelMode::Notifications => "notifications opened".to_string(),
+        RightPanelMode::WebTabs => "web tabs opened".to_string(),
+        RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
+    }
+}
 const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
 const KDE_CLOSE_TERMINAL_DETACH_MS: u64 = 180;
 const KDE_CLOSE_FINAL_HIDE_MS: u64 = 60;
@@ -8699,6 +8712,39 @@ impl ShellState {
         if mode == RightPanelMode::WebTabs && self.right_panel_mode != RightPanelMode::WebTabs {
             self.right_panel_mode_before_web_tabs = Some(self.user_right_panel_view());
         }
+        // THE RAIL STACK (user bug 2026-07-17): while an app pane holds the
+        // slot but the ACTIVE session cannot serve it, the display has fallen
+        // back to the base view — so a rail change here is the user editing
+        // the BASE, not closing the pane. The pane's tenancy survives, and
+        // returning to its session still restores it. (On the pane's OWN
+        // session the change really does displace the pane — that path keeps
+        // the existing leave-tenancy semantics below.)
+        if let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode
+            && !matches!(mode, RightPanelMode::AppPane(_))
+            && !self.active_session_offers_pane(&pane_id.clone())
+        {
+            if mode == RightPanelMode::WebTabs
+                && self.right_panel_mode_before_app_pane != Some(RightPanelMode::WebTabs)
+            {
+                // Mirror the normal WebTabs-entry capture, resolved through
+                // the CURRENT tenants before the base moves.
+                self.right_panel_mode_before_web_tabs = Some(self.user_right_panel_view());
+            }
+            self.terminal_input_override_active =
+                terminal_input_override_for_right_panel_mode(&mode);
+            self.settings.show_settings = mode == RightPanelMode::Settings;
+            self.last_action = right_panel_last_action(&mode);
+            self.right_panel_mode_before_app_pane = Some(mode);
+            self.persist_settings();
+            return;
+        }
+        self.set_right_panel_mode_direct(mode);
+    }
+    /// The unconditional half of [`set_right_panel_mode`]: assigns the mode
+    /// with no displacement check. `close_app_pane` (and only paths that are
+    /// deliberately ENDING an app pane's tenancy) call this directly — a
+    /// close is never a base edit, whatever session is active.
+    fn set_right_panel_mode_direct(&mut self, mode: RightPanelMode) {
         // Leaving an app pane for anything else ends that pane's tenancy: drop its
         // remembered view and its draft values (a typed password must not outlive
         // the pane that collected it). Pane→pane hops keep both.
@@ -8712,15 +8758,7 @@ impl ShellState {
         self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
         self.persist_settings();
-        self.last_action = match &self.right_panel_mode {
-            RightPanelMode::Settings => "settings opened".to_string(),
-            RightPanelMode::Hidden => "right panel hidden".to_string(),
-            RightPanelMode::Metadata => "metadata opened".to_string(),
-            RightPanelMode::Connect => "ssh connect opened".to_string(),
-            RightPanelMode::Notifications => "notifications opened".to_string(),
-            RightPanelMode::WebTabs => "web tabs opened".to_string(),
-            RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
-        };
+        self.last_action = right_panel_last_action(&self.right_panel_mode);
     }
     /// The user's OWN right-panel view: the one they chose, with every TENANT
     /// resolved away. Two things borrow the slot without owning it — an app's
@@ -8800,14 +8838,16 @@ impl ShellState {
         self.app_pane_request_seq
     }
     /// Give the right panel back to whatever the user had open before an app's
-    /// pane borrowed it — `Hidden` only if that is what they had.
+    /// pane borrowed it — `Hidden` only if that is what they had. Uses the
+    /// DIRECT setter: closing IS ending the tenancy, so the displaced-base
+    /// redirect must not intercept the restore.
     fn close_app_pane(&mut self) {
         self.clear_app_pane_draft();
         let restored = self
             .right_panel_mode_before_app_pane
             .take()
             .unwrap_or(RightPanelMode::Hidden);
-        self.set_right_panel_mode(restored);
+        self.set_right_panel_mode_direct(restored);
     }
     /// An app's pane vanished with its declaration (the app exited, was killed,
     /// or stopped declaring). Hand the panel back instead of collapsing the rail:
@@ -8829,27 +8869,53 @@ impl ShellState {
         active_session_offers_pane: bool,
         now_ms: u64,
     ) -> RightPanelMode {
-        match &self.right_panel_mode {
-            RightPanelMode::AppPane(_) if !active_session_offers_pane => self
-                .right_panel_mode_before_app_pane
-                .clone()
-                .unwrap_or(RightPanelMode::Hidden),
-            // The tab rail is a tenant of the surface, exactly like a contributed
-            // pane is a tenant of its app: a session with no LIVE web surface has
-            // no tabs, so the rail stands down. Liveness, not map presence — a
-            // defunct app's swept-less entry must not pin an empty tab tree onto
-            // the session (see `active_web_surface_is_live`). It does NOT collapse
-            // to Hidden — it falls back to the user's own remembered non-web view,
-            // so the ychrome tab tree never bleeds into an unrelated session and
-            // the panel the user had open before browsing comes back (Hidden only
-            // if that is what they had). Symmetric with the `AppPane` fallback
-            // above.
-            RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms) => self
-                .right_panel_mode_before_web_tabs
-                .clone()
-                .unwrap_or(RightPanelMode::Hidden),
-            mode => mode.clone(),
+        // Tenancy nests: a contributed pane routinely borrows the slot FROM
+        // the tab rail, so `before_app_pane` can itself hold `WebTabs`. The
+        // resolution must therefore RECURSE (bounded, like
+        // `user_right_panel_view`): a single-step fallback handed a native
+        // session the tab rail of a browser it never had — the near-blank
+        // "No web surface is open" rail (user bug 2026-07-17). Each tenant
+        // stands down by its own rule: a pane when the active session cannot
+        // serve it, the tab rail when the session has no LIVE surface
+        // (liveness, not map presence — a defunct app's swept-less entry
+        // must not pin an empty tab tree onto the session). Neither
+        // collapses to Hidden unless Hidden is what the user actually had.
+        let mut mode = self.right_panel_mode.clone();
+        for _ in 0..2 {
+            mode = match &mode {
+                RightPanelMode::AppPane(_) if !active_session_offers_pane => self
+                    .right_panel_mode_before_app_pane
+                    .clone()
+                    .unwrap_or(RightPanelMode::Hidden),
+                RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms) => self
+                    .right_panel_mode_before_web_tabs
+                    .clone()
+                    .unwrap_or(RightPanelMode::Hidden),
+                settled => return settled.clone(),
+            };
         }
+        // Anything still a tenant after the bounded walk has no live base
+        // beneath it; Hidden is the honest floor.
+        match mode {
+            RightPanelMode::AppPane(_) if !active_session_offers_pane => RightPanelMode::Hidden,
+            RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms) => {
+                RightPanelMode::Hidden
+            }
+            settled => settled,
+        }
+    }
+    /// Does the ACTIVE session's live contribution offer pane `pane_id`?
+    /// The displacement test: an app pane whose session this is NOT has
+    /// fallen back to the base view, and rail changes there edit the BASE.
+    fn active_session_offers_pane(&self, pane_id: &str) -> bool {
+        self.server
+            .active_session_path()
+            .map(str::to_string)
+            .is_some_and(|path| {
+                self.active_sidebar_panes(&path, current_millis())
+                    .iter()
+                    .any(|pane| pane.id == pane_id)
+            })
     }
     /// Draft input values never survive a pane switch: a search term or an
     /// add-form password belongs to the pane the user was looking at.
@@ -54550,6 +54616,11 @@ const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
             icon_box_px: 20,
             dot_rail_px: 9,
         },
+        // Density differs in SPACING only (padding/radius/indent). The
+        // typography and the icon/dot slot geometry are IDENTICAL to the
+        // sidebar's — a human eye reads the left cwdtree and a right-rail
+        // file list as the same vocabulary, and an 11px rail title next to
+        // the 12px tree was visibly "off" (user-caught 2026-07-17).
         SessionRowDensity::Rail => SessionRowMetrics {
             indent_base_px: 10,
             indent_step_px: 12,
@@ -54557,8 +54628,8 @@ const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
             pad_h_px: 8,
             radius_px: 8,
             gap_px: 6,
-            font_px: 11.0,
-            icon_box_px: 16,
+            font_px: 12.0,
+            icon_box_px: 20,
             dot_rail_px: 9,
         },
     }
@@ -54682,7 +54753,9 @@ fn SessionStyleRow(
     );
     let subtitle_text = subtitle.filter(|text| !text.is_empty());
     let badge_text = badge.filter(|text| !text.is_empty());
-    let title_style = session_row_label_style(density, &text_color, selected);
+    // Selection is the tint, NEVER a weight change — the cwdtree's rule, and
+    // a bolded selected row read as a different font next to it.
+    let title_style = session_row_label_style(density, &text_color, false);
     rsx! {
         div {
             style: "{container}",
@@ -62153,16 +62226,31 @@ fn TerminalCanvas(
                                             );
                                             // The app that served the pane is
                                             // gone; stop painting a schema no
-                                            // control endpoint backs.
-                                            if matches!(
-                                                shell.right_panel_mode,
-                                                RightPanelMode::AppPane(_)
-                                            ) {
-                                                shell.set_right_panel_mode(RightPanelMode::Hidden);
+                                            // control endpoint backs. Only when
+                                            // the CLOSED session is the active
+                                            // one — a background app's exit must
+                                            // not reach across and clobber the
+                                            // rail (or the base) of whatever the
+                                            // user is looking at.
+                                            let closed_is_active =
+                                                shell.server.active_session_path()
+                                                    == Some(contribution_session_path.as_str());
+                                            if closed_is_active
+                                                && matches!(
+                                                    shell.right_panel_mode,
+                                                    RightPanelMode::AppPane(_)
+                                                )
+                                            {
+                                                // Hand the panel back to the
+                                                // user's remembered base, not to
+                                                // an unconditional Hidden.
+                                                shell.close_app_pane();
                                             }
-                                            shell.app_pane_schema = None;
-                                            shell.app_pane_values.clear();
-                                            shell.app_pane_error = None;
+                                            if closed_is_active {
+                                                shell.app_pane_schema = None;
+                                                shell.app_pane_values.clear();
+                                                shell.app_pane_error = None;
+                                            }
                                             // The document surface is the same
                                             // app's tenant in the viewport.
                                             shell.clear_document_panes_for_session(
@@ -92250,6 +92338,116 @@ mod tests {
             shell.sidebar_reads_live_since,
             Some(("local://ws".to_string(), switch_tick))
         );
+    }
+
+    /// The nested-tenant rail bug fixture: a contribution declaring a RAIL
+    /// pane, so `active_session_offers_pane` has something real to answer.
+    fn shell_with_rail_pane(session_path: &str, pane_id: &str, now_ms: u64) -> ShellState {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.upsert_sidebar_contribution(
+            session_path,
+            vec![SidebarPaneDeclaration {
+                id: pane_id.to_string(),
+                icon: "N".to_string(),
+                title: "Notes".to_string(),
+                placement: PanePlacement::Rail,
+            }],
+            None,
+            Some("yedit".to_string()),
+            None,
+            None,
+            None,
+            now_ms,
+            Some(("http://127.0.0.1:1/".to_string(), None)),
+        );
+        shell
+    }
+
+    // The rail stack, display half (user bug 2026-07-17): an app pane's
+    // remembered base can itself be a tenant (WebTabs), and a single-step
+    // fallback handed a native session the near-blank "No web surface" rail.
+    // The resolution must recurse to the user's real base.
+    #[test]
+    fn a_displaced_pane_resolves_through_a_nested_tenant_to_the_real_base() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://native");
+        let mut shell = ShellState::new(bootstrap);
+        shell.right_panel_mode = RightPanelMode::AppPane("vault".to_string());
+        shell.right_panel_mode_before_app_pane = Some(RightPanelMode::WebTabs);
+        shell.right_panel_mode_before_web_tabs = Some(RightPanelMode::Metadata);
+
+        // Active session offers no pane and has no live web surface.
+        assert_eq!(
+            shell.effective_right_panel_mode(false, 1_000),
+            RightPanelMode::Metadata,
+            "the display walks pane → tab rail → the user's own view"
+        );
+
+        // No remembered base anywhere: Hidden is the honest floor.
+        shell.right_panel_mode_before_web_tabs = None;
+        assert_eq!(
+            shell.effective_right_panel_mode(false, 1_000),
+            RightPanelMode::Hidden
+        );
+    }
+
+    // The rail stack, mutation half: changing the rail while the pane is
+    // DISPLACED (its session not active) edits the BASE — the pane's tenancy
+    // survives and returning to its session restores it. On the pane's own
+    // session the same change still closes the pane (existing semantics).
+    #[test]
+    fn a_rail_change_while_displaced_edits_the_base_and_keeps_the_pane() {
+        let mut shell = shell_with_rail_pane("local://app", "notes", 1_000);
+        shell.open_app_pane("notes");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("notes".to_string())
+        );
+
+        // Simulate being on a session that does NOT serve the pane by
+        // expiring the contribution's freshness beyond the stale window
+        // (active_sidebar_panes is freshness-gated, so offers=false).
+        shell
+            .sidebar_contributions
+            .get_mut("local://app")
+            .unwrap()
+            .last_seen_ms = 0;
+        assert!(!shell.active_session_offers_pane("notes"));
+
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("notes".to_string()),
+            "the pane's tenancy survives a displaced base edit"
+        );
+        assert_eq!(
+            shell.right_panel_mode_before_app_pane,
+            Some(RightPanelMode::Metadata),
+            "the base is what changed"
+        );
+        assert_eq!(
+            shell.effective_right_panel_mode(false, 1_000),
+            RightPanelMode::Metadata,
+            "the native session displays the edited base"
+        );
+
+        // Back on the serving session: the pane re-reveals.
+        shell
+            .sidebar_contributions
+            .get_mut("local://app")
+            .unwrap()
+            .last_seen_ms = current_millis();
+        assert!(shell.active_session_offers_pane("notes"));
+        assert_eq!(
+            shell.effective_right_panel_mode(true, 1_000),
+            RightPanelMode::AppPane("notes".to_string())
+        );
+
+        // On the pane's OWN session the same change closes the pane.
+        shell.set_right_panel_mode(RightPanelMode::Connect);
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Connect);
+        assert_eq!(shell.right_panel_mode_before_app_pane, None);
     }
 
     // Block click-to-edit (Phase 4): the offset-iter pass must yield exactly

@@ -349,7 +349,10 @@ functions and the `SessionStyleRow` component in shell.rs.
 
 - Two densities of the same anatomy: `Sidebar` (the cwdtree main row's numbers
   — 20px icon box, 9px dot rail, font 12, radius 12, 12px indent step) and
-  `Rail` (right-rail lists — font 11, radius 8, padding 6/8, same indent step).
+  `Rail` (right-rail lists). Density differs in SPACING ONLY (padding 6/8,
+  radius 8): typography and the icon/dot slot geometry are IDENTICAL across
+  densities — an 11px rail title next to the 12px tree read as a different
+  font (user-caught 2026-07-17). Selection is the tint, never a weight change.
 - Selection tint is the palette's `accent_soft` everywhere. Never a
   per-consumer mix.
 - The status-dot SLOT is laid out even when empty, so an appearing dot never
