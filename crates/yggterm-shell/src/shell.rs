@@ -1178,12 +1178,33 @@ fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
 /// `url` must ALREADY be GUI-reachable (`resolve_control_endpoint_url` has
 /// turned a remote loopback into the local end of an `ssh -L` forward).
 fn control_request(url: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    control_request_with_timeout(url, body, Duration::from_secs(10))
+}
+
+/// The liveness ping's short fuse: a suspended app's listener still ACCEPTS
+/// (kernel backlog) but never answers, so an unbudgeted read would stall a
+/// whole poll tick. 1500ms loses at most part of one tick to a dead endpoint.
+fn control_ping_request(url: &str) -> Result<serde_json::Value, String> {
+    control_request_with_timeout(url, None, Duration::from_millis(1500))
+}
+
+fn control_request_with_timeout(
+    url: &str,
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
     use std::io::{Read as _, Write as _};
+    use std::net::ToSocketAddrs as _;
     let (host, port, path) = web_surface_url_parts(url).ok_or("unparseable control url")?;
-    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve {host}:{port}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {host}:{port}: no address"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .map_err(|error| format!("connect {host}:{port}: {error}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
     let request = match body {
         Some(body) => {
             let payload = body.to_string();
@@ -7188,6 +7209,46 @@ impl ShellState {
             appearance: !appearance_version.is_empty(),
             document: !document_version.is_empty(),
         }
+    }
+    /// Apply a successful `<control>/ping` reply ([[campaign-libyggterm]]
+    /// Phase 2). A ping is the PTY declare's EQUAL as proof of life: it bumps
+    /// `last_seen_ms` (so the overlay/expiry pipeline judges endpoint-mode and
+    /// PTY-mode apps identically) and any stamp the reply carries dispatches
+    /// the same refetch a declare would. A ping only ever REFRESHES — creation
+    /// stays declare-only, so a ping racing a close cannot resurrect anything.
+    /// Stamps the reply omits read "unchanged", never "cleared".
+    #[allow(clippy::too_many_arguments)]
+    fn apply_sidebar_ping(
+        &mut self,
+        session_path: &str,
+        app_name: Option<String>,
+        policy_version: Option<String>,
+        zoom_version: Option<String>,
+        appearance_version: Option<String>,
+        document_version: Option<String>,
+        now_ms: u64,
+    ) -> Option<SidebarRefetch> {
+        let existing = self.sidebar_contributions.get(session_path)?;
+        let panes = existing.panes.clone();
+        let app_name = app_name.or_else(|| existing.app_name.clone());
+        let policy_version =
+            Some(policy_version.unwrap_or_else(|| existing.policy_version.clone()));
+        let zoom_version = Some(zoom_version.unwrap_or_else(|| existing.zoom_version.clone()));
+        let appearance_version =
+            Some(appearance_version.unwrap_or_else(|| existing.appearance_version.clone()));
+        let document_version =
+            Some(document_version.unwrap_or_else(|| existing.document_version.clone()));
+        Some(self.upsert_sidebar_contribution(
+            session_path,
+            panes,
+            policy_version,
+            app_name,
+            zoom_version,
+            appearance_version,
+            document_version,
+            now_ms,
+            None,
+        ))
     }
     /// Store the policy the app served for `policy_version`. A reply for a stale
     /// version is dropped: the app has already moved on and a newer fetch is in
@@ -17074,8 +17135,91 @@ fn trace_working_edge_if_changed(
 const WORKING_FLAGS_POLL_INTERVAL_MS: u64 = 2_500;
 const WORKING_FLAGS_POLL_ERROR_BACKOFF_MS: u64 = 30_000;
 
+/// Endpoint-ping liveness ([[campaign-libyggterm]] Phase 2, the emacsclient
+/// model): an app that declares a control endpoint is alive iff that endpoint
+/// ANSWERS — the view client that wrote the declare may exit and the shell
+/// comes back; a suspended app stops answering. Pings the ACTIVE-VISIBLE
+/// session's contribution once per poll tick (the same reads-live rule the
+/// sweep judges by). A reply routes through `apply_sidebar_ping`, so the
+/// overlay/expiry pipeline and stamp-driven refetches treat endpoint-mode and
+/// PTY-declare apps identically; PTY heartbeats alone remain sufficient for
+/// endpoint-less apps. No answer needs no handling here — `last_seen_ms` just
+/// keeps aging into the overlay and then expiry. (A dropped remote `ssh -L`
+/// forward reads the same way; automatic forward re-resolve is deferred until
+/// a remote document app exists.)
+async fn sidebar_endpoint_ping_tick(
+    mut state: Signal<ShellState>,
+    trace_home: std::path::PathBuf,
+) {
+    let target = state.with(|shell| {
+        shell.sidebar_reads_live_path().and_then(|path| {
+            shell
+                .sidebar_contributions
+                .get(&path)
+                .map(|contribution| (path.clone(), contribution.control_url.clone()))
+        })
+    });
+    let Some((session_path, control_url)) = target else {
+        return;
+    };
+    let ping_url = format!("{}/ping", control_url.trim_end_matches('/'));
+    let Ok(Ok(reply)) = task::spawn_blocking(move || control_ping_request(&ping_url)).await
+    else {
+        return;
+    };
+    let field = |key: &str| {
+        reply
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    let (app_name, policy_version, zoom_version, appearance_version, document_version) = (
+        field("app_name"),
+        field("policy_version"),
+        field("zoom_version"),
+        field("appearance_version"),
+        field("document_version"),
+    );
+    let now_ms = current_millis();
+    let Some(refetch) = state.with_mut(|shell| {
+        shell.apply_sidebar_ping(
+            &session_path,
+            app_name,
+            policy_version.clone(),
+            zoom_version.clone(),
+            appearance_version.clone(),
+            document_version.clone(),
+            now_ms,
+        )
+    }) else {
+        return;
+    };
+    // Same dispatch as the declare arm: a stamp that moved refetches what it
+    // stamps. Only stamps the reply itself carried can have moved.
+    if refetch.policy && let Some(version) = policy_version {
+        let trace_home = trace_home.clone();
+        let session = session_path.clone();
+        spawn(app_policy_fetch(state, session, version, trace_home));
+    }
+    if refetch.zoom && let Some(version) = zoom_version {
+        let trace_home = trace_home.clone();
+        let session = session_path.clone();
+        spawn(app_zoom_fetch(state, session, version, trace_home));
+    }
+    if refetch.appearance && let Some(version) = appearance_version {
+        let trace_home = trace_home.clone();
+        let session = session_path.clone();
+        spawn(app_appearance_fetch(state, session, version, trace_home));
+    }
+    if refetch.document {
+        let seq = state.with_mut(|shell| shell.document_pane_next_request());
+        spawn(document_pane_fetch_schema(state, session_path, seq));
+    }
+}
+
 fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let trace_home = resolve_yggterm_home().unwrap_or_default();
     spawn(async move {
         loop {
             sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
@@ -17108,6 +17252,9 @@ fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
                     shell.sweep_stale_sidebar_contributions(current_millis());
                 });
             }
+            // Endpoint-ping liveness rides the same tick (Phase 2): fire and
+            // forget — the ping task owns its own short timeout.
+            spawn(sidebar_endpoint_ping_tick(state, trace_home.clone()));
             if !has_flagged_sessions {
                 continue;
             }
@@ -91586,6 +91733,65 @@ mod tests {
             shell.sidebar_reads_live_since,
             Some(("local://ws".to_string(), switch_tick))
         );
+    }
+
+    // Endpoint-ping liveness (Phase 2): a ping reply is the PTY declare's
+    // equal — it clears the not-responding overlay, refreshes the clock, and
+    // an unchanged (or omitted) stamp dispatches no refetch.
+    #[test]
+    fn a_ping_reply_is_proof_of_life_and_clears_the_overlay() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        shell.sweep_stale_sidebar_contributions(2_000);
+        let stale_at = 2_000 + WEB_SURFACE_STALE_AFTER_MS + 1;
+        shell.sweep_stale_sidebar_contributions(stale_at);
+        assert_eq!(shell.document_surface_stale.as_deref(), Some("local://ws"));
+
+        let refetch = shell
+            .apply_sidebar_ping("local://ws", None, None, None, None, None, stale_at + 100)
+            .expect("existing contribution accepts a ping");
+        assert_eq!(shell.document_surface_stale, None, "answering IS proof of life");
+        assert!(
+            !refetch.policy && !refetch.zoom && !refetch.appearance && !refetch.document,
+            "omitted stamps read unchanged, never cleared"
+        );
+        // The refreshed clock keeps the surface alive on the next tick.
+        shell.sweep_stale_sidebar_contributions(stale_at + 200);
+        assert!(shell.sidebar_contributions.contains_key("local://ws"));
+    }
+
+    // A detached app's content changes travel on the ping: a moved
+    // document stamp must dispatch the same refetch a declare would.
+    #[test]
+    fn a_ping_with_a_moved_document_stamp_dispatches_a_refetch() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        let refetch = shell
+            .apply_sidebar_ping(
+                "local://ws",
+                None,
+                None,
+                None,
+                None,
+                Some("5:false".to_string()),
+                2_000,
+            )
+            .expect("existing contribution accepts a ping");
+        assert!(refetch.document, "a moved stamp refetches what it stamps");
+        assert!(!refetch.policy && !refetch.zoom && !refetch.appearance);
+    }
+
+    // Creation stays declare-only: a ping racing a close (or landing after
+    // expiry) must not resurrect a contribution.
+    #[test]
+    fn a_ping_never_creates_a_contribution() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        assert!(
+            shell
+                .apply_sidebar_ping("local://ws", None, None, None, None, None, 1_000)
+                .is_none()
+        );
+        assert!(shell.sidebar_contributions.is_empty());
     }
 
     // Vertical mode IS the rail. A GUI that starts with the pref already on used
