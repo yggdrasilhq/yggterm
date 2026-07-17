@@ -1335,6 +1335,27 @@ struct SidebarRefetch {
 /// stops asking and leaves the last schema on screen.
 const MAX_DOCUMENT_FETCH_ATTEMPTS: u32 = 3;
 
+/// `(session_path, view context)` — which session's document, and WHICH VIEW
+/// of it. The context is the app-defined discriminator ("pane pinned to note
+/// X"); `DOCUMENT_PANE_DEFAULT_VIEW` is the app's default view and the only
+/// context v1 keys. The schema GET grows `?view=<context>` the moment a real
+/// second view exists ([[campaign-libyggterm]] Phase 3).
+type DocumentPaneKey = (String, String);
+const DOCUMENT_PANE_DEFAULT_VIEW: &str = "";
+
+/// One document pane's channel state: the fetched schema, the user's draft
+/// values, the last error, and the stale-reply guard. Keyed per
+/// (session, context) so co-visible document panes — two sessions side by
+/// side, or one session's two views — can never clobber each other's drafts
+/// or drop each other's in-flight fetches.
+#[derive(Default, Clone)]
+struct DocumentPaneChannel {
+    schema: Option<AppPaneSchemaState>,
+    values: HashMap<String, String>,
+    error: Option<String>,
+    request_seq: u64,
+}
+
 /// Attempts at `<control>/zoom` for one stamp before the reconciler stops asking
 /// and leaves the surfaces on the global zoom.
 const MAX_ZOOM_FETCH_ATTEMPTS: u32 = 3;
@@ -4011,20 +4032,15 @@ struct ShellState {
     /// Bumped on every pane open / action so a late reply from a superseded
     /// fetch cannot overwrite a newer schema.
     app_pane_request_seq: u64,
-    /// The DOCUMENT SURFACE's schema — the viewport-placement pane of the
-    /// session that declared it (yedit's reader). Its own channel, deliberately
-    /// separate from the rail's `app_pane_schema`: both can be open at once,
-    /// and a rail search must never clobber a document draft.
-    document_pane_schema: Option<AppPaneSchemaState>,
-    /// Which session's contribution `document_pane_schema` belongs to.
-    document_pane_session: Option<String>,
-    /// Draft values for the document's inputs (the plain-mode editor buffer),
-    /// same ownership rule as `app_pane_values`: the app owns every value.
-    document_pane_values: HashMap<String, String>,
-    document_pane_error: Option<String>,
-    /// Bumped on every document fetch / action so a late reply from a
-    /// superseded fetch cannot overwrite a newer schema.
-    document_pane_request_seq: u64,
+    /// The DOCUMENT channels — one per (session, view context), Phase 3's
+    /// keyed generalization of the old single slot. Deliberately separate
+    /// from the rail's `app_pane_schema`: both can be open at once, and a
+    /// rail search must never clobber a document draft. Each channel guards
+    /// its own request_seq, so a fetch for one session's document cannot
+    /// invalidate another's in-flight reply. Channels are created by
+    /// `document_pane_next_request` (a fetch beginning) and by a draft edit;
+    /// replies never create — a late reply after a clear stays dead.
+    document_panes: HashMap<DocumentPaneKey, DocumentPaneChannel>,
     /// Sessions where the user toggled the document surface OFF (to the
     /// terminal). The ~4s re-declare must never fight this — the same
     /// heartbeats-never-clobber-the-user rule the web surface learned.
@@ -5794,11 +5810,7 @@ impl ShellState {
             right_panel_mode_before_web_tabs: None,
             app_pane_error: None,
             app_pane_request_seq: 0,
-            document_pane_schema: None,
-            document_pane_session: None,
-            document_pane_values: HashMap::new(),
-            document_pane_error: None,
-            document_pane_request_seq: 0,
+            document_panes: HashMap::new(),
             document_surface_hidden: HashSet::new(),
             document_rail_auto_opened: HashSet::new(),
             document_surface_stale: None,
@@ -6583,16 +6595,23 @@ impl ShellState {
                         .and_then(|contribution| contribution.app_name.clone()),
                 })
             }),
-            // The document schema rides the snapshot only when it belongs to
-            // the ACTIVE session — a background yedit's document must not
-            // paint over the session the user is looking at.
-            document_pane_schema: self
-                .document_pane_session
+            // The document channel rides the snapshot keyed by the ACTIVE
+            // session — structural now (the key IS the session), so a
+            // background yedit's document cannot paint over the session the
+            // user is looking at.
+            document_pane_schema: active_session_path
                 .as_deref()
-                .filter(|owner| active_session_path.as_deref() == Some(*owner))
-                .and_then(|_| self.document_pane_schema.clone()),
-            document_pane_error: self.document_pane_error.clone(),
-            document_pane_values: self.document_pane_values.clone(),
+                .and_then(|path| self.document_pane_channel(path))
+                .and_then(|channel| channel.schema.clone()),
+            document_pane_error: active_session_path
+                .as_deref()
+                .and_then(|path| self.document_pane_channel(path))
+                .and_then(|channel| channel.error.clone()),
+            document_pane_values: active_session_path
+                .as_deref()
+                .and_then(|path| self.document_pane_channel(path))
+                .map(|channel| channel.values.clone())
+                .unwrap_or_default(),
             terminal_palette: terminal_theme_by_name(&self.effective_terminal_theme_name())
                 .map(|theme| theme.palette.clone())
                 .unwrap_or_default(),
@@ -7508,8 +7527,11 @@ impl ShellState {
             }
             if !live {
                 // Expired like a close: a future instance re-earns its rail
-                // auto-open.
+                // auto-open, and the dead app's document channels go with it
+                // (a late reply must find nothing to write into).
                 self.document_rail_auto_opened.remove(session_path);
+                self.document_panes
+                    .retain(|(session, _), _| session != session_path);
             }
             live
         });
@@ -8854,11 +8876,26 @@ impl ShellState {
     // ===== the DOCUMENT SURFACE's schema channel =====
     // A viewport-placement pane rendered as shell DOM in the main viewport.
     // Same contract as the rail channel (the app owns every value, epochs
-    // rebuild only pushed values, a stale seq is dropped) on separate state,
-    // so a document draft and a rail search can never clobber each other.
-    fn document_pane_next_request(&mut self) -> u64 {
-        self.document_pane_request_seq = self.document_pane_request_seq.wrapping_add(1);
-        self.document_pane_request_seq
+    // rebuild only pushed values, a stale seq is dropped) on separate,
+    // per-(session, context) state, so a document draft and a rail search —
+    // or two co-visible documents — can never clobber each other.
+    fn document_pane_key(session_path: &str) -> DocumentPaneKey {
+        (
+            session_path.to_string(),
+            DOCUMENT_PANE_DEFAULT_VIEW.to_string(),
+        )
+    }
+    fn document_pane_channel(&self, session_path: &str) -> Option<&DocumentPaneChannel> {
+        self.document_panes
+            .get(&Self::document_pane_key(session_path))
+    }
+    fn document_pane_next_request(&mut self, session_path: &str) -> u64 {
+        let channel = self
+            .document_panes
+            .entry(Self::document_pane_key(session_path))
+            .or_default();
+        channel.request_seq = channel.request_seq.wrapping_add(1);
+        channel.request_seq
     }
     fn document_pane_apply_schema(
         &mut self,
@@ -8867,11 +8904,19 @@ impl ShellState {
         pane_id: &str,
         schema: AppPaneSchema,
     ) {
-        if seq != self.document_pane_request_seq {
+        // Replies never CREATE a channel: after a clear, a late reply finds
+        // nothing and stays dead.
+        let Some(channel) = self
+            .document_panes
+            .get_mut(&Self::document_pane_key(session_path))
+        else {
+            return;
+        };
+        if seq != channel.request_seq {
             return;
         }
-        let previous_epochs = self
-            .document_pane_schema
+        let previous_epochs = channel
+            .schema
             .as_ref()
             .filter(|state| state.pane_id == pane_id)
             .map(|state| state.value_epochs.clone())
@@ -8883,8 +8928,8 @@ impl ShellState {
                 continue;
             };
             let epoch = previous_epochs.get(id).copied().unwrap_or(0);
-            let unchanged = self
-                .document_pane_values
+            let unchanged = channel
+                .values
                 .get(id)
                 .is_some_and(|shown| *shown == declared);
             value_epochs.insert(
@@ -8893,10 +8938,9 @@ impl ShellState {
             );
             values.insert(id.to_string(), declared);
         }
-        self.document_pane_values = values;
-        self.document_pane_error = None;
-        self.document_pane_session = Some(session_path.to_string());
-        self.document_pane_schema = Some(AppPaneSchemaState {
+        channel.values = values;
+        channel.error = None;
+        channel.schema = Some(AppPaneSchemaState {
             pane_id: pane_id.to_string(),
             schema,
             value_epochs,
@@ -8907,27 +8951,37 @@ impl ShellState {
         }
     }
     fn document_pane_apply_error(&mut self, seq: u64, session_path: &str, error: String) {
-        if seq != self.document_pane_request_seq {
+        let Some(channel) = self
+            .document_panes
+            .get_mut(&Self::document_pane_key(session_path))
+        else {
+            return;
+        };
+        if seq != channel.request_seq {
             return;
         }
-        self.document_pane_error = Some(error);
+        channel.error = Some(error);
         if let Some(contribution) = self.sidebar_contributions.get_mut(session_path) {
             contribution.document_attempts = contribution.document_attempts.saturating_add(1);
         }
     }
-    fn clear_document_pane(&mut self) {
-        self.document_pane_schema = None;
-        self.document_pane_session = None;
-        self.document_pane_values.clear();
-        self.document_pane_error = None;
-        self.document_pane_request_seq = self.document_pane_request_seq.wrapping_add(1);
+    /// Drop every view's channel for the session (its app closed or expired).
+    fn clear_document_panes_for_session(&mut self, session_path: &str) {
+        self.document_panes
+            .retain(|(session, _), _| session != session_path);
     }
-    fn set_document_pane_value(&mut self, widget_id: &str, value: String) {
-        self.document_pane_values.insert(widget_id.to_string(), value);
+    fn set_document_pane_value(&mut self, session_path: &str, widget_id: &str, value: String) {
+        self.document_panes
+            .entry(Self::document_pane_key(session_path))
+            .or_default()
+            .values
+            .insert(widget_id.to_string(), value);
     }
-    fn document_pane_values_json(&self) -> serde_json::Value {
+    fn document_pane_values_json(&self, session_path: &str) -> serde_json::Value {
         serde_json::Value::Object(
-            self.document_pane_values
+            self.document_pane_channel(session_path)
+                .map(|channel| channel.values.clone())
+                .unwrap_or_default()
                 .iter()
                 .map(|(id, value)| (id.clone(), serde_json::Value::String(value.clone())))
                 .collect(),
@@ -17212,7 +17266,7 @@ async fn sidebar_endpoint_ping_tick(
         spawn(app_appearance_fetch(state, session, version, trace_home));
     }
     if refetch.document {
-        let seq = state.with_mut(|shell| shell.document_pane_next_request());
+        let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
         spawn(document_pane_fetch_schema(state, session_path, seq));
     }
 }
@@ -41388,7 +41442,7 @@ async fn document_pane_run_action(
         let shell = state.read();
         (
             shell.sidebar_control_url(&session_path),
-            shell.document_pane_values_json(),
+            shell.document_pane_values_json(&session_path),
         )
     };
     let Some(control_url) = control_url else {
@@ -41397,7 +41451,7 @@ async fn document_pane_run_action(
     if let (Some(value), Some(map)) = (value, values.as_object_mut()) {
         map.insert("value".to_string(), serde_json::Value::String(value));
     }
-    let seq = state.with_mut(|shell| shell.document_pane_next_request());
+    let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
     let url = app_pane_action_url(&control_url);
     let body = json!({ "pane": pane_id, "action": action, "values": values });
     let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
@@ -41426,8 +41480,8 @@ async fn document_pane_run_action(
     if let Some(toast) = reply.toast {
         state.with_mut(|shell| {
             let title = shell
-                .document_pane_schema
-                .as_ref()
+                .document_pane_channel(&session_path)
+                .and_then(|channel| channel.schema.as_ref())
                 .filter(|s| s.pane_id == pane_id)
                 .map(|s| s.schema.title.clone())
                 .filter(|t| !t.is_empty())
@@ -41699,12 +41753,13 @@ async fn app_pane_run_action(
         // collision). This is what lets a rail Save flush the editor buffer
         // the user is typing in the viewport — same app, same control
         // endpoint, one action.
-        if active
+        if let Some(path) = active
             .as_deref()
-            .is_some_and(|path| shell.viewport_pane_for_session(path).is_some())
+            .filter(|path| shell.viewport_pane_for_session(path).is_some())
+            && let Some(channel) = shell.document_pane_channel(path)
             && let Some(map) = values.as_object_mut()
         {
-            for (id, value) in &shell.document_pane_values {
+            for (id, value) in &channel.values {
                 map.entry(id.clone())
                     .or_insert_with(|| serde_json::Value::String(value.clone()));
             }
@@ -41828,7 +41883,7 @@ async fn app_pane_run_action(
         // rather than a heartbeat later.
         let session = state.peek().server.active_session_path().map(str::to_string);
         if let Some(session) = session {
-            let seq = state.with_mut(|shell| shell.document_pane_next_request());
+            let seq = state.with_mut(|shell| shell.document_pane_next_request(&session));
             spawn(document_pane_fetch_schema(state, session, seq));
         }
     }
@@ -61858,8 +61913,9 @@ fn TerminalCanvas(
                                         // lands.
                                         if refetch.document {
                                             let session = contribution_session_path.clone();
-                                            let seq = state
-                                                .with_mut(|shell| shell.document_pane_next_request());
+                                            let seq = state.with_mut(|shell| {
+                                                shell.document_pane_next_request(&session)
+                                            });
                                             spawn(document_pane_fetch_schema(state, session, seq));
                                         }
                                         // A document app's RAIL pane opens WITH
@@ -61920,11 +61976,9 @@ fn TerminalCanvas(
                                             shell.app_pane_error = None;
                                             // The document surface is the same
                                             // app's tenant in the viewport.
-                                            if shell.document_pane_session.as_deref()
-                                                == Some(contribution_session_path.as_str())
-                                            {
-                                                shell.clear_document_pane();
-                                            }
+                                            shell.clear_document_panes_for_session(
+                                                &contribution_session_path,
+                                            );
                                             // The app retired: a NEW instance in
                                             // this session earns a fresh rail
                                             // auto-open. (The once-guard exists
@@ -84850,9 +84904,14 @@ fn DocumentSurfaceBody(
                                         oninput: {
                                             let mut state = state;
                                             let id = id.clone();
+                                            let session_path = session_path.clone();
                                             move |evt: FormEvent| {
                                                 state.with_mut(|shell| {
-                                                    shell.set_document_pane_value(&id, evt.value());
+                                                    shell.set_document_pane_value(
+                                                        &session_path,
+                                                        &id,
+                                                        evt.value(),
+                                                    );
                                                 });
                                             }
                                         },
@@ -84988,9 +85047,14 @@ fn DocumentSurfaceBody(
                                             oninput: {
                                                 let mut state = state;
                                                 let id = id.clone();
+                                                let session_path = session_path.clone();
                                                 move |evt: FormEvent| {
                                                     state.with_mut(|shell| {
-                                                        shell.set_document_pane_value(&id, evt.value());
+                                                        shell.set_document_pane_value(
+                                                            &session_path,
+                                                            &id,
+                                                            evt.value(),
+                                                        );
                                                     });
                                                 }
                                             },
@@ -91733,6 +91797,51 @@ mod tests {
             shell.sidebar_reads_live_since,
             Some(("local://ws".to_string(), switch_tick))
         );
+    }
+
+    // The keyed document channel (Phase 3.1): each (session, view) owns its
+    // schema/values/error/seq, so co-visible documents cannot clobber each
+    // other — one session's fetch cannot invalidate another's in-flight
+    // reply, and drafts stay with their session.
+    #[test]
+    fn document_channels_are_isolated_per_session() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let schema = AppPaneSchema {
+            title: "Doc".to_string(),
+            widgets: Vec::new(),
+        };
+
+        let seq_a = shell.document_pane_next_request("local://a");
+        let seq_b = shell.document_pane_next_request("local://b");
+        // B's newer request must NOT invalidate A's in-flight reply.
+        shell.document_pane_apply_schema(seq_a, "local://a", "doc", schema.clone());
+        shell.document_pane_apply_schema(seq_b, "local://b", "doc", schema.clone());
+        assert!(shell.document_pane_channel("local://a").unwrap().schema.is_some());
+        assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
+
+        // Drafts stay with their session.
+        shell.set_document_pane_value("local://a", "editor", "alpha".to_string());
+        shell.set_document_pane_value("local://b", "editor", "beta".to_string());
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!("alpha")
+        );
+        assert_eq!(
+            shell.document_pane_values_json("local://b")["editor"],
+            serde_json::json!("beta")
+        );
+
+        // Clearing one session's channels leaves the other untouched; a late
+        // reply for the cleared session finds nothing and stays dead.
+        shell.clear_document_panes_for_session("local://a");
+        assert!(shell.document_pane_channel("local://a").is_none());
+        shell.document_pane_apply_schema(seq_a, "local://a", "doc", schema);
+        assert!(
+            shell.document_pane_channel("local://a").is_none(),
+            "replies never create a channel"
+        );
+        assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
     }
 
     // Endpoint-ping liveness (Phase 2): a ping reply is the PTY declare's
