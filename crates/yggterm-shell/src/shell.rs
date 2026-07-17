@@ -642,6 +642,7 @@ const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 10
 const SESSION_ROW_HOVER_CSS: &str =
     "[data-session-row] [data-session-row-actions]{opacity:0; transition:opacity 120ms ease;} \
      [data-session-row]:hover [data-session-row-actions]{opacity:1;} \
+     [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions]{opacity:1;} \
      [data-session-row] [data-session-row-actions]:focus-within{opacity:1;}";
 /// The vertical-tabs left pane slides in from the edge as the top chrome
 /// collapses (max-height transition on the tab bar + nav bar).
@@ -54744,6 +54745,10 @@ fn SessionStyleRow(
     #[props(default)] badge_color: Option<String>,
     #[props(default)] dot: Option<Element>,
     #[props(default)] icon: Option<Element>,
+    /// Icon slot color. The cwdtree's rule: MUTED normally, full text color
+    /// on the selected row — pass both and the row picks. Defaults to
+    /// `text_color` when unset.
+    #[props(default)] icon_color: Option<String>,
     #[props(default)] actions: Option<Element>,
     #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
     #[props(default)] onmousedown: Option<EventHandler<MouseEvent>>,
@@ -54764,9 +54769,11 @@ fn SessionStyleRow(
     // Selection is the tint, NEVER a weight change — the cwdtree's rule, and
     // a bolded selected row read as a different font next to it.
     let title_style = session_row_label_style(density, &text_color, false);
+    let icon_slot_color = icon_color.unwrap_or_else(|| text_color.clone());
     rsx! {
         div {
             "data-session-row": "1",
+            "data-session-row-selected": if selected { "true" } else { "false" },
             style: "{container}",
             onclick: move |evt| {
                 if let Some(handler) = &onclick {
@@ -54792,7 +54799,7 @@ fn SessionStyleRow(
             }
             if let Some(icon) = icon {
                 span {
-                    style: session_row_icon_box_style(density, &text_color),
+                    style: session_row_icon_box_style(density, &icon_slot_color),
                     {icon}
                 }
             }
@@ -54864,7 +54871,7 @@ fn FileBadgeIcon(ext: String) -> Element {
                 height: "14",
                 rx: "3",
                 stroke: "currentColor",
-                stroke_width: "1.2",
+                stroke_width: "1.1",
             }
             text {
                 x: "9",
@@ -54873,7 +54880,7 @@ fn FileBadgeIcon(ext: String) -> Element {
                 dominant_baseline: "middle",
                 fill: "currentColor",
                 font_size: "6.5",
-                font_weight: "700",
+                font_weight: "600",
                 font_family: "inherit",
                 letter_spacing: "0.02em",
                 "{label}"
@@ -86091,6 +86098,12 @@ fn AppPaneRailBody(
                                         subtitle: (!subtitle.is_empty()).then(|| subtitle.clone()),
                                         subtitle_color: Some(palette.muted.to_string()),
                                         icon: (!icon.is_empty()).then(|| app_pane_row_icon(&icon)),
+                                        // The cwdtree's icon rule: muted at
+                                        // rest, text color on the selected row.
+                                        icon_color: Some(
+                                            if selected { palette.text } else { palette.muted }
+                                                .to_string(),
+                                        ),
                                         onclick: clickable.then(|| {
                                             let (pane_id, action, row_id) =
                                                 (pane_id.clone(), row_action.clone(), id.clone());
