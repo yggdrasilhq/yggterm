@@ -2049,6 +2049,21 @@ struct DaemonRuntime {
     /// drop-telemetry showed ZERO drops because the update snapshot itself
     /// was correct). After this is set, routine persists are no-ops.
     update_restart_state_written: bool,
+    /// Wall-clock (ms) when `update_restart_state_written` was last armed.
+    /// LIVE INCIDENT (2026-07-18, jojo): a daemon armed the update-restart
+    /// snapshot, its same-version handoff successor died on socket collision,
+    /// and it kept SERVING the GUI for 12h as a permanently persist-muted
+    /// process — every session the user closed lived only in memory, and the
+    /// next cold-restore resurrected them from the frozen snapshot
+    /// ([[finding-dead-sessions-revive-permanent-persist-mute]]). A real
+    /// update-restart hands off and the successor reads the snapshot within
+    /// seconds; if this daemon is still the live server long after arming it,
+    /// the update did NOT converge and it is the de-facto owner. The persist
+    /// mute self-heals after `UPDATE_RESTART_PERSIST_MUTE_GRACE_MS` so closes
+    /// reach disk again. The flag itself is left set (so client-close
+    /// preservation keeps its SAFE preserve-non-keep-alive behavior); only the
+    /// persist suppression expires.
+    update_restart_state_written_at_ms: Option<u64>,
     /// Run #17 split-brain lesson (structural): cross-daemon duplicate-runtime
     /// pruning probes/drops/retires against OTHER daemons' sockets — against a
     /// live-but-busy duplicate each round-trip can take seconds, and running
@@ -2192,6 +2207,7 @@ impl DaemonRuntime {
             preserved_owner_unreachable_until_ms: HashMap::new(),
             terminal_write_relaunch_attempted_at_ms: HashMap::new(),
             update_restart_state_written: false,
+            update_restart_state_written_at_ms: None,
             duplicate_runtime_prune_in_flight: Arc::new(AtomicBool::new(false)),
             pending_preserved_owner_removals: Arc::new(Mutex::new(Vec::new())),
             superseded_routine_persist_muted: false,
@@ -3382,6 +3398,25 @@ impl DaemonRuntime {
                 if !crate::persisted_live_session_is_recoverable(&live) {
                     continue;
                 }
+                // Only RESCUE a session the superseded daemon still OWNS a live
+                // terminal runtime for. Its owned runtimes (local PTYs, incl.
+                // non-keep-alive shells that the normal persist drops and can be
+                // recovered ONLY here) die with it, so they must be adopted. But
+                // a stale sibling that merely holds METADATA for a session the
+                // user CLOSED on the authoritative daemon must NOT resurrect it:
+                // jojo 2026-07-18, a lingering 2.11.3 daemon that never saw the
+                // closes re-added 9 dead rows through this import and jammed the
+                // Live pane on the next restart. The authoritative live set is
+                // the handoff snapshot this daemon already restored; a superseded
+                // daemon can only ADD runtimes it is about to lose, never revive
+                // closed rows. [[finding-dead-sessions-revive-permanent-persist-mute]]
+                let superseded_owns_runtime = status
+                    .owned_terminal_session_keys
+                    .iter()
+                    .any(|runtime_key| normalize(runtime_key) == normalized);
+                if !superseded_owns_runtime {
+                    continue;
+                }
                 let key = live.key.clone();
                 self.server.restore_live_session(live);
                 self.server.move_live_session_after(&key, anchor.as_deref());
@@ -4476,11 +4511,39 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    /// Mark that the update-restart snapshot has just been written, stamping the
+    /// arm time so the persist mute can self-heal if the update never converges.
+    /// Every site that writes the protected snapshot must go through here so the
+    /// timestamp can never drift from the flag.
+    fn mark_update_restart_state_written(&mut self) {
+        self.update_restart_state_written = true;
+        self.update_restart_state_written_at_ms = Some(current_millis_u64());
+    }
+
+    /// Should routine persists be suppressed right now? True while a strictly
+    /// newer daemon owns the file (gate #8), or during the brief window after an
+    /// update-restart snapshot was armed. The update-restart suppression EXPIRES
+    /// after a grace window: a real handoff completes in seconds (and once the
+    /// newer successor is live, `superseded_routine_persist_muted` takes over the
+    /// hard mute), so a daemon still serving long after arming is a stranded
+    /// de-facto owner that MUST resume persisting — otherwise its in-memory
+    /// closes never reach disk and the next cold-restore resurrects them.
+    fn routine_persist_muted(&self) -> bool {
+        routine_persist_should_mute(
+            self.superseded_routine_persist_muted,
+            self.update_restart_state_written,
+            self.update_restart_state_written_at_ms,
+            current_millis_u64(),
+        )
+    }
+
     fn persist(&mut self) -> Result<()> {
-        if self.update_restart_state_written || self.superseded_routine_persist_muted {
+        if self.routine_persist_muted() {
             // Never clobber the update-restart snapshot during retire, and
             // never clobber the SUCCESSOR's state file once a newer daemon is
-            // live (gate #8 — see the field docs).
+            // live (gate #8 — see the field docs). The update-restart arm of
+            // this mute self-heals after a grace window; see
+            // `routine_persist_muted`.
             return Ok(());
         }
         let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "persist");
@@ -4557,7 +4620,7 @@ impl DaemonRuntime {
     /// Genuine lifecycle events still call the full `persist()`. See campaign D1 / the
     /// born-at-correct-size synchronous flush.
     fn persist_state_only(&self) -> Result<()> {
-        if self.update_restart_state_written || self.superseded_routine_persist_muted {
+        if self.routine_persist_muted() {
             return Ok(());
         }
         write_persisted_state(&self.state_path, &self.server.persisted_state())
@@ -4628,7 +4691,7 @@ impl DaemonRuntime {
                         "failed to persist daemon state for update restart; proceeding without blocking the restart"
                     );
                 }
-                self.update_restart_state_written = true;
+                self.mark_update_restart_state_written();
                 ServerResponse::Ack {
                     message: Some("update restart prepared".to_string()),
                 }
@@ -4860,7 +4923,7 @@ impl DaemonRuntime {
                             &terminal_session_key_set,
                         );
                     write_persisted_state(&self.state_path, &state)?;
-                    self.update_restart_state_written = true;
+                    self.mark_update_restart_state_written();
                     let owner_endpoint = default_endpoint(self.store.home_dir());
                     let represented_preserved_owner_keys = runtime_status
                         .preserved_terminal_owner_keys
@@ -4935,7 +4998,7 @@ impl DaemonRuntime {
                         &terminal_session_key_set,
                     );
                 write_persisted_state(&self.state_path, &state)?;
-                self.update_restart_state_written = true;
+                self.mark_update_restart_state_written();
                 let represented_preserved_owner_keys = runtime_status
                     .preserved_terminal_owner_keys
                     .iter()
@@ -11757,6 +11820,42 @@ struct DaemonRequestOutcome {
 /// handoff loses every row.
 ///
 /// [[incident-cli-forked-daemon-resurrected-sessions]]
+/// Grace window before an armed-but-unconverged update-restart stops muting
+/// routine persists. Far longer than any real GUI relaunch + successor bind, so
+/// a genuine update-restart is always still within grace (or already handed off
+/// to a newer daemon, at which point `superseded_routine_persist_muted` holds
+/// the hard mute). See [[finding-dead-sessions-revive-permanent-persist-mute]].
+const UPDATE_RESTART_PERSIST_MUTE_GRACE_MS: u64 = 120_000;
+
+/// Should routine persists be suppressed right now?
+///
+/// `superseded` (gate #8: a strictly newer daemon owns the file) is a HARD mute.
+/// The update-restart mute is SOFT: it expires after the grace window so a daemon
+/// that armed an update-restart snapshot but is still serving long afterwards —
+/// because the handoff never converged (e.g. a same-version successor died on a
+/// socket collision) — resumes persisting. Otherwise its in-memory session
+/// closes never reach disk and the next cold-restore resurrects them
+/// ([[finding-dead-sessions-revive-permanent-persist-mute]]). A missing arm
+/// timestamp fails OPEN (persist), never mute-forever.
+fn routine_persist_should_mute(
+    superseded_routine_persist_muted: bool,
+    update_restart_state_written: bool,
+    update_restart_state_written_at_ms: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    if superseded_routine_persist_muted {
+        return true;
+    }
+    if update_restart_state_written {
+        return update_restart_state_written_at_ms
+            .map(|armed_at| {
+                now_ms.saturating_sub(armed_at) < UPDATE_RESTART_PERSIST_MUTE_GRACE_MS
+            })
+            .unwrap_or(false);
+    }
+    false
+}
+
 fn may_cold_restore_live_sessions(
     handoff_target_version: Option<&str>,
     our_version: &str,
@@ -12215,6 +12314,43 @@ mod tests {
         assert!(may(Some("2.9.66"), "2.9.66", &[(4242, 17)]));
         // A registry naming some OTHER version is not our handoff.
         assert!(!may(Some("2.9.63"), "2.9.66", &[(4242, 17)]));
+    }
+
+    // The persist mute must self-heal, or a daemon that armed an update-restart
+    // whose handoff never converged serves forever without persisting, and the
+    // next cold-restore resurrects every session the user closed meanwhile
+    // (jojo 2026-07-18, [[finding-dead-sessions-revive-permanent-persist-mute]]).
+    #[test]
+    fn routine_persist_mute_self_heals_after_the_grace_window() {
+        use super::routine_persist_should_mute as mute;
+        use super::UPDATE_RESTART_PERSIST_MUTE_GRACE_MS as GRACE;
+
+        let now = 10_000_000u64;
+
+        // Nothing armed: persist freely.
+        assert!(!mute(false, false, None, now));
+
+        // Gate #8 (a strictly newer daemon owns the file) is a HARD mute that
+        // never expires, regardless of any update-restart timestamp.
+        assert!(mute(true, false, None, now));
+        assert!(mute(true, true, Some(now), now));
+
+        // Update-restart just armed: mute (protect the snapshot the successor
+        // is about to read).
+        assert!(mute(false, true, Some(now), now));
+        // Still within grace: mute holds.
+        assert!(mute(false, true, Some(now - (GRACE - 1)), now));
+        // Grace elapsed with the daemon still serving: the handoff never
+        // converged — un-mute so closes reach disk.
+        assert!(!mute(false, true, Some(now - GRACE), now));
+        assert!(!mute(false, true, Some(now - (GRACE + 60_000)), now));
+
+        // Flag set without a timestamp fails OPEN (persist), never mute-forever.
+        assert!(!mute(false, true, None, now));
+
+        // Clock skew (armed_at in the future) must not underflow into a false
+        // un-mute — saturating_sub keeps it muted within grace.
+        assert!(mute(false, true, Some(now + 5_000), now));
     }
 
     // Progressive migration is the mechanism that drains a handed-off daemon's

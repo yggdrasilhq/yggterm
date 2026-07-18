@@ -2,6 +2,27 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.5
+
+- **Sessions you close stay closed across a GUI/daemon restart.** Two compounding
+  defects let closed sessions resurrect and jam the Live pane after a restart:
+  1. *Permanent persist-mute.* A daemon that armed an update-restart snapshot but
+     whose handoff never converged (e.g. a same-version successor died on a socket
+     collision) kept serving the GUI while permanently muting its own
+     persistence — so every session you closed lived only in memory and the next
+     cold-restore resurrected it from the frozen snapshot. The persist mute is now
+     SOFT for the update-restart case: it self-heals after a 120s grace window
+     (far longer than any real relaunch, and a genuine newer successor still holds
+     the hard gate-#8 mute), so a stranded de-facto owner resumes writing its true
+     state to disk. Client-close session-preservation behavior is unchanged.
+  2. *Takeover re-merge.* When a new daemon took over a superseded one, it merged
+     the union of the old daemon's live sessions — including stale metadata for
+     sessions you had CLOSED on the authoritative daemon (a lingering old daemon
+     never saw the closes). Takeover now rescues from a superseded daemon ONLY the
+     sessions it still owns a live terminal runtime for (local PTYs, incl.
+     non-keep-alive shells that would otherwise be lost); it never revives
+     closed-and-forgotten metadata rows.
+
 ## 2.11.4
 
 - **Two machines that each build their own yggterm stop re-provisioning each
