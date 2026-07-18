@@ -208,6 +208,36 @@ the PTY.
   instant death). Automatic forward re-resolve on ping failure is DEFERRED
   until a remote document app exists.
 
+### The command envelope — app→GUI ingress (SPEC agreed 2026-07-18, NOT BUILT)
+
+The ping reply is the ONLY app→GUI data path (the app can never call the
+GUI; app-control never crosses hosts; the PTY OSC is identity-bound to its
+own session). So GUI ingress for a host daemon — "open a tab in session X",
+"raise session Y", "toast the user" — rides the ping reply as a generic,
+acked **command envelope**. First consumer: ychrome's routing verb
+(`ychrome [--profile P] <url>` routes into a running surface — design:
+ychrome `docs/host-daemon.md`); second consumer already visible: yedit
+focusing the session its daemon routed a file into.
+
+- Ping becomes `GET <control>/ping?session=<env_id>&ack=<batch_id>` — the
+  GUI stores the declare's `session` env id on the contribution and passes
+  it, which is also the capability marker an app checks before promising
+  routed delivery.
+- Reply MAY carry `commands: {batch_id, entries:[{id, kind, session,
+  ...args}]}`. v1 kinds: `open_tab {session, url, raise}`,
+  `toast {title, body, tone}`. Later: `focus_session`.
+- **At-least-once, idempotent**: the app retains a batch until acked; the
+  GUI dedups by entry id, executes only for sessions whose contribution it
+  holds (env id → session path via the stored declare id), drops + journals
+  unknown targets; the app expires undeliverable entries (~60s).
+- **Cadence**: active-visible contribution every poll tick (2.5s); every
+  OTHER live contribution every 4th tick (~10s) — background pings refresh
+  liveness and propagate stamps identically.
+- **A command is an explicit user-initiated act queued by a CLI verb —
+  NEVER synthesized by heartbeat/ping logic.** The "heartbeats must not
+  navigate" lesson is load-bearing here; a ping only ever refreshes.
+- No secret ever rides the envelope (standing schema/OSC rule).
+
 ### Trap: key contributed widgets by identity, never by index
 
 Keying rendered widgets on their position let Dioxus patch a `section` node into
