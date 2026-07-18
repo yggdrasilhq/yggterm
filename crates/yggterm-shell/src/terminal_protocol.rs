@@ -205,6 +205,13 @@ pub(crate) enum TerminalJsEvent {
         /// only when it moves, so a ~4s re-declare never drags a document over
         /// the wire. Absent ⇒ the app ships no viewport pane.
         document_version: Option<String>,
+        /// The app's own routing identity for this session (ychrome's `env_id`,
+        /// yedit's daemon session key). The GUI stores it on the contribution so
+        /// a host daemon can target commands at `env_id` and the GUI can reverse
+        /// it to the yggterm session path ([[campaign-libyggterm]] Phase 5, the
+        /// command envelope). Its presence on a ping is also the
+        /// routing-capability marker. Absent ⇒ the app is not routing-aware.
+        env_id: Option<String>,
     },
     /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
     /// user's presence. The app carries only the rpId and a display label — no
@@ -390,6 +397,8 @@ enum TerminalJsEventWire {
         appearance_version: Option<String>,
         #[serde(default)]
         document_version: Option<String>,
+        #[serde(default)]
+        env_id: Option<String>,
     },
     Fido2Request {
         action: String,
@@ -549,6 +558,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 zoom_version,
                 appearance_version,
                 document_version,
+                env_id,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
@@ -558,6 +568,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 zoom_version,
                 appearance_version,
                 document_version,
+                env_id,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
