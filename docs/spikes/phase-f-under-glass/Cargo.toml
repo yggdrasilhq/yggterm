@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "phasef-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = "0.18.2"
+gdk = "0.18"
+cairo-rs = "0.18"
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+glib = "0.18"
+
+[profile.dev]
+opt-level = 0
+debug = 0
