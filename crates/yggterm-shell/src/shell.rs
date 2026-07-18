@@ -68801,7 +68801,16 @@ fn TerminalCanvas(
                         // surface paints; no rect (session switched away, start
                         // page, other view mode) hides the surface.
                         div {
-                            style: "flex:1 1 auto; min-height:0; background:#ffffff;",
+                            // Inset + rounded to MATCH the terminal viewport frame
+                            // (`.yggterm-term-focused`: margin 4px, radius 10px),
+                            // which sits inside the same container this page area
+                            // fills. Without the 4px margin the native child webview
+                            // placed on this rect paints the full container box, so
+                            // its square corners overflow the rounded frame by 4px
+                            // at all four corners (a native widget cannot be clipped
+                            // by CSS border-radius, so the margin is what tucks it
+                            // inside the frame). [[campaign-libyggterm]] #10.
+                            style: "flex:1 1 auto; min-height:0; margin:4px; border-radius:10px; background:#ffffff;",
                             "data-ws-page": "{web_surface_session_path}",
                         }
                     }
