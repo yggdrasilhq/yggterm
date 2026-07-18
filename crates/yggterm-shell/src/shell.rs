@@ -57009,27 +57009,37 @@ fn MainSurface(
                             session_path: session.session_path.clone(),
                         }
                     } else if snapshot.document_surfaces.contains_key(&session.session_path) {
-                        // Hidden by the user's toggle: a floating chip is the
-                        // way back (the app cannot draw one — its surface is
-                        // exactly what is hidden).
-                        button {
+                        // Hidden by the user's toggle. Mirror the document
+                        // surface's OWN segmented control (Terminal active,
+                        // Document the clickable way back) so the switch is the
+                        // SAME control in both states — never degrading to a lone
+                        // button. The app cannot draw this: its surface is
+                        // exactly what is hidden.
+                        div {
                             style: format!(
-                                "position:absolute; top:10px; right:14px; z-index:30; padding:5px 12px; \
-                                 border:1px solid rgba(127,127,127,0.4); border-radius:8px; cursor:pointer; \
-                                 background:{}; color:{}; font-size:11px; font-weight:600;",
-                                snapshot.palette.panel, snapshot.palette.text
+                                "position:absolute; top:10px; right:16px; z-index:30; opacity:0.9; {}",
+                                segmented_control_track_style(snapshot.palette)
                             ),
-                            title: "Show the app's document view",
-                            onclick: {
-                                let mut state = state;
-                                let session_path = session.session_path.clone();
-                                move |_| {
-                                    state.with_mut(|shell| {
-                                        shell.document_surface_hidden.remove(&session_path);
-                                    });
-                                }
-                            },
-                            "📄\u{fe0e} Document"
+                            button {
+                                "data-document-show-toggle": "1",
+                                style: segmented_control_segment_style(snapshot.palette, false, false, false),
+                                title: "Show the app's document view",
+                                onclick: {
+                                    let mut state = state;
+                                    let session_path = session.session_path.clone();
+                                    move |_| {
+                                        state.with_mut(|shell| {
+                                            shell.document_surface_hidden.remove(&session_path);
+                                        });
+                                    }
+                                },
+                                "📄\u{fe0e} Document"
+                            }
+                            button {
+                                style: segmented_control_segment_style(snapshot.palette, true, false, false),
+                                title: "Showing the terminal (the app keeps running)",
+                                "⌨\u{fe0e} Terminal"
+                            }
                         }
                     }
                 }
@@ -59507,6 +59517,16 @@ fn TerminalCanvas(
     let terminal_resume_prefill = terminal_placeholder.clone();
     let host_is_active_session = snapshot.active_view_mode == WorkspaceViewMode::Terminal
         && snapshot.active_session_path.as_deref() == Some(host_session_path.as_str());
+    // A visible document surface (shell-DOM viewport pane) covers this host's
+    // terminal. While it does, the terminal must NOT reclaim input focus or
+    // accept pointer events — otherwise its focus-reclaim cascade yanks focus
+    // out of the document editor (the yedit focus-steal bug). Mirrors
+    // `web_surface_owns_viewport`; `document_surface_visible_for` is the same
+    // source of truth the full-bleed DocumentSurfaceBody render keys off.
+    let document_surface_owns_viewport = {
+        let shell = state.read();
+        shell.document_surface_visible_for(&host_session_path)
+    };
     let session_launch_phase_running = matches!(
         session.launch_phase,
         yggterm_server::TerminalLaunchPhase::Running
@@ -68006,6 +68026,11 @@ fn TerminalCanvas(
                     } else {
                         "false"
                     },
+                    "data-document-surface-owns-viewport": if document_surface_owns_viewport {
+                        "true"
+                    } else {
+                        "false"
+                    },
                     "data-terminal-mount-epoch": "{mount_epoch}",
                     "data-terminal-resume-overlay-visible": "false",
                     "data-terminal-resume-overlay-text": "",
@@ -71988,6 +72013,19 @@ fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellStat
     if web_surface_owns_viewport {
         return;
     }
+    // A visible document surface likewise owns the viewport: the click landed on
+    // the shell-DOM editor, not the terminal underneath. Reclaiming here steals
+    // focus from the editor (the yedit focus-steal bug).
+    let document_surface_owns_viewport = {
+        let shell = state.read();
+        shell
+            .server
+            .active_session_path()
+            .is_some_and(|path| shell.document_surface_visible_for(path))
+    };
+    if document_surface_owns_viewport {
+        return;
+    }
     state.with_mut(|shell| {
         shell.dismiss_titlebar_transients();
         shell.terminal_input_override_active = true;
@@ -74456,7 +74494,21 @@ fn terminal_eval_script_with_canvas_renderer(
                 return '';
             }}
         }};
+        const documentSurfaceOwnsViewport = () => {{
+            try {{
+                return String(host.getAttribute('data-document-surface-owns-viewport') || '')
+                    .trim() === 'true';
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         const hostOwnsActiveTerminalInput = () => {{
+            // A shell-DOM document surface covering this host owns input; the
+            // terminal must stand down so its focus-reclaim cascade cannot steal
+            // focus from the document editor.
+            if (documentSurfaceOwnsViewport()) {{
+                return false;
+            }}
             const sessionPath = currentHostSessionPath();
             const activeSessionPath = activeTerminalSessionPath();
             return Boolean(sessionPath && activeSessionPath && sessionPath === activeSessionPath);
@@ -95963,6 +96015,16 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("const hostOwnsActiveTerminalInput = () => {"));
+        // A visible document surface must stand the terminal down so its
+        // focus-reclaim cascade cannot steal focus from the shell-DOM editor.
+        assert!(script.contains("const documentSurfaceOwnsViewport = () => {"));
+        assert!(script.contains(
+            "String(host.getAttribute('data-document-surface-owns-viewport') || '')"
+        ));
+        assert!(
+            script.contains("if (documentSurfaceOwnsViewport()) {"),
+            "hostOwnsActiveTerminalInput must yield to a covering document surface"
+        );
         assert!(script.contains("setInputEnabled(false, false);"));
         assert!(script.contains("const requestedEnabled = Boolean(enabled);"));
         assert!(script.contains(
