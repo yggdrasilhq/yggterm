@@ -1327,6 +1327,18 @@ struct SidebarContributionState {
     document_loaded: bool,
     /// Failed document-schema fetches for the current stamp, capped.
     document_attempts: u32,
+    /// The app's routing identity for this session (ychrome `env_id`, yedit
+    /// daemon key), from the declare. A host daemon targets commands at this id;
+    /// the GUI reverses it to `session_path` to place a routed `open_tab`
+    /// ([[campaign-libyggterm]] Phase 5, the command envelope). `None` ⇒ the app
+    /// is not routing-aware, so its ping omits `?session=` and it can receive no
+    /// commands.
+    env_id: Option<String>,
+    /// The last command batch this contribution's ping DRAINED. Sent as
+    /// `?ack=<batch_id>` on the next ping so the daemon can retire it
+    /// (at-least-once delivery; the GUI dedups entries by id globally). `None`
+    /// until the first batch is drained.
+    acked_command_batch: Option<String>,
     last_seen_ms: u64,
 }
 
@@ -1339,6 +1351,52 @@ struct SidebarRefetch {
     zoom: bool,
     appearance: bool,
     document: bool,
+}
+
+/// The command envelope ([[campaign-libyggterm]] Phase 5, §5): the platform
+/// primitive by which a host daemon asks the GUI to perform an explicit,
+/// user-initiated operation for a session it holds. Delivered on a `<control>
+/// /ping` reply, drained EXACTLY once (dedup by entry id), acked so the daemon
+/// can retire the batch. Commands are NEVER synthesized by heartbeat logic —
+/// a ping only ever REFRESHES; a command enters the queue solely from an
+/// explicit CLI verb (`ychrome <url>`, `yedit --focus`, ...).
+const MAX_DRAINED_COMMAND_IDS: usize = 256;
+
+/// One navigation the drain deferred to the async caller: a command `open_tab`
+/// created the blank tab in-place (so the id is stable), but the actual
+/// navigation + the `raise`-driven session activation need the `Signal` and a
+/// spawned egress resolve, which a `&mut ShellState` method cannot do.
+struct CommandOpenTab {
+    session_path: String,
+    tab_id: u64,
+    url: String,
+    ssh_target: Option<String>,
+    raise: bool,
+}
+
+/// The result of draining one ping reply's command batch. `should_ack` is true
+/// only when every entry reached a terminal state (executed, or a permanent
+/// drop that a retry could never fix); a TRANSIENT drop (an `open_tab` whose
+/// target surface is not up yet) leaves the batch un-acked so the daemon
+/// re-sends until its own 60s expiry — the dedup set keeps already-run entries
+/// from re-firing in the meantime.
+#[derive(Default)]
+struct CommandDrainOutcome {
+    batch_id: String,
+    should_ack: bool,
+    open_tabs: Vec<CommandOpenTab>,
+    delivered: usize,
+    dropped: usize,
+}
+
+/// Map a command `tone` string to the toast tone. Unknown/absent ⇒ Info.
+fn command_toast_tone(tone: Option<&str>) -> NotificationTone {
+    match tone.unwrap_or("").to_ascii_lowercase().as_str() {
+        "success" => NotificationTone::Success,
+        "warning" | "warn" => NotificationTone::Warning,
+        "error" => NotificationTone::Error,
+        _ => NotificationTone::Info,
+    }
 }
 
 /// Attempts at a document-pane schema for one stamp before the reconciler
@@ -4122,6 +4180,13 @@ struct ShellState {
     /// terminal). The ~4s re-declare must never fight this — the same
     /// heartbeats-never-clobber-the-user rule the web surface learned.
     document_surface_hidden: HashSet<String>,
+    /// Command-envelope entry ids already executed ([[campaign-libyggterm]]
+    /// Phase 5, §5). At-least-once delivery re-sends a batch until its ping
+    /// acks it, so the same entry can arrive twice; this bounded FIFO dedups by
+    /// id so a command runs EXACTLY once. Global (not per-contribution) so a
+    /// session-less `toast` dedups too. Capped at
+    /// `MAX_DRAINED_COMMAND_IDS`, oldest evicted.
+    drained_command_ids: std::collections::VecDeque<String>,
     /// Sessions whose companion RAIL pane was already auto-opened once (a
     /// document app's sidebar opens WITH its document — the ychrome tab-rail
     /// shape). Once only: a user who closes the rail must not have the next
@@ -5918,6 +5983,7 @@ impl ShellState {
             document_panes: HashMap::new(),
             document_draft_sync: HashMap::new(),
             document_surface_hidden: HashSet::new(),
+            drained_command_ids: std::collections::VecDeque::new(),
             document_rail_auto_opened: HashSet::new(),
             document_surface_stale: None,
             sidebar_reads_live_since: None,
@@ -7258,6 +7324,7 @@ impl ShellState {
     /// app declared a `policy_version` this session has not fetched, and
     /// `<control>/zoom` likewise for `zoom_version`. Two stamps, so a zoom edit
     /// never drags the ruleset over the wire.
+    #[allow(clippy::too_many_arguments)]
     fn upsert_sidebar_contribution(
         &mut self,
         session_path: &str,
@@ -7267,6 +7334,7 @@ impl ShellState {
         zoom_version: Option<String>,
         appearance_version: Option<String>,
         document_version: Option<String>,
+        env_id: Option<String>,
         now_ms: u64,
         resolved: Option<(
             String,
@@ -7293,6 +7361,12 @@ impl ShellState {
             // The app's display name is cheap and can change (unlikely, but the
             // declaration owns it).
             existing.app_name = app_name;
+            // Routing identity: set-if-present so a partial re-declare or a ping
+            // (which passes None) never clears a known env_id. Once a routing-
+            // aware app names itself, it stays named for the contribution's life.
+            if env_id.is_some() {
+                existing.env_id = env_id;
+            }
             // A changed stamp means the app's rules or userscripts changed on
             // its own host: drop what we hold and refetch. An unchanged stamp
             // is the common case and costs nothing.
@@ -7367,6 +7441,8 @@ impl ShellState {
                 document_version: document_version.clone(),
                 document_loaded: false,
                 document_attempts: 0,
+                env_id,
+                acked_command_batch: None,
                 last_seen_ms: now_ms,
             },
         );
@@ -7376,6 +7452,163 @@ impl ShellState {
             appearance: !appearance_version.is_empty(),
             document: !document_version.is_empty(),
         }
+    }
+    /// The yggterm session path a routing `env_id` maps to, if a contribution
+    /// currently holds it. This is the reverse of the declare's `env_id` stamp:
+    /// a daemon targets a command at `env_id`; the GUI resolves it here to the
+    /// session whose surface the command acts on. `None` ⇒ no held session owns
+    /// that id (the surface may be gone, or never existed).
+    fn session_path_for_env_id(&self, env_id: &str) -> Option<String> {
+        self.sidebar_contributions
+            .iter()
+            .find(|(_, contribution)| contribution.env_id.as_deref() == Some(env_id))
+            .map(|(session_path, _)| session_path.clone())
+    }
+    /// Whether a command entry id was already executed. Dedup for at-least-once
+    /// delivery: a re-sent batch must not re-run its entries.
+    fn command_id_already_drained(&self, id: &str) -> bool {
+        self.drained_command_ids.iter().any(|seen| seen == id)
+    }
+    /// Record a command entry id as executed, evicting the oldest past the cap.
+    fn remember_drained_command_id(&mut self, id: &str) {
+        if self.command_id_already_drained(id) {
+            return;
+        }
+        self.drained_command_ids.push_back(id.to_string());
+        while self.drained_command_ids.len() > MAX_DRAINED_COMMAND_IDS {
+            self.drained_command_ids.pop_front();
+        }
+    }
+    /// Create the tab an `open_tab` command wants, into a LIVE web surface only
+    /// (no surface ⇒ `None`, a transient drop the caller leaves un-acked). Under
+    /// `raise` the tab is foregrounded within the surface; otherwise focus stays
+    /// on the previously active tab (a background open). Returns the new tab id
+    /// and the session's egress target so the caller can navigate it.
+    fn open_command_tab(&mut self, session_path: &str, raise: bool) -> Option<(u64, Option<String>)> {
+        if !self.web_surfaces.contains_key(session_path) {
+            return None;
+        }
+        let ssh_target = self.web_surface_session_ssh_target(session_path);
+        let previous_active = self
+            .web_surfaces
+            .get(session_path)
+            .map(|surface| surface.active_tab);
+        self.web_surface_new_tab(session_path);
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        let tab_id = surface.active_tab;
+        if !raise && let Some(previous) = previous_active {
+            // web_surface_new_tab foregrounded the tab; put focus back for a
+            // background open so the user's current tab is not yanked away.
+            surface.active_tab = previous;
+            surface.address_draft = None;
+        }
+        Some((tab_id, ssh_target))
+    }
+    /// Drain one ping reply's command batch ([[campaign-libyggterm]] Phase 5,
+    /// §5). Executes each not-yet-seen entry EXACTLY once: `toast` in place,
+    /// `open_tab` by minting the tab here and returning the navigation for the
+    /// async caller. Unknown kinds and malformed entries are permanent drops
+    /// (deduped so a re-send does not re-journal); an `open_tab` whose target
+    /// surface is not up is a TRANSIENT drop that leaves the batch un-acked so
+    /// the daemon re-sends until its own expiry. Returns `None` when the reply
+    /// carries no well-formed batch.
+    fn drain_ping_commands(&mut self, reply: &serde_json::Value) -> Option<CommandDrainOutcome> {
+        let commands = reply.get("commands")?;
+        let batch_id = commands
+            .get("batch_id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())?
+            .to_string();
+        let entries = commands.get("entries").and_then(|value| value.as_array())?;
+        let mut outcome = CommandDrainOutcome {
+            batch_id,
+            should_ack: true,
+            ..Default::default()
+        };
+        for entry in entries {
+            let id = entry.get("id").and_then(|value| value.as_str()).unwrap_or("");
+            if id.is_empty() {
+                // Malformed: nothing to dedup on, permanent drop, still ack-able.
+                outcome.dropped += 1;
+                continue;
+            }
+            if self.command_id_already_drained(id) {
+                continue;
+            }
+            let kind = entry.get("kind").and_then(|value| value.as_str()).unwrap_or("");
+            let target_path = entry
+                .get("session")
+                .and_then(|value| value.as_str())
+                .and_then(|env| self.session_path_for_env_id(env));
+            match kind {
+                "toast" => {
+                    let title = entry
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = entry
+                        .get("body")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tone = command_toast_tone(entry.get("tone").and_then(|value| value.as_str()));
+                    self.push_notification(tone, title, body);
+                    self.remember_drained_command_id(id);
+                    outcome.delivered += 1;
+                }
+                "open_tab" => {
+                    let url = entry
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let raise = entry
+                        .get("raise")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true);
+                    match target_path {
+                        _ if url.is_empty() => {
+                            // No url: malformed, permanent drop.
+                            self.remember_drained_command_id(id);
+                            outcome.dropped += 1;
+                        }
+                        Some(session_path) => match self.open_command_tab(&session_path, raise) {
+                            Some((tab_id, ssh_target)) => {
+                                self.remember_drained_command_id(id);
+                                outcome.open_tabs.push(CommandOpenTab {
+                                    session_path,
+                                    tab_id,
+                                    url,
+                                    ssh_target,
+                                    raise,
+                                });
+                                outcome.delivered += 1;
+                            }
+                            None => {
+                                // Target session held but no live web surface:
+                                // transient, retry until the daemon expires it.
+                                outcome.dropped += 1;
+                                outcome.should_ack = false;
+                            }
+                        },
+                        None => {
+                            // env_id maps to no held session: transient (the
+                            // surface may still appear), leave un-acked.
+                            outcome.dropped += 1;
+                            outcome.should_ack = false;
+                        }
+                    }
+                }
+                _ => {
+                    // A command kind this GUI does not know (a newer daemon):
+                    // permanent drop, deduped so a re-send stops re-journaling.
+                    self.remember_drained_command_id(id);
+                    outcome.dropped += 1;
+                }
+            }
+        }
+        Some(outcome)
     }
     /// Apply a successful `<control>/ping` reply ([[campaign-libyggterm]]
     /// Phase 2). A ping is the PTY declare's EQUAL as proof of life: it bumps
@@ -7413,6 +7646,9 @@ impl ShellState {
             zoom_version,
             appearance_version,
             document_version,
+            // A ping never changes the routing identity — it is declare-owned;
+            // set-if-present in the upsert keeps the stored env_id intact.
+            None,
             now_ms,
             None,
         ))
@@ -17540,22 +17776,109 @@ const WORKING_FLAGS_POLL_ERROR_BACKOFF_MS: u64 = 30_000;
 /// keeps aging into the overlay and then expiry. (A dropped remote `ssh -L`
 /// forward reads the same way; automatic forward re-resolve is deferred until
 /// a remote document app exists.)
+/// Percent-encode a routing id for a `/ping` query value. env_ids and batch
+/// ids are app-generated (ULID/UUID today), but a defensive encode keeps a
+/// stray `&`/`?`/`#`/space from corrupting the query.
+fn ping_query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Build the `<control>/ping` URL. Phase 5 widens it: `?session=<env_id>` is
+/// both the command-target hint AND the routing-capability marker (a daemon
+/// enables `/route` only once it has seen a `?session=` ping); `?ack=<batch>`
+/// retires the last drained command batch. Both are omitted when absent, so a
+/// pre-Phase-5 app sees exactly the old bare `/ping`.
+fn build_control_ping_url(control_url: &str, env_id: Option<&str>, ack_batch: Option<&str>) -> String {
+    let base = format!("{}/ping", control_url.trim_end_matches('/'));
+    let mut query: Vec<String> = Vec::new();
+    if let Some(env_id) = env_id.filter(|id| !id.is_empty()) {
+        query.push(format!("session={}", ping_query_encode(env_id)));
+    }
+    if let Some(ack) = ack_batch.filter(|id| !id.is_empty()) {
+        query.push(format!("ack={}", ping_query_encode(ack)));
+    }
+    if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", query.join("&"))
+    }
+}
+
+/// Endpoint-ping liveness ([[campaign-libyggterm]] Phase 2) + command drain
+/// (Phase 5). Cadence (§5): the active-visible contribution is pinged EVERY
+/// tick (2.5s); every OTHER live contribution every 4th tick (~10s), which
+/// refreshes background stamps and drains commands for backgrounded sessions.
+/// Each target is pinged in its own spawned task so a slow endpoint never
+/// blocks the others.
 async fn sidebar_endpoint_ping_tick(
+    state: Signal<ShellState>,
+    trace_home: std::path::PathBuf,
+    tick: u64,
+) {
+    let targets: Vec<(String, String, Option<String>, Option<String>)> = state.with(|shell| {
+        let active = shell.sidebar_reads_live_path();
+        let mut targets = Vec::new();
+        if let Some(active) = active.as_ref()
+            && let Some(contribution) = shell.sidebar_contributions.get(active)
+        {
+            targets.push((
+                active.clone(),
+                contribution.control_url.clone(),
+                contribution.env_id.clone(),
+                contribution.acked_command_batch.clone(),
+            ));
+        }
+        // The background sweep: every 4th tick, ping the other live
+        // contributions too. Off the active path this is the ONLY carrier of a
+        // background app's stamp moves and queued commands.
+        if tick.is_multiple_of(4) {
+            for (session_path, contribution) in shell.sidebar_contributions.iter() {
+                if Some(session_path) == active.as_ref() {
+                    continue;
+                }
+                targets.push((
+                    session_path.clone(),
+                    contribution.control_url.clone(),
+                    contribution.env_id.clone(),
+                    contribution.acked_command_batch.clone(),
+                ));
+            }
+        }
+        targets
+    });
+    for (session_path, control_url, env_id, ack_batch) in targets {
+        spawn(ping_and_apply_contribution(
+            state,
+            session_path,
+            control_url,
+            env_id,
+            ack_batch,
+            trace_home.clone(),
+        ));
+    }
+}
+
+/// Ping one contribution's control endpoint, apply the stamps it carries
+/// (Phase 2), and drain any command batch (Phase 5). Fire-and-forget: it owns
+/// its own short ping timeout and never blocks the caller.
+async fn ping_and_apply_contribution(
     mut state: Signal<ShellState>,
+    session_path: String,
+    control_url: String,
+    env_id: Option<String>,
+    ack_batch: Option<String>,
     trace_home: std::path::PathBuf,
 ) {
-    let target = state.with(|shell| {
-        shell.sidebar_reads_live_path().and_then(|path| {
-            shell
-                .sidebar_contributions
-                .get(&path)
-                .map(|contribution| (path.clone(), contribution.control_url.clone()))
-        })
-    });
-    let Some((session_path, control_url)) = target else {
-        return;
-    };
-    let ping_url = format!("{}/ping", control_url.trim_end_matches('/'));
+    let ping_url = build_control_ping_url(&control_url, env_id.as_deref(), ack_batch.as_deref());
     let Ok(Ok(reply)) = task::spawn_blocking(move || control_ping_request(&ping_url)).await
     else {
         return;
@@ -17574,8 +17897,10 @@ async fn sidebar_endpoint_ping_tick(
         field("document_version"),
     );
     let now_ms = current_millis();
-    let Some(refetch) = state.with_mut(|shell| {
-        shell.apply_sidebar_ping(
+    // Apply stamps and drain commands atomically, and persist the ack so the
+    // NEXT ping to this endpoint retires the batch we just drained.
+    let applied = state.with_mut(|shell| {
+        let refetch = shell.apply_sidebar_ping(
             &session_path,
             app_name,
             policy_version.clone(),
@@ -17583,8 +17908,17 @@ async fn sidebar_endpoint_ping_tick(
             appearance_version.clone(),
             document_version.clone(),
             now_ms,
-        )
-    }) else {
+        )?;
+        let drain = shell.drain_ping_commands(&reply);
+        if let Some(outcome) = &drain
+            && outcome.should_ack
+            && let Some(contribution) = shell.sidebar_contributions.get_mut(&session_path)
+        {
+            contribution.acked_command_batch = Some(outcome.batch_id.clone());
+        }
+        Some((refetch, drain))
+    });
+    let Some((refetch, drain)) = applied else {
         return;
     };
     // Same dispatch as the declare arm: a stamp that moved refetches what it
@@ -17606,7 +17940,42 @@ async fn sidebar_endpoint_ping_tick(
     }
     if refetch.document {
         let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
-        spawn(document_pane_fetch_schema(state, session_path, seq));
+        spawn(document_pane_fetch_schema(state, session_path.clone(), seq));
+    }
+    // Command envelope (Phase 5): navigate the tabs the drain minted, activating
+    // the session when the command asked to raise, then journal the batch.
+    if let Some(drain) = drain {
+        for tab in drain.open_tabs {
+            navigate_web_surface_tab(
+                state,
+                tab.session_path.clone(),
+                tab.tab_id,
+                tab.url,
+                tab.ssh_target,
+                None,
+            );
+            if tab.raise
+                && let Some(row) = state.with(|shell| resolve_app_control_row(shell, &tab.session_path))
+            {
+                state.with_mut(|shell| shell.prepare_app_control_foreground_open());
+                spawn_open_session_row(state, row);
+            }
+        }
+        if drain.delivered > 0 || drain.dropped > 0 {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "command_envelope",
+                "drain",
+                json!({
+                    "session_path": session_path,
+                    "batch_id": drain.batch_id,
+                    "delivered": drain.delivered,
+                    "dropped": drain.dropped,
+                    "acked": drain.should_ack,
+                }),
+            );
+        }
     }
 }
 
@@ -17614,8 +17983,12 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let trace_home = resolve_yggterm_home().unwrap_or_default();
     spawn(async move {
+        // Cadence counter for the Phase 5 background ping sweep: the
+        // active-visible contribution pings every tick, others every 4th.
+        let mut ping_tick: u64 = 0;
         loop {
             sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
+            ping_tick = ping_tick.wrapping_add(1);
             let (closing, has_flagged_sessions) = state.with(|shell| {
                 (
                     shell.closing_app,
@@ -17646,8 +18019,9 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                 });
             }
             // Endpoint-ping liveness rides the same tick (Phase 2): fire and
-            // forget — the ping task owns its own short timeout.
-            spawn(sidebar_endpoint_ping_tick(state, trace_home.clone()));
+            // forget — the ping task owns its own short timeout. Phase 5 folds
+            // the command drain + background stamp sweep into the same tick.
+            spawn(sidebar_endpoint_ping_tick(state, trace_home.clone(), ping_tick));
             // Debounced GUI→app draft sync (Phase 4): a settled dirty draft
             // POSTs `draft` to its app, so the buffer reaches the daemon's
             // sqlite row — the crash story — without waiting for a Save.
@@ -62594,6 +62968,7 @@ fn TerminalCanvas(
                                 zoom_version,
                                 appearance_version,
                                 document_version,
+                                env_id,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -62618,6 +62993,7 @@ fn TerminalCanvas(
                                                     zoom_version.clone(),
                                                     appearance_version.clone(),
                                                     document_version.clone(),
+                                                    env_id.clone(),
                                                     now_ms,
                                                     None,
                                                 )
@@ -62656,6 +63032,7 @@ fn TerminalCanvas(
                                                     zoom_version.clone(),
                                                     appearance_version.clone(),
                                                     document_version.clone(),
+                                                    env_id.clone(),
                                                     now_ms,
                                                     Some((effective_control.clone(), forward_child)),
                                                 )
@@ -73371,6 +73748,9 @@ fn terminal_eval_script_with_canvas_renderer(
                                     : null,
                                 document_version: typeof payload.document_version === 'string'
                                     ? payload.document_version
+                                    : null,
+                                env_id: typeof payload.env_id === 'string'
+                                    ? payload.env_id
                                     : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
@@ -92988,10 +93368,224 @@ mod tests {
             None,
             None,
             None,
+            None,
             declared_ms,
             Some(("http://127.0.0.1:1/".to_string(), None)),
         );
         shell
+    }
+
+    // A contribution that carries a routing identity (env_id), the Phase 5
+    // command-envelope target. Built on shell_with_contribution + a re-declare
+    // that stamps the env_id (set-if-present).
+    fn routing_shell(session_path: &str, env_id: &str) -> ShellState {
+        let mut shell = shell_with_contribution(session_path, 1_000);
+        shell.upsert_sidebar_contribution(
+            session_path,
+            Vec::new(),
+            None,
+            Some("ychrome".to_string()),
+            None,
+            None,
+            None,
+            Some(env_id.to_string()),
+            1_100,
+            None,
+        );
+        shell.settings.in_app_notifications = true;
+        shell
+    }
+
+    fn seed_web_surface(shell: &mut ShellState, session_path: &str) {
+        shell.web_surfaces.insert(
+            session_path.to_string(),
+            WebSurfaceUiState {
+                tabs: vec![WebSurfaceTab {
+                    id: 0,
+                    url: "https://app".to_string(),
+                    effective_url: "https://app".to_string(),
+                    socks_port: None,
+                    title: None,
+                    forward_child: None,
+                    history: Vec::new(),
+                    history_index: 0,
+                    reload_nonce: 0,
+                    profile: "default".to_string(),
+                    folder: None,
+                    loading: false,
+                    script_opened: false,
+                }],
+                folders: Vec::new(),
+                active_tab: 0,
+                next_tab_id: 1,
+                opened_at_ms: 1_000,
+                last_seen_ms: 1_000,
+                address_draft: None,
+                address_typed_len: None,
+                address_suggestion_index: None,
+                osc_url: "https://app".to_string(),
+                picker: None,
+            },
+        );
+    }
+
+    // Phase 5 §5: the ping URL widens with the routing session + the batch ack,
+    // both omitted (bare /ping) for a pre-Phase-5 app, and query-encoded.
+    #[test]
+    fn build_control_ping_url_widens_with_session_and_ack() {
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9/", None, None),
+            "http://127.0.0.1:9/ping"
+        );
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9", Some("env-1"), None),
+            "http://127.0.0.1:9/ping?session=env-1"
+        );
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9", Some("env 1"), Some("b#2")),
+            "http://127.0.0.1:9/ping?session=env%201&ack=b%232"
+        );
+        // Empty ids read as absent, so a bare /ping still goes out.
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9", Some(""), Some("")),
+            "http://127.0.0.1:9/ping"
+        );
+    }
+
+    #[test]
+    fn a_toast_command_drains_once_and_shows_a_notification() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        let reply = json!({
+            "commands": {
+                "batch_id": "b1",
+                "entries": [
+                    { "id": "c1", "kind": "toast", "title": "Hi", "body": "there", "tone": "success" }
+                ]
+            }
+        });
+        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert_eq!(outcome.batch_id, "b1");
+        assert!(outcome.should_ack);
+        assert_eq!(outcome.delivered, 1);
+        assert_eq!(shell.notifications.len(), 1);
+        assert_eq!(shell.notifications[0].title, "Hi");
+        // At-least-once delivery re-sends: the same id must NOT re-fire.
+        let again = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert_eq!(again.delivered, 0);
+        assert_eq!(shell.notifications.len(), 1);
+    }
+
+    #[test]
+    fn an_open_tab_command_routes_by_env_id_and_mints_a_foreground_tab() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        seed_web_surface(&mut shell, "local://ws");
+        let reply = json!({
+            "commands": {
+                "batch_id": "b2",
+                "entries": [
+                    { "id": "c2", "kind": "open_tab", "session": "env-1", "url": "https://example.com", "raise": true }
+                ]
+            }
+        });
+        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert!(outcome.should_ack);
+        assert_eq!(outcome.open_tabs.len(), 1);
+        assert_eq!(outcome.open_tabs[0].session_path, "local://ws");
+        assert_eq!(outcome.open_tabs[0].url, "https://example.com");
+        assert!(outcome.open_tabs[0].raise);
+        let surface = shell.web_surfaces.get("local://ws").expect("surface");
+        assert_eq!(surface.tabs.len(), 2, "the app tab plus the routed tab");
+        assert_eq!(
+            surface.active_tab, outcome.open_tabs[0].tab_id,
+            "raise foregrounds the routed tab"
+        );
+    }
+
+    #[test]
+    fn a_background_open_tab_does_not_steal_the_active_tab() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        seed_web_surface(&mut shell, "local://ws");
+        let reply = json!({
+            "commands": {
+                "batch_id": "b2b",
+                "entries": [
+                    { "id": "c2b", "kind": "open_tab", "session": "env-1", "url": "https://bg", "raise": false }
+                ]
+            }
+        });
+        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert_eq!(outcome.open_tabs.len(), 1);
+        let surface = shell.web_surfaces.get("local://ws").expect("surface");
+        assert_eq!(surface.tabs.len(), 2);
+        assert_eq!(surface.active_tab, 0, "a background open leaves focus on the app tab");
+    }
+
+    #[test]
+    fn an_open_tab_for_an_unheld_session_is_a_transient_drop() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        let reply = json!({
+            "commands": {
+                "batch_id": "b3",
+                "entries": [
+                    { "id": "c3", "kind": "open_tab", "session": "env-nope", "url": "https://x", "raise": true }
+                ]
+            }
+        });
+        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert_eq!(outcome.dropped, 1);
+        assert!(
+            !outcome.should_ack,
+            "un-acked so the daemon re-sends until its own 60s expiry"
+        );
+        assert!(
+            !shell.command_id_already_drained("c3"),
+            "a transient drop is retryable, so it must NOT be deduped"
+        );
+    }
+
+    #[test]
+    fn an_unknown_command_kind_is_a_permanent_ackable_drop() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        let reply = json!({
+            "commands": {
+                "batch_id": "b4",
+                "entries": [
+                    { "id": "c4", "kind": "warp_drive", "session": "env-1" }
+                ]
+            }
+        });
+        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        assert_eq!(outcome.dropped, 1);
+        assert!(
+            outcome.should_ack,
+            "a kind this GUI cannot run is retired, not retried forever"
+        );
+        assert!(
+            shell.command_id_already_drained("c4"),
+            "a permanent drop is deduped so a re-send stops re-journaling"
+        );
+    }
+
+    #[test]
+    fn a_reply_without_commands_drains_to_none() {
+        let mut shell = routing_shell("local://ws", "env-1");
+        assert!(shell.drain_ping_commands(&json!({ "app_name": "ychrome" })).is_none());
+        assert!(
+            shell
+                .drain_ping_commands(&json!({ "commands": { "entries": [] } }))
+                .is_none(),
+            "a batch with no id is not well-formed"
+        );
+    }
+
+    #[test]
+    fn session_path_reverse_maps_the_routing_env_id() {
+        let shell = routing_shell("local://ws", "env-1");
+        assert_eq!(
+            shell.session_path_for_env_id("env-1").as_deref(),
+            Some("local://ws")
+        );
+        assert_eq!(shell.session_path_for_env_id("env-x"), None);
     }
 
     // The Ctrl+Z zombie surface (user-hit, live-caught): a suspended app stops
@@ -93055,6 +93649,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             stale_at + 100,
             None,
         );
@@ -93111,6 +93706,7 @@ mod tests {
             }],
             None,
             Some("yedit".to_string()),
+            None,
             None,
             None,
             None,
@@ -99432,6 +100028,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             now_ms,
             Some(("http://127.0.0.1:1".to_string(), None)),
         );
@@ -99453,6 +100050,7 @@ mod tests {
                     placement: PanePlacement::Rail,
                 }],
                 policy_version.map(str::to_string),
+                None,
                 None,
                 None,
                 None,
@@ -100567,6 +101165,7 @@ mod tests {
             "app_name:",
             "zoom_version:",
             "document_version:",
+            "env_id:",
             "placement:",
             "panes:",
         ] {
