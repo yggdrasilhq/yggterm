@@ -4,47 +4,7 @@ Open, user-confirmed bugs that are NOT yet fixed. An agent asked to "finish the
 pending bugs" should start here. Remove an entry (in the same commit as the
 fix) once the fix is verified live on jojo.
 
-## yedit document-surface bugs (user-reported 2026-07-18, REPRODUCED + root-caused; fix next session with the ychrome Phase 5 work)
-
-- **Focus-steal: cannot type in the yedit editor (any of the 3 modes).**
-  REPRODUCED live on jojo. A yedit document surface is a viewport-placement
-  pane rendered as shell DOM OVER a Terminal-view (shell) session. The
-  terminal underneath still believes it owns input, so its focus-reclaim
-  cascade (`focusTerminal` / `scheduleInputDriftRecovery`, the
-  0/32/96/220/420/760/1200ms `setTimeout` ladder in the terminal mount JS,
-  ~line 77970-78060) drives focus into the `.xterm-helper-textarea`. Probe:
-  focus the editor and it holds for ~300ms, then is yanked to the helper
-  textarea and STAYS (once in the helper, `elementBlocksTerminalAutofocus`
-  returns false, so it sticks). Any transient blur of the editor (a
-  re-render from draft-sync / heartbeat / schema refetch) opens the window
-  the cascade needs. Keystrokes then go to the shell PTY, not the editor.
-  **Root cause pinned**: the document surface does NOT signal that it owns
-  input. DECISIVE TEST: holding `window.__yggtermUiFocusClaimUntilMs` in the
-  future makes editor focus survive indefinitely (the cascade stands down
-  via the `Date.now() < globalClaimUntilMs` branch of
-  `activeElementBlocksTerminalAutofocus`). **Fix path** (prefer the
-  structural gate, matching the existing `web_surface_owns_viewport`
-  early-return in `reclaim_active_terminal_input_from_viewport_click`): when
-  a document surface is visible for the active session, the terminal mount
-  must treat itself as NOT owning input — a `document_surface_owns_viewport`
-  gate on `hostOwnsActiveTerminalInput()` plus a `data-*`/window flag the
-  reconciler sets so the JS cascade reads it. (A weaker fix — the surface
-  setting the focus claim — works but leaves the terminal machinery running
-  under an overlay.) Note: on a QUIESCENT surface (no recent re-activation)
-  programmatic focus can stick, which is why it looks intermittent; a real
-  click + any re-render loses it every time.
-
-- **Document↔Terminal slider degrades to a lone button on the shell side.**
-  On the document surface the control is a proper 2-segment slider
-  `[📄 Document | ⌨ Terminal]` (inline top-bar OR floating top-right, both in
-  `DocumentSurfaceBody`, ~line 85963-86002). When the surface is HIDDEN
-  (terminal shown), `DocumentSurfaceBody` is not rendered at all; MainSurface
-  instead draws a lone floating `button` "📄 Document" (~line 57012-57033).
-  User: "on shell mode, the slider should not change to a button." **Fix**:
-  render the SAME segmented control on the terminal side with the Terminal
-  segment active and Document the inactive clickable one, so the control is
-  consistent (and toggles both ways) in both states. Keep the stale-overlay
-  "Show terminal" as a plain button (single action, not a mode switch).
+## Standing traps / other open bugs
 
 - **THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
   A deploy that lands new binaries does NOT mean the new code is running. The
