@@ -2812,24 +2812,64 @@ fn web_surface_tab_place_rect(
 /// All keyed on the root `data-under-glass` stamp so a runtime probe demotion
 /// restores every background with NO re-render and NO DOM mutation (the
 /// 2026-07-19 incident was runtime inline mutation of shared ancestors — this
-/// replaces it with scoped, declarative CSS). The three transparent-ized
-/// backgrounds are all inline `web_frame_bg`/`#ffffff` on session-view-scoped
-/// elements, never shared app chrome:
+/// replaces it with scoped, declarative CSS). Session-view-scoped elements
+/// (inline `web_frame_bg`/`#ffffff` paints) go transparent outright:
 ///   - the terminal host (`data-web-surface-owns-viewport`, the web-overlay
 ///     host) loses its frame background AND hides its xterm canvas (opaque
 ///     pixels behind the overlay — `visibility:hidden`, not `display`, so the
 ///     xterm resize family never wakes);
+///   - the viewport frame wrapper (`data-ws-frame`, stamped only while a live
+///     web surface owns the viewport) loses its `web_frame_bg` fill — the tab
+///     strip self-paints its tint over that fill (render-time, both modes) so
+///     the chrome look survives the wrapper going clear;
 ///   - the web overlay panel (`data-ws-overlay`) loses its cover background so
 ///     the page area below it is see-through (its chrome children keep their
 ///     own backgrounds);
-///   - the page placeholder (`data-ws-page`) loses its white fill — it IS the
-///     hole.
+///   - the page placeholder (`data-ws-page`) and the split-tab pinned pane
+///     placeholder (`data-ws-pinned-session`) lose their white fill — they ARE
+///     the holes.
+///
+/// The SHARED containers (`#yggterm-shell-root`, the `data-yggterm-shell`
+/// material/gradient frame) cannot go blanket-transparent — that was the
+/// incident. Instead ONE dedicated background layer (`data-yggterm-app-bg`,
+/// z-index:-1 first child of the frame, no children) replicates the frame's
+/// paint and takes an evenodd `clip-path` hole per visible page rect via
+/// `--yggterm-under-glass-holes`, written change-gated by the reconcile loop
+/// from the SAME applied bounds that drive the input-region holes. Under
+/// glass the frame + root paints clear and the holed layer is the app
+/// background; legacy/demoted, the stamp is "0" and the layer sits invisibly
+/// beneath the frame's identical paint.
 const WEB_UNDER_GLASS_CSS: &str = r#"
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
+:root[data-under-glass="1"] [data-ws-frame="1"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-ws-overlay="1"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-ws-page] { background: transparent !important; }
+:root[data-under-glass="1"] [data-ws-pinned-session] { background: transparent !important; }
+:root[data-under-glass="1"] #yggterm-shell-root { background: transparent !important; }
+:root[data-under-glass="1"] [data-yggterm-shell="1"] { background-color: transparent !important; background-image: none !important; }
+:root[data-under-glass="1"] [data-yggterm-app-bg="1"] { clip-path: var(--yggterm-under-glass-holes, none); -webkit-clip-path: var(--yggterm-under-glass-holes, none); }
 "#;
+
+/// The `--yggterm-under-glass-holes` value: an evenodd `path()` whose outer
+/// rect vastly overshoots the layer box (clip-path only ever RESTRICTS
+/// painting, so the overshoot is free and window size is not needed) with one
+/// closed subpath per visible page rect. Empty holes ⇒ `None` ⇒ the property
+/// is removed and the layer falls back to `none` (full paint) — the paint
+/// twin of the input-region safety invariant.
+fn under_glass_paint_holes_css(holes: &[(i32, i32, i32, i32)]) -> Option<String> {
+    let subpaths: String = holes
+        .iter()
+        .filter(|(_, _, w, h)| *w > 0 && *h > 0)
+        .map(|(x, y, w, h)| format!("M{x} {y}h{w}v{h}h-{w}Z"))
+        .collect();
+    if subpaths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "path(evenodd, \"M0 0H32767V32767H0Z{subpaths}\")"
+    ))
+}
 
 /// The reconciler's per-tick geometry + visibility oracle, as one script:
 /// page/pinned rects (placement AND under-glass input holes ride the same
@@ -2912,6 +2952,11 @@ async fn web_surface_native_reconcile_loop(
     // behind pages. Both follow a runtime probe demotion within one tick.
     let mut last_under_glass: Option<bool> = None;
     let mut last_backdrop: Option<(u8, u8, u8)> = None;
+    // The `--yggterm-under-glass-holes` value last written to the root
+    // (None = property absent). Lives on documentElement.style — outside
+    // Dioxus's render domain, like the `data-under-glass` stamp itself — so
+    // re-renders never fight it and this loop is its ONE writer.
+    let mut last_paint_holes: Option<String> = None;
     loop {
         let under_glass = desktop.web_surface_under_glass();
         if last_under_glass != Some(under_glass) {
@@ -2920,6 +2965,14 @@ async fn web_surface_native_reconcile_loop(
                 "document.documentElement.setAttribute('data-under-glass','{}');",
                 if under_glass { "1" } else { "0" }
             ));
+            if !under_glass && last_paint_holes.take().is_some() {
+                // Demotion restore: the stamp flip already deactivates every
+                // under-glass rule; dropping the stale holes var keeps the
+                // next arming from starting with yesterday's rects.
+                let _ = document::eval(
+                    "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');",
+                );
+            }
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -3199,6 +3252,15 @@ async fn web_surface_native_reconcile_loop(
             // (full region) — a stale hole over a closed page would be a dead
             // rectangle in the chrome. Change-gated, so this is one call.
             desktop.set_web_surface_input_holes(&[], &[]);
+            // Paint twin of the same invariant: zero pages ⇒ no paint holes
+            // (the app-background layer paints in full). This branch is the
+            // idle early-continue the incident's restore branch died in —
+            // clearing HERE is what makes the holes var restorable.
+            if last_paint_holes.take().is_some() {
+                let _ = document::eval(
+                    "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');",
+                );
+            }
             publish_web_surface_native_ids(&applied);
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
@@ -3759,6 +3821,23 @@ async fn web_surface_native_reconcile_loop(
                 .map(|entry| entry.bounds)
                 .collect();
             desktop.set_web_surface_input_holes(&holes, &cover_rects);
+            // The PAINT holes ride the same applied bounds (SSOT with the
+            // input region — placement, input and paint can never diverge).
+            // Written to documentElement.style, change-gated; consumed only
+            // by the under-glass CSS on the app-background layer, so in
+            // legacy stacking the value is inert.
+            if under_glass {
+                let paint_holes = under_glass_paint_holes_css(&holes);
+                if last_paint_holes != paint_holes {
+                    last_paint_holes = paint_holes.clone();
+                    let _ = document::eval(&match paint_holes {
+                        Some(value) => format!(
+                            "document.documentElement.style.setProperty('--yggterm-under-glass-holes', '{value}');"
+                        ),
+                        None => "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');".to_string(),
+                    });
+                }
+            }
         }
         publish_web_surface_native_ids(&applied);
         sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
@@ -49551,22 +49630,16 @@ pub fn launch_shell(mut bootstrap: ShellBootstrap) -> Result<()> {
         .with_maximized(initial_window_maximized)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(480.0, 360.0));
-    // Phase F under-glass needs an RGBA window visual: the shell ("glass")
-    // webview alpha-composites its transparent page-hole regions onto the
-    // page webview sibling BELOW it, and GTK only gives the webview an alpha
-    // channel when the top-level window is transparent. Without this the hole
-    // shows the webview's opaque GTK backing, never the page (proven on the
-    // dev sandbox: legacy stacking painted the page, under-glass showed a
-    // flat #f4f4f2). The env opt-in that arms under-glass (read again in
-    // vendored dioxus-desktop for the stacking) therefore also forces window
-    // transparency here, at build time — the window visual cannot change
-    // after creation.
+    // Phase F under-glass needs NO window-visual change (F.0.1 finding): the
+    // glass webview's transparent page holes composite onto the page webview
+    // below through WebKit's DMABUF renderer path, on an ordinary opaque
+    // window (sandbox-verified both ways). The earlier "under-glass forces an
+    // RGBA window" belief was an artifact of the SHM presentation path, which
+    // cannot alpha-composite a webview over sibling widgets at all — that
+    // path now demotes under-glass to legacy instead (see
+    // configure_linux_webkit_compositing + the vendored arming gate).
     #[cfg(not(target_os = "macos"))]
-    let under_glass_opt_in = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    #[cfg(not(target_os = "macos"))]
-    let linux_transparent_window = linux_window_transparent || under_glass_opt_in;
+    let linux_transparent_window = linux_window_transparent;
     #[cfg(not(target_os = "macos"))]
     let window = {
         let window = WindowBuilder::new()
@@ -52121,6 +52194,24 @@ fn app() -> Element {
                     maximized,
                     linux_transparent_window,
                 ),
+                // The ONE app-background owner for the under-glass hole
+                // treatment (see WEB_UNDER_GLASS_CSS): replicates the frame's
+                // paint beneath every sibling; only under glass does it become
+                // the visible background — with clip-path holes over pages.
+                div {
+                    "data-yggterm-app-bg": "1",
+                    style: shell_background_layer_style(
+                        snapshot.palette,
+                        effective_shell_radius,
+                        &snapshot.shell_tint,
+                        &snapshot.chrome_material_tint,
+                        &snapshot.shell_gradient,
+                        &snapshot.shell_gradient_background_size,
+                        &snapshot.shell_gradient_background_repeat,
+                        maximized,
+                        linux_transparent_window,
+                    ),
+                }
                 if !fullscreen {
                     WindowResizeHandles {}
                 }
@@ -68509,6 +68600,11 @@ fn TerminalCanvas(
             key: "{instance_key}",
             style: "display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0;",
             div {
+                // Under glass this wrapper's `web_frame_bg` fill is the last
+                // session-view paint over the page hole — the stamp (present
+                // only while a live web surface owns the viewport) lets
+                // WEB_UNDER_GLASS_CSS clear it without touching terminals.
+                "data-ws-frame": if web_surface_owns_viewport_host { "1" },
                 style: format!(
                     "display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; gap:0; border-radius:{}; \
                      background:{}; box-shadow:{}; overflow:hidden; position:relative;",
@@ -68644,10 +68740,15 @@ fn TerminalCanvas(
                             // away (max-height→0) — the tabs live in the rail.
                             style: format!(
                                 "display:flex; align-items:stretch; gap:2px; padding:{}; {} box-sizing:border-box; \
-                                 background:rgba(127,127,127,0.16); user-select:none; overflow:hidden; \
+                                 background:linear-gradient(rgba(127,127,127,0.16), rgba(127,127,127,0.16)), {}; user-select:none; overflow:hidden; \
                                  transition:max-height 0.18s ease, padding 0.18s ease;",
                                 if web_overlay.vertical_tabs { "0 8px" } else { "6px 8px 0" },
                                 if web_overlay.vertical_tabs { "max-height:0; min-height:0;" } else { "max-height:60px; min-height:35px;" },
+                                // The tint used to composite over the frame
+                                // wrapper's fill; baking the frame color in
+                                // keeps the strip identical when that wrapper
+                                // goes transparent under glass.
+                                web_frame_bg,
                             ),
                             // ROOT TABS ONLY. A strip has nowhere to draw a
                             // folder, so a filed tab is not here — it is in the
@@ -90912,6 +91013,79 @@ fn shell_transparent_material_fill(
         String::new()
     }
 }
+/// The app-background paint (fill + gradient) — computed ONCE, painted twice:
+/// by `shell_style` on the frame (the everyday pixels) and by
+/// `shell_background_layer_style` on the dedicated `data-yggterm-app-bg`
+/// layer that takes the under-glass clip-path hole treatment. Sharing the
+/// computation is what keeps the two paints from diverging.
+fn shell_background_paint(
+    palette: Palette,
+    shell_tint: &str,
+    chrome_material_tint: &str,
+    shell_gradient: &str,
+    maximized: bool,
+    transparent_window: bool,
+) -> (String, String) {
+    let opaque_linux_paint = shell_uses_opaque_linux_paint(transparent_window);
+    let transparent_material_fill = shell_transparent_material_fill(
+        shell_tint,
+        chrome_material_tint,
+        maximized,
+        transparent_window,
+        shell_live_blur_supported(),
+    );
+    let fill = if opaque_linux_paint {
+        shell_opaque_fill(palette).to_string()
+    } else if !transparent_material_fill.is_empty() {
+        transparent_material_fill
+    } else {
+        palette.shell.to_string()
+    };
+    let gradient = if opaque_linux_paint {
+        "none".to_string()
+    } else {
+        shell_gradient.to_string()
+    };
+    (fill, gradient)
+}
+/// The dedicated app-background layer (`data-yggterm-app-bg`): z-index:-1
+/// first child of the shell frame, replicating the frame's background paint
+/// exactly. Invisible in legacy stacking (it sits beneath the frame's own
+/// identical paint); under glass the frame/root paints clear (CSS) and this
+/// layer — the only element with no children — safely takes the evenodd
+/// `clip-path` page holes via `--yggterm-under-glass-holes`. Hole coords are
+/// window-logical px; on Linux the frame is flush (inset 0) so the layer box
+/// IS the window box — the one platform under-glass runs on today.
+fn shell_background_layer_style(
+    palette: Palette,
+    radius: u8,
+    shell_tint: &str,
+    chrome_material_tint: &str,
+    shell_gradient: &str,
+    shell_gradient_background_size: &str,
+    shell_gradient_background_repeat: &str,
+    maximized: bool,
+    transparent_window: bool,
+) -> String {
+    let (fill, gradient) = shell_background_paint(
+        palette,
+        shell_tint,
+        chrome_material_tint,
+        shell_gradient,
+        maximized,
+        transparent_window,
+    );
+    let effective_radius = if maximized { 0 } else { radius };
+    format!(
+        "position:absolute; inset:0; z-index:-1; pointer-events:none; border-radius:{}px; \
+         background-color:{}; background-image:{}; background-size:{}; background-repeat:{}; background-clip:padding-box;",
+        effective_radius,
+        fill,
+        gradient,
+        shell_gradient_background_size,
+        shell_gradient_background_repeat,
+    )
+}
 fn shell_style(
     palette: Palette,
     radius: u8,
@@ -90925,26 +91099,14 @@ fn shell_style(
     transparent_window: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized, transparent_window, shell_material_blur_px);
-    let opaque_linux_paint = shell_uses_opaque_linux_paint(transparent_window);
-    let transparent_material_fill = shell_transparent_material_fill(
+    let (effective_shell_fill, effective_shell_gradient) = shell_background_paint(
+        palette,
         shell_tint,
         chrome_material_tint,
+        shell_gradient,
         maximized,
         transparent_window,
-        shell_live_blur_supported(),
     );
-    let effective_shell_fill = if opaque_linux_paint {
-        shell_opaque_fill(palette).to_string()
-    } else if !transparent_material_fill.is_empty() {
-        transparent_material_fill
-    } else {
-        palette.shell.to_string()
-    };
-    let effective_shell_gradient = if opaque_linux_paint {
-        "none"
-    } else {
-        shell_gradient
-    };
     let exported_shell_gradient = shell_gradient;
     let stable_transparent_fill = shell_opaque_fill(palette).to_string();
     let chrome_tint = if transparent_window && !maximized && !shell_live_blur_supported() {
@@ -96835,6 +96997,113 @@ mod tests {
         // F.0 keeps the titlebar clamp; deleting it is F.1 work that must
         // arrive together with the covers-driven input region for the reveal.
         assert!(js.contains("clampTop"));
+    }
+
+    #[test]
+    fn a_under_glass_css_clears_every_backing_wrapper_and_holes_the_app_bg_layer() {
+        // F.0.1: the probe-confirmed opaque chain over a page hole was
+        // wrapper (web_frame_bg) → material frame → shell root. Every one of
+        // them must be handled here, every rule keyed on the root stamp so a
+        // probe demotion restores the lot with no re-render.
+        let css = WEB_UNDER_GLASS_CSS;
+        for needle in [
+            "[data-web-surface-owns-viewport=\"true\"] { background: transparent !important; }",
+            "[data-ws-frame=\"1\"] { background: transparent !important; }",
+            "[data-ws-overlay=\"1\"] { background: transparent !important; }",
+            "[data-ws-page] { background: transparent !important; }",
+            "[data-ws-pinned-session] { background: transparent !important; }",
+            "#yggterm-shell-root { background: transparent !important; }",
+        ] {
+            assert!(css.contains(needle), "missing under-glass clear: {needle}");
+        }
+        // The shared material frame loses color+gradient only — its exported
+        // CSS variables stay (titlebar and panels read them).
+        assert!(css.contains(
+            "[data-yggterm-shell=\"1\"] { background-color: transparent !important; background-image: none !important; }"
+        ));
+        // The dedicated background layer takes the holes, nothing else does.
+        assert!(css.contains(
+            "[data-yggterm-app-bg=\"1\"] { clip-path: var(--yggterm-under-glass-holes, none);"
+        ));
+        for line in css.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                line.starts_with(":root[data-under-glass=\"1\"]"),
+                "under-glass rule not keyed on the root stamp: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_glass_paint_holes_css_builds_evenodd_path_and_clears_when_empty() {
+        assert_eq!(under_glass_paint_holes_css(&[]), None);
+        // Degenerate rects are dropped (same as the input region); an
+        // all-degenerate set means FULL paint, not a stale hole.
+        assert_eq!(
+            under_glass_paint_holes_css(&[(5, 5, 0, 10), (5, 5, 10, -1)]),
+            None
+        );
+        let path = under_glass_paint_holes_css(&[(100, 40, 800, 600), (10, 10, 20, 20)]).unwrap();
+        assert_eq!(
+            path,
+            "path(evenodd, \"M0 0H32767V32767H0ZM100 40h800v600h-800ZM10 10h20v20h-20Z\")"
+        );
+    }
+
+    #[test]
+    fn app_background_layer_paint_matches_shell_frame_paint() {
+        // The layer replicates the frame's background so legacy stacking is
+        // pixel-identical and under glass swaps owners invisibly. One shared
+        // computation backs both; this pins the rendered declarations too.
+        let light = palette(UiTheme::ZedLight);
+        let first_decl = |style: &str, prop: &str| -> String {
+            style
+                .split(&format!("{prop}:"))
+                .nth(1)
+                .and_then(|tail| tail.split(';').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (maximized, transparent_window) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let frame = shell_style(
+                light,
+                10,
+                "rgb(243, 247, 250)",
+                "rgb(243, 247, 250)",
+                light.gradient,
+                "100% 100vh",
+                "no-repeat",
+                22.0,
+                maximized,
+                transparent_window,
+            );
+            let layer = shell_background_layer_style(
+                light,
+                10,
+                "rgb(243, 247, 250)",
+                "rgb(243, 247, 250)",
+                light.gradient,
+                "100% 100vh",
+                "no-repeat",
+                maximized,
+                transparent_window,
+            );
+            for prop in [
+                "background-color",
+                "background-image",
+                "background-size",
+                "background-repeat",
+            ] {
+                assert_eq!(
+                    first_decl(&frame, prop),
+                    first_decl(&layer, prop),
+                    "{prop} diverged (maximized={maximized}, transparent={transparent_window})"
+                );
+            }
+            assert!(layer.contains("z-index:-1"));
+            assert!(layer.contains("pointer-events:none"));
+        }
     }
 
     #[test]
