@@ -50,6 +50,20 @@ document.getElementById('tb').addEventListener('click', () => {
   document.getElementById('tb').style.background = '#d946ef';
   document.title = 'shell-clicked';
 });
+// AC-content probe (F.0.1): ?ac in the html forces REAL accelerated
+// compositing — a WebGL canvas + a 3D-transformed layer, like the
+// production glass (WebGL xterm). Policy alone may not engage AC.
+if (location.search.includes('ac') || window.__spikeAc) {
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  c.style.cssText = 'position:fixed;left:4px;top:4px;width:32px;height:32px;z-index:3';
+  document.body.appendChild(c);
+  const gl = c.getContext('webgl');
+  if (gl) { gl.clearColor(1, 0.5, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); document.title = 'ac-webgl-on'; }
+  const layer = document.createElement('div');
+  layer.style.cssText = 'position:fixed;right:4px;top:4px;width:24px;height:24px;background:#0ff;transform:translateZ(0);will-change:transform;z-index:3';
+  document.body.appendChild(layer);
+}
 document.addEventListener('keydown', (e) => {
   document.getElementById('tb').style.background = '#ff8800';
   document.getElementById('tb').textContent = 'SHELL GOT KEY: ' + e.key;
@@ -62,6 +76,16 @@ fn main() {
     let win = gtk::Window::new(gtk::WindowType::Toplevel);
     win.set_default_size(W, H);
     win.set_decorated(false);
+    // Window-visual probe (F.0.1): env SPIKE_WIN=rgba gives the toplevel an
+    // RGBA visual + app_paintable, like tao's transparent window.
+    if std::env::var("SPIKE_WIN").map(|v| v == "rgba").unwrap_or(false) {
+        let screen: Option<gdk::Screen> = gtk::prelude::WidgetExt::screen(&win);
+        if let Some(visual) = screen.and_then(|screen| screen.rgba_visual()) {
+            win.set_visual(Some(&visual));
+        }
+        win.set_app_paintable(true);
+        eprintln!("spike: toplevel RGBA visual + app_paintable");
+    }
     win.connect_delete_event(|_, _| {
         gtk::main_quit();
         glib::Propagation::Proceed
@@ -70,17 +94,66 @@ fn main() {
     let overlay = gtk::Overlay::new();
     win.add(&overlay);
 
+    // Tree-shape probe (F.0.1): env SPIKE_TREE=prod assembles the PRODUCTION
+    // widget tree (backdrop Box base child; page webview inside a gtk::Fixed
+    // overlay child at a rect; shell webview inside a GtkBox overlay child,
+    // reordered topmost) instead of the original spike tree (page = base
+    // child, shell = direct overlay child).
+    let prod_tree = std::env::var("SPIKE_TREE").map(|v| v == "prod").unwrap_or(false);
+
     // PAGE layer: the overlay's base child, fills the window (production: each
     // page webview sits in a gtk::Fixed at its rect; full-bleed is fine here).
     let page = webkit2gtk::WebView::new();
     page.load_html(PAGE_HTML, None);
-    overlay.add(&page);
+    if prod_tree {
+        let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        overlay.add(&backdrop);
+        let fixed = gtk::Fixed::new();
+        fixed.set_halign(gtk::Align::Start);
+        fixed.set_valign(gtk::Align::Start);
+        fixed.set_margin_start(HOLE_X);
+        fixed.set_margin_top(HOLE_Y);
+        fixed.set_size_request(HOLE_W, HOLE_H);
+        page.set_size_request(HOLE_W, HOLE_H);
+        fixed.put(&page, 0, 0);
+        overlay.add_overlay(&fixed);
+        eprintln!("spike: PRODUCTION tree (backdrop base, page in Fixed overlay child)");
+    } else {
+        overlay.add(&page);
+    }
 
     // SHELL layer: overlay child ABOVE the page, transparent background.
     let shell = webkit2gtk::WebView::new();
     shell.set_background_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
-    shell.load_html(SHELL_HTML, None);
-    overlay.add_overlay(&shell);
+    // AC-mode probe (F.0.1): env SPIKE_SHELL_AC=always forces the shell into
+    // accelerated compositing — the production glass (WebGL xterm) always is.
+    // Hypothesis under test: the AC backing-store paint blits with cairo
+    // operator SOURCE, erasing the page pixels beneath instead of
+    // compositing OVER them.
+    let shell_ac = std::env::var("SPIKE_SHELL_AC").map(|v| v == "always").unwrap_or(false);
+    if shell_ac {
+        use webkit2gtk::SettingsExt as _;
+        if let Some(settings) = WebViewExt::settings(&shell) {
+            settings.set_hardware_acceleration_policy(
+                webkit2gtk::HardwareAccelerationPolicy::Always,
+            );
+            eprintln!("spike: shell hardware-acceleration-policy = ALWAYS");
+        }
+    }
+    let shell_html = if shell_ac {
+        SHELL_HTML.replace("location.search.includes('ac')", "true")
+    } else {
+        SHELL_HTML.to_string()
+    };
+    shell.load_html(&shell_html, None);
+    if prod_tree {
+        let glass_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        glass_box.pack_start(&shell, true, true, 0);
+        overlay.add_overlay(&glass_box);
+        overlay.reorder_overlay(&glass_box, -1);
+    } else {
+        overlay.add_overlay(&shell);
+    }
 
     // GTK-level input observability: who actually receives events?
     win.connect_button_press_event(|_, ev| {
