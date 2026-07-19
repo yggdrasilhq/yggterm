@@ -1,7 +1,52 @@
 # Phase F — web surfaces under the glass
 
-**Status: F.0 landed but OPT-IN (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`) after a
-live incident; F.0.1 (the hole redesign) is the next work item.**
+**Status: F.0.1 COMPLETE — under-glass compositing works end-to-end on the dev
+sandbox (page through the hole, chrome over it, interactive, session-switch
+clean). Still OPT-IN (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`); next: jojo live
+proof, then F.1.**
+
+**F.0.1 RESOLUTION (2026-07-19 pt3, dev sandbox, real ychrome surface):**
+TWO stacked root causes, both fixed:
+
+1. **The DOM chain (this repo).** The probe-confirmed opaque chain over a page
+   hole was: viewport frame wrapper (`web_frame_bg` #f4f4f2) → material frame
+   (`data-yggterm-shell`, `shell_style`) → `#yggterm-shell-root`. Fixed with
+   scoped, declarative CSS keyed on `:root[data-under-glass="1"]`
+   (`WEB_UNDER_GLASS_CSS`): session-view elements (wrapper via a conditional
+   `data-ws-frame` stamp, overlay, page + pinned placeholders) go transparent;
+   the SHARED containers do NOT — a dedicated `data-yggterm-app-bg` layer
+   (z-index:-1 first child of the frame, paint shared with `shell_style` via
+   `shell_background_paint`) owns the app background under glass and takes an
+   evenodd `clip-path` hole per visible page rect via the
+   `--yggterm-under-glass-holes` root variable, written change-gated by the
+   reconcile loop from the SAME applied bounds as the input-region holes
+   (placement/input/paint SSOT). The tab strip self-paints its tint over
+   `web_frame_bg` (pixel-identical in both modes) so it survives the wrapper
+   going clear. No runtime DOM mutation anywhere; a probe demotion restores
+   everything by flipping the root stamp.
+2. **The presentation path (env).** `configure_linux_webkit_compositing` set
+   `WEBKIT_DISABLE_DMABUF_RENDERER=1` (historical llvmpipe-crash workaround).
+   WebKit's SHM presentation path CLEARS a transparent webview's regions
+   straight through every sibling widget beneath — the hole punched through
+   page webviews and backdrop to the window background (black on an opaque
+   window, the desktop on an RGBA one). The DMABUF renderer composites
+   in-widget with alpha and works, **including over software GL** (llvmpipe —
+   verified on the sandbox with `LIBGL_ALWAYS_SOFTWARE=1`). Fix: armed ⇒ the
+   env var is not set (DMABUF default); unarmed ⇒ workaround preserved; env
+   explicitly forcing SHM while armed ⇒ the vendored host demotes to legacy.
+   Bisected with the committed spike: `SPIKE_TREE=prod SPIKE_WIN=rgba
+   SPIKE_SHELL_AC=always` all PASS; `WEBKIT_DISABLE_DMABUF_RENDERER=1` alone
+   reproduces the failure.
+   **Corollary: the "under-glass needs an RGBA window" belief (F.0.1 pt2) was
+   an SHM-path artifact — the DMABUF path composites on an ordinary opaque
+   window, so the forced window transparency is REMOVED.**
+
+Falsified along the way (kept here so nobody re-walks these): glass native
+GdkWindow (subsurface) — blanks all chrome on GDK3-Wayland; cairo draw
+"sandwich" (push_group/pop around webkit's draw) — webkit paints OUTSIDE the
+GTK draw-signal pipeline under DMABuf, and the group swallows chrome; GDK
+sibling occlusion-culling — clip regions dumped FULL (`YGGTERM_WEB_SURFACE_DEBUG_TREE=1`
+prints the widget/GdkWindow tree with clip/visible regions).
 Owner surface: web surfaces (ychrome pilot). Repo side: yggterm shell +
 vendored `dioxus-desktop` web-surface host. GUI-only; no wire change.
 
