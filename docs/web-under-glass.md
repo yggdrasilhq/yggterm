@@ -18,7 +18,34 @@ canvases are opaque glass-DOM pixels that occlude the page — the terminal
 host now hides under an active overlay (`data-web-surface-owns-viewport` +
 `WEB_UNDER_GLASS_CSS`, visibility-only so layout never moves).
 
-**F.0.1 — the hole, redesigned (do this before re-arming):**
+**F.0.1 PROGRESS (2026-07-19 pt2, dev sandbox, real ychrome surface, commit
+8047946) — partial, page still not compositing:**
+- DONE + probe-verified: terminal host frame background transparent + xterm
+  canvas hidden under an active web overlay (the c5b4871 terminal-occlusion is
+  GONE); web overlay panel + page placeholder transparent; the window is now
+  built with an RGBA visual when under-glass is armed (GTK gives the glass
+  webview an alpha channel to composite the hole onto the page webview below
+  ONLY when the top-level window is transparent — the raw-webkit spike got
+  this for free from the compositor; the wry window defaults opaque).
+- STILL BLOCKED (root-caused, not fixed): the web surface renders through
+  opaque `web_frame_bg` BACKING WRAPPERS that the host/overlay/page CSS does
+  not reach. Confirmed one at the **depth-2 parent of `[data-ws-overlay]`**
+  (#f4f4f2, no data-attribute) in the **MainSurface split render path**. There
+  are TWO web-surface render paths (the `TerminalCanvas` host path AND the
+  MainSurface split path); each has its own opaque backing wrappers. The
+  incident's ancestor walk existed to catch ALL of them — the correct
+  replacement is **render-time conditional transparency on each backing
+  wrapper** (mark it, or make its `background` conditional at the source),
+  across BOTH paths. Legacy stacking proved the page renders and grim captures
+  it, so this is a DOM-layering gap, not a capture artifact.
+- VERIFY METHOD THAT WORKS ON THE SANDBOX (no KDE needed): headless sway +
+  `grim` DOES capture native webviews (legacy stacking showed example.com);
+  `--backend os` faithful capture REFUSES on non-KDE. Create a real surface:
+  `server app terminal new` → send `<abs-path>/ychrome --profile p <url>` into
+  it. Probe the hole ancestor chain for `<OPAQUE>` backgrounds; compare the
+  hole pixel to backdrop (theme bg) vs the page's own bg to disambiguate.
+
+**F.0.1 — the hole, redesigned (remaining work):**
 1. **No runtime DOM mutation.** Render-time conditional styling from a
    snapshot flag: the reconcile loop mirrors `under_glass` into ShellState on
    change; RenderSnapshot carries it; rsx conditionals do the rest.
