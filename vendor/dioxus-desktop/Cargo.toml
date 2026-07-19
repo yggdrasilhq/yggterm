@@ -257,6 +257,9 @@ version = "0.18.2"
 version = "=2.0.2"
 features = ["v2_40"]
 
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.webkit2gtk-sys]
+version = "=2.0.2"
+
 [target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.cairo-rs]
 version = "0.18"
 features = ["png"]
