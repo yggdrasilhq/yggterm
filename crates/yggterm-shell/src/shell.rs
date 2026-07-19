@@ -2844,24 +2844,43 @@ const WEB_UNDER_GLASS_CSS: &str = r#"
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
 :root[data-under-glass="1"] [data-ws-frame="1"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-ws-overlay="1"] { background: transparent !important; }
-:root[data-under-glass="1"] [data-ws-page] { background: transparent !important; }
+:root[data-under-glass="1"] [data-ws-page] { background: transparent !important; margin: 0 !important; }
 :root[data-under-glass="1"] [data-ws-pinned-session] { background: transparent !important; }
 :root[data-under-glass="1"] #yggterm-shell-root { background: transparent !important; }
 :root[data-under-glass="1"] [data-yggterm-shell="1"] { background-color: transparent !important; background-image: none !important; }
 :root[data-under-glass="1"] [data-yggterm-app-bg="1"] { clip-path: var(--yggterm-under-glass-holes, none); -webkit-clip-path: var(--yggterm-under-glass-holes, none); }
 "#;
 
+/// The molded frame's corner radius (F.1): each paint hole is a ROUNDED
+/// rect, so the app-background layer paints the four corner wedges OVER the
+/// page — the frame cuts the page's square corners ("a rounded photo frame
+/// on a square TV"). Matches the terminal viewport frame radius
+/// (`.yggterm-term-focused`: 10px). The INPUT hole stays rectangular — the
+/// corner-wedge discrepancy is the accepted, documented trade
+/// (docs/web-under-glass.md).
+const WEB_UNDER_GLASS_CORNER_RADIUS_PX: i32 = 10;
+
 /// The `--yggterm-under-glass-holes` value: an evenodd `path()` whose outer
 /// rect vastly overshoots the layer box (clip-path only ever RESTRICTS
 /// painting, so the overshoot is free and window size is not needed) with one
-/// closed subpath per visible page rect. Empty holes ⇒ `None` ⇒ the property
-/// is removed and the layer falls back to `none` (full paint) — the paint
-/// twin of the input-region safety invariant.
+/// closed ROUNDED-rect subpath per visible page rect (the molded frame).
+/// Empty holes ⇒ `None` ⇒ the property is removed and the layer falls back to
+/// `none` (full paint) — the paint twin of the input-region safety invariant.
 fn under_glass_paint_holes_css(holes: &[(i32, i32, i32, i32)]) -> Option<String> {
     let subpaths: String = holes
         .iter()
         .filter(|(_, _, w, h)| *w > 0 && *h > 0)
-        .map(|(x, y, w, h)| format!("M{x} {y}h{w}v{h}h-{w}Z"))
+        .map(|(x, y, w, h)| {
+            let r = WEB_UNDER_GLASS_CORNER_RADIUS_PX.min(w / 2).min(h / 2).max(0);
+            if r == 0 {
+                return format!("M{x} {y}h{w}v{h}h-{w}Z");
+            }
+            let (iw, ih) = (w - 2 * r, h - 2 * r);
+            let sx = x + r;
+            format!(
+                "M{sx} {y}h{iw}a{r} {r} 0 0 1 {r} {r}v{ih}a{r} {r} 0 0 1 -{r} {r}h-{iw}a{r} {r} 0 0 1 -{r} -{r}v-{ih}a{r} {r} 0 0 1 {r} -{r}Z"
+            )
+        })
         .collect();
     if subpaths.is_empty() {
         return None;
@@ -2876,14 +2895,17 @@ fn under_glass_paint_holes_css(holes: &[(i32, i32, i32, i32)]) -> Option<String>
 /// sample — the SSOT rule), `data-covers-web-surface` rects, and the
 /// under-glass transparency-chain maintenance. Tripwire-tested.
 const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
-    // The auto-hiding titlebar is a floating DOM overlay, and a
-    // native webview paints above ALL DOM — so the webview must be
-    // CLAMPED below the titlebar's live bottom edge. Collapsed,
-    // that keeps the 6px hover sensor at the window's top edge
-    // real (hoverable DOM, not native surface); revealed, it makes
-    // the titlebar visible over the page by dipping the page —
-    // without re-laying-out anything else, which is the point.
-    const tb = document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
+    // LEGACY stacking only: the auto-hiding titlebar is a floating
+    // DOM overlay, and a legacy native webview paints above ALL
+    // DOM — so the webview must be CLAMPED below the titlebar's
+    // live bottom edge (the reveal dips the page). UNDER GLASS the
+    // chrome draws OVER the page, so the page is never clamped:
+    // a titlebar reveal is an input-region cover update
+    // (data-covers-web-surface + the synchronous cover push), not
+    // a geometry change — the [data-ws-page] rect must be
+    // IDENTICAL before/during/after a reveal (F.1 acceptance 2).
+    const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';
+    const tb = underGlass ? null : document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
     const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
     const out = {};
     for (const el of document.querySelectorAll('[data-ws-page]')) {
@@ -2936,6 +2958,122 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // eval SAMPLES ONLY.
     dioxus.send({pages: out, pinned: pinned, covers: covers});
 })();"#;
+
+/// F.1 synchronous cover push (T8). The tick's geometry eval samples covers
+/// too, but it is a documented-starvable oracle (seconds, under output
+/// flood) — acceptable while it only places pixels, unacceptable as the
+/// INPUT authority: a dialog would be visible for one-to-several ticks while
+/// clicks on it fell through to the page (an invisible misclick). This
+/// observer pushes a cover update the instant a `data-covers-web-surface`
+/// element mounts, unmounts, or resizes (ResizeObserver tracks the titlebar
+/// reveal transition frame-by-frame); the reconcile tick remains as
+/// idempotent self-heal only. The channel is rebound on reinstall (webview
+/// reload); the observers themselves install once per page lifetime.
+const WEB_SURFACE_COVER_OBSERVER_JS: &str = r#"(function(){
+    window.__yggtermCoverPush = (covers) => dioxus.send(covers);
+    if (window.__yggtermCoverObserverKick) { window.__yggtermCoverObserverKick(); return; }
+    const sample = () => {
+        const covers = [];
+        for (const el of document.querySelectorAll('[data-covers-web-surface]')) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 1 && r.height > 1) {
+                covers.push([Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]);
+            }
+        }
+        return covers;
+    };
+    let queued = false;
+    let last = null;
+    const push = () => {
+        queued = false;
+        const covers = sample();
+        const key = JSON.stringify(covers);
+        if (key !== last) { last = key; window.__yggtermCoverPush(covers); }
+    };
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(push); } };
+    const resize = new ResizeObserver(schedule);
+    const observed = new Set();
+    const rescan = () => {
+        for (const el of observed) {
+            if (!el.isConnected || !el.hasAttribute('data-covers-web-surface')) {
+                observed.delete(el);
+                resize.unobserve(el);
+            }
+        }
+        for (const el of document.querySelectorAll('[data-covers-web-surface]')) {
+            if (!observed.has(el)) { observed.add(el); resize.observe(el); }
+        }
+        schedule();
+    };
+    new MutationObserver(rescan).observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['data-covers-web-surface'],
+    });
+    // A fresh channel re-sends the CURRENT covers even if nothing mutates.
+    window.__yggtermCoverObserverKick = () => { last = null; schedule(); };
+    rescan();
+})();"#;
+
+/// F.1: receive cover-rect batches from the shell DOM's cover observer and
+/// push them host-side OUT OF TICK (`set_web_surface_input_covers` replaces
+/// only the covers; holes stay at the reconciler's last applied set). No-op
+/// in legacy stacking, change-gated in the host — running this loop is free
+/// when nothing changes.
+async fn web_surface_cover_push_loop(desktop: dioxus::desktop::DesktopContext) {
+    loop {
+        let mut eval = document::eval(WEB_SURFACE_COVER_OBSERVER_JS);
+        while let Ok(value) = eval.recv::<Value>().await {
+            let covers: Vec<(i32, i32, i32, i32)> = value
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let rect = entry.as_array()?;
+                            Some((
+                                rect.first()?.as_i64()? as i32,
+                                rect.get(1)?.as_i64()? as i32,
+                                rect.get(2)?.as_i64()? as i32,
+                                rect.get(3)?.as_i64()? as i32,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            desktop.set_web_surface_input_covers(&covers);
+        }
+        // The eval channel died (webview reload): rebind the push target.
+        sleep(Duration::from_millis(1_000)).await;
+    }
+}
+
+/// F.1 reveal trigger, shell half (T9). The vendored host observes pointer
+/// motion on page webviews and calls `window.__yggtermGlassEdgeMotion` when
+/// the pointer enters the window's top edge zone — the zone the shell's own
+/// 6px hover sensor can no longer see once the titlebar clamp is gone (the
+/// hole owns that input). Each firing runs the SAME reveal the titlebar's
+/// mouseenter runs; collapse still happens via the titlebar's own
+/// mouseleave (the revealed titlebar is a cover, so the shell owns its
+/// pointer stream).
+async fn web_surface_edge_motion_reveal_loop(
+    state: Signal<ShellState>,
+    hovered: Signal<bool>,
+    lingering: Signal<bool>,
+    linger_generation: Signal<u64>,
+) {
+    loop {
+        let mut eval = document::eval("window.__yggtermGlassEdgeMotion = () => dioxus.send(1);");
+        while eval.recv::<i32>().await.is_ok() {
+            if state.peek().settings.auto_hide_titlebar {
+                titlebar_autohide_reveal(hovered, lingering, linger_generation);
+            }
+        }
+        // Channel died (webview reload): rebind the hook.
+        sleep(Duration::from_millis(1_000)).await;
+    }
+}
 
 async fn web_surface_native_reconcile_loop(
     state: Signal<ShellState>,
@@ -3054,18 +3192,22 @@ async fn web_surface_native_reconcile_loop(
             // the eval blinds out for seconds, and a backgrounded surface would
             // otherwise linger composited over the newly-revealed session (the
             // "ychrome->terminal switch broken for ~6-7s" class).
-            // A modal (passkey prompt, close/delete confirm, edit-summary) is a
-            // Dioxus overlay in the MAIN webview, but a native web surface (a gtk
-            // overlay child) draws ABOVE all DOM — so while a modal is up the
-            // surface must be cleared or the user only sees the dimmed backdrop,
-            // never the dialog (the "modal doesn't appear over the webview"
-            // report). Merely `set_visible(false)` does NOT clear a WebKitGTK
-            // surface (the reload-white pathology — see the stash comment below),
-            // so treat a modal as making NO surface active-visible: the active
-            // surface then joins the "backgrounded" set and is STASHED (detached
-            // from the overlay), which reliably clears it. When the modal closes
-            // it becomes active-visible again and unstashes in place — page intact.
-            let modal_over_viewport = shell_ref.has_modal_over_viewport();
+            // LEGACY stacking: a modal (passkey prompt, close/delete confirm,
+            // edit-summary) is a Dioxus overlay in the MAIN webview, but a
+            // legacy native web surface draws ABOVE all DOM — so while a modal
+            // is up the surface must be cleared or the user only sees the
+            // dimmed backdrop, never the dialog. Merely `set_visible(false)`
+            // does NOT clear a WebKitGTK surface (the reload-white pathology —
+            // see the stash comment below), so a modal makes NO surface
+            // active-visible: the active surface joins the "backgrounded" set
+            // and is STASHED. UNDER GLASS the stash is RETIRED (F.1 T10):
+            // chrome DOM draws OVER pages, so the dialog renders above the
+            // live page, and its full-window transient cover
+            // (`chrome_transient_over_viewport` + the synchronous cover push)
+            // routes all input to the shell while it is up. Retiring the stash
+            // without the covers would make every modal a click-through
+            // window — they are ONE work item by design.
+            let modal_over_viewport = shell_ref.has_modal_over_viewport() && !under_glass;
             let active_visible_sessions = if modal_over_viewport {
                 std::collections::HashSet::new()
             } else {
@@ -7489,6 +7631,15 @@ impl ShellState {
         // Only the ACTIVE-VISIBLE session's reads are live, so only it is a
         // reliable dead-app signal here.
         let active_visible_path = self.sidebar_reads_live_path();
+        // reads-since grace: a JUST-foregrounded session is reads-live with an
+        // aged `last_seen_ms` — sweeping it before a full stale window of live
+        // listening would kill a healthy surface right as the user switches to
+        // it (the first post-switch OSC event runs this sweep BEFORE the
+        // heartbeat upsert lands). Same rule the contribution sweep applies.
+        let reads_since = active_visible_path
+            .as_deref()
+            .map(|path| self.session_reads_since(path, now_ms))
+            .unwrap_or(0);
         self.web_surfaces.retain(|session_path, surface| {
             let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
             if !reads_live {
@@ -7496,7 +7647,8 @@ impl ShellState {
                 // background hold owns its lifetime.
                 return true;
             }
-            let live = now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
+            let live = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
+                <= WEB_SURFACE_STALE_AFTER_MS;
             if !live {
                 kill_web_surface_forward(surface);
             }
@@ -8162,10 +8314,15 @@ impl ShellState {
     /// and offering them as rail buttons painted the whole document into a
     /// 300px rail twice (live-caught 2026-07-17, the yedit duplication).
     fn active_sidebar_panes(&self, session_path: &str, now_ms: u64) -> Vec<SidebarPaneDeclaration> {
+        // reads-since grace, same as the surface overlay: the rail must not
+        // blink out for the first post-switch tick while the contribution's
+        // aged `last_seen_ms` waits for a live read.
+        let reads_since = self.session_reads_since(session_path, now_ms);
         self.sidebar_contributions
             .get(session_path)
             .filter(|contribution| {
-                now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
+                now_ms.saturating_sub(contribution.last_seen_ms.max(reads_since))
+                    <= WEB_SURFACE_STALE_AFTER_MS
             })
             .map(|contribution| {
                 contribution
@@ -8236,21 +8393,47 @@ impl ShellState {
             .get(session_path)
             .map(|contribution| contribution.control_url.clone())
     }
+    /// The moment live OSC reads started for `session_path`, or 0 when it is
+    /// not the reads-live session. `last_seen_ms` only moves while a session's
+    /// declares are being READ — a backgrounded session's heartbeats pile up
+    /// unread — so every web-surface/contribution liveness judge must use
+    /// `last_seen.max(reads_since)`: a just-foregrounded surface is live until
+    /// a full stale window of LIVE listening passes without a declare, instead
+    /// of "stale" for the 0–4s until its first read heartbeat lands. That gap
+    /// was the terminal-flash-on-switch class: the overlay (chrome + xterm
+    /// hide + `[data-ws-page]`) refused to render, so the bare terminal showed
+    /// until the heartbeat arrived. The sweep's clock
+    /// (`sidebar_reads_live_since`) resets on the SWEEP tick, not the switch
+    /// instant — until it names this session, reads started NOW.
+    fn session_reads_since(&self, session_path: &str, now_ms: u64) -> u64 {
+        if self.sidebar_reads_live_path().as_deref() != Some(session_path) {
+            return 0;
+        }
+        match &self.sidebar_reads_live_since {
+            Some((path, since)) if path == session_path => *since,
+            _ => now_ms,
+        }
+    }
     /// Cheap liveness probe (no view construction) for the input policy.
     fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
+        let reads_since = self.session_reads_since(session_path, now_ms);
         self.web_surfaces
             .get(session_path)
             .is_some_and(|surface| {
-                now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
+                now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
+                    <= WEB_SURFACE_STALE_AFTER_MS
             })
     }
-    /// True while a modal that must sit OVER the viewport is open. A native web
-    /// surface is a GTK overlay child that draws above ALL DOM, so any such modal
-    /// (rendered in the DOM) is invisible behind a live surface unless the surface
-    /// is hidden while it is up — the user saw only the dimmed backdrop, never the
-    /// dialog (the passkey prompt AND the close/delete confirm both hit this). The
-    /// reconciler hides the surface whenever this is true. Add every new
-    /// over-viewport modal here.
+    /// True while a modal that must sit OVER the viewport is open. In LEGACY
+    /// stacking a native web surface draws above ALL DOM, so any such modal is
+    /// invisible behind a live surface unless the reconciler stashes the
+    /// surface while it is up — the user saw only the dimmed backdrop, never
+    /// the dialog (the passkey prompt AND the close/delete confirm both hit
+    /// this). UNDER GLASS the stash is retired (F.1 T10): the dialog draws
+    /// over the live page and `chrome_transient_over_viewport` covers the
+    /// window for input. Add every new over-viewport modal here AND to that
+    /// predicate — the two lists answer the same question for the two
+    /// stacking modes.
     fn has_modal_over_viewport(&self) -> bool {
         self.pending_fido2.is_some()
             || self.pending_delete.is_some()
@@ -8664,7 +8847,14 @@ impl ShellState {
         now_ms: u64,
     ) -> Option<WebSurfaceOverlayView> {
         let surface = self.web_surfaces.get(session_path)?;
-        if now_ms.saturating_sub(surface.last_seen_ms) > WEB_SURFACE_STALE_AFTER_MS {
+        // reads-since grace: a just-foregrounded surface must render its
+        // overlay IMMEDIATELY (see `session_reads_since`) — judging raw
+        // `last_seen_ms` here showed the bare terminal for the 0–4s until the
+        // first read heartbeat (user report 2026-07-19, the switch flash).
+        let reads_since = self.session_reads_since(session_path, now_ms);
+        if now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
+            > WEB_SURFACE_STALE_AFTER_MS
+        {
             return None;
         }
         let active_tab_id = surface.active_tab;
@@ -8835,9 +9025,9 @@ impl ShellState {
     /// freshness rule as `web_surface_overlay_for_session`, so the rail and the
     /// overlay can never disagree about whether a surface exists.
     fn active_web_surface_is_live(&self, now_ms: u64) -> bool {
-        self.active_web_surface().is_some_and(|surface| {
-            now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
-        })
+        self.server
+            .active_session_path()
+            .is_some_and(|session| self.has_live_web_surface(session, now_ms))
     }
     fn active_web_surface_has_folders(&self) -> bool {
         self.active_web_surface()
@@ -26574,6 +26764,26 @@ fn titlebar_autohide_pinned_flags(
         || titlebar_new_menu_open
         || titlebar_session_menu_open
         || titlebar_overflow_menu_open
+}
+/// F.1 (T8/T10): chrome that takes the WHOLE viewport while it is up —
+/// titlebar menus, the search dropdown, the context menu, every over-viewport
+/// dialog. Under glass these must own ALL input: an outside click over a page
+/// has to close the menu / reach the dialog scrim, never scroll the page
+/// beneath. While any of them is open, ONE full-window
+/// `data-covers-web-surface` element mounts (`pointer-events:none`, so DOM
+/// behavior is untouched — the cover only feeds the GTK input region), and
+/// the synchronous cover push makes it effective the instant it is visible.
+fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
+    snapshot.titlebar_new_menu_open
+        || snapshot.titlebar_session_menu_open
+        || snapshot.titlebar_overflow_menu_open
+        || titlebar_search_dropdown_open(snapshot)
+        || snapshot.context_menu_row.is_some()
+        || snapshot.pending_delete.is_some()
+        || snapshot.pending_classic_tabs_switch
+        || snapshot.copy_edit_dialog.is_some()
+        || snapshot.pending_fido2.is_some()
+        || snapshot.theme_editor_open
 }
 fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
     // KeyTips need the affordances they annotate on screen: when the overlay is
@@ -50065,6 +50275,26 @@ fn app() -> Element {
             web_surface_native_reconcile_loop(state, desktop, trace_home).await;
         });
     }
+    // F.1 under-glass input plumbing: the synchronous cover push and the
+    // page-edge reveal forward. Both are inert in legacy stacking.
+    let web_surface_cover_push_loop_started =
+        use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !web_surface_cover_push_loop_started.swap(true, Ordering::SeqCst) {
+        let desktop = desktop.clone();
+        spawn_forever(async move {
+            web_surface_cover_push_loop(desktop).await;
+        });
+    }
+    let web_surface_edge_motion_loop_started =
+        use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !web_surface_edge_motion_loop_started.swap(true, Ordering::SeqCst) {
+        spawn_forever(web_surface_edge_motion_reveal_loop(
+            state,
+            titlebar_autohide_hovered,
+            titlebar_autohide_lingering,
+            titlebar_autohide_linger_generation,
+        ));
+    }
     let keytip_alt_tap_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     if !keytip_alt_tap_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
@@ -52221,6 +52451,15 @@ fn app() -> Element {
                         "data-titlebar-auto-hide-enabled": if titlebar_auto_hide_enabled { "true" } else { "false" },
                         "data-titlebar-revealed": if titlebar_revealed { "true" } else { "false" },
                         "data-titlebar-hover-active": if titlebar_autohide_hovered() { "true" } else { "false" },
+                        // F.1: a REVEALED auto-hide titlebar floats over the
+                        // page hole, so it declares itself a cover — the
+                        // synchronous cover push routes its rect back to the
+                        // shell's input region (ResizeObserver tracks the
+                        // reveal transition). Collapsed, the 6px sensor stays
+                        // UNdeclared: the page owns its top edge and the
+                        // reveal comes from the host motion observer (the
+                        // reserved-strip alternative was rejected).
+                        "data-covers-web-surface": if titlebar_auto_hide_enabled && titlebar_revealed { "titlebar" },
                         style: titlebar_wrapper_style(
                             titlebar_auto_hide_enabled,
                             titlebar_revealed,
@@ -52958,6 +53197,16 @@ fn app() -> Element {
                             let row = row.clone();
                             move |id: String| dispatch_row_menu_action(state, row.clone(), id)
                         },
+                    }
+                }
+                // F.1: while any whole-viewport transient chrome is up, one
+                // full-window cover routes ALL input to the shell (see
+                // `chrome_transient_over_viewport`). Invisible and
+                // pointer-events:none — it only feeds the input region.
+                if chrome_transient_over_viewport(&snapshot) {
+                    div {
+                        "data-covers-web-surface": "transient-chrome",
+                        style: "position:fixed; inset:0; pointer-events:none; background:transparent; z-index:0;",
                     }
                 }
                 if let Some(pending_delete) = snapshot.pending_delete.clone() {
@@ -69050,15 +69299,19 @@ fn TerminalCanvas(
                         // surface paints; no rect (session switched away, start
                         // page, other view mode) hides the surface.
                         div {
-                            // Inset + rounded to MATCH the terminal viewport frame
-                            // (`.yggterm-term-focused`: margin 4px, radius 10px),
-                            // which sits inside the same container this page area
-                            // fills. Without the 4px margin the native child webview
-                            // placed on this rect paints the full container box, so
-                            // its square corners overflow the rounded frame by 4px
-                            // at all four corners (a native widget cannot be clipped
-                            // by CSS border-radius, so the margin is what tucks it
-                            // inside the frame). [[campaign-libyggterm]] #10.
+                            // LEGACY: inset + rounded to MATCH the terminal
+                            // viewport frame (`.yggterm-term-focused`: margin
+                            // 4px, radius 10px). A legacy native child webview
+                            // paints the full container box and cannot be
+                            // clipped by CSS border-radius, so the margin is
+                            // what tucks its square corners inside the frame
+                            // ([[campaign-libyggterm]] #10 — the interim
+                            // inset). UNDER GLASS the margin is cleared
+                            // (WEB_UNDER_GLASS_CSS margin:0): the page fills
+                            // the frame edge-to-edge and the app-background
+                            // layer's ROUNDED paint hole molds its corners
+                            // (WEB_UNDER_GLASS_CORNER_RADIUS_PX) — the F.1
+                            // molded frame, no inset gap.
                             style: "flex:1 1 auto; min-height:0; margin:4px; border-radius:10px; background:#ffffff;",
                             "data-ws-page": "{web_surface_session_path}",
                         }
@@ -94009,6 +94262,48 @@ mod tests {
         );
     }
 
+    // The switch flash (user report 2026-07-19, under glass): a backgrounded
+    // surface's declares are not read, so its last_seen ages while the app is
+    // healthy. The overlay must render the INSTANT the session is foregrounded
+    // (reads-since grace), not after the first read heartbeat lands — that gap
+    // showed the bare terminal for ~2s on every switch to an ychrome session.
+    #[test]
+    fn a_just_foregrounded_stale_surface_renders_its_overlay_immediately() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        seed_web_surface(&mut shell, "local://ws");
+        // Long after the stale window; the reads clock still names the
+        // PREVIOUS session (the sweep has not ticked since the switch).
+        shell.sidebar_reads_live_since = Some(("local://other".to_string(), 500));
+        let now = 1_000 + WEB_SURFACE_STALE_AFTER_MS * 4;
+        assert!(
+            shell
+                .web_surface_overlay_for_session("local://ws", now)
+                .is_some(),
+            "reads started at the switch instant; an aged last_seen proves nothing"
+        );
+        assert!(shell.has_live_web_surface("local://ws", now));
+        assert!(shell.active_web_surface_is_live(now));
+        // The sweep must not reap it either: the first post-switch OSC event
+        // runs the sweep BEFORE the heartbeat upsert lands.
+        shell.sweep_stale_web_surfaces(now);
+        assert!(shell.web_surfaces.contains_key("local://ws"));
+        // Once the clock names this session and a full stale window of LIVE
+        // listening passes with no declare, the app is honestly gone.
+        shell.sidebar_reads_live_since = Some(("local://ws".to_string(), now));
+        let dead_at = now + WEB_SURFACE_STALE_AFTER_MS + 1;
+        assert!(
+            shell
+                .web_surface_overlay_for_session("local://ws", dead_at)
+                .is_none(),
+            "the grace is a listening window, not immortality"
+        );
+        shell.sweep_stale_web_surfaces(dead_at);
+        assert!(
+            !shell.web_surfaces.contains_key("local://ws"),
+            "a dead app's surface still expires after live listening"
+        );
+    }
+
     /// The nested-tenant rail bug fixture: a contribution declaring a RAIL
     /// pane, so `active_session_offers_pane` has something real to answer.
     fn shell_with_rail_pane(session_path: &str, pane_id: &str, now_ms: u64) -> ShellState {
@@ -94077,12 +94372,15 @@ mod tests {
 
         // Simulate being on a session that does NOT serve the pane by
         // expiring the contribution's freshness beyond the stale window
-        // (active_sidebar_panes is freshness-gated, so offers=false).
+        // (active_sidebar_panes is freshness-gated, so offers=false). The
+        // reads clock must name the session with an ancient `since`, or the
+        // reads-since grace treats the aged last_seen as an unread artifact.
         shell
             .sidebar_contributions
             .get_mut("local://app")
             .unwrap()
             .last_seen_ms = 0;
+        shell.sidebar_reads_live_since = Some(("local://app".to_string(), 0));
         assert!(!shell.active_session_offers_pane("notes"));
 
         shell.set_right_panel_mode(RightPanelMode::Metadata);
@@ -94392,6 +94690,10 @@ mod tests {
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+        // We have been LISTENING to this session the whole time (the
+        // reads-since grace only shields a just-foregrounded session whose
+        // declares were not being read).
+        shell.sidebar_reads_live_since = Some(("local://ws".to_string(), 1_000));
 
         // Heartbeats fresh → the rail holds.
         assert_eq!(
@@ -96994,9 +97296,104 @@ mod tests {
             "the geometry eval SAMPLES ONLY — no DOM mutation, ever \
              (incident-f0-transparency-chain-app-wide-break)"
         );
-        // F.0 keeps the titlebar clamp; deleting it is F.1 work that must
-        // arrive together with the covers-driven input region for the reveal.
-        assert!(js.contains("clampTop"));
+        // F.1: the clamp is DEAD under glass (the titlebar floats over the
+        // page as a cover; the page rect must not move on reveal) and ALIVE
+        // in legacy stacking (dipping the page is the only visible reveal
+        // there). Both halves are load-bearing — losing the underGlass gate
+        // re-introduces the reveal reflow; losing clampTop breaks legacy.
+        assert!(
+            js.contains("const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';"),
+            "the clamp must be gated on the under-glass stamp"
+        );
+        assert!(
+            js.contains("underGlass ? null"),
+            "under glass the titlebar is never sampled for a clamp"
+        );
+        assert!(js.contains("clampTop"), "legacy keeps the clamp");
+    }
+
+    // F.1 T8 tripwire: the synchronous cover observer must sample the SAME
+    // covers vocabulary as the tick's geometry eval (one selector, two
+    // cadences), and — like the eval — must never mutate the DOM.
+    #[test]
+    fn a_cover_observer_samples_the_same_covers_and_never_mutates() {
+        let js = WEB_SURFACE_COVER_OBSERVER_JS;
+        assert!(
+            js.contains("querySelectorAll('[data-covers-web-surface]')"),
+            "the observer and the geometry eval must share the covers selector"
+        );
+        assert!(
+            js.contains("ResizeObserver") && js.contains("MutationObserver"),
+            "mount/unmount (mutation) AND resize (the titlebar reveal \
+             transition) must both push"
+        );
+        assert!(
+            !js.contains("style.") && !js.contains("setAttribute"),
+            "the cover observer SAMPLES ONLY — no DOM mutation, ever"
+        );
+    }
+
+    // F.1 T10 tripwire: under glass a modal no longer stashes the surface —
+    // it relies on the full-window transient cover for input. Every modal
+    // `has_modal_over_viewport` counts must therefore also open the
+    // transient cover, or it becomes a click-through window over a page.
+    #[test]
+    fn every_over_viewport_modal_opens_the_transient_cover() {
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        assert!(!shell.has_modal_over_viewport());
+        assert!(!chrome_transient_over_viewport(&shell.snapshot()));
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut ShellState)>)> = vec![
+            (
+                "pending_delete",
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_delete = Some(PendingDeleteDialog {
+                        document_paths: Vec::new(),
+                        group_paths: Vec::new(),
+                        session_paths: Vec::new(),
+                        ssh_machine_keys: Vec::new(),
+                        labels: Vec::new(),
+                        hard_delete: false,
+                        live_session_close: false,
+                        live_session_bulk_close: false,
+                        live_session_unkept_paths: Vec::new(),
+                    });
+                }),
+            ),
+            (
+                "copy_edit_dialog",
+                Box::new(|shell: &mut ShellState| {
+                    shell.copy_edit_dialog = Some(CopyEditDialog {
+                        field: CopyEditField::Title,
+                        session_path: "local://ws".to_string(),
+                        session_id: String::new(),
+                        cwd: String::new(),
+                        title: String::new(),
+                        value: String::new(),
+                    });
+                }),
+            ),
+            (
+                "pending_classic_tabs_switch",
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_classic_tabs_switch = true;
+                }),
+            ),
+        ];
+        for (name, arm) in cases {
+            let mut shell = shell_with_contribution("local://ws", 1_000);
+            arm(&mut shell);
+            assert!(
+                shell.has_modal_over_viewport(),
+                "{name}: expected an over-viewport modal"
+            );
+            assert!(
+                chrome_transient_over_viewport(&shell.snapshot()),
+                "{name}: an over-viewport modal MUST open the transient cover \
+                 (click-through modal under glass otherwise)"
+            );
+        }
+        let _ = &mut shell;
     }
 
     #[test]
@@ -97010,7 +97407,10 @@ mod tests {
             "[data-web-surface-owns-viewport=\"true\"] { background: transparent !important; }",
             "[data-ws-frame=\"1\"] { background: transparent !important; }",
             "[data-ws-overlay=\"1\"] { background: transparent !important; }",
-            "[data-ws-page] { background: transparent !important; }",
+            // F.1 molded frame: the interim 4px inset dies under glass — the
+            // page fills to the frame edge and the rounded paint hole molds
+            // its corners instead.
+            "[data-ws-page] { background: transparent !important; margin: 0 !important; }",
             "[data-ws-pinned-session] { background: transparent !important; }",
             "#yggterm-shell-root { background: transparent !important; }",
         ] {
@@ -97042,10 +97442,22 @@ mod tests {
             under_glass_paint_holes_css(&[(5, 5, 0, 10), (5, 5, 10, -1)]),
             None
         );
+        // F.1 molded frame: each hole is a ROUNDED rect (radius 10, clamped
+        // to half the short side) so the app-bg layer paints the corner
+        // wedges over the page — the frame cuts the page's square corners.
         let path = under_glass_paint_holes_css(&[(100, 40, 800, 600), (10, 10, 20, 20)]).unwrap();
         assert_eq!(
             path,
-            "path(evenodd, \"M0 0H32767V32767H0ZM100 40h800v600h-800ZM10 10h20v20h-20Z\")"
+            "path(evenodd, \"M0 0H32767V32767H0Z\
+             M110 40h780a10 10 0 0 1 10 10v580a10 10 0 0 1 -10 10h-780a10 10 0 0 1 -10 -10v-580a10 10 0 0 1 10 -10Z\
+             M20 10h0a10 10 0 0 1 10 10v0a10 10 0 0 1 -10 10h-0a10 10 0 0 1 -10 -10v-0a10 10 0 0 1 10 -10Z\")"
+        );
+        // The radius clamps to the short side, never inverting the geometry.
+        let tiny = under_glass_paint_holes_css(&[(0, 0, 8, 30)]).unwrap();
+        assert_eq!(
+            tiny,
+            "path(evenodd, \"M0 0H32767V32767H0Z\
+             M4 0h0a4 4 0 0 1 4 4v22a4 4 0 0 1 -4 4h-0a4 4 0 0 1 -4 -4v-22a4 4 0 0 1 4 -4Z\")"
         );
     }
 
