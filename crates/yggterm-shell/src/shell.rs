@@ -2196,6 +2196,12 @@ const WEB_SURFACE_CLOSE_GHOST_GRACE_MS: u64 = 5_000;
 /// Reconcile cadence while any surface exists; geometry follows layout
 /// changes (sidebar resize, window resize, tab/session switch) within a tick.
 const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
+/// Switch-kick granularity: while waiting out a tick the loop checks the
+/// active session/view at this beat and wakes early on a change, so the
+/// page hole + reveal ride the FIRST post-switch tick instead of one up to
+/// a full tick later (chrome mounts render-time; the page swap waits on
+/// this loop — the visible lag on session switch).
+const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 16;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
 /// A native surface as last applied to the compositor: the reconciler's
@@ -2230,6 +2236,20 @@ struct AppliedWebSurface {
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
     page_title: String,
+}
+/// Whether backgrounding a session's surface DETACHES its webview from the
+/// overlay (hard stash) or leaves it attached, composited below the glass
+/// (soft stash — the container is demoted to the bottom of the page stack
+/// instead). Under glass the opaque app-background layer covers every page
+/// that has no hole, so a backgrounded page is invisible WITHOUT detaching —
+/// and staying attached is what makes switch-back instant: the pixels are
+/// already composited when the hole is cut, instead of a GTK re-map +
+/// WebKit re-composite (the ~2s terminal/backdrop flash on every switch to
+/// a web session). A LEGACY surface draws above all DOM and nothing short
+/// of unmapping reliably clears its pixels (the stuck-composite /
+/// reload-white family) — legacy must keep the detach.
+fn web_surface_background_detach(under_glass: bool) -> bool {
+    !under_glass
 }
 /// How long a backgrounded session's surface stays alive (stashed, page state
 /// intact) before it is destroyed. `~/.yggterm/web-surface.json`
@@ -2818,6 +2838,17 @@ fn web_surface_tab_place_rect(
 ///     host) loses its frame background AND hides its xterm canvas (opaque
 ///     pixels behind the overlay — `visibility:hidden`, not `display`, so the
 ///     xterm resize family never wakes);
+///   - the host's BORING-REVEAL covers stand down too: the reveal ghost
+///     (`.yggterm-reveal-ghost`, a snapshot canvas of the prior terminal
+///     frame, held ~2.4s on remount) and the cold-mount veil
+///     (`.yggterm-cold-mount-veil`) are SIBLINGS of `.xterm` inside the host,
+///     so hiding `.xterm` alone left them painting a stale TERMINAL frame
+///     over the page hole for seconds on every switch to a web session (the
+///     switch-flash class, live-caught 2026-07-19). When a live web surface
+///     owns the viewport the page IS the reveal — no terminal cover may
+///     paint. Keyed on the same stamp, so the covers work unchanged for
+///     plain terminals and self-hide even when they attach before the
+///     overlay mounts;
 ///   - the viewport frame wrapper (`data-ws-frame`, stamped only while a live
 ///     web surface owns the viewport) loses its `web_frame_bg` fill — the tab
 ///     strip self-paints its tint over that fill (render-time, both modes) so
@@ -2842,6 +2873,8 @@ fn web_surface_tab_place_rect(
 const WEB_UNDER_GLASS_CSS: &str = r#"
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
+:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .yggterm-reveal-ghost { visibility: hidden; }
+:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .yggterm-cold-mount-veil { visibility: hidden; }
 :root[data-under-glass="1"] [data-ws-frame="1"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-ws-overlay="1"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-ws-page] { background: transparent !important; margin: 0 !important; }
@@ -3358,7 +3391,14 @@ async fn web_surface_native_reconcile_loop(
                 } else if let Some(entry) = applied.get_mut(&key)
                     && entry.stashed_at_ms.is_none()
                 {
-                    let _ = desktop.stash_web_surface(entry.native_id);
+                    if web_surface_background_detach(under_glass) {
+                        let _ = desktop.stash_web_surface(entry.native_id);
+                    } else {
+                        // Soft stash: stays attached below the glass (the
+                        // reveal is "cut the hole" over live pixels), demoted
+                        // so it can never occlude the active page's hole.
+                        let _ = desktop.demote_web_surface(entry.native_id);
+                    }
                     entry.stashed_at_ms = Some(now_ms);
                     entry.visible = false;
                     // A stashed surface stops being polled for page state, so a
@@ -3384,6 +3424,7 @@ async fn web_surface_native_reconcile_loop(
                             "tab_id": key.1,
                             "native_id": entry.native_id,
                             "hold_ms": hold_ms,
+                            "detached": web_surface_background_detach(under_glass),
                         }),
                     );
                 }
@@ -3982,7 +4023,34 @@ async fn web_surface_native_reconcile_loop(
             }
         }
         publish_web_surface_native_ids(&applied);
-        sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
+        // Tick pacing with a SWITCH KICK. Chrome mounts on the FIRST render
+        // after a session/view switch (the overlay gate is render-time), but
+        // the page hole + reveal ride THIS loop — a plain tick sleep leaves
+        // the page area visibly lagging the chrome. Wake within one beat of
+        // the active session or view mode changing; one extra beat lets that
+        // render flush so the geometry eval sees the new overlay's rect.
+        let baseline_view_mode = {
+            let shell = state.peek();
+            shell.server.active_view_mode()
+        };
+        let baseline_session: Option<String> = {
+            let shell = state.peek();
+            shell.server.active_session_path().map(str::to_string)
+        };
+        let mut waited_ms = 0u64;
+        while waited_ms < WEB_SURFACE_RECONCILE_TICK_MS {
+            sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_BEAT_MS)).await;
+            waited_ms += WEB_SURFACE_RECONCILE_BEAT_MS;
+            let switched = {
+                let shell = state.peek();
+                shell.server.active_view_mode() != baseline_view_mode
+                    || shell.server.active_session_path() != baseline_session.as_deref()
+            };
+            if switched {
+                sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_BEAT_MS)).await;
+                break;
+            }
+        }
     }
 }
 fn web_surface_url_is_loopback(url: &str) -> bool {
@@ -97405,6 +97473,11 @@ mod tests {
         let css = WEB_UNDER_GLASS_CSS;
         for needle in [
             "[data-web-surface-owns-viewport=\"true\"] { background: transparent !important; }",
+            // The boring-reveal covers are siblings of .xterm inside the
+            // host — hiding .xterm alone leaves them painting a stale
+            // terminal frame over the page hole for seconds on switch.
+            "[data-web-surface-owns-viewport=\"true\"] .yggterm-reveal-ghost { visibility: hidden; }",
+            "[data-web-surface-owns-viewport=\"true\"] .yggterm-cold-mount-veil { visibility: hidden; }",
             "[data-ws-frame=\"1\"] { background: transparent !important; }",
             "[data-ws-overlay=\"1\"] { background: transparent !important; }",
             // F.1 molded frame: the interim 4px inset dies under glass — the
@@ -97431,6 +97504,20 @@ mod tests {
                 "under-glass rule not keyed on the root stamp: {line}"
             );
         }
+    }
+
+    // Under glass the backgrounding stash is SOFT: the webview stays
+    // attached (demoted to the bottom of the page stack) and composited
+    // under the opaque glass, so switch-back is "cut the hole" over
+    // already-live pixels — no GTK re-map, no WebKit re-composite, no
+    // seconds-long terminal/backdrop flash on every switch to a web
+    // session. Legacy stacking MUST keep the detach: a legacy surface
+    // draws above all DOM and only unmapping clears its pixels (the
+    // stuck-composite / reload-white family).
+    #[test]
+    fn a_under_glass_backgrounding_never_detaches_the_webview() {
+        assert!(web_surface_background_detach(false));
+        assert!(!web_surface_background_detach(true));
     }
 
     #[test]
