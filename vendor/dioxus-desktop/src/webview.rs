@@ -602,14 +602,21 @@ impl WebviewInstance {
                 web_surface_overlay,
                 web_surface_backdrop.clone().upcast(),
             );
-            // Self-probe, structural v1: env override + engine version gate
-            // (in-widget DMABuf renderer landed by 2.40; the nested-compositor
-            // subsurface era is long gone) now, native-window walk per opened
-            // surface later (WebSurfaceHost::open). Failure at any stage
-            // demotes to legacy stacking at runtime — the safety direction.
-            let force_legacy = std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK")
+            // Under-glass is OPT-IN until F.0.1 lands: the transparency-chain
+            // hole needs the background-ownership consolidation (see
+            // docs/web-under-glass.md + the 2026-07-19 incident — the runtime
+            // chain-clearing broke the live GUI app-wide). Arming requires
+            // YGGTERM_WEB_SURFACE_UNDER_GLASS=1; the LEGACY_STACK override
+            // still force-disables on top of that. Self-probe, structural v1:
+            // engine version gate now, native-window walk per opened surface
+            // later (WebSurfaceHost::open); failure demotes at runtime.
+            let opt_in = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+            let force_legacy = !opt_in
+                || std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
             let engine_ok = {
                 // Runtime engine version, not the build-time API version — the
                 // in-widget DMABuf renderer the restack relies on landed by 2.40.

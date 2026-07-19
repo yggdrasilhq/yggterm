@@ -2803,6 +2803,16 @@ fn web_surface_tab_place_rect(
 /// page, and view-mode changes. Surfaces are created lazily on first
 /// visibility and destroyed when their (session, tab) leaves the map (close,
 /// sweep, tab close — those paths only mutate the map).
+/// Under-glass paint discipline for the glass DOM. The terminal host under an
+/// active web overlay is HIDDEN (visibility, not display — layout must not
+/// move, or the xterm resize family wakes up): its canvases are opaque pixels
+/// that would occlude the page webview below the hole. Keyed on the root
+/// under-glass stamp so a runtime probe demotion restores the terminal with
+/// no re-render.
+const WEB_UNDER_GLASS_CSS: &str = r#"
+:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { visibility: hidden; }
+"#;
+
 /// The reconciler's per-tick geometry + visibility oracle, as one script:
 /// page/pinned rects (placement AND under-glass input holes ride the same
 /// sample — the SSOT rule), `data-covers-web-surface` rects, and the
@@ -2858,30 +2868,14 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
             ]);
         }
     }
-    // Under-glass transparency chain: the page shows THROUGH the
-    // shell, so the hole element and every ancestor whose
-    // background would paint over its rect must be transparent.
-    // Ancestors are anonymous inline-styled divs, so the chain is
-    // cleared here (originals remembered for demotion restore)
-    // rather than via brittle CSS selectors. Idempotent per
-    // element via data-ug-cleared.
-    const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';
-    for (const el of document.querySelectorAll('[data-ws-page],[data-ws-pinned-session]')) {
-        let node = el;
-        while (node) {
-            if (underGlass && node.dataset.ugCleared !== '1') {
-                node.dataset.ugCleared = '1';
-                node.dataset.ugBg = node.style.background || '';
-                node.style.background = 'transparent';
-            } else if (!underGlass && node.dataset.ugCleared === '1') {
-                node.style.background = node.dataset.ugBg || '';
-                delete node.dataset.ugCleared;
-                delete node.dataset.ugBg;
-            }
-            if (node === document.documentElement) { break; }
-            node = node.parentElement;
-        }
-    }
+    // NO transparency-chain mutation here. The first version walked
+    // [data-ws-page] ancestors setting inline transparent backgrounds —
+    // shared app containers included — and broke the live GUI app-wide
+    // (2026-07-19 incident: Dioxus re-renders fight inline mutations, and
+    // the restore branch dies with this eval when surfaces close). The
+    // under-glass hole is F.0.1 work: render-time conditional styling from
+    // a snapshot flag + a single owner for app background painting. This
+    // eval SAMPLES ONLY.
     dioxus.send({pages: out, pinned: pinned, covers: covers});
 })();"#;
 
@@ -51786,6 +51780,7 @@ fn app() -> Element {
                 evt.stop_propagation();
             },
             style { "{TOAST_CSS}" }
+            style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
             style { "{WEB_SURFACE_VTAB_CSS}" }
             style { "{shell_document_css}" }
@@ -68389,6 +68384,18 @@ fn TerminalCanvas(
     let web_surface_overlay = state.with(|shell| {
         shell.web_surface_overlay_for_session(&session.session_path, current_millis())
     });
+    // Under glass, the terminal host beneath an active web overlay must not
+    // paint: the xterm canvases are opaque PIXELS inside the glass, and
+    // anything opaque in the glass DOM occludes the page webview below the
+    // hole (live-caught on the first F.0 deploy — the page area showed the
+    // terminal). Pre-Phase-F the native page floated above all DOM, which
+    // hid this. The stamp is inert in legacy stacking: the CSS rule that
+    // consumes it (WEB_UNDER_GLASS_CSS) keys on :root[data-under-glass="1"],
+    // so a runtime probe demotion un-hides the terminal instantly. Picker
+    // mode keeps the terminal visible (no native page exists to reveal).
+    let web_surface_owns_viewport_host = web_surface_overlay
+        .as_ref()
+        .is_some_and(|overlay| overlay.picker_control_url.is_none());
     // Chrome + frame colours for a web surface follow the app's appearance (Light
     // by default); a terminal keeps the terminal theme. `web_frame_bg` repaints
     // the viewport frame that used to draw the dark "border" around a light page;
@@ -68504,6 +68511,11 @@ fn TerminalCanvas(
                         "false"
                     },
                     "data-document-surface-owns-viewport": if document_surface_owns_viewport {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    "data-web-surface-owns-viewport": if web_surface_owns_viewport_host {
                         "true"
                     } else {
                         "false"
@@ -96765,12 +96777,11 @@ mod tests {
 
     #[test]
     fn a_web_surface_geometry_eval_samples_covers_and_maintains_the_transparency_chain() {
-        // Phase F tripwires: the ONE geometry sample must also carry the
-        // under-glass machinery — covers for the input region (a toast over a
-        // page must stay clickable), and the transparency-chain maintenance
-        // that makes the page visible through the glass at all. Losing any of
-        // these silently reverts an under-glass symptom, so they are pinned
-        // here like the declare-forwarder fields.
+        // Phase F tripwires: the ONE geometry sample must carry the covers
+        // for the input region (a toast over a page must stay clickable),
+        // and it must NEVER mutate the DOM — the 2026-07-19 incident came
+        // from this eval clearing shared ancestor backgrounds inline
+        // (app-wide breakage, unrestorable once the eval stops running).
         let js = WEB_SURFACE_GEOMETRY_EVAL_JS;
         assert!(
             js.contains("querySelectorAll('[data-covers-web-surface]')"),
@@ -96781,16 +96792,9 @@ mod tests {
             "covers must ride the same send as the page rects"
         );
         assert!(
-            js.contains("data-under-glass"),
-            "the transparency chain must key on the under-glass stamp"
-        );
-        assert!(
-            js.contains("ugCleared") && js.contains("ugBg"),
-            "chain clearing must be idempotent and reversible (demotion restore)"
-        );
-        assert!(
-            js.contains("'[data-ws-page],[data-ws-pinned-session]'"),
-            "pinned panes get the same transparency chain as page areas"
+            !js.contains("style.background") && !js.contains("ugCleared"),
+            "the geometry eval SAMPLES ONLY — no DOM mutation, ever \
+             (incident-f0-transparency-chain-app-wide-break)"
         );
         // F.0 keeps the titlebar clamp; deleting it is F.1 work that must
         // arrive together with the covers-driven input region for the reveal.
