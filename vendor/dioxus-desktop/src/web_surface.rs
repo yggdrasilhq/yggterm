@@ -311,6 +311,17 @@ pub struct WebSurfaceHost {
     /// Style provider on the overlay's base child (the native backdrop):
     /// `set_backdrop_color` reloads it with the theme background color.
     backdrop_css: gtk::CssProvider,
+    /// Same theme color, painted by EVERY surface container's draw handler
+    /// (GtkFixed renders no CSS background — it needs an explicit fill): an
+    /// unpainted webview (fresh create, first load in flight) composites
+    /// nothing under DMABuf, and with backgrounded pages left attached under
+    /// the glass (the soft stash) whatever sits below would show through the
+    /// hole — a STALE OTHER PAGE, not the backdrop (live-caught: a new
+    /// surface's hole showed the previous session's page until first paint).
+    /// The fill restores the first-paint contract: theme background until
+    /// the page's first frame. `None` (legacy — `set_backdrop_color` only
+    /// runs under glass) draws nothing, exactly the old behavior.
+    backdrop_rgb: Rc<Cell<Option<(u8, u8, u8)>>>,
     /// The shell webview's container ("the glass") when Phase F under-glass
     /// stacking is active: pages sit BELOW it, chrome DOM draws over them, and
     /// an input-shape hole per page routes pointer events through. `None` =
@@ -638,6 +649,29 @@ fn clear_glass_input_shape(glass: &gtk::Widget) {
     apply_input_region_up_to_toplevel(glass, &region);
 }
 
+/// Paint the theme backdrop under a surface's webview (see `backdrop_rgb`):
+/// a normal `connect_draw` handler runs BEFORE the class closure that draws
+/// the children, so the fill lands beneath the webview, never over it.
+/// GtkFixed renders no CSS background of its own, hence cairo. `None` (the
+/// legacy default — only the under-glass reconcile path sets a color) draws
+/// nothing at all.
+fn install_container_fill(container: &gtk::Fixed, backdrop_rgb: &Rc<Cell<Option<(u8, u8, u8)>>>) {
+    let backdrop_rgb = backdrop_rgb.clone();
+    container.connect_draw(move |widget, cr| {
+        if let Some((r, g, b)) = backdrop_rgb.get() {
+            let alloc = widget.allocation();
+            cr.set_source_rgb(
+                r as f64 / 255.0,
+                g as f64 / 255.0,
+                b as f64 / 255.0,
+            );
+            cr.rectangle(0.0, 0.0, alloc.width() as f64, alloc.height() as f64);
+            let _ = cr.fill();
+        }
+        gtk::glib::Propagation::Proceed
+    });
+}
+
 fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
     use wry::WebViewExtUnix as _;
     let (w, h) = (w.max(1), h.max(1));
@@ -668,6 +702,7 @@ fn build_popup_webview(
     surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    backdrop_rgb: &Rc<Cell<Option<(u8, u8, u8)>>>,
     popup_id: u64,
     opener: &webkit2gtk::WebView,
     opener_bounds: (i32, i32, i32, i32),
@@ -686,6 +721,7 @@ fn build_popup_webview(
     container.set_margin_start(x.max(0));
     container.set_margin_top(y.max(0));
     container.set_size_request(w.max(1), h.max(1));
+    install_container_fill(&container, backdrop_rgb);
     overlay.add_overlay(&container);
     restack_glass(overlay, glass);
     container.show();
@@ -759,6 +795,7 @@ impl WebSurfaceHost {
         Self {
             overlay,
             backdrop_css,
+            backdrop_rgb: Rc::new(Cell::new(None)),
             glass: Rc::new(RefCell::new(None)),
             last_glass_holes: RefCell::new(None),
             surfaces: Rc::new(RefCell::new(HashMap::new())),
@@ -783,6 +820,12 @@ impl WebSurfaceHost {
         let css = format!("box {{ background-color: rgb({r},{g},{b}); }}");
         if let Err(error) = self.backdrop_css.load_from_data(css.as_bytes()) {
             tracing::warn!(?error, "web surface: backdrop css failed to load");
+        }
+        // Container draw-fill twin (see `backdrop_rgb`): repaint live
+        // containers so a theme change lands without waiting for damage.
+        self.backdrop_rgb.set(Some((r, g, b)));
+        for surface in self.surfaces.borrow().values() {
+            surface.container.queue_draw();
         }
     }
 
@@ -912,6 +955,7 @@ impl WebSurfaceHost {
         container.set_margin_start(x.max(0));
         container.set_margin_top(y.max(0));
         container.set_size_request(w.max(1), h.max(1));
+        install_container_fill(&container, &self.backdrop_rgb);
         self.overlay.add_overlay(&container);
         restack_glass(&self.overlay, &self.glass);
         container.show();
@@ -974,6 +1018,7 @@ impl WebSurfaceHost {
             let overlay = self.overlay.clone();
             let glass = self.glass.clone();
             let edge_motion = self.edge_motion.clone();
+            let backdrop_rgb = self.backdrop_rgb.clone();
             let ids = self.next_id.clone();
             let popup_scripts = userscripts.to_vec();
             let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
@@ -1003,6 +1048,7 @@ impl WebSurfaceHost {
                     &surfaces,
                     &close_requests,
                     &edge_motion,
+                    &backdrop_rgb,
                     popup_id,
                     &features.opener.webview,
                     bounds,
@@ -1223,18 +1269,40 @@ impl WebSurfaceHost {
         Ok(())
     }
 
-    /// Re-attach a stashed surface at the given bounds and show it.
+    /// Re-attach a stashed surface at the given bounds and show it. A
+    /// soft-stashed surface (under glass — never detached, see `demote`) is
+    /// RAISED instead: with backgrounded pages left attached, containers
+    /// overlap, and the revealed one must top the page stack (still below
+    /// the glass) or a stale background page shows through the hole.
     pub fn unstash(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
         let surfaces = self.surfaces.borrow();
         let s = surfaces.get(&id).ok_or("no such surface")?;
         if s.container.parent().is_none() {
             self.overlay.add_overlay(&s.container);
-            restack_glass(&self.overlay, &self.glass);
+        } else {
+            self.overlay.reorder_overlay(&s.container, -1);
         }
+        restack_glass(&self.overlay, &self.glass);
         apply_bounds(s, x, y, w, h);
         let _ = s.webview.set_visible(true);
         s.container.show_all();
         self.overlay.queue_resize();
+        Ok(())
+    }
+
+    /// Push surface `id`'s container to the BOTTOM of the page stack (still
+    /// above the overlay's base child). The under-glass soft stash: a
+    /// backgrounded page stays attached and composited — the opaque glass
+    /// covers it (no hole) — so switch-back needs no re-map/re-composite.
+    /// Demoting it keeps every later-revealed or popup-created page above
+    /// it; without this a backgrounded page (or its script popup, which
+    /// attaches topmost) would occlude the active page through the hole.
+    pub fn demote(&self, id: u64) -> Result<(), String> {
+        let surfaces = self.surfaces.borrow();
+        let s = surfaces.get(&id).ok_or("no such surface")?;
+        if s.container.parent().is_some() {
+            self.overlay.reorder_overlay(&s.container, 0);
+        }
         Ok(())
     }
 
