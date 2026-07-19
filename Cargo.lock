@@ -1046,6 +1046,7 @@ dependencies = [
  "tungstenite",
  "webbrowser",
  "webkit2gtk",
+ "webkit2gtk-sys",
  "wry",
 ]
 

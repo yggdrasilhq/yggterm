@@ -302,14 +302,25 @@ per-platform.
 
 Synthesized from the eng review + outside voice. Checkbox as shipped.
 
-- [ ] **T1 (P1)** — spike harness — keyboard round-trip extension (F.-1)
-- [ ] **T2 (P1)** — vendored host — restack + transparency + 3-writer
-      reorder + shell-last assertion (F.0)
-- [ ] **T3 (P1)** — vendored host — runtime self-probe + auto-fallback (F.0)
-- [ ] **T4 (P1)** — shell.rs — focus-cascade audit under new event flow (F.0 gate)
-- [ ] **T5 (P1)** — shell.rs — safety invariant: zero pages/error ⇒ shape removed (F.0)
-- [ ] **T6 (P2)** — shell.rs — coarse static covers for F.0 soak (toasts, KeyTips)
-- [ ] **T7 (P1)** — shell.rs — region assembly pure fn + 5 unit tests (F.1)
+- [x] **T1 (P1)** — spike harness — keyboard round-trip extension (F.-1) —
+      PASSED 2026-07-19 (page and shell each receive keys after their click;
+      Wayland injection needs a held virtual keyboard, `wtype -s 2500`)
+- [x] **T2 (P1)** — vendored host — restack + transparency + 3-writer
+      reorder (open/unstash/popup-create) — code landed, live proof pending
+- [x] **T3 (P1)** — vendored host — self-probe (env override + engine ≥2.40 +
+      Wayland native-window walk per surface open) + auto-demote — code landed
+- [x] **T4 (P1)** — shell.rs — focus-cascade audit: PASSES with no change.
+      The Rust reclaim already stands down when the active session has a live
+      web surface (`web_surface_owns_viewport`); page clicks never reach shell
+      DOM; the JS cascade's focus() is internal to the shell webview and
+      cannot yank GTK focus from a page webview (F.-1 proved the round-trip)
+- [x] **T5 (P1)** — safety invariant: zero pages ⇒ full region push (idle
+      path); empty-holes ⇒ full region in `glass_input_region`
+- [x] **T6 (P2)** — covers v1: `data-covers-web-surface` stamped on toast
+      CARDS (not the pointer-events:none stack root); KeyTips badges need no
+      cover (decorative, clicks should pass to the page)
+- [x] **T7 (P1)** — `glass_input_region` pure fn + 6 unit tests (pulled
+      forward from F.1 — cairo regions need no display)
 - [ ] **T8 (P1)** — shell.rs — synchronous cover push (MutationObserver) + apply-on-change (F.1)
 - [ ] **T9 (P1)** — shell.rs — motion observer → reveal logic; delete clamp (F.1)
 - [ ] **T10 (P1)** — shell.rs — modal stash retirement tied to covers (F.1)

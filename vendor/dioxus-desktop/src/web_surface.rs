@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::rc::Rc;
 
+use gtk::gdk;
 use gtk::prelude::*;
 use wry::{
     dpi::{LogicalPosition, LogicalSize, Position, Size},
@@ -307,6 +308,18 @@ pub struct SurfacePopup {
 /// `open_web_surface` / `web_surface_*` methods on `DesktopContext`.
 pub struct WebSurfaceHost {
     overlay: gtk::Overlay,
+    /// Style provider on the overlay's base child (the native backdrop):
+    /// `set_backdrop_color` reloads it with the theme background color.
+    backdrop_css: gtk::CssProvider,
+    /// The shell webview's container ("the glass") when Phase F under-glass
+    /// stacking is active: pages sit BELOW it, chrome DOM draws over them, and
+    /// an input-shape hole per page routes pointer events through. `None` =
+    /// legacy stacking (pages above the shell), either because the host was
+    /// built before `install_glass` ran or because the self-probe demoted it.
+    glass: Rc<RefCell<Option<gtk::Widget>>>,
+    /// Last input-hole set pushed to the glass — region pushes are gated on
+    /// change so the per-tick reconciler doesn't spam the compositor.
+    last_glass_holes: RefCell<Option<(Vec<(i32, i32, i32, i32)>, Vec<(i32, i32, i32, i32)>)>>,
     surfaces: Rc<RefCell<HashMap<u64, Surface>>>,
     /// Native surface ids. The HOST allocates them, because it is no longer the
     /// only thing that creates surfaces: a popup is born inside a WebKit signal
@@ -352,6 +365,165 @@ fn rect_logical(w: i32, h: i32) -> Rect {
 /// widget draws above all DOM; closing the rail left a gap. Neither was visible to
 /// `app screenshot`'s default backend, which composites the DOM and is blind to
 /// native children — only `--backend os` shows it.
+/// The glass input region, as a PURE function (the reconciler's rects in,
+/// cairo region out — unit-tested; the GdkWindow application is separate).
+/// Full window minus holes (page rects) plus covers (chrome declared over
+/// pages). Empty holes ⇒ the FULL region: the safety invariant — zero pages
+/// or any upstream doubt resolves to "chrome owns all input", never a dead
+/// zone in the chrome.
+fn glass_input_region(
+    full: (i32, i32),
+    holes: &[(i32, i32, i32, i32)],
+    covers: &[(i32, i32, i32, i32)],
+) -> cairo::Region {
+    let full = cairo::RectangleInt::new(0, 0, full.0.max(1), full.1.max(1));
+    let region = cairo::Region::create_rectangle(&full);
+    if !holes.is_empty() {
+        for &(x, y, w, h) in holes {
+            if w > 0 && h > 0 {
+                let _ = region.subtract_rectangle(&cairo::RectangleInt::new(x, y, w, h));
+            }
+        }
+        for &(x, y, w, h) in covers {
+            if w > 0 && h > 0 {
+                let _ = region.union_rectangle(&cairo::RectangleInt::new(x, y, w, h));
+            }
+        }
+    }
+    region
+}
+
+#[cfg(test)]
+mod glass_region_tests {
+    use super::glass_input_region;
+
+    fn contains(region: &cairo::Region, x: i32, y: i32) -> bool {
+        region.contains_point(x, y)
+    }
+
+    #[test]
+    fn a_single_hole_routes_its_rect_to_the_page_and_nothing_else() {
+        let region = glass_input_region((800, 600), &[(100, 100, 200, 150)], &[]);
+        assert!(!contains(&region, 200, 175), "hole center must pass through");
+        assert!(contains(&region, 50, 50), "chrome outside the hole stays shell");
+        assert!(contains(&region, 99, 100), "one px left of the hole stays shell");
+        assert!(!contains(&region, 100, 100), "hole top-left passes through");
+        assert!(contains(&region, 300, 100), "one px right of the hole stays shell");
+    }
+
+    #[test]
+    fn a_cover_over_a_hole_stays_shell_interactive() {
+        let region = glass_input_region(
+            (800, 600),
+            &[(100, 100, 400, 400)],
+            &[(250, 20, 320, 90)], // toast overlapping the hole's top edge
+        );
+        assert!(contains(&region, 300, 105), "covered strip inside the hole is shell");
+        assert!(!contains(&region, 300, 130), "uncovered hole below the toast passes");
+    }
+
+    #[test]
+    fn a_cover_fully_inside_a_hole_is_an_island() {
+        let region = glass_input_region(
+            (800, 600),
+            &[(0, 0, 800, 600)],
+            &[(300, 200, 200, 100)], // dialog floating over a full-bleed page
+        );
+        assert!(contains(&region, 400, 250), "dialog rect is shell");
+        assert!(!contains(&region, 100, 100), "page around the dialog passes");
+    }
+
+    #[test]
+    fn two_holes_and_a_pinned_pane_all_pass() {
+        let region = glass_input_region(
+            (800, 600),
+            &[(0, 0, 390, 600), (410, 0, 390, 600)],
+            &[],
+        );
+        assert!(!contains(&region, 100, 300), "left pane passes");
+        assert!(!contains(&region, 700, 300), "right pane passes");
+        assert!(contains(&region, 400, 300), "the gutter between panes stays shell");
+    }
+
+    #[test]
+    fn zero_holes_is_the_full_region_even_with_covers() {
+        let region = glass_input_region((800, 600), &[], &[(10, 10, 50, 50)]);
+        assert!(contains(&region, 5, 5));
+        assert!(contains(&region, 400, 300));
+        assert!(contains(&region, 799, 599), "full region: chrome owns everything");
+    }
+
+    #[test]
+    fn degenerate_rects_are_ignored() {
+        let region = glass_input_region((800, 600), &[(100, 100, 0, 150), (200, 200, 50, -1)], &[]);
+        assert!(contains(&region, 100, 150), "zero-width hole is ignored");
+        assert!(contains(&region, 225, 210), "negative-height hole is ignored");
+    }
+}
+
+/// Keep the glass the TOP overlay child. Called after every surface attach —
+/// `add_overlay` appends on top, so a page or popup attached after the glass
+/// would silently draw above the chrome (legacy stacking for that one
+/// surface). `reorder_overlay(.., -1)` moves the glass to the end.
+fn restack_glass(overlay: &gtk::Overlay, glass: &Rc<RefCell<Option<gtk::Widget>>>) {
+    let glass = glass.borrow();
+    if let Some(glass) = glass.as_ref() {
+        if glass.parent().is_some() {
+            overlay.reorder_overlay(glass, -1);
+        } else {
+            tracing::warn!("web surface: glass installed but not parented to the overlay");
+        }
+    }
+}
+
+/// Apply `region` as the input shape of `widget`'s GdkWindow and every
+/// ancestor window up to but EXCLUDING the toplevel (see
+/// `set_glass_input_holes` for why both bounds matter).
+fn apply_input_region_up_to_toplevel(widget: &gtk::Widget, region: &cairo::Region) {
+    let toplevel_window = widget.toplevel().and_then(|toplevel| toplevel.window());
+    let mut current = widget.window();
+    while let Some(window) = current {
+        if Some(&window) == toplevel_window.as_ref() {
+            break;
+        }
+        window.input_shape_combine_region(region, 0, 0);
+        current = window.parent();
+    }
+}
+
+/// The demotion itself (free fn: also called from probe closures that cannot
+/// hold `&self`). Existing pages sit at overlay indices above 0, so moving
+/// the glass to 0 restores pages-above-chrome for every open surface at once.
+fn demote_glass(overlay: &gtk::Overlay, glass: &Rc<RefCell<Option<gtk::Widget>>>) {
+    let glass = glass.borrow_mut().take();
+    if let Some(glass) = glass {
+        clear_glass_input_shape(&glass);
+        if glass.parent().is_some() {
+            overlay.reorder_overlay(&glass, 0);
+        }
+    }
+}
+
+/// Self-probe stage 2: any NATIVE GdkWindow inside a webview's window
+/// subtree means the engine is not compositing in-widget on this stack (a
+/// native child window on Wayland is a subsurface — it draws above the
+/// toplevel regardless of GTK z-order), so under-glass stacking cannot be
+/// trusted.
+fn window_subtree_has_native(window: &gdk::Window) -> bool {
+    if window.has_native() {
+        return true;
+    }
+    window.children().iter().any(window_subtree_has_native)
+}
+
+/// Reset the glass subtree's input shape to "everything" (used on demotion).
+fn clear_glass_input_shape(glass: &gtk::Widget) {
+    let alloc = glass.allocation();
+    let full = cairo::RectangleInt::new(0, 0, alloc.width().max(1), alloc.height().max(1));
+    let region = cairo::Region::create_rectangle(&full);
+    apply_input_region_up_to_toplevel(glass, &region);
+}
+
 fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
     use wry::WebViewExtUnix as _;
     let (w, h) = (w.max(1), h.max(1));
@@ -375,8 +547,10 @@ fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
 /// The page policy (userscripts, the passkey shim, the ad filter) is re-attached
 /// here, because a fresh view gets a fresh user-content manager. A popup with no
 /// passkey shim is precisely the window a passkey is needed in.
+#[allow(clippy::too_many_arguments)]
 fn build_popup_webview(
     overlay: &gtk::Overlay,
+    glass: &Rc<RefCell<Option<gtk::Widget>>>,
     surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     popup_id: u64,
@@ -398,6 +572,7 @@ fn build_popup_webview(
     container.set_margin_top(y.max(0));
     container.set_size_request(w.max(1), h.max(1));
     overlay.add_overlay(&container);
+    restack_glass(overlay, glass);
     container.show();
 
     let mut builder = WebViewBuilder::new()
@@ -457,14 +632,84 @@ fn build_popup_webview(
 }
 
 impl WebSurfaceHost {
-    pub(crate) fn new(overlay: gtk::Overlay) -> Self {
+    pub(crate) fn new(overlay: gtk::Overlay, backdrop: gtk::Widget) -> Self {
+        let backdrop_css = gtk::CssProvider::new();
+        backdrop.style_context().add_provider(
+            &backdrop_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
         Self {
             overlay,
+            backdrop_css,
+            glass: Rc::new(RefCell::new(None)),
+            last_glass_holes: RefCell::new(None),
             surfaces: Rc::new(RefCell::new(HashMap::new())),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
             close_requests: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// Paint the native backdrop (the overlay's base child) in the app's
+    /// theme background color. Under-glass pages sit above it, so it shows
+    /// only where a page hasn't painted yet — turning the first-paint flash
+    /// theme-colored instead of white.
+    pub fn set_backdrop_color(&self, r: u8, g: u8, b: u8) {
+        let css = format!("box {{ background-color: rgb({r},{g},{b}); }}");
+        if let Err(error) = self.backdrop_css.load_from_data(css.as_bytes()) {
+            tracing::warn!(?error, "web surface: backdrop css failed to load");
+        }
+    }
+
+    /// Arm under-glass stacking: remember the shell webview's container and
+    /// restack it to the TOP of the overlay. From here on, every surface
+    /// attach point restacks below it (the shell-topmost invariant — three
+    /// writers: `open`, `unstash`, popup-create).
+    pub(crate) fn install_glass(&self, glass: gtk::Widget) {
+        *self.glass.borrow_mut() = Some(glass);
+        restack_glass(&self.overlay, &self.glass);
+    }
+
+    /// Whether under-glass stacking is active (pages below the shell).
+    pub fn under_glass(&self) -> bool {
+        self.glass.borrow().is_some()
+    }
+
+    /// Apply the glass input region: full window minus `holes` plus `covers`
+    /// (all logical px, glass-local coords — the same coords the reconciler
+    /// samples off `[data-ws-page]`). Empty holes ⇒ the FULL region is
+    /// applied, i.e. the shape is effectively removed — the safety invariant:
+    /// any doubt resolves to "chrome owns all input, pages temporarily
+    /// mouse-unreachable", never a dead zone in the chrome.
+    ///
+    /// Shapes the glass's GdkWindow and every ancestor up to but EXCLUDING
+    /// the toplevel: GtkOverlay wraps each overlay child in an intermediate
+    /// GdkWindow with an empty event mask; left unshaped it still picks, and
+    /// GDK then bubbles unhandled events to the TOPLEVEL (an ancestor), never
+    /// the page (a sibling below). Never shape the toplevel itself — on X11
+    /// its parent is the root window and a shaped toplevel drops clicks
+    /// through the whole application. (Both spike-caught.)
+    pub fn set_glass_input_holes(
+        &self,
+        holes: &[(i32, i32, i32, i32)],
+        covers: &[(i32, i32, i32, i32)],
+    ) {
+        let glass = self.glass.borrow();
+        let Some(glass) = glass.as_ref() else {
+            return;
+        };
+        let key = (holes.to_vec(), covers.to_vec());
+        if self.last_glass_holes.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        let alloc = self.overlay.allocation();
+        let region = glass_input_region(
+            (alloc.width().max(1), alloc.height().max(1)),
+            holes,
+            covers,
+        );
+        apply_input_region_up_to_toplevel(glass, &region);
+        *self.last_glass_holes.borrow_mut() = Some(key);
     }
 
     /// The ONE allocator of native surface ids. The shell asks for one before
@@ -528,6 +773,7 @@ impl WebSurfaceHost {
         container.set_margin_top(y.max(0));
         container.set_size_request(w.max(1), h.max(1));
         self.overlay.add_overlay(&container);
+        restack_glass(&self.overlay, &self.glass);
         container.show();
 
         // Persistent per-profile storage when a jar is given; ephemeral
@@ -586,6 +832,7 @@ impl WebSurfaceHost {
             let surfaces = self.surfaces.clone();
             let close_requests = self.close_requests.clone();
             let overlay = self.overlay.clone();
+            let glass = self.glass.clone();
             let ids = self.next_id.clone();
             let popup_scripts = userscripts.to_vec();
             let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
@@ -611,6 +858,7 @@ impl WebSurfaceHost {
                     .unwrap_or((0, 0, 1, 1));
                 match build_popup_webview(
                     &overlay,
+                    &glass,
                     &surfaces,
                     &close_requests,
                     popup_id,
@@ -671,6 +919,43 @@ impl WebSurfaceHost {
                 .unwrap_or_else(|| std::path::PathBuf::from("compiled"));
             adblock::ensure_compiled(ruleset, &store_dir);
             adblock::attach(&webview);
+        }
+
+        // Self-probe stage 2, per surface: on Wayland, a native GdkWindow in
+        // the page webview's subtree is a subsurface — it draws above the
+        // toplevel regardless of GTK z-order, so under-glass stacking cannot
+        // be trusted and the host demotes itself to legacy. X11 native child
+        // windows honor restacking (spike-proven) and are not disqualifying.
+        // Deferred 1s: WebKit realizes its windows lazily.
+        if self.under_glass() {
+            let is_wayland = gdk::Display::default()
+                .map(|display| {
+                    use gtk::glib::prelude::ObjectExt as _;
+                    display.type_().name() == "GdkWaylandDisplay"
+                })
+                .unwrap_or(false);
+            if is_wayland {
+                let overlay = self.overlay.clone();
+                let glass = self.glass.clone();
+                let webkit = {
+                    use wry::WebViewExtUnix as _;
+                    webview.webview()
+                };
+                gtk::glib::timeout_add_seconds_local(1, move || {
+                    if glass.borrow().is_some() {
+                        if let Some(window) = webkit.window() {
+                            if window_subtree_has_native(&window) {
+                                tracing::warn!(
+                                    "web surface: native child window detected on Wayland — \
+                                     demoting to legacy stacking"
+                                );
+                                demote_glass(&overlay, &glass);
+                            }
+                        }
+                    }
+                    gtk::glib::ControlFlow::Break
+                });
+            }
         }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
@@ -784,6 +1069,7 @@ impl WebSurfaceHost {
         let s = surfaces.get(&id).ok_or("no such surface")?;
         if s.container.parent().is_none() {
             self.overlay.add_overlay(&s.container);
+            restack_glass(&self.overlay, &self.glass);
         }
         apply_bounds(s, x, y, w, h);
         let _ = s.webview.set_visible(true);

@@ -225,6 +225,84 @@ impl DesktopService {
         let _ = (id, x, y, w, h);
     }
 
+    /// Whether Phase F under-glass stacking is active: pages composite BELOW
+    /// the (transparent) shell webview, chrome DOM draws over them, and the
+    /// shell's input shape has a hole per page. `false` = legacy stacking
+    /// (env override, engine too old, or the runtime self-probe demoted it).
+    /// The shell DOM keys its page-hole transparency on this.
+    pub fn web_surface_under_glass(&self) -> bool {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            self.web_surface_host
+                .borrow()
+                .as_ref()
+                .map(|host| host.under_glass())
+                .unwrap_or(false)
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            false
+        }
+    }
+
+    /// Push the glass input holes (visible page rects) and cover rects
+    /// (chrome declared over pages) — logical px, window coords, from the
+    /// SAME reconciler geometry sample that places the surfaces. No-op in
+    /// legacy stacking. Change-gated inside the host.
+    pub fn set_web_surface_input_holes(
+        &self,
+        holes: &[(i32, i32, i32, i32)],
+        covers: &[(i32, i32, i32, i32)],
+    ) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_glass_input_holes(holes, covers);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (holes, covers);
+    }
+
+    /// Paint the native backdrop behind under-glass pages in the app's theme
+    /// background color (first-paint flash becomes theme-colored, not white).
+    pub fn set_web_surface_backdrop_color(&self, r: u8, g: u8, b: u8) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_backdrop_color(r, g, b);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (r, g, b);
+    }
+
     /// Set the WebKit page-zoom factor for an open web surface (1.0 == 100%).
     pub fn set_web_surface_zoom(&self, id: u64, factor: f64) {
         #[cfg(not(any(

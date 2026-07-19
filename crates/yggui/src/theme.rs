@@ -372,7 +372,7 @@ fn looks_like_hex_color(value: &str) -> bool {
         && bytes[1..].iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn hex_to_rgb(value: &str) -> Option<(u8, u8, u8)> {
+pub fn hex_to_rgb(value: &str) -> Option<(u8, u8, u8)> {
     if !looks_like_hex_color(value) {
         return None;
     }
