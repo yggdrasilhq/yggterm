@@ -1,9 +1,14 @@
 # Phase F — web surfaces under the glass
 
-**Status: F.0.1 COMPLETE — under-glass compositing works end-to-end on the dev
-sandbox (page through the hole, chrome over it, interactive, session-switch
-clean). Still OPT-IN (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`); next: jojo live
-proof, then F.1.**
+**Status: F.0.1 COMPLETE + JOJO LIVE PROOF PASSED (2026-07-19). Under-glass
+compositing verified on the live host: GUI-only restart with the arming env,
+`under_glass active:true`, no DMABuf-on-llvmpipe crash, faithful `--backend
+os` pixel of the meta-profile facebook surface — page fully rendered through
+the glass hole, sidebar + vertical-tabs rail chrome live around it, form
+interactive via web eval, terminals faithful, user viewport restored. Still
+OPT-IN per launch (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1` on the GUI env);
+remaining smokes: popup + passkey under glass, real pointer click through the
+input hole (user-observable), soak before making the env default. Next: F.1.**
 
 **F.0.1 RESOLUTION (2026-07-19 pt3, dev sandbox, real ychrome surface):**
 TWO stacked root causes, both fixed:
