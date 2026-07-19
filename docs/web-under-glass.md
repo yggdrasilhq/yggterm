@@ -1,14 +1,35 @@
 # Phase F — web surfaces under the glass
 
-**Status: F.0.1 COMPLETE + JOJO LIVE PROOF PASSED (2026-07-19). Under-glass
-compositing verified on the live host: GUI-only restart with the arming env,
-`under_glass active:true`, no DMABuf-on-llvmpipe crash, faithful `--backend
-os` pixel of the meta-profile facebook surface — page fully rendered through
-the glass hole, sidebar + vertical-tabs rail chrome live around it, form
-interactive via web eval, terminals faithful, user viewport restored. Still
-OPT-IN per launch (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1` on the GUI env);
-remaining smokes: popup + passkey under glass, real pointer click through the
-input hole (user-observable), soak before making the env default. Next: F.1.**
+**Status: F.1 IMPLEMENTED (2026-07-19, pending live proof). T8–T11 landed:
+the titlebar clamp is DEAD under glass (the geometry eval zeroes `clampTop`
+on the root stamp; legacy keeps it); reveal comes from the host GTK
+motion-notify observer on page webviews (`connect_edge_motion_observer`,
+Proceed-only, fires on top-edge zone entry → `__yggtermGlassEdgeMotion` in
+the shell webview → the normal reveal); the revealed titlebar declares
+`data-covers-web-surface` and the synchronous cover observer
+(`WEB_SURFACE_COVER_OBSERVER_JS`: MutationObserver + ResizeObserver →
+`set_web_surface_input_covers`, covers-only merge with the reconciler's last
+holes) pushes it out-of-tick; the modal stash is RETIRED under glass
+(`has_modal_over_viewport && !under_glass`) — every whole-viewport transient
+(titlebar menus, search dropdown, context menu, the four modals, theme
+editor) mounts ONE full-window pointer-events:none cover
+(`chrome_transient_over_viewport`), so outside clicks close menus instead of
+reaching the page; the molded frame ships as ROUNDED paint holes
+(`WEB_UNDER_GLASS_CORNER_RADIUS_PX` = 10) + the interim 4px `[data-ws-page]`
+inset cleared under glass (margin:0 in `WEB_UNDER_GLASS_CSS`). Companion fix:
+the switch flash (terminal visible ~2s) root-caused to surface liveness
+judging raw `last_seen_ms` — `session_reads_since` grace applied to overlay/
+has-live/sweep/panes. Still OPT-IN per launch
+(`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`); remaining smokes: F.1 acceptance on
+jojo + popup + passkey + real pointer click + soak. F.0.1 story below.**
+
+**Prior status: F.0.1 COMPLETE + JOJO LIVE PROOF PASSED (2026-07-19).
+Under-glass compositing verified on the live host: GUI-only restart with the
+arming env, `under_glass active:true`, no DMABuf-on-llvmpipe crash, faithful
+`--backend os` pixel of the meta-profile facebook surface — page fully
+rendered through the glass hole, sidebar + vertical-tabs rail chrome live
+around it, form interactive via web eval, terminals faithful, user viewport
+restored.**
 
 **F.0.1 RESOLUTION (2026-07-19 pt3, dev sandbox, real ychrome surface):**
 TWO stacked root causes, both fixed:
@@ -429,10 +450,27 @@ Synthesized from the eng review + outside voice. Checkbox as shipped.
       cover (decorative, clicks should pass to the page)
 - [x] **T7 (P1)** — `glass_input_region` pure fn + 6 unit tests (pulled
       forward from F.1 — cairo regions need no display)
-- [ ] **T8 (P1)** — shell.rs — synchronous cover push (MutationObserver) + apply-on-change (F.1)
-- [ ] **T9 (P1)** — shell.rs — motion observer → reveal logic; delete clamp (F.1)
-- [ ] **T10 (P1)** — shell.rs — modal stash retirement tied to covers (F.1)
-- [ ] **T11 (P2)** — tests — covers-attribute tripwire + transparency-chain tripwire (F.1)
+- [x] **T8 (P1)** — synchronous cover push: `WEB_SURFACE_COVER_OBSERVER_JS`
+      (MutationObserver + ResizeObserver, rAF-batched, change-gated) →
+      `web_surface_cover_push_loop` → `set_web_surface_input_covers` (host
+      merges with last-applied holes; one applier, one gate). Covers stamped:
+      revealed auto-hide titlebar + ONE full-window transient element
+      (`chrome_transient_over_viewport`: titlebar menus, search dropdown,
+      context menu, 4 modals, theme editor) + toast cards (F.0) — code
+      landed, live proof pending
+- [x] **T9 (P1)** — clamp deleted UNDER GLASS (geometry eval zeroes clampTop
+      on the root stamp; legacy keeps it; tripwire updated same commit);
+      host motion observer (`connect_edge_motion_observer`, Proceed, zone
+      entry only, event-time glass gate) → `__yggtermGlassEdgeMotion` →
+      `web_surface_edge_motion_reveal_loop` → the normal reveal — code
+      landed, live proof pending
+- [x] **T10 (P1)** — modal stash retired under glass
+      (`has_modal_over_viewport && !under_glass`); modal input rides the
+      full-window transient cover — ONE work item with T8, as specced
+- [x] **T11 (P2)** — tripwires: cover-observer samples the same selector +
+      never mutates; every `has_modal_over_viewport` member opens the
+      transient cover (list-drift tripwire); under-glass CSS coverage +
+      rounded-paint-holes pins updated
 - [ ] **T12 (P2)** — shell.rs — pane-focus click observer; split rings over pages (F.2)
 - [ ] **T13 (P3)** — docs/DESIGN.md — molded-frame vocabulary, opacity rule, capture docs (F.3)
 
