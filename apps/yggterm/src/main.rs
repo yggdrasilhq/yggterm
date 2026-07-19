@@ -3505,7 +3505,21 @@ fn configure_linux_webkit_compositing() {
             unsafe { std::env::set_var("GALLIUM_DRIVER", "llvmpipe") };
         }
     }
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+    // Phase F under-glass REQUIRES the DMABUF renderer (F.0.1 root cause,
+    // sandbox-proven): the SHM presentation path clears a transparent
+    // webview's regions straight through every sibling widget beneath — the
+    // glass hole punches through page webviews and backdrop to the window
+    // background, so the page can never show. The DMABUF path composites
+    // in-widget with alpha and works, INCLUDING over software GL (llvmpipe,
+    // the safety net above) — verified on the dev headless sandbox with a
+    // real surface. So: armed ⇒ leave the renderer at WebKit's default
+    // (DMABUF); unarmed ⇒ keep the historical SHM workaround for the hosts
+    // whose hardware EGL/DMABUF path crashed. If the env still forces SHM
+    // while armed, the vendored host demotes under-glass to legacy stacking.
+    let under_glass_armed = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !under_glass_armed && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
     }
 }

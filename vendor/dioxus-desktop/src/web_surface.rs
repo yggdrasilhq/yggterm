@@ -516,6 +516,70 @@ fn window_subtree_has_native(window: &gdk::Window) -> bool {
     window.children().iter().any(window_subtree_has_native)
 }
 
+/// Diagnostic (env `YGGTERM_WEB_SURFACE_DEBUG_TREE=1`): dump the overlay's
+/// widget children (order = paint order) and the toplevel GdkWindow subtree
+/// (order = stacking truth) to the log. The instrument that told us WHY an
+/// under-glass hole showed the compositor instead of the page.
+fn debug_dump_overlay_tree(overlay: &gtk::Overlay, label: &str) {
+    if std::env::var("YGGTERM_WEB_SURFACE_DEBUG_TREE").map(|v| v == "1") != Ok(true) {
+        return;
+    }
+    use gtk::glib::prelude::ObjectExt as _;
+    let mut lines = Vec::new();
+    for (index, child) in overlay.children().iter().enumerate() {
+        let alloc = child.allocation();
+        lines.push(format!(
+            "widget[{index}] {} visible={} mapped={} alloc=({},{} {}x{}) window={} app_paintable={}",
+            child.type_().name(),
+            child.is_visible(),
+            child.is_mapped(),
+            alloc.x(),
+            alloc.y(),
+            alloc.width(),
+            alloc.height(),
+            child.window().is_some(),
+            child.is_app_paintable(),
+        ));
+    }
+    fn walk(window: &gdk::Window, depth: usize, lines: &mut Vec<String>) {
+        let (x, y) = window.position();
+        let describe = |region: Option<cairo::Region>, label: &str| -> String {
+            match region {
+                Some(region) => {
+                    let first = (region.num_rectangles() > 0)
+                        .then(|| region.rectangle(0))
+                        .map(|r| format!("({},{} {}x{})", r.x(), r.y(), r.width(), r.height()))
+                        .unwrap_or_default();
+                    format!(
+                        "{label}[n={} empty={} {first}]",
+                        region.num_rectangles(),
+                        region.is_empty()
+                    )
+                }
+                None => format!("{label}[None]"),
+            }
+        };
+        let clip = describe(window.clip_region(), "clip");
+        let visible = describe(window.visible_region(), "vis");
+        lines.push(format!(
+            "{}gdkwin type={:?} pos=({x},{y}) size={}x{} visible={} native={} {clip} {visible}",
+            "  ".repeat(depth),
+            window.window_type(),
+            window.width(),
+            window.height(),
+            window.is_visible(),
+            window.has_native(),
+        ));
+        for child in window.children() {
+            walk(&child, depth + 1, lines);
+        }
+    }
+    if let Some(toplevel) = overlay.toplevel().and_then(|w| w.window()) {
+        walk(&toplevel, 0, &mut lines);
+    }
+    tracing::info!("web surface debug tree [{label}]:\n{}", lines.join("\n"));
+}
+
 /// Reset the glass subtree's input shape to "everything" (used on demotion).
 fn clear_glass_input_shape(glass: &gtk::Widget) {
     let alloc = glass.allocation();
@@ -921,6 +985,13 @@ impl WebSurfaceHost {
             adblock::attach(&webview);
         }
 
+        {
+            let overlay = self.overlay.clone();
+            gtk::glib::timeout_add_seconds_local(2, move || {
+                debug_dump_overlay_tree(&overlay, "post-open");
+                gtk::glib::ControlFlow::Break
+            });
+        }
         // Self-probe stage 2, per surface: on Wayland, a native GdkWindow in
         // the page webview's subtree is a subsurface — it draws above the
         // toplevel regardless of GTK z-order, so under-glass stacking cannot

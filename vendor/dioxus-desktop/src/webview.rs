@@ -616,6 +616,15 @@ impl WebviewInstance {
             let force_legacy = !opt_in
                 || std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK")
                     .map(|v| v == "1")
+                    .unwrap_or(false)
+                // The SHM presentation path cannot alpha-composite a webview
+                // over sibling widgets (F.0.1 root cause: it CLEARS the
+                // glass's transparent regions through page webviews and
+                // backdrop). main.rs skips setting this when under-glass is
+                // armed; if the environment still forces it, under-glass is
+                // structurally impossible — demote to legacy stacking.
+                || std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER")
+                    .map(|v| !v.is_empty() && v != "0")
                     .unwrap_or(false);
             let engine_ok = {
                 // Runtime engine version, not the build-time API version — the

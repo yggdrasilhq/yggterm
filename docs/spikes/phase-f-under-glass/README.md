@@ -43,3 +43,18 @@ Traps this spike caught (already baked into the plan):
 
 Run: `cargo build` here, launch under any compositor, click the hole
 center and the titlebar, watch stderr + a screenshot.
+
+## F.0.1 bisection knobs (2026-07-19)
+
+Used to isolate the production failure; all combinations PASS except the last:
+
+- `SPIKE_TREE=prod` — production widget tree (backdrop Box base child, page
+  webview in a `gtk::Fixed` overlay child, shell in a GtkBox overlay child
+  reordered topmost).
+- `SPIKE_WIN=rgba` — RGBA visual + app_paintable toplevel (tao-transparent).
+- `SPIKE_SHELL_AC=always` — hardware-acceleration-policy ALWAYS + real AC
+  content (WebGL canvas + 3D-transformed layer) in the shell.
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1` — **reproduces the app failure**: the
+  SHM presentation path clears the shell's transparent regions through the
+  page beneath (hole = black on an opaque window). This was the production
+  root cause — yggterm set it as an llvmpipe-crash workaround.
