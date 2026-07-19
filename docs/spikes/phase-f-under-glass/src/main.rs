@@ -31,6 +31,10 @@ window.addEventListener('click', () => {
   document.body.style.background = '#eecc00';
   document.title = 'page-clicked';
 });
+document.addEventListener('keydown', (e) => {
+  document.body.style.background = '#00aa44';
+  document.querySelector('h1').textContent = 'PAGE GOT KEY: ' + e.key;
+});
 </script></body>"#;
 
 const SHELL_HTML: &str = r#"<!doctype html><body style="margin:0;background:transparent">
@@ -45,6 +49,10 @@ const SHELL_HTML: &str = r#"<!doctype html><body style="margin:0;background:tran
 document.getElementById('tb').addEventListener('click', () => {
   document.getElementById('tb').style.background = '#d946ef';
   document.title = 'shell-clicked';
+});
+document.addEventListener('keydown', (e) => {
+  document.getElementById('tb').style.background = '#ff8800';
+  document.getElementById('tb').textContent = 'SHELL GOT KEY: ' + e.key;
 });
 </script></body>"#;
 
@@ -85,6 +93,14 @@ fn main() {
     });
     shell.connect_button_press_event(|_, ev| {
         eprintln!("spike: SHELL widget button-press at {:?}", ev.position());
+        glib::Propagation::Proceed
+    });
+    page.connect_key_press_event(|_, ev| {
+        eprintln!("spike: PAGE widget key-press {:?}", ev.keyval());
+        glib::Propagation::Proceed
+    });
+    shell.connect_key_press_event(|_, ev| {
+        eprintln!("spike: SHELL widget key-press {:?}", ev.keyval());
         glib::Propagation::Proceed
     });
     page.connect_enter_notify_event(|_, _| {

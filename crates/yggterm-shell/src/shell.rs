@@ -2803,6 +2803,88 @@ fn web_surface_tab_place_rect(
 /// page, and view-mode changes. Surfaces are created lazily on first
 /// visibility and destroyed when their (session, tab) leaves the map (close,
 /// sweep, tab close — those paths only mutate the map).
+/// The reconciler's per-tick geometry + visibility oracle, as one script:
+/// page/pinned rects (placement AND under-glass input holes ride the same
+/// sample — the SSOT rule), `data-covers-web-surface` rects, and the
+/// under-glass transparency-chain maintenance. Tripwire-tested.
+const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
+    // The auto-hiding titlebar is a floating DOM overlay, and a
+    // native webview paints above ALL DOM — so the webview must be
+    // CLAMPED below the titlebar's live bottom edge. Collapsed,
+    // that keeps the 6px hover sensor at the window's top edge
+    // real (hoverable DOM, not native surface); revealed, it makes
+    // the titlebar visible over the page by dipping the page —
+    // without re-laying-out anything else, which is the point.
+    const tb = document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
+    const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
+    const out = {};
+    for (const el of document.querySelectorAll('[data-ws-page]')) {
+        const r = el.getBoundingClientRect();
+        const top = Math.max(Math.round(r.top), clampTop);
+        const height = Math.round(r.bottom) - top;
+        if (r.width > 1 && height > 1) {
+            out[el.getAttribute('data-ws-page') || ''] = [
+                Math.round(r.left), top,
+                Math.round(r.width), height,
+            ];
+        }
+    }
+    // Pinned split-tab panes: the (session, tab)-keyed twin of
+    // [data-ws-page] — a rect that places ONE specific tab's
+    // webview regardless of the surface's active tab.
+    const pinned = [];
+    for (const el of document.querySelectorAll('[data-ws-pinned-session]')) {
+        const r = el.getBoundingClientRect();
+        const top = Math.max(Math.round(r.top), clampTop);
+        const height = Math.round(r.bottom) - top;
+        if (r.width > 1 && height > 1) {
+            pinned.push([
+                el.getAttribute('data-ws-pinned-session') || '',
+                Number(el.getAttribute('data-ws-pinned-tab') || '0'),
+                [Math.round(r.left), top, Math.round(r.width), height],
+            ]);
+        }
+    }
+    // Chrome DECLARED over pages (`data-covers-web-surface`):
+    // under-glass, these rects are added back to the shell's input
+    // region so a toast/dialog floating over a page is clickable.
+    const covers = [];
+    for (const el of document.querySelectorAll('[data-covers-web-surface]')) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 1 && r.height > 1) {
+            covers.push([
+                Math.round(r.left), Math.round(r.top),
+                Math.round(r.width), Math.round(r.height),
+            ]);
+        }
+    }
+    // Under-glass transparency chain: the page shows THROUGH the
+    // shell, so the hole element and every ancestor whose
+    // background would paint over its rect must be transparent.
+    // Ancestors are anonymous inline-styled divs, so the chain is
+    // cleared here (originals remembered for demotion restore)
+    // rather than via brittle CSS selectors. Idempotent per
+    // element via data-ug-cleared.
+    const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';
+    for (const el of document.querySelectorAll('[data-ws-page],[data-ws-pinned-session]')) {
+        let node = el;
+        while (node) {
+            if (underGlass && node.dataset.ugCleared !== '1') {
+                node.dataset.ugCleared = '1';
+                node.dataset.ugBg = node.style.background || '';
+                node.style.background = 'transparent';
+            } else if (!underGlass && node.dataset.ugCleared === '1') {
+                node.style.background = node.dataset.ugBg || '';
+                delete node.dataset.ugCleared;
+                delete node.dataset.ugBg;
+            }
+            if (node === document.documentElement) { break; }
+            node = node.parentElement;
+        }
+    }
+    dioxus.send({pages: out, pinned: pinned, covers: covers});
+})();"#;
+
 async fn web_surface_native_reconcile_loop(
     state: Signal<ShellState>,
     desktop: dioxus::desktop::DesktopContext,
@@ -2813,7 +2895,37 @@ async fn web_surface_native_reconcile_loop(
     // but is now looking at a different page has to be redrawn — see the refetch
     // below.
     let mut last_app_pane_page: Option<(String, Option<String>)> = None;
+    // Under-glass mode + backdrop color, change-gated: the DOM stamp keys the
+    // page-hole transparency chain, the backdrop paints the theme background
+    // behind pages. Both follow a runtime probe demotion within one tick.
+    let mut last_under_glass: Option<bool> = None;
+    let mut last_backdrop: Option<(u8, u8, u8)> = None;
     loop {
+        let under_glass = desktop.web_surface_under_glass();
+        if last_under_glass != Some(under_glass) {
+            last_under_glass = Some(under_glass);
+            let _ = document::eval(&format!(
+                "document.documentElement.setAttribute('data-under-glass','{}');",
+                if under_glass { "1" } else { "0" }
+            ));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "under_glass",
+                json!({ "active": under_glass }),
+            );
+        }
+        if under_glass {
+            let backdrop = terminal_theme_by_name(&state.peek().effective_terminal_theme_name())
+                .and_then(|theme| yggui::hex_to_rgb(&theme.palette.background));
+            if let Some(rgb) = backdrop
+                && last_backdrop != Some(rgb)
+            {
+                last_backdrop = Some(rgb);
+                desktop.set_web_surface_backdrop_color(rgb.0, rgb.1, rgb.2);
+            }
+        }
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
         //           policy gate).
@@ -3071,57 +3183,21 @@ async fn web_surface_native_reconcile_loop(
             }
         }
         if desired.is_empty() && applied.is_empty() {
+            // Safety invariant: zero pages ⇒ the glass carries NO input shape
+            // (full region) — a stale hole over a closed page would be a dead
+            // rectangle in the chrome. Change-gated, so this is one call.
+            desktop.set_web_surface_input_holes(&[], &[]);
             publish_web_surface_native_ids(&applied);
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
         }
         // Geometry + visibility oracle: the placeholder rect of every web
         // surface page area currently laid out (CSS px == wry logical px).
-        let mut eval = document::eval(
-            r#"(function(){
-                // The auto-hiding titlebar is a floating DOM overlay, and a
-                // native webview paints above ALL DOM — so the webview must be
-                // CLAMPED below the titlebar's live bottom edge. Collapsed,
-                // that keeps the 6px hover sensor at the window's top edge
-                // real (hoverable DOM, not native surface); revealed, it makes
-                // the titlebar visible over the page by dipping the page —
-                // without re-laying-out anything else, which is the point.
-                const tb = document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
-                const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
-                const out = {};
-                for (const el of document.querySelectorAll('[data-ws-page]')) {
-                    const r = el.getBoundingClientRect();
-                    const top = Math.max(Math.round(r.top), clampTop);
-                    const height = Math.round(r.bottom) - top;
-                    if (r.width > 1 && height > 1) {
-                        out[el.getAttribute('data-ws-page') || ''] = [
-                            Math.round(r.left), top,
-                            Math.round(r.width), height,
-                        ];
-                    }
-                }
-                // Pinned split-tab panes: the (session, tab)-keyed twin of
-                // [data-ws-page] — a rect that places ONE specific tab's
-                // webview regardless of the surface's active tab.
-                const pinned = [];
-                for (const el of document.querySelectorAll('[data-ws-pinned-session]')) {
-                    const r = el.getBoundingClientRect();
-                    const top = Math.max(Math.round(r.top), clampTop);
-                    const height = Math.round(r.bottom) - top;
-                    if (r.width > 1 && height > 1) {
-                        pinned.push([
-                            el.getAttribute('data-ws-pinned-session') || '',
-                            Number(el.getAttribute('data-ws-pinned-tab') || '0'),
-                            [Math.round(r.left), top, Math.round(r.width), height],
-                        ]);
-                    }
-                }
-                dioxus.send({pages: out, pinned: pinned});
-            })();"#,
-        );
-        let (rects, pinned_rects): (
+        let mut eval = document::eval(WEB_SURFACE_GEOMETRY_EVAL_JS);
+        let (rects, pinned_rects, cover_rects): (
             HashMap<String, (i32, i32, i32, i32)>,
             HashMap<(String, u64), (i32, i32, i32, i32)>,
+            Vec<(i32, i32, i32, i32)>,
         ) = match tokio::time::timeout(Duration::from_millis(1500), eval.recv::<Value>()).await {
             Ok(Ok(value)) => {
                 let parse_rect = |rect: &Value| -> Option<(i32, i32, i32, i32)> {
@@ -3163,7 +3239,17 @@ async fn web_surface_native_reconcile_loop(
                             .collect()
                     })
                     .unwrap_or_default();
-                (pages, pinned)
+                let covers = value
+                    .get("covers")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| parse_rect(entry))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (pages, pinned, covers)
             }
             _ => {
                 // Eval blind (webview busy / not yet ready): backgrounded-session
@@ -3647,6 +3733,20 @@ async fn web_surface_native_reconcile_loop(
                     },
                 }),
             );
+        }
+        // Under-glass input holes: where webviews are ACTUALLY shown this tick
+        // (`applied` bounds — the same values just pushed to the host, so the
+        // input region can never diverge from the placement), minus nothing —
+        // chrome covers are added back host-side. Empty holes ⇒ the host
+        // applies the FULL region (safety invariant: chrome owns all input).
+        // No-op in legacy stacking. Change-gated inside the host.
+        {
+            let holes: Vec<(i32, i32, i32, i32)> = applied
+                .values()
+                .filter(|entry| entry.visible && entry.stashed_at_ms.is_none())
+                .map(|entry| entry.bounds)
+                .collect();
+            desktop.set_web_surface_input_holes(&holes, &cover_rects);
         }
         publish_web_surface_native_ids(&applied);
         sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
@@ -96661,6 +96761,40 @@ mod tests {
         assert!(script.contains("if (protocolBypass) {"));
         assert!(script.contains("protocolDataEventCount"));
         assert!(script.contains("ignoredDataEventCount"));
+    }
+
+    #[test]
+    fn a_web_surface_geometry_eval_samples_covers_and_maintains_the_transparency_chain() {
+        // Phase F tripwires: the ONE geometry sample must also carry the
+        // under-glass machinery — covers for the input region (a toast over a
+        // page must stay clickable), and the transparency-chain maintenance
+        // that makes the page visible through the glass at all. Losing any of
+        // these silently reverts an under-glass symptom, so they are pinned
+        // here like the declare-forwarder fields.
+        let js = WEB_SURFACE_GEOMETRY_EVAL_JS;
+        assert!(
+            js.contains("querySelectorAll('[data-covers-web-surface]')"),
+            "covers must be sampled in the SAME eval as page rects (SSOT)"
+        );
+        assert!(
+            js.contains("covers: covers"),
+            "covers must ride the same send as the page rects"
+        );
+        assert!(
+            js.contains("data-under-glass"),
+            "the transparency chain must key on the under-glass stamp"
+        );
+        assert!(
+            js.contains("ugCleared") && js.contains("ugBg"),
+            "chain clearing must be idempotent and reversible (demotion restore)"
+        );
+        assert!(
+            js.contains("'[data-ws-page],[data-ws-pinned-session]'"),
+            "pinned panes get the same transparency chain as page areas"
+        );
+        // F.0 keeps the titlebar clamp; deleting it is F.1 work that must
+        // arrive together with the covers-driven input region for the reveal.
+        assert!(js.contains("clampTop"));
     }
 
     #[test]

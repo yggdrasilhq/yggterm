@@ -158,6 +158,14 @@ pub fn ToastViewport(
             for notification in visible {
                 div {
                     key: "{notification.id}",
+                    // Interactive floating chrome over the viewport: under-glass
+                    // web surfaces subtract this rect from their input hole so a
+                    // toast is clickable the moment it is visible. Stamped on the
+                    // CARD (pointer-events:auto), not the stack root
+                    // (pointer-events:none) — covering the root would route the
+                    // gaps between cards to the shell's inert DOM instead of the
+                    // page below.
+                    "data-covers-web-surface": "toast",
                     style: "pointer-events:auto; animation:yggterm-toast-stack-in 220ms ease both;",
                     div {
                         style: if notification.persistent {
