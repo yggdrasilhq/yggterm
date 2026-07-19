@@ -445,8 +445,10 @@ the GUI process; the headless farm has no GUI to route through. The verb
      (the addressing already resolves it — this proves it end-to-end, incl. the
      stale-error-string fix and backgrounded-snapshot freshness); (ii) whether
      `isTrusted`-true input injection into a target WebView is possible **at
-     all** without moving the seat pointer — try GDK event synthesis AND
-     WebKitGTK automation/WebDriver input dispatch. **GO/NO-GO gate.**
+     all** without moving the seat pointer. **✅ done 2026-07-20 = GO** (GDK
+     event → `WidgetExt::event` yields trusted input, no seat move;
+     `docs/spikes/slice2a-istrusted-inject`); the read/capture-on-stashed live
+     proof is still owed on a clean sandbox. **GO/NO-GO gate → GO.**
    - **2b — ENGINE, only on GO (1–2 sessions).** `do` (single injection
      primitive, F1) + the Action & lifecycle correctness invariants (F3) +
      `wait` + agent lease + headless create + the addressed command protocol.
@@ -468,10 +470,15 @@ not a code claim.
 
 0. **Slice-2a proof gate (GO/NO-GO, precedes everything else).** (a) `read` +
    `capture` against a **backgrounded** surface return its real content (not the
-   active surface's, not an error). (b) A verdict — with evidence — on whether
-   `isTrusted`-true injection into a target WebView is achievable without the
-   seat pointer. This gate decides whether gates 2/6's `do` path is on the GUI
-   plane or deferred to the farm plane.
+   active surface's, not an error) — verified in code (the reconciler keeps a
+   demoted surface in `applied` → registry → `resolve_live_web_surface` until
+   the hold expires); a clean live proof is owed on an uncrowded sandbox.
+   (b) whether `isTrusted`-true injection into a target WebView is achievable
+   without the seat pointer — **✅ PASS / GO (2026-07-20)**: a `gdk_event_new`
+   button event filled with the webview's `GdkWindow` + seat device and
+   delivered via `WidgetExt::event` yields a trusted click at the right coords,
+   no seat move (`docs/spikes/slice2a-istrusted-inject`). **`do` ships on the
+   GUI plane (2b), not deferred to the farm.**
 1. **Undisturbed shadow probe.** An agent runs `read`, `capture`, and a `do`
    click against a **backgrounded** session while the user stays on a different
    session. The user's viewport never switches; a screenshot before and after
@@ -508,7 +515,8 @@ not a code claim.
 
 | Risk | Signal | Mitigation / fallback |
 |---|---|---|
-| **`isTrusted`-true injection may be impossible in WebKitGTK without the seat (the central gate)** | slice-2a proof | GO/NO-GO gate BEFORE any engine is built; try GDK synthesis + WebKitGTK automation input; NO-GO ⇒ `do` → farm plane, 2b ships read/wait/capture/lease without trusted `do` |
+| ~~`isTrusted`-true injection may be impossible in WebKitGTK without the seat (the central gate)~~ **RESOLVED — GO (2026-07-20)** | slice-2a proof (done) | `gdk_event_new` button + webview `GdkWindow`/seat device → `WidgetExt::event` = trusted click, no seat move (`docs/spikes/slice2a-istrusted-inject`). `do` on the GUI plane. Remaining sub-risk: delivery into a *demoted/unmapped* webview (below) |
+| Injection into a **demoted/soft-stashed** (not visible) webview may differ from the mapped case | slice-2b | the spike used a mapped webview; 2b re-runs it against a demoted surface — if it fails, transient off-screen map, else defer that surface's `do` to the farm plane |
 | Surface recreated under a queued verb/lease (reused native id) | slice-2b | durable handle `(session, tab, generation)`; verbs fail closed with `stale_handle`; cancellation on recreate (Action & lifecycle) |
 | GTK/WebKit event delivery into an unmapped/minimized webview | slice-2a spike | transient off-screen map for the injection; else defer hidden-surface `do` to the farm plane (same verb) |
 | `webkit.snapshot` on a truly backgrounded surface returns blank/stale | slice-2 spike | soft-stash keeps it attached+composited; if snapshot still needs a live view, briefly promote-under-lease, capture, demote |
