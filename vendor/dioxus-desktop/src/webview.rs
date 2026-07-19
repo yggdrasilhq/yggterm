@@ -655,6 +655,24 @@ impl WebviewInstance {
                     .webview()
                     .set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
             }
+            // F.1 reveal forward: page-webview top-edge motion calls into the
+            // shell webview's reveal hook (installed by the shell's edge-motion
+            // listener loop; a missing hook is a no-op). GTK main thread only —
+            // motion events and run_javascript both live there.
+            {
+                use webkit2gtk::WebViewExt as _;
+                use wry::WebViewExtUnix as _;
+                let shell_webkit = desktop_context.webview.webview();
+                host.set_edge_motion_notifier(move || {
+                    let cancellable: Option<&gtk::gio::Cancellable> = None;
+                    #[allow(deprecated)]
+                    shell_webkit.run_javascript(
+                        "window.__yggtermGlassEdgeMotion && window.__yggtermGlassEdgeMotion();",
+                        cancellable,
+                        |_| {},
+                    );
+                });
+            }
             desktop_context.install_web_surface_host(host);
         }
 

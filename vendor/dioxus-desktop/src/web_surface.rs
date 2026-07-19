@@ -341,6 +341,56 @@ pub struct WebSurfaceHost {
     /// close itself, and a browser that ignores that strands every OAuth popup
     /// ever written.
     close_requests: Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+    /// F.1 reveal trigger. With the titlebar clamp gone, the auto-hide hover
+    /// zone sits INSIDE the input hole, so the shell webview never sees the
+    /// mousemove. Each page webview gets a GTK motion observer (Proceed —
+    /// observe, never consume) that calls this when the pointer enters the
+    /// window's top edge zone; the notifier forwards into the shell webview,
+    /// which runs its normal reveal logic.
+    edge_motion: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+}
+
+/// The top-edge motion zone (window coords, logical px) that forwards to the
+/// shell's titlebar reveal. Twin of the shell's
+/// TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX (6px) plus slack for the window border
+/// inset — over-forwarding is harmless (the reveal is idempotent and the
+/// shell still decides), under-forwarding makes the titlebar unreachable
+/// over a maximized page.
+const GLASS_EDGE_REVEAL_ZONE_PX: f64 = 8.0;
+
+/// Observe pointer motion on a page webview and forward top-edge entry to the
+/// shell's reveal logic. `Propagation::Proceed` always — the page's own input
+/// is untouched; this only watches. Gated at EVENT time on the glass being
+/// armed (a runtime demotion silences it without disconnecting anything).
+/// Fires on the out→in zone transition only, mirroring `mouseenter`.
+fn connect_edge_motion_observer(
+    webkit: &webkit2gtk::WebView,
+    container: &gtk::Fixed,
+    glass: &Rc<RefCell<Option<gtk::Widget>>>,
+    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+) {
+    let glass = glass.clone();
+    let edge_motion = edge_motion.clone();
+    let container = container.clone();
+    let in_zone = Cell::new(false);
+    // The webview was just built (unrealized): motion events can still be
+    // added. WebKit requests them itself for hover, but do not depend on it.
+    webkit.add_events(gdk::EventMask::POINTER_MOTION_MASK);
+    webkit.connect_motion_notify_event(move |_, event| {
+        if glass.borrow().is_some() {
+            let (_, y) = event.position();
+            let window_y = container.margin_top() as f64 + y;
+            let zone = window_y <= GLASS_EDGE_REVEAL_ZONE_PX;
+            if zone && !in_zone.get() {
+                let notify = edge_motion.borrow().clone();
+                if let Some(notify) = notify {
+                    notify();
+                }
+            }
+            in_zone.set(zone);
+        }
+        gtk::glib::Propagation::Proceed
+    });
 }
 
 fn rect_logical(w: i32, h: i32) -> Rect {
@@ -617,6 +667,7 @@ fn build_popup_webview(
     glass: &Rc<RefCell<Option<gtk::Widget>>>,
     surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     popup_id: u64,
     opener: &webkit2gtk::WebView,
     opener_bounds: (i32, i32, i32, i32),
@@ -663,6 +714,9 @@ fn build_popup_webview(
     if adblock_ruleset.is_some() {
         adblock::attach(&webview);
     }
+    // A popup replaces the page in the same rect: it needs the same top-edge
+    // reveal forward as the page it covers.
+    connect_edge_motion_observer(&webview.webview(), &container, glass, edge_motion);
     // `window.close()`: the page's own report (the engine will not tell us), plus
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
@@ -711,7 +765,14 @@ impl WebSurfaceHost {
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
             close_requests: Rc::new(RefCell::new(Vec::new())),
+            edge_motion: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Install the edge-motion forward target (the shell webview's reveal
+    /// hook). Set once at host construction, before any surface opens.
+    pub(crate) fn set_edge_motion_notifier(&self, notify: impl Fn() + 'static) {
+        *self.edge_motion.borrow_mut() = Some(Rc::new(notify));
     }
 
     /// Paint the native backdrop (the overlay's base child) in the app's
@@ -774,6 +835,21 @@ impl WebSurfaceHost {
         );
         apply_input_region_up_to_toplevel(glass, &region);
         *self.last_glass_holes.borrow_mut() = Some(key);
+    }
+
+    /// F.1 synchronous cover push: cover rects arrive OUT OF TICK from the
+    /// shell's MutationObserver the instant chrome mounts/unmounts/resizes
+    /// over a page — the tick's own covers sample remains as idempotent
+    /// self-heal. Holes stay whatever the reconciler last applied: two
+    /// cadences, one applier, one change gate.
+    pub fn set_glass_covers(&self, covers: &[(i32, i32, i32, i32)]) {
+        let holes = self
+            .last_glass_holes
+            .borrow()
+            .as_ref()
+            .map(|(holes, _)| holes.clone())
+            .unwrap_or_default();
+        self.set_glass_input_holes(&holes, covers);
     }
 
     /// The ONE allocator of native surface ids. The shell asks for one before
@@ -897,6 +973,7 @@ impl WebSurfaceHost {
             let close_requests = self.close_requests.clone();
             let overlay = self.overlay.clone();
             let glass = self.glass.clone();
+            let edge_motion = self.edge_motion.clone();
             let ids = self.next_id.clone();
             let popup_scripts = userscripts.to_vec();
             let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
@@ -925,6 +1002,7 @@ impl WebSurfaceHost {
                     &glass,
                     &surfaces,
                     &close_requests,
+                    &edge_motion,
                     popup_id,
                     &features.opener.webview,
                     bounds,
@@ -1027,6 +1105,17 @@ impl WebSurfaceHost {
                     gtk::glib::ControlFlow::Break
                 });
             }
+        }
+        // F.1 reveal trigger: forward top-edge motion over this page to the
+        // shell's titlebar reveal (see `connect_edge_motion_observer`).
+        {
+            use wry::WebViewExtUnix as _;
+            connect_edge_motion_observer(
+                &webview.webview(),
+                &container,
+                &self.glass,
+                &self.edge_motion,
+            );
         }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is

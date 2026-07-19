@@ -282,6 +282,30 @@ impl DesktopService {
         let _ = (holes, covers);
     }
 
+    /// F.1 synchronous cover push: replace ONLY the cover rects (chrome
+    /// declared over pages) while the holes stay at the reconciler's last
+    /// applied set. Called out-of-tick by the shell's cover MutationObserver
+    /// so a dialog/titlebar over a page is clickable the instant it is
+    /// visible. No-op in legacy stacking; change-gated inside the host.
+    pub fn set_web_surface_input_covers(&self, covers: &[(i32, i32, i32, i32)]) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_glass_covers(covers);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = covers;
+    }
+
     /// Paint the native backdrop behind under-glass pages in the app's theme
     /// background color (first-paint flash becomes theme-colored, not white).
     pub fn set_web_surface_backdrop_color(&self, r: u8, g: u8, b: u8) {
