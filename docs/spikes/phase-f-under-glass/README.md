@@ -19,7 +19,14 @@ PASS looks like:
    the titlebar stays with the shell (magenta). GTK-level `button-press`
    logs on stderr say which widget got each event.
 
-Verified 2026-07-18 on webkit2gtk 2.52.4, both backends:
+3. **Keyboard** (F.-1 extension, verified 2026-07-19): click hole → typed key
+   reaches the page DOM ("PAGE GOT KEY"); click titlebar → next key reaches
+   the shell DOM ("SHELL GOT KEY"). Click-to-focus round-trips both ways.
+   Wayland keyboard injection needs the same held-connection trick as the
+   pointer: `wtype -s 2500 <key>` (in-stream sleep so the client binds
+   `wl_keyboard` before the key event; instant wtype keys are lost).
+
+Verified 2026-07-18/19 on webkit2gtk 2.52.4, both backends:
 - Wayland: sway `WLR_BACKENDS=headless` + grim, GPU render node present.
   Input needs a **held** virtual-pointer connection (pywayland +
   `zwlr_virtual_pointer_v1`, sleep ~2s after create so the client binds

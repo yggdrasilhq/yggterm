@@ -523,6 +523,8 @@ impl WebviewInstance {
             target_os = "android"
         )))]
         let web_surface_overlay;
+        let web_surface_backdrop;
+        let web_surface_glass;
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",
@@ -535,15 +537,32 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtUnix;
             let vbox = window.default_vbox().unwrap();
             // yggterm web surfaces: wrap the main webview in a gtk::Overlay so
-            // native surface webviews (per-surface WebContext + SOCKS proxy) can
-            // be layered above the page area. The main webview becomes the
-            // overlay's base (full-size) child; each surface is added as its own
-            // overlay child (see crate::web_surface::WebSurfaceHost).
+            // native surface webviews (per-surface WebContext + SOCKS proxy)
+            // can be layered relative to the page area.
+            //
+            // Phase F (under-glass): the overlay's BASE child is a native
+            // backdrop (theme background color); the shell webview ("the
+            // glass") is an overlay child that WebSurfaceHost keeps TOPMOST so
+            // page webviews stack below it and chrome DOM draws over them.
+            // Legacy stacking (probe failure / env override) is the same tree
+            // with the glass at overlay index 0 — pages appended later stack
+            // above it, which is byte-identical to the pre-Phase-F behavior.
             let overlay = gtk::Overlay::new();
             vbox.pack_start(&overlay, true, true, 0);
+            let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            overlay.add(&backdrop);
+            backdrop.show();
+            let glass_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            overlay.add_overlay(&glass_box);
+            glass_box.show();
             overlay.show();
-            let built = webview.build_gtk(&overlay);
+            // wry packs a GtkBox child with pack_start(expand: true, fill:
+            // true), and an overlay child's default halign/valign is Fill —
+            // the glass fills the window exactly as the old base-child did.
+            let built = webview.build_gtk(&glass_box);
             web_surface_overlay = overlay;
+            web_surface_backdrop = backdrop;
+            web_surface_glass = glass_box;
             built
         };
         let webview = webview.unwrap();
@@ -568,8 +587,9 @@ impl WebviewInstance {
         });
 
         // yggterm web surfaces: hand the main window's gtk::Overlay to the
-        // desktop context so the shell can layer native surface webviews over
-        // the page area.
+        // desktop context so the shell can layer native surface webviews
+        // relative to the page area, and arm Phase F under-glass stacking
+        // when the engine qualifies.
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",
@@ -577,9 +597,49 @@ impl WebviewInstance {
             target_os = "android"
         )))]
         {
-            desktop_context.install_web_surface_host(
-                crate::web_surface::WebSurfaceHost::new(web_surface_overlay),
+            use gtk::prelude::*;
+            let host = crate::web_surface::WebSurfaceHost::new(
+                web_surface_overlay,
+                web_surface_backdrop.clone().upcast(),
             );
+            // Self-probe, structural v1: env override + engine version gate
+            // (in-widget DMABuf renderer landed by 2.40; the nested-compositor
+            // subsurface era is long gone) now, native-window walk per opened
+            // surface later (WebSurfaceHost::open). Failure at any stage
+            // demotes to legacy stacking at runtime — the safety direction.
+            let force_legacy = std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let engine_ok = {
+                // Runtime engine version, not the build-time API version — the
+                // in-widget DMABuf renderer the restack relies on landed by 2.40.
+                let (major, minor) = unsafe {
+                    (
+                        webkit2gtk_sys::webkit_get_major_version(),
+                        webkit2gtk_sys::webkit_get_minor_version(),
+                    )
+                };
+                major > 2 || (major == 2 && minor >= 40)
+            };
+            if force_legacy || !engine_ok {
+                tracing::info!(
+                    force_legacy,
+                    engine_ok,
+                    "web surface: legacy stacking (under-glass not armed)"
+                );
+            } else {
+                host.install_glass(web_surface_glass.clone().upcast());
+                // The glass must be see-through where its DOM paints
+                // transparency (the page holes). With the DOM fully opaque —
+                // legacy mode, or no page open — this is visually inert.
+                use webkit2gtk::WebViewExt as _;
+                use wry::WebViewExtUnix as _;
+                desktop_context
+                    .webview
+                    .webview()
+                    .set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+            }
+            desktop_context.install_web_surface_host(host);
         }
 
         // Request an initial redraw
