@@ -635,7 +635,17 @@ impl App {
         if cfg!(target_os = "linux") && self.disable_dma_buf_on_wayland {
             static INIT: std::sync::Once = std::sync::Once::new();
             INIT.call_once(|| {
-                if std::path::Path::new("/dev/dri").exists()
+                // Under-glass REQUIRES the DMABuf renderer (the SHM path
+                // clears a transparent webview's regions through all sibling
+                // widgets — F.0.1 root cause). An armed launch from a real
+                // Wayland session (XDG_SESSION_TYPE=wayland) was silently
+                // demoted to legacy stacking by this workaround; main.rs
+                // already gates its own SHM fallback on the same arming var.
+                let under_glass_armed = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if !under_glass_armed
+                    && std::path::Path::new("/dev/dri").exists()
                     && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland"
                 {
                     // Gnome Webkit is currently buggy under Wayland and KDE, so we will run it with XWayland mode.
