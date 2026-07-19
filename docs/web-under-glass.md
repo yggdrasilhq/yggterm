@@ -1,8 +1,39 @@
 # Phase F — web surfaces under the glass
 
-**Status: PLANNED — spike-proven, eng-reviewed (multi-section + outside voice, 2026-07-19).**
+**Status: F.0 landed but OPT-IN (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`) after a
+live incident; F.0.1 (the hole redesign) is the next work item.**
 Owner surface: web surfaces (ychrome pilot). Repo side: yggterm shell +
 vendored `dioxus-desktop` web-surface host. GUI-only; no wire change.
+
+**Incident (2026-07-19, first live deploy):** the transparency-chain
+implementation cleared inline backgrounds on EVERY `[data-ws-page]` ancestor
+up to `<html>` — shared app containers included — from the geometry eval.
+Three compounding flaws: unscoped (app-wide background loss), mutation fights
+the renderer (Dioxus re-renders rewrite `style`), unrestorable (the restore
+branch dies with the eval when surfaces close / the loop idles). The live GUI
+broke app-wide within minutes. Mitigated by relaunching with the legacy
+override; the chain-clearing is now REMOVED and the geometry eval is
+sample-only (tripwire-enforced). Second live finding, fix kept: xterm
+canvases are opaque glass-DOM pixels that occlude the page — the terminal
+host now hides under an active overlay (`data-web-surface-owns-viewport` +
+`WEB_UNDER_GLASS_CSS`, visibility-only so layout never moves).
+
+**F.0.1 — the hole, redesigned (do this before re-arming):**
+1. **No runtime DOM mutation.** Render-time conditional styling from a
+   snapshot flag: the reconcile loop mirrors `under_glass` into ShellState on
+   change; RenderSnapshot carries it; rsx conditionals do the rest.
+2. **One owner for app background painting.** The hole is unimplementable
+   while backgrounds are scattered across shared containers. Consolidate to a
+   designated app-background layer; session-view-scoped elements (viewport
+   wrapper, overlay column, `[data-ws-page]`) get conditional transparent
+   backgrounds; the background layer gets the hole treatment (evenodd
+   clip-path from the same geometry sample) if it overlaps page rects.
+3. **Probe first:** full ancestor-background inventory at the hole rect, in
+   the dev sandbox with a synthetic surface (printf OSC declare + python
+   /ping — no ychrome setup needed).
+4. **Verify gate that would have caught the incident:** the headless smoke
+   MUST open a real web surface (synthetic router), screenshot the hole, then
+   close the surface and screenshot again — backgrounds intact both times.
 
 ## The problem (north star)
 
