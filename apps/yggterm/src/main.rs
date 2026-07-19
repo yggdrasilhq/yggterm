@@ -3471,8 +3471,43 @@ fn configure_linux_accessibility_bridge() {
     }
 }
 
+/// Whether under-glass web-surface stacking should be armed, from the two
+/// environment knobs. DEFAULT ON (F.1 tail, 2026-07-19): unset ⇒ armed.
+/// Explicit opt-outs: `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` or the legacy
+/// force `YGGTERM_WEB_SURFACE_LEGACY_STACK=1`. Structural safety stays
+/// runtime-side — the vendored host's self-probe demotes to legacy
+/// stacking on engines/paths that cannot composite (SHM, webkit < 2.40),
+/// so the default costs nothing where under-glass is impossible.
+fn under_glass_default_armed(
+    under_glass_var: Option<&str>,
+    legacy_stack_var: Option<&str>,
+) -> bool {
+    if legacy_stack_var == Some("1") {
+        return false;
+    }
+    match under_glass_var {
+        Some(value) => value == "1",
+        None => true,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_compositing() {
+    // Under-glass by DEFAULT: resolve the two env knobs into the ONE arming
+    // variable every downstream reader keys on (this fn's DMABuf gate, the
+    // vendored disable_dma_buf workaround, the vendored host's opt_in).
+    // Writing the var (rather than exporting a flag) keeps the vendored
+    // readers untouched and the arming decision in exactly one place.
+    let armed = under_glass_default_armed(
+        std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok().as_deref(),
+        std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK").ok().as_deref(),
+    );
+    unsafe {
+        std::env::set_var(
+            "YGGTERM_WEB_SURFACE_UNDER_GLASS",
+            if armed { "1" } else { "0" },
+        )
+    };
     // WebGL (xterm.js 6's GPU renderer) can ONLY present to screen with WebKitGTK
     // accelerated compositing ENABLED. We previously disabled it
     // (WEBKIT_DISABLE_COMPOSITING_MODE=1) because the GPU compositing path crashed in
@@ -4466,10 +4501,24 @@ mod tests {
         linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
         record_matches_executable, should_handoff_to_preferred_executable,
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
+        under_glass_default_armed,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
         signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
         superseded_client_retirement_strategy_label,
     };
+
+    // F.1 tail: under-glass is DEFAULT ON — unset env arms it; only an
+    // explicit =0 or the legacy force turns it off. The legacy force wins
+    // over an explicit =1 (it is the escape hatch of last resort).
+    #[test]
+    fn under_glass_defaults_on_with_explicit_opt_outs() {
+        assert!(under_glass_default_armed(None, None));
+        assert!(under_glass_default_armed(Some("1"), None));
+        assert!(!under_glass_default_armed(Some("0"), None));
+        assert!(!under_glass_default_armed(None, Some("1")));
+        assert!(!under_glass_default_armed(Some("1"), Some("1")));
+        assert!(under_glass_default_armed(None, Some("0")));
+    }
     #[cfg(target_os = "linux")]
     use super::{
         LINUX_GUI_ENTRY_ENV_SOURCE_KEY, linux_choose_desktop_environment,
