@@ -29,6 +29,31 @@ C test_widget_send_key:           handled=true
 - Probe C — `gtk::test_widget_send_key` — is handled; keyboard injection is
   viable too.
 
+## Hidden-surface phase (soft-stash / unmapped) — added 2026-07-20
+
+The page is painted magenta (`#c800c8`), then the webview is `hide()`-unmapped
+and re-probed:
+
+```
+D read (eval) while hidden:     PASS    bg=rgb(200,0,200)            (eval returns correct state)
+E inject while hidden:          FAIL    events=[]                   (unmapped widget drops the GDK event)
+F capture (snapshot) while hidden: PASS+FRESH  500x400 center_rgb=(200,0,200)  (re-rendered the magenta,
+                                                                     NOT a stale cached frame)
+```
+
+- **read + capture reach a non-visible surface.** Capture is even proven
+  **fresh** — the snapshot's center pixel is the magenta painted *after* the
+  last visible frame, so `webkit.snapshot` re-renders current state while
+  hidden. This kills the "backgrounded snapshot returns blank/stale" worry for
+  the hidden case and is the engine half of gate 0(i).
+- **inject needs a MAPPED target.** `WidgetExt::event` on an unmapped webview
+  delivers nothing (`webview.window()` still exists, but events aren't
+  processed). The under-glass **soft-stash keeps surfaces mapped** (demote =
+  occluded, still realized+mapped), so `do` works on soft-stashed surfaces; a
+  legacy hard-stashed / fully-hidden surface needs a transient off-screen map
+  or defers to the farm plane. This is the spec's F2 sub-risk, confirmed with a
+  defined fallback.
+
 ## The proven recipe (what slice-2b `do` uses)
 
 ```rust
@@ -55,10 +80,15 @@ future WebKit ever gates on it; here 0 yields fully trusted events.
 - The **F1** decision (one injection primitive) rides this recipe: the existing
   synthetic `Pointer`/`Grid` JS paths (`document::eval`, isTrusted=false) refold
   onto `WidgetExt::event`.
-- Still to prove in 2b (not blockers, the injection premise is settled):
-  delivery into a **demoted/soft-stashed** webview (this spike used a mapped,
-  visible one — the demoted case is the narrower F2 sub-risk), coordinate
-  mapping under page zoom/scroll, and the F3 lifecycle guards.
+- Injection into an **unmapped** surface is proven to fail → soft-stash keeps
+  surfaces mapped (works); hard-stash/hidden needs a transient map or the farm.
+- read + capture on a non-visible surface proven (capture fresh) — the engine
+  half of gate 0(i). The remaining owed piece is a live yggterm proof that
+  `--session` resolves a real soft-stashed surface (verified in code:
+  shell.rs:3391-3402), on an uncrowded host.
+- Still to build in 2b (not feasibility blockers): coordinate mapping under
+  page zoom/scroll, and the F3 lifecycle guards (generation handles, freshness,
+  preemption).
 
 ## Run it
 

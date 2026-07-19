@@ -470,9 +470,14 @@ not a code claim.
 
 0. **Slice-2a proof gate (GO/NO-GO, precedes everything else).** (a) `read` +
    `capture` against a **backgrounded** surface return its real content (not the
-   active surface's, not an error) — verified in code (the reconciler keeps a
-   demoted surface in `applied` → registry → `resolve_live_web_surface` until
-   the hold expires); a clean live proof is owed on an uncrowded sandbox.
+   active surface's, not an error) — **✅ engine half proven (2026-07-20)**: on a
+   hidden/unmapped webview, `eval` returns correct state and `webkit.snapshot`
+   returns a **fresh** frame (center pixel = a color painted after the last
+   visible render, not a stale cache — `docs/spikes/slice2a-istrusted-inject`);
+   and the reconciler keeps a demoted surface in `applied` → registry →
+   `resolve_live_web_surface` until the hold expires (verified in code). A clean
+   live yggterm proof that `--session` resolves a real soft-stashed surface is
+   still owed on an uncrowded sandbox.
    (b) whether `isTrusted`-true injection into a target WebView is achievable
    without the seat pointer — **✅ PASS / GO (2026-07-20)**: a `gdk_event_new`
    button event filled with the webview's `GdkWindow` + seat device and
@@ -516,7 +521,7 @@ not a code claim.
 | Risk | Signal | Mitigation / fallback |
 |---|---|---|
 | ~~`isTrusted`-true injection may be impossible in WebKitGTK without the seat (the central gate)~~ **RESOLVED — GO (2026-07-20)** | slice-2a proof (done) | `gdk_event_new` button + webview `GdkWindow`/seat device → `WidgetExt::event` = trusted click, no seat move (`docs/spikes/slice2a-istrusted-inject`). `do` on the GUI plane. Remaining sub-risk: delivery into a *demoted/unmapped* webview (below) |
-| Injection into a **demoted/soft-stashed** (not visible) webview may differ from the mapped case | slice-2b | the spike used a mapped webview; 2b re-runs it against a demoted surface — if it fails, transient off-screen map, else defer that surface's `do` to the farm plane |
+| ~~Injection into a not-visible webview may differ from the mapped case~~ **RESOLVED (2026-07-20)** | spike | injection into an **unmapped** webview delivers nothing (`events=[]`); a **mapped** one (incl. the soft-stash demote, which stays mapped) works. So `do` works on soft-stashed surfaces; a hard-stashed/hidden surface needs a transient off-screen map or defers to the farm. read + capture DO work while hidden (capture fresh) |
 | Surface recreated under a queued verb/lease (reused native id) | slice-2b | durable handle `(session, tab, generation)`; verbs fail closed with `stale_handle`; cancellation on recreate (Action & lifecycle) |
 | GTK/WebKit event delivery into an unmapped/minimized webview | slice-2a spike | transient off-screen map for the injection; else defer hidden-surface `do` to the farm plane (same verb) |
 | `webkit.snapshot` on a truly backgrounded surface returns blank/stale | slice-2 spike | soft-stash keeps it attached+composited; if snapshot still needs a live view, briefly promote-under-lease, capture, demote |
