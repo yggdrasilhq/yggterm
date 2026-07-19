@@ -2803,14 +2803,32 @@ fn web_surface_tab_place_rect(
 /// page, and view-mode changes. Surfaces are created lazily on first
 /// visibility and destroyed when their (session, tab) leaves the map (close,
 /// sweep, tab close — those paths only mutate the map).
-/// Under-glass paint discipline for the glass DOM. The terminal host under an
-/// active web overlay is HIDDEN (visibility, not display — layout must not
-/// move, or the xterm resize family wakes up): its canvases are opaque pixels
-/// that would occlude the page webview below the hole. Keyed on the root
-/// under-glass stamp so a runtime probe demotion restores the terminal with
-/// no re-render.
+/// Under-glass paint discipline for the glass DOM (F.0.1). A web surface page
+/// is a native webview UNDER the glass; the page area of the glass DOM must be
+/// a transparent hole for it to show through, and the opaque things stacked
+/// over that rect must stand down — WITHOUT hiding the web chrome (tab strip,
+/// omnibox) which is glass DOM that legitimately draws over the page.
+///
+/// All keyed on the root `data-under-glass` stamp so a runtime probe demotion
+/// restores every background with NO re-render and NO DOM mutation (the
+/// 2026-07-19 incident was runtime inline mutation of shared ancestors — this
+/// replaces it with scoped, declarative CSS). The three transparent-ized
+/// backgrounds are all inline `web_frame_bg`/`#ffffff` on session-view-scoped
+/// elements, never shared app chrome:
+///   - the terminal host (`data-web-surface-owns-viewport`, the web-overlay
+///     host) loses its frame background AND hides its xterm canvas (opaque
+///     pixels behind the overlay — `visibility:hidden`, not `display`, so the
+///     xterm resize family never wakes);
+///   - the web overlay panel (`data-ws-overlay`) loses its cover background so
+///     the page area below it is see-through (its chrome children keep their
+///     own backgrounds);
+///   - the page placeholder (`data-ws-page`) loses its white fill — it IS the
+///     hole.
 const WEB_UNDER_GLASS_CSS: &str = r#"
-:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { visibility: hidden; }
+:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { background: transparent !important; }
+:root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
+:root[data-under-glass="1"] [data-ws-overlay="1"] { background: transparent !important; }
+:root[data-under-glass="1"] [data-ws-page] { background: transparent !important; }
 "#;
 
 /// The reconciler's per-tick geometry + visibility oracle, as one script:
@@ -49533,8 +49551,22 @@ pub fn launch_shell(mut bootstrap: ShellBootstrap) -> Result<()> {
         .with_maximized(initial_window_maximized)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(480.0, 360.0));
+    // Phase F under-glass needs an RGBA window visual: the shell ("glass")
+    // webview alpha-composites its transparent page-hole regions onto the
+    // page webview sibling BELOW it, and GTK only gives the webview an alpha
+    // channel when the top-level window is transparent. Without this the hole
+    // shows the webview's opaque GTK backing, never the page (proven on the
+    // dev sandbox: legacy stacking painted the page, under-glass showed a
+    // flat #f4f4f2). The env opt-in that arms under-glass (read again in
+    // vendored dioxus-desktop for the stacking) therefore also forces window
+    // transparency here, at build time — the window visual cannot change
+    // after creation.
     #[cfg(not(target_os = "macos"))]
-    let linux_transparent_window = linux_window_transparent;
+    let under_glass_opt_in = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    #[cfg(not(target_os = "macos"))]
+    let linux_transparent_window = linux_window_transparent || under_glass_opt_in;
     #[cfg(not(target_os = "macos"))]
     let window = {
         let window = WindowBuilder::new()
@@ -68385,14 +68417,13 @@ fn TerminalCanvas(
         shell.web_surface_overlay_for_session(&session.session_path, current_millis())
     });
     // Under glass, the terminal host beneath an active web overlay must not
-    // paint: the xterm canvases are opaque PIXELS inside the glass, and
-    // anything opaque in the glass DOM occludes the page webview below the
-    // hole (live-caught on the first F.0 deploy — the page area showed the
-    // terminal). Pre-Phase-F the native page floated above all DOM, which
-    // hid this. The stamp is inert in legacy stacking: the CSS rule that
-    // consumes it (WEB_UNDER_GLASS_CSS) keys on :root[data-under-glass="1"],
-    // so a runtime probe demotion un-hides the terminal instantly. Picker
-    // mode keeps the terminal visible (no native page exists to reveal).
+    // paint over the page hole: its frame background and its xterm canvas are
+    // opaque, and the native page webview sits BELOW the glass (live-caught on
+    // the first F.0 deploy — the page area showed the terminal). This flag
+    // drives the WEB_UNDER_GLASS_CSS rules (transparent host bg + hidden
+    // xterm), all keyed on :root[data-under-glass="1"] so a runtime probe
+    // demotion restores everything with no re-render. Picker mode is excluded
+    // (no native page exists — the picker is GUI-native DOM).
     let web_surface_owns_viewport_host = web_surface_overlay
         .as_ref()
         .is_some_and(|overlay| overlay.picker_control_url.is_none());
@@ -68589,6 +68620,11 @@ fn TerminalCanvas(
                         }
                     } else {
                     div {
+                        // Under glass, this panel's cover background goes
+                        // transparent (WEB_UNDER_GLASS_CSS) so the page area
+                        // below it shows the native page webview; the tab
+                        // strip and omnibox keep their own backgrounds.
+                        "data-ws-overlay": "1",
                         style: format!(
                             "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
                             terminal_web_overlay_inset, web_frame_bg, terminal_web_overlay_radius,
