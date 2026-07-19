@@ -1,9 +1,19 @@
 # The Agent Control Plane — surface-generic engine verbs + shadow clients
 
-**Status: SPEC (2026-07-19). Approved direction, nothing here built yet except
-where marked "exists today". This is slice 1 of the shadow/engine campaign; the
-user settled the ordering as spec → slices 2→3 → (Phase F.2 splits wait). It is
-the normative doc for agent control of libyggterm surfaces.**
+**Status: SPEC (2026-07-19; eng-reviewed 2026-07-20, four findings folded — see
+"Eng-review amendments" at the end). Approved direction, nothing here built yet
+except where marked "exists today". This is slice 1 of the shadow/engine
+campaign; the user settled the ordering as spec → slices 2→3 → (Phase F.2 splits
+wait). It is the normative doc for agent control of libyggterm surfaces.**
+
+**Eng-review outcome (2026-07-20), binding on the sections below:** `do` is the
+single click-delivery primitive (the existing synthetic `Pointer`/`Grid` paths
+refold onto it — F1); slice 2 is split into a spike-gated **2a → GO/NO-GO → 2b**
+because the `isTrusted` injection premise is unproven and both review models
+called it the central feasibility gate (F2); a normative **Action & lifecycle
+correctness** section is added because handle-staleness, focus-retargeting, and
+the reap predicate are non-determinism traps (F3); **read/capture/journal secret
+redaction** extends the standing no-secret rule to the new output door (F4).
 
 This doc unifies two threads the user has been steering:
 
@@ -192,11 +202,35 @@ do <handle> move    --x --y                     # real hover — menus/tooltips
 - Selector-addressed clicks are sugar over coordinate clicks: one resolver
   (`getBoundingClientRect` → scroll into view → dispatch real coords), shared by
   `do` and `read`.
+- **`do` is the ONE click-delivery primitive (F1, single source of truth).**
+  Today `AppControlCommand::Pointer` delivers clicks via
+  `document::eval(app_control_pointer_script(…))` — JS-synthetic (`isTrusted`
+  false), main-webview only — and `Grid`'s click-through does the same. Once
+  `do` lands, `Pointer` and `Grid`'s click-through are refactored to *resolve
+  coordinates then call `do`'s injection path*, so exactly one mechanism owns
+  "click a surface." The existing grid machinery (`ClickGridParams`, `Show`/
+  refine) is not thrown away — it is reused for slice-3's capture-side agent
+  grid (which is therefore ~80% built, not net-new).
+- **Coordinate space, focus targeting, and freshness are normative** — see the
+  "Action & lifecycle correctness" section. In short: coords are CSS px in the
+  target webview's document space (the resolver applies page zoom and scroll,
+  and rejects cross-frame targets in v1); `do type` resolves and focuses its
+  target element rather than trusting ambient focus; every selector dispatch
+  re-checks the surface generation so a click queued before a navigation never
+  fires against the wrong document.
 
-**Spike risk (slice 2):** GTK/WebKit event delivery into an **unmapped or
-minimized** webview. If a demoted-but-attached surface accepts injected events
-but a fully unmapped one does not, `do` on a hidden surface needs a transient
-off-screen map, or defers to the farm plane. Phase-A spike settles this.
+**Spike risk — the CENTRAL feasibility gate, not a slice detail (F2).** The
+premise that a GTK/GDK-synthesized event yields `isTrusted: true` inside a
+WebKitGTK WebView **without moving the seat pointer** is unproven in this stack
+(the F.-1 keyboard spike used a *real* seat pointer crossing into the page, not
+synthesized events). Slice 2a proves-or-kills it before any engine is frozen
+around it; the spike also evaluates WebKitGTK's built-in **automation/WebDriver
+input dispatch** (a Layer-1 path) against raw GDK synthesis. Delivery into an
+**unmapped/minimized** webview is a second, narrower question — a demoted-but-
+attached surface is expected to accept events; a fully unmapped one may need a
+transient off-screen map, or `do` on it defers to the farm plane. On NO-GO,
+`do` moves to the farm plane (slice 4) and 2b still ships read/wait/capture/
+lease without trusted `do`.
 
 ### `wait` — event-driven synchronization (rung 2)
 
@@ -207,9 +241,15 @@ wait <handle> --until load:committed|load:finished
   → {met:true, elapsed_ms} | {met:false, reason}
 ```
 
-The engine does the polling (100 ms cadence for `js`), so scripts never
-hand-roll a screenshot-poll loop again. This is the verb that kills the
-"screenshot until it looks done" anti-pattern the current instruments force.
+The engine does the polling (100 ms cadence for `js`, **per surface**, not a
+global tick), so scripts never hand-roll a screenshot-poll loop again. This is
+the verb that kills the "screenshot until it looks done" anti-pattern the
+current instruments force. **Mechanism honesty:** `load:*` rides WebKit's
+`load-changed` signal (already feeding `page_state`); `idle:<ms>` is an
+in-process quiescence heuristic (no DOM mutations / no pending `load` for the
+window), NOT DevTools network-idle — true network-idle waterfall is a `probe`
+capability on the inspector protocol (a later slice), and this verb must not
+claim it in v1.
 
 ### `probe` — the dtrace layer (rung 1, read-only)
 
@@ -228,10 +268,16 @@ capture <handle> --mode viewport|full [--grid] [--out <path>]
   → PNG (+ JSON manifest when --grid)
 ```
 
-- **web**: `webkit.snapshot(FullDocument)` — **always faithful**, works while
-  the surface is backgrounded/minimized (offscreen render, not a compositor
-  grab). Exists today as `WebSurfaceScreenshot`. One-shot, slow — probe stills,
-  not video.
+- **web**: `webkit.snapshot(FullDocument)` — faithful for laid-out DOM, works
+  while the surface is backgrounded/minimized (offscreen render, not a
+  compositor grab). Exists today as `WebSurfaceScreenshot`. One-shot, slow —
+  probe stills, not video. **Freshness contract (do not overclaim):** the
+  snapshot reflects the last committed paint; canvas/video/async-painted
+  regions and a truly throttled backgrounded surface can lag. `capture` returns
+  a `{captured_ms, page_state, throttled}` manifest so a caller can tell a
+  fresh frame from a stale one; the slice-2a spike measures backgrounded-
+  snapshot staleness and, if needed, briefly promotes-under-lease → captures →
+  demotes (risk table).
 - `--grid` composites the click grid **into the returned image only** (see
   Agent presence), never into the live DOM.
 - terminal: the faithful xterm composite (`capture_backend=xterm_canvas_composite`).
@@ -268,20 +314,91 @@ presence dialog.
   backgrounded surfaces + the structured `read --as` extractor, not new
   addressing. The stale code comment "missing entry = backgrounded" predates
   the stash and must be corrected: missing now means *closed or hold-expired*.
+- **A handle is not durable as `(session_path, native_id)` alone.** The
+  reconciler can destroy and recreate a surface (hold expiry, tab swap, profile
+  change) and reuse a native id, so a command or lease queued against a bare
+  pair can act on the wrong surface. The durable handle is
+  `(session_path, tab_id, generation)` — the generation bumps on every
+  recreate; every addressed verb carries it and fails closed with
+  `stale_handle` when it no longer matches (see Action & lifecycle).
 - **Lease has one owner.** A lease rides the `AppliedWebSurface` entry the
   reconciler already owns (it is where stash timing lives) — a lease is just a
   later reap deadline on the same struct, never a second registry that could
-  disagree with the applied map.
+  disagree with the applied map. **Reap predicate (normative):** a stashed
+  surface is reaped iff `now ≥ max(stashed_at + background_hold, lease_until)`
+  — the lease strictly extends, never shortens, the hold.
 - **Agent lease.** `lease <handle> --ttl <s>` pins a surface past the
   `background_hold` (default 600 s) so a long shadow run is not reaped
   mid-flight. The lease is journaled; it never triggers takeover (see below); it
   expires so a dead agent leaks nothing. Multiple agents may co-lease one
-  surface (read/do interleave; the human always preempts).
+  surface (read/do interleave; the human always preempts). A lease taken while
+  the surface is still foreground survives the later foreground→stash transition
+  (it is written to the entry, not to the stash timer).
 - **Headless surface-create.** `open --session <path> --url … --headless` mounts
   a surface that is created but never revealed — the reconciler places it
   demoted with a lease and no page hole. Dream §2: OSC surface-create must not
   defer while the window is backgrounded. On the farm plane this is just
   `/open`.
+
+## Action & lifecycle correctness (slice 2b — normative, F3)
+
+The dangerous edges of "act on a surface the user is not watching" are lifecycle
+and input-targeting races, not the verbs themselves. This repo's rules forbid
+non-determinism; these are the invariants slice 2b must hold, each with an
+acceptance test. This whole section is gated behind the 2a GO — if the
+`isTrusted` spike returns NO-GO, `do`/type/key move to the farm plane and only
+the read/capture/lease invariants below apply.
+
+**Lifecycle**
+
+- **Durable handle = `(session_path, tab_id, generation)`.** The generation is a
+  monotonic counter bumped by the reconciler on every webview recreate for that
+  `(session_path, tab_id)`. It is published alongside the native id in
+  `WEB_SURFACE_NATIVE_IDS`. Every addressed verb carries the generation it was
+  issued against.
+- **Fail closed on stale handle.** A verb whose generation no longer matches the
+  live entry returns `{error: "stale_handle", current_generation}` and performs
+  no action — never a best-effort dispatch against whatever now occupies the id.
+- **Reap predicate:** `reap iff now ≥ max(stashed_at + background_hold,
+  lease_until)` (repeated from the lease section because it is the invariant a
+  test pins).
+- **Cancellation on recreate/close.** When the reconciler destroys or recreates
+  a surface, every queued/in-flight verb for the old generation is cancelled
+  with `stale_handle` and journaled — nothing silently re-binds.
+- **GTK-main-thread ownership.** All surface mutation (event injection, lease
+  writes, generation bumps) happens on the GTK main thread via the existing
+  app-control dispatch; app-control worker threads only enqueue. This is the one
+  writer discipline the reconciler already uses — no second writer.
+
+**Input targeting**
+
+- **Coordinate space is defined.** `--x --y` are CSS pixels in the target
+  webview's *document* space; the resolver applies the surface's current page
+  zoom and scroll offset before dispatch. Under-glass hole geometry and covers
+  are irrelevant (injection targets the widget, not the seat). v1 rejects
+  cross-frame / nested-iframe targets with `unsupported_frame` rather than
+  guessing.
+- **`do type` resolves and focuses its target.** It does not trust ambient
+  focus (global mutable state a redirect, dialog, or human keystroke can move).
+  It focuses the resolved element, verifies focus landed, then dispatches keys;
+  if focus cannot be established it returns `focus_failed`, not a blind type.
+- **Selector freshness guard.** Between resolve and dispatch the engine
+  re-checks the surface generation and (for selectors) that the element still
+  matches at the resolved rect; a navigation or reflow in the gap aborts with
+  `target_moved` instead of clicking whatever now sits there.
+
+**Concurrency and preemption**
+
+- **Per-surface FIFO, one in flight.** Concurrent `do`s on one surface serialize
+  by arrival; deterministic, no timing-dependent interleave. Both journaled.
+- **Human preemption is defined, not aspirational.** Real seat input to a
+  surface (focus-in from the user, a keystroke, a pointer button) sets a
+  preempt flag on that surface: the in-flight agent verb is allowed to finish
+  its single atomic dispatch, the rest of that agent's queued batch for the
+  surface is cancelled with `preempted`, and the cancellation is journaled. The
+  human is never queued behind the agent. Detection rides the existing
+  focus/input signals the shell already tracks; it is not another queue
+  participant.
 
 ## Agent presence — grid and cursors (slice 3, the most expensive rung)
 
@@ -318,14 +435,27 @@ the GUI process; the headless farm has no GUI to route through. The verb
 
 ## Slices (execution order — F.2 splits wait until 2–3 land)
 
-1. **SPEC (this doc)** → plan-eng-review → fold. *Deliverable of this session.*
-2. **Engine core (1–2 sessions).** `--session`-addressed `read`/`capture`/`wait`
-   on GUI-hosted surfaces (mostly wiring existing eval/snapshot to addressing +
-   backgrounded proof); `do` with GTK injection + `isTrusted` verification;
-   agent lease; headless create. **Spike first:** GTK event delivery into
-   unmapped/minimized windows (risk register).
-3. **Agent presence (1 session).** Capture-side grid; agent cursor overlays
-   (cursor v1). Pure GUI.
+1. **SPEC (this doc)** → plan-eng-review → fold. *Deliverable of this session
+   (done 2026-07-20; four findings folded).*
+2. **Engine core — spike-gated (F2).** Split so the unproven primitive cannot
+   sink the cheap wins or freeze an engine around a hole:
+   - **2a — PROOF, then STOP (short, next session).** Two independent proofs on
+     the live host: (i) `--session`-addressed `read` + `capture` against a
+     **stashed/backgrounded** surface actually return that surface's content
+     (the addressing already resolves it — this proves it end-to-end, incl. the
+     stale-error-string fix and backgrounded-snapshot freshness); (ii) whether
+     `isTrusted`-true input injection into a target WebView is possible **at
+     all** without moving the seat pointer — try GDK event synthesis AND
+     WebKitGTK automation/WebDriver input dispatch. **GO/NO-GO gate.**
+   - **2b — ENGINE, only on GO (1–2 sessions).** `do` (single injection
+     primitive, F1) + the Action & lifecycle correctness invariants (F3) +
+     `wait` + agent lease + headless create + the addressed command protocol.
+     **On NO-GO:** `do`/type/key defer to the farm plane (slice 4); 2b still
+     ships `read`/`wait`/`capture`/`lease` without trusted `do`, and the "act
+     without the seat on the GUI plane" promise is honestly deferred.
+3. **Agent presence (1 session).** Capture-side grid (**redirect the existing
+   `Grid`/`ClickGridParams` machinery** to the returned image — ~80% built, not
+   net-new); agent cursor overlays (cursor v1). Pure GUI.
 4. **3.0.0 — true shadow clients + idle-host farm.** Protocol client identity + roles
    (takeover guard), jar leases, input arbitration; headless WPE farm (ychrome
    agent-engine.md Phases A–E). The headless-sway recipe proven this campaign is
@@ -336,6 +466,12 @@ the GUI process; the headless farm has no GUI to route through. The verb
 Each gate is a live proof on the desktop host (screenshot / journal / probe),
 not a code claim.
 
+0. **Slice-2a proof gate (GO/NO-GO, precedes everything else).** (a) `read` +
+   `capture` against a **backgrounded** surface return its real content (not the
+   active surface's, not an error). (b) A verdict — with evidence — on whether
+   `isTrusted`-true injection into a target WebView is achievable without the
+   seat pointer. This gate decides whether gates 2/6's `do` path is on the GUI
+   plane or deferred to the farm plane.
 1. **Undisturbed shadow probe.** An agent runs `read`, `capture`, and a `do`
    click against a **backgrounded** session while the user stays on a different
    session. The user's viewport never switches; a screenshot before and after
@@ -355,12 +491,26 @@ not a code claim.
 6. **Cursor v1.** With an agent working session X and the user viewing X, the
    user sees exactly one `agent-N` colored pointer tracking the agent's actions;
    viewing session Y shows none.
+7. **Secret hygiene (F4).** After a vault `fill`, `read --as html` and `capture`
+   of that page show the secret field **masked**, and the journal line carries
+   the field name + action but never the value. A grep of the trace/journal for
+   the filled secret returns nothing.
+8. **Stale handle fails closed (F3).** A verb issued against generation N after
+   the surface was recreated (now generation N+1) returns `stale_handle` and
+   performs no action — proven by forcing a recreate mid-batch and confirming
+   the queued `do` did not fire against the new document.
+9. **Human preempts (F3).** With an agent mid-batch on a surface, real seat
+   input cancels the rest of the agent's queue (`preempted` in the journal), the
+   human's input is not queued behind the agent, and no further agent verb from
+   that batch dispatches.
 
 ## Risks and spikes
 
 | Risk | Signal | Mitigation / fallback |
 |---|---|---|
-| GTK/WebKit event delivery into an unmapped/minimized webview | slice-2 spike | transient off-screen map for the injection; else defer hidden-surface `do` to the farm plane (same verb) |
+| **`isTrusted`-true injection may be impossible in WebKitGTK without the seat (the central gate)** | slice-2a proof | GO/NO-GO gate BEFORE any engine is built; try GDK synthesis + WebKitGTK automation input; NO-GO ⇒ `do` → farm plane, 2b ships read/wait/capture/lease without trusted `do` |
+| Surface recreated under a queued verb/lease (reused native id) | slice-2b | durable handle `(session, tab, generation)`; verbs fail closed with `stale_handle`; cancellation on recreate (Action & lifecycle) |
+| GTK/WebKit event delivery into an unmapped/minimized webview | slice-2a spike | transient off-screen map for the injection; else defer hidden-surface `do` to the farm plane (same verb) |
 | `webkit.snapshot` on a truly backgrounded surface returns blank/stale | slice-2 spike | soft-stash keeps it attached+composited; if snapshot still needs a live view, briefly promote-under-lease, capture, demote |
 | Two agents `do` the same surface concurrently | slice-2 | per-surface input serialized **FIFO by arrival**, one in flight at a time, both journaled (deterministic ordering, no timing-dependent interleave); human preempts |
 | Lease outlives a dead agent | always | TTL + journaled; reconciler reaps on expiry exactly like the background hold |
@@ -378,6 +528,14 @@ not a code claim.
 - Passkey user-presence invariant unchanged (above). Vault fill stays
   origin-exact, per-fill journal line. No secret ever rides a schema, OSC, or
   command envelope (standing platform rules).
+- **Output redaction — the new door (F4).** `read`/`capture` add
+  whole-page-content outputs and the journal logs every action, so the standing
+  no-secret rule extends here: `input[type=password]` and vault-filled fields
+  are **masked in `read` and `capture` output**; the journal records
+  `{field_name, action}`, never `{value}`; a `do type` of secret material is
+  flagged and its text is not logged. This is not a restriction on the agent
+  (allow-default is unchanged) — it stops the vault's own secrets from spilling
+  into agent-readable output and on-disk traces (acceptance gate 7).
 - Per-profile `agent_drive: allow|deny` (default allow — the owner's explicit
   decision) gates `open`/`do` on the farm plane.
 
@@ -403,3 +561,44 @@ Until `--session` addressing lands, add **probe etiquette** to yggui: after any
 probe that had to switch the active session, restore the user's prior active
 session. Kills the viewport-yank annoyance for the cost of one extra switch, and
 is a strict subset of what slice 2 makes unnecessary.
+
+## Eng-review amendments (2026-07-20)
+
+`/plan-eng-review` (Claude) + an independent Codex outside voice, both folded
+with the owner's per-finding approval. The load-bearing "exists today" claims
+were verified against the code (`resolve_live_web_surface`,
+`WEB_SURFACE_NATIVE_IDS` mirror of the reconciler's `applied` map,
+`is_read_only`, the soft-stash demote path) — the central "a backgrounded
+surface is reachable by `--session` today" claim holds.
+
+1. **F1 — `do` is the single click primitive.** The existing synthetic
+   `AppControlCommand::Pointer`/`Grid` click paths (`document::eval` of a JS
+   event script, `isTrusted` false) refold onto `do`; one owner of "click a
+   surface." The grid machinery is reused for slice-3's capture-side grid.
+2. **F2 — slice 2 is spike-gated (2a → GO/NO-GO → 2b).** Both models called the
+   `isTrusted` hidden-WebView injection the central unproven gate and warned
+   against freezing leases/headless/protocol/cursor around it. 2a proves-or-
+   kills it (and addressed read/capture on a stashed surface) first.
+3. **F3 — Action & lifecycle correctness is normative.** Durable
+   `(session, tab, generation)` handles that fail closed on stale, the reap
+   predicate `max(hold, lease)`, defined coordinate space, resolve-and-focus
+   `do type`, selector freshness guard, and real human-preemption semantics.
+4. **F4 — output redaction.** The standing no-secret rule extends to
+   `read`/`capture` output and the journal.
+
+**Honest scope caveat (Codex #10, does NOT reopen settled decision #5):** the
+verb layer stays surface-generic by decision, but **web is the only fleshed-out
+adapter**; the terminal/document/cellulose columns are one-line mappings, not
+implemented contracts. Slice 2 builds the web adapter only — the others inherit
+the vocabulary when their adapter is written, and the spec should not be read as
+claiming they work yet.
+
+**Discarded as a false positive:** Codex read *"F.2 splits wait until after
+slices 2–3"* as the `wait` **verb** being contradictorily deferred. "Splits" =
+the F.2 pane-split feature; the `wait` verb is correctly in slice 2b.
+
+**Deferred, not folded (Codex, lower-priority — the owner may revisit):** the
+site-lore-as-action-policy trust concern (a poisoned fleet-shared lore entry
+driving `do`) — lore is a shipped, separate system the control plane only
+references; revisit when `do` actually replays lore method blocks (queue
+item 3), not in this spec.
