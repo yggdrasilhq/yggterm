@@ -18961,6 +18961,7 @@ pub fn run_app_control_web_surface_totp(
 pub fn run_app_control_web_surface_do(
     session_path: Option<&str>,
     action: WebSurfaceDoAction,
+    generation: Option<u64>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -18969,6 +18970,28 @@ pub fn run_app_control_web_surface_do(
         AppControlCommand::WebSurfaceDo {
             session_path: session_path.map(str::to_string),
             action,
+            generation,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Claim a session's web surface so the background reaper leaves it alone while
+/// unattended agent work runs (agent control plane `lease`, slice 2b). The lease
+/// only ever EXTENDS the background hold; `ttl_secs: 0` releases it.
+pub fn run_app_control_web_surface_lease(
+    session_path: Option<&str>,
+    ttl_secs: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceLease {
+            session_path: session_path.map(str::to_string),
+            ttl_secs,
         },
         timeout_ms,
     )?;
