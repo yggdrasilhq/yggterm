@@ -90,11 +90,15 @@ def main():
     if autopsies:
         print("\n== render-storm autopsies (what forced the root re-render) ==")
         for ts, a in autopsies[-5:]:
+            drill = "" if a.get("arm_rate_is_default", True) else (
+                f"  [DRILL: armed at {a.get('arm_rate_per_sec')}/s, not a real storm]"
+            )
             print(
                 f"\n  ts={ts} renders={a.get('renders_observed')} "
                 f"rate={a.get('renders_per_sec')}/s window={a.get('window_ms')}ms "
                 f"unattributed={a.get('unattributed')}"
                 + (" [time-truncated]" if a.get("truncated_by_time") else "")
+                + drill
             )
             changed = a.get("changed_fields") or {}
             if changed:
