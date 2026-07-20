@@ -112,9 +112,41 @@ fix) once the fix is verified live on jojo.
     showed no such corruption. That is the "hit hardest" prediction above,
     confirmed on a session the user cannot use.
 
-  Nothing here changes the fix: **per-session attach-phase state**, as already
-  specified. It raises the priority — there is currently NO workaround for the
-  user on a heavily-streaming remote CC session.
+  **CORRECTION, same run — the sanitizers are NOT the cause of THIS symptom.**
+  It was tempting to file the above under suspect (a) because it matches the
+  narrative, but the probe refuses it: `terminal_forward_divergence` fired
+  **3 times in the whole trace, all on an unrelated `live::5d0e22ed…` plain
+  shell, and ZERO times on `remote-cc://dev/029a3955`**. The GUI forwards the
+  daemon's bytes faithfully for the corrupted session. Two further facts clear
+  the excision specifically: the per-line predicate requires a SCHEME-QUALIFIED
+  match (`local://`, `remote-session://`, `codex-runtime://` — note
+  `cc-runtime://` is absent), so prose quoting the phrase is already guarded by
+  `batch_terminal_chunks_keeps_prose_about_missing_sessions`. An attach-phase
+  gate for `batch_terminal_chunks` was written and then **reverted unshipped**
+  because it fixed a bug this session does not have. Suspect (a) remains real
+  for the sessions where divergence DOES fire; it is simply not this.
+
+  **The actual mechanism, read off the raw stream.** The agent CLI paints by
+  skipping unchanged cells with cursor-forward, not by overwriting them — the
+  daemon-side bytes for this session are literally
+  `❯ On\x1b[C the\x1b[C meta\x1b[C page` and `t\x1b[8C html`, i.e. every space
+  and every run of spaces is a CUF. **Cells that CUF skips keep whatever was
+  already in them.** So once the client buffer's base state diverges from the
+  frame the CLI believes is on screen, every skipped region shows stale content
+  and the CLI never rewrites it — permanent, character-by-character
+  interleaving, exactly what is on screen. It re-corrupts within seconds of a
+  clean reveal because the very next diff frame paints against the wrong base.
+
+  **Next step (unverified hypothesis, do not ship on it):** find where the
+  post-attach live stream resumes relative to where the attach replay stopped.
+  A seam — overlap or gap — between the replayed snapshot and the live stream
+  would leave the client buffer holding a base the CLI never authored, which is
+  all it takes. A gap is consistent with a high-throughput session being hit
+  hardest (~1.2 MB/s here). Note that two real SIGWINCHes did NOT repair it,
+  which needs explaining: a resize normally forces a full repaint, so either CC
+  did not receive it or its own full repaint is also CUF-based against a stale
+  model. Settle that first — it discriminates between "client base is wrong"
+  and "CLI model is wrong".
 
 ## Deployed live on jojo, faithful-gesture confirmation pending
 
