@@ -15,7 +15,7 @@ pub use app_control::{
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
     ProbeTerminalViewportInputMode, ScreenshotTarget, WebSurfaceDoAction, WebSurfaceReadAs,
-    app_control_captures_dir,
+    WebSurfaceWaitUntil, app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -18964,6 +18964,30 @@ pub fn run_app_control_web_surface_read(
             mode,
         },
         timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Block until a condition holds on a session's web surface (agent control plane
+/// `wait`, slice 2b). The GUI handler polls up to `wait_timeout_ms`; the
+/// app-control request timeout is given headroom beyond that so the response
+/// (met/timeout) is not cut off by the transport.
+pub fn run_app_control_web_surface_wait(
+    session_path: Option<&str>,
+    until: WebSurfaceWaitUntil,
+    wait_timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let request_timeout_ms = wait_timeout_ms.saturating_add(5_000);
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceWait {
+            session_path: session_path.map(str::to_string),
+            until,
+            timeout_ms: wait_timeout_ms,
+        },
+        request_timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
