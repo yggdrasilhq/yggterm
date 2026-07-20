@@ -198,11 +198,15 @@ pub enum WebSurfaceDoAction {
     },
     /// Press a single named key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`, or
     /// a single character) with optional modifiers (`ctrl`, `shift`, `alt`,
-    /// `meta`).
+    /// `meta`). With `selector`, the target element is focused first (so
+    /// editing/navigation keys like `Backspace`/`ArrowDown` land on it); without
+    /// it, the key goes to whatever the page currently focuses.
     Key {
         key: String,
         #[serde(default)]
         mods: Vec<String>,
+        #[serde(default)]
+        selector: Option<String>,
     },
 }
 
@@ -230,6 +234,30 @@ pub enum WebSurfaceReadAs {
     Text,
     /// The serialized DOM (`outerHTML`).
     Html,
+}
+
+/// The condition a `wait` verb polls for (agent control plane, rung 2 — the
+/// event-driven synchronization that replaces the screenshot-poll loop;
+/// docs/agent-control-plane.md). The engine polls per-surface at a fixed
+/// cadence until met or the wait times out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "until", rename_all = "snake_case")]
+pub enum WebSurfaceWaitUntil {
+    /// `document.readyState` is past `loading` (navigation committed).
+    LoadCommitted,
+    /// `document.readyState === 'complete'` (load finished).
+    LoadFinished,
+    /// No DOM mutations for `ms` (in-process quiescence heuristic — NOT DevTools
+    /// network-idle; that is a `probe` capability, a later slice).
+    Idle { ms: u64 },
+    /// An element matches `css` (optionally requiring a non-zero rect).
+    Selector {
+        css: String,
+        #[serde(default)]
+        visible: bool,
+    },
+    /// A JS expression evaluates truthy (exceptions count as not-yet).
+    Js { expr: String },
 }
 
 fn default_grid_cols() -> u32 {
@@ -670,6 +698,16 @@ pub enum AppControlCommand {
         #[serde(default, rename = "as")]
         mode: WebSurfaceReadAs,
     },
+    /// Block until a condition holds on a session's active web-surface tab — the
+    /// agent control plane `wait` verb (slice 2b, rung 2). The engine polls the
+    /// condition per-surface; kills the "screenshot until it looks done"
+    /// anti-pattern. Read-only (no mutation). `timeout_ms` bounds the poll.
+    WebSurfaceWait {
+        #[serde(default)]
+        session_path: Option<String>,
+        until: WebSurfaceWaitUntil,
+        timeout_ms: u64,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -711,6 +749,7 @@ impl AppControlCommand {
                 | Self::ReadTerminalBuffer { .. }
                 | Self::WebSurfaceScreenshot { .. }
                 | Self::WebSurfaceRead { .. }
+                | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
         )
     }
@@ -783,6 +822,7 @@ impl AppControlCommand {
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::WebSurfaceDo { .. } => "web_surface_do",
             Self::WebSurfaceRead { .. } => "web_surface_read",
+            Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
@@ -1382,6 +1422,7 @@ mod tests {
             WebSurfaceDoAction::Key {
                 key: "Enter".to_string(),
                 mods: vec!["ctrl".to_string()],
+                selector: None,
             },
             WebSurfaceDoAction::Scroll {
                 x: None,
@@ -1432,6 +1473,43 @@ mod tests {
         ] {
             match serde_json::from_str::<AppControlCommand>(json).expect("deserialize") {
                 AppControlCommand::WebSurfaceRead { mode, .. } => assert_eq!(mode, expect),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn web_surface_wait_serializes_nested_until_and_is_read_only() {
+        let command = AppControlCommand::WebSurfaceWait {
+            session_path: None,
+            until: WebSurfaceWaitUntil::Selector {
+                css: "#ready".to_string(),
+                visible: true,
+            },
+            timeout_ms: 5000,
+        };
+        // Polling a condition mutates nothing → read-only.
+        assert!(command.is_read_only());
+        assert_eq!(command.name(), "web_surface_wait");
+        let value = serde_json::to_value(&command).expect("serialize");
+        assert_eq!(
+            value.get("until").and_then(|u| u.get("until")).and_then(serde_json::Value::as_str),
+            Some("selector")
+        );
+        // Round-trip a few condition kinds.
+        for until in [
+            WebSurfaceWaitUntil::LoadFinished,
+            WebSurfaceWaitUntil::Idle { ms: 500 },
+            WebSurfaceWaitUntil::Js { expr: "window.ready".to_string() },
+        ] {
+            let cmd = AppControlCommand::WebSurfaceWait {
+                session_path: None,
+                until: until.clone(),
+                timeout_ms: 1000,
+            };
+            let json = serde_json::to_string(&cmd).unwrap();
+            match serde_json::from_str::<AppControlCommand>(&json).unwrap() {
+                AppControlCommand::WebSurfaceWait { until: back, .. } => assert_eq!(back, until),
                 other => panic!("wrong variant: {other:?}"),
             }
         }

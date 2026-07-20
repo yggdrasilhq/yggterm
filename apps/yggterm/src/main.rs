@@ -49,7 +49,7 @@ use yggterm_server::{
     run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_read,
     run_app_control_web_surface_screenshot,
-    run_app_control_web_surface_totp,
+    run_app_control_web_surface_totp, run_app_control_web_surface_wait,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
@@ -508,6 +508,7 @@ fn parse_web_surface_do_action(
             mods: cli_flag_value(args, "--mods")
                 .map(|raw| raw.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
+            selector: cli_flag_value(args, "--selector").map(str::to_string),
         },
         other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|key)"),
     };
@@ -2769,6 +2770,42 @@ fn main() -> Result<()> {
                             ),
                         };
                         run_app_control_web_surface_read(session_path, mode, timeout_ms)
+                    }
+                    "wait" => {
+                        // Event-driven synchronization (agent control plane slice
+                        // 2b, rung 2) — no more screenshot-poll loops:
+                        //   web wait --until load:finished|load:committed|idle:<ms>
+                        //                    |selector:<css> [--visible] |js:<expr>
+                        //            [--wait-timeout <ms>]
+                        use yggterm_server::WebSurfaceWaitUntil;
+                        let raw = cli_flag_value(&args, "--until")
+                            .context("missing --until for server app web wait")?;
+                        let visible = args.iter().any(|arg| arg == "--visible");
+                        let until = match raw.split_once(':') {
+                            Some(("load", "committed")) => WebSurfaceWaitUntil::LoadCommitted,
+                            Some(("load", "finished")) => WebSurfaceWaitUntil::LoadFinished,
+                            Some(("idle", ms)) => WebSurfaceWaitUntil::Idle {
+                                ms: ms.parse().context("--until idle:<ms> needs a number")?,
+                            },
+                            Some(("selector", css)) => WebSurfaceWaitUntil::Selector {
+                                css: css.to_string(),
+                                visible,
+                            },
+                            Some(("js", expr)) => WebSurfaceWaitUntil::Js {
+                                expr: expr.to_string(),
+                            },
+                            _ => match raw {
+                                "committed" => WebSurfaceWaitUntil::LoadCommitted,
+                                "finished" | "load" | "loaded" => WebSurfaceWaitUntil::LoadFinished,
+                                other => anyhow::bail!(
+                                    "bad --until: {other} (load:committed|load:finished|idle:<ms>|selector:<css>|js:<expr>)"
+                                ),
+                            },
+                        };
+                        let wait_timeout_ms = cli_flag_value(&args, "--wait-timeout")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10_000);
+                        run_app_control_web_surface_wait(session_path, until, wait_timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
