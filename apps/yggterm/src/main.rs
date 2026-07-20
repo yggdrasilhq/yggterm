@@ -46,6 +46,7 @@ use yggterm_server::{
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
+    run_app_control_web_surface_lease,
     run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_read,
     run_app_control_web_surface_screenshot,
@@ -2748,8 +2749,39 @@ fn main() -> Result<()> {
                         //   web do scroll  [--x --y] --dx <n> --dy <n>
                         //   web do type    --text "…" [--selector <css>]
                         //   web do key     --key Enter [--mods ctrl,shift]
+                        // `--generation <n>` pins the surface incarnation the
+                        // verb was issued against: if the webview has been
+                        // destroyed and rebuilt since (reload, profile/proxy
+                        // change, hold expiry), the verb fails closed with
+                        // `stale_handle` rather than acting on a page the
+                        // caller never observed (F3). Every response reports
+                        // the current `generation` to pin the next call with.
                         let action = parse_web_surface_do_action(&args)?;
-                        run_app_control_web_surface_do(session_path, action, timeout_ms)
+                        let generation = cli_flag_value(&args, "--generation")
+                            .map(|raw| {
+                                raw.parse::<u64>()
+                                    .context("--generation needs a number")
+                            })
+                            .transpose()?;
+                        run_app_control_web_surface_do(
+                            session_path,
+                            action,
+                            generation,
+                            timeout_ms,
+                        )
+                    }
+                    "lease" => {
+                        // Claim the surface so the background reaper leaves it
+                        // alone while unattended work runs:
+                        //   web lease --ttl <secs>   (0 releases the claim)
+                        // The lease only ever EXTENDS the background hold — it
+                        // cannot cut one short, so leasing can never destroy a
+                        // surface the user is about to return to.
+                        let ttl_secs = cli_flag_value(&args, "--ttl")
+                            .context("missing --ttl for server app web lease")?
+                            .parse::<u64>()
+                            .context("--ttl needs a number of seconds")?;
+                        run_app_control_web_surface_lease(session_path, ttl_secs, timeout_ms)
                     }
                     "read" => {
                         // Structured read-only observation (agent control plane
