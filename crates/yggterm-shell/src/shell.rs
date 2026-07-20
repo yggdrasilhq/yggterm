@@ -366,8 +366,25 @@ static STORM_AUTOPSY_PREV: OnceCell<Mutex<Vec<(&'static str, u64)>>> = OnceCell:
 static STORM_ONSET_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 static STORM_ONSET_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 // A storm is >=20 renders/s (steady agent streaming sits ~1/s, bursts ~16/s).
+// `YGGTERM_RENDER_STORM_ARM_RATE` overrides the arming rate: lower it to force
+// an autopsy on an idle app when verifying the probe path itself, raise it if
+// the class ever gets noisy. Clamped to >=1 so it can never divide by zero.
 const STORM_ONSET_SAMPLE_RENDERS: u64 = 128;
-const STORM_ONSET_MAX_WINDOW_MS: u64 = STORM_ONSET_SAMPLE_RENDERS * 1000 / 20;
+const STORM_ARM_RATE_ENV: &str = "YGGTERM_RENDER_STORM_ARM_RATE";
+const STORM_ARM_RATE_DEFAULT: u64 = 20;
+static STORM_ARM_RATE: OnceLock<u64> = OnceLock::new();
+fn storm_arm_rate_per_sec() -> u64 {
+    *STORM_ARM_RATE.get_or_init(|| {
+        std::env::var(STORM_ARM_RATE_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|rate| *rate >= 1)
+            .unwrap_or(STORM_ARM_RATE_DEFAULT)
+    })
+}
+fn storm_onset_max_window_ms() -> u64 {
+    STORM_ONSET_SAMPLE_RENDERS * 1000 / storm_arm_rate_per_sec()
+}
 const STORM_AUTOPSY_RENDER_BUDGET: u64 = 512;
 const STORM_AUTOPSY_MAX_WINDOW_MS: u64 = 15_000;
 const STORM_AUTOPSY_COOLDOWN_MS: u64 = 300_000;
@@ -18552,9 +18569,23 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                     .await;
             match outcome {
                 Ok(Ok(flags)) => {
-                    let _ = safe_shell_mut(state, "working_flags_apply", |shell| {
-                        shell.apply_working_flags_poll(&flags)
-                    });
+                    // Peek before mutating. `with_mut` dirties the whole
+                    // ShellState signal — and therefore re-renders the root —
+                    // even when the operation changes nothing, and this poll
+                    // finds nothing to do on the overwhelming majority of its
+                    // 2.5s ticks. Taking the read path when the flags already
+                    // match removes that idle re-render entirely.
+                    let would_change = safe_shell_read(state, "working_flags_would_change", |shell| {
+                        shell
+                            .server
+                            .live_session_working_flags_would_change(&flags)
+                    })
+                    .unwrap_or(true);
+                    if would_change {
+                        let _ = safe_shell_mut(state, "working_flags_apply", |shell| {
+                            shell.apply_working_flags_poll(&flags)
+                        });
+                    }
                 }
                 _ => {
                     // Old daemon (unknown request) or transient socket error —
@@ -50958,7 +50989,7 @@ fn app() -> Element {
                 let sampled = STORM_ONSET_WINDOW_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 if sampled >= STORM_ONSET_SAMPLE_RENDERS {
                     let elapsed = now.saturating_sub(window_start);
-                    let storming = elapsed > 0 && elapsed <= STORM_ONSET_MAX_WINDOW_MS;
+                    let storming = elapsed > 0 && elapsed <= storm_onset_max_window_ms();
                     let last_emit = STORM_AUTOPSY_LAST_EMIT_MS.load(AtomicOrdering::Relaxed);
                     let cooled = last_emit == 0
                         || now.saturating_sub(last_emit) >= STORM_AUTOPSY_COOLDOWN_MS;
@@ -51217,6 +51248,11 @@ fn app() -> Element {
                     "session_path": "",
                     "anomaly": {
                         "pattern": "app_render_storm_autopsy",
+                        // Arm rate is stamped so a reader can tell a real storm
+                        // from one forced by lowering the threshold to verify
+                        // the probe path. Anything but the default is a drill.
+                        "arm_rate_per_sec": storm_arm_rate_per_sec(),
+                        "arm_rate_is_default": storm_arm_rate_per_sec() == STORM_ARM_RATE_DEFAULT,
                         "renders_observed": observed,
                         "window_ms": duration_ms,
                         "renders_per_sec": per_sec,
