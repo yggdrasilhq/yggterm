@@ -182,7 +182,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WebSurfaceReadAs,
+    WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -43624,6 +43625,191 @@ mod web_do_verb_tests {
         assert_eq!(web_do_mods_to_state(&["meta".into()]), 0x0400_0000);
         assert_eq!(web_do_mods_to_state(&["bogus".into()]), 0);
     }
+
+    #[test]
+    fn each_read_mode_has_a_distinct_iife_extractor() {
+        use WebSurfaceReadAs::*;
+        let modes = [Snapshot, Forms, Tables, Readable, Links, Text, Html];
+        let mut scripts = std::collections::HashSet::new();
+        for m in modes {
+            let s = web_read_script(m);
+            // Every extractor is a self-invoking function returning a value —
+            // the same raw-IIFE contract `web eval` uses (no bare `return`).
+            assert!(s.starts_with("(function(){"), "{:?} not an IIFE", m);
+            assert!(s.contains("return"), "{:?} has no return", m);
+            assert!(scripts.insert(s), "{:?} shares a script with another mode", m);
+            // Non-empty, distinct wire name.
+            assert!(!web_read_mode_name(m).is_empty());
+        }
+        assert_eq!(scripts.len(), modes.len());
+    }
+
+    #[test]
+    fn secret_bearing_read_modes_mask_password_values() {
+        // F4: the field-value door must mask password inputs, never echo them.
+        for m in [WebSurfaceReadAs::Snapshot, WebSurfaceReadAs::Forms] {
+            let s = web_read_script(m);
+            assert!(
+                s.contains("password") && s.contains("•••"),
+                "{m:?} extractor must mask password values"
+            );
+        }
+    }
+
+    #[test]
+    fn read_mode_names_match_serde_wire_names() {
+        // The echoed `as` name must equal the serde wire name (single source of
+        // truth for the mode string).
+        for m in [
+            WebSurfaceReadAs::Snapshot,
+            WebSurfaceReadAs::Forms,
+            WebSurfaceReadAs::Tables,
+            WebSurfaceReadAs::Readable,
+            WebSurfaceReadAs::Links,
+            WebSurfaceReadAs::Text,
+            WebSurfaceReadAs::Html,
+        ] {
+            let wire = serde_json::to_value(m).unwrap();
+            assert_eq!(wire.as_str(), Some(web_read_mode_name(m)));
+        }
+    }
+}
+
+/// The interactable-element extractor (agent control plane `read --as snapshot`).
+/// Returns a compact tree of buttons/links/inputs/selects/textareas/[role]/
+/// [contenteditable], each with a resolvable `selector` + viewport `rect`, so
+/// `read` → pick → `do click --selector` composes. F4: a password field's value
+/// is masked (never the real characters).
+const WEB_READ_SNAPSHOT_JS: &str = r#"(function(){
+function cssPath(el){
+  if(el.id) return '#'+CSS.escape(el.id);
+  var parts=[];
+  while(el&&el.nodeType===1&&parts.length<6){
+    var s=el.tagName.toLowerCase();
+    var nm=el.getAttribute&&el.getAttribute('name');
+    if(nm){s+='[name="'+nm+'"]';parts.unshift(s);break;}
+    var p=el.parentNode;
+    if(p&&p.children){var sibs=Array.prototype.filter.call(p.children,function(c){return c.tagName===el.tagName;});if(sibs.length>1)s+=':nth-of-type('+(sibs.indexOf(el)+1)+')';}
+    parts.unshift(s);
+    if(p&&p.id){parts.unshift('#'+CSS.escape(p.id));break;}
+    el=p;
+  }
+  return parts.join('>');
+}
+var sel='a[href],button,input,select,textarea,[role],[contenteditable="true"],[onclick],[tabindex]';
+var out=[];
+document.querySelectorAll(sel).forEach(function(el){
+  var r=el.getBoundingClientRect();
+  if(r.width<=0||r.height<=0)return;
+  var isSecret=el.tagName==='INPUT'&&el.type==='password';
+  var val;
+  if(el.value!==undefined&&el.value!==null)val=isSecret?'•••':String(el.value).slice(0,200);
+  var text=isSecret?(el.getAttribute('aria-label')||el.placeholder||''):((el.innerText||el.getAttribute('aria-label')||el.placeholder||el.getAttribute('value')||''));
+  out.push({role:el.getAttribute('role')||el.tagName.toLowerCase(),type:el.type||undefined,name:(el.getAttribute&&el.getAttribute('name'))||undefined,text:(text||'').trim().slice(0,120)||undefined,selector:cssPath(el),rect:[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)],value:val});
+});
+return out.slice(0,300);
+})()"#;
+
+/// Form fields (inputs/selects/textareas) with name/type/value; secret values
+/// masked (F4).
+const WEB_READ_FORMS_JS: &str = r#"(function(){
+var out=[];
+document.querySelectorAll('input,select,textarea').forEach(function(el){
+  var isSecret=el.type==='password';
+  out.push({tag:el.tagName.toLowerCase(),type:el.type||undefined,name:(el.getAttribute&&el.getAttribute('name'))||undefined,id:el.id||undefined,placeholder:el.placeholder||undefined,value:isSecret?'•••':(el.value!==undefined?String(el.value).slice(0,200):undefined),form:(el.form&&(el.form.getAttribute('name')||el.form.id||el.form.action))||undefined});
+});
+return out.slice(0,200);
+})()"#;
+
+/// Tables as row/col JSON.
+const WEB_READ_TABLES_JS: &str = r#"(function(){
+var out=[];
+document.querySelectorAll('table').forEach(function(t,ti){
+  var rows=[];
+  t.querySelectorAll('tr').forEach(function(tr){
+    var cells=[];
+    tr.querySelectorAll('th,td').forEach(function(c){cells.push((c.innerText||'').trim().slice(0,120));});
+    if(cells.length)rows.push(cells);
+  });
+  if(rows.length)out.push({table:ti,rows:rows.slice(0,200)});
+});
+return out.slice(0,20);
+})()"#;
+
+/// Article extraction — the main readable text.
+const WEB_READ_READABLE_JS: &str = r#"(function(){
+var root=document.querySelector('article')||document.querySelector('main')||document.body;
+return {title:document.title,text:((root&&root.innerText)||'').trim().slice(0,20000)};
+})()"#;
+
+/// All `a[href]` links as `{text, href}`.
+const WEB_READ_LINKS_JS: &str = r#"(function(){
+var out=[];
+document.querySelectorAll('a[href]').forEach(function(a){out.push({text:(a.innerText||a.getAttribute('aria-label')||'').trim().slice(0,120),href:a.href});});
+return out.slice(0,500);
+})()"#;
+
+/// The page's visible text.
+const WEB_READ_TEXT_JS: &str =
+    r#"(function(){return (document.body?document.body.innerText:'').slice(0,50000);})()"#;
+
+/// Serialized DOM. `outerHTML` does not serialize live input `.value`
+/// properties, so typed/filled secrets are not present; forms/snapshot mask
+/// explicitly for the field-value door (F4).
+const WEB_READ_HTML_JS: &str =
+    r#"(function(){return document.documentElement.outerHTML.slice(0,500000);})()"#;
+
+/// The extractor script for a read mode.
+fn web_read_script(mode: WebSurfaceReadAs) -> &'static str {
+    match mode {
+        WebSurfaceReadAs::Snapshot => WEB_READ_SNAPSHOT_JS,
+        WebSurfaceReadAs::Forms => WEB_READ_FORMS_JS,
+        WebSurfaceReadAs::Tables => WEB_READ_TABLES_JS,
+        WebSurfaceReadAs::Readable => WEB_READ_READABLE_JS,
+        WebSurfaceReadAs::Links => WEB_READ_LINKS_JS,
+        WebSurfaceReadAs::Text => WEB_READ_TEXT_JS,
+        WebSurfaceReadAs::Html => WEB_READ_HTML_JS,
+    }
+}
+
+/// The wire name for a read mode (echoed in the response for the caller).
+fn web_read_mode_name(mode: WebSurfaceReadAs) -> &'static str {
+    match mode {
+        WebSurfaceReadAs::Snapshot => "snapshot",
+        WebSurfaceReadAs::Forms => "forms",
+        WebSurfaceReadAs::Tables => "tables",
+        WebSurfaceReadAs::Readable => "readable",
+        WebSurfaceReadAs::Links => "links",
+        WebSurfaceReadAs::Text => "text",
+        WebSurfaceReadAs::Html => "html",
+    }
+}
+
+/// App-control: structured, read-only observation of a session's active
+/// web-surface tab — the agent control plane `read` verb (slice 2b, rung 1, the
+/// cheapest observation). Resolves the live surface (reaches a soft-stashed one
+/// by `--session`), runs the extractor for `mode`, returns JSON. Never mutates,
+/// never moves a pointer. Secret field values are masked in the output (F4).
+async fn web_surface_read_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    mode: WebSurfaceReadAs,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    match web_do_eval(desktop, native_id, web_read_script(mode)).await {
+        Ok(result) => json!({
+            "accepted": true,
+            "session_path": session,
+            "native_id": native_id,
+            "as": web_read_mode_name(mode),
+            "result": result,
+        }),
+        Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
+    }
 }
 
 /// App-control: full-document PNG capture of a session's active web-surface
@@ -48184,6 +48370,24 @@ async fn process_pending_app_control_requests(
         } => {
             let result =
                 web_surface_do_for(&state, &desktop, session_path.as_deref(), &action).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceRead { session_path, mode } => {
+            let result =
+                web_surface_read_for(&state, &desktop, session_path.as_deref(), mode).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
