@@ -2197,6 +2197,13 @@ pub struct ManagedSessionView {
     pub working: Option<bool>,
 }
 
+/// The one place that decides whether a polled working flag differs from what a
+/// session already holds. Both the working-flags mutator and its would-change
+/// predicate route through this so they cannot drift apart.
+fn working_flag_differs(session: &ManagedSessionView, working: bool) -> bool {
+    session.working != Some(working)
+}
+
 #[derive(Debug, Clone)]
 pub struct YggtermServer {
     sessions: BTreeMap<String, ManagedSessionView>,
@@ -3527,6 +3534,26 @@ impl YggtermServer {
     /// field of matching live sessions in place, between full snapshot applies.
     /// Returns the (path, working) pairs that actually CHANGED so the caller
     /// can trace the edges and fire finished-working notifications.
+    /// Whether [`Self::apply_live_session_working_flags`] would change anything.
+    ///
+    /// The working-flags poll ticks every 2.5s and almost always finds nothing
+    /// to do, but the caller went through `state.with_mut` regardless — and
+    /// Dioxus marks the whole `ShellState` signal dirty on `with_mut` whether or
+    /// not a field actually moved, so every idle tick forced a full root
+    /// re-render. Telemetry campaign run 4 measured `working_flags_apply` as the
+    /// single hottest `safe_shell_mut` write context on a completely idle app.
+    /// Callers peek this first and only take the mutable path when it is true.
+    ///
+    /// This is deliberately the same per-entry condition the mutator applies —
+    /// both go through [`working_flag_differs`] so the two can never disagree.
+    pub fn live_session_working_flags_would_change(&self, flags: &[(String, bool)]) -> bool {
+        flags.iter().any(|(path, working)| {
+            self.sessions
+                .get(path)
+                .is_some_and(|session| working_flag_differs(session, *working))
+        })
+    }
+
     pub fn apply_live_session_working_flags(
         &mut self,
         flags: &[(String, bool)],
@@ -3534,7 +3561,7 @@ impl YggtermServer {
         let mut changed = Vec::new();
         for (path, working) in flags {
             if let Some(session) = self.sessions.get_mut(path)
-                && session.working != Some(*working)
+                && working_flag_differs(session, *working)
             {
                 session.working = Some(*working);
                 changed.push((path.clone(), *working));
@@ -23678,6 +23705,37 @@ mod tests {
             .cloned()
             .expect("session");
         assert_eq!(session.working, Some(false));
+    }
+
+    #[test]
+    fn working_flags_would_change_agrees_with_the_mutator_on_every_tick() {
+        // Telemetry campaign run 4: the 2.5s working-flags poll called the
+        // mutator unconditionally, and `state.with_mut` dirties the whole
+        // ShellState signal whether or not a field moved — so an idle app
+        // re-rendered its root on every tick. The caller now peeks
+        // `live_session_working_flags_would_change` first, which is only sound
+        // while the predicate and the mutator agree EXACTLY. Lock that: for
+        // each step the predicate must be true iff the mutator reports an edge.
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/pi"), None);
+        let steps: Vec<Vec<(String, bool)>> = vec![
+            vec![(path.clone(), true)],                    // first true: edge
+            vec![(path.clone(), true)],                    // repeat: no edge
+            vec![(path.clone(), false)],                   // true -> false: edge
+            vec![(path.clone(), false)],                   // repeat: no edge
+            vec![("local://nope".to_string(), true)],      // unknown path: no edge
+            vec![],                                        // empty poll: no edge
+            vec![(path.clone(), true), ("local://nope".to_string(), false)],
+        ];
+        for (index, flags) in steps.iter().enumerate() {
+            let predicted = server.live_session_working_flags_would_change(flags);
+            let changed = !server.apply_live_session_working_flags(flags).is_empty();
+            assert_eq!(
+                predicted, changed,
+                "step {index}: predicate said {predicted} but the mutator reported {changed}; \
+                 a disagreement here silently drops a working-dot edge"
+            );
+        }
     }
 
     #[test]
