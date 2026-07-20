@@ -359,6 +359,9 @@ static STORM_AUTOPSY_RENDERS_LEFT: AtomicU64 = AtomicU64::new(0);
 static STORM_AUTOPSY_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static STORM_AUTOPSY_LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
 static STORM_AUTOPSY_UNATTRIBUTED: AtomicU64 = AtomicU64::new(0);
+/// `FORCED_WAKE_TOTAL` sampled when the autopsy arms, so the emitted report can
+/// carry the DELTA (see the arm site for why that delta is the discriminator).
+static STORM_AUTOPSY_FORCED_WAKE_BASE: AtomicU64 = AtomicU64::new(0);
 static STORM_AUTOPSY_FIELD_HITS: OnceCell<Mutex<HashMap<&'static str, u64>>> = OnceCell::new();
 static STORM_AUTOPSY_PREV: OnceCell<Mutex<Vec<(&'static str, u64)>>> = OnceCell::new();
 // Onset detector: renders are sampled in fixed-size batches so a storm is
@@ -51056,6 +51059,21 @@ fn app() -> Element {
                         STORM_AUTOPSY_RENDERS_LEFT
                             .store(STORM_AUTOPSY_RENDER_BUDGET, AtomicOrdering::Relaxed);
                         STORM_AUTOPSY_STARTED_MS.store(now, AtomicOrdering::Relaxed);
+                        // Baseline the forced-wake counter so the emit can report
+                        // how many of the window's renders were OUR explicit
+                        // schedule_update() calls. THE discriminator the previous
+                        // autopsies lacked: they reported 511/512 renders
+                        // "unattributed" with every field histogram EMPTY, which
+                        // says only "no signal changed" — not who woke the root.
+                        // forced_wakes ~= renders  => a caller is over-scheduling
+                        // (find it via the guarded call sites).
+                        // forced_wakes ~= 0        => nothing of ours asked; the
+                        //   wakes are Dioxus-internal (a future/eval/task
+                        //   resolving every frame), which is a completely
+                        //   different fix and cannot be found by auditing our
+                        //   schedule_update callers at all.
+                        STORM_AUTOPSY_FORCED_WAKE_BASE
+                            .store(FORCED_WAKE_TOTAL.load(Ordering::SeqCst), AtomicOrdering::Relaxed);
                         STORM_AUTOPSY_ARMED.store(true, AtomicOrdering::Relaxed);
                     }
                     STORM_ONSET_WINDOW_START_MS.store(now, AtomicOrdering::Relaxed);
@@ -51300,6 +51318,15 @@ fn app() -> Element {
                         "window_ms": duration_ms,
                         "renders_per_sec": per_sec,
                         "unattributed": STORM_AUTOPSY_UNATTRIBUTED.load(Ordering::Relaxed),
+                        // Renders this window that OUR schedule_update() asked
+                        // for. Read it against `renders_observed`: ~equal means a
+                        // caller over-schedules; ~0 with a high unattributed count
+                        // means the wakes come from inside Dioxus (a future/eval
+                        // resolving), not from us. Counted unconditionally, so
+                        // this is always populated when a storm fires.
+                        "forced_wakes": FORCED_WAKE_TOTAL
+                            .load(Ordering::SeqCst)
+                            .saturating_sub(STORM_AUTOPSY_FORCED_WAKE_BASE.load(Ordering::Relaxed)),
                         "changed_fields": Value::Object(field_hits),
                         "shellstate_mut": Value::Object(mut_hist),
                         "truncated_by_time": expired && left > 0,
@@ -51317,14 +51344,19 @@ fn app() -> Element {
     let mut last_sidebar_bounds_repair_key = use_signal(|| None::<String>);
     let mut last_tree_rename_focus_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
-    let schedule_ui_update: std::sync::Arc<dyn Fn() + Send + Sync> = if render_trace_enabled() {
+    // Count forced wakes ALWAYS, not only under the render trace. A storm is
+    // sporadic and unannounced, so a counter you must predict and enable ahead of
+    // time is a counter that is off exactly when the storm you needed it for
+    // fires (the previous autopsies all landed with no wake data at all). The
+    // cost is one relaxed atomic add per explicit schedule_update — nothing next
+    // to the render it triggers. The EXPENSIVE part (per-field hashing in
+    // render_cause_field_hashes) stays gated behind render_trace_enabled().
+    let schedule_ui_update: std::sync::Arc<dyn Fn() + Send + Sync> = {
         let inner = schedule_ui_update;
         std::sync::Arc::new(move || {
             FORCED_WAKE_TOTAL.fetch_add(1, Ordering::SeqCst);
             inner();
         })
-    } else {
-        schedule_ui_update
     };
     let web_surface_reconcile_loop_started =
         use_hook(|| Arc::new(AtomicBool::new(false))).clone();
