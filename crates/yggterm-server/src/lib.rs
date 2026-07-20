@@ -14,7 +14,7 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, app_control_captures_dir,
+    ProbeTerminalViewportInputMode, ScreenshotTarget, WebSurfaceDoAction, app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -18920,6 +18920,27 @@ pub fn run_app_control_web_surface_totp(
             session_path: session_path.map(str::to_string),
             entry: entry.map(str::to_string),
             user: user.map(str::to_string),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Inject a trusted `do` action (agent control plane slice 2b) into a session's
+/// active web surface. The action is already parsed CLI-side into the typed
+/// `WebSurfaceDoAction`; the GUI resolves selectors + maps coordinates.
+pub fn run_app_control_web_surface_do(
+    session_path: Option<&str>,
+    action: WebSurfaceDoAction,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceDo {
+            session_path: session_path.map(str::to_string),
+            action,
         },
         timeout_ms,
     )?;

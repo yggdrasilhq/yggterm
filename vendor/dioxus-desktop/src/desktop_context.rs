@@ -696,6 +696,135 @@ impl DesktopService {
         }
     }
 
+    /// Inject a trusted pointer CLICK (press + release) into web surface `id`'s
+    /// page at CSS-viewport `(x, y)`. No seat pointer moves; the page sees
+    /// `isTrusted: true`. `button` is the GDK button number (1 left). The
+    /// agent-control-plane `do click` primitive (slice 2b).
+    pub fn inject_web_surface_click(
+        &self,
+        id: u64,
+        x: f64,
+        y: f64,
+        button: u32,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.inject_click(id, x, y, button),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, x, y, button);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Inject a trusted pointer MOVE (real hover) into web surface `id`'s page.
+    pub fn inject_web_surface_move(&self, id: u64, x: f64, y: f64) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.inject_move(id, x, y),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, x, y);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Inject a smooth-scroll wheel event into web surface `id`'s page at
+    /// CSS-viewport `(x, y)` with the given deltas (positive `dy` = down).
+    pub fn inject_web_surface_scroll(
+        &self,
+        id: u64,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.inject_scroll(id, x, y, dx, dy),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, x, y, dx, dy);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Inject a single trusted key press OR release into web surface `id`'s
+    /// page. `keyval` is the GDK keyval; `state` is the GDK modifier bitmask.
+    /// The shell composes `type`/`key` verbs from press+release pairs.
+    pub fn inject_web_surface_key(
+        &self,
+        id: u64,
+        press: bool,
+        keyval: u32,
+        state: u32,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.inject_key(id, press, keyval, state),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, press, keyval, state);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Start the creation of a new window using the props and window builder
     ///
     /// Returns a future that resolves to the webview handle for the new window. You can use this

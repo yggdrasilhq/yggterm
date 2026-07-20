@@ -152,6 +152,60 @@ pub enum AppControlKeyCommand {
     Type { text: String },
 }
 
+/// One trusted action injected into a web surface's page (agent control plane
+/// `do` verb, slice 2b). Delivered via GTK-level event synthesis into the target
+/// webview — `isTrusted: true`, NO seat pointer moved — so a backgrounded
+/// surface is actionable and the user's real cursor is never hijacked. This is
+/// the ONE click-delivery primitive (docs/agent-control-plane.md F1); the older
+/// synthetic `Pointer`/`Grid` JS-click paths are the untrusted, main-webview
+/// legacy. Coordinates are **document-space CSS pixels**; the shell resolves
+/// selectors and maps CSS→widget px (page zoom + scroll) before dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum WebSurfaceDoAction {
+    /// Click at document-space CSS `(x, y)`.
+    Click {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        button: AppControlPointerButton,
+    },
+    /// Click the element matching `selector` (engine resolves its rect + scrolls
+    /// it into view, then clicks its center). Sugar over `Click`.
+    ClickSelector {
+        selector: String,
+        #[serde(default)]
+        button: AppControlPointerButton,
+    },
+    /// A real hover (drives `:hover`, tooltips, menu reveal) at CSS `(x, y)`.
+    Move { x: f64, y: f64 },
+    /// A smooth wheel scroll by `(dx, dy)` at CSS `(x, y)` (defaults to the
+    /// viewport center). Positive `dy` scrolls content down.
+    Scroll {
+        #[serde(default)]
+        x: Option<f64>,
+        #[serde(default)]
+        y: Option<f64>,
+        dx: f64,
+        dy: f64,
+    },
+    /// Type `text` into the element matching `selector` (resolve + focus first);
+    /// with no selector, types into the page's currently focused element.
+    Type {
+        text: String,
+        #[serde(default)]
+        selector: Option<String>,
+    },
+    /// Press a single named key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`, or
+    /// a single character) with optional modifiers (`ctrl`, `shift`, `alt`,
+    /// `meta`).
+    Key {
+        key: String,
+        #[serde(default)]
+        mods: Vec<String>,
+    },
+}
+
 fn default_grid_cols() -> u32 {
     12
 }
@@ -566,6 +620,19 @@ pub enum AppControlCommand {
         #[serde(default)]
         user: Option<String>,
     },
+    /// Inject a TRUSTED action into a session's active web-surface tab — the
+    /// agent control plane `do` verb (slice 2b). Delivered by GTK-level event
+    /// synthesis into the target webview (`isTrusted: true`, NO seat pointer
+    /// moved), so a backgrounded surface is actionable and the user's cursor is
+    /// never hijacked. Reaches a soft-stashed (demoted, still mapped) surface by
+    /// `--session`; a fully-hidden/unmapped one fails closed with
+    /// `surface_not_mapped`. The ONE click-delivery primitive
+    /// (docs/agent-control-plane.md F1).
+    WebSurfaceDo {
+        #[serde(default)]
+        session_path: Option<String>,
+        action: WebSurfaceDoAction,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -676,6 +743,7 @@ impl AppControlCommand {
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
+            Self::WebSurfaceDo { .. } => "web_surface_do",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
@@ -1229,6 +1297,77 @@ mod tests {
             Some("superseded-client-handoff")
         );
         assert_eq!(command.name(), "close_window_preserving_sessions");
+    }
+
+    #[test]
+    fn web_surface_do_serializes_with_nested_verb_tag() {
+        let command = AppControlCommand::WebSurfaceDo {
+            session_path: Some("local://abc".to_string()),
+            action: WebSurfaceDoAction::ClickSelector {
+                selector: "button[type=submit]".to_string(),
+                button: AppControlPointerButton::Primary,
+            },
+        };
+        let value = serde_json::to_value(&command).expect("serialize web_surface_do");
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("web_surface_do")
+        );
+        assert_eq!(
+            value
+                .get("action")
+                .and_then(|a| a.get("verb"))
+                .and_then(serde_json::Value::as_str),
+            Some("click_selector")
+        );
+        assert_eq!(
+            value
+                .get("action")
+                .and_then(|a| a.get("selector"))
+                .and_then(serde_json::Value::as_str),
+            Some("button[type=submit]")
+        );
+        assert_eq!(command.name(), "web_surface_do");
+        // A mutating action → must NOT be read-only (it needs a re-render gate).
+        assert!(!command.is_read_only());
+    }
+
+    #[test]
+    fn web_surface_do_click_and_key_round_trip() {
+        for action in [
+            WebSurfaceDoAction::Click {
+                x: 12.0,
+                y: 34.0,
+                button: AppControlPointerButton::Secondary,
+            },
+            WebSurfaceDoAction::Key {
+                key: "Enter".to_string(),
+                mods: vec!["ctrl".to_string()],
+            },
+            WebSurfaceDoAction::Scroll {
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 120.0,
+            },
+        ] {
+            let command = AppControlCommand::WebSurfaceDo {
+                session_path: None,
+                action: action.clone(),
+            };
+            let json = serde_json::to_string(&command).expect("serialize");
+            let back: AppControlCommand = serde_json::from_str(&json).expect("deserialize");
+            match back {
+                AppControlCommand::WebSurfaceDo {
+                    session_path,
+                    action: round,
+                } => {
+                    assert_eq!(session_path, None);
+                    assert_eq!(round, action);
+                }
+                other => panic!("round-tripped into the wrong variant: {other:?}"),
+            }
+        }
     }
 
     #[test]
