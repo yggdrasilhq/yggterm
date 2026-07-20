@@ -85,6 +85,37 @@ fix) once the fix is verified live on jojo.
   mechanism, and the reason it can't be a one-liner are recorded in code at
   `batch_terminal_chunks`. **This is the next thing to do on that campaign.**
 
+  **UPDATE 2026-07-20 (run 5): now USER-BLOCKING, and it reproduces hardest on
+  the busiest remote-CC session.** The user reported a session that "100% never
+  renders", where closing and reopening the GUI — their standing workaround —
+  had stopped working. Named session: `remote-cc://dev/029a3955…`
+  ("libyggterm Rebase"). Evidence gathered this run:
+
+  - **The corruption is in the client BUFFER, not the paint.** `app terminal
+    read-buffer --mode screen` shows three different screen states interleaved
+    character-by-character on the same rows (an old report, a test-code frame, a
+    `/context` usage panel, plus a stray line-number column). The faithful
+    screenshot merely renders that corrupt buffer honestly, so this is NOT a
+    canvas/renderer problem — do not chase the renderer again.
+  - **It survives every repair that does not fix the pipe.** Two real SIGWINCHes
+    (PTY winsize verified changing 63×167 → 62×166 → 63×167 on dev, so CC
+    definitely re-authored its frame) left the buffer byte-identical in the
+    corrupt regions; GUI restarts and repeated `app open` reveals do not stick.
+    The attach/replay seed is clean (fixed in 2.10.4), so a fresh reveal paints
+    correctly and then **re-corrupts within seconds** of live streaming.
+  - **Why THIS session and not the neighbouring one.** CC on dev is writing
+    ~1.2 MB/s (`/proc/<pid>/io` write_bytes +6 MB in 5 s). High throughput means
+    more batches, and the excision is content-triggered — and this session's
+    transcript is saturated with the exact transport phrases the sanitizer
+    matches ("dropped", "eval failed", "never armed", and it literally quotes
+    `terminal session not found`). The calm local session in the same window
+    showed no such corruption. That is the "hit hardest" prediction above,
+    confirmed on a session the user cannot use.
+
+  Nothing here changes the fix: **per-session attach-phase state**, as already
+  specified. It raises the priority — there is currently NO workaround for the
+  user on a heavily-streaming remote CC session.
+
 ## Deployed live on jojo, faithful-gesture confirmation pending
 
 - **Middle-click a link in a web surface → new tab (2.10.15, c6542edc).** Root
