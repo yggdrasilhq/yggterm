@@ -183,7 +183,7 @@ use yggterm_server::{
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WebSurfaceReadAs,
-    WorkspaceViewMode,
+    WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -43324,6 +43324,30 @@ async fn web_do_eval(
     }
 }
 
+/// Focus the element matching `selector` in the target surface (F3: do not
+/// trust ambient focus — a redirect, dialog, or human keystroke can move it).
+/// Errors `no element matches` / `focus_failed` if the target is absent or
+/// cannot take focus. Shared by `do type` and `do key --selector`.
+async fn web_do_focus_selector(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    selector: &str,
+) -> Result<(), String> {
+    let script = format!(
+        "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
+         el.focus();return{{found:true,focused:document.activeElement===el}};}})()",
+        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await?;
+    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!("no element matches selector: {selector}"));
+    }
+    if !info.get("focused").and_then(Value::as_bool).unwrap_or(false) {
+        return Err("focus_failed (could not focus the selector target)".to_string());
+    }
+    Ok(())
+}
+
 /// GDK button number for an app-control pointer button.
 fn web_do_gdk_button(button: AppControlPointerButton) -> u32 {
     match button {
@@ -43500,8 +43524,16 @@ async fn web_surface_do_for(
                 Err(reason) => Err(reason),
             }
         }
-        WebSurfaceDoAction::Key { key, mods } => match web_do_key_name_to_keyval(key) {
+        WebSurfaceDoAction::Key { key, mods, selector } => match web_do_key_name_to_keyval(key) {
             Some(keyval) => {
+                // Editing/navigation keys need a focused DOM element (the widget
+                // grab alone has no target). Focus the selector first when given.
+                if let Some(selector) = selector {
+                    match web_do_focus_selector(desktop, native_id, selector).await {
+                        Ok(()) => {}
+                        Err(reason) => return json!({ "accepted": false, "session_path": session, "reason": reason }),
+                    }
+                }
                 let state_bits = web_do_mods_to_state(mods);
                 let press = desktop.inject_web_surface_key(native_id, true, keyval, state_bits);
                 let release = desktop.inject_web_surface_key(native_id, false, keyval, state_bits);
@@ -43514,25 +43546,10 @@ async fn web_surface_do_for(
         WebSurfaceDoAction::Type { text, selector } => {
             // Optionally resolve + focus the target first (F3: do not trust
             // ambient focus). Then deliver each character as a key press+release.
-            if let Some(selector) = selector {
-                let script = format!(
-                    "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
-                     el.focus();return{{found:true,focused:document.activeElement===el}};}})()",
-                    sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-                );
-                match web_do_eval(desktop, native_id, &script).await {
-                    Ok(info) => {
-                        if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-                            return json!({ "accepted": false, "session_path": session, "reason": format!("no element matches selector: {selector}") });
-                        }
-                        if !info.get("focused").and_then(Value::as_bool).unwrap_or(false) {
-                            return json!({ "accepted": false, "session_path": session, "reason": "focus_failed (could not focus the selector target)" });
-                        }
-                    }
-                    Err(reason) => {
-                        return json!({ "accepted": false, "session_path": session, "reason": reason });
-                    }
-                }
+            if let Some(selector) = selector
+                && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+            {
+                return json!({ "accepted": false, "session_path": session, "reason": reason });
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -43654,6 +43671,53 @@ mod web_do_verb_tests {
                 "{m:?} extractor must mask password values"
             );
         }
+    }
+
+    #[test]
+    fn wait_scripts_are_iifes_and_only_idle_carries_a_threshold() {
+        // Boolean conditions → no threshold; Idle → the ms threshold + observer.
+        for (until, wants_threshold) in [
+            (WebSurfaceWaitUntil::LoadFinished, false),
+            (WebSurfaceWaitUntil::LoadCommitted, false),
+            (
+                WebSurfaceWaitUntil::Selector {
+                    css: "#x".into(),
+                    visible: true,
+                },
+                false,
+            ),
+            (
+                WebSurfaceWaitUntil::Js {
+                    expr: "window.ok".into(),
+                },
+                false,
+            ),
+            (WebSurfaceWaitUntil::Idle { ms: 500 }, true),
+        ] {
+            let (script, threshold) = web_wait_script(&until);
+            assert!(script.starts_with("(function(){"), "{until:?} not an IIFE");
+            assert_eq!(threshold.is_some(), wants_threshold, "{until:?} threshold");
+        }
+        // Idle carries its ms and installs the one-time observer.
+        let (idle_script, threshold) = web_wait_script(&WebSurfaceWaitUntil::Idle { ms: 750 });
+        assert_eq!(threshold, Some(750));
+        assert!(idle_script.contains("MutationObserver"));
+        // A visible-selector wait checks the rect; a plain one does not.
+        let (vis, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+            css: "#x".into(),
+            visible: true,
+        });
+        assert!(vis.contains("getBoundingClientRect"));
+        let (plain, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+            css: "#x".into(),
+            visible: false,
+        });
+        assert!(!plain.contains("getBoundingClientRect"));
+        // The Js condition swallows exceptions (never aborts the wait).
+        let (js, _) = web_wait_script(&WebSurfaceWaitUntil::Js {
+            expr: "a.b.c".into(),
+        });
+        assert!(js.contains("catch"));
     }
 
     #[test]
@@ -43782,6 +43846,98 @@ fn web_read_mode_name(mode: WebSurfaceReadAs) -> &'static str {
         WebSurfaceReadAs::Links => "links",
         WebSurfaceReadAs::Text => "text",
         WebSurfaceReadAs::Html => "html",
+    }
+}
+
+/// The JS that evaluates a `wait` condition. Returns a value the handler
+/// interprets: for `Idle` it is the ms-since-last-mutation number (met when
+/// `>= ms`); for every other condition it is a boolean (met when true). The
+/// `Idle` script installs a one-time MutationObserver on first call.
+fn web_wait_script(until: &WebSurfaceWaitUntil) -> (String, Option<u64>) {
+    match until {
+        WebSurfaceWaitUntil::LoadCommitted => (
+            "(function(){return document.readyState!=='loading';})()".to_string(),
+            None,
+        ),
+        WebSurfaceWaitUntil::LoadFinished => (
+            "(function(){return document.readyState==='complete';})()".to_string(),
+            None,
+        ),
+        WebSurfaceWaitUntil::Selector { css, visible } => {
+            let sel = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".to_string());
+            let script = if *visible {
+                format!("(function(){{var e=document.querySelector({sel});if(!e)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()")
+            } else {
+                format!("(function(){{return !!document.querySelector({sel});}})()")
+            };
+            (script, None)
+        }
+        WebSurfaceWaitUntil::Js { expr } => (
+            // Exceptions count as not-yet (return false), never abort the wait.
+            format!("(function(){{try{{return !!({expr});}}catch(e){{return false;}}}})()"),
+            None,
+        ),
+        WebSurfaceWaitUntil::Idle { ms } => (
+            "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
+             var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
+             o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
+             window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()"
+                .to_string(),
+            Some(*ms),
+        ),
+    }
+}
+
+/// App-control: block until a condition holds on a session's active web-surface
+/// tab — the agent control plane `wait` verb (slice 2b, rung 2). Polls the
+/// condition per-surface at a 100ms cadence until met or `timeout_ms` elapses;
+/// read-only (kills the screenshot-poll anti-pattern). Returns
+/// `{met, elapsed_ms}` (or `{met:false, reason:"timeout"}`).
+async fn web_surface_wait_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    until: &WebSurfaceWaitUntil,
+    timeout_ms: u64,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "met": false, "reason": reason }),
+    };
+    let (script, idle_ms) = web_wait_script(until);
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_millis(timeout_ms);
+    loop {
+        match web_do_eval(desktop, native_id, &script).await {
+            Ok(value) => {
+                let met = match idle_ms {
+                    Some(ms) => value.as_f64().map(|e| e >= ms as f64).unwrap_or(false),
+                    None => value.as_bool().unwrap_or(false),
+                };
+                if met {
+                    return json!({
+                        "accepted": true,
+                        "met": true,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "session_path": session,
+                        "native_id": native_id,
+                    });
+                }
+            }
+            Err(reason) => {
+                return json!({ "accepted": false, "met": false, "session_path": session, "reason": reason });
+            }
+        }
+        if start.elapsed() >= deadline {
+            return json!({
+                "accepted": true,
+                "met": false,
+                "reason": "timeout",
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "session_path": session,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -48388,6 +48544,34 @@ async fn process_pending_app_control_requests(
         AppControlCommand::WebSurfaceRead { session_path, mode } => {
             let result =
                 web_surface_read_for(&state, &desktop, session_path.as_deref(), mode).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceWait {
+            session_path,
+            until,
+            timeout_ms,
+        } => {
+            let result = web_surface_wait_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &until,
+                timeout_ms,
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
