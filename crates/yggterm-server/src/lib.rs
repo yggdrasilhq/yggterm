@@ -14,7 +14,8 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, WebSurfaceDoAction, app_control_captures_dir,
+    ProbeTerminalViewportInputMode, ScreenshotTarget, WebSurfaceDoAction, WebSurfaceReadAs,
+    app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -18941,6 +18942,26 @@ pub fn run_app_control_web_surface_do(
         AppControlCommand::WebSurfaceDo {
             session_path: session_path.map(str::to_string),
             action,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Structured read-only observation of a session's web surface (agent control
+/// plane `read`, slice 2b). Returns the interactable tree / forms / etc. as JSON.
+pub fn run_app_control_web_surface_read(
+    session_path: Option<&str>,
+    mode: WebSurfaceReadAs,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceRead {
+            session_path: session_path.map(str::to_string),
+            mode,
         },
         timeout_ms,
     )?;

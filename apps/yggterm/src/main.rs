@@ -47,7 +47,8 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_eval,
-    run_app_control_web_surface_fill, run_app_control_web_surface_screenshot,
+    run_app_control_web_surface_fill, run_app_control_web_surface_read,
+    run_app_control_web_surface_screenshot,
     run_app_control_web_surface_totp,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
@@ -2748,6 +2749,26 @@ fn main() -> Result<()> {
                         //   web do key     --key Enter [--mods ctrl,shift]
                         let action = parse_web_surface_do_action(&args)?;
                         run_app_control_web_surface_do(session_path, action, timeout_ms)
+                    }
+                    "read" => {
+                        // Structured read-only observation (agent control plane
+                        // slice 2b, rung 1):
+                        //   web read [--as snapshot|forms|tables|readable|links|text|html]
+                        let mode = match cli_flag_value(&args, "--as").unwrap_or("snapshot") {
+                            "snapshot" | "interactable" | "tree" => {
+                                yggterm_server::WebSurfaceReadAs::Snapshot
+                            }
+                            "forms" | "form" => yggterm_server::WebSurfaceReadAs::Forms,
+                            "tables" | "table" => yggterm_server::WebSurfaceReadAs::Tables,
+                            "readable" | "article" => yggterm_server::WebSurfaceReadAs::Readable,
+                            "links" | "link" => yggterm_server::WebSurfaceReadAs::Links,
+                            "text" => yggterm_server::WebSurfaceReadAs::Text,
+                            "html" => yggterm_server::WebSurfaceReadAs::Html,
+                            other => anyhow::bail!(
+                                "unknown --as for web read: {other} (snapshot|forms|tables|readable|links|text|html)"
+                            ),
+                        };
+                        run_app_control_web_surface_read(session_path, mode, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
