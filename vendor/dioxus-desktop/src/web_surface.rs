@@ -1394,6 +1394,220 @@ impl WebSurfaceHost {
         );
         Ok(())
     }
+
+    // ---- Trusted input injection (agent control plane `do` verb, slice 2b) ----
+    //
+    // Deliver a synthesized GDK event STRAIGHT to a surface's engine webview
+    // widget. NO seat pointer is moved and no seat key is pressed, so a
+    // backgrounded/occluded (but still mapped) surface is actionable and the
+    // user's real cursor/focus is never hijacked (the Helium-incident class
+    // cannot recur through this path). WebKit treats the delivered event as real
+    // windowing-system input, so the resulting DOM event carries
+    // `isTrusted: true` — proven on webkit2gtk 2.52 by the slice-2a spike
+    // (`docs/spikes/slice2a-istrusted-inject`). `x`/`y` are CSS-viewport pixels;
+    // page zoom → widget px is applied here, next to the webview.
+
+    /// Resolve surface `id`'s engine webview, refusing if it is not MAPPED.
+    /// An unmapped webview (legacy hard-stash / fully hidden) silently drops
+    /// synthesized events (slice-2a hidden-phase proof), so injection fails
+    /// closed with `surface_not_mapped` instead of a lie of success. The
+    /// under-glass soft-stash keeps demoted surfaces mapped (occluded, still
+    /// realized), so `do` works on them.
+    fn mapped_engine_webview(&self, id: u64) -> Result<webkit2gtk::WebView, String> {
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        let webkit = surface.webview.webview();
+        if !gtk::prelude::WidgetExt::is_mapped(&webkit) {
+            return Err("surface_not_mapped".to_string());
+        }
+        Ok(webkit)
+    }
+
+    /// A left/middle/right button click (press + release on the same point;
+    /// WebKit synthesizes the `click` from the pair). `button` is the GDK
+    /// button number (1 left, 2 middle, 3 right). `(x, y)` are CSS-viewport px
+    /// (post-scroll); zoom→widget mapping happens here, next to the webview.
+    pub fn inject_click(&self, id: u64, x: f64, y: f64, button: u32) -> Result<(), String> {
+        let webkit = self.mapped_engine_webview(id)?;
+        let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        unsafe {
+            synth_button(&webkit, true, wx, wy, button)?;
+            synth_button(&webkit, false, wx, wy, button)?;
+        }
+        Ok(())
+    }
+
+    /// A pointer move (real hover — drives `:hover`, tooltips, menu reveal).
+    pub fn inject_move(&self, id: u64, x: f64, y: f64) -> Result<(), String> {
+        let webkit = self.mapped_engine_webview(id)?;
+        let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        unsafe { synth_motion(&webkit, wx, wy) }
+    }
+
+    /// A smooth-scroll wheel event at CSS-viewport `(x, y)` with the given
+    /// deltas (positive `dy` scrolls the page content down, like a real wheel).
+    pub fn inject_scroll(&self, id: u64, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), String> {
+        let webkit = self.mapped_engine_webview(id)?;
+        let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        unsafe { synth_scroll(&webkit, wx, wy, dx, dy) }
+    }
+
+    /// A single key press OR release. `keyval` is the GDK keyval (the shell maps
+    /// key names / characters to it); `state` is the GDK modifier bitmask.
+    pub fn inject_key(&self, id: u64, press: bool, keyval: u32, state: u32) -> Result<(), String> {
+        let webkit = self.mapped_engine_webview(id)?;
+        // A key event needs keyboard focus in the target webview; grab it first
+        // (widget-local — it does not move the seat's global focus on screen).
+        gtk::prelude::WidgetExt::grab_focus(&webkit);
+        unsafe { synth_key(&webkit, press, keyval, state) }
+    }
+}
+
+/// Map CSS-viewport pixels to the webview WIDGET's GDK coordinate space. WebKit
+/// page zoom (`zoom_level`) scales page content in the widget, so a CSS-px point
+/// at viewport `(x, y)` lands at widget `(x·z, y·z)`. The HiDPI device scale is
+/// handled by GDK below the event-coordinate layer, so it does not enter here.
+fn css_viewport_to_widget(webkit: &webkit2gtk::WebView, x: f64, y: f64) -> (f64, f64) {
+    use webkit2gtk::WebViewExt as _;
+    let z = webkit.zoom_level();
+    let z = if z > 0.0 { z } else { 1.0 };
+    (x * z, y * z)
+}
+
+/// Synthesize a GDK button event and hand it to the webview widget (no seat
+/// pointer). See the injection block on `WebSurfaceHost` for the trust/no-warp
+/// rationale.
+unsafe fn synth_button(
+    webview: &webkit2gtk::WebView,
+    press: bool,
+    x: f64,
+    y: f64,
+    button: u32,
+) -> Result<(), String> {
+    use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+    let gdk_window = gtk::prelude::WidgetExt::window(webview)
+        .ok_or("webview has no GdkWindow (unrealized)")?;
+    let etype = if press {
+        gdk::ffi::GDK_BUTTON_PRESS
+    } else {
+        gdk::ffi::GDK_BUTTON_RELEASE
+    };
+    let ev_ptr = gdk::ffi::gdk_event_new(etype);
+    let bev = ev_ptr as *mut gdk::ffi::GdkEventButton;
+    (*bev).window = gdk_window.to_glib_full();
+    (*bev).send_event = 0; // look like windowing-system input, not SendEvent
+    (*bev).time = 0; // GDK_CURRENT_TIME
+    (*bev).x = x;
+    (*bev).y = y;
+    (*bev).x_root = x;
+    (*bev).y_root = y;
+    (*bev).button = button;
+    (*bev).state = 0;
+    if let Some(device) = default_seat_pointer() {
+        (*bev).device = device.to_glib_full();
+    }
+    let event: gdk::Event = from_glib_full(ev_ptr);
+    gtk::prelude::WidgetExt::event(webview, &event);
+    Ok(())
+}
+
+/// Synthesize a GDK motion (hover) event.
+unsafe fn synth_motion(webview: &webkit2gtk::WebView, x: f64, y: f64) -> Result<(), String> {
+    use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+    let gdk_window = gtk::prelude::WidgetExt::window(webview)
+        .ok_or("webview has no GdkWindow (unrealized)")?;
+    let ev_ptr = gdk::ffi::gdk_event_new(gdk::ffi::GDK_MOTION_NOTIFY);
+    let mev = ev_ptr as *mut gdk::ffi::GdkEventMotion;
+    (*mev).window = gdk_window.to_glib_full();
+    (*mev).send_event = 0;
+    (*mev).time = 0;
+    (*mev).x = x;
+    (*mev).y = y;
+    (*mev).x_root = x;
+    (*mev).y_root = y;
+    (*mev).state = 0;
+    (*mev).is_hint = 0;
+    if let Some(device) = default_seat_pointer() {
+        (*mev).device = device.to_glib_full();
+    }
+    let event: gdk::Event = from_glib_full(ev_ptr);
+    gtk::prelude::WidgetExt::event(webview, &event);
+    Ok(())
+}
+
+/// Synthesize a GDK smooth-scroll event.
+unsafe fn synth_scroll(
+    webview: &webkit2gtk::WebView,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+) -> Result<(), String> {
+    use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+    let gdk_window = gtk::prelude::WidgetExt::window(webview)
+        .ok_or("webview has no GdkWindow (unrealized)")?;
+    let ev_ptr = gdk::ffi::gdk_event_new(gdk::ffi::GDK_SCROLL);
+    let sev = ev_ptr as *mut gdk::ffi::GdkEventScroll;
+    (*sev).window = gdk_window.to_glib_full();
+    (*sev).send_event = 0;
+    (*sev).time = 0;
+    (*sev).x = x;
+    (*sev).y = y;
+    (*sev).x_root = x;
+    (*sev).y_root = y;
+    (*sev).state = 0;
+    (*sev).direction = gdk::ffi::GDK_SCROLL_SMOOTH;
+    (*sev).delta_x = dx;
+    (*sev).delta_y = dy;
+    if let Some(device) = default_seat_pointer() {
+        (*sev).device = device.to_glib_full();
+    }
+    let event: gdk::Event = from_glib_full(ev_ptr);
+    gtk::prelude::WidgetExt::event(webview, &event);
+    Ok(())
+}
+
+/// Synthesize a GDK key event (press or release).
+unsafe fn synth_key(
+    webview: &webkit2gtk::WebView,
+    press: bool,
+    keyval: u32,
+    state: u32,
+) -> Result<(), String> {
+    use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+    let gdk_window = gtk::prelude::WidgetExt::window(webview)
+        .ok_or("webview has no GdkWindow (unrealized)")?;
+    let etype = if press {
+        gdk::ffi::GDK_KEY_PRESS
+    } else {
+        gdk::ffi::GDK_KEY_RELEASE
+    };
+    let ev_ptr = gdk::ffi::gdk_event_new(etype);
+    let kev = ev_ptr as *mut gdk::ffi::GdkEventKey;
+    (*kev).window = gdk_window.to_glib_full();
+    (*kev).send_event = 0;
+    (*kev).time = 0;
+    (*kev).state = state;
+    (*kev).keyval = keyval;
+    (*kev).hardware_keycode = 0;
+    (*kev).group = 0;
+    if let Some(device) = gdk::Display::default()
+        .and_then(|d| d.default_seat())
+        .and_then(|s| s.keyboard())
+    {
+        gdk::ffi::gdk_event_set_device(ev_ptr, device.to_glib_full());
+    }
+    let event: gdk::Event = from_glib_full(ev_ptr);
+    gtk::prelude::WidgetExt::event(webview, &event);
+    Ok(())
+}
+
+/// The default seat's pointer device, or None on a headless seat.
+fn default_seat_pointer() -> Option<gdk::Device> {
+    gdk::Display::default()
+        .and_then(|d| d.default_seat())
+        .and_then(|s| s.pointer())
 }
 
 /// Proxy one `yggterm-appctl://` request to the app's control endpoint `base`

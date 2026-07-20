@@ -45,7 +45,8 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
-    run_app_control_web_surface_devtools, run_app_control_web_surface_eval,
+    run_app_control_web_surface_devtools, run_app_control_web_surface_do,
+    run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_screenshot,
     run_app_control_web_surface_totp,
     run_app_control_submit_terminal_prompt,
@@ -435,6 +436,81 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Parse a `server app web do <verb> …` invocation into a typed
+/// `WebSurfaceDoAction` (agent control plane `do` verb, slice 2b). Coordinates
+/// are document-space CSS pixels; the GUI resolves selectors + maps to widget
+/// px. `args[4]` is the verb (`click`/`move`/`scroll`/`type`/`key`).
+fn parse_web_surface_do_action(
+    args: &[String],
+) -> anyhow::Result<yggterm_server::WebSurfaceDoAction> {
+    use yggterm_server::{AppControlPointerButton, WebSurfaceDoAction};
+    let verb = args
+        .get(4)
+        .map(String::as_str)
+        .context("missing verb for server app web do (click|move|scroll|type|key)")?;
+    let button = match cli_flag_value(args, "--button") {
+        Some("middle" | "auxiliary" | "2") => AppControlPointerButton::Middle,
+        Some("secondary" | "right" | "3") => AppControlPointerButton::Secondary,
+        _ => AppControlPointerButton::Primary,
+    };
+    let req_f64 = |flag: &str| -> anyhow::Result<f64> {
+        cli_flag_value(args, flag)
+            .with_context(|| format!("missing {flag} for server app web do {verb}"))?
+            .parse::<f64>()
+            .with_context(|| format!("invalid number for {flag}"))
+    };
+    let opt_f64 = |flag: &str| cli_flag_value(args, flag).and_then(|v| v.parse::<f64>().ok());
+    let action = match verb {
+        "click" | "tap" => {
+            if let Some(selector) = cli_flag_value(args, "--selector") {
+                WebSurfaceDoAction::ClickSelector {
+                    selector: selector.to_string(),
+                    button,
+                }
+            } else {
+                WebSurfaceDoAction::Click {
+                    x: req_f64("--x")?,
+                    y: req_f64("--y")?,
+                    button,
+                }
+            }
+        }
+        "move" | "hover" => WebSurfaceDoAction::Move {
+            x: req_f64("--x")?,
+            y: req_f64("--y")?,
+        },
+        "scroll" => {
+            let dx = opt_f64("--dx").unwrap_or(0.0);
+            let dy = opt_f64("--dy").unwrap_or(0.0);
+            if dx == 0.0 && dy == 0.0 {
+                anyhow::bail!("server app web do scroll needs --dx and/or --dy");
+            }
+            WebSurfaceDoAction::Scroll {
+                x: opt_f64("--x"),
+                y: opt_f64("--y"),
+                dx,
+                dy,
+            }
+        }
+        "type" => WebSurfaceDoAction::Type {
+            text: cli_flag_value(args, "--text")
+                .context("missing --text for server app web do type")?
+                .to_string(),
+            selector: cli_flag_value(args, "--selector").map(str::to_string),
+        },
+        "key" | "press" => WebSurfaceDoAction::Key {
+            key: cli_flag_value(args, "--key")
+                .context("missing --key for server app web do key")?
+                .to_string(),
+            mods: cli_flag_value(args, "--mods")
+                .map(|raw| raw.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+        },
+        other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|key)"),
+    };
+    Ok(action)
 }
 
 /// Parse the agent-oriented screenshot post-process flags:
@@ -2662,6 +2738,16 @@ fn main() -> Result<()> {
                         let entry = cli_flag_value(&args, "--entry");
                         let user = cli_flag_value(&args, "--user");
                         run_app_control_web_surface_totp(session_path, entry, user, timeout_ms)
+                    }
+                    "do" => {
+                        // Trusted action injection (agent control plane slice 2b):
+                        //   web do click   --selector <css> | --x <n> --y <n> [--button …]
+                        //   web do move    --x <n> --y <n>
+                        //   web do scroll  [--x --y] --dx <n> --dy <n>
+                        //   web do type    --text "…" [--selector <css>]
+                        //   web do key     --key Enter [--mods ctrl,shift]
+                        let action = parse_web_surface_do_action(&args)?;
+                        run_app_control_web_surface_do(session_path, action, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
