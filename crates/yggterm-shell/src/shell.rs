@@ -79160,102 +79160,37 @@ fn terminal_eval_script_with_canvas_renderer(
             }});
         }};
         const forceTerminalRepaint = (reason) => redrawTerminal(reason || 'forced_repaint');
-        // READ TECHNIQUE — must match the faithful-screenshot composite.
-        // `getContext('2d')` returns NULL on a canvas that already holds a
-        // webgl/webgl2 context, and WebglAddon is where ALL terminal text is
-        // painted on this platform (xterm_webgl_enabled_for_wayland). The old
-        // sampler called `getContext('2d')` on each layer and `continue`d when
-        // it was null, so it could never read the text layer at all: it scored
-        // only the (always transparent) `.xterm-link-layer` plus whatever
-        // zero-box scratch canvases xterm keeps for glyph measurement. It
-        // therefore reported `canvas blank` on a perfectly painted terminal —
-        // and every such false `unhealthy` scheduled redrawTerminal(), which
-        // clears the glyph atlas and refreshes every row. Measured on guihost
-        // 2026-07-20: a ~6s heavy-repaint loop that ran for minutes on end and
-        // survived every GUI restart (the user's "glyph corruption on
-        // switching" / "it never renders"). Live A/B on the active host: the
-        // WebGL text canvas read 6144/6144 inked pixels via drawImage and was
-        // `readable=false` via getContext('2d').
-        //
-        // Drawing each layer into one small offscreen 2D canvas reads a WebGL
-        // layer correctly (WebglAddon is constructed with
-        // preserveDrawingBuffer=true precisely so it stays readable — keep the
-        // two together) and costs ONE blit + ONE getImageData per layer
-        // instead of ~96 single-pixel GPU syncs, so the instrument also stops
-        // perturbing the thing it measures.
-        const INK_SAMPLE_WIDTH = 96;
-        const INK_SAMPLE_HEIGHT = 64;
-        let canvasReadScratch = null;
-        // The ONE way to read pixels out of a terminal canvas layer. Every
-        // render probe must go through this — a direct getContext('2d') on a
-        // layer is a bug (see the note above).
-        const readCanvasPixels = (canvas, targetWidth, targetHeight) => {{
-            const sourceWidth = Math.max(1, Number(canvas && canvas.width ? canvas.width : 0));
-            const sourceHeight = Math.max(1, Number(canvas && canvas.height ? canvas.height : 0));
-            const width = Math.max(1, Math.floor(Number(targetWidth) || sourceWidth));
-            const height = Math.max(1, Math.floor(Number(targetHeight) || sourceHeight));
-            try {{
-                if (!canvasReadScratch) {{
-                    canvasReadScratch = document.createElement('canvas');
-                }}
-                if (canvasReadScratch.width !== width) {{
-                    canvasReadScratch.width = width;
-                }}
-                if (canvasReadScratch.height !== height) {{
-                    canvasReadScratch.height = height;
-                }}
-                const context = canvasReadScratch.getContext('2d', {{ willReadFrequently: true }});
-                if (!context) {{
-                    return null;
-                }}
-                context.clearRect(0, 0, width, height);
-                context.drawImage(canvas, 0, 0, sourceWidth, sourceHeight, 0, 0, width, height);
-                const image = context.getImageData(0, 0, width, height);
-                const data = image && image.data ? image.data : null;
-                return data ? {{ data, width, height }} : null;
-            }} catch (_error) {{
-                return null;
-            }}
-        }};
         const sampleCanvasInk = () => {{
             const canvases = Array.from(host.querySelectorAll('canvas'))
                 .filter((canvas) => Number(canvas.width || 0) > 0 && Number(canvas.height || 0) > 0)
-                // Only layers that occupy a real box on screen. A zero-box
-                // scratch canvas paints nothing the user can see, and counting
-                // its ink was masking genuinely blank text layers.
-                .filter((canvas) => {{
-                    try {{
-                        const rect = canvas.getBoundingClientRect();
-                        return Number(rect.width || 0) > 0 && Number(rect.height || 0) > 0;
-                    }} catch (_error) {{
-                        return true;
-                    }}
-                }})
                 .slice(-4);
             let sampledPixels = 0;
             let nontransparentPixels = 0;
             let alphaSum = 0;
-            let readableLayers = 0;
             for (const canvas of canvases) {{
-                const pixels = readCanvasPixels(canvas, INK_SAMPLE_WIDTH, INK_SAMPLE_HEIGHT);
-                if (!pixels) {{
-                    continue;
-                }}
-                readableLayers += 1;
-                const data = pixels.data;
-                const pixelCount = pixels.width * pixels.height;
-                for (let index = 0; index < pixelCount; index += 1) {{
-                    const alpha = Number(data[index * 4 + 3] || 0);
-                    sampledPixels += 1;
-                    alphaSum += alpha;
-                    if (alpha > 8) {{
-                        nontransparentPixels += 1;
+                try {{
+                    const context = canvas.getContext('2d', {{ willReadFrequently: true }});
+                    if (!context) {{
+                        continue;
                     }}
-                }}
+                    const width = Math.max(1, Number(canvas.width || 0));
+                    const height = Math.max(1, Number(canvas.height || 0));
+                    const stepX = Math.max(1, Math.floor(width / 12));
+                    const stepY = Math.max(1, Math.floor(height / 8));
+                    for (let y = Math.floor(stepY / 2); y < height; y += stepY) {{
+                        for (let x = Math.floor(stepX / 2); x < width; x += stepX) {{
+                            const data = context.getImageData(x, y, 1, 1).data;
+                            sampledPixels += 1;
+                            alphaSum += Number(data[3] || 0);
+                            if (Number(data[3] || 0) > 8) {{
+                                nontransparentPixels += 1;
+                            }}
+                        }}
+                    }}
+                }} catch (_error) {{}}
             }}
             return {{
                 canvas_count: canvases.length,
-                readable_layers: readableLayers,
                 sampled_pixels: sampledPixels,
                 nontransparent_pixels: nontransparentPixels,
                 alpha_sum: alphaSum,
@@ -79282,41 +79217,21 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!buffer || rowCount < 4) {{
                 return null;
             }}
-            // Finding the text layer by class ONLY works on xterm's software
-            // canvas renderer (.xterm-text-layer). The WebGL renderer paints
-            // into a canvas with NO className at all, so the class lookup found
-            // nothing and this whole detector silently never ran on the WebGL
-            // path — which is the path the live Wayland host actually uses
-            // (verified on guihost 2026-07-20: layers were `.xterm-link-layer`,
-            // an unclassed webgl2 canvas, and a zero-box scratch canvas).
-            // Fall back to the largest non-overlay layer in the screen, which
-            // is the text layer on either renderer.
-            const screenCanvases = Array.from(host.querySelectorAll('.xterm-screen canvas'))
-                .filter((canvas) => Number(canvas.width || 0) > 0
+            const textCanvas = Array.from(host.querySelectorAll('.xterm-screen canvas'))
+                .find((canvas) => canvasLayerRole(canvas) === 'text'
+                    && Number(canvas.width || 0) > 0
                     && Number(canvas.height || 0) > 0);
-            const textCanvas = screenCanvases.find((canvas) => canvasLayerRole(canvas) === 'text')
-                || screenCanvases
-                    .filter((canvas) => {{
-                        const role = canvasLayerRole(canvas);
-                        if (role === 'selection' || role === 'link' || role === 'cursor') {{
-                            return false;
-                        }}
-                        try {{
-                            const rect = canvas.getBoundingClientRect();
-                            return Number(rect.width || 0) > 0 && Number(rect.height || 0) > 0;
-                        }} catch (_error) {{
-                            return true;
-                        }}
-                    }})
-                    .sort((a, b) => (Number(b.width || 0) * Number(b.height || 0))
-                        - (Number(a.width || 0) * Number(a.height || 0)))[0];
             if (!textCanvas) {{
                 return null;
             }}
-            // Read through the shared reader — a WebGL text layer returns null
-            // from getContext('2d') and would abort the scan here.
-            const image = readCanvasPixels(textCanvas, textCanvas.width, textCanvas.height);
-            if (!image) {{
+            let image = null;
+            try {{
+                const context = textCanvas.getContext('2d', {{ willReadFrequently: true }});
+                if (!context) {{
+                    return null;
+                }}
+                image = context.getImageData(0, 0, textCanvas.width, textCanvas.height);
+            }} catch (_error) {{
                 return null;
             }}
             const width = Number(textCanvas.width || 0);
@@ -79429,13 +79344,9 @@ fn terminal_eval_script_with_canvas_renderer(
             // firing it anyway formed an endless ~6s heavy-repaint loop per
             // backgrounded host (guihost trace 2026-07-07: session kept
             // unhealthy+recovery_pending every 5-6s for minutes after switch-away).
-            // Keep the unhealthy STATUS but suffix the reason, and never
-            // schedule the recovery redraw for background hosts. NOTE: the only
-            // consumer of the unhealthy status on the Rust side is the
-            // `terminal_render_health_unhealthy` telemetry emit (shell.rs
-            // ~65101) — an older comment here claimed the reveal reconcile
-            // consumed it to force a repaint; no such consumer exists (checked
-            // 2026-07-20), so do not rely on that behaviour.
+            // Keep the unhealthy STATUS (the Rust reveal reconcile uses it to
+            // force a repaint when the session is next revealed) but suffix the
+            // reason and never schedule the recovery redraw for background hosts.
             const hostActiveAttr = host.getAttribute('data-active-session-host');
             const hostIsActive = hostActiveAttr === 'true'
                 || (hostActiveAttr === null
@@ -102690,8 +102601,8 @@ mod tests {
         // A hidden/backgrounded host samples blank legitimately, so the recovery
         // redraw can never heal it — ungated, it loops a heavy redrawTerminal
         // every ~6s per background host forever. The recovery must only fire for
-        // the active host; background detections keep the unhealthy status
-        // (telemetry consumes it) under a distinguishable reason.
+        // the active host; background detections keep the unhealthy status (the
+        // reveal reconcile consumes it) under a distinguishable reason.
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
         let script = terminal_eval_script_with_canvas_renderer(
             "yggterm-terminal-test",
@@ -102705,61 +102616,6 @@ mod tests {
         assert!(script.contains(
             "const hostActiveAttr = host.getAttribute('data-active-session-host');"
         ));
-    }
-
-    #[test]
-    fn render_probes_read_canvas_layers_through_the_shared_webgl_safe_reader() {
-        // REGRESSION (guihost 2026-07-20): `getContext('2d')` returns null on a
-        // canvas that already holds a webgl context, and WebglAddon is where
-        // ALL terminal text is painted on Wayland. Both render probes read
-        // pixels with a direct per-layer `getContext('2d')`, so:
-        //   * the ink sampler scored only the transparent `.xterm-link-layer`
-        //     and reported "canvas blank with buffer text" on a fully painted
-        //     terminal, scheduling a glyph-atlas-clearing redrawTerminal()
-        //     every ~6s forever (the user's flicker / glyph corruption), and
-        //   * the glyph-gap detector aborted immediately, so the partial-blank
-        //     scan never ran at all on the renderer actually in use.
-        // Every layer read must go through readCanvasPixels(), which blits via
-        // drawImage into an offscreen 2D canvas (preserveDrawingBuffer=true on
-        // the WebglAddon is what keeps that readable).
-        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
-        let script = terminal_eval_script_with_canvas_renderer(
-            "yggterm-terminal-test",
-            &theme,
-            true,
-            true,
-            "test_reason",
-        );
-        assert!(script.contains(
-            "context.drawImage(canvas, 0, 0, sourceWidth, sourceHeight, 0, 0, width, height);"
-        ));
-        assert!(script
-            .contains("const pixels = readCanvasPixels(canvas, INK_SAMPLE_WIDTH, INK_SAMPLE_HEIGHT);"));
-        assert!(script.contains(
-            "const image = readCanvasPixels(textCanvas, textCanvas.width, textCanvas.height);"
-        ));
-        // The blind technique must not come back on either probe.
-        assert!(!script.contains("const context = canvas.getContext('2d', { willReadFrequently: true });"));
-        assert!(!script.contains("const context = textCanvas.getContext('2d', { willReadFrequently: true });"));
-    }
-
-    #[test]
-    fn glyph_gap_detector_finds_an_unclassed_webgl_text_layer() {
-        // The WebGL renderer paints into a canvas with NO className, so a
-        // lookup restricted to `.xterm-text-layer` (the software-canvas
-        // renderer's class) found nothing and the detector silently no-opped
-        // on the live host. Keep the class lookup as the fast path, but fall
-        // back to the largest non-overlay layer in the screen.
-        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
-        let script = terminal_eval_script_with_canvas_renderer(
-            "yggterm-terminal-test",
-            &theme,
-            true,
-            true,
-            "test_reason",
-        );
-        assert!(script.contains("screenCanvases.find((canvas) => canvasLayerRole(canvas) === 'text')"));
-        assert!(script.contains("if (role === 'selection' || role === 'link' || role === 'cursor') {"));
     }
 
     #[test]
