@@ -182,7 +182,7 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -43300,6 +43300,332 @@ async fn web_surface_eval_for(
     }
 }
 
+/// One-shot JS eval against an already-resolved native surface id, returning the
+/// completion value as parsed JSON. The `do` handler resolves the surface once,
+/// then uses this for selector/coordinate resolution before injecting — so it
+/// does not pay `resolve_live_web_surface` per sub-step.
+async fn web_do_eval(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    script: &str,
+) -> Result<Value, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    desktop.eval_web_surface(native_id, script, move |outcome| {
+        let _ = tx.send(outcome);
+    })?;
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(Ok(value_json))) => {
+            Ok(serde_json::from_str(&value_json).unwrap_or_else(|_| Value::String(value_json)))
+        }
+        Ok(Ok(Err(js_error))) => Err(format!("js: {js_error}")),
+        Ok(Err(_)) => Err("eval callback dropped (surface destroyed mid-do?)".to_string()),
+        Err(_) => Err("resolve eval timed out (5s)".to_string()),
+    }
+}
+
+/// GDK button number for an app-control pointer button.
+fn web_do_gdk_button(button: AppControlPointerButton) -> u32 {
+    match button {
+        AppControlPointerButton::Primary => 1,
+        AppControlPointerButton::Middle => 2,
+        AppControlPointerButton::Secondary => 3,
+    }
+}
+
+/// Map a named key (e.g. `Enter`, `Tab`, `ArrowDown`) to its GDK keyval. A
+/// single character maps to its codepoint (GDK keyvals equal the Unicode
+/// codepoint for Basic Latin, `0x0100_0000 + cp` above it). Returns None for an
+/// unknown multi-character name.
+fn web_do_key_name_to_keyval(name: &str) -> Option<u32> {
+    // Single character → codepoint keyval (covers letters/digits/punctuation).
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.clone().next()) {
+        return Some(web_do_char_to_keyval(c));
+    }
+    let keyval = match name {
+        "Enter" | "Return" => 0xff0d,
+        "Tab" => 0xff09,
+        "Escape" | "Esc" => 0xff1b,
+        "Backspace" => 0xff08,
+        "Delete" | "Del" => 0xffff,
+        "Space" => 0x0020,
+        "ArrowUp" | "Up" => 0xff52,
+        "ArrowDown" | "Down" => 0xff54,
+        "ArrowLeft" | "Left" => 0xff51,
+        "ArrowRight" | "Right" => 0xff53,
+        "Home" => 0xff50,
+        "End" => 0xff57,
+        "PageUp" => 0xff55,
+        "PageDown" => 0xff56,
+        _ => return None,
+    };
+    Some(keyval)
+}
+
+/// A single character's GDK keyval (codepoint for Basic Latin/BMP, the
+/// `0x0100_0000` Unicode plane above it).
+fn web_do_char_to_keyval(c: char) -> u32 {
+    let cp = c as u32;
+    if cp <= 0xff {
+        cp
+    } else {
+        0x0100_0000 + cp
+    }
+}
+
+/// GDK modifier bitmask from mod names (`ctrl`/`shift`/`alt`/`meta`).
+fn web_do_mods_to_state(mods: &[String]) -> u32 {
+    let mut state = 0u32;
+    for m in mods {
+        state |= match m.to_ascii_lowercase().as_str() {
+            "shift" => 0x1,                          // GDK_SHIFT_MASK
+            "ctrl" | "control" => 0x4,               // GDK_CONTROL_MASK
+            "alt" | "mod1" => 0x8,                    // GDK_MOD1_MASK
+            "meta" | "super" | "win" => 0x0400_0000, // GDK_SUPER_MASK
+            _ => 0,
+        };
+    }
+    state
+}
+
+/// App-control: inject a TRUSTED action into a session's active web-surface tab
+/// — the agent control plane `do` verb (slice 2b). Resolves the live surface
+/// (reaches a soft-stashed/demoted one by `--session`), resolves selectors +
+/// maps document-space CSS coords to viewport CSS (the vendored layer applies
+/// page zoom → widget px), then delivers the event via GTK-level synthesis:
+/// `isTrusted: true`, NO seat pointer moved. Fails closed with
+/// `surface_not_mapped` on a fully-hidden surface (soft-stash keeps it mapped).
+async fn web_surface_do_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    action: &WebSurfaceDoAction,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    // Document-space CSS (x, y) → viewport CSS by subtracting the live scroll
+    // offset. The vendored inject layer applies page zoom to reach widget px.
+    async fn doc_to_viewport(
+        desktop: &dioxus::desktop::DesktopContext,
+        native_id: u64,
+        x: f64,
+        y: f64,
+    ) -> Result<(f64, f64), String> {
+        let scroll = web_do_eval(
+            desktop,
+            native_id,
+            "(function(){return {sx:window.scrollX||window.pageXOffset||0,sy:window.scrollY||window.pageYOffset||0};})()",
+        )
+        .await?;
+        let sx = scroll.get("sx").and_then(Value::as_f64).unwrap_or(0.0);
+        let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
+        Ok((x - sx, y - sy))
+    }
+    let result = match action {
+        WebSurfaceDoAction::Click { x, y, button } => {
+            match doc_to_viewport(desktop, native_id, *x, *y).await {
+                Ok((vx, vy)) => desktop
+                    .inject_web_surface_click(native_id, vx, vy, web_do_gdk_button(*button))
+                    .map(|()| json!({ "verb": "click", "x": vx, "y": vy })),
+                Err(reason) => Err(reason),
+            }
+        }
+        WebSurfaceDoAction::ClickSelector { selector, button } => {
+            // Resolve the element rect IN THE PAGE (scroll it into view), take
+            // its viewport-space center, and re-verify the point still hits the
+            // element (freshness guard — a reflow/navigation in the gap aborts).
+            let script = format!(
+                "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
+                 el.scrollIntoView({{block:'center',inline:'center'}});\
+                 var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
+                 var hit=document.elementFromPoint(cx,cy);\
+                 var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
+                 return{{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,visible:r.width>0&&r.height>0}};}})()",
+                sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
+            );
+            match web_do_eval(desktop, native_id, &script).await {
+                Ok(info) => {
+                    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
+                        Err(format!("no element matches selector: {selector}"))
+                    } else if !info.get("visible").and_then(Value::as_bool).unwrap_or(false) {
+                        Err(format!("selector matched a zero-size element: {selector}"))
+                    } else if !info.get("onTarget").and_then(Value::as_bool).unwrap_or(false) {
+                        // The resolved center is occluded / moved — do NOT click
+                        // whatever now sits there (F3 freshness guard).
+                        Err("target_moved (resolved point no longer hits the selector)".to_string())
+                    } else {
+                        let vx = info.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                        let vy = info.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                        desktop
+                            .inject_web_surface_click(native_id, vx, vy, web_do_gdk_button(*button))
+                            .map(|()| json!({ "verb": "click_selector", "selector": selector, "x": vx, "y": vy }))
+                    }
+                }
+                Err(reason) => Err(reason),
+            }
+        }
+        WebSurfaceDoAction::Move { x, y } => {
+            match doc_to_viewport(desktop, native_id, *x, *y).await {
+                Ok((vx, vy)) => desktop
+                    .inject_web_surface_move(native_id, vx, vy)
+                    .map(|()| json!({ "verb": "move", "x": vx, "y": vy })),
+                Err(reason) => Err(reason),
+            }
+        }
+        WebSurfaceDoAction::Scroll { x, y, dx, dy } => {
+            // Position defaults to the viewport center; explicit coords are
+            // document-space (subtract scroll).
+            let pos = match (x, y) {
+                (Some(px), Some(py)) => doc_to_viewport(desktop, native_id, *px, *py).await,
+                _ => web_do_eval(
+                    desktop,
+                    native_id,
+                    "(function(){return {x:window.innerWidth/2,y:window.innerHeight/2};})()",
+                )
+                .await
+                .map(|v| {
+                    (
+                        v.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                        v.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                    )
+                }),
+            };
+            match pos {
+                Ok((vx, vy)) => desktop
+                    .inject_web_surface_scroll(native_id, vx, vy, *dx, *dy)
+                    .map(|()| json!({ "verb": "scroll", "x": vx, "y": vy, "dx": dx, "dy": dy })),
+                Err(reason) => Err(reason),
+            }
+        }
+        WebSurfaceDoAction::Key { key, mods } => match web_do_key_name_to_keyval(key) {
+            Some(keyval) => {
+                let state_bits = web_do_mods_to_state(mods);
+                let press = desktop.inject_web_surface_key(native_id, true, keyval, state_bits);
+                let release = desktop.inject_web_surface_key(native_id, false, keyval, state_bits);
+                press
+                    .and(release)
+                    .map(|()| json!({ "verb": "key", "key": key }))
+            }
+            None => Err(format!("unknown key name: {key}")),
+        },
+        WebSurfaceDoAction::Type { text, selector } => {
+            // Optionally resolve + focus the target first (F3: do not trust
+            // ambient focus). Then deliver each character as a key press+release.
+            if let Some(selector) = selector {
+                let script = format!(
+                    "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
+                     el.focus();return{{found:true,focused:document.activeElement===el}};}})()",
+                    sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
+                );
+                match web_do_eval(desktop, native_id, &script).await {
+                    Ok(info) => {
+                        if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
+                            return json!({ "accepted": false, "session_path": session, "reason": format!("no element matches selector: {selector}") });
+                        }
+                        if !info.get("focused").and_then(Value::as_bool).unwrap_or(false) {
+                            return json!({ "accepted": false, "session_path": session, "reason": "focus_failed (could not focus the selector target)" });
+                        }
+                    }
+                    Err(reason) => {
+                        return json!({ "accepted": false, "session_path": session, "reason": reason });
+                    }
+                }
+            }
+            let mut typed = 0u32;
+            let mut error: Option<String> = None;
+            for c in text.chars() {
+                let keyval = web_do_char_to_keyval(c);
+                if let Err(reason) = desktop
+                    .inject_web_surface_key(native_id, true, keyval, 0)
+                    .and(desktop.inject_web_surface_key(native_id, false, keyval, 0))
+                {
+                    error = Some(reason);
+                    break;
+                }
+                typed += 1;
+            }
+            match error {
+                // Never log the typed text (F4 output redaction) — only its length.
+                Some(reason) => Err(reason),
+                None => Ok(json!({ "verb": "type", "chars": typed })),
+            }
+        }
+    };
+    match result {
+        Ok(mut detail) => {
+            if let Some(obj) = detail.as_object_mut() {
+                obj.insert("accepted".to_string(), Value::Bool(true));
+                obj.insert("session_path".to_string(), Value::String(session));
+                obj.insert("native_id".to_string(), json!(native_id));
+                obj.insert("is_trusted".to_string(), Value::Bool(true));
+            }
+            detail
+        }
+        Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
+    }
+}
+
+#[cfg(test)]
+mod web_do_verb_tests {
+    use super::*;
+
+    #[test]
+    fn gdk_button_maps_each_pointer_button() {
+        assert_eq!(web_do_gdk_button(AppControlPointerButton::Primary), 1);
+        assert_eq!(web_do_gdk_button(AppControlPointerButton::Middle), 2);
+        assert_eq!(web_do_gdk_button(AppControlPointerButton::Secondary), 3);
+    }
+
+    #[test]
+    fn ascii_char_keyval_is_the_codepoint() {
+        // GDK keyvals equal the Unicode codepoint for Basic Latin.
+        assert_eq!(web_do_char_to_keyval('a'), 0x61);
+        assert_eq!(web_do_char_to_keyval('A'), 0x41);
+        assert_eq!(web_do_char_to_keyval('0'), 0x30);
+        assert_eq!(web_do_char_to_keyval(' '), 0x20);
+        assert_eq!(web_do_char_to_keyval('@'), 0x40);
+    }
+
+    #[test]
+    fn non_latin_char_keyval_uses_the_unicode_plane() {
+        // Above Basic Latin, GDK keyval = 0x0100_0000 + codepoint.
+        assert_eq!(web_do_char_to_keyval('€'), 0x0100_0000 + 0x20ac);
+    }
+
+    #[test]
+    fn named_keys_resolve_to_gdk_keyvals() {
+        assert_eq!(web_do_key_name_to_keyval("Enter"), Some(0xff0d));
+        assert_eq!(web_do_key_name_to_keyval("Return"), Some(0xff0d));
+        assert_eq!(web_do_key_name_to_keyval("Tab"), Some(0xff09));
+        assert_eq!(web_do_key_name_to_keyval("Escape"), Some(0xff1b));
+        assert_eq!(web_do_key_name_to_keyval("ArrowDown"), Some(0xff54));
+    }
+
+    #[test]
+    fn single_char_key_name_falls_through_to_codepoint() {
+        assert_eq!(web_do_key_name_to_keyval("a"), Some(0x61));
+        assert_eq!(web_do_key_name_to_keyval("/"), Some(0x2f));
+    }
+
+    #[test]
+    fn unknown_multichar_key_name_is_none() {
+        assert_eq!(web_do_key_name_to_keyval("NopeKey"), None);
+    }
+
+    #[test]
+    fn mods_accumulate_into_gdk_bitmask() {
+        assert_eq!(web_do_mods_to_state(&[]), 0);
+        assert_eq!(web_do_mods_to_state(&["ctrl".into()]), 0x4);
+        assert_eq!(web_do_mods_to_state(&["Shift".into()]), 0x1);
+        assert_eq!(web_do_mods_to_state(&["ctrl".into(), "shift".into()]), 0x5);
+        assert_eq!(web_do_mods_to_state(&["alt".into()]), 0x8);
+        assert_eq!(web_do_mods_to_state(&["meta".into()]), 0x0400_0000);
+        assert_eq!(web_do_mods_to_state(&["bogus".into()]), 0);
+    }
+}
+
 /// App-control: full-document PNG capture of a session's active web-surface
 /// tab via the engine's snapshot API (captures the WHOLE page, not just the
 /// visible viewport — and works where the DOM/composite capture paths are
@@ -47837,6 +48163,27 @@ async fn process_pending_app_control_requests(
                 user.as_deref(),
             )
             .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceDo {
+            session_path,
+            action,
+        } => {
+            let result =
+                web_surface_do_for(&state, &desktop, session_path.as_deref(), &action).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
