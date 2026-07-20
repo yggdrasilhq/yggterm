@@ -206,6 +206,32 @@ pub enum WebSurfaceDoAction {
     },
 }
 
+/// What structured view a `read` verb returns (agent control plane, rung 1 —
+/// the cheapest, default observation an agent reaches for; docs/agent-control-
+/// plane.md). Never mutates, never moves a pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSurfaceReadAs {
+    /// The interactable-element tree: buttons, links, inputs, selects,
+    /// textareas, `[role]`/`[contenteditable]` — each with a resolvable
+    /// selector + rect, so `read` → pick → `do click --selector` composes. The
+    /// default an agent reaches for first.
+    #[default]
+    Snapshot,
+    /// Form fields only (inputs/selects/textareas) with name/type/value.
+    Forms,
+    /// Tables as row/col JSON.
+    Tables,
+    /// Article extraction — the main readable text.
+    Readable,
+    /// All `a[href]` links as `{text, href}`.
+    Links,
+    /// The page's visible text (`body.innerText`).
+    Text,
+    /// The serialized DOM (`outerHTML`).
+    Html,
+}
+
 fn default_grid_cols() -> u32 {
     12
 }
@@ -633,6 +659,17 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         action: WebSurfaceDoAction,
     },
+    /// Structured, read-only observation of a session's active web-surface tab —
+    /// the agent control plane `read` verb (slice 2b, rung 1). Returns the
+    /// interactable tree / forms / tables / readable / links / text / html as
+    /// JSON. Pure observation (no pointer, no mutation) → classified read-only.
+    /// Secret field values are masked in the output (F4).
+    WebSurfaceRead {
+        #[serde(default)]
+        session_path: Option<String>,
+        #[serde(default, rename = "as")]
+        mode: WebSurfaceReadAs,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -673,6 +710,7 @@ impl AppControlCommand {
                 | Self::DescribeState
                 | Self::ReadTerminalBuffer { .. }
                 | Self::WebSurfaceScreenshot { .. }
+                | Self::WebSurfaceRead { .. }
                 | Self::ListCommands
         )
     }
@@ -744,6 +782,7 @@ impl AppControlCommand {
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::WebSurfaceDo { .. } => "web_surface_do",
+            Self::WebSurfaceRead { .. } => "web_surface_read",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
@@ -1366,6 +1405,34 @@ mod tests {
                     assert_eq!(round, action);
                 }
                 other => panic!("round-tripped into the wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn web_surface_read_is_read_only_and_serializes_as_mode() {
+        let command = AppControlCommand::WebSurfaceRead {
+            session_path: None,
+            mode: WebSurfaceReadAs::Snapshot,
+        };
+        // Pure observation → read-only (skips the forced re-render).
+        assert!(command.is_read_only());
+        assert_eq!(command.name(), "web_surface_read");
+        // The wire field is `as` (not the Rust keyword-avoiding `mode`).
+        let value = serde_json::to_value(&command).expect("serialize");
+        assert_eq!(
+            value.get("as").and_then(serde_json::Value::as_str),
+            Some("snapshot")
+        );
+        // Round-trip each mode; `as` omitted defaults to snapshot.
+        for (json, expect) in [
+            (r#"{"kind":"web_surface_read","as":"forms"}"#, WebSurfaceReadAs::Forms),
+            (r#"{"kind":"web_surface_read","as":"links"}"#, WebSurfaceReadAs::Links),
+            (r#"{"kind":"web_surface_read"}"#, WebSurfaceReadAs::Snapshot),
+        ] {
+            match serde_json::from_str::<AppControlCommand>(json).expect("deserialize") {
+                AppControlCommand::WebSurfaceRead { mode, .. } => assert_eq!(mode, expect),
+                other => panic!("wrong variant: {other:?}"),
             }
         }
     }
