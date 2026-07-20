@@ -36095,7 +36095,82 @@ fn coerce_degraded_viewport_from_ready_terminal_attempt(
     );
 }
 
-fn append_viewport_session_contract_violations(snapshot: &mut Value, viewport: &Value) {
+/// Parse the daemon's "PTY size" metadata string ("167 × 81 cells") into
+/// `(cols, rows)`. The GUI session model does not carry pty_cols/rows as typed
+/// fields (only this display string reaches it), so the SSOT divergence check
+/// has to read it back out. Robust to the `×` separator and trailing "cells".
+fn parse_pty_size_cells(value: &str) -> Option<(u64, u64)> {
+    let mut nums = value
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .filter_map(|piece| piece.parse::<u64>().ok());
+    match (nums.next(), nums.next()) {
+        (Some(cols), Some(rows)) => Some((cols, rows)),
+        _ => None,
+    }
+}
+fn append_viewport_session_contract_violations(
+    snapshot: &mut Value,
+    viewport: &Value,
+    active_pty_grid: Option<(u64, u64)>,
+) {
+    // SSOT: the client's live xterm viewport is the source of truth for the
+    // terminal grid. When the daemon's PTY grid diverges from it the CLI paints
+    // the wrong number of rows into the viewport — the squish / broken-bottom
+    // the user sees. The metadata-only contract validator was structurally blind
+    // to this (a probe that cannot show what the user plainly sees is a BUG, not
+    // a trap to remember). Flag it HERE, the one place that holds both truths:
+    // the client host grid (from JS) and the daemon PTY grid (the "PTY size"
+    // string). See finding-pty-grid-ssot-divergence.
+    let active_view_mode_for_grid = snapshot
+        .get("active_view_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if active_view_mode_for_grid == "Terminal"
+        && let Some((pty_cols, pty_rows)) = active_pty_grid
+        && pty_cols > 0
+        && pty_rows > 0
+    {
+        let active_path = snapshot
+            .get("active_session_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let client_grid = viewport
+            .get("active_terminal_hosts")
+            .and_then(Value::as_array)
+            .and_then(|hosts| {
+                hosts
+                    .iter()
+                    .find(|host| {
+                        host.get("session_path").and_then(Value::as_str) == Some(active_path.as_str())
+                    })
+                    .or_else(|| {
+                        hosts
+                            .iter()
+                            .find(|host| host.get("active").and_then(Value::as_bool) == Some(true))
+                    })
+            })
+            .map(|host| {
+                (
+                    host.get("cols").and_then(Value::as_u64).unwrap_or(0),
+                    host.get("rows").and_then(Value::as_u64).unwrap_or(0),
+                )
+            });
+        if let Some((client_cols, client_rows)) = client_grid
+            && client_cols > 0
+            && client_rows > 0
+            && (client_cols != pty_cols || client_rows != pty_rows)
+            && let Some(violations) = snapshot
+                .get_mut("session_view_contract_violations")
+                .and_then(Value::as_array_mut)
+        {
+            violations.push(Value::String(format!(
+                "Client viewport {client_cols}×{client_rows} diverges from daemon PTY grid \
+                 {pty_cols}×{pty_rows} for {active_path} (broken-bottom risk)"
+            )));
+        }
+    }
     let active_view_mode = snapshot
         .get("active_view_mode")
         .and_then(Value::as_str)
@@ -50084,7 +50159,20 @@ async fn process_pending_app_control_requests(
                     map.insert("viewport".to_string(), viewport);
                 }
                 if let Some(viewport) = snapshot.get("viewport").cloned() {
-                    append_viewport_session_contract_violations(&mut snapshot, &viewport);
+                    // The daemon's PTY grid only reaches the GUI as the "PTY size"
+                    // metadata string; read it back for the SSOT divergence check.
+                    let active_pty_grid = {
+                        let shell = state.read();
+                        shell
+                            .server
+                            .active_session()
+                            .and_then(|session| parse_pty_size_cells(&metadata_value(session, "PTY size")))
+                    };
+                    append_viewport_session_contract_violations(
+                        &mut snapshot,
+                        &viewport,
+                        active_pty_grid,
+                    );
                     expose_viewport_terminal_truth_on_snapshot(&mut snapshot, &viewport);
                 }
                 trace_stage("describe_state_coerce_begin", json!({}));
@@ -94963,6 +95051,68 @@ mod tests {
     use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    #[test]
+    fn parse_pty_size_cells_reads_the_grid_string() {
+        assert_eq!(parse_pty_size_cells("167 × 81 cells"), Some((167, 81)));
+        assert_eq!(parse_pty_size_cells("120 x 36"), Some((120, 36)));
+        assert_eq!(parse_pty_size_cells(""), None);
+        assert_eq!(parse_pty_size_cells("unknown"), None);
+    }
+
+    fn contract_snapshot_with_client_grid(cols: u64, rows: u64) -> (Value, Value) {
+        let snapshot = json!({
+            "active_view_mode": "Terminal",
+            "active_session_path": "remote-cc://dev/s1",
+            "session_view_contract_violations": [],
+        });
+        let viewport = json!({
+            "active_terminal_hosts": [
+                { "session_path": "remote-cc://dev/s1", "active": true, "cols": cols, "rows": rows }
+            ]
+        });
+        (snapshot, viewport)
+    }
+
+    #[test]
+    fn contract_flags_client_viewport_vs_daemon_pty_grid_divergence() {
+        // The broken-bottom SSOT bug: daemon PTY grid 167×81, client xterm 167×63.
+        let (mut snapshot, viewport) = contract_snapshot_with_client_grid(167, 63);
+        append_viewport_session_contract_violations(&mut snapshot, &viewport, Some((167, 81)));
+        let violations = snapshot["session_view_contract_violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(
+            violations.iter().any(|v| v
+                .as_str()
+                .is_some_and(|s| s.contains("167×63")
+                    && s.contains("167×81")
+                    && s.contains("broken-bottom"))),
+            "divergence must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn contract_stays_quiet_when_grids_agree() {
+        let (mut snapshot, viewport) = contract_snapshot_with_client_grid(167, 63);
+        append_viewport_session_contract_violations(&mut snapshot, &viewport, Some((167, 63)));
+        assert!(
+            snapshot["session_view_contract_violations"]
+                .as_array()
+                .expect("violations array")
+                .is_empty(),
+            "matching grids must not flag a divergence"
+        );
+        // Also quiet when the daemon grid is unknown (no false positive).
+        let (mut snapshot2, viewport2) = contract_snapshot_with_client_grid(167, 63);
+        append_viewport_session_contract_violations(&mut snapshot2, &viewport2, None);
+        assert!(
+            snapshot2["session_view_contract_violations"]
+                .as_array()
+                .expect("violations array")
+                .is_empty()
+        );
+    }
 
     fn split_test_row(kind: BrowserRowKind, full_path: &str, depth: usize) -> BrowserRow {
         BrowserRow {
