@@ -455,6 +455,23 @@ the GUI process; the headless farm has no GUI to route through. The verb
      **On NO-GO:** `do`/type/key defer to the farm plane (slice 4); 2b still
      ships `read`/`wait`/`capture`/`lease` without trusted `do`, and the "act
      without the seat on the GUI plane" promise is honestly deferred.
+     **2b progress (2026-07-20): the `do` injection PRIMITIVE is BUILT** —
+     `AppControlCommand::WebSurfaceDo` (verbs `click`/`click_selector`/`move`/
+     `scroll`/`type`/`key`), the vendored `WebSurfaceHost::inject_*` GDK-synth
+     path (the proven slice-2a recipe, ported next to the existing `eval`/
+     `snapshot` host methods) with a `surface_not_mapped` fail-closed guard, the
+     `desktop.inject_web_surface_*` delegates, the shell `web_surface_do_for`
+     handler (selector→rect resolution + `elementFromPoint` freshness guard +
+     document→viewport→widget coord mapping, zoom applied next to the webview),
+     and the `server app web do …` CLI. Compiles across the workspace; unit
+     tests (keyval/mods/button mapping) + a `WebSurfaceDo` serde round-trip are
+     green. **Owed:** the live proof (gate 2 trusted-click differential + part-(i)
+     `--session` on a real soft-stashed surface) on an uncrowded host — dev is a
+     crowded multi-daemon home with another agent's GUI, so no deploy/competing
+     GUI was stood up. Still to build in 2b: the F3 generation-handle staleness
+     machinery, `read`/`wait`/`lease`/`headless`, and keyboard-injection live
+     proof (`click` is proven; `type`/`key` synthesis is best-effort until a
+     live character-insertion check passes).
 3. **Agent presence (1 session).** Capture-side grid (**redirect the existing
    `Grid`/`ClickGridParams` machinery** to the returned image — ~80% built, not
    net-new); agent cursor overlays (cursor v1). Pure GUI.
