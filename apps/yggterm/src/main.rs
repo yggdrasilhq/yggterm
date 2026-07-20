@@ -3625,8 +3625,25 @@ fn configure_linux_accessibility_bridge() {
 fn under_glass_default_armed(
     under_glass_var: Option<&str>,
     legacy_stack_var: Option<&str>,
+    software_gl: bool,
 ) -> bool {
     if legacy_stack_var == Some("1") {
+        return false;
+    }
+    // SOFTWARE-GL HOSTS DEMOTE (2026-07-20, live-caught on the KDE host). Under
+    // glass REQUIRES the DMABuf renderer (SHM cannot composite a transparent
+    // webview), and the DMABuf path SIGSEGVs on a host with no working hardware
+    // GL — the same Mesa/EGL crash the LIBGL_ALWAYS_SOFTWARE safety net below
+    // exists for. Arming re-enabled exactly that path: the GUI crash-looped
+    // (6 coredumps in a day, systemd relaunching each time = a blank viewport
+    // and a dropped session every few minutes). A one-off sandbox verification
+    // said "DMABuf composites fine over llvmpipe"; sustained production use
+    // falsified it. So the arming decision — the ONE owner of the presentation
+    // path — refuses to arm where DMABuf is unsafe, instead of forcing DMABuf on
+    // and leaving the user to discover the crash. An explicit
+    // YGGTERM_WEB_SURFACE_UNDER_GLASS=1 still wins (opt-in override for a host
+    // whose software GL is known good); the default just stops being a trap.
+    if software_gl && under_glass_var != Some("1") {
         return false;
     }
     match under_glass_var {
@@ -3665,9 +3682,15 @@ fn configure_linux_webkit_compositing() {
     // vendored disable_dma_buf workaround, the vendored host's opt_in).
     // Writing the var (rather than exporting a flag) keeps the vendored
     // readers untouched and the arming decision in exactly one place.
+    // Resolved BEFORE arming: under glass needs DMABuf, and DMABuf is unsafe on
+    // a software-GL host, so the safety-net decision is an INPUT to arming (see
+    // under_glass_default_armed). Same predicate the net itself uses below —
+    // one source of truth for "this host has no working hardware GL".
+    let use_hardware_gl = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
     let armed = under_glass_default_armed(
         std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok().as_deref(),
         std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK").ok().as_deref(),
+        !use_hardware_gl,
     );
     unsafe {
         std::env::set_var(
@@ -3697,8 +3720,8 @@ fn configure_linux_webkit_compositing() {
     if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some() {
         return;
     }
-    // Default to the software-GL safety net; opt out on hosts with working hardware GL.
-    let use_hardware_gl = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
+    // Default to the software-GL safety net; opt out on hosts with working
+    // hardware GL. (`use_hardware_gl` is resolved above — arming needs it.)
     if !use_hardware_gl {
         if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
             unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
@@ -4695,12 +4718,30 @@ mod tests {
     // over an explicit =1 (it is the escape hatch of last resort).
     #[test]
     fn under_glass_defaults_on_with_explicit_opt_outs() {
-        assert!(under_glass_default_armed(None, None));
-        assert!(under_glass_default_armed(Some("1"), None));
-        assert!(!under_glass_default_armed(Some("0"), None));
-        assert!(!under_glass_default_armed(None, Some("1")));
-        assert!(!under_glass_default_armed(Some("1"), Some("1")));
-        assert!(under_glass_default_armed(None, Some("0")));
+        // Hardware GL (software_gl = false): the historical default-on matrix.
+        assert!(under_glass_default_armed(None, None, false));
+        assert!(under_glass_default_armed(Some("1"), None, false));
+        assert!(!under_glass_default_armed(Some("0"), None, false));
+        assert!(!under_glass_default_armed(None, Some("1"), false));
+        assert!(!under_glass_default_armed(Some("1"), Some("1"), false));
+        assert!(under_glass_default_armed(None, Some("0"), false));
+    }
+
+    // A software-GL host must NOT arm by default: under glass requires the
+    // DMABuf renderer and DMABuf SIGSEGVs where there is no working hardware GL
+    // — live-caught as a GUI crash-loop (blank viewport + dropped session every
+    // few minutes, systemd relaunching each time). An explicit =1 still wins so
+    // a host with known-good software GL can opt back in; the legacy force still
+    // beats everything.
+    #[test]
+    fn under_glass_demotes_on_software_gl_hosts() {
+        assert!(!under_glass_default_armed(None, None, true));
+        assert!(!under_glass_default_armed(Some("0"), None, true));
+        assert!(!under_glass_default_armed(None, Some("1"), true));
+        // Explicit opt-in overrides the software-GL demotion...
+        assert!(under_glass_default_armed(Some("1"), None, true));
+        // ...but the legacy force still wins over that opt-in.
+        assert!(!under_glass_default_armed(Some("1"), Some("1"), true));
     }
 
     // The arming decision OWNS the presentation path. A GUI relaunched by a
