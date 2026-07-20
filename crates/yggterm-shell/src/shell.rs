@@ -43531,6 +43531,103 @@ fn web_do_mods_to_state(mods: &[String]) -> u32 {
 /// page zoom → widget px), then delivers the event via GTK-level synthesis:
 /// `isTrusted: true`, NO seat pointer moved. Fails closed with
 /// `surface_not_mapped` on a fully-hidden surface (soft-stash keeps it mapped).
+/// The DOM event types whose arrival proves an action actually reached the page.
+/// One row per verb — the injector's own "I sent it" is not evidence.
+fn web_do_observed_event_types(action: &WebSurfaceDoAction) -> &'static [&'static str] {
+    match action {
+        WebSurfaceDoAction::Click { .. } | WebSurfaceDoAction::ClickSelector { .. } => {
+            &["mousedown", "mouseup", "click"]
+        }
+        WebSurfaceDoAction::Move { .. } => &["mousemove"],
+        WebSurfaceDoAction::Scroll { .. } => &["wheel"],
+        WebSurfaceDoAction::Key { .. } | WebSurfaceDoAction::Type { .. } => &["keydown"],
+    }
+}
+
+/// Arm a capture-phase recorder for `types` and return the document identity it
+/// was armed against. Capture phase on `window` sees the event before any page
+/// handler, so a page that stops propagation cannot hide delivery from us.
+fn web_do_observe_arm_script(types: &[&str]) -> String {
+    format!(
+        "(function(){{var K='__yggDoObserve';\
+         try{{if(window[K]&&window[K].off)window[K].off();}}catch(e){{}}\
+         var doc=document.documentElement.getAttribute('data-ygg-doc');\
+         if(!doc){{doc=String(Date.now())+':'+String(performance.now());\
+         document.documentElement.setAttribute('data-ygg-doc',doc);}}\
+         var rec={{n:0,trusted:true,doc:doc}};var types={types};\
+         var h=function(ev){{rec.n++;if(!ev.isTrusted)rec.trusted=false;}};\
+         types.forEach(function(t){{window.addEventListener(t,h,true);}});\
+         rec.off=function(){{types.forEach(function(t){{window.removeEventListener(t,h,true);}});}};\
+         window[K]=rec;return doc;}})()",
+        types = serde_json::to_string(types).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+/// Read the recorder back and tear it down. A missing recorder or a changed
+/// document identity means the page navigated under us — that is `unknown`,
+/// NOT `false` (a click that navigates is the honest ambiguous case).
+const WEB_DO_OBSERVE_READ_JS: &str = "(function(){var K='__yggDoObserve';var r=window[K];\
+     if(!r)return{present:false};\
+     var out={present:true,n:r.n,trusted:r.trusted,\
+     doc:document.documentElement.getAttribute('data-ygg-doc')};\
+     try{r.off();}catch(e){}try{delete window[K];}catch(e){}\
+     try{document.documentElement.removeAttribute('data-ygg-doc');}catch(e){}\
+     return out;})()";
+
+/// What the page-side recorder actually saw. `Unknown` is a first-class answer:
+/// claiming delivery we did not observe is what made this verb family look
+/// healthy while it was a no-op under the shipped stacking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebDoDelivery {
+    Delivered { trusted: bool },
+    NotDelivered,
+    Unknown,
+}
+
+fn web_do_delivery_from_readback(armed_doc: Option<&str>, readback: Option<&Value>) -> WebDoDelivery {
+    let Some(readback) = readback else {
+        return WebDoDelivery::Unknown;
+    };
+    if !readback
+        .get("present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return WebDoDelivery::Unknown;
+    }
+    // Navigated between arm and read ⇒ the recorder we are reading is not the
+    // one we armed (or the document was replaced): honestly unknown.
+    let same_doc = match (armed_doc, readback.get("doc").and_then(Value::as_str)) {
+        (Some(armed), Some(now)) => armed == now,
+        _ => false,
+    };
+    if !same_doc {
+        return WebDoDelivery::Unknown;
+    }
+    match readback.get("n").and_then(Value::as_u64).unwrap_or(0) {
+        0 => WebDoDelivery::NotDelivered,
+        _ => WebDoDelivery::Delivered {
+            trusted: readback
+                .get("trusted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+    }
+}
+
+/// Tear down the armed recorder and return the failure. Used by the paths that
+/// abort AFTER arming (selector focus failures) so no page keeps a stray
+/// listener when the verb never injected anything.
+async fn web_do_disarm_and_fail(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    session: String,
+    reason: String,
+) -> Value {
+    let _ = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS).await;
+    json!({ "accepted": false, "session_path": session, "reason": reason })
+}
+
 async fn web_surface_do_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -43559,6 +43656,17 @@ async fn web_surface_do_for(
         let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
         Ok((x - sx, y - sy))
     }
+    // Arm the page-side delivery recorder BEFORE injecting. If arming fails the
+    // verb still runs — it just reports `delivered: "unknown"` rather than
+    // inventing a success claim.
+    let armed_doc = web_do_eval(
+        desktop,
+        native_id,
+        &web_do_observe_arm_script(web_do_observed_event_types(action)),
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_str().map(ToOwned::to_owned));
     let result = match action {
         WebSurfaceDoAction::Click { x, y, button } => {
             match doc_to_viewport(desktop, native_id, *x, *y).await {
@@ -43639,11 +43747,11 @@ async fn web_surface_do_for(
             Some(keyval) => {
                 // Editing/navigation keys need a focused DOM element (the widget
                 // grab alone has no target). Focus the selector first when given.
-                if let Some(selector) = selector {
-                    match web_do_focus_selector(desktop, native_id, selector).await {
-                        Ok(()) => {}
-                        Err(reason) => return json!({ "accepted": false, "session_path": session, "reason": reason }),
-                    }
+                if let Some(selector) = selector
+                    && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+                {
+                    // Single exit path: the armed recorder is torn down below.
+                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
                 }
                 let state_bits = web_do_mods_to_state(mods);
                 let press = desktop.inject_web_surface_key(native_id, true, keyval, state_bits);
@@ -43660,7 +43768,7 @@ async fn web_surface_do_for(
             if let Some(selector) = selector
                 && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
             {
-                return json!({ "accepted": false, "session_path": session, "reason": reason });
+                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -43682,13 +43790,35 @@ async fn web_surface_do_for(
             }
         }
     };
+    // Always read the recorder back, success or failure, so no page keeps a
+    // stray listener.
+    let readback = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS)
+        .await
+        .ok();
+    let delivery = web_do_delivery_from_readback(armed_doc.as_deref(), readback.as_ref());
     match result {
         Ok(mut detail) => {
             if let Some(obj) = detail.as_object_mut() {
                 obj.insert("accepted".to_string(), Value::Bool(true));
                 obj.insert("session_path".to_string(), Value::String(session));
                 obj.insert("native_id".to_string(), json!(native_id));
-                obj.insert("is_trusted".to_string(), Value::Bool(true));
+                // `accepted` means "the injector ran"; `delivered` is what the
+                // PAGE saw. They are different questions, and conflating them
+                // is what let a silently-dropped-event regression pass for
+                // weeks — so `is_trusted` is now an OBSERVATION, reported only
+                // when an event actually arrived.
+                match delivery {
+                    WebDoDelivery::Delivered { trusted } => {
+                        obj.insert("delivered".to_string(), Value::Bool(true));
+                        obj.insert("is_trusted".to_string(), Value::Bool(trusted));
+                    }
+                    WebDoDelivery::NotDelivered => {
+                        obj.insert("delivered".to_string(), Value::Bool(false));
+                    }
+                    WebDoDelivery::Unknown => {
+                        obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
+                    }
+                }
             }
             detail
         }
@@ -43699,6 +43829,83 @@ async fn web_surface_do_for(
 #[cfg(test)]
 mod web_do_verb_tests {
     use super::*;
+
+    // Delivery is an OBSERVATION with three honest answers. A dropped event
+    // must read `NotDelivered`, and a page that navigated under us must read
+    // `Unknown` — never a fabricated success. (The regression this guards:
+    // `do` reported is_trusted:true for weeks while WebKit dropped every
+    // event under the shipped stacking.)
+    #[test]
+    fn delivery_readback_distinguishes_delivered_dropped_and_unknown() {
+        let armed = Some("doc-1");
+        assert_eq!(
+            web_do_delivery_from_readback(
+                armed,
+                Some(&json!({"present": true, "n": 3, "trusted": true, "doc": "doc-1"}))
+            ),
+            WebDoDelivery::Delivered { trusted: true }
+        );
+        // Arrived, but synthetic — report it, do not launder it into `true`.
+        assert_eq!(
+            web_do_delivery_from_readback(
+                armed,
+                Some(&json!({"present": true, "n": 1, "trusted": false, "doc": "doc-1"}))
+            ),
+            WebDoDelivery::Delivered { trusted: false }
+        );
+        // The injector ran and the page saw nothing: the silent no-op.
+        assert_eq!(
+            web_do_delivery_from_readback(
+                armed,
+                Some(&json!({"present": true, "n": 0, "trusted": true, "doc": "doc-1"}))
+            ),
+            WebDoDelivery::NotDelivered
+        );
+        // Navigated between arm and read (a click that follows a link).
+        assert_eq!(
+            web_do_delivery_from_readback(
+                armed,
+                Some(&json!({"present": true, "n": 0, "trusted": true, "doc": "doc-2"}))
+            ),
+            WebDoDelivery::Unknown
+        );
+        // Recorder gone / eval failed / never armed.
+        assert_eq!(
+            web_do_delivery_from_readback(armed, Some(&json!({"present": false}))),
+            WebDoDelivery::Unknown
+        );
+        assert_eq!(web_do_delivery_from_readback(armed, None), WebDoDelivery::Unknown);
+        assert_eq!(
+            web_do_delivery_from_readback(
+                None,
+                Some(&json!({"present": true, "n": 2, "trusted": true, "doc": "doc-1"}))
+            ),
+            WebDoDelivery::Unknown
+        );
+    }
+
+    #[test]
+    fn observed_event_types_cover_every_verb() {
+        // Each verb must name the events that prove IT arrived — a key verb
+        // watching for mouse events would observe nothing and read as dropped.
+        assert!(web_do_observed_event_types(&WebSurfaceDoAction::Move { x: 0.0, y: 0.0 })
+            .contains(&"mousemove"));
+        assert!(
+            web_do_observed_event_types(&WebSurfaceDoAction::Key {
+                key: "Backspace".to_string(),
+                mods: Vec::new(),
+                selector: None,
+            })
+            .contains(&"keydown")
+        );
+        assert!(
+            web_do_observed_event_types(&WebSurfaceDoAction::Type {
+                text: "x".to_string(),
+                selector: None,
+            })
+            .contains(&"keydown")
+        );
+    }
 
     #[test]
     fn gdk_button_maps_each_pointer_button() {
