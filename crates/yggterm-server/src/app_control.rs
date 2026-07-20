@@ -686,6 +686,13 @@ pub enum AppControlCommand {
         #[serde(default)]
         session_path: Option<String>,
         action: WebSurfaceDoAction,
+        /// The surface incarnation this verb was issued against (F3). When set,
+        /// the shell fails closed with `stale_handle` if the webview has been
+        /// destroyed and rebuilt since — so a mutating verb can never land on a
+        /// page the agent never observed. Omitted = address whatever is live
+        /// (the interactive/exploratory case).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
     /// Structured, read-only observation of a session's active web-surface tab —
     /// the agent control plane `read` verb (slice 2b, rung 1). Returns the
@@ -707,6 +714,16 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         until: WebSurfaceWaitUntil,
         timeout_ms: u64,
+    },
+    /// Claim a session's web surface for `ttl_secs` so the background reaper
+    /// leaves it alone while unattended work runs (agent control plane `lease`,
+    /// slice 2b). The lease only ever EXTENDS the background hold — reaping
+    /// takes the later of the two — so it can never shorten a surface's life.
+    /// `ttl_secs: 0` releases the lease and returns the surface to the hold.
+    WebSurfaceLease {
+        #[serde(default)]
+        session_path: Option<String>,
+        ttl_secs: u64,
     },
     DescribeRows,
     OpenPath {
@@ -823,6 +840,7 @@ impl AppControlCommand {
             Self::WebSurfaceDo { .. } => "web_surface_do",
             Self::WebSurfaceRead { .. } => "web_surface_read",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
+            Self::WebSurfaceLease { .. } => "web_surface_lease",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
@@ -1386,6 +1404,7 @@ mod tests {
                 selector: "button[type=submit]".to_string(),
                 button: AppControlPointerButton::Primary,
             },
+            generation: None,
         };
         let value = serde_json::to_value(&command).expect("serialize web_surface_do");
         assert_eq!(
@@ -1434,6 +1453,7 @@ mod tests {
             let command = AppControlCommand::WebSurfaceDo {
                 session_path: None,
                 action: action.clone(),
+                generation: None,
             };
             let json = serde_json::to_string(&command).expect("serialize");
             let back: AppControlCommand = serde_json::from_str(&json).expect("deserialize");
@@ -1441,9 +1461,11 @@ mod tests {
                 AppControlCommand::WebSurfaceDo {
                     session_path,
                     action: round,
+                    generation,
                 } => {
                     assert_eq!(session_path, None);
                     assert_eq!(round, action);
+                    assert_eq!(generation, None);
                 }
                 other => panic!("round-tripped into the wrong variant: {other:?}"),
             }
