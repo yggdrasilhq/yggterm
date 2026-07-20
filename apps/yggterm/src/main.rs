@@ -3635,6 +3635,29 @@ fn under_glass_default_armed(
     }
 }
 
+/// What the arming decision implies for the WebKit presentation path. The
+/// arming decision is the ONE owner of this choice, so an inherited SHM force
+/// from an earlier unarmed run is cleared rather than left to fight it.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShmForce {
+    /// Under-glass armed: the DMABuf renderer is required, drop any SHM force.
+    Clear,
+    /// Unarmed and nothing set it yet: apply the historical SHM workaround.
+    Apply,
+    /// Unarmed and already forced: leave the caller's value alone.
+    Keep,
+}
+
+#[cfg(target_os = "linux")]
+fn shm_force_for_arming(armed: bool, already_forced: bool) -> ShmForce {
+    match (armed, already_forced) {
+        (true, _) => ShmForce::Clear,
+        (false, false) => ShmForce::Apply,
+        (false, true) => ShmForce::Keep,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_compositing() {
     // Under-glass by DEFAULT: resolve the two env knobs into the ONE arming
@@ -3691,15 +3714,31 @@ fn configure_linux_webkit_compositing() {
     // background, so the page can never show. The DMABUF path composites
     // in-widget with alpha and works, INCLUDING over software GL (llvmpipe,
     // the safety net above) — verified on the dev headless sandbox with a
-    // real surface. So: armed ⇒ leave the renderer at WebKit's default
+    // real surface. So: armed ⇒ the renderer MUST be at WebKit's default
     // (DMABUF); unarmed ⇒ keep the historical SHM workaround for the hosts
-    // whose hardware EGL/DMABUF path crashed. If the env still forces SHM
-    // while armed, the vendored host demotes under-glass to legacy stacking.
-    let under_glass_armed = std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !under_glass_armed && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    // whose hardware EGL/DMABUF path crashed.
+    //
+    // The arming decision is the SINGLE source of truth for the presentation
+    // path, so armed CLEARS an inherited SHM force instead of leaving two
+    // answers to diverge. Why this is not theoretical: an UNARMED run sets
+    // this var (here, and vendored app.rs on Wayland+/dev/dri), and a GUI
+    // relaunched by a running GUI (hot-restart / deferred restart after a
+    // binary swap) inherits that process env — so the var outlived the run
+    // that wanted it and rode into an ARMED launch, where the vendored host
+    // silently demoted under-glass to legacy stacking. Live-caught on the KDE
+    // host 2026-07-20: GUI env had UNDER_GLASS=1 AND the SHM force, trace read
+    // `under_glass active:false`, backgrounded surfaces were hard-stashed
+    // (`native_stash detached:true`) and injection failed `surface_not_mapped`.
+    // Under-glass losing to a stale env is exactly the silent divergence the
+    // one-owner rule exists to prevent; the runtime self-probe stays the real
+    // safety net (it demotes to legacy when compositing genuinely fails).
+    let already_forced = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some();
+    match shm_force_for_arming(armed, already_forced) {
+        ShmForce::Clear => unsafe { std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER") },
+        ShmForce::Apply => unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+        },
+        ShmForce::Keep => {}
     }
 }
 
@@ -4663,10 +4702,25 @@ mod tests {
         assert!(!under_glass_default_armed(Some("1"), Some("1")));
         assert!(under_glass_default_armed(None, Some("0")));
     }
+
+    // The arming decision OWNS the presentation path. A GUI relaunched by a
+    // running GUI inherits its env, so an SHM force set during an unarmed run
+    // used to ride into an armed launch and silently demote under-glass to
+    // legacy stacking (live-caught on the KDE host 2026-07-20). Armed must
+    // therefore CLEAR the force, not merely decline to set it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arming_owns_the_shm_presentation_force() {
+        assert_eq!(shm_force_for_arming(true, true), ShmForce::Clear);
+        assert_eq!(shm_force_for_arming(true, false), ShmForce::Clear);
+        assert_eq!(shm_force_for_arming(false, false), ShmForce::Apply);
+        assert_eq!(shm_force_for_arming(false, true), ShmForce::Keep);
+    }
     #[cfg(target_os = "linux")]
     use super::{
-        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, linux_choose_desktop_environment,
+        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, ShmForce, linux_choose_desktop_environment,
         linux_environ_bytes_to_map, linux_gui_entry_environment_overrides_from_desktop,
+        shm_force_for_arming,
     };
     #[cfg(target_os = "linux")]
     use std::collections::BTreeMap;
