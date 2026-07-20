@@ -148,6 +148,38 @@ fix) once the fix is verified live on jojo.
   model. Settle that first — it discriminates between "client base is wrong"
   and "CLI model is wrong".
 
+- **Remote CC session stays permanently blank: `resume-cc` deadlocks before it
+  launches the CLI (dev, 2026-07-20).** User-reported as "it never renders", and
+  it is NOT a render bug — the xterm buffer is genuinely empty (0 non-whitespace
+  chars), so the blank viewport is honest. On the remote host the wrapper
+  `yggterm server remote resume-cc <uuid> <cwd> --require-existing` sits in
+  `unix_stream_read_generic` (blocked on a daemon unix socket) for many minutes
+  with **no children** — it never spawns `claude` at all, so the PTY produces
+  nothing forever. `Status` in the metadata rail reads `bootstrapping · idle`.
+
+  **Neither workaround clears it.** Re-clicking the row just logs
+  `terminal_bootstrap_existing_lease_skip` ("bootstrap skipped because an
+  existing attach lease ...") — three attempts in a row did that here, none
+  reaching `ready`. A full GUI restart does NOT fix it either (verified: fresh
+  GUI, re-open, still 0 chars), which rules out GUI-side in-memory lease state
+  as the blocker and matches the user's "even the workarounds do not work".
+
+  **Recovery that DOES work:** kill the stuck wrapper on the remote host
+  (`pgrep -af "resume-cc <uuid>"`, it has no children and holds no user work);
+  the next open spawns a fresh wrapper which does launch `claude --resume`, and
+  the session comes back with full scrollback. Confirmed end-to-end on
+  `remote-cc://dev/75874380…`.
+
+  **Prime suspect: the dev daemon fleet.** dev is still running **six**
+  `yggterm-headless server daemon` processes (the consolidation item carried
+  from telemetry run 3, [[finding-adopt-gap-untypeable-fixed-2113]]). A helper
+  that connects to a stale/wrong daemon socket and blocks forever on read is
+  exactly this signature. Fix direction: (1) consolidate dev's daemons, (2) give
+  `resume-cc` a connect/read deadline so it can never block indefinitely before
+  spawning the CLI, and (3) make `terminal_bootstrap_existing_lease_skip`
+  reclaim a lease whose attach never reached ready, instead of deferring to it
+  forever.
+
 ## Deployed live on jojo, faithful-gesture confirmation pending
 
 - **Middle-click a link in a web surface → new tab (2.10.15, c6542edc).** Root
