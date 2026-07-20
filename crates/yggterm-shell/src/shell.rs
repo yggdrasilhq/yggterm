@@ -1142,6 +1142,14 @@ struct WebSurfaceTab {
     /// both tab homes. A tab with no webview yet (restored, never activated) is
     /// never loading — it is a URL in the tree until it is selected.
     loading: bool,
+    /// Wall-clock ms after which an AGENT's claim on this surface lapses
+    /// (`web lease --ttl`). A backgrounded surface is normally reaped once the
+    /// background hold expires; a lease keeps it alive so long-running
+    /// unattended work is not destroyed mid-flight. The lease only ever
+    /// EXTENDS the hold — reaping takes the LATER of the two — so leasing can
+    /// never shorten a surface's life, and a lapsed lease simply returns it to
+    /// the normal hold. `None` = unleased.
+    lease_until_ms: Option<u64>,
 }
 impl WebSurfaceTab {
     fn kill_forward(&self) {
@@ -2286,7 +2294,52 @@ struct AppliedWebSurface {
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
     page_title: String,
+    /// Which incarnation of this (session, tab) the webview is. Bumped on every
+    /// CREATE, never reused, published in the handle so an agent can tell that
+    /// the surface it addressed was destroyed and rebuilt underneath it (F3).
+    generation: u64,
 }
+/// Is a backgrounded surface due to be destroyed? The hold and an agent's
+/// lease are two independent claims on the same surface, and the surface dies
+/// only when BOTH have lapsed — `max`, never `min`. A lease therefore only ever
+/// EXTENDS life: it cannot cut a hold short, so an agent can never reap a
+/// surface the user is about to come back to.
+fn web_surface_reap_due(
+    now_ms: u64,
+    stashed_at_ms: Option<u64>,
+    hold_ms: u64,
+    lease_until_ms: Option<u64>,
+) -> bool {
+    let hold_due = match stashed_at_ms {
+        Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
+        // Not yet marked stashed this tick: only a zero hold reaps immediately.
+        None => hold_ms == 0,
+    };
+    let lease_due = match lease_until_ms {
+        Some(until) => now_ms >= until,
+        None => true,
+    };
+    hold_due && lease_due
+}
+
+/// The agent lease on one (session, tab), read from the desired-state owner
+/// (`ShellState`) — the reconciler's `applied` map is a MIRROR, so the lease
+/// must not live there or it would be a second copy that can diverge.
+fn web_surface_lease_until_ms(
+    state: &Signal<ShellState>,
+    session_path: &str,
+    tab_id: u64,
+) -> Option<u64> {
+    let shell = state.peek();
+    shell
+        .web_surfaces
+        .get(session_path)?
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)?
+        .lease_until_ms
+}
+
 /// Whether backgrounding a session's surface DETACHES its webview from the
 /// overlay (hard stash) or leaves it attached, composited below the glass
 /// (soft stash — the container is demoted to the bottom of the page stack
@@ -2854,33 +2907,62 @@ fn web_history_data_url(profile: &str) -> String {
 fn web_surface_internal_page_label(url: &str) -> Option<&'static str> {
     url.starts_with("data:text/html").then_some("History")
 }
+/// A handle to one live web surface: WHICH webview, and WHICH incarnation of
+/// it. `native_id` alone is not a safe address for an agent — ids are reused
+/// when a surface is destroyed and recreated (reload, proxy/profile change,
+/// hold expiry), so a verb issued against the page an agent last observed can
+/// land on a completely different page that inherited the id. The generation
+/// makes that detectable (F3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WebSurfaceHandle {
+    native_id: u64,
+    generation: u64,
+}
+/// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
+/// so a generation identifies an incarnation on its own — a stale handle can
+/// never collide with a live one from a different key.
+static WEB_SURFACE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+fn next_web_surface_generation() -> u64 {
+    WEB_SURFACE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 /// Published mirror of the reconciler's applied surfaces: (session_path,
-/// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
-/// republishes at every tick exit); app-control handlers (web eval /
-/// screenshot / devtools) read it to target a live webview. A missing entry
-/// means no live surface — e.g. the session is backgrounded (surfaces are
-/// destroy-on-background by design).
+/// tab_id) → handle. The reconcile loop is the ONLY writer (it republishes at
+/// every tick exit); app-control handlers (web eval / screenshot / devtools /
+/// the engine verbs) read it to target a live webview.
+///
+/// A missing entry means the surface is CLOSED or its background hold expired.
+/// It does NOT mean "backgrounded": under-glass soft stash keeps backgrounded
+/// surfaces attached, mapped and addressable for the whole hold — that is what
+/// makes shadow reach (acting on a session the user is not looking at) work.
 static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(String, u64), u64>>,
+    std::sync::Mutex<HashMap<(String, u64), WebSurfaceHandle>>,
 > = std::sync::OnceLock::new();
 fn publish_web_surface_native_ids(applied: &HashMap<(String, u64), AppliedWebSurface>) {
     let registry = WEB_SURFACE_NATIVE_IDS.get_or_init(Default::default);
     if let Ok(mut map) = registry.lock() {
         map.clear();
-        map.extend(
-            applied
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.native_id)),
-        );
+        map.extend(applied.iter().map(|(key, entry)| {
+            (
+                key.clone(),
+                WebSurfaceHandle {
+                    native_id: entry.native_id,
+                    generation: entry.generation,
+                },
+            )
+        }));
     }
 }
-fn web_surface_native_id_for(session_path: &str, tab_id: u64) -> Option<u64> {
+fn web_surface_handle_for(session_path: &str, tab_id: u64) -> Option<WebSurfaceHandle> {
     WEB_SURFACE_NATIVE_IDS
         .get()?
         .lock()
         .ok()?
         .get(&(session_path.to_string(), tab_id))
         .copied()
+}
+fn web_surface_native_id_for(session_path: &str, tab_id: u64) -> Option<u64> {
+    web_surface_handle_for(session_path, tab_id).map(|handle| handle.native_id)
 }
 /// Placement rule for one (session, tab) webview ([[campaign-libyggterm]]
 /// Phase 3): a split pane PINNED to exactly this tab wins its rect
@@ -3460,10 +3542,12 @@ async fn web_surface_native_reconcile_loop(
                 || web_surface_force_background_pressure();
             let hold_ms = web_surface_background_hold_ms(swap_pressured);
             for key in backgrounded {
-                let expired = match applied.get(&key).and_then(|entry| entry.stashed_at_ms) {
-                    Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
-                    None => hold_ms == 0,
-                };
+                let expired = web_surface_reap_due(
+                    now_ms,
+                    applied.get(&key).and_then(|entry| entry.stashed_at_ms),
+                    hold_ms,
+                    web_surface_lease_until_ms(&state, &key.0, key.1),
+                );
                 if expired {
                     if let Some(entry) = applied.remove(&key) {
                         desktop.close_web_surface(entry.native_id);
@@ -3943,6 +4027,7 @@ async fn web_surface_native_reconcile_loop(
                                     loading: true,
                                     page_url: effective_url,
                                     page_title: String::new(),
+                                    generation: next_web_surface_generation(),
                                 },
                             );
                         }
@@ -4038,6 +4123,7 @@ async fn web_surface_native_reconcile_loop(
                     loading: true,
                     page_url: popup.url,
                     page_title: String::new(),
+                    generation: next_web_surface_generation(),
                 },
             );
         }
@@ -7556,6 +7642,7 @@ impl ShellState {
             profile: profile.clone(),
             folder: None,
             loading: true,
+            lease_until_ms: None,
             script_opened: false,
         };
         // Rehydrate the profile's tab tree. The folders and everything filed in
@@ -7612,6 +7699,7 @@ impl ShellState {
                 // A restored tab has no webview until it is selected, so nothing
                 // is loading in it.
                 loading: false,
+                lease_until_ms: None,
                 script_opened: false,
             });
             next_tab_id += 1;
@@ -7709,6 +7797,7 @@ impl ShellState {
             profile: "default".to_string(),
             folder: None,
             loading: false,
+            lease_until_ms: None,
             script_opened: false,
         };
         self.web_surface_deliberate_close_ms.remove(session_path);
@@ -8637,6 +8726,7 @@ impl ShellState {
                 profile,
                 folder: None,
                 loading: false,
+                lease_until_ms: None,
                 script_opened: false,
             });
             surface.active_tab = id;
@@ -8712,6 +8802,7 @@ impl ShellState {
             folder: None,
             // WebKit began the load the moment it made the view.
             loading: true,
+            lease_until_ms: None,
             // A script opened it, so a script may close it.
             script_opened: true,
         });
@@ -42757,6 +42848,48 @@ fn resolve_live_web_surface(
     Ok((session, native_id))
 }
 
+/// Like `resolve_live_web_surface`, but yields the full handle so a caller can
+/// report — or enforce — the incarnation it is acting on (F3).
+fn resolve_live_web_surface_handle(
+    state: &Signal<ShellState>,
+    session_path: Option<&str>,
+) -> Result<(String, WebSurfaceHandle), String> {
+    let shell = state.peek();
+    let session = match session_path {
+        Some(path) => path.to_string(),
+        None => shell
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .ok_or("no active session")?,
+    };
+    let surface = shell
+        .web_surfaces
+        .get(&session)
+        .ok_or_else(|| format!("session has no web surface: {session}"))?;
+    let handle = web_surface_handle_for(&session, surface.active_tab)
+        .ok_or("web surface not live (session backgrounded or not yet revealed)")?;
+    Ok((session, handle))
+}
+
+/// Fail closed when a verb was issued against an incarnation that no longer
+/// exists. Acting on a rebuilt surface is acting on a page the agent never
+/// observed — the failure mode this guard exists to make impossible.
+fn web_surface_stale_handle(
+    expected_generation: Option<u64>,
+    handle: WebSurfaceHandle,
+) -> Option<Value> {
+    match expected_generation {
+        Some(expected) if expected != handle.generation => Some(json!({
+            "accepted": false,
+            "reason": "stale_handle",
+            "expected_generation": expected,
+            "current_generation": handle.generation,
+        })),
+        _ => None,
+    }
+}
+
 /// App-control: evaluate JS in a session's active web-surface tab and return
 /// the completion value as JSON (or the JS exception as the failure reason).
 /// GET the active app's schema for `pane_id` and render it.
@@ -43615,6 +43748,66 @@ fn web_do_delivery_from_readback(armed_doc: Option<&str>, readback: Option<&Valu
     }
 }
 
+/// App-control `lease`: claim a session's active web-surface tab for `ttl_secs`
+/// so the background reaper leaves it alone while unattended work runs.
+///
+/// Writes the desired-state owner (`ShellState`), which the reconciler reads
+/// when deciding to reap — the lease is NOT copied into the applied mirror, so
+/// there is exactly one place that answers "is this surface leased".
+/// `ttl_secs: 0` releases the claim.
+fn web_surface_lease_for(
+    state: &mut Signal<ShellState>,
+    session_path: Option<&str>,
+    ttl_secs: u64,
+) -> Value {
+    let session = {
+        let shell = state.peek();
+        match session_path {
+            Some(path) => path.to_string(),
+            None => match shell.server.active_session_path() {
+                Some(path) => path.to_string(),
+                None => return json!({ "accepted": false, "reason": "no active session" }),
+            },
+        }
+    };
+    let now_ms = current_millis() as u64;
+    // A lease is a deadline, not a duration: re-leasing REPLACES the old one
+    // (an agent extending its own claim must not have to reason about what it
+    // set before), and releasing is simply a deadline of None.
+    let lease_until_ms = match ttl_secs {
+        0 => None,
+        secs => Some(now_ms.saturating_add(secs.saturating_mul(1000))),
+    };
+    let mut outcome: Option<(u64, Option<u64>)> = None;
+    state.with_mut(|shell| {
+        if let Some(surface) = shell.web_surfaces.get_mut(&session) {
+            let active_tab = surface.active_tab;
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active_tab) {
+                tab.lease_until_ms = lease_until_ms;
+                outcome = Some((active_tab, lease_until_ms));
+            }
+        }
+    });
+    match outcome {
+        Some((tab_id, until)) => json!({
+            "accepted": true,
+            "session_path": session,
+            "tab_id": tab_id,
+            "leased": until.is_some(),
+            "lease_until_ms": until,
+            "ttl_secs": ttl_secs,
+            // The lease guarantees a FLOOR on the surface's life, never a
+            // ceiling: the reaper takes the later of hold and lease.
+            "extends_only": true,
+        }),
+        None => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "session has no web surface",
+        }),
+    }
+}
+
 /// Tear down the armed recorder and return the failure. Used by the paths that
 /// abort AFTER arming (selector focus failures) so no page keeps a stray
 /// listener when the verb never injected anything.
@@ -43633,11 +43826,20 @@ async fn web_surface_do_for(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
     action: &WebSurfaceDoAction,
+    expected_generation: Option<u64>,
 ) -> Value {
-    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+    let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
+    // Check the incarnation BEFORE injecting anything (F3).
+    if let Some(mut stale) = web_surface_stale_handle(expected_generation, handle) {
+        if let Some(obj) = stale.as_object_mut() {
+            obj.insert("session_path".to_string(), Value::String(session));
+        }
+        return stale;
+    }
+    let native_id = handle.native_id;
     // Document-space CSS (x, y) → viewport CSS by subtracting the live scroll
     // offset. The vendored inject layer applies page zoom to reach widget px.
     async fn doc_to_viewport(
@@ -43802,6 +44004,9 @@ async fn web_surface_do_for(
                 obj.insert("accepted".to_string(), Value::Bool(true));
                 obj.insert("session_path".to_string(), Value::String(session));
                 obj.insert("native_id".to_string(), json!(native_id));
+                // Always report the incarnation acted on, so the next verb can
+                // pin it with --generation without a separate lookup.
+                obj.insert("generation".to_string(), json!(handle.generation));
                 // `accepted` means "the injector ran"; `delivered` is what the
                 // PAGE saw. They are different questions, and conflating them
                 // is what let a silently-dropped-event regression pass for
@@ -43882,6 +44087,67 @@ mod web_do_verb_tests {
             ),
             WebDoDelivery::Unknown
         );
+    }
+
+    // F3: a verb pinned to an incarnation must refuse to act once the webview
+    // has been rebuilt — acting would target a page the caller never observed.
+    // Unpinned callers (no --generation) keep addressing whatever is live.
+    #[test]
+    fn stale_handle_fails_closed_only_when_pinned_and_rebuilt() {
+        let handle = WebSurfaceHandle {
+            native_id: 7,
+            generation: 42,
+        };
+        assert!(web_surface_stale_handle(None, handle).is_none());
+        assert!(web_surface_stale_handle(Some(42), handle).is_none());
+        let stale = web_surface_stale_handle(Some(41), handle).expect("rebuilt surface must fail");
+        assert_eq!(
+            stale.get("reason").and_then(Value::as_str),
+            Some("stale_handle")
+        );
+        assert_eq!(stale.get("accepted").and_then(Value::as_bool), Some(false));
+        // The caller needs the live generation to re-pin without a lookup.
+        assert_eq!(
+            stale.get("current_generation").and_then(Value::as_u64),
+            Some(42)
+        );
+        assert_eq!(
+            stale.get("expected_generation").and_then(Value::as_u64),
+            Some(41)
+        );
+    }
+
+    // The lease's safety property: it EXTENDS a surface's life and can never
+    // shorten it. Hold and lease are independent claims; the surface dies only
+    // when BOTH have lapsed. If this ever became `min`, an agent's short lease
+    // could reap a surface the user was about to switch back to.
+    #[test]
+    fn lease_extends_the_hold_and_never_shortens_it() {
+        let hold = 600_000;
+        let stashed = Some(1_000_u64);
+        // Hold not yet up, no lease: keep.
+        assert!(!web_surface_reap_due(2_000, stashed, hold, None));
+        // Hold up, no lease: reap (unchanged behavior).
+        assert!(web_surface_reap_due(601_000, stashed, hold, None));
+        // Hold up but lease still running: KEEP — this is what lease buys.
+        assert!(!web_surface_reap_due(601_000, stashed, hold, Some(900_000)));
+        // Hold up and lease lapsed: reap.
+        assert!(web_surface_reap_due(901_000, stashed, hold, Some(900_000)));
+        // A lease SHORTER than the hold must not reap early.
+        assert!(!web_surface_reap_due(2_000, stashed, hold, Some(1_500)));
+        // Zero hold still honors a live lease.
+        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000)));
+        assert!(web_surface_reap_due(2_000, None, 0, None));
+    }
+
+    // A generation must never be reused, or a stale handle could be mistaken
+    // for a live one.
+    #[test]
+    fn generations_are_monotonic_and_unique() {
+        let a = next_web_surface_generation();
+        let b = next_web_surface_generation();
+        let c = next_web_surface_generation();
+        assert!(a < b && b < c);
     }
 
     #[test]
@@ -48841,9 +49107,11 @@ async fn process_pending_app_control_requests(
         AppControlCommand::WebSurfaceDo {
             session_path,
             action,
+            generation,
         } => {
             let result =
-                web_surface_do_for(&state, &desktop, session_path.as_deref(), &action).await;
+                web_surface_do_for(&state, &desktop, session_path.as_deref(), &action, generation)
+                    .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -48890,6 +49158,26 @@ async fn process_pending_app_control_requests(
                 timeout_ms,
             )
             .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceLease {
+            session_path,
+            ttl_secs,
+        } => {
+            let result = web_surface_lease_for(&mut state, session_path.as_deref(), ttl_secs);
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -95284,6 +95572,7 @@ mod tests {
                     profile: "default".to_string(),
                     folder: None,
                     loading: false,
+                    lease_until_ms: None,
                     script_opened: false,
                 }],
                 folders: Vec::new(),
