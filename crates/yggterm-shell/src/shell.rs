@@ -2295,14 +2295,48 @@ struct AppliedWebSurface {
 /// a web session). A LEGACY surface draws above all DOM and nothing short
 /// of unmapping reliably clears its pixels (the stuck-composite /
 /// reload-white family) — legacy must keep the detach.
-fn web_surface_background_detach(under_glass: bool) -> bool {
-    !under_glass
+fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> bool {
+    // Legacy stacking always detaches (a legacy page draws above all DOM; only
+    // unmapping reliably clears its pixels). Under glass a backgrounded page is
+    // covered by the opaque app-bg layer, so it normally stays ATTACHED — that
+    // is what makes switch-back instant (pixels already composited when the hole
+    // is cut). But an attached WebKitGTK view keeps its DOM timers, animation
+    // and video running at full CPU and holds its full memory (a single Meta
+    // surface measured ~1.3 GB and >1 core while invisible). When the machine is
+    // under memory pressure — swap climbing toward thrash — that instant-reveal
+    // luxury is exactly what tips it into a freeze, so under glass we DETACH
+    // under pressure too: unmapping throttles the view and lets the
+    // background-hold destroy reclaim its memory. Reveal then pays a re-attach,
+    // but only while RAM is genuinely tight. See the telemetry-run resource work
+    // (guihost froze on 13.5 GB swap while two backgrounded surfaces held ~1.8 GB).
+    !under_glass || swap_pressured
+}
+/// Backgrounded-surface hold under memory pressure: collapse the default hold so
+/// a detached surface is destroyed (its memory reclaimed) within seconds instead
+/// of ten minutes. A few seconds of grace keeps a quick A→B→A switch from
+/// destroying B needlessly.
+const WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS: u64 = 5_000;
+/// Verification override: force the pressure-triggered web-surface reclaim on
+/// without inducing real swap. Set `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` at
+/// launch to exercise the reclaim on a healthy machine — background a web
+/// surface and watch `native_stash detached:true swap_pressured:true` then
+/// `native_close reason:background_hold_expired` within the short hold, and the
+/// WebKitWebProcess RSS drop. Never set in normal operation.
+fn web_surface_force_background_pressure() -> bool {
+    std::env::var("YGGTERM_WEB_SURFACE_FORCE_PRESSURE")
+        .is_ok_and(|value| !value.is_empty() && value != "0")
 }
 /// How long a backgrounded session's surface stays alive (stashed, page state
 /// intact) before it is destroyed. `~/.yggterm/web-surface.json`
 /// `{"background_hold_secs": N}`; default 600, 0 = destroy immediately (the
 /// pre-hold behavior).
-fn web_surface_background_hold_ms() -> u64 {
+fn web_surface_background_hold_ms(swap_pressured: bool) -> u64 {
+    // Under memory pressure, reclaim aggressively regardless of the configured
+    // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
+    // back to the system before it thrashes swap.
+    if swap_pressured {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+    }
     let default_ms = 600_000;
     let Ok(home) = yggterm_core::resolve_yggterm_home() else {
         return default_ms;
@@ -3413,7 +3447,15 @@ async fn web_surface_native_reconcile_loop(
             .cloned()
             .collect();
         if !backgrounded.is_empty() {
-            let hold_ms = web_surface_background_hold_ms();
+            // Pressure-triggered reclaim: sample swap once per pass. Under
+            // memory pressure a backgrounded surface is DETACHED (throttles its
+            // CPU) and its hold collapses so the destroy below reclaims its
+            // memory within seconds. Normal (no pressure) keeps the soft stash
+            // (attached, instant switch-back). One /proc/meminfo read, gated on
+            // there actually being a backgrounded surface to act on.
+            let swap_pressured = read_memory_pressure_snapshot().swap_pressured()
+                || web_surface_force_background_pressure();
+            let hold_ms = web_surface_background_hold_ms(swap_pressured);
             for key in backgrounded {
                 let expired = match applied.get(&key).and_then(|entry| entry.stashed_at_ms) {
                     Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
@@ -3438,7 +3480,7 @@ async fn web_surface_native_reconcile_loop(
                 } else if let Some(entry) = applied.get_mut(&key)
                     && entry.stashed_at_ms.is_none()
                 {
-                    if web_surface_background_detach(under_glass) {
+                    if web_surface_background_detach(under_glass, swap_pressured) {
                         let _ = desktop.stash_web_surface(entry.native_id);
                     } else {
                         // Soft stash: stays attached below the glass (the
@@ -3471,7 +3513,8 @@ async fn web_surface_native_reconcile_loop(
                             "tab_id": key.1,
                             "native_id": entry.native_id,
                             "hold_ms": hold_ms,
-                            "detached": web_surface_background_detach(under_glass),
+                            "detached": web_surface_background_detach(under_glass, swap_pressured),
+                            "swap_pressured": swap_pressured,
                         }),
                     );
                 }
@@ -98465,8 +98508,27 @@ mod tests {
     // stuck-composite / reload-white family).
     #[test]
     fn a_under_glass_backgrounding_never_detaches_the_webview() {
-        assert!(web_surface_background_detach(false));
-        assert!(!web_surface_background_detach(true));
+        // Legacy always detaches; under glass with no memory pressure keeps the
+        // soft stash (attached, instant switch-back).
+        assert!(web_surface_background_detach(false, false));
+        assert!(!web_surface_background_detach(true, false));
+    }
+
+    #[test]
+    fn under_glass_backgrounding_detaches_and_reclaims_under_memory_pressure() {
+        // Pressure-triggered reclaim: under glass + swap pressured, a
+        // backgrounded surface DETACHES (unmap -> CPU throttled) and its hold
+        // collapses to seconds so the destroy-on-hold branch reclaims its
+        // memory instead of holding ~1.3 GB for ten minutes. Legacy is
+        // unaffected (always detaches).
+        assert!(web_surface_background_detach(true, true));
+        assert!(web_surface_background_detach(false, true));
+        // The pressured hold is the short reclaim window (deterministic — the
+        // pressured branch returns before reading any config file).
+        assert_eq!(
+            web_surface_background_hold_ms(true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
     }
 
     #[test]
