@@ -81,6 +81,32 @@ def main():
     for k, v in per_session.most_common(10):
         print(f"  {v:5}  {k}")
 
+    autopsies = []
+    for d in events:
+        p = d.get("payload", {})
+        a = p.get("anomaly", {})
+        if isinstance(a, dict) and a.get("pattern") == "app_render_storm_autopsy":
+            autopsies.append((d.get("ts_ms"), a))
+    if autopsies:
+        print("\n== render-storm autopsies (what forced the root re-render) ==")
+        for ts, a in autopsies[-5:]:
+            print(
+                f"\n  ts={ts} renders={a.get('renders_observed')} "
+                f"rate={a.get('renders_per_sec')}/s window={a.get('window_ms')}ms "
+                f"unattributed={a.get('unattributed')}"
+                + (" [time-truncated]" if a.get("truncated_by_time") else "")
+            )
+            changed = a.get("changed_fields") or {}
+            if changed:
+                print("    changed ShellState fields (renders each was dirty):")
+                for k, v in list(changed.items())[:10]:
+                    print(f"      {v:6}  {k}")
+            muts = a.get("shellstate_mut") or {}
+            if muts:
+                print("    safe_shell_mut write contexts (count in window):")
+                for k, v in list(muts.items())[:10]:
+                    print(f"      {v:6}  {k}")
+
     print("\n== recent examples (last 8) ==")
     for d in events[-8:]:
         p = d.get("payload", {})
