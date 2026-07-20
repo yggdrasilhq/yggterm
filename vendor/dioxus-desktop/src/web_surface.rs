@@ -1495,6 +1495,9 @@ unsafe fn synth_button(
     };
     let ev_ptr = gdk::ffi::gdk_event_new(etype);
     let bev = ev_ptr as *mut gdk::ffi::GdkEventButton;
+    // Event coords belong to `event->window`, which is only the webview's own
+    // window when it has one (legacy stacking) — see `widget_to_event_window`.
+    let (x, y) = widget_to_event_window(webview, x, y);
     (*bev).window = gdk_window.to_glib_full();
     (*bev).send_event = 0; // look like windowing-system input, not SendEvent
     (*bev).time = 0; // GDK_CURRENT_TIME
@@ -1519,6 +1522,7 @@ unsafe fn synth_motion(webview: &webkit2gtk::WebView, x: f64, y: f64) -> Result<
         .ok_or("webview has no GdkWindow (unrealized)")?;
     let ev_ptr = gdk::ffi::gdk_event_new(gdk::ffi::GDK_MOTION_NOTIFY);
     let mev = ev_ptr as *mut gdk::ffi::GdkEventMotion;
+    let (x, y) = widget_to_event_window(webview, x, y);
     (*mev).window = gdk_window.to_glib_full();
     (*mev).send_event = 0;
     (*mev).time = 0;
@@ -1549,6 +1553,7 @@ unsafe fn synth_scroll(
         .ok_or("webview has no GdkWindow (unrealized)")?;
     let ev_ptr = gdk::ffi::gdk_event_new(gdk::ffi::GDK_SCROLL);
     let sev = ev_ptr as *mut gdk::ffi::GdkEventScroll;
+    let (x, y) = widget_to_event_window(webview, x, y);
     (*sev).window = gdk_window.to_glib_full();
     (*sev).send_event = 0;
     (*sev).time = 0;
@@ -1590,8 +1595,19 @@ unsafe fn synth_key(
     (*kev).time = 0;
     (*kev).state = state;
     (*kev).keyval = keyval;
-    (*kev).hardware_keycode = 0;
-    (*kev).group = 0;
+    // A synthetic key event MUST carry a real hardware keycode, not 0. WebKit
+    // builds the DOM `keydown`/`keyup` straight from `keyval` — so a keycode-0
+    // event still fires a correct, isTrusted event and printable text still
+    // inserts — but EDITING COMMANDS (DeleteBackward, MoveLeft, …) come from
+    // GTK binding activation, which translates the event back through the
+    // keymap using `hardware_keycode`/`group`. Keycode 0 translates to nothing,
+    // no binding matches, and the command never runs: live-caught 2026-07-20,
+    // where `do key --key Backspace` delivered `{key:"Backspace",
+    // isTrusted:true}` to the page yet deleted no character. Reverse-map the
+    // keyval through the display's keymap to fill both fields.
+    let (hardware_keycode, group) = keyval_hardware_key(keyval);
+    (*kev).hardware_keycode = hardware_keycode;
+    (*kev).group = group;
     if let Some(device) = gdk::Display::default()
         .and_then(|d| d.default_seat())
         .and_then(|s| s.keyboard())
@@ -1601,6 +1617,59 @@ unsafe fn synth_key(
     let event: gdk::Event = from_glib_full(ev_ptr);
     gtk::prelude::WidgetExt::event(webview, &event);
     Ok(())
+}
+
+/// Translate widget-local coordinates into the coordinate space of the GdkWindow
+/// a synthesized event will carry (`WidgetExt::window`), which is NOT always the
+/// widget's own window.
+///
+/// GDK event coordinates are relative to `event->window`. A widget that owns its
+/// window (`has_window`) takes widget-local coords unchanged; a WINDOWLESS widget
+/// shares its nearest ancestor's window, and GTK defines its allocation to be in
+/// that same window's space — so the allocation origin is exactly the offset to
+/// add.
+///
+/// This is the difference between the two web stackings, and it silently broke
+/// injection: LEGACY page webviews own a NATIVE GdkWindow (the very thing the
+/// under-glass self-probe looks for), so widget-local == window-local and clicks
+/// landed. UNDER GLASS there is deliberately no native subwindow, so unadjusted
+/// widget-local coords addressed a point somewhere else in the ancestor window
+/// and WebKit dropped the event — while the verb still reported success. Caught
+/// live 2026-07-20, when a `do click` that had "passed" for weeks turned out to
+/// have only ever run against a GUI that had fallen back to legacy stacking.
+fn widget_to_event_window(webview: &webkit2gtk::WebView, x: f64, y: f64) -> (f64, f64) {
+    use gtk::prelude::WidgetExt as _;
+    if webview.has_window() {
+        return (x, y);
+    }
+    let allocation = webview.allocation();
+    (x + f64::from(allocation.x()), y + f64::from(allocation.y()))
+}
+
+/// Reverse-map a keyval to the `(hardware_keycode, group)` that produces it on
+/// this display's keymap, so a synthesized key event can activate GTK key
+/// bindings (WebKit's editing commands) and not just fire a DOM event. Falls
+/// back to `(0, 0)` — the DOM event still carries the right `key`, only the
+/// editing command is lost — when the keyval is not on the layout at all
+/// (e.g. a codepoint key the user's layout cannot type) or there is no keymap.
+fn keyval_hardware_key(keyval: u32) -> (u16, u8) {
+    let Some(keymap) = gdk::Display::default().and_then(|display| gdk::Keymap::for_display(&display))
+    else {
+        return (0, 0);
+    };
+    keymap
+        .entries_for_keyval(keyval)
+        .into_iter()
+        // Prefer the unshifted entry: a shifted level would need the matching
+        // modifier in `state`, which the caller owns and did not ask for.
+        .min_by_key(|key| (key.level(), key.group()))
+        .map(|key| {
+            (
+                u16::try_from(key.keycode()).unwrap_or(0),
+                u8::try_from(key.group()).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 /// The default seat's pointer device, or None on a headless seat.
