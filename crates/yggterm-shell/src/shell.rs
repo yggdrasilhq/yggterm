@@ -345,6 +345,35 @@ static FORCED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
 // the hot write reasons during a load are nameable. Gated YGGTERM_TRACE_RENDER=1.
 static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHELLSTATE_MUT_HIST: OnceCell<Mutex<HashMap<&'static str, u64>>> = OnceCell::new();
+// Storm autopsy (telemetry campaign run 4): the render-cause probe above is
+// env-gated, so it has never been on when a storm actually happened — 21
+// `app_render_storm` detections between 2026-07-10 and 2026-07-20 were all
+// unattributed. This arms the SAME attribution machinery automatically the
+// moment a storm starts, accumulates in memory, and emits ONE aggregated
+// `app_render_storm_autopsy` event when the window closes. Bounded on purpose:
+// per-render trace emission at 50/s is the js_debug flood that froze the UI
+// (finding-ui-freeze-js-debug-trace-flood), so the autopsy never emits per
+// render.
+static STORM_AUTOPSY_ARMED: AtomicBool = AtomicBool::new(false);
+static STORM_AUTOPSY_RENDERS_LEFT: AtomicU64 = AtomicU64::new(0);
+static STORM_AUTOPSY_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+static STORM_AUTOPSY_LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+static STORM_AUTOPSY_UNATTRIBUTED: AtomicU64 = AtomicU64::new(0);
+static STORM_AUTOPSY_FIELD_HITS: OnceCell<Mutex<HashMap<&'static str, u64>>> = OnceCell::new();
+static STORM_AUTOPSY_PREV: OnceCell<Mutex<Vec<(&'static str, u64)>>> = OnceCell::new();
+// Onset detector: renders are sampled in fixed-size batches so a storm is
+// caught within ~a few seconds of starting rather than at the next 60s report.
+static STORM_ONSET_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+static STORM_ONSET_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+// A storm is >=20 renders/s (steady agent streaming sits ~1/s, bursts ~16/s).
+const STORM_ONSET_SAMPLE_RENDERS: u64 = 128;
+const STORM_ONSET_MAX_WINDOW_MS: u64 = STORM_ONSET_SAMPLE_RENDERS * 1000 / 20;
+const STORM_AUTOPSY_RENDER_BUDGET: u64 = 512;
+const STORM_AUTOPSY_MAX_WINDOW_MS: u64 = 15_000;
+const STORM_AUTOPSY_COOLDOWN_MS: u64 = 300_000;
+fn storm_autopsy_armed() -> bool {
+    STORM_AUTOPSY_ARMED.load(Ordering::Relaxed)
+}
 static APP_INSTANCE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_APP_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static DAEMON_ENSURE_IN_FLIGHT: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
@@ -17158,8 +17187,13 @@ fn safe_shell_mut<R>(
     context: &'static str,
     operation: impl FnOnce(&mut ShellState) -> R,
 ) -> std::thread::Result<R> {
-    if render_trace_enabled() {
-        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::SeqCst);
+    // The total is always counted (one relaxed add on a path that already does
+    // catch_unwind + a signal write). The per-context histogram is the costly
+    // half, so it is kept for the env-gated probe and for the bounded storm
+    // autopsy window — that window is precisely when knowing WHICH write
+    // context is spinning is the whole answer.
+    SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if render_trace_enabled() || storm_autopsy_armed() {
         if let Ok(mut hist) = SHELLSTATE_MUT_HIST
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -50910,6 +50944,51 @@ fn app() -> Element {
             }
             RENDER_COUNT.store(0, AtomicOrdering::Relaxed);
         }
+        // Storm ONSET detector. The 60s report above can only describe a storm
+        // that already ended; this samples every STORM_ONSET_SAMPLE_RENDERS
+        // renders so a live storm arms the attribution pass while it is still
+        // running. Arming is skipped when the env-gated probe is already on
+        // (that path emits per render and owns the accumulators).
+        if !render_trace_enabled() {
+            let window_start = STORM_ONSET_WINDOW_START_MS.load(AtomicOrdering::Relaxed);
+            if window_start == 0 {
+                STORM_ONSET_WINDOW_START_MS.store(now, AtomicOrdering::Relaxed);
+                STORM_ONSET_WINDOW_COUNT.store(0, AtomicOrdering::Relaxed);
+            } else {
+                let sampled = STORM_ONSET_WINDOW_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if sampled >= STORM_ONSET_SAMPLE_RENDERS {
+                    let elapsed = now.saturating_sub(window_start);
+                    let storming = elapsed > 0 && elapsed <= STORM_ONSET_MAX_WINDOW_MS;
+                    let last_emit = STORM_AUTOPSY_LAST_EMIT_MS.load(AtomicOrdering::Relaxed);
+                    let cooled = last_emit == 0
+                        || now.saturating_sub(last_emit) >= STORM_AUTOPSY_COOLDOWN_MS;
+                    if storming && cooled && !storm_autopsy_armed() {
+                        if let Some(hits) = STORM_AUTOPSY_FIELD_HITS.get() {
+                            if let Ok(mut hits) = hits.lock() {
+                                hits.clear();
+                            }
+                        }
+                        if let Some(prev) = STORM_AUTOPSY_PREV.get() {
+                            if let Ok(mut prev) = prev.lock() {
+                                prev.clear();
+                            }
+                        }
+                        if let Some(hist) = SHELLSTATE_MUT_HIST.get() {
+                            if let Ok(mut hist) = hist.lock() {
+                                hist.clear();
+                            }
+                        }
+                        STORM_AUTOPSY_UNATTRIBUTED.store(0, AtomicOrdering::Relaxed);
+                        STORM_AUTOPSY_RENDERS_LEFT
+                            .store(STORM_AUTOPSY_RENDER_BUDGET, AtomicOrdering::Relaxed);
+                        STORM_AUTOPSY_STARTED_MS.store(now, AtomicOrdering::Relaxed);
+                        STORM_AUTOPSY_ARMED.store(true, AtomicOrdering::Relaxed);
+                    }
+                    STORM_ONSET_WINDOW_START_MS.store(now, AtomicOrdering::Relaxed);
+                    STORM_ONSET_WINDOW_COUNT.store(0, AtomicOrdering::Relaxed);
+                }
+            }
+        }
     }
     let app_instance_id = use_hook(|| APP_INSTANCE_ID_SEQ.fetch_add(1, Ordering::SeqCst));
     let is_primary_instance = use_hook({
@@ -51049,6 +51128,105 @@ fn app() -> Element {
                     }
                 }
             }
+        }
+    } else if storm_autopsy_armed() {
+        // Armed by the onset detector. Accumulate which ShellState fields
+        // changed render-over-render, then emit a single aggregated autopsy
+        // when the budget or the time window closes.
+        let async_epoch_val = *async_render_epoch.peek();
+        let window_epoch_val = *window_epoch.peek();
+        if let Some(current) = safe_shell_read(state, "storm_autopsy_fingerprint", |shell| {
+            render_cause_field_hashes(shell, async_epoch_val, window_epoch_val)
+        }) {
+            let prev_lock = STORM_AUTOPSY_PREV.get_or_init(|| Mutex::new(Vec::new()));
+            if let Ok(mut prev) = prev_lock.lock() {
+                let first = prev.is_empty();
+                let changed: Vec<&'static str> = current
+                    .iter()
+                    .filter(|(name, hash)| {
+                        prev.iter()
+                            .find(|(pname, _)| pname == name)
+                            .map(|(_, phash)| phash != hash)
+                            .unwrap_or(true)
+                    })
+                    .map(|(name, _)| *name)
+                    .collect();
+                *prev = current;
+                drop(prev);
+                if !first {
+                    if changed.is_empty() {
+                        STORM_AUTOPSY_UNATTRIBUTED.fetch_add(1, Ordering::Relaxed);
+                    } else if let Ok(mut hits) = STORM_AUTOPSY_FIELD_HITS
+                        .get_or_init(|| Mutex::new(HashMap::new()))
+                        .lock()
+                    {
+                        for name in changed {
+                            *hits.entry(name).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let started = STORM_AUTOPSY_STARTED_MS.load(Ordering::Relaxed);
+        let now_ms = current_millis();
+        let left = STORM_AUTOPSY_RENDERS_LEFT
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        let expired = now_ms.saturating_sub(started) >= STORM_AUTOPSY_MAX_WINDOW_MS;
+        if left == 0 || expired {
+            STORM_AUTOPSY_ARMED.store(false, Ordering::Relaxed);
+            STORM_AUTOPSY_LAST_EMIT_MS.store(now_ms, Ordering::Relaxed);
+            let observed = STORM_AUTOPSY_RENDER_BUDGET.saturating_sub(left);
+            let duration_ms = now_ms.saturating_sub(started);
+            let per_sec = if duration_ms > 0 {
+                (observed as f64 / (duration_ms as f64 / 1000.0) * 10.0).round() / 10.0
+            } else {
+                0.0
+            };
+            let field_hits: serde_json::Map<String, Value> = STORM_AUTOPSY_FIELD_HITS
+                .get()
+                .and_then(|hits| hits.lock().ok())
+                .map(|hits| {
+                    let mut entries: Vec<(&&'static str, &u64)> = hits.iter().collect();
+                    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| ((*k).to_string(), json!(*v)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut_hist: serde_json::Map<String, Value> = SHELLSTATE_MUT_HIST
+                .get()
+                .and_then(|hist| hist.lock().ok())
+                .map(|hist| {
+                    let mut entries: Vec<(&&'static str, &u64)> = hist.iter().collect();
+                    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    entries
+                        .into_iter()
+                        .take(24)
+                        .map(|(k, v)| ((*k).to_string(), json!(*v)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "render_fail_pattern",
+                "detected",
+                json!({
+                    "session_path": "",
+                    "anomaly": {
+                        "pattern": "app_render_storm_autopsy",
+                        "renders_observed": observed,
+                        "window_ms": duration_ms,
+                        "renders_per_sec": per_sec,
+                        "unattributed": STORM_AUTOPSY_UNATTRIBUTED.load(Ordering::Relaxed),
+                        "changed_fields": Value::Object(field_hits),
+                        "shellstate_mut": Value::Object(mut_hist),
+                        "truncated_by_time": expired && left > 0,
+                    },
+                }),
+            );
         }
     }
     let mut last_startup_terminal_restore_path = use_signal(|| None::<String>);
