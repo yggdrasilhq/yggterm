@@ -788,6 +788,26 @@ not a code claim.
    input cancels the rest of the agent's queue (`preempted` in the journal), the
    human's input is not queued behind the agent, and no further agent verb from
    that batch dispatches.
+   **Status (2026-07-21): half built, and this gate's framing was wrong.**
+   *Ordering / one-verb-in-flight was never missing* — the app-control pump
+   (`process_pending_app_control_requests`) already drains ONE request at a time
+   behind an `app_control_drain_in_flight` guard and awaits it before the next,
+   so verbs cannot overlap and already dispatch in arrival order. Building a
+   queue for it would have been a second encoding of ordering. What WAS missing
+   is preemption, now owned by `crates/yggterm-shell/src/agent_input_arbiter.rs`:
+   per-surface agent **batches** (keyed by the slice-3 `--agent` identity),
+   cancelled as a unit on human input, with later verbs from a cancelled batch
+   refused `preempted` at the `do` chokepoint and journaled. Unit-tested.
+   ⛔ **Remaining: the seat-input DETECTOR** — nothing calls
+   `note_human_input_on_web_surface` yet, so the refusal cannot fire in
+   production and this gate is NOT met. It is not trivial: yggterm's own
+   injection produces `isTrusted: true` events (slice-2a spike), so a page-side
+   listener **cannot** distinguish agent input from human input. Likely shape: a
+   GTK-level tap correlated against the injection window the GUI itself opened,
+   since only the GUI knows when it injected.
+   **Corollary for slice 4.1:** it must extend THIS batch table by keying on
+   `(client_id, role)` — the `AgentBatch::client_id` seat already exists — not
+   add a parallel lease table.
 10. **Shadow cannot take over (slice 4.0).** A `Shadow` connection issuing an
     ownership-claiming request (preserved-owner import / `DropTerminalRuntime` /
     a keep-alive owner write) is refused with `shadow_cannot_own` and journaled;
