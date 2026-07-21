@@ -857,7 +857,45 @@ pub struct AppControlRequest {
     pub created_at_ms: u128,
     #[serde(default)]
     pub preferred_pid: Option<u32>,
+    /// Who is driving, for agent presence (cursor v1, `docs/agent-control-plane.md`
+    /// slice 3): `--agent <id>` or `$YGGTERM_AGENT`. The window shows this
+    /// agent's pointer as `agent-N` while the user watches the same session.
+    /// Absent means "some agent" — every unnamed driver shares one identity,
+    /// which is honest: the window genuinely cannot tell them apart.
+    #[serde(default)]
+    pub agent: Option<String>,
     pub command: AppControlCommand,
+}
+
+/// Process-wide agent identity, set once from `--agent` before any request is
+/// built. A global rather than a parameter because every app-control call site
+/// would otherwise have to thread an identity it does not care about, and they
+/// all belong to the same driving agent anyway — one CLI invocation is one agent.
+static AGENT_IDENTITY_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Record the `--agent <id>` this invocation was given. Blank clears it.
+pub fn set_agent_identity(identity: Option<&str>) {
+    let cleaned = identity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Ok(mut slot) = AGENT_IDENTITY_OVERRIDE.write() {
+        *slot = cleaned;
+    }
+}
+
+/// Agent identity stamped on outgoing app-control requests: `--agent` if this
+/// invocation set one, else `$YGGTERM_AGENT`, else none. One resolver so every
+/// call site agrees.
+pub fn resolve_agent_identity() -> Option<String> {
+    AGENT_IDENTITY_OVERRIDE
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .or_else(|| std::env::var("YGGTERM_AGENT").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1017,6 +1055,7 @@ pub fn enqueue_app_control_request(
         request_id: Uuid::new_v4().to_string(),
         created_at_ms: current_millis(),
         preferred_pid,
+        agent: resolve_agent_identity(),
         command,
     };
     let final_path = requests_dir.join(format!("{}.json", request.request_id));
@@ -1250,6 +1289,7 @@ pub fn enqueue_screenshot_request(
         request_id,
         created_at_ms: current_millis(),
         preferred_pid,
+        agent: resolve_agent_identity(),
         command: AppControlCommand::CaptureScreenshot {
             target,
             output_path,
@@ -1294,6 +1334,7 @@ pub fn enqueue_screen_recording_request(
         request_id,
         created_at_ms: current_millis(),
         preferred_pid,
+        agent: resolve_agent_identity(),
         command: AppControlCommand::CaptureScreenRecording {
             output_path,
             duration_secs: duration_secs.max(1),

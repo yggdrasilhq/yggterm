@@ -416,10 +416,27 @@ every piece is opt-in / co-presence-only. None of it is on the default path.
   **Acceptance gate 5 passed live on the desktop host:** a plain screenshot
   taken immediately after a `--grid` capture shows no grid at all. Composes with
   `--crop`/`--region`/`--scale`. Details: `docs/yggui-click-grid.md`.
-- **Visible distinct agent cursors — cursor v1 (the ONE settled rule).** When an
-  agent is working a session **and the user is viewing that same session's
-  viewport**, the user sees that agent's colored pointer tagged `agent-N`,
-  driven by the engine's pointer state for that agent. That is all v1 does:
+- **Visible distinct agent cursors — cursor v1. ✅ SHIPPED + live-proven
+  (2026-07-21).** Agent identity rides the app-control request (`--agent <id>`
+  or `$YGGTERM_AGENT`); every pointer verb (`pointer move/press/click/drag`,
+  `grid click/hover`) publishes that agent's position into
+  `yggterm_core::agent_presence`, and the GUI draws a coloured arrow tagged
+  `agent-N` for agents working the session the user is viewing. Identity→index→
+  colour is assigned once per window and is stable for its life. Presence is
+  readable at `app state` → `agent_presence` (`visible` = what the user can see
+  now; `live` = every agent inside its TTL, whatever the user is viewing).
+  Pointers expire after `AGENT_CURSOR_TTL_MS` (8 s) via a **one-shot** CSS fade
+  — never a repeating animation, which would re-introduce the per-element blink
+  cost that halving idle GUI CPU removed.
+
+  ⚠ **Verifying it needs `--backend os`.** The default capture composites the
+  xterm canvas OVER a DOM snapshot, so an agent cursor that overlaps the
+  terminal viewport is missing from the frame *even though the user sees it*.
+  This cost a real debugging detour: the first proof frame looked empty while
+  the overlay was painting correctly. Probe with the compositor backend, or
+  place the cursor over the sidebar where the composite is not blind.
+
+  The settled rule, and all v1 does:
   - no co-presence on/off toggle (explicitly parked — *"We both do not know what
     co-presence on means"*);
   - no ghost-cursor mimicry, no visibility modes;
@@ -480,9 +497,8 @@ the GUI process; the headless farm has no GUI to route through. The verb
      machinery, `read`/`wait`/`lease`/`headless`, and keyboard-injection live
      proof (`click` is proven; `type`/`key` synthesis is best-effort until a
      live character-insertion check passes).
-3. **Agent presence (1 session).** Capture-side grid — **✅ SHIPPED 2026-07-21**,
-   gate 5 passed live (see Agent presence above). Remaining: agent cursor
-   overlays (cursor v1). Pure GUI.
+3. **Agent presence — ✅ DONE (2026-07-21).** Capture-side grid (gate 5) and
+   cursor v1 (gate 6) both shipped and live-proven; see Agent presence above.
 4. **3.0.0 — true shadow clients + idle-host farm.** Protocol client identity + roles
    (takeover guard), jar leases, input arbitration; headless WPE farm (ychrome
    agent-engine.md Phases A–E). The headless-sway recipe proven this campaign is
@@ -528,9 +544,16 @@ not a code claim.
    overlay only ever exists in the returned image. `--grid-refine C4 --crop`
    verified too: sub-cells `C4.1`..`C4.9`, and `capture.x - crop.x == image.x`
    held exactly.
-6. **Cursor v1.** With an agent working session X and the user viewing X, the
-   user sees exactly one `agent-N` colored pointer tracking the agent's actions;
-   viewing session Y shows none.
+6. **Cursor v1. ✅ PASSED (2026-07-21, live desktop host).** Two agents
+   (`--agent codex-alpha`, `--agent claude-beta`) drove `pointer move` against
+   the viewed session; a compositor grab showed exactly two arrows at the
+   requested coordinates with distinct colours and the tags `agent-1 move` /
+   `agent-2 move` (≈1050 clustered pixels of each agent's colour at its point).
+   Switching the viewport to another session dropped `agent_presence.visible`
+   to 0 while `live` still held both bound to the original session, and the
+   frame contained **no** cursor pixels (3 scattered near-matches frame-wide
+   versus ~1050 clustered when shown). The user's session was restored
+   afterwards and contract violations stayed empty.
 7. **Secret hygiene (F4).** After a vault `fill`, `read --as html` and `capture`
    of that page show the secret field **masked**, and the journal line carries
    the field name + action but never the value. A grep of the trace/journal for

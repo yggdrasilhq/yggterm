@@ -1048,6 +1048,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // Agent presence (cursor v1): stamp every app-control request this
+    // invocation sends with who is driving, so the window can show the user an
+    // `agent-N` pointer. One resolve for the whole process — an invocation is
+    // one agent — instead of an --agent parameter on every verb.
+    yggterm_server::set_agent_identity(cli_flag_value(&args, "--agent"));
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
     maybe_handoff_to_preferred_headless_executable(&current_exe, &args, &install_context)?;

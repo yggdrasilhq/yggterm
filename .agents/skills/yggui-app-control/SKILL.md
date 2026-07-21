@@ -88,6 +88,28 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/g.png --grid -
 - Composes with `--crop`/`--region`/`--scale`; the grid spans the cropped area.
 - Full contract: `docs/yggui-click-grid.md`.
 
+### Say who you are: `--agent <id>` (agent presence, cursor v1)
+
+Pass `--agent <id>` on any app-control command **after** the subcommand
+(`server app pointer move --x 760 --y 430 --agent codex-alpha`), or export
+`YGGTERM_AGENT`. A leading `--agent` is rejected by the subcommand classifier.
+
+The window then shows your pointer as a coloured `agent-N` arrow while the user
+is viewing the session you are working — so a human watching the screen can see
+that something else is driving, and which one. Presence is readable at
+`app state` → `agent_presence`:
+
+- `visible` — pointers the user can see right now (agents on the viewed session)
+- `live` — every agent inside the TTL, whatever the user is looking at
+- pointers expire after `ttl_ms` (8 s)
+
+⚠️ **Confirming a cursor visually requires `--backend os`.** The default backend
+pastes the xterm canvas over a DOM snapshot, so a cursor sitting over the
+terminal viewport is absent from the frame **even though the user sees it**.
+Either grab with `--backend os`, or place the probe cursor over the sidebar.
+A frame that seems to show "no agent cursor" is not evidence unless it came
+from the compositor backend.
+
 ### Native web surfaces need `--backend os` (v2.9.57+)
 
 The default capture backends are **blind to native child webviews** — the
