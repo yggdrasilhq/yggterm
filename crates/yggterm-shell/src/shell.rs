@@ -4363,25 +4363,18 @@ fn web_surface_url_scheme_allowed(url: &str) -> bool {
 /// OSC payload (ychrome `--profile`); defaults to "default" and is sanitized
 /// to a single path-safe component (it is used verbatim as a directory name
 /// under `~/.yggterm/web-profiles/`), so a hostile PTY cannot escape the dir.
+/// Canonical profile name. Delegates to [`yggterm_core::web_profile`], which is
+/// the one owner — the daemon's slice-4.2 write-lock keys on the SAME
+/// normalization, so `"default "` here and there cannot become two locks over
+/// one jar.
 fn normalize_web_surface_profile(profile: Option<&str>) -> String {
-    let name = profile.map(str::trim).unwrap_or("");
-    let safe = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains(std::path::is_separator);
-    if safe {
-        name.to_string()
-    } else {
-        "default".to_string()
-    }
+    yggterm_core::web_profile::normalize_web_profile(profile)
 }
 /// Reserved profile name for an ephemeral (private-browsing) surface: no jar
 /// on disk, all website data in memory, gone when the surface closes. Owned
 /// here and mirrored by ychrome's picker/standalone handling — a
 /// `web-profiles/temp/` directory on disk is ignored by design.
-const WEB_SURFACE_TEMP_PROFILE: &str = "temp";
+const WEB_SURFACE_TEMP_PROFILE: &str = yggterm_core::web_profile::WEB_PROFILE_TEMP;
 /// Absolute path of a host-owned web-profile jar on THIS (GUI) host. Mirrors
 /// ychrome's `profile_dir` (`~/.yggterm/web-profiles/<name>/`) so a profile
 /// means the same storage whether ychrome renders it standalone or the GUI

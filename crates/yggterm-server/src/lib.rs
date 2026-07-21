@@ -4,6 +4,7 @@ mod codex_cli;
 mod daemon;
 pub mod grid_overlay;
 mod host;
+mod profile_write_lock;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
@@ -32,6 +33,8 @@ pub use codex_cli::{
 pub use daemon::{
     ClientDaemonEndpoint, ClientIdentity, ClientRequestEnvelope, ClientRole, SHADOW_CANNOT_OWN,
     ShadowAccess, daemon_enforces_client_roles, role_gate,
+    ProfileWriteLockStatus, acquire_profile_write_lock, profile_write_lock_report,
+    release_profile_write_lock,
     HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
     ServerResponse, ServerRuntimeStatus, hot_restart_block_reason_summary,
