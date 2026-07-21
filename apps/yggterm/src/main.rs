@@ -886,6 +886,10 @@ fn print_server_app_help() {
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app keytips audit
   yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
+  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
+  yggterm server app web do <click|move|scroll|type|key> [--selector <css>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--session <path>]
+  yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
+  yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
   yggterm server app web devtools [--close] [--session <path>]"
     );
