@@ -149,6 +149,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
+use yggterm_core::agent_presence::{AGENT_CURSOR_TTL_MS, AgentPointer, AgentPresence};
 use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
@@ -952,6 +953,18 @@ const UPDATE_CTA_CSS: &str = r#"
   0%, 20% { opacity: 0.28; }
   50% { opacity: 1; }
   100% { opacity: 0.28; }
+}
+"#;
+
+/// Cursor v1 fade. Deliberately a ONE-SHOT animation with `forwards`: once it
+/// completes the element stops compositing, so an idle window pays nothing for a
+/// pointer left behind by an agent that has gone quiet. A repeating animation
+/// here would re-introduce exactly the per-element blink cost that halving idle
+/// GUI CPU removed.
+const AGENT_CURSOR_CSS: &str = r#"
+@keyframes yggterm-agent-cursor-fade {
+  0%, 70% { opacity: 1; }
+  100% { opacity: 0; }
 }
 "#;
 
@@ -5014,6 +5027,10 @@ struct ShellState {
     // recomputed in JS from these params at click time — never cached as rects
     // — so window resizes between show and click cannot skew the target.
     click_grid: Option<ClickGridParams>,
+    // Where each agent driving this window last acted (cursor v1,
+    // docs/agent-control-plane.md slice 3). The overlay draws an agent's
+    // pointer only while the user is viewing the session it acted on.
+    agent_presence: AgentPresence,
     // Per-session deadline through which the fault-recovery watchdog treats a
     // benign "xterm surface is empty" on a revealed retained host (one that
     // already reached ready and whose daemon still owns the PTY) as a transient
@@ -5487,6 +5504,10 @@ struct RenderSnapshot {
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
+    /// Agent pointers to draw over the CURRENT viewport (cursor v1). Already
+    /// filtered to agents working the session the user is viewing, and to
+    /// pointers inside their TTL, so the overlay just draws what it is given.
+    agent_cursors: Vec<AgentPointer>,
     keep_alive_plan: Option<KeepAlivePlan>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
@@ -6758,6 +6779,7 @@ impl ShellState {
             terminal_cold_remount_count: HashMap::new(),
             startup_restore_recover_streak: HashMap::new(),
             click_grid: None,
+            agent_presence: AgentPresence::default(),
             terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
@@ -7548,6 +7570,9 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
+            agent_cursors: self
+                .agent_presence
+                .visible_for(self.server.active_session_path(), current_millis()),
             keep_alive_plan,
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
@@ -19458,6 +19483,40 @@ fn parse_split_axis(raw: Option<&str>) -> SplitAxis {
 
 /// A JSON view of the split-group SSOT for app-control responses / `server app
 /// state`, so the yggui surface is drivable + verifiable headlessly.
+/// Agent presence for `app state` (cursor v1). See the call site for why both
+/// `visible` and `live` are reported.
+fn agent_presence_debug_json(shell: &ShellState, snapshot: &RenderSnapshot) -> Value {
+    let now = current_millis();
+    let describe = |pointer: &AgentPointer| {
+        json!({
+            "tag": pointer.tag(),
+            "color": pointer.color(),
+            "session_path": pointer.session_path,
+            "x": pointer.x,
+            "y": pointer.y,
+            "action": pointer.action,
+            "age_ms": now.saturating_sub(pointer.updated_ms),
+        })
+    };
+    json!({
+        "ttl_ms": AGENT_CURSOR_TTL_MS,
+        "viewing_session": shell.server.active_session_path(),
+        "visible": snapshot.agent_cursors.iter().map(describe).collect::<Vec<_>>(),
+        "live": shell
+            .agent_presence
+            .live(now)
+            .iter()
+            .map(|(identity, pointer)| {
+                let mut entry = describe(pointer);
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("identity".to_string(), json!(identity));
+                }
+                entry
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn split_groups_debug_json(shell: &ShellState) -> Value {
     let active = shell.active_split_group().map(|group| group.group_id.clone());
     json!({
@@ -24384,6 +24443,65 @@ fn click_grid_core_script(
         return {{ cell: CELL, ...hit }};
         "#
     )
+}
+
+/// Where a pointer command leaves the agent's pointer, and what to call it in
+/// the `agent-N` tag. `Release` carries no coordinates, so it leaves the
+/// existing pointer where it is rather than inventing a position.
+fn pointer_command_destination(
+    command: &AppControlPointerCommand,
+) -> Option<(f64, f64, &'static str)> {
+    match command {
+        AppControlPointerCommand::Move { x, y } => Some((*x, *y, "move")),
+        AppControlPointerCommand::Press { x, y, .. } => Some((*x, *y, "press")),
+        AppControlPointerCommand::Click { x, y, .. } => Some((*x, *y, "click")),
+        AppControlPointerCommand::Drag { end_x, end_y, .. } => Some((*end_x, *end_y, "drag")),
+        AppControlPointerCommand::Release { .. } => None,
+    }
+}
+
+/// Publish an agent pointer from a click-grid hit. The grid script resolves the
+/// cell to a real `{x, y}` itself, so this reads the resolution rather than
+/// re-deriving it — the geometry stays owned in one place. `show`/`hide` move
+/// no pointer and are ignored.
+fn record_agent_pointer_from_grid_hit(
+    mut state: Signal<ShellState>,
+    agent: Option<&str>,
+    session_path: Option<String>,
+    hit: &Value,
+    mode: &str,
+) {
+    if !matches!(mode, "click" | "hover") {
+        return;
+    }
+    let (Some(x), Some(y)) = (
+        hit.get("x").and_then(Value::as_f64),
+        hit.get("y").and_then(Value::as_f64),
+    ) else {
+        return;
+    };
+    let action = if mode == "hover" { "hover" } else { "click" };
+    record_agent_pointer(state, agent, session_path, x, y, action);
+}
+
+/// Publish one agent pointer position (cursor v1). `session_path` is the
+/// session the agent acted on; `None` means "whatever the window is showing",
+/// which is the truth for main-webview verbs — they land on the active
+/// viewport by construction.
+fn record_agent_pointer(
+    mut state: Signal<ShellState>,
+    agent: Option<&str>,
+    session_path: Option<String>,
+    x: f64,
+    y: f64,
+    action: &str,
+) {
+    let now = current_millis();
+    state.with_mut(|shell| {
+        let session = session_path
+            .or_else(|| shell.server.active_session_path().map(ToOwned::to_owned));
+        shell.agent_presence.record(agent, session, x, y, action, now);
+    });
 }
 
 fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
@@ -36094,6 +36212,13 @@ fn describe_app_state_snapshot(
         "active_precis": snapshot.active_precis.clone(),
         "active_summary": snapshot.active_summary.clone(),
         "session_view_contract_violations": session_view_contract_violations,
+        // Agent presence (cursor v1). `visible` is what the user can actually
+        // see right now — agents working the session they are viewing — while
+        // `live` is every agent inside its TTL regardless of session, so an
+        // agent can confirm its own pointer without guessing what the user has
+        // open. Two fields because they answer two different questions; neither
+        // is derivable from the other without the active session path.
+        "agent_presence": agent_presence_debug_json(&shell, &snapshot),
         "live_session_snapshot_debug": live_session_snapshot_debug,
         "runtime_truth": runtime_truth,
         "daemon_update_state": daemon_update_state,
@@ -48353,6 +48478,9 @@ async fn process_pending_app_control_requests(
         AppControlCommand::Pointer { command } => {
             let script = app_control_pointer_script(&command);
             let _ = document::eval(&script);
+            if let Some((x, y, action)) = pointer_command_destination(&command) {
+                record_agent_pointer(state, request.agent.as_deref(), None, x, y, action);
+            }
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -48480,6 +48608,15 @@ async fn process_pending_app_control_requests(
                             .get("error")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
+                        // The script resolved the cell to a real point; publish
+                        // it as this agent's pointer (cursor v1).
+                        record_agent_pointer_from_grid_hit(
+                            state,
+                            request.agent.as_deref(),
+                            None,
+                            &value,
+                            mode,
+                        );
                         respond(json!({ "target": "main", "result": value }), error)
                     }
                     Ok(Err(error)) => respond(json!({ "target": "main" }), Some(error.to_string())),
@@ -48506,6 +48643,13 @@ async fn process_pending_app_control_requests(
                 // The surface-eval envelope's metadata rides alongside as
                 // siblings so nothing is lost.
                 let inner = result.get("value").cloned().unwrap_or(Value::Null);
+                record_agent_pointer_from_grid_hit(
+                    state,
+                    request.agent.as_deref(),
+                    params.session_path.clone(),
+                    &inner,
+                    mode,
+                );
                 let mut payload = json!({ "target": "surface", "result": inner });
                 if let Some(obj) = payload.as_object_mut() {
                     for key in ["accepted", "session_path", "native_id", "reason"] {
@@ -55384,6 +55528,12 @@ fn app() -> Element {
                             },
                         }
                     }
+                }
+                // Cursor v1: agents working THIS session get a visible pointer.
+                // Nothing renders when no agent has acted recently, so the
+                // default path pays nothing.
+                if !snapshot.agent_cursors.is_empty() {
+                    AgentCursorOverlay { cursors: snapshot.agent_cursors.clone() }
                 }
                 if let Some(row) = context_menu_overlay.clone() {
                     ContextMenuOverlay {
@@ -91304,6 +91454,68 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         }
     }
 }
+/// Cursor v1 (`docs/agent-control-plane.md` slice 3): the pointers of agents
+/// working the session the user is currently viewing, each a coloured arrow
+/// tagged `agent-N`.
+///
+/// The whole of v1 is "show me where the other driver is". There is no
+/// co-presence toggle, no ghost-cursor mimicry, and no visibility modes — those
+/// were explicitly parked. The caller has already filtered to this session and
+/// to live pointers, so this component only draws.
+#[component]
+fn AgentCursorOverlay(cursors: Vec<AgentPointer>) -> Element {
+    rsx! {
+        style { "{AGENT_CURSOR_CSS}" }
+        div {
+            "data-yggterm-agent-cursors": "1",
+            // Above the chrome so the pointer is never buried, below the click
+            // grid's 2147483000 so an agent's own aiming overlay still wins.
+            // pointer-events:none — presence is information, never a hit target.
+            style: "position:fixed; inset:0; z-index:210; pointer-events:none;",
+            for cursor in cursors.iter() {
+                div {
+                    key: "agent-cursor-{cursor.index}",
+                    // Every branch of this component emits the SAME style keys.
+                    // Dioxus applies `style` property-by-property and never
+                    // clears a key a later render drops, so a conditional key
+                    // would linger as a ghost (see the sidebar overlay trap).
+                    style: format!(
+                        "position:absolute; left:{x}px; top:{y}px; display:flex; align-items:flex-start; \
+                         gap:4px; transform:translate(-2px, -2px); will-change:opacity; \
+                         animation:yggterm-agent-cursor-fade {ttl}ms linear forwards;",
+                        x = cursor.x,
+                        y = cursor.y,
+                        ttl = AGENT_CURSOR_TTL_MS,
+                    ),
+                    // The arrow. An inline SVG rather than a glyph so the
+                    // silhouette is identical on every platform's font stack.
+                    svg {
+                        width: "18",
+                        height: "18",
+                        view_box: "0 0 18 18",
+                        path {
+                            d: "M2 1 L2 14 L5.6 10.6 L8 15.6 L10.4 14.4 L8 9.6 L13 9.6 Z",
+                            fill: "{cursor.color()}",
+                            stroke: "rgba(0,0,0,0.55)",
+                            stroke_width: "1",
+                            stroke_linejoin: "round",
+                        }
+                    }
+                    span {
+                        style: format!(
+                            "margin-top:11px; padding:1px 6px; border-radius:6px; font:700 11px \
+                             ui-monospace, monospace; white-space:nowrap; color:#0b0b0b; \
+                             background:{color}; box-shadow:0 1px 3px rgba(0,0,0,0.45);",
+                            color = cursor.color(),
+                        ),
+                        "{cursor.tag()} {cursor.action}"
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn ContextMenuOverlay(
     /// The row the menu acts on.
@@ -111315,6 +111527,45 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn pointer_commands_report_where_they_leave_the_agent_pointer() {
+        use AppControlPointerCommand as Cmd;
+        assert_eq!(
+            pointer_command_destination(&Cmd::Move { x: 3.0, y: 4.0 }),
+            Some((3.0, 4.0, "move"))
+        );
+        assert_eq!(
+            pointer_command_destination(&Cmd::Click {
+                x: 10.0,
+                y: 20.0,
+                button: AppControlPointerButton::Primary,
+                count: 1,
+            }),
+            Some((10.0, 20.0, "click"))
+        );
+        // A drag leaves the pointer where it ENDED, not where it began.
+        assert_eq!(
+            pointer_command_destination(&Cmd::Drag {
+                start_x: 0.0,
+                start_y: 0.0,
+                end_x: 90.0,
+                end_y: 80.0,
+                button: AppControlPointerButton::Primary,
+                steps: 4,
+                step_delay_ms: 24,
+            }),
+            Some((90.0, 80.0, "drag"))
+        );
+        // Release carries no coordinates: it must not invent a position, or the
+        // cursor would jump to (0,0) every time a drag finished.
+        assert_eq!(
+            pointer_command_destination(&Cmd::Release {
+                button: AppControlPointerButton::Primary
+            }),
+            None
+        );
+    }
+
     fn test_sidebar_row(path: &str) -> BrowserRow {
         BrowserRow {
             kind: BrowserRowKind::Session,
@@ -122479,6 +122730,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -123121,6 +123373,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -123298,6 +123551,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -123475,6 +123729,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -123655,6 +123910,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -123839,6 +124095,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -124015,6 +124272,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -124191,6 +124449,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -124401,6 +124660,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -124580,6 +124840,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -124791,6 +125052,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
@@ -125179,6 +125441,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            agent_cursors: Vec::new(),
             daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
