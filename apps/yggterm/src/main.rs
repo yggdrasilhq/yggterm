@@ -545,14 +545,23 @@ fn parse_screenshot_post_process(args: &[String]) -> Option<ScreenshotPostProces
         }
     });
     let scale = cli_flag_value(args, "--scale").and_then(|raw| raw.parse::<f32>().ok());
-    if region.is_none() && crop.is_none() && scale.is_none() {
+    let grid = parse_screenshot_grid(args);
+    if region.is_none() && crop.is_none() && scale.is_none() && grid.is_none() {
         return None;
     }
     Some(ScreenshotPostProcess {
         region,
         crop,
         scale: scale.unwrap_or(1.0),
+        grid,
     })
+}
+
+/// `--grid` (12x8 default) / `--grid COLSxROWS`, plus `--grid-refine CELL` to
+/// subdivide one cell into a labelled 3x3. Shares its body with the headless
+/// binary via `yggterm_server::screenshot_grid_from_args`.
+fn parse_screenshot_grid(args: &[String]) -> Option<yggterm_server::GridSpec> {
+    yggterm_server::grid_overlay::screenshot_grid_from_args(args)
 }
 
 fn launch_app_background(
@@ -1696,6 +1705,7 @@ fn main() -> Result<()> {
                 region: None,
                 crop: None,
                 scale: 1.0,
+                grid: None,
             });
             return run_screenshot_capture_with_post_process(
                 &target,
@@ -1788,6 +1798,7 @@ fn main() -> Result<()> {
                             region: None,
                             crop: None,
                             scale: 1.0,
+                            grid: None,
                         });
                     run_screenshot_capture_with_post_process(
                         target,

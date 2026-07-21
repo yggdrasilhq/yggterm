@@ -19,6 +19,58 @@ The agent works a vision loop:
    labels 1–9, then `grid click B7.5`. Two hops ≈ 20 px precision with
    always-legible labels; fine pitch is never needed.
 
+## Two grids, one geometry
+
+There are two ways to get a grid, and they differ in **who can see it**:
+
+| | live DOM grid | capture-side grid |
+|---|---|---|
+| verb | `server app grid show` | `server app screenshot --grid` |
+| drawn into | the running page | the returned PNG only |
+| the user sees it | **yes** (until TTL/hide) | **never** |
+| cell resolution | server-side, `grid click B7` | manifest coords + a click verb |
+
+Both derive every rect from **one owner**, `yggterm_core::click_grid::GridGeometry`
+— cell codes, tiling, and the 3x3 refine are defined once and shared, so the two
+grids can never disagree about where `B7` is.
+
+Use the capture-side grid by default: it is the agent-presence rung of the
+control plane (`docs/agent-control-plane.md` slice 3) and it is co-presence-safe
+— an agent can aim while the user keeps working, and a human screenshot taken at
+the same instant is grid-free.
+
+### `screenshot --grid`
+
+```
+server app screenshot <out.png> [--grid | --grid COLSxROWS] [--grid-refine CELL]
+                                [--region …] [--crop x,y,w,h] [--scale N]
+```
+
+- `--grid` alone = 12x8, the same default as the DOM grid. `--grid 16x10` sets it.
+- `--grid-refine C4` draws C4's nine sub-cells (`C4.1`..`C4.9`) and dims the rest.
+- Composes with `--crop`/`--region`/`--scale`: the grid spans the **cropped**
+  area, and labels scale with `--scale` so they stay proportional.
+- The manifest lands in `data.post_process.grid`:
+
+```jsonc
+{
+  "cols": 12, "rows": 8, "refine": null,
+  "region": { "x": 0, "y": 0, "w": 1920, "h": 1160, "cx": 960, "cy": 580 },
+  "click_space": "capture",
+  "capture_size": [1920, 1160],
+  "cells": [ { "code": "A1",
+               "capture": { "x": 0, "y": 0, "w": 160, "h": 145, "cx": 80, "cy": 72.5 },
+               "image":   { "x": 0, "y": 0, "w": 160, "h": 145, "cx": 80, "cy": 72.5 } } ]
+}
+```
+
+**Two coordinate spaces, both reported** — `capture` is the frame before
+crop/scale (the space `--crop` and `rows_rect` use); `image` is the PNG actually
+written. Click with `capture`; read labels off `image`. `capture_size` is there
+so you can check it against `window.inner_size` in `app state`: when they match,
+capture pixels *are* CSS pixels and `capture.cx/cy` go straight to a click verb.
+It is reported rather than assumed so a HiDPI host cannot silently mis-aim.
+
 ## Targets — where the grid draws and where the click lands
 
 - `main` — the main (Dioxus) webview: sidebar, terminal viewport, pickers,
