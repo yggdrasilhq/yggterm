@@ -3593,17 +3593,137 @@ impl YggtermServer {
     /// See [[finding-daemon-handoff-drops-live-rows]].
     pub fn stored_session_keys(&self) -> Vec<String> {
         let mut keys = self
-            .sessions
-            .iter()
-            .filter(|(path, session)| {
-                session.source == SessionSource::Stored
-                    && !stored_document_owns_runtime_uri(session.kind, path)
-            })
-            .map(|(path, _)| path.clone())
+            .stored_sessions_persisted()
+            .into_iter()
+            .map(|session| session.path)
             .collect::<Vec<_>>();
         keys.sort();
         keys.dedup();
         keys
+    }
+
+    /// The DORMANT (stored, non-live) rows this daemon holds, as the same
+    /// `PersistedStoredSession` records that persistence writes — SSOT for "a
+    /// dormant row's essence" (path, kind, id, cwd, title). Mirrors the
+    /// `persisted_state` filter exactly (Bug 9 document-twin guard included), so
+    /// persistence, the status wire, and `stored_session_keys` cannot diverge.
+    /// A SUCCESSOR daemon reads these off a reachable predecessor's status and
+    /// ADOPTS the ones it lacks, so a hot-restart never drops dormant rows
+    /// (B4 — the live rows are handed off, the dormant ones were not).
+    /// See [[finding-daemon-handoff-drops-live-rows]].
+    pub fn stored_sessions_persisted(&self) -> Vec<PersistedStoredSession> {
+        self.sessions
+            .iter()
+            .filter(|(path, session)| {
+                // Bug 9: never persist a kind=document stored twin that owns a runtime
+                // URI — it collides with the live codex of the same UUID (the blink).
+                !stored_document_owns_runtime_uri(session.kind, path)
+            })
+            .filter_map(|(path, session)| {
+                (session.source == SessionSource::Stored).then(|| PersistedStoredSession {
+                    path: path.clone(),
+                    kind: session.kind,
+                    session_id: Some(session.id.clone()),
+                    cwd: session
+                        .metadata
+                        .iter()
+                        .find(|entry| entry.label == "Cwd")
+                        .map(|entry| entry.value.clone()),
+                    title_hint: Some(session.title.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Restore ONE dormant/stored row into the session map — the shared body of
+    /// initial state restore and cross-daemon adoption, so both take the exact
+    /// same path (remote-path normalization, hydration mode, document load, the
+    /// Bug 9 document-twin guard). Returns true if the row was newly added.
+    /// `normalized_desired_active_path` eagerly hydrates the row that will become
+    /// active on a cold restore; adoption passes `None` so it never touches focus.
+    fn restore_stored_session_entry(
+        &mut self,
+        session: &PersistedStoredSession,
+        store: Option<&SessionStore>,
+        normalized_desired_active_path: Option<&str>,
+    ) -> bool {
+        // Bug 9 defense-in-depth: drop a stale kind=document stored twin that owns
+        // a runtime URI so it can't be restored alongside (and collide with) the
+        // live codex of the same UUID. This cleans up twins already on disk.
+        if stored_document_owns_runtime_uri(session.kind, &session.path) {
+            return false;
+        }
+        let path = if let Some((machine_key, session_id)) =
+            parse_remote_scanned_session_path(&session.path)
+        {
+            remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+        } else {
+            session.path.clone()
+        };
+        let was_missing = !self.sessions.contains_key(&path);
+        let hydration_mode = if session.kind == SessionKind::Document
+            || normalized_desired_active_path.is_some_and(|active_path| active_path == path.as_str())
+        {
+            StoredPreviewHydrationMode::Eager
+        } else {
+            StoredPreviewHydrationMode::Deferred
+        };
+        let document = if session.kind == SessionKind::Document {
+            store.and_then(|store| store.load_document(&path).ok().flatten())
+        } else {
+            None
+        };
+        let entry = self.sessions.entry(path.clone()).or_insert_with(|| {
+            build_session(
+                session.kind,
+                &path,
+                session.session_id.as_deref(),
+                session.cwd.as_deref(),
+                session.title_hint.as_deref(),
+                document.as_ref(),
+                self.backend,
+                self.theme,
+                self.ghostty_host.bridge_enabled,
+                hydration_mode,
+            )
+        });
+        entry.kind = session.kind;
+        entry.backend = self.backend;
+        if let Some(session_id) = session.session_id.as_deref() {
+            entry.id = session_id.to_string();
+        }
+        if let Some(cwd) = session.cwd.as_deref() {
+            entry.metadata.retain(|entry| entry.label != "Cwd");
+            entry.metadata.push(SessionMetadataEntry {
+                label: "Cwd",
+                value: cwd.to_string(),
+            });
+        }
+        if let Some(title_hint) = session.title_hint.as_deref() {
+            if passive_title_hint_can_update(&entry.title, title_hint, was_missing) {
+                entry.title = title_hint.to_string();
+            }
+        }
+        if let Some(document) = document.as_ref() {
+            hydrate_document_session(entry, document);
+        }
+        entry.stored_preview_hydrated = session.kind == SessionKind::Document
+            || matches!(hydration_mode, StoredPreviewHydrationMode::Eager);
+        was_missing
+    }
+
+    /// Adopt a DORMANT row a reachable predecessor daemon holds but this daemon
+    /// does not — so a hot-restart never drops it (B4: live rows are handed off,
+    /// dormant rows were not). Uses the exact same restore path as initial state
+    /// restore; passes no "desired active" so adoption never steals focus.
+    /// Returns true if the row was newly added.
+    /// See [[finding-daemon-handoff-drops-live-rows]].
+    pub fn adopt_stored_session(
+        &mut self,
+        session: &PersistedStoredSession,
+        store: Option<&SessionStore>,
+    ) -> bool {
+        self.restore_stored_session_entry(session, store, None)
     }
 
     pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
@@ -4043,28 +4163,7 @@ impl YggtermServer {
         protect_all_live: bool,
         protected_runtime_keys: Option<&HashSet<String>>,
     ) -> PersistedDaemonState {
-        let stored_sessions = self
-            .sessions
-            .iter()
-            .filter(|(path, session)| {
-                // Bug 9: never persist a kind=document stored twin that owns a runtime
-                // URI — it collides with the live codex of the same UUID (the blink).
-                !stored_document_owns_runtime_uri(session.kind, path)
-            })
-            .filter_map(|(path, session)| {
-                (session.source == SessionSource::Stored).then(|| PersistedStoredSession {
-                    path: path.clone(),
-                    kind: session.kind,
-                    session_id: Some(session.id.clone()),
-                    cwd: session
-                        .metadata
-                        .iter()
-                        .find(|entry| entry.label == "Cwd")
-                        .map(|entry| entry.value.clone()),
-                    title_hint: Some(session.title.clone()),
-                })
-            })
-            .collect();
+        let stored_sessions = self.stored_sessions_persisted();
         // Persistence-drop telemetry (live incident 2026-06-11: local rows
         // kept vanishing at swaps even after the mapper fix; the unit test
         // passed while the live path failed). Every live key that does NOT
@@ -4377,70 +4476,11 @@ impl YggtermServer {
             .clone()
             .map(|home| PerfSpan::start(home, "server", "restore_stored_sessions"));
         for session in state.stored_sessions {
-            // Bug 9 defense-in-depth: drop a stale kind=document stored twin that owns
-            // a runtime URI so it can't be restored alongside (and collide with) the
-            // live codex of the same UUID. This cleans up twins already on disk.
-            if stored_document_owns_runtime_uri(session.kind, &session.path) {
-                continue;
-            }
-            let path = if let Some((machine_key, session_id)) =
-                parse_remote_scanned_session_path(&session.path)
-            {
-                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
-            } else {
-                session.path.clone()
-            };
-            let was_missing = !self.sessions.contains_key(&path);
-            let hydration_mode = if session.kind == SessionKind::Document
-                || normalized_desired_active_path
-                    .as_deref()
-                    .is_some_and(|active_path| active_path == path)
-            {
-                StoredPreviewHydrationMode::Eager
-            } else {
-                StoredPreviewHydrationMode::Deferred
-            };
-            let document = if session.kind == SessionKind::Document {
-                store.and_then(|store| store.load_document(&path).ok().flatten())
-            } else {
-                None
-            };
-            let entry = self.sessions.entry(path.clone()).or_insert_with(|| {
-                build_session(
-                    session.kind,
-                    &path,
-                    session.session_id.as_deref(),
-                    session.cwd.as_deref(),
-                    session.title_hint.as_deref(),
-                    document.as_ref(),
-                    self.backend,
-                    self.theme,
-                    self.ghostty_host.bridge_enabled,
-                    hydration_mode,
-                )
-            });
-            entry.kind = session.kind;
-            entry.backend = self.backend;
-            if let Some(session_id) = session.session_id.as_deref() {
-                entry.id = session_id.to_string();
-            }
-            if let Some(cwd) = session.cwd.as_deref() {
-                entry.metadata.retain(|entry| entry.label != "Cwd");
-                entry.metadata.push(SessionMetadataEntry {
-                    label: "Cwd",
-                    value: cwd.to_string(),
-                });
-            }
-            if let Some(title_hint) = session.title_hint.as_deref() {
-                if passive_title_hint_can_update(&entry.title, title_hint, was_missing) {
-                    entry.title = title_hint.to_string();
-                }
-            }
-            if let Some(document) = document.as_ref() {
-                hydrate_document_session(entry, document);
-            }
-            entry.stored_preview_hydrated = session.kind == SessionKind::Document
-                || matches!(hydration_mode, StoredPreviewHydrationMode::Eager);
+            self.restore_stored_session_entry(
+                &session,
+                store,
+                normalized_desired_active_path.as_deref(),
+            );
         }
         if let Some(span) = stored_restore_perf {
             span.finish(serde_json::json!({
@@ -23248,6 +23288,7 @@ mod tests {
             preserved_terminal_owner_keys: Vec::new(),
             stored_terminal_session_count: 0,
             stored_terminal_session_keys: Vec::new(),
+            stored_terminal_sessions: Vec::new(),
             advertises_stored_session_keys: true,
             terminal_retained_chunks: 0,
             terminal_retained_bytes: 0,
@@ -33455,6 +33496,7 @@ terminal_window_id: None,
             preserved_terminal_owner_keys: Vec::new(),
             stored_terminal_session_count: 0,
             stored_terminal_session_keys: Vec::new(),
+            stored_terminal_sessions: Vec::new(),
             advertises_stored_session_keys: true,
             terminal_retained_chunks: 0,
             terminal_retained_bytes: 0,

@@ -4,7 +4,8 @@ use crate::codex_cli::{
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     CodexRuntimeProcessIdentity, GhosttyHostSupport, ManagedSessionView, PersistedDaemonState,
-    PersistedLiveSession, RemoteMachineSnapshot, RemoteRuntimeRegistry, ServerUiSnapshot,
+    PersistedLiveSession, PersistedStoredSession, RemoteMachineSnapshot, RemoteRuntimeRegistry,
+    ServerUiSnapshot,
     SessionKind, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalManager,
     WorkspaceViewMode, YggtermServer, active_client_instance_records,
     active_client_instance_records_for_endpoint_scope,
@@ -1608,6 +1609,15 @@ pub struct ServerRuntimeStatus {
     pub stored_terminal_session_count: usize,
     #[serde(default)]
     pub stored_terminal_session_keys: Vec<String>,
+    /// The DORMANT rows as full `PersistedStoredSession` records (path, kind, id,
+    /// cwd, title) — enough for a SUCCESSOR to ADOPT them so a hot-restart never
+    /// drops dormant rows (B4). Built together with `stored_terminal_session_keys`
+    /// from the one source (`stored_sessions_persisted`), so the keys are just its
+    /// projection and cannot diverge. Carried on status (not the snapshot) because
+    /// the snapshot has 119 literal call sites and the reconcile already fetches
+    /// status. See [[finding-daemon-handoff-drops-live-rows]].
+    #[serde(default)]
+    pub stored_terminal_sessions: Vec<PersistedStoredSession>,
     /// True on any daemon that populates `stored_terminal_session_keys`. A
     /// pre-B4 daemon lacks the field entirely and deserializes `false` — so a
     /// dormant-row coverage check treats its (invisible) dormant set as
@@ -2766,7 +2776,15 @@ impl DaemonRuntime {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
-        let stored_terminal_session_keys = self.server.stored_session_keys();
+        // Built together from the one source so keys are a pure projection of the
+        // records — they cannot disagree about which dormant rows exist.
+        let stored_terminal_sessions = self.server.stored_sessions_persisted();
+        let mut stored_terminal_session_keys = stored_terminal_sessions
+            .iter()
+            .map(|session| session.path.clone())
+            .collect::<Vec<_>>();
+        stored_terminal_session_keys.sort();
+        stored_terminal_session_keys.dedup();
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
@@ -2801,6 +2819,7 @@ impl DaemonRuntime {
             preserved_terminal_owner_keys: preserved_owner_keys,
             stored_terminal_session_count: stored_terminal_session_keys.len(),
             stored_terminal_session_keys,
+            stored_terminal_sessions,
             advertises_stored_session_keys: true,
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
@@ -3506,6 +3525,7 @@ impl DaemonRuntime {
         let before = self.preserved_terminal_owners.keys().len();
         self.restore_missing_preserved_owner_live_sessions(reason);
         self.recover_missing_preserved_owner_live_sessions_from_reachable_daemons(reason);
+        self.adopt_missing_dormant_sessions_from_reachable_daemons(reason);
         append_trace_event(
             self.store.home_dir(),
             "daemon",
@@ -3517,6 +3537,49 @@ impl DaemonRuntime {
                 "registered_owner_keys_after": self.preserved_terminal_owners.keys().len(),
             }),
         );
+    }
+
+    /// B4 DORMANT-row prevention: adopt the dormant (stored, non-live) rows a
+    /// reachable predecessor daemon holds but this daemon does not. The live half
+    /// (`recover_missing_...`) only adopts LIVE rows — the daemon snapshot carries
+    /// `live_sessions` but not stored ones — yet the 2026-07-21 drop (26→13) was
+    /// DORMANT rows. Their full records ride on the predecessor's STATUS
+    /// (`stored_terminal_sessions`), which this reconcile ALREADY fetches, so
+    /// there is no extra snapshot fetch and no new RPC variant (which would
+    /// hard-fail an old daemon). A pre-dormant predecessor omits the field
+    /// (empty) → nothing to adopt, which is safe. Adoption only ADDS rows.
+    /// See [[finding-daemon-handoff-drops-live-rows]].
+    fn adopt_missing_dormant_sessions_from_reachable_daemons(&mut self, reason: &'static str) {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        for (owner_endpoint, owner_status) in reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        ) {
+            if owner_status.stored_terminal_sessions.is_empty() {
+                continue;
+            }
+            let mut adopted = Vec::new();
+            for stored in &owner_status.stored_terminal_sessions {
+                if self.server.adopt_stored_session(stored, Some(&self.store)) {
+                    adopted.push(stored.path.clone());
+                }
+            }
+            if !adopted.is_empty() {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "preserved_owner_dormant_sessions_adopted",
+                    serde_json::json!({
+                        "reason": reason,
+                        "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                        "owner_server_version": owner_status.server_version,
+                        "owner_server_pid": owner_status.server_pid,
+                        "adopted_row_keys": adopted,
+                    }),
+                );
+            }
+        }
     }
 
     fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {
@@ -14861,6 +14924,46 @@ mod tests {
         assert!(server.live_session_keep_alive(&session_path));
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+    }
+
+    #[test]
+    fn adopt_stored_session_adds_a_missing_dormant_row_idempotently_without_focus() {
+        // B4 dormant-row prevention: the successor adopts a predecessor's dormant
+        // rows, which the live snapshot path does NOT carry. Adoption must add the
+        // row, be idempotent, and never steal the user's focus.
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "local://b4-dormant-adopt".to_string();
+        let stored = crate::PersistedStoredSession {
+            path: path.clone(),
+            kind: SessionKind::ClaudeCode,
+            session_id: Some("b4-dormant-adopt".to_string()),
+            cwd: Some("/home/pi/git/x".to_string()),
+            title_hint: Some("adopted dormant row".to_string()),
+        };
+
+        assert!(
+            server.adopt_stored_session(&stored, None),
+            "first adoption should add the dormant row"
+        );
+        assert!(
+            server.stored_session_keys().contains(&path),
+            "the adopted row must appear as a stored (dormant) session"
+        );
+        assert!(
+            !server.adopt_stored_session(&stored, None),
+            "adopting the same row again must be a no-op"
+        );
+        assert_eq!(
+            server.active_session_path(),
+            None,
+            "adoption must never steal the user's focus"
+        );
     }
 
     #[test]

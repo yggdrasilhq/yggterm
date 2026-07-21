@@ -57,13 +57,25 @@ fix) once the fix is verified live on jojo.
   and a two-daemon sandbox (2.12.0 predecessor + 2.12.1 successor, same home)
   showed the successor starting cleanly in ~0.5s with the inline reconcile — no
   hang/deadlock — then the older daemon retiring as designed.
-  **STILL OWED — DORMANT-row prevention.** The reconcile adopts only LIVE rows,
-  because the daemon `snapshot()` carries `live_sessions` but NOT stored/dormant
-  sessions. The 2026-07-21 case (26→13) was DORMANT rows, so it is detected-loud
-  but not yet auto-prevented. Fix: extend `ServerUiSnapshot` with a
-  `stored_sessions: Vec<...>` (additive, no shape-stamp bump — same as the status
-  field) and adopt missing dormant rows in the reconcile. Riskiest daemon path;
-  verify in a two-daemon sandbox, never a destructive live handoff on a busy host.
+  **DORMANT-row PREVENTION now shipped too (same branch, NOT deployed).** The
+  2026-07-21 case (26→13) was DORMANT rows, which the live reconcile could not
+  adopt because the daemon `snapshot()` carries `live_sessions` but not stored
+  ones. Rather than extend the snapshot (119 literal call sites), the dormant
+  rows now ride on the predecessor's STATUS as full records
+  (`ServerRuntimeStatus.stored_terminal_sessions`, additive — no shape-stamp
+  bump), which the reconcile already fetches; a new
+  `adopt_missing_dormant_sessions_from_reachable_daemons` step adopts the ones
+  the successor lacks via a shared `restore_stored_session_entry` (same path as
+  initial state-restore, so no second encoding). Proven end-to-end in a
+  two-daemon sandbox (2.12.0 pred + 2.12.1 succ): a dormant row present ONLY in
+  the predecessor's memory (never in the successor's loaded state) appeared on
+  the successor after its reconcile — adoption confirmed. Unit-tested
+  (`adopt_stored_session_adds_a_missing_dormant_row_idempotently_without_focus`);
+  579 lib green.
+  **B4 is now fully PREVENTED (live + dormant) + detected, on branch, NOT
+  deployed.** Remove this entry once verified live on jojo after a deploy.
+  (`retarget_current_alias_entries` + `prune_unrepresented_preserved_owner_runtime_sessions`
+  remain dead — wire only if a live case needs them.)
 
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
