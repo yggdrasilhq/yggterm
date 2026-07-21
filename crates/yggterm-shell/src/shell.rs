@@ -105814,6 +105814,38 @@ mod tests {
             format!("{YGGTERM_DESKTOP_APP_ID}.ismoketest")
         );
     }
+
+    /// A shadow view client (slice 4.3) runs ALONGSIDE the user's GUI on the
+    /// same home, so it must not resolve the same GTK application id.
+    ///
+    /// LIVE FAILURE this pins (2026-07-21): two clients sharing a home both got
+    /// the bare `YGGTERM_DESKTOP_APP_ID`, so the second became a GApplication
+    /// *remote* instance — its launch returned instantly and the process exited
+    /// **0 with no window and no error**. Silent, and it looked exactly like a
+    /// broken headless GL stack. `scripts/shadow-client.sh` passes
+    /// `YGGTERM_DESKTOP_APP_ID_SUFFIX=shadow-<name>`; this asserts that suffix
+    /// actually separates the ids, and that distinct shadows never collide with
+    /// each other either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shadow_clients_get_app_ids_distinct_from_the_users_gui() {
+        let home = Some("/home/user/.yggterm");
+        let user_gui = linux_desktop_app_id_for_context(None, false, false, home);
+        let shadow_a = linux_desktop_app_id_for_context(Some("shadow-a"), false, false, home);
+        let shadow_b = linux_desktop_app_id_for_context(Some("shadow-b"), false, false, home);
+
+        assert_eq!(user_gui, YGGTERM_DESKTOP_APP_ID);
+        assert_ne!(
+            shadow_a, user_gui,
+            "a shadow sharing the user's app id becomes a GApplication remote and \
+             exits silently without a window"
+        );
+        assert_ne!(shadow_b, user_gui);
+        assert_ne!(
+            shadow_a, shadow_b,
+            "two shadows must not collide with each other either"
+        );
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_desktop_app_id_ignores_update_handoff_multi_window_env() {
