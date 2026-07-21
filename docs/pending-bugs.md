@@ -42,18 +42,28 @@ fix) once the fix is verified live on jojo.
   dormant-row keys (`stored_terminal_session_keys` + `advertises_stored_session_keys`,
   fail-safe like `role_enforcement`) so the check has no false positives across a
   mixed-version window. Additive fields — no protocol-shape-stamp bump.
-  **PREVENTION still owed, and the root cause is now sharper:** the successor-side
-  recovery meant to ADOPT a predecessor's rows —
-  `recover_missing_preserved_owner_live_sessions_from_reachable_daemons` (plus
-  `restore_missing_preserved_owner_live_sessions`,
-  `prune_unrepresented_preserved_owner_runtime_sessions`,
-  `focus_live_session_without_launch_if_active_missing`) — is DEAD CODE: zero call
-  sites, the compiler flags them `never used`. That is *why* it "never fired." The
-  fix is to WIRE that recovery into the successor lifecycle (startup + periodic)
-  and extend it to dormant rows, OR gate the version-socket-alias claim on
-  adoption. Riskiest daemon path; verify with a two-daemon sandbox
-  (`YGGTERM_HOME=<tmp> yggterm-headless server daemon`), never a destructive live
-  handoff on a busy host.
+  **LIVE-row PREVENTION now shipped too (same branch, NOT deployed).** The root
+  cause was that the successor-side recovery meant to ADOPT a predecessor's rows
+  (`recover_missing_preserved_owner_live_sessions_from_reachable_daemons` +
+  `restore_missing_preserved_owner_live_sessions`) was DEAD CODE — `load()`
+  deferred the deep reconcile until after socket-bind (per the
+  `runtime_load_defers_...` test) but nothing ever ran it. Now `run_daemon` runs
+  `run_deferred_preserved_owner_deep_reconcile` inline right after the socket
+  binds (before the accept loop, so cross-daemon probes can't deafen a client):
+  the successor ADOPTS live rows from any reachable predecessor daemon in its
+  home. Proven: adoption mechanism unit-tested
+  (`preserved_owner_snapshot_restores_missing_live_session_row`), wiring
+  unit-tested (`run_daemon_runs_deferred_preserved_owner_reconcile_after_socket_bind`),
+  and a two-daemon sandbox (2.12.0 predecessor + 2.12.1 successor, same home)
+  showed the successor starting cleanly in ~0.5s with the inline reconcile — no
+  hang/deadlock — then the older daemon retiring as designed.
+  **STILL OWED — DORMANT-row prevention.** The reconcile adopts only LIVE rows,
+  because the daemon `snapshot()` carries `live_sessions` but NOT stored/dormant
+  sessions. The 2026-07-21 case (26→13) was DORMANT rows, so it is detected-loud
+  but not yet auto-prevented. Fix: extend `ServerUiSnapshot` with a
+  `stored_sessions: Vec<...>` (additive, no shape-stamp bump — same as the status
+  field) and adopt missing dormant rows in the reconcile. Riskiest daemon path;
+  verify in a two-daemon sandbox, never a destructive live handoff on a busy host.
 
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
