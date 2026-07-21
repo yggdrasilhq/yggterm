@@ -502,7 +502,229 @@ the GUI process; the headless farm has no GUI to route through. The verb
 4. **3.0.0 — true shadow clients + idle-host farm.** Protocol client identity + roles
    (takeover guard), jar leases, input arbitration; headless WPE farm (ychrome
    agent-engine.md Phases A–E). The headless-sway recipe proven this campaign is
-   the pattern.
+   the pattern. **Decomposed into deployable sub-slices 4.0–4.4 in the build plan
+   below** — ordered by risk, only 4.0 bumps the protocol.
+
+## Slice 4 build plan — true shadow clients + idle-host farm (3.0.0)
+
+Slices 2–3 gave the agent everything the *soft-stashed GUI surfaces* can give:
+read/do/wait/capture/lease on a surface the user is not watching, an agent-only
+grid, per-agent cursors. Slice 4 is the **residual the GUI-hosted plane cannot
+reach**, and only that residual:
+
+- a **per-agent viewport** whose active session and geometry are independent of
+  the user's GUI, so a probe never yanks the user's view (the "whooping"
+  annoyance, pt10), and
+- **GUI-closed / idle-host web automation** via a headless WPE farm on an idle
+  box (oc, idle by design).
+
+The user settled the shape (pt10): the engine verbs already cover most of the
+win, so slice 4 adds only the two things above. It is the **riskiest work in the
+repo** — it changes the daemon protocol and touches the session-ownership path
+that both the 2.11.5 dead-sessions class and the row-dropping handoff live in —
+so it is decomposed into sub-slices **ordered by risk, each independently
+deployable**, and only the first bumps the protocol.
+
+### Two identity layers already exist; slice 4 adds a third — do NOT conflate them
+
+Reusing either existing identity for the takeover guard would be the
+second-encoding mistake this repo forbids.
+
+| Layer | Where (verified in tree) | Lifetime | Answers |
+|---|---|---|---|
+| **App-control agent identity** (slice 3) | `AGENT_IDENTITY_OVERRIDE: RwLock<Option<String>>` in `app_control.rs`, set once from `--agent` | process-global, one invocation | which colour/tag the agent's cursor draws |
+| **Runtime owner** (exists today) | `PreservedTerminalOwner` / `owner_server_pid` / the hot-update-owners file in `daemon.rs` | one daemon per PTY, survives hot-restart | who holds the PTY master fd — a hot-restart successor *takes over* this |
+| **View-client identity + role** (slice 4, NEW) | per-connection on `ServerRequest`, see 4.0 | one live client connection | is this client Active or Shadow — gates takeover + input |
+
+The app-control field is process-global and per-invocation: right for "one CLI
+call is one agent," wrong for a long-lived daemon serving many connections. The
+runtime-owner is about the *PTY*, not the *viewer*. The new layer answers only
+"may this client take runtime ownership / drive input," and lives on the
+connection — not on `AGENT_IDENTITY_OVERRIDE`, not on a new global.
+
+### 4.0 — Client identity + role in the daemon protocol (foundation; the one protocol bump)
+
+Everything after this is additive on the handshake it introduces.
+
+- **Encoding (eng-review D4).** Identity/role rides as an `Option<ClientIdentity>`
+  field with `#[serde(default)]` on the existing attach/connect request(s) —
+  **never a new `ServerRequest` variant**. `ServerRequest` is
+  `#[serde(tag="kind")]` with no `deny_unknown_fields`, so an unknown *variant*
+  hard-fails an older chain daemon (the row-drop path) while an unknown *field* is
+  safely ignored. `client_role ∈ {Active, Shadow}`; `client_id` is
+  **server-issued per connection**, not a client assertion, and role/identity are
+  **frozen after registration** (no mid-connection role change). Anonymous /
+  pre-4.0 connections default to `Active`, so the user's GUI is unchanged and the
+  26-row handoff check still passes. Both-direction round-trip tests are required
+  (old-client→new-daemon = None = Active; new-client→old-daemon = field ignored).
+- **Fail closed, never silently downgrade (eng-review D7).** A silently-ignored
+  role is a privilege *escalation*, not a safe default: a Shadow whose role an old
+  daemon drops would be treated as Active exactly during the mixed-version window
+  when the guard matters most. So the daemon **advertises role-enforcement** (in
+  the `Status`/handshake reply) and a `Shadow` client **refuses to operate**
+  against a daemon that cannot enforce it. Active/anonymous clients are unaffected.
+- **SSOT:** the role lives in one place, the per-client connection/session-handle
+  the daemon already keeps. It is *not* derived from `AGENT_IDENTITY_OVERRIDE`
+  and *not* a new global.
+- **Takeover guard = default-deny allowlist (eng-review D3).** A `Shadow` may
+  issue **only** an enumerated read/observe set (`Status`, `Snapshot`,
+  `WorkingFlags`, `TerminalRead`, `TerminalSnapshot`, row/state queries); **every
+  other `ServerRequest` variant is refused** with `shadow_cannot_own`, journaled.
+  Expressed as an **exhaustive `match` with no wildcard arm**, so a newly-added
+  variant fails the build until its access is classified and the default is
+  refuse — the ownership boundary cannot develop a silent hole. A Shadow never
+  writes the hot-update owners file and never becomes `owner_server_pid`.
+- **Hot-restart provenance (eng-review D9).** The hot-restart handoff must carry
+  role/epoch provenance **or** force re-registration — a successor connection with
+  no role must **not** default to Active. Test a mixed **N / N-1 / N-2** parent
+  chain, not just one restart.
+- **Protocol version.** `SERVER_PROTOCOL_VERSION` is the crate version, so the
+  envelope change stamps a real bump → a **daemon** deploy to the live host (the
+  row-dropping-handoff path). The only sub-slice needing a coordinated deploy
+  window; 4.1–4.4 ride the already-deployed handshake.
+
+Acceptance gates 10, 15.
+
+### 4.1 — Input arbitration across clients (the human-always-preempts half)
+
+- Extend the **existing** per-surface human-preempt (slice-2b, one arbiter) to a
+  **per-session input lease** keyed by `(client_id, role)`. The Active client
+  (the human) holds standing priority; a Shadow may drive input to a session only
+  while it holds a transient input lease **and** the Active client is not focused
+  on that session. Real seat input from the Active client revokes the lease
+  immediately, cancels the Shadow's queued batch (`preempted`, journaled), and is
+  never queued behind the agent — the exact machinery slice-2b already defines
+  for one surface, now keyed across clients.
+- **SSOT:** one arbiter, the slice-2b preempt path extended — not a second lease
+  table.
+- **Arbitrate semantic transactions, not bytes (eng-review D9).** The lease is
+  keyed on a stable `client_id` + connection epoch with fencing; input is
+  arbitrated as **atomic semantic transactions** (bracketed paste, mouse drag,
+  modifier+key sequences), never split mid-sequence into byte chunks. On
+  disconnect/restart, queued and pending input for that client is cancelled, not
+  replayed.
+
+Acceptance gate 11.
+
+### 4.2 — Profile write-lock (single-writer, profile-safety)
+
+- **Renamed from "jar lease" (eng-review D5) and widened (D9).** Distinct from the
+  slice-2b *surface lease* (reconciler-owned, keep-alive): this is a
+  **daemon-owned single-writer lock across clients** — two owners at two layers
+  that never share state. It covers the **whole mutable profile context**, not
+  just the cookie jar: SQLite WAL/SHM, IndexedDB, service workers, caches,
+  downloads. Two `WebContext`s on one profile corrupt it, so the daemon grants the
+  write-lock to exactly **one** live web client at a time for its process
+  lifetime; a second writer gets `profile_busy` (or an explicit read-only mirror).
+  Define crash/restart recovery and lock ordering against the surface lease. One
+  owner = a profile-write-lock table on the daemon keyed by profile; releasing
+  frees it for the next client.
+
+Acceptance gate 12.
+
+### 4.3 — The shadow view client (headless-compositor recipe)
+
+- A second yggterm **view** client process attaches to the same daemon with
+  `client_role = Shadow`, under a headless compositor (`WLR_BACKENDS=headless`
+  sway — proven this campaign; the dev sandbox was the pattern). It has its **own**
+  active session and geometry, independent of the user's GUI.
+- Addressed by `--client <name>` on the app-control verbs so a probe names its
+  target client; its screenshots/switches touch only its shadow view (captured
+  via `grim`). The user's GUI is never driven — the pt10 "whooping" annoyance is
+  gone.
+- Both clients read the **same daemon truth** (Phase-2 doctrine: daemon = truth,
+  view client = disposable); the shadow adds a view, never a second source of
+  state.
+- **Read-only geometry (eng-review D8).** A Shadow **never** drives PTY winsize,
+  terminal focus, or scroll. A differently-sized shadow view issuing `SIGWINCH`
+  would reflow the CLI and scramble the user's live frame (the known
+  frame-corruption class) *without* claiming ownership, so the takeover guard
+  alone does not cover it. The shadow view uses a **fixed/canonical grid**
+  (letterboxing any size difference) or a **read-only replay** of the active grid.
+- **On-demand lifecycle (eng-review D6).** A shadow client is spawned when an
+  agent first drives it and **reaped after an idle TTL** (no verb in N minutes →
+  torn down; the next verb re-spawns), reusing the slice-2b reap-deadline
+  discipline. The full compositor + WebKit stack (100s of MB) is paid only during
+  active work, never by idle shadows.
+- **User geometry changes are first-class, never an agent alarm (eng-review
+  D11 — user-raised).** The inverse of the read-only-geometry guard: the Active
+  client (the user) is the SOLE driver of a session's canonical geometry, and
+  changing it — docking a sidebar, resizing the window — must not break agents
+  mid-flight. Three things make it safe: (1) the shipped auto-hide sidebars are
+  **overlays** (hover-reveal over the viewport, `spec-sidebar-auto-hide-hover-overlay`),
+  so the common "open a sidebar" case reflows **nothing** — the PTY winsize is
+  untouched; only a docked/explicit resize drives `SIGWINCH`. (2) When a real
+  resize does happen it reflows the ONE canonical grid **once** (the shadow
+  follows it, never fights it — D8), and any agent web verb in flight against the
+  old geometry **fails closed** via the existing slice-2b generation-handle /
+  selector-freshness guard (`stale_handle` / `target_moved`), so the agent
+  re-observes and retries instead of clicking a stale coordinate. (3) The change
+  is journaled as an active-client geometry event, so an agent sees "geometry
+  changed by the user" and simply re-captures — a changed frame is a normal
+  reflow, not corruption to panic over. Geometry authority is single-owner and
+  user-priority; the agent absorbs it, it never absorbs the agent.
+
+Acceptance gates 13, 19.
+
+### 4.4 — The idle-host farm plane (oc)
+
+- Mount the ychrome headless WPE engine (`agent-engine.md`, `WPEDisplayHeadless`)
+  under `/engine/*` on the per-host ychrome daemon, so **GUI-closed** web
+  automation runs the same verb vocabulary with `--page <id>` instead of
+  `--session <path>`. oc (idle by design) is the natural farm; fleet routing
+  already exists.
+- **The binding is the verb table above** (§ The two planes): a recipe moves
+  GUI-plane → farm-plane by changing only the handle flag. The farm endpoints are
+  renamed/aliased to the CLI verbs so a site-lore method block reads identically
+  on both planes.
+- **Host-local profiles (eng-review D9).** Profiles are explicitly **host-local
+  and non-shareable** — a local write-lock does not fence a profile copied or
+  synced across hosts, so "same profile, two hosts" is forbidden rather than
+  distributed-locked. Cross-host automation runs against the target host's own
+  profile.
+- **`--page` is a capability, not an address (eng-review D9).** A farm page
+  reference is an **opaque, unguessable capability** scoped to `{host identity,
+  engine epoch, profile grant, caller identity, expiry}`. A stale, forged,
+  post-reboot, or cross-host `--page` is rejected — it must not resurrect a page,
+  reach another host's page, or expose its cookies.
+- **4.4 needs its own trust + placement sub-spec before it builds (eng-review
+  D9).** "Idle host" is not a security principal: define who may schedule onto a
+  host, what identity the engine runs as, whether it may use personal browser
+  credentials, reachable network origins, how SSH transport binds a request to its
+  target, and audit attribution — plus a placement/revocation model (host
+  discovery, capacity, health/version compat, timeout/kill, host-becomes-busy
+  preemption, orphan cleanup, page migration). **4.4 gets its own eng-review
+  gate**; 4.0–4.3 do not depend on it.
+
+Acceptance gates 14, 17, 18.
+
+### Deploy discipline (slice 4 is where the deploy rules bite hardest)
+
+- 4.0 is the **only** protocol bump. It cannot use the client-side or GUI-only
+  recipes — it needs a **daemon** swap on the live host, the row-dropping-handoff
+  path. **Count `server app rows` before and after** every daemon swap, and
+  coordinate a window: the live host also hosts other agents' campaigns, and can
+  host the very session the user is viewing.
+- 4.1–4.2 are daemon-side but ride the 4.0 handshake (deploy with or after 4.0).
+- 4.3–4.4 stand up **new processes** (a shadow client, a farm engine); they
+  change nothing about the user's existing GUI or daemon and can be proven on an
+  idle box without touching the live viewport.
+
+### Open questions — eng-review resolutions (2026-07-21)
+
+1. **Client identity durability.** `client_id` is **server-issued per connection**
+   and frozen after registration (eng-review D4/D9). Resolved for identity; the
+   one residual detail is whether a reconnecting shadow *reclaims its prior view*
+   or starts fresh — decide at 4.0 build (default: fresh view, lease re-taken).
+2. **Shadow read scope across the hot-restart chain.** Resolved (eng-review D9):
+   the handoff carries role/epoch provenance or forces re-registration; a
+   successor connection with no role is never Active. Tested across N/N-1/N-2.
+3. **Profile contention policy.** Resolved (eng-review D5/D9): `profile_busy`
+   hard-fail is the default; an explicit read-only mirror is the opt-in.
+4. **Farm auth.** Resolved (eng-review D9): profiles are host-local + non-shareable
+   and `--page` is an opaque capability scoped to `{host, engine epoch, profile
+   grant, caller, expiry}`; the full cross-host trust model is 4.4's own sub-spec
+   + eng-review gate before it builds.
 
 ## Acceptance (F-style, the user's words made testable)
 
@@ -566,6 +788,67 @@ not a code claim.
    input cancels the rest of the agent's queue (`preempted` in the journal), the
    human's input is not queued behind the agent, and no further agent verb from
    that batch dispatches.
+10. **Shadow cannot take over (slice 4.0).** A `Shadow` connection issuing an
+    ownership-claiming request (preserved-owner import / `DropTerminalRuntime` /
+    a keep-alive owner write) is refused with `shadow_cannot_own` and journaled;
+    the PTY's `owner_server_pid` is unchanged; an anonymous/Active client issuing
+    the same request still succeeds (no regression). The daemon swap that lands
+    4.0 preserves the row count (26 → 26).
+11. **Human preempts a shadow across clients (slice 4.1).** With a Shadow client
+    mid-batch driving input to session S, the user focusing S on the Active
+    client revokes the shadow's input lease within one dispatch, cancels the rest
+    of its batch (`preempted`), and the user's keystroke is not queued behind it.
+12. **Profile single-writer (slice 4.2).** Two clients requesting a writable
+    context on one profile: the second gets `profile_busy` (or the declared
+    read-only mirror); the profile is never opened by two `WebContext`s at once;
+    releasing the write-lock lets the next client acquire it.
+13. **Undisturbed shadow viewport (slice 4.3).** A shadow client switches
+    sessions and captures its viewport (grim) while the user's GUI stays on its
+    own session — a compositor grab of the user's display before and after is
+    identical; both clients' state came from the one daemon.
+14. **Plane-portable recipe (slice 4.4).** One site-lore method block runs
+    unchanged on the GUI plane (`--session`) and the farm plane (`--page`),
+    changing only the handle flag; both planes' journals record the same verb
+    sequence.
+15. **No silent downgrade across the version chain (4.0, eng-review D7).** A new
+    Shadow client to every OLDER daemon in a live N/N-1/N-2 restart chain is
+    **refused** (role-enforcement not advertised → Shadow fails closed), never
+    silently treated as Active. An Active/anonymous client to the same chain still
+    attaches unchanged (26→26 rows).
+16. **Shadow cannot reflow the active session (4.3, eng-review D8).** Active and
+    Shadow views at different viewport sizes leave the active terminal's rows,
+    columns, and pixels **byte-identical**; a Shadow attempting to set winsize /
+    focus / scroll is refused and the user's live frame does not repaint.
+17. **Profile integrity under concurrency (4.2, eng-review D9).** Two clients
+    cannot mutate any shared profile component (jar, WAL/SHM, IndexedDB, service
+    workers, caches) at once — the second writer gets `profile_busy`; a crash /
+    restart recovers to a single writer, never two.
+18. **Farm capabilities fail closed (4.4, eng-review D9).** Forged, stale,
+    cross-host, and post-reboot `--page` capabilities are rejected; farm
+    loss/restart cannot route input or a screenshot to a reused page/profile
+    identity.
+19. **User geometry change doesn't break agents (4.1/4.3, eng-review D11).** While
+    an agent runs verbs against a session, the user docks a sidebar / resizes: the
+    canonical grid reflows **once**, an in-flight web verb aborts with
+    `stale_handle` / `target_moved` (never a wrong-target click), the agent's next
+    capture reflects the new geometry, and no agent verb fires against stale
+    coordinates. An overlay-sidebar toggle reflows nothing (PTY winsize unchanged).
+
+### Unit-test requirements (eng-review test pass — fold at build time)
+
+The gates above are live proofs; these unit tests (Rust, in-crate `#[cfg(test)]`,
+matching the slice-2b/3 convention) back the pure logic and must ship with each
+sub-slice:
+
+- **4.0** — `role_gate(&ServerRequest)` exhaustive-match: Shadow refused on every
+  mutating variant, allowed on the read set (backs gate 10/D3). `ClientIdentity`
+  serde both directions (old↔new, backs D4). `shadow_cannot_own` emits its journal
+  line.
+- **4.1** — input lease grant/deny by focus state; per-session FIFO determinism;
+  preempt cancels the queued batch and journals it; queued input cancelled on
+  disconnect.
+- **4.2** — profile-write-lock acquire → second writer `profile_busy` → release →
+  re-acquire; crash-recovery re-establishes a single writer.
 
 ## Risks and spikes
 
@@ -579,7 +862,9 @@ not a code claim.
 | Two agents `do` the same surface concurrently | slice-2 | per-surface input serialized **FIFO by arrival**, one in flight at a time, both journaled (deterministic ordering, no timing-dependent interleave); human preempts |
 | Lease outlives a dead agent | always | TTL + journaled; reconciler reaps on expiry exactly like the background hold |
 | Jar single-writer (farm + GUI open one profile) | slice-4 | daemon leases a jar to one live client at a time (shadow-client hard part #2) |
-| Shadow client triggers takeover (the 2.11.5 dead-sessions class) | slice-4 | client identity + role (active vs shadow) in the daemon protocol; a shadow NEVER takes over |
+| Shadow client triggers takeover (the 2.11.5 dead-sessions class) | slice-4 | client identity + role (active vs shadow) in the daemon protocol; default-deny allowlist (4.0); a shadow NEVER takes over |
+| Silent role downgrade on an old chain daemon = privilege escalation | slice-4.0 (eng-review D7) | daemon advertises role-enforcement; a Shadow fails closed against a daemon that cannot enforce — never silently promoted to Active (gate 15) |
+| Shadow reflows the user's live session via SIGWINCH without owning it | slice-4.3 (eng-review D8) | a Shadow never drives winsize/focus/scroll; fixed canonical grid or read-only replay (gate 16) |
 | Anti-bot flags injected input | slice-2/4 | same UA/identity + real `isTrusted` events; no evasion beyond honesty (standing rule) |
 
 ## Security
