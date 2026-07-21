@@ -985,3 +985,85 @@ site-lore-as-action-policy trust concern (a poisoned fleet-shared lore entry
 driving `do`) — lore is a shipped, separate system the control plane only
 references; revisit when `do` actually replays lore method blocks (queue
 item 3), not in this spec.
+
+## Field findings — live co-browse dogfood (2026-07-22)
+
+A real co-browse task (external login + admin actions on a third-party web app,
+human present) was run end-to-end against the CURRENT build to answer "are we
+there yet." Render + DOM-drive + surface isolation held under real load (a fresh
+surface, dozens of live sessions untouched). These are the gaps it surfaced,
+each mapped to where it belongs:
+
+1. **The co-browse recipe drives the shared foreground GUI, not the shadow
+   path — and nothing steers an agent to the shadow path.** The task opened a
+   surface, ran `web eval` against the *active* surface, and used full-app
+   `screenshot` — i.e. "user-and-agent active compositor control", which yanks
+   the human's viewport. The slice-2b shadow reach (`--session`-addressed
+   `eval`/`do`/`read` + per-surface `web screenshot` on a soft-stashed
+   backgrounded surface) already exists and is live-proven, but was not the
+   path taken. → The **restore-user's-active-session-after-probe etiquette**
+   this spec names as the pre-shadow mitigation ("The pain" / taxonomy) needs
+   to be the *documented default* for co-browse, and the `--session` +
+   `web screenshot --session` idiom made the obvious one. Process gap, not a
+   code gap — but it is why the human got disturbed.
+
+2. **Headless-create (`open --headless`, slice 2b) is the missing piece for a
+   fully-undisturbed NEW surface.** Confirmed live: a surface must be
+   foregrounded once to register before `--session` reaches it (a ychrome
+   launched/left backgrounded returns `web surface not live (backgrounded or
+   not yet revealed)`). Until create-but-never-reveal lands, every *new*
+   co-browse necessarily flashes the viewport once. This raises `open
+   --headless` from "nice slice-2b verb" to "the thing blocking undisturbed
+   co-browse." Best interim flow: foreground once to create+register → restore
+   the human's session → drive backgrounded via `--session`.
+
+3. **The `wait` verb exists but is easy to miss → navigate/eval races.**
+   `location.href=…` immediately followed by `web eval` races the load; the
+   built `wait --until load_finished|js|selector` solves it but wasn't reached
+   for (three retries were spent URL-guarding instead). → Either document
+   "always `web wait` after navigation" in the recipe, or add `--await-load`
+   to the navigate/eval path so the race is unspellable.
+
+4. **Credential plane is host-split; `fill`/`otp` (rung 1) have no cross-host
+   path.** The vault agent is per-host. When the driving host ≠ the GUI host,
+   there is no secure fill: piping the secret across would breach F4's no-echo
+   rule, so the agent stalls at the secret until the human unlocks the GUI
+   host's vault. The rung-1 `fill`/`otp` verbs implicitly assume same-host. →
+   Define fill/otp routing over the daemon's authenticated socket (the GUI
+   host's vault fills in-process, secret never crosses a host boundary); ties
+   into slice-4 client identity. Minimum viable: surface a "vault locked on the
+   GUI host — unlock there" state so the human knows the exact unblock.
+
+5. **`fill` is specced at rung 1 but not wired as an app-control verb.** Even
+   with an unlocked local vault and a strict host `match`, nothing auto-filled
+   on load and there is no `server app web fill <host>` to trigger the *native*
+   in-surface fill — the task hand-rolled injection via `eval --stdin`. Wiring
+   `web fill` (native vault fill, secret stays in-process) closes both this and
+   the safe-injection story. Overlaps #4.
+
+6. **Site-lore IS built and pushed — but absent on hosts that haven't pulled
+   (a fleet-sync gap, not a build gap).** The `ychrome-site-lore` skill
+   (`lore.py` + `lore/<domain>.md` SOT + gitignored sqlite index) exists and is
+   on `origin/main` (commit 9c2e557); the escalation ladder's "logging = site-
+   lore, as shipped" is accurate. The trap: it is a normal git-tracked skill, so
+   a host that hasn't `git pull`ed the ychrome repo (jojo, during this run) has
+   no lore and reports it "missing" — reading that as "not built" is wrong (I
+   made exactly that error by checking jojo, not dev). → Co-browse setup should
+   `git pull` ychrome (or check `origin/main..main`) before concluding lore is
+   absent. Mentors.debian.net lore was seeded this run.
+
+7. **Robustness: broken-markup submit controls.** Real pages orphan a submit
+   `<input>` from its `<form>` (a parsed-empty-form quirk); a naive `.click()`
+   silently no-ops. A `do submit` / "activate this control as the page intends"
+   helper (build-and-POST carrying the page's CSRF) would harden `do` against
+   markup the agent does not control.
+
+**Deploy state (2026-07-22, jojo v2.12.1).** The slice-2b engine verbs are
+committed/proven on a dev build but are **not in the live host's binary**:
+`server app web --help` there lists only `eval`/`screenshot`/`devtools` (all
+`--session`-capable) — `do`/`read`/`wait` are absent, and a `--session` eval on a
+backgrounded surface returned `not live` this run (hold-expiry or missing
+soft-stash reach — undetermined). So the shadow path is real in the tree but a
+co-browse on the deployed binary still uses the foreground; the restore-active-
+session etiquette is the interim mitigation. A deploy of the pushed slice-2b work
+to jojo is a prerequisite for testing undisturbed co-browse end to end.
