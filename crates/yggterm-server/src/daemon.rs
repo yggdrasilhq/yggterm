@@ -3482,6 +3482,43 @@ impl DaemonRuntime {
         status_cache
     }
 
+    /// Run the preserved-owner deep reconcile that `load()` DEFERS until the
+    /// current daemon's socket is bound (`load` emits
+    /// `preserved_owner_deep_reconcile_deferred_on_load` and, per the
+    /// `runtime_load_defers_...` test, must NOT probe other daemons before its
+    /// own socket is reachable). **Until this was wired, the reconcile never
+    /// ran** — `restore_missing_preserved_owner_live_sessions` and
+    /// `recover_missing_preserved_owner_live_sessions_from_reachable_daemons`
+    /// were dead code — which is the prevention gap behind B4: a hot-restart
+    /// successor claims every version-socket alias (so it is the only daemon the
+    /// GUI can reach) yet may have restored fewer rows than the predecessor
+    /// still holds, and those rows go INVISIBLE. This ADOPTS them:
+    /// - `restore_missing_...` restores live rows for preserved owners already
+    ///   in this daemon's registry that it does not yet represent;
+    /// - `recover_missing_...` discovers and adopts live rows from ANY other
+    ///   reachable versioned daemon in this home (registering the owner too).
+    ///
+    /// Both only ADD rows; neither drops. Call ONCE at startup, inline, before
+    /// the accept loop begins — the cross-daemon probes hold the runtime lock,
+    /// but no client is being served yet, so they cannot deafen anyone.
+    /// See [[finding-daemon-handoff-drops-live-rows]].
+    fn run_deferred_preserved_owner_deep_reconcile(&mut self, reason: &'static str) {
+        let before = self.preserved_terminal_owners.keys().len();
+        self.restore_missing_preserved_owner_live_sessions(reason);
+        self.recover_missing_preserved_owner_live_sessions_from_reachable_daemons(reason);
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "hot_update",
+            "preserved_owner_deep_reconcile_ran",
+            serde_json::json!({
+                "reason": reason,
+                "registered_owner_keys_before": before,
+                "registered_owner_keys_after": self.preserved_terminal_owners.keys().len(),
+            }),
+        );
+    }
+
     fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let mut owner_status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
@@ -11462,6 +11499,19 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         let listener = std::os::unix::net::UnixListener::bind(path)
             .with_context(|| format!("binding server socket {}", path.display()))?;
         refresh_legacy_server_socket_aliases(path);
+        // B4 prevention: NOW the socket is bound, run the preserved-owner deep
+        // reconcile that `DaemonRuntime::load` deliberately deferred. It adopts
+        // live rows from any reachable predecessor daemon in this home, so a
+        // hot-restart successor never becomes the only daemon the GUI can reach
+        // while silently holding fewer rows than its predecessor still owns.
+        // Inline and BEFORE the accept loop, so the cross-daemon probes (which
+        // hold the runtime lock) cannot deafen a client — none is served yet.
+        // [[finding-daemon-handoff-drops-live-rows]]
+        {
+            let mut rt =
+                lock_daemon_runtime(&runtime, "startup_preserved_owner_deep_reconcile");
+            rt.run_deferred_preserved_owner_deep_reconcile("startup_post_bind");
+        }
         listener
             .set_nonblocking(true)
             .context("setting daemon unix listener nonblocking")?;
@@ -14629,6 +14679,31 @@ mod tests {
         assert!(
             load_body.contains("preserved_owner_deep_reconcile_deferred_on_load"),
             "runtime load should leave trace evidence for deferred deep reconcile"
+        );
+    }
+
+    #[test]
+    fn run_daemon_runs_deferred_preserved_owner_reconcile_after_socket_bind() {
+        // The counterpart to the load-defers test: load leaves the deep reconcile
+        // undone, and run_daemon must actually RUN it — but only AFTER the socket
+        // is bound, so cross-daemon probes never precede our own reachability. If
+        // this call is dropped, B4 regresses (the recovery becomes dead code again
+        // and a hot-restart successor silently keeps a predecessor's rows invisible).
+        let source = include_str!("daemon.rs");
+        let run_daemon = source
+            .split("pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {")
+            .nth(1)
+            .expect("run_daemon should be present");
+        let (before_unix_bind, after_unix_bind) = run_daemon
+            .split_once("let listener = std::os::unix::net::UnixListener::bind(path)")
+            .expect("unix listener bind should be present");
+        assert!(
+            !before_unix_bind.contains("run_deferred_preserved_owner_deep_reconcile("),
+            "the deep reconcile must not run before the current socket is bound"
+        );
+        assert!(
+            after_unix_bind.contains("run_deferred_preserved_owner_deep_reconcile("),
+            "run_daemon must run the deferred preserved-owner deep reconcile after binding the socket"
         );
     }
 
