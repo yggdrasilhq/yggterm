@@ -107,9 +107,12 @@ pub fn SideRailShell(
                 "data-yggui-side-rail-content": "1",
                 style: content_style,
                 {body}
-            }
-            if let Some(resize_handle) = resize_handle {
-                {resize_handle}
+                // The grip rides the CARD's inner edge (inside it), so it moves
+                // with the card in every mode — docked and revealed-overlay alike
+                // — exactly as the left tree's grip lives inside its content card.
+                if let Some(resize_handle) = resize_handle {
+                    {resize_handle}
+                }
             }
         }
     }

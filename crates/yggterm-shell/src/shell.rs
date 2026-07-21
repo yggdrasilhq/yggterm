@@ -4720,6 +4720,10 @@ struct ShellState {
     rail_width: f32,
     rail_resize_drag: Option<SidebarResizeDrag>,
     right_panel_mode: RightPanelMode,
+    /// The last non-hidden rail mode, so grabbing a hidden rail's resize grip
+    /// un-hides it to what the user last had (Metadata/Settings/…), not a forced
+    /// default. Mirror of how the left tree's resize just re-opens the tree.
+    right_panel_restore_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
     fullscreen: bool,
@@ -5324,6 +5328,9 @@ struct RenderSnapshot {
     rail_width: f32,
     rail_resizing: bool,
     right_panel_mode: RightPanelMode,
+    /// The mode a hidden rail reveals/docks to — the last one it actually showed.
+    /// SSOT for reveal content AND the resize-grip un-hide, so they agree.
+    right_panel_restore_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
     selected_row: Option<BrowserRow>,
@@ -6590,6 +6597,11 @@ impl ShellState {
             sidebar_resize_drag: None,
             rail_width,
             rail_resize_drag: None,
+            right_panel_restore_mode: if right_panel_mode == RightPanelMode::Hidden {
+                RightPanelMode::Metadata
+            } else {
+                right_panel_mode.clone()
+            },
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: initial_window_maximized,
@@ -7347,6 +7359,7 @@ impl ShellState {
                 };
                 self.effective_right_panel_mode(offers_pane, current_millis())
             },
+            right_panel_restore_mode: self.right_panel_restore_mode.clone(),
             rows,
             selected_path,
             selected_row,
@@ -9708,6 +9721,12 @@ impl ShellState {
     // but the handle lives on the rail's INNER (left) edge, so dragging LEFT (a
     // negative x delta) makes it WIDER — hence the negated delta below.
     fn start_rail_resize(&mut self, client_x: f64) {
+        // Grabbing a HIDDEN rail's grip docks it (to the last mode it showed) and
+        // resizes — exactly as the left tree's grip re-opens the tree. So the
+        // rail is draggable in hidden mode too, at parity with the left sidebar.
+        if self.right_panel_mode == RightPanelMode::Hidden {
+            self.set_right_panel_mode(self.right_panel_restore_mode.clone());
+        }
         self.rail_resize_drag = Some(SidebarResizeDrag {
             origin_client_x: client_x,
             origin_width: self.rail_width,
@@ -9823,6 +9842,11 @@ impl ShellState {
         }
         self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(&mode);
         self.right_panel_mode = mode;
+        // Remember the last mode the rail was actually SHOWING, so a hidden rail's
+        // resize grip un-hides to it (not a forced default).
+        if self.right_panel_mode != RightPanelMode::Hidden {
+            self.right_panel_restore_mode = self.right_panel_mode.clone();
+        }
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
         self.persist_settings();
         self.last_action = right_panel_last_action(&self.right_panel_mode);
@@ -87415,19 +87439,13 @@ fn RightRail(
     state: Signal<ShellState>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode.clone();
-    let mut retained_mode = use_signal({
-        let initial = requested_mode.clone();
-        move || initial
-    });
-    use_effect({
-        let requested_mode = requested_mode.clone();
-        move || {
-            let current_retained = retained_mode();
-            if requested_mode != RightPanelMode::Hidden && current_retained != requested_mode {
-                retained_mode.set(requested_mode.clone());
-            }
-        }
-    });
+    // The mode a HIDDEN rail reveals to is the shell's authoritative
+    // `right_panel_restore_mode` (the last mode it actually showed) — the SAME
+    // value the resize-grip un-hides to, so hover-reveal and drag-dock can never
+    // disagree. Replaces a component-local `retained_mode` signal that lagged and
+    // showed Metadata even after the user had switched to Settings (the
+    // "hardlocked to session metadata" report, 2026-07-21).
+    let restore_mode = snapshot.right_panel_restore_mode.clone();
     // A contributed pane lives and dies with its declaration: when the app stops
     // declaring (exited, session switched, contribution swept) the pane
     // collapses, and it re-reveals when the app is back.
@@ -87441,7 +87459,7 @@ fn RightRail(
     let rendered_mode = if visible {
         requested_mode.clone()
     } else {
-        retained_mode()
+        restore_mode.clone()
     };
     // Extracted before the rsx! chain: an `if let` arm inside it defeats the
     // macro's branch-type inference.
@@ -87474,24 +87492,24 @@ fn RightRail(
         on_mouse_leave: EventHandler::new(move |_| autohide.handle_mouse_leave()),
         on_focus_within: EventHandler::new(move |focused: bool| autohide.set_focus_within(focused)),
     });
-    // Docked only: a grip on the rail's INNER (left) edge, mirroring the tree's
-    // handle on its right edge. Hidden when the rail is an overlay (resizing a
-    // hover card is not a thing).
-    let rail_resize_handle = visible.then(|| {
-        rsx! {
-            div {
-                "data-rail-resize-handle": "1",
-                style: format!(
-                    "position:absolute; top:0; left:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
-                     background:transparent;",
-                    SIDEBAR_RESIZE_HANDLE_WIDTH
-                ),
-                onmousedown: move |evt| {
-                    evt.stop_propagation();
-                    on_start_rail_resize.call(evt.client_coordinates().x);
-                },
-                ondoubleclick: |evt| evt.stop_propagation(),
-            }
+    // A grip on the rail's INNER (left) edge, mirroring the tree's grip on its
+    // right edge — rendered in EVERY mode so a hidden rail is draggable too (the
+    // grip lives inside the card; a fully-collapsed card is un-clickable, so you
+    // hover-reveal first, then drag, and the drag docks + resizes). `start_rail_
+    // resize` un-hides to the last shown mode.
+    let rail_resize_handle = Some(rsx! {
+        div {
+            "data-rail-resize-handle": "1",
+            style: format!(
+                "position:absolute; top:0; left:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+                 background:transparent;",
+                SIDEBAR_RESIZE_HANDLE_WIDTH
+            ),
+            onmousedown: move |evt| {
+                evt.stop_propagation();
+                on_start_rail_resize.call(evt.client_coordinates().x);
+            },
+            ondoubleclick: |evt| evt.stop_propagation(),
         }
     });
     rsx! {
@@ -91280,7 +91298,12 @@ fn ContextMenuOverlay(
     let menu_blur = overlay_backdrop_style("blur(20px) saturate(150%)");
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:90; background:transparent; pointer-events:none;",
+            // z-index ABOVE the auto-hidden sidebar overlay (`SIDEBAR_AUTOHIDE_Z_INDEX`
+            // = 170) and the titlebar (180): a row context menu is raised FROM the
+            // sidebar, so it must float over it. At the old 90 it rendered BEHIND a
+            // revealed floating sidebar and was invisible/unclickable (user report
+            // 2026-07-21).
+            style: "position:fixed; inset:0; z-index:200; background:transparent; pointer-events:none;",
             onclick: move |evt| on_close.call(evt),
             div {
                 "data-context-menu": "1",
@@ -101240,6 +101263,26 @@ mod tests {
         shell.finish_rail_resize();
         assert!(shell.rail_resize_drag.is_none());
         assert_eq!(shell.settings.rail_width, RAIL_MAX_WIDTH);
+    }
+    // Grabbing a HIDDEN rail's grip docks it (to the LAST shown mode, not a
+    // forced default) and resizes — parity with the left tree, whose grip
+    // re-opens the tree. Fixes "in hidden mode cannot be dragged like the left"
+    // + "hardlocked to session metadata" (2026-07-21).
+    #[test]
+    fn hidden_rail_grip_unhides_to_last_mode_then_resizes() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        // User last had SETTINGS, then hid the rail.
+        shell.set_right_panel_mode(RightPanelMode::Settings);
+        assert_eq!(shell.right_panel_restore_mode, RightPanelMode::Settings);
+        shell.set_right_panel_mode(RightPanelMode::Hidden);
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+        // Grip drag un-hides to Settings (NOT a forced Metadata) and resizes.
+        shell.start_rail_resize(1000.0);
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Settings);
+        assert!(shell.rail_resize_drag.is_some());
+        shell.handle_rail_resize_pointer(950.0);
+        assert_eq!(shell.rail_width, clamp_rail_width(292.0 + 50.0));
+        shell.finish_rail_resize();
     }
     #[test]
     fn terminal_eval_script_scrollbar_is_draggable_not_pushed_off_screen() {
@@ -122373,6 +122416,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -123014,6 +123058,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -123190,6 +123235,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -123366,6 +123412,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -123545,6 +123592,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -123728,6 +123776,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -123903,6 +123952,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -124078,6 +124128,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -124287,6 +124338,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(active_session.session_path.clone()),
             selected_row: Some(row.clone()),
@@ -124465,6 +124517,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -124675,6 +124728,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -125062,6 +125116,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_width: 292.0,
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
+            right_panel_restore_mode: RightPanelMode::Notifications,
             rows: Vec::new(),
             selected_path: None,
             selected_row: None,
