@@ -2,6 +2,7 @@ mod app_control;
 mod attach;
 mod codex_cli;
 mod daemon;
+pub mod grid_overlay;
 mod host;
 mod protocol;
 mod remote_cli;
@@ -16353,11 +16354,13 @@ pub fn run_trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Resul
     Ok(())
 }
 
+pub use grid_overlay::GridSpec;
+
 /// Agent-oriented post-processing for a captured screenshot. A full 1920px frame
 /// renders illegibly small when an agent reads it back, so these options crop to
 /// the region of interest and upscale it. The capture itself is unchanged; this
 /// only rewrites the PNG on disk after it lands.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScreenshotPostProcess {
     /// "terminal" crops to the active terminal viewport (rect read from app state).
     pub region: Option<String>,
@@ -16365,11 +16368,31 @@ pub struct ScreenshotPostProcess {
     pub crop: Option<(u32, u32, u32, u32)>,
     /// Nearest-neighbour upscale factor applied after cropping (1.0 = none).
     pub scale: f32,
+    /// Agent-only click grid composited into the RETURNED IMAGE (never the live
+    /// page). See `crates/yggterm-server/src/grid_overlay.rs`.
+    pub grid: Option<GridSpec>,
+}
+
+/// `scale: 1.0` is identity, so the derived `Default` (which would be 0.0) would
+/// make `is_noop` false and force every flagless screenshot through a pointless
+/// full decode + re-encode, reporting a `scale: 0.0` that never happened.
+impl Default for ScreenshotPostProcess {
+    fn default() -> Self {
+        Self {
+            region: None,
+            crop: None,
+            scale: 1.0,
+            grid: None,
+        }
+    }
 }
 
 impl ScreenshotPostProcess {
     fn is_noop(&self) -> bool {
-        self.region.is_none() && self.crop.is_none() && (self.scale - 1.0).abs() < f32::EPSILON
+        self.region.is_none()
+            && self.crop.is_none()
+            && self.grid.is_none()
+            && (self.scale - 1.0).abs() < f32::EPSILON
     }
 }
 
@@ -16492,14 +16515,19 @@ fn apply_screenshot_post_process(
     };
     let bytes = std::fs::read(path)?;
     let (mut rgba, mut width, mut height) = decode_png_to_rgba(&bytes)?;
+    let capture_size = (width, height);
     let mut applied_crop = None;
+    let mut region_origin = (0.0f64, 0.0f64);
     if let Some((cx, cy, cw, ch)) = crop {
         let (cropped, nw, nh) = crop_rgba(&rgba, width, height, cx, cy, cw, ch);
         rgba = cropped;
         width = nw;
         height = nh;
+        region_origin = (cx as f64, cy as f64);
         applied_crop = Some(serde_json::json!({"x": cx, "y": cy, "width": nw, "height": nh}));
     }
+    // Post-crop, pre-scale extent: the gridded region in capture pixels.
+    let region_extent = (width as f64, height as f64);
     let scale = post.scale;
     if scale > 0.0 && (scale - 1.0).abs() >= f32::EPSILON {
         let (scaled, nw, nh) = scale_rgba_nearest(&rgba, width, height, scale);
@@ -16507,15 +16535,49 @@ fn apply_screenshot_post_process(
         width = nw;
         height = nh;
     }
+    // Grid last: it draws in final-image pixels so labels stay crisp at any
+    // --scale, while its manifest reports the clickable capture-space coords.
+    let mut grid_manifest = None;
+    if let Some(spec) = post.grid.as_ref() {
+        // The region is the post-crop extent (crop_rgba clamps to the frame, so
+        // an oversized crop rect can never grid area that is not there), placed
+        // at the crop origin in capture space.
+        let region = yggterm_core::click_grid::GridRect::new(
+            region_origin.0,
+            region_origin.1,
+            region_extent.0,
+            region_extent.1,
+        );
+        let transform = grid_overlay::CaptureTransform {
+            crop_x: region_origin.0,
+            crop_y: region_origin.1,
+            scale: if scale > 0.0 { scale as f64 } else { 1.0 },
+        };
+        let manifest = grid_overlay::composite(
+            &mut rgba,
+            width,
+            height,
+            spec,
+            region,
+            transform,
+            capture_size,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        grid_manifest = Some(manifest);
+    }
     let encoded = encode_rgba_to_png(width, height, &rgba)?;
     std::fs::write(path, encoded)?;
-    Ok(serde_json::json!({
+    let mut summary = serde_json::json!({
         "region": post.region,
         "crop": applied_crop,
         "scale": scale,
         "out_width": width,
         "out_height": height,
-    }))
+    });
+    if let (Some(manifest), Some(object)) = (grid_manifest, summary.as_object_mut()) {
+        object.insert("grid".to_string(), serde_json::to_value(manifest)?);
+    }
+    Ok(summary)
 }
 
 fn decode_png_to_rgba(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
@@ -22114,6 +22176,21 @@ mod tests {
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TERMINAL_IDENTITY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_screenshot_post_process_is_a_noop() {
+        // A flagless capture must skip post-processing entirely: a derived
+        // Default would leave scale at 0.0, forcing a full decode + re-encode of
+        // every screenshot and reporting a `scale: 0.0` that never happened.
+        let post = crate::ScreenshotPostProcess::default();
+        assert_eq!(post.scale, 1.0);
+        assert!(post.is_noop());
+        assert!(!crate::ScreenshotPostProcess {
+            grid: Some(crate::GridSpec::default()),
+            ..Default::default()
+        }
+        .is_noop());
+    }
 
     #[test]
     fn screenshot_crop_then_scale_produces_expected_pixels() {

@@ -67,6 +67,27 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/strip.png --cr
 - `--scale n` nearest-neighbour upscales after cropping (2–3 is usually right).
 - The response records what it did under `data.post_process`.
 
+### Aiming a click: `--grid` (agent-only, the user never sees it)
+
+Don't guess pixel coordinates off a screenshot. Ask for a labelled grid:
+
+```bash
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/g.png --grid"
+# then, to zoom in on one cell:
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/g.png --grid --grid-refine C4"
+```
+
+- The grid is composited into the **returned PNG only** — the live page is never
+  touched, so this is safe to run while the user is working, and a screenshot
+  they take at the same moment is grid-free. (This is the difference from
+  `server app grid show`, which paints into the real page until its TTL.)
+- Read the cell manifest from `data.post_process.grid`. Each cell carries
+  `capture` coords (**click these**) and `image` coords (what you see).
+  `capture_size` should equal `window.inner_size` from `app state` — when it
+  does, capture pixels are CSS pixels and `capture.cx/cy` go straight to a click.
+- Composes with `--crop`/`--region`/`--scale`; the grid spans the cropped area.
+- Full contract: `docs/yggui-click-grid.md`.
+
 ### Native web surfaces need `--backend os` (v2.9.57+)
 
 The default capture backends are **blind to native child webviews** — the

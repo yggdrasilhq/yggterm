@@ -360,13 +360,17 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
         }
     });
     let scale = cli_flag_value(args, "--scale").and_then(|raw| raw.parse::<f32>().ok());
-    if region.is_none() && crop.is_none() && scale.is_none() {
+    // `--grid [COLSxROWS]` / `--grid-refine CELL`: the agent-only click grid,
+    // composited into the RETURNED IMAGE only — the live page never sees it.
+    let grid = yggterm_server::grid_overlay::screenshot_grid_from_args(args);
+    if region.is_none() && crop.is_none() && scale.is_none() && grid.is_none() {
         return None;
     }
     Some(ScreenshotPostProcess {
         region,
         crop,
         scale: scale.unwrap_or(1.0),
+        grid,
     })
 }
 
@@ -1293,6 +1297,7 @@ fn main() -> Result<()> {
                     region: None,
                     crop: None,
                     scale: 1.0,
+                    grid: None,
                 }),
                 compositor,
             ),
@@ -1414,6 +1419,7 @@ fn main() -> Result<()> {
                             region: None,
                             crop: None,
                             scale: 1.0,
+                            grid: None,
                         }),
                         compositor,
                     ),

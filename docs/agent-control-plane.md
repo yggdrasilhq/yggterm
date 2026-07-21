@@ -405,9 +405,17 @@ the read/capture/lease invariants below apply.
 Everything here is **pure GUI DOM** under glass (chrome draws over pages), and
 every piece is opt-in / co-presence-only. None of it is on the default path.
 
-- **Agent-only click grid.** Composited into the screenshot `capture` returns
-  (capture-side overlay + a JSON manifest of cell→coord), never injected into
-  the page. The user never sees it. Trivial once capture is session-addressed.
+- **Agent-only click grid. ✅ SHIPPED + live-proven (2026-07-21).**
+  `server app screenshot --grid [COLSxROWS] [--grid-refine CELL]` composites the
+  grid into the returned PNG and returns a cell manifest at
+  `data.post_process.grid`; the page is never touched. Geometry moved to ONE
+  owner — `yggterm_core::click_grid::GridGeometry` — shared with the live DOM
+  grid, so the two cannot disagree about where `B7` is. The manifest reports
+  **both** coordinate spaces (`capture` = clickable, `image` = what the eye
+  reads) plus `capture_size`, so a HiDPI host cannot silently mis-aim.
+  **Acceptance gate 5 passed live on the desktop host:** a plain screenshot
+  taken immediately after a `--grid` capture shows no grid at all. Composes with
+  `--crop`/`--region`/`--scale`. Details: `docs/yggui-click-grid.md`.
 - **Visible distinct agent cursors — cursor v1 (the ONE settled rule).** When an
   agent is working a session **and the user is viewing that same session's
   viewport**, the user sees that agent's colored pointer tagged `agent-N`,
@@ -472,9 +480,9 @@ the GUI process; the headless farm has no GUI to route through. The verb
      machinery, `read`/`wait`/`lease`/`headless`, and keyboard-injection live
      proof (`click` is proven; `type`/`key` synthesis is best-effort until a
      live character-insertion check passes).
-3. **Agent presence (1 session).** Capture-side grid (**redirect the existing
-   `Grid`/`ClickGridParams` machinery** to the returned image — ~80% built, not
-   net-new); agent cursor overlays (cursor v1). Pure GUI.
+3. **Agent presence (1 session).** Capture-side grid — **✅ SHIPPED 2026-07-21**,
+   gate 5 passed live (see Agent presence above). Remaining: agent cursor
+   overlays (cursor v1). Pure GUI.
 4. **3.0.0 — true shadow clients + idle-host farm.** Protocol client identity + roles
    (takeover guard), jar leases, input arbitration; headless WPE farm (ychrome
    agent-engine.md Phases A–E). The headless-sway recipe proven this campaign is
@@ -514,9 +522,12 @@ not a code claim.
 4. **Cheapest-route honored.** A logged-in site flow runs entirely on rung-1/2
    verbs from its site-lore method block; `capture` appears only where the lore
    marks pixels required.
-5. **Agent grid is agent-only.** `capture --grid` returns a gridded image + cell
-   manifest; a simultaneous human-side screenshot shows **no** grid in the live
-   page.
+5. **Agent grid is agent-only. ✅ PASSED (2026-07-21, live desktop host).**
+   `screenshot --grid` returned a gridded 1920x1160 frame with a 96-cell
+   manifest; the very next capture of the same screen was grid-free, because the
+   overlay only ever exists in the returned image. `--grid-refine C4 --crop`
+   verified too: sub-cells `C4.1`..`C4.9`, and `capture.x - crop.x == image.x`
+   held exactly.
 6. **Cursor v1.** With an agent working session X and the user viewing X, the
    user sees exactly one `agent-N` colored pointer tracking the agent's actions;
    viewing session Y shows none.
