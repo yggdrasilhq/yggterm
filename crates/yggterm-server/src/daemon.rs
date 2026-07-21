@@ -1765,6 +1765,25 @@ pub enum ServerRequest {
         #[serde(default)]
         scope: Option<String>,
     },
+    /// Slice 4.2: claim the single-writer lock over a web profile's mutable
+    /// storage. Granted to at most one live client per profile; a second live
+    /// client is refused `profile_busy`, and a dead holder's lock is reclaimed.
+    /// `pid` identifies the holding PROCESS (crash recovery); the requester's
+    /// slice-4.0 `client_id` names the client.
+    AcquireProfileWriteLock {
+        #[serde(default)]
+        profile: Option<String>,
+        pid: u32,
+    },
+    /// Release a profile write-lock held by this client, freeing it for the
+    /// next. Never steals another live client's lock.
+    ReleaseProfileWriteLock {
+        #[serde(default)]
+        profile: Option<String>,
+        pid: u32,
+    },
+    /// Read-only report of every currently held profile write-lock.
+    ProfileWriteLockReport,
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -1983,6 +2002,24 @@ pub enum ServerResponse {
     Ack {
         message: Option<String>,
     },
+    /// Slice 4.2 outcome of an acquire/release/report on a profile write-lock.
+    ProfileWriteLock {
+        /// `granted` | `already_held` | `reclaimed_from_dead` | `busy` |
+        /// `ephemeral` | `released` | `not_held` | `not_holder` | `report`.
+        outcome: String,
+        /// May the requesting client write the profile after this outcome?
+        writable: bool,
+        profile: String,
+        /// Who holds it now (or who blocked the request), when anyone does.
+        #[serde(default)]
+        held_by_client_id: Option<String>,
+        #[serde(default)]
+        held_by_pid: Option<u32>,
+        /// Every currently held lock, as `(profile, client_id, pid)`. Populated
+        /// for the report request.
+        #[serde(default)]
+        locks: Vec<(String, String, u32)>,
+    },
     HotUpdateHandoff {
         message: Option<String>,
         owner_endpoint: String,
@@ -2119,6 +2156,9 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::WorkingFlags
         | ServerRequest::Snapshot
         | ServerRequest::RowOrderLedgerReport { .. }
+        // Reporting which client holds a profile write-lock is read-only;
+        // ACQUIRING one is a write claim and is denied below.
+        | ServerRequest::ProfileWriteLockReport
         | ServerRequest::TerminalRead { .. }
         | ServerRequest::TerminalSnapshot { .. }
         | ServerRequest::TerminalRetainedSnapshot { .. }
@@ -2146,6 +2186,10 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::DropTerminalRuntime { .. }
         | ServerRequest::SetSessionKeepAlive { .. }
         | ServerRequest::ReorderLiveSessions { .. }
+        // A Shadow is read-only by construction: it must never claim the right
+        // to WRITE a profile jar, nor release a lock it cannot hold.
+        | ServerRequest::AcquireProfileWriteLock { .. }
+        | ServerRequest::ReleaseProfileWriteLock { .. }
         | ServerRequest::StartLocalSession { .. }
         | ServerRequest::SwitchAgentSessionMode { .. }
         | ServerRequest::StartCommandSession { .. }
@@ -2179,6 +2223,56 @@ fn shadow_refused_trace_fields(request_name: &str, client_id: Option<&str>) -> s
         "request": request_name,
         "client_id": client_id,
     })
+}
+
+/// Stable wire name for an acquire outcome (slice 4.2) — one owner for the
+/// journal and the response so they cannot drift.
+fn profile_write_lock_outcome_name(
+    outcome: &crate::profile_write_lock::AcquireOutcome,
+) -> &'static str {
+    use crate::profile_write_lock::AcquireOutcome;
+    match outcome {
+        AcquireOutcome::Granted => "granted",
+        AcquireOutcome::AlreadyHeld => "already_held",
+        AcquireOutcome::ReclaimedFromDead { .. } => "reclaimed_from_dead",
+        AcquireOutcome::Busy { .. } => crate::profile_write_lock::PROFILE_BUSY,
+        AcquireOutcome::Ephemeral => "ephemeral",
+    }
+}
+
+/// Build the wire response for an acquire outcome (slice 4.2). On refusal the
+/// blocking holder is named, so a client can report *who* has the profile
+/// rather than only that it is busy.
+fn profile_write_lock_acquire_response(
+    profile: String,
+    requester: &crate::profile_write_lock::ProfileWriteLockHolder,
+    outcome: crate::profile_write_lock::AcquireOutcome,
+) -> ServerResponse {
+    use crate::profile_write_lock::AcquireOutcome;
+    let name = profile_write_lock_outcome_name(&outcome).to_string();
+    let writable = outcome.is_writable();
+    let (held_by_client_id, held_by_pid) = match &outcome {
+        // Refused: name the client that actually holds it.
+        AcquireOutcome::Busy { held_by } => {
+            (Some(held_by.client_id.clone()), Some(held_by.pid))
+        }
+        // Held by the requester now.
+        AcquireOutcome::Granted
+        | AcquireOutcome::AlreadyHeld
+        | AcquireOutcome::ReclaimedFromDead { .. } => {
+            (Some(requester.client_id.clone()), Some(requester.pid))
+        }
+        // Nothing is ever recorded for an ephemeral profile.
+        AcquireOutcome::Ephemeral => (None, None),
+    };
+    ServerResponse::ProfileWriteLock {
+        outcome: name,
+        writable,
+        profile,
+        held_by_client_id,
+        held_by_pid,
+        locks: Vec::new(),
+    }
 }
 
 /// Client-side fail-closed check (eng-review D7): a `Shadow` must refuse to
@@ -2226,6 +2320,13 @@ struct DaemonRuntime {
     /// every order change through the persist chokepoint and answers "where
     /// does this row go when it comes back?" — see `row_order_ledger.rs`.
     row_order_ledger: crate::row_order_ledger::RowOrderLedger,
+    /// Slice 4.2: which live client may WRITE each web profile. Two
+    /// `WebContext`s on one profile corrupt it, so exactly one holder per
+    /// profile at a time; a dead holder's lock is reclaimed on the next
+    /// acquire. In-memory by design — a lock is scoped to holder process
+    /// lifetimes, so a daemon restart correctly starts with none held.
+    /// See `profile_write_lock.rs`.
+    profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable,
     remote_machine_refreshes_in_flight: HashSet<String>,
     codex_process_identity_cache: Mutex<BTreeMap<u32, CodexRuntimeProcessIdentity>>,
     restored_from_persisted_state: bool,
@@ -2400,6 +2501,7 @@ impl DaemonRuntime {
             row_order_ledger: crate::row_order_ledger::RowOrderLedger::load(
                 store_home_dir_for_ledger.as_path(),
             ),
+            profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable::new(),
             remote_machine_refreshes_in_flight: HashSet::new(),
             codex_process_identity_cache: Mutex::new(BTreeMap::new()),
             restored_from_persisted_state,
@@ -4838,7 +4940,11 @@ impl DaemonRuntime {
         self.server.persisted_state_for_update_restart()
     }
 
-    fn handle_request(&mut self, request: ServerRequest) -> Result<ServerResponse> {
+    fn handle_request(
+        &mut self,
+        request: ServerRequest,
+        identity: &ClientIdentity,
+    ) -> Result<ServerResponse> {
         // Apply registry removals queued by the background duplicate-runtime
         // prune (cheap; usually empty).
         self.drain_pending_preserved_owner_removals();
@@ -5707,6 +5813,139 @@ impl DaemonRuntime {
                 };
                 ServerResponse::Ack {
                     message: Some(report.to_string()),
+                }
+            }
+            ServerRequest::AcquireProfileWriteLock { profile, pid } => {
+                use crate::profile_write_lock::ProfileWriteLockHolder;
+                let holder = ProfileWriteLockHolder::new(
+                    identity.client_id.clone().unwrap_or_else(|| {
+                        // An anonymous client still gets a stable identity for
+                        // the lock: its process. Without this, two anonymous
+                        // clients would look like one holder and both write.
+                        format!("anonymous:{pid}")
+                    }),
+                    pid,
+                );
+                let resolved = yggterm_core::web_profile::normalize_web_profile(profile.as_deref());
+                let outcome = self.profile_write_locks.acquire(
+                    profile.as_deref(),
+                    holder.clone(),
+                    current_millis_u64(),
+                    &crate::profile_write_lock::SystemLiveness,
+                );
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "profile_write_lock",
+                    "acquire",
+                    serde_json::json!({
+                        "profile": resolved,
+                        "client_id": holder.client_id,
+                        "pid": pid,
+                        "outcome": profile_write_lock_outcome_name(&outcome),
+                    }),
+                );
+                profile_write_lock_acquire_response(resolved, &holder, outcome)
+            }
+            ServerRequest::ReleaseProfileWriteLock { profile, pid } => {
+                use crate::profile_write_lock::{ProfileWriteLockHolder, ReleaseOutcome};
+                let holder = ProfileWriteLockHolder::new(
+                    identity
+                        .client_id
+                        .clone()
+                        .unwrap_or_else(|| format!("anonymous:{pid}")),
+                    pid,
+                );
+                let resolved = yggterm_core::web_profile::normalize_web_profile(profile.as_deref());
+                let outcome = self.profile_write_locks.release(profile.as_deref(), &holder);
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "profile_write_lock",
+                    "release",
+                    serde_json::json!({
+                        "profile": resolved,
+                        "client_id": holder.client_id,
+                        "pid": pid,
+                        "outcome": match &outcome {
+                            ReleaseOutcome::Released => "released",
+                            ReleaseOutcome::NotHeld => "not_held",
+                            ReleaseOutcome::NotHolder { .. } => "not_holder",
+                            ReleaseOutcome::Ephemeral => "ephemeral",
+                        },
+                    }),
+                );
+                match outcome {
+                    ReleaseOutcome::Released => ServerResponse::ProfileWriteLock {
+                        outcome: "released".to_string(),
+                        writable: false,
+                        profile: resolved,
+                        held_by_client_id: None,
+                        held_by_pid: None,
+                        locks: Vec::new(),
+                    },
+                    ReleaseOutcome::NotHeld => ServerResponse::ProfileWriteLock {
+                        outcome: "not_held".to_string(),
+                        writable: false,
+                        profile: resolved,
+                        held_by_client_id: None,
+                        held_by_pid: None,
+                        locks: Vec::new(),
+                    },
+                    ReleaseOutcome::NotHolder { held_by } => ServerResponse::ProfileWriteLock {
+                        outcome: "not_holder".to_string(),
+                        writable: false,
+                        profile: resolved,
+                        held_by_client_id: Some(held_by.client_id),
+                        held_by_pid: Some(held_by.pid),
+                        locks: Vec::new(),
+                    },
+                    ReleaseOutcome::Ephemeral => ServerResponse::ProfileWriteLock {
+                        outcome: "ephemeral".to_string(),
+                        writable: true,
+                        profile: resolved,
+                        held_by_client_id: None,
+                        held_by_pid: None,
+                        locks: Vec::new(),
+                    },
+                }
+            }
+            ServerRequest::ProfileWriteLockReport => {
+                // Sweep dead holders first so the report never shows a lock no
+                // live process is holding.
+                let reaped = self
+                    .profile_write_locks
+                    .reap_dead(&crate::profile_write_lock::SystemLiveness);
+                for entry in &reaped {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "profile_write_lock",
+                        "reaped_dead_holder",
+                        serde_json::json!({
+                            "profile": entry.profile,
+                            "client_id": entry.holder.client_id,
+                            "pid": entry.holder.pid,
+                        }),
+                    );
+                }
+                ServerResponse::ProfileWriteLock {
+                    outcome: "report".to_string(),
+                    writable: false,
+                    profile: String::new(),
+                    held_by_client_id: None,
+                    held_by_pid: None,
+                    locks: self
+                        .profile_write_locks
+                        .entries()
+                        .map(|entry| {
+                            (
+                                entry.profile.clone(),
+                                entry.holder.client_id.clone(),
+                                entry.holder.pid,
+                            )
+                        })
+                        .collect(),
                 }
             }
             ServerRequest::StartLocalSession {
@@ -7962,6 +8201,9 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::ReorderLiveSessions { .. } => "reorder_live_sessions",
         ServerRequest::RowOrderLedgerReport { .. } => "row_order_ledger_report",
+        ServerRequest::AcquireProfileWriteLock { .. } => "acquire_profile_write_lock",
+        ServerRequest::ReleaseProfileWriteLock { .. } => "release_profile_write_lock",
+        ServerRequest::ProfileWriteLockReport => "profile_write_lock_report",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
@@ -8949,6 +9191,95 @@ pub fn row_order_ledger_report(
         ServerResponse::Ack { message } => Ok(message.unwrap_or_else(|| "{}".to_string())),
         other => anyhow::bail!("unexpected response to row-order ledger report: {other:?}"),
     }
+}
+
+/// Outcome of a profile write-lock request, as the client sees it (slice 4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileWriteLockStatus {
+    /// `granted` | `already_held` | `reclaimed_from_dead` | `profile_busy` |
+    /// `ephemeral` | `released` | `not_held` | `not_holder` | `report`.
+    pub outcome: String,
+    /// May this client write the profile? **Check this before opening a
+    /// `WebContext`** — a `false` here means another live client owns the jar.
+    pub writable: bool,
+    pub profile: String,
+    pub held_by_client_id: Option<String>,
+    pub held_by_pid: Option<u32>,
+    pub locks: Vec<(String, String, u32)>,
+}
+
+fn expect_profile_write_lock(response: ServerResponse) -> Result<ProfileWriteLockStatus> {
+    match response {
+        ServerResponse::ProfileWriteLock {
+            outcome,
+            writable,
+            profile,
+            held_by_client_id,
+            held_by_pid,
+            locks,
+        } => Ok(ProfileWriteLockStatus {
+            outcome,
+            writable,
+            profile,
+            held_by_client_id,
+            held_by_pid,
+            locks,
+        }),
+        other => anyhow::bail!("unexpected response to profile write-lock request: {other:?}"),
+    }
+}
+
+/// Claim the single-writer lock over a web profile before opening a writable
+/// `WebContext` on it (slice 4.2). `client_id` names this client; the lock is
+/// tied to `pid` so a crash cannot wedge the profile forever.
+///
+/// **Lock ordering: acquire this BEFORE the slice-2b surface lease**, and do
+/// not take the surface lease if this is not `writable`.
+pub fn acquire_profile_write_lock(
+    endpoint: &ServerEndpoint,
+    profile: Option<&str>,
+    client_id: &str,
+    pid: u32,
+) -> Result<ProfileWriteLockStatus> {
+    expect_profile_write_lock(send_request_as(
+        endpoint,
+        &ServerRequest::AcquireProfileWriteLock {
+            profile: profile.map(str::to_string),
+            pid,
+        },
+        &ClientIdentity {
+            role: ClientRole::Active,
+            client_id: Some(client_id.to_string()),
+        },
+    )?)
+}
+
+/// Release a profile write-lock this client holds, freeing it for the next.
+pub fn release_profile_write_lock(
+    endpoint: &ServerEndpoint,
+    profile: Option<&str>,
+    client_id: &str,
+    pid: u32,
+) -> Result<ProfileWriteLockStatus> {
+    expect_profile_write_lock(send_request_as(
+        endpoint,
+        &ServerRequest::ReleaseProfileWriteLock {
+            profile: profile.map(str::to_string),
+            pid,
+        },
+        &ClientIdentity {
+            role: ClientRole::Active,
+            client_id: Some(client_id.to_string()),
+        },
+    )?)
+}
+
+/// Report every currently held profile write-lock (dead holders swept first).
+pub fn profile_write_lock_report(endpoint: &ServerEndpoint) -> Result<ProfileWriteLockStatus> {
+    expect_profile_write_lock(send_request(
+        endpoint,
+        &ServerRequest::ProfileWriteLockReport,
+    )?)
 }
 
 pub fn reorder_live_sessions_scoped(
@@ -11273,7 +11604,7 @@ fn daemon_request_response(
     }
     let mut runtime = lock_daemon_runtime(runtime, "handle_request");
     let home_dir = runtime.store.home_dir().to_path_buf();
-    match panic::catch_unwind(AssertUnwindSafe(|| runtime.handle_request(request))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| runtime.handle_request(request, identity))) {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => ServerResponse::Error {
             message: error.to_string(),
@@ -12343,8 +12674,20 @@ fn trim_process_heap_if_supported() {
 fn trim_process_heap_if_supported() {}
 
 fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
+    // Anonymous = Active, and an anonymous envelope serializes byte-identical to
+    // the bare request, so every existing caller's wire is unchanged.
+    send_request_as(endpoint, request, &ClientIdentity::anonymous())
+}
+
+/// Send a request declaring this client's slice-4.0 identity/role.
+fn send_request_as(
+    endpoint: &ServerEndpoint,
+    request: &ServerRequest,
+    identity: &ClientIdentity,
+) -> Result<ServerResponse> {
+    let envelope = ClientRequestEnvelope::new(request.clone(), identity);
     let mut request_bytes =
-        serde_json::to_vec(request).context("serializing daemon request payload")?;
+        serde_json::to_vec(&envelope).context("serializing daemon request payload")?;
     request_bytes.push(b'\n');
     let io_timeout = Some(std::time::Duration::from_millis(
         daemon_request_io_timeout_ms(request),
@@ -13425,6 +13768,144 @@ mod tests {
         }))
         .unwrap();
         assert!(daemon_enforces_client_roles(&new));
+    }
+
+    // ---- slice 4.2: profile write-lock protocol wiring ----
+
+    #[test]
+    fn shadow_may_report_profile_locks_but_never_claim_one() {
+        use super::{ServerRequest, ShadowAccess, role_gate};
+        // Reporting is read-only.
+        assert_eq!(
+            role_gate(&ServerRequest::ProfileWriteLockReport),
+            ShadowAccess::Allow
+        );
+        // Claiming (or releasing) write access is not.
+        assert_eq!(
+            role_gate(&ServerRequest::AcquireProfileWriteLock {
+                profile: Some("work".into()),
+                pid: 1,
+            }),
+            ShadowAccess::Deny
+        );
+        assert_eq!(
+            role_gate(&ServerRequest::ReleaseProfileWriteLock {
+                profile: Some("work".into()),
+                pid: 1,
+            }),
+            ShadowAccess::Deny
+        );
+    }
+
+    #[test]
+    fn acquire_response_names_the_blocking_holder_and_gates_writability() {
+        use super::{ServerResponse, profile_write_lock_acquire_response};
+        use crate::profile_write_lock::{AcquireOutcome, ProfileWriteLockHolder};
+        let requester = ProfileWriteLockHolder::new("shadow", 200);
+        let incumbent = ProfileWriteLockHolder::new("gui", 100);
+
+        // Refused: the response must name who actually holds it, and must NOT
+        // report the profile as writable.
+        let busy = profile_write_lock_acquire_response(
+            "work".to_string(),
+            &requester,
+            AcquireOutcome::Busy {
+                held_by: incumbent.clone(),
+            },
+        );
+        match busy {
+            ServerResponse::ProfileWriteLock {
+                outcome,
+                writable,
+                profile,
+                held_by_client_id,
+                held_by_pid,
+                ..
+            } => {
+                assert_eq!(outcome, crate::profile_write_lock::PROFILE_BUSY);
+                assert!(!writable, "a refused client must never be told it can write");
+                assert_eq!(profile, "work");
+                assert_eq!(held_by_client_id.as_deref(), Some("gui"));
+                assert_eq!(held_by_pid, Some(100));
+            }
+            other => panic!("expected a profile write-lock response, got {other:?}"),
+        }
+
+        // Granted: the requester is the holder, and it may write.
+        let granted = profile_write_lock_acquire_response(
+            "work".to_string(),
+            &requester,
+            AcquireOutcome::Granted,
+        );
+        match granted {
+            ServerResponse::ProfileWriteLock {
+                outcome,
+                writable,
+                held_by_client_id,
+                held_by_pid,
+                ..
+            } => {
+                assert_eq!(outcome, "granted");
+                assert!(writable);
+                assert_eq!(held_by_client_id.as_deref(), Some("shadow"));
+                assert_eq!(held_by_pid, Some(200));
+            }
+            other => panic!("expected a profile write-lock response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_write_lock_outcome_names_are_stable_wire_strings() {
+        use super::profile_write_lock_outcome_name;
+        use crate::profile_write_lock::{AcquireOutcome, ProfileWriteLockHolder};
+        assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::Granted),
+            "granted"
+        );
+        assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::AlreadyHeld),
+            "already_held"
+        );
+        assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::ReclaimedFromDead {
+                previous: ProfileWriteLockHolder::new("gone", 1),
+            }),
+            "reclaimed_from_dead"
+        );
+        assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::Busy {
+                held_by: ProfileWriteLockHolder::new("gui", 1),
+            }),
+            "profile_busy"
+        );
+        assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::Ephemeral),
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn profile_write_lock_requests_are_backward_compatible_on_the_wire() {
+        use super::{ClientRequestEnvelope, ServerRequest};
+        // These variants are NEW: an old daemon cannot parse them, and must fail
+        // LOUDLY rather than silently ignoring a lock claim and letting a second
+        // writer open the jar. (Same deliberate property as the CC session
+        // variants — unknown VARIANT hard-fails, unknown FIELD is ignored.)
+        let wire = serde_json::to_string(&ServerRequest::AcquireProfileWriteLock {
+            profile: Some("work".into()),
+            pid: 7,
+        })
+        .unwrap();
+        assert!(wire.contains("\"kind\":\"acquire_profile_write_lock\""));
+        // A NEW daemon parses it through the identity envelope.
+        let (req, identity) = serde_json::from_str::<ClientRequestEnvelope>(&wire)
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            req,
+            ServerRequest::AcquireProfileWriteLock { pid: 7, .. }
+        ));
+        assert_eq!(identity.role, super::ClientRole::Active);
     }
 
     #[test]
@@ -17449,8 +17930,11 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        const STAMPED_AT_VERSION: &str = "2.11.4";
-        const STAMPED_SHAPE_HASH: u64 = 0xb513bed5b007ef21;
+        // Re-stamped for slice 4.2: `ServerRequest` gained the profile
+        // write-lock acquire/release/report variants and `ServerResponse` gained
+        // `ProfileWriteLock` (agent control plane, docs/agent-control-plane.md).
+        const STAMPED_AT_VERSION: &str = "2.12.0";
+        const STAMPED_SHAPE_HASH: u64 = 0xb82a2ebb9ed1b9d4;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

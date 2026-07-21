@@ -11,6 +11,7 @@ mod telemetry;
 mod titles;
 mod trace;
 mod transcript;
+pub mod web_profile;
 mod workspace;
 
 use anyhow::{Context, Result};
