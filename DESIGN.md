@@ -137,15 +137,35 @@ Yggdrasil shells should support a reusable visual theme editor.
   metadata rail does not remove it; it collapses to a thin hover strip on its
   own window edge and reveals on hover, over the workspace, on the z axis. There
   is no settings toggle — this is simply what hidden means. Both edges use the
-  same reveal state machine as the titlebar (`AutoHideSignals`), the same
-  restrained desktop-fast motion, and the same depth vocabulary: soft drop
-  shadow cast into the viewport, mirrored per edge, and never a border hairline
-  (`sidebar_autohide_overlay_shadow`).
+  same reveal state machine as the titlebar (`AutoHideSignals`) and the same
+  restrained desktop-fast motion.
+- **The revealed panel is a floating island, not a slab.** Modelled on Zen's
+  hover sidebar: an inset card with a margin on all four sides, rounded corners,
+  and a soft ambient drop shadow on every side (`sidebar_card_shadow`) — never a
+  border hairline (a 1px border paints the chrome fill and reads as a bright
+  separator line; the titlebar's 2026-06-27 lesson). The workspace shows around
+  it. **Always-visible (docked) is unchanged — same seamless in-flow panel as
+  before.** Only the hover-reveal is a card.
+- **The card's corner radius matches the viewport's** (`SIDEBAR_OVERLAY_RADIUS_PX`
+  == `terminal_frame_style` host_radius, 10px). The floating panel and the
+  terminal it floats over must read as the same rounded language (user 2026-07-21).
+- **Both sidebars are independently draggable.** The left tree resizes from its
+  right edge (`tree_width`), the right rail from its inner/left edge
+  (`rail_width`) — each with its own clamp and its own persisted setting. The
+  rail's drag delta is negated because its grip is on the inner edge (drag left
+  ⇒ wider).
 - A revealed sidebar overlay must never resize the workspace. It is positioned
   out of flow, so the terminal keeps its exact `cols × rows` before, during and
   after a reveal. This is a correctness rule, not a preference: a reflowing
   sidebar would re-fit the xterm and push a new PTY grid to the daemon on every
   hover.
+- **One geometry, fixed CSS keys across every state** (`sidebar_panel_outer_style`
+  / `sidebar_panel_card_style`, keyed by `SidebarPanelMode`). Docked, collapsed
+  and revealed must emit the SAME property keys — only values change. Dioxus
+  applies `style` property-by-property and does not clear a key the next render
+  drops, so a divergent key set left overlay props (`position:absolute`,
+  `z-index`, `box-shadow`) lingering when a rail toggled back to docked, floating
+  it as a transparent ghost over the viewport (fixed 2026-07-21).
 - Transparent desktop chrome must never be alpha-only. The stable material
   stack is theme tint, gradient wash, and enough fill opacity to stay readable
   without compositor blur.

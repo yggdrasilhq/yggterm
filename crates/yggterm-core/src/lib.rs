@@ -358,6 +358,9 @@ pub struct AppSettings {
     pub auto_hide_titlebar: bool,
     pub window_maximized: bool,
     pub tree_width: f32,
+    /// Width of the right metadata/settings rail, in px. Independently draggable
+    /// from the left tree ([[spec-sidebar-auto-hide-hover-overlay]]).
+    pub rail_width: f32,
     pub rendered_font_size: f32,
     pub terminal_font_size: f32,
     /// Global zoom for native web surfaces (ychrome / libyggterm web apps),
@@ -425,6 +428,7 @@ impl Default for AppSettings {
             auto_hide_titlebar: false,
             window_maximized: false,
             tree_width: 300.0,
+            rail_width: 292.0,
             rendered_font_size: 10.0,
             terminal_font_size: 14.0,
             web_surface_zoom_percent: 100.0,
@@ -1071,6 +1075,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.tree_width =
             serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
     }
+    if let Some(value) = object.get("rail_width") {
+        settings.rail_width =
+            serde_json::from_value(value.clone()).context("failed to parse rail_width")?;
+    }
     if let Some(value) = object.get("rendered_font_size") {
         settings.rendered_font_size =
             serde_json::from_value(value.clone()).context("failed to parse rendered_font_size")?;
@@ -1191,6 +1199,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "auto_hide_titlebar": settings.auto_hide_titlebar,
         "window_maximized": settings.window_maximized,
         "tree_width": settings.tree_width,
+        "rail_width": settings.rail_width,
         "rendered_font_size": settings.rendered_font_size,
         "terminal_font_size": settings.terminal_font_size,
         "terminal_light_theme_name": settings.terminal_light_theme_name,
