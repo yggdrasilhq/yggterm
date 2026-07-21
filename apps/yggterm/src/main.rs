@@ -1258,6 +1258,8 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 fn main() -> Result<()> {
     maybe_wait_for_update_relaunch_parent_exit();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // Agent presence (cursor v1) — see the twin in the headless binary.
+    yggterm_server::set_agent_identity(cli_flag_value(&args, "--agent"));
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
