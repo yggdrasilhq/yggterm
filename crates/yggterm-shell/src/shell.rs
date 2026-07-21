@@ -44626,11 +44626,11 @@ fn agent_input_batch_for_current_agent() -> crate::agent_input_arbiter::AgentBat
 /// Real seat input landed on a session's web surface: cancel every agent batch
 /// driving it (gate 9). Journals what was cancelled.
 ///
-/// NOTE: no caller yet — wiring a seat-input DETECTOR is the remaining half of
-/// gate 9, and it is not trivial (yggterm's own injection produces
-/// `isTrusted: true`, so a page-side listener cannot distinguish agent input
-/// from human input). See `docs/agent-control-plane.md`.
-#[allow(dead_code)]
+/// Called from the `do` chokepoint when the webview layer reports real seat
+/// input on the surface (see `DesktopContext::take_web_surface_seat_input`).
+/// The detection has to happen at that layer because the agent's own injected
+/// events carry `isTrusted: true` by design, so a page-side listener cannot
+/// distinguish them from the human. See `docs/agent-control-plane.md`.
 fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
     let surface = crate::agent_input_arbiter::SurfaceKey::new(session_path, generation);
     let report = agent_input_arbiter_lock().note_human_input(&surface);
@@ -44680,6 +44680,12 @@ async fn web_surface_do_for(
         let batch = agent_input_batch_for_current_agent();
         let surface_key =
             crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
+        // Did the human touch this surface since the last verb? The webview
+        // layer counts real seat input (clicks/keys/scrolls) and excludes our
+        // own injections, so a non-zero count is unambiguously the user.
+        if desktop.take_web_surface_seat_input(handle.native_id) > 0 {
+            note_human_input_on_web_surface(&session, handle.generation);
+        }
         let outcome = agent_input_arbiter_lock()
             .admit(&surface_key, &batch, handle.generation);
         if outcome == crate::agent_input_arbiter::AdmitOutcome::Preempted {
