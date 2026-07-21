@@ -1,5 +1,6 @@
 pub mod app_registry;
 mod browser;
+pub mod click_grid;
 mod icon;
 mod install;
 mod perf;
