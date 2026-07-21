@@ -17,7 +17,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
@@ -37,9 +37,9 @@ use std::sync::{
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_trace_event,
-    local_cc_session_jsonl_path, looks_like_generated_fallback_title, read_cc_session_title,
-    resolve_yggterm_home,
+    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_bounded_jsonl_record,
+    append_trace_event, local_cc_session_jsonl_path, looks_like_generated_fallback_title,
+    read_cc_session_title, resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -1451,6 +1451,83 @@ fn runtime_status_direct_terminal_keys(status: &ServerRuntimeStatus) -> Vec<Stri
     keys
 }
 
+/// Every LIVE row key a daemon's status advertises: owned + preserved PTY
+/// terminals. Accurate on every daemon version (these fields predate B4), so it
+/// is the basis for the always-valid half of the retire coverage check.
+fn runtime_status_live_row_keys(status: &ServerRuntimeStatus) -> Vec<String> {
+    let mut keys = status.terminal_session_keys.clone();
+    keys.extend(status.owned_terminal_session_keys.iter().cloned());
+    keys.extend(status.preserved_terminal_owner_keys.iter().cloned());
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Row keys the retiring daemon holds that NO reachable successor covers — the
+/// set that becomes invisible to the GUI the instant this daemon calls
+/// `shutdown` (B4: the delayed Live-Sessions row-drop). The GUI can only reach
+/// the daemon that owns the version-socket aliases (the successor), so a row a
+/// retiring predecessor holds but the successor does not is not lost — the JSONL
+/// and PTY survive — yet is invisible, which is indistinguishable from loss from
+/// where the user sits. Pure so the branch logic is unit-testable without a
+/// live handoff. See [[finding-daemon-handoff-drops-live-rows]].
+fn uncovered_rows_on_retirement(
+    mine: &BTreeSet<String>,
+    successor_row_keys: &HashSet<String>,
+) -> Vec<String> {
+    mine.iter()
+        .filter(|key| !successor_row_keys.contains(*key))
+        .cloned()
+        .collect()
+}
+
+/// Which of a retiring daemon's rows no reachable successor covers. Pure — the
+/// whole retire-coverage decision, with none of the IO — so every branch (live
+/// gap, dormant gap, pre-B4 successor makes dormant unverifiable) is unit-
+/// testable without a live handoff. See [[finding-daemon-handoff-drops-live-rows]].
+struct RetireCoverageOutcome {
+    uncovered_live: Vec<String>,
+    uncovered_dormant: Vec<String>,
+    /// This daemon holds dormant rows but NO reachable successor advertises its
+    /// stored keys, so dormant coverage cannot be confirmed either way.
+    dormant_unverifiable: bool,
+}
+
+fn compute_retire_coverage(
+    live_mine: &BTreeSet<String>,
+    dormant_mine: &BTreeSet<String>,
+    successors: &[ServerRuntimeStatus],
+) -> RetireCoverageOutcome {
+    let successor_live_keys = successors
+        .iter()
+        .flat_map(runtime_status_live_row_keys)
+        .collect::<HashSet<String>>();
+    let uncovered_live = uncovered_rows_on_retirement(live_mine, &successor_live_keys);
+
+    // Dormant coverage is only verifiable against a B4+ successor that advertises
+    // its stored keys. A dormant row counts as covered if such a successor holds
+    // it as a stored row OR any successor now holds it live (it was promoted).
+    let dormant_aware = successors
+        .iter()
+        .any(|status| status.advertises_stored_session_keys);
+    let uncovered_dormant = if !dormant_mine.is_empty() && dormant_aware {
+        let mut covered = successors
+            .iter()
+            .filter(|status| status.advertises_stored_session_keys)
+            .flat_map(|status| status.stored_terminal_session_keys.iter().cloned())
+            .collect::<HashSet<String>>();
+        covered.extend(successor_live_keys.iter().cloned());
+        uncovered_rows_on_retirement(dormant_mine, &covered)
+    } else {
+        Vec::new()
+    };
+    RetireCoverageOutcome {
+        uncovered_live,
+        uncovered_dormant,
+        dormant_unverifiable: !dormant_mine.is_empty() && !dormant_aware,
+    }
+}
+
 fn preserved_owner_entries_live_for_handoff(
     entries: &[PreservedTerminalOwnerEntry],
     outgoing_owned_runtime_keys: &HashSet<String>,
@@ -1522,6 +1599,22 @@ pub struct ServerRuntimeStatus {
     pub preserved_terminal_owner_count: usize,
     #[serde(default)]
     pub preserved_terminal_owner_keys: Vec<String>,
+    /// Keys of the DORMANT (stored, non-live) Live Sessions rows this daemon
+    /// holds — the rows with no owned PTY. B4: a hot-restart hands off live PTY
+    /// rows but NOT dormant rows, so a successor needs to see a predecessor's
+    /// dormant keys to notice it is about to drop them. See
+    /// [[finding-daemon-handoff-drops-live-rows]].
+    #[serde(default)]
+    pub stored_terminal_session_count: usize,
+    #[serde(default)]
+    pub stored_terminal_session_keys: Vec<String>,
+    /// True on any daemon that populates `stored_terminal_session_keys`. A
+    /// pre-B4 daemon lacks the field entirely and deserializes `false` — so a
+    /// dormant-row coverage check treats its (invisible) dormant set as
+    /// unverifiable rather than false-alarming. Same fail-safe encoding as
+    /// `role_enforcement` (D7).
+    #[serde(default)]
+    pub advertises_stored_session_keys: bool,
     #[serde(default)]
     pub terminal_retained_chunks: usize,
     #[serde(default)]
@@ -2673,6 +2766,7 @@ impl DaemonRuntime {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
+        let stored_terminal_session_keys = self.server.stored_session_keys();
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
@@ -2705,6 +2799,9 @@ impl DaemonRuntime {
             terminal_session_keys,
             preserved_terminal_owner_count: preserved_owner_keys.len(),
             preserved_terminal_owner_keys: preserved_owner_keys,
+            stored_terminal_session_count: stored_terminal_session_keys.len(),
+            stored_terminal_session_keys,
+            advertises_stored_session_keys: true,
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
             terminal_session_buffer_limit_bytes: crate::terminal::MAX_BUFFER_BYTES,
@@ -10301,6 +10398,137 @@ fn spawn_force_remote_restart_daemon_cleanup(store: &SessionStore, owner_registr
 #[cfg(not(target_os = "linux"))]
 fn spawn_force_remote_restart_daemon_cleanup(_store: &SessionStore, _owner_registry_empty: bool) {}
 
+/// B4 (the delayed Live-Sessions row-drop): observation-only guard run at the
+/// exact moment a daemon is about to `shutdown`. It changes NOTHING about the
+/// retire — it only makes an otherwise-silent row drop LOUD. Before shutdown,
+/// compare every row this daemon holds (live PTY + preserved + dormant/stored)
+/// against the union of every reachable successor's rows; anything uncovered
+/// vanishes from the GUI the instant this process exits (the successor owns the
+/// version-socket aliases, so it is the only daemon the GUI can reach). On a
+/// gap it writes a `daemon_retire_row_coverage_gap` trace event AND a durable
+/// `agent-incidents.jsonl` record, so the NEXT deploy's drop is caught by the
+/// agent instead of the user — the 2026-07-21 incident (26 rows → 13, twenty
+/// minutes after the swap, when this daemon's disk-binary poll retired it) was
+/// caught by the user, not the agent, precisely because nothing here was loud.
+///
+/// - LIVE rows are checked against every successor version (those status fields
+///   predate B4).
+/// - DORMANT rows are only checked against a successor that advertises stored
+///   keys (`advertises_stored_session_keys`, B4+); against a pre-B4 successor a
+///   dormant row is unverifiable (the successor may hold it as a stored row we
+///   cannot see) and is reported as such rather than false-alarmed.
+/// - When NO successor is reachable the check is skipped: that is the
+///   cold-restore path (the next client recovery-spawns a daemon that restores
+///   from persisted state), not the aliased-socket handoff this guards.
+///
+/// See [[finding-daemon-handoff-drops-live-rows]].
+fn assert_retire_row_coverage(
+    reason: &str,
+    endpoint: &ServerEndpoint,
+    home_dir: &Path,
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+) {
+    let (live_mine, dormant_mine) = {
+        let rt = lock_daemon_runtime(runtime, "assert_retire_row_coverage");
+        let mut live = BTreeSet::new();
+        live.extend(rt.terminals.session_keys());
+        live.extend(rt.preserved_terminal_owner_keys());
+        let dormant = rt
+            .server
+            .stored_session_keys()
+            .into_iter()
+            .collect::<BTreeSet<String>>();
+        (live, dormant)
+    };
+    if live_mine.is_empty() && dormant_mine.is_empty() {
+        return;
+    }
+    let successors = reachable_versioned_daemon_statuses_excluding_endpoint(home_dir, endpoint);
+    if successors.is_empty() {
+        return;
+    }
+    let successor_statuses = successors
+        .iter()
+        .map(|(_, status)| status.clone())
+        .collect::<Vec<_>>();
+    let RetireCoverageOutcome {
+        uncovered_live,
+        uncovered_dormant,
+        dormant_unverifiable,
+    } = compute_retire_coverage(&live_mine, &dormant_mine, &successor_statuses);
+
+    if uncovered_live.is_empty() && uncovered_dormant.is_empty() {
+        if dormant_unverifiable {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "daemon_retire_dormant_coverage_unverifiable",
+                serde_json::json!({
+                    "reason": reason,
+                    "retiring_pid": std::process::id(),
+                    "retiring_version": SERVER_PROTOCOL_VERSION,
+                    "dormant_row_count": dormant_mine.len(),
+                    "successor_versions": successors
+                        .iter()
+                        .map(|(_, status)| status.server_version.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        return;
+    }
+
+    let uncovered_live_count = uncovered_live.len();
+    let uncovered_dormant_count = uncovered_dormant.len();
+    let successors_detail = successors
+        .iter()
+        .map(|(ep, status)| {
+            serde_json::json!({
+                "endpoint": owner_endpoint_label(ep),
+                "server_version": status.server_version,
+                "server_pid": status.server_pid,
+                "advertises_stored_session_keys": status.advertises_stored_session_keys,
+            })
+        })
+        .collect::<Vec<_>>();
+    let detail = serde_json::json!({
+        "reason": reason,
+        "retiring_pid": std::process::id(),
+        "retiring_version": SERVER_PROTOCOL_VERSION,
+        "held_live_row_count": live_mine.len(),
+        "held_dormant_row_count": dormant_mine.len(),
+        "uncovered_live_row_count": uncovered_live_count,
+        "uncovered_live_row_keys": uncovered_live,
+        "uncovered_dormant_row_count": uncovered_dormant_count,
+        "uncovered_dormant_row_keys": uncovered_dormant,
+        "dormant_coverage_unverifiable": dormant_unverifiable,
+        "successors": successors_detail,
+    });
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "daemon_retire_row_coverage_gap",
+        detail.clone(),
+    );
+    let mut record = detail;
+    record["ts_ms"] = serde_json::json!(current_millis_u64());
+    record["kind"] = serde_json::json!("daemon_retire_row_coverage_gap");
+    append_bounded_jsonl_record(
+        &home_dir.join("agent-incidents.jsonl"),
+        "agent-incidents.previous.jsonl",
+        4 * 1024 * 1024,
+        &record,
+    );
+    warn!(
+        reason = reason,
+        uncovered_live = uncovered_live_count,
+        uncovered_dormant = uncovered_dormant_count,
+        "daemon retirement would drop Live Sessions rows no successor covers"
+    );
+}
+
 /// Per [[bug-class-old-daemon-never-retires]]: poll `/proc/self/exe` every
 /// 60s. Linux appends the literal " (deleted)" suffix to the link target
 /// when the file on disk has been replaced (the running process holds the
@@ -10515,6 +10743,9 @@ fn spawn_disk_binary_version_poll(
                 );
                 continue;
             }
+            // B4: make it loud if this cold shutdown would strand rows a
+            // reachable successor does not cover (observation only).
+            assert_retire_row_coverage(retire_trigger, &endpoint, &home_dir, &runtime);
             // Best-effort self-shutdown. If the call fails (e.g. socket
             // already torn down), the thread just exits and the daemon
             // continues; the next poll cycle would retry, but the
@@ -10607,6 +10838,15 @@ fn spawn_progressive_session_migration(
                     "lifecycle",
                     "progressive_migration_owner_empty_retire",
                     serde_json::json!({ "current_pid": std::process::id() }),
+                );
+                // B4: this is the DELAYED-drop moment — the predecessor handed
+                // off its live PTYs one-by-one and is now retiring, taking any
+                // dormant rows with it. Make an uncovered set loud before we go.
+                assert_retire_row_coverage(
+                    "progressive_migration_owner_empty",
+                    &endpoint,
+                    &home_dir,
+                    &runtime,
                 );
                 let _ = shutdown(&endpoint);
                 break;
@@ -13379,6 +13619,126 @@ mod tests {
         let partial = runtime_status_with_keys(&[], &keys[..2]);
         assert!(!stale_daemon_retire_covered_by_current(&partial, &stale));
     }
+
+    // ---- B4: retire row-coverage guard ([[finding-daemon-handoff-drops-live-rows]]) ----
+
+    fn set(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Build a successor `ServerRuntimeStatus` for coverage tests. `advertises`
+    /// false models a PRE-B4 daemon: it never populates `stored_terminal_session_keys`.
+    fn successor_status(
+        version: &str,
+        live_keys: &[&str],
+        stored_keys: &[&str],
+        advertises_stored: bool,
+    ) -> super::ServerRuntimeStatus {
+        serde_json::from_value(serde_json::json!({
+            "server_version": version,
+            "server_pid": 1234,
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "terminal_session_count": live_keys.len(),
+            "terminal_session_keys": live_keys,
+            "stored_terminal_session_count": if advertises_stored { stored_keys.len() } else { 0 },
+            "stored_terminal_session_keys": if advertises_stored { stored_keys.to_vec() } else { Vec::new() },
+            "advertises_stored_session_keys": advertises_stored,
+        }))
+        .expect("test successor status")
+    }
+
+    #[test]
+    fn uncovered_rows_on_retirement_reports_only_the_difference() {
+        let mine = set(&["local://a", "local://b", "local://c"]);
+        let successor: std::collections::HashSet<String> =
+            ["local://a", "local://c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            super::uncovered_rows_on_retirement(&mine, &successor),
+            vec!["local://b".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_row_keys_union_owned_preserved_and_terminal_deduped() {
+        let status = successor_status("2.12.1", &["local://a", "local://b"], &[], true);
+        let keys = super::runtime_status_live_row_keys(&status);
+        assert_eq!(keys, vec!["local://a".to_string(), "local://b".to_string()]);
+    }
+
+    #[test]
+    fn retire_coverage_clean_when_successor_covers_every_row() {
+        // Successor holds all my live rows live, and all my dormant rows as stored.
+        let successor =
+            successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
+        let outcome = super::compute_retire_coverage(
+            &set(&["local://live1"]),
+            &set(&["local://dorm1"]),
+            &[successor],
+        );
+        assert!(outcome.uncovered_live.is_empty());
+        assert!(outcome.uncovered_dormant.is_empty());
+        assert!(!outcome.dormant_unverifiable);
+    }
+
+    #[test]
+    fn retire_coverage_flags_a_dropped_live_row() {
+        // Successor adopted only live1; live2 vanishes when this daemon retires.
+        let successor = successor_status("2.12.1", &["local://live1"], &[], true);
+        let outcome = super::compute_retire_coverage(
+            &set(&["local://live1", "local://live2"]),
+            &set(&[]),
+            &[successor],
+        );
+        assert_eq!(outcome.uncovered_live, vec!["local://live2".to_string()]);
+    }
+
+    #[test]
+    fn retire_coverage_flags_a_dropped_dormant_row_against_b4_successor() {
+        // The exact delayed-drop shape: live handed off, a dormant row is not.
+        let successor =
+            successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
+        let outcome = super::compute_retire_coverage(
+            &set(&["local://live1"]),
+            &set(&["local://dorm1", "local://dorm2"]),
+            &[successor],
+        );
+        assert!(outcome.uncovered_live.is_empty());
+        assert_eq!(outcome.uncovered_dormant, vec!["local://dorm2".to_string()]);
+        assert!(!outcome.dormant_unverifiable);
+    }
+
+    #[test]
+    fn retire_coverage_dormant_is_unverifiable_against_pre_b4_successor() {
+        // A pre-B4 successor never advertises stored keys: we must NOT false-alarm
+        // a dormant row as dropped (it may hold it as a stored row we cannot see),
+        // but we DO record that dormant coverage was unverifiable.
+        let successor = successor_status("2.11.6", &["local://live1"], &[], false);
+        let outcome = super::compute_retire_coverage(
+            &set(&["local://live1"]),
+            &set(&["local://dorm1"]),
+            &[successor],
+        );
+        assert!(outcome.uncovered_live.is_empty());
+        assert!(outcome.uncovered_dormant.is_empty());
+        assert!(outcome.dormant_unverifiable);
+    }
+
+    #[test]
+    fn retire_coverage_dormant_covered_if_successor_promoted_it_live() {
+        // A dormant row the successor now owns LIVE (it was re-resumed) is covered.
+        let successor = successor_status("2.12.1", &["local://dorm1"], &[], true);
+        let outcome = super::compute_retire_coverage(
+            &set(&[]),
+            &set(&["local://dorm1"]),
+            &[successor],
+        );
+        assert!(outcome.uncovered_dormant.is_empty());
+        assert!(!outcome.dormant_unverifiable);
+    }
+
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
