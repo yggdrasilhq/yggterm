@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.6
+
+- **Remote sessions no longer come back with a broken bottom after you switch
+  away and back.** A session first shown in a tall window persisted an 81-row
+  grid; a later, shorter (63-row) window never corrected it because the client
+  only sends a resize when its size *changes* — so every re-open re-pinned the
+  remote PTY to the stale 81 rows and the CLI painted 18 rows off the bottom of
+  the viewport (blank void, collapsed composer). The forwarding daemon now
+  records the attached client's viewport as the source of truth, so the persisted
+  grid converges to the window you're actually looking at instead of a stale one.
+
 ## 2.11.5
 
 - **Sessions you close stay closed across a GUI/daemon restart.** Two compounding
