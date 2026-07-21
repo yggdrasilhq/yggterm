@@ -44583,6 +44583,76 @@ async fn web_do_disarm_and_fail(
     json!({ "accepted": false, "session_path": session, "reason": reason })
 }
 
+/// Process-wide agent-input preemption state (acceptance gate 9). A global for
+/// the same reason the slice-3 agent identity is one: every `do` call site would
+/// otherwise thread state it does not care about, and there is exactly one GUI
+/// process owning these surfaces.
+static AGENT_INPUT_ARBITER: std::sync::Mutex<
+    Option<crate::agent_input_arbiter::AgentInputArbiter>,
+> = std::sync::Mutex::new(None);
+
+fn agent_input_arbiter_lock()
+-> impl std::ops::DerefMut<Target = crate::agent_input_arbiter::AgentInputArbiter> {
+    struct Guard(std::sync::MutexGuard<'static, Option<crate::agent_input_arbiter::AgentInputArbiter>>);
+    impl std::ops::Deref for Guard {
+        type Target = crate::agent_input_arbiter::AgentInputArbiter;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().expect("arbiter initialized")
+        }
+    }
+    impl std::ops::DerefMut for Guard {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.0.as_mut().expect("arbiter initialized")
+        }
+    }
+    let mut slot = AGENT_INPUT_ARBITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(crate::agent_input_arbiter::AgentInputArbiter::new());
+    }
+    Guard(slot)
+}
+
+/// The batch a `do` verb belongs to: the slice-3 agent identity (`--agent`), so
+/// one agent's run is one cancellable batch. Anonymous callers share a batch —
+/// correct, since preemption should stop all un-attributed agent work too.
+fn agent_input_batch_for_current_agent() -> crate::agent_input_arbiter::AgentBatch {
+    crate::agent_input_arbiter::AgentBatch::new(
+        yggterm_server::resolve_agent_identity().unwrap_or_else(|| "anonymous".to_string()),
+    )
+}
+
+/// Real seat input landed on a session's web surface: cancel every agent batch
+/// driving it (gate 9). Journals what was cancelled.
+///
+/// NOTE: no caller yet — wiring a seat-input DETECTOR is the remaining half of
+/// gate 9, and it is not trivial (yggterm's own injection produces
+/// `isTrusted: true`, so a page-side listener cannot distinguish agent input
+/// from human input). See `docs/agent-control-plane.md`.
+#[allow(dead_code)]
+fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
+    let surface = crate::agent_input_arbiter::SurfaceKey::new(session_path, generation);
+    let report = agent_input_arbiter_lock().note_human_input(&surface);
+    if report.is_empty() {
+        return;
+    }
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "agent_input",
+            crate::agent_input_arbiter::PREEMPTED,
+            json!({
+                "session_path": session_path,
+                "generation": generation,
+                "cancelled_batches": report.cancelled_batches,
+                "trigger": "human_input",
+            }),
+        );
+    }
+}
+
 async fn web_surface_do_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -44600,6 +44670,39 @@ async fn web_surface_do_for(
             obj.insert("session_path".to_string(), Value::String(session));
         }
         return stale;
+    }
+    // Human-preempt gate (acceptance gate 9): once real seat input lands on a
+    // surface, every agent batch that was driving it is cancelled and its later
+    // verbs are refused here — so a verb the agent planned before the user acted
+    // cannot land afterwards. Ordering/one-in-flight is NOT re-implemented: the
+    // app-control pump already drains one request at a time.
+    {
+        let batch = agent_input_batch_for_current_agent();
+        let surface_key =
+            crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
+        let outcome = agent_input_arbiter_lock()
+            .admit(&surface_key, &batch, handle.generation);
+        if outcome == crate::agent_input_arbiter::AdmitOutcome::Preempted {
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "agent_input",
+                    crate::agent_input_arbiter::PREEMPTED,
+                    json!({
+                        "session_path": session,
+                        "batch_id": batch.batch_id,
+                        "generation": handle.generation,
+                    }),
+                );
+            }
+            return json!({
+                "accepted": false,
+                "reason": crate::agent_input_arbiter::PREEMPTED,
+                "session_path": session,
+                "detail": "the user took this surface; start a new batch after re-observing",
+            });
+        }
     }
     let native_id = handle.native_id;
     // Document-space CSS (x, y) → viewport CSS by subtracting the live scroll

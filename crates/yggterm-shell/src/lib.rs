@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod agent_input_arbiter;
 mod app_capture;
 mod command_registry;
 mod hot_update_policy;
