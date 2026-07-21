@@ -798,13 +798,27 @@ not a code claim.
    per-surface agent **batches** (keyed by the slice-3 `--agent` identity),
    cancelled as a unit on human input, with later verbs from a cancelled batch
    refused `preempted` at the `do` chokepoint and journaled. Unit-tested.
-   ⛔ **Remaining: the seat-input DETECTOR** — nothing calls
-   `note_human_input_on_web_surface` yet, so the refusal cannot fire in
-   production and this gate is NOT met. It is not trivial: yggterm's own
-   injection produces `isTrusted: true` events (slice-2a spike), so a page-side
-   listener **cannot** distinguish agent input from human input. Likely shape: a
-   GTK-level tap correlated against the injection window the GUI itself opened,
-   since only the GUI knows when it injected.
+   **Seat-input detector: BUILT (2026-07-21).** The page cannot make this
+   distinction — yggterm's injection sets `send_event = 0` and the real seat
+   device precisely so WebKit trusts it, so `isTrusted` is true for agent input
+   too. It is therefore made at the **webview layer**, where we know what we
+   ourselves produced: every injection ends in one *synchronous*
+   `WidgetExt::event(...)`, so `deliver_injected_event` sets a flag around that
+   single call and a GTK observer
+   (`connect_seat_input_observer`, button-press / key-press / scroll — **not**
+   pointer motion, which is drift rather than intent) counts only events seen
+   with the flag clear. Because GTK delivery is synchronous and single-threaded
+   this is a lexical scope, **not a timing window** — it satisfies the
+   no-non-determinism rule. The shell drains the count at the `do` chokepoint
+   via `DesktopContext::take_web_surface_seat_input` and preempts the batch.
+   Unit-tested in both directions, the important one being that the agent's own
+   injection is never counted as the human (a false positive there would make
+   every batch preempt itself on its second verb).
+   ⛔ **Still owed: the LIVE proof.** It needs a real seat clicking a real web
+   surface while an agent batch runs — a human action, not something the agent
+   can synthesize (any event it could generate would go through the injection
+   path and be correctly excluded). Until then this gate is code-complete and
+   unit-proven, not live-proven.
    **Corollary for slice 4.1:** it must extend THIS batch table by keying on
    `(client_id, role)` — the `AgentBatch::client_id` seat already exists — not
    add a parallel lease table.

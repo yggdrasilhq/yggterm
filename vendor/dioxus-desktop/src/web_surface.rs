@@ -404,6 +404,85 @@ fn connect_edge_motion_observer(
     });
 }
 
+// ===========================================================================
+// Seat-input detection (agent control plane, acceptance gate 9).
+//
+// The agent's `do` verbs inject GDK events with `send_event = 0` and the real
+// seat device, precisely so WebKit treats them as genuine — which means
+// `isTrusted` is TRUE for them and a page-side listener **cannot** tell agent
+// input from human input. The distinction has to be made HERE, where we know
+// which events we ourselves produced.
+//
+// How: every injection ends in a *synchronous* `WidgetExt::event(...)` call, so
+// wrapping that one call in a flag is exact — anything the observer sees while
+// the flag is clear came from the seat. GTK delivery is single-threaded and
+// synchronous, so this is a lexical scope, NOT a timing window (the repo forbids
+// timing-dependent behavior).
+// ===========================================================================
+
+thread_local! {
+    /// Set only for the duration of one synchronous injected-event delivery.
+    static INJECTING_EVENT: Cell<bool> = const { Cell::new(false) };
+    /// Per-webview count of real seat inputs observed but not yet consumed.
+    static SEAT_INPUT_COUNTS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+}
+
+/// Deliver an injected event with the "this is ours" flag set, so the seat-input
+/// observer does not mistake the agent's own injection for the human.
+fn deliver_injected_event(webview: &webkit2gtk::WebView, event: &gdk::Event) {
+    INJECTING_EVENT.with(|flag| flag.set(true));
+    gtk::prelude::WidgetExt::event(webview, event);
+    INJECTING_EVENT.with(|flag| flag.set(false));
+}
+
+fn note_seat_input(surface_id: u64) {
+    if INJECTING_EVENT.with(|flag| flag.get()) {
+        return; // our own injection, not the human
+    }
+    SEAT_INPUT_COUNTS.with(|counts| {
+        *counts.borrow_mut().entry(surface_id).or_insert(0) += 1;
+    });
+}
+
+/// Consume the count of real seat inputs seen on this surface since the last
+/// call. Non-zero means the human touched it — the agent's batch is preempted.
+pub fn take_seat_input_count(surface_id: u64) -> u64 {
+    SEAT_INPUT_COUNTS.with(|counts| counts.borrow_mut().remove(&surface_id).unwrap_or(0))
+}
+
+/// Forget a closed surface's seat-input tally.
+pub fn forget_seat_input(surface_id: u64) {
+    SEAT_INPUT_COUNTS.with(|counts| {
+        counts.borrow_mut().remove(&surface_id);
+    });
+}
+
+/// Observe real seat input on a webview: button presses, key presses, scrolls
+/// and touch — the gestures that mean "the human took this surface back".
+///
+/// Pointer MOTION is deliberately excluded: the pointer drifting across a
+/// window is not intent, and counting it would preempt agent batches constantly.
+fn connect_seat_input_observer(webkit: &webkit2gtk::WebView, surface_id: u64) {
+    webkit.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::KEY_PRESS_MASK
+            | gdk::EventMask::SCROLL_MASK
+            | gdk::EventMask::TOUCH_MASK,
+    );
+    webkit.connect_button_press_event(move |_, _| {
+        note_seat_input(surface_id);
+        gtk::glib::Propagation::Proceed
+    });
+    webkit.connect_key_press_event(move |_, _| {
+        note_seat_input(surface_id);
+        gtk::glib::Propagation::Proceed
+    });
+    webkit.connect_scroll_event(move |_, _| {
+        note_seat_input(surface_id);
+        gtk::glib::Propagation::Proceed
+    });
+}
+
 fn rect_logical(w: i32, h: i32) -> Rect {
     Rect {
         position: Position::Logical(LogicalPosition::new(0.0, 0.0)),
@@ -753,6 +832,9 @@ fn build_popup_webview(
     // A popup replaces the page in the same rect: it needs the same top-edge
     // reveal forward as the page it covers.
     connect_edge_motion_observer(&webview.webview(), &container, glass, edge_motion);
+    // Gate 9: notice when the HUMAN takes this popup, so a queued agent batch
+    // stops instead of landing behind them.
+    connect_seat_input_observer(&webview.webview(), popup_id);
     // `window.close()`: the page's own report (the engine will not tell us), plus
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
@@ -1162,6 +1244,11 @@ impl WebSurfaceHost {
                 &self.glass,
                 &self.edge_motion,
             );
+            // Gate 9: real seat input on this surface preempts any agent batch
+            // driving it. Attached here, next to the webview, because only this
+            // layer can tell the agent's own injection from the human (the
+            // injected events are deliberately indistinguishable to the page).
+            connect_seat_input_observer(&webview.webview(), id);
         }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
@@ -1252,6 +1339,10 @@ impl WebSurfaceHost {
             }
             // Surface drops here: webview + WebContext torn down together.
         }
+        // Do not leave a seat-input tally behind for a surface that is gone —
+        // ids are reused, and a stale count would preempt the next agent batch
+        // on the new surface for something the user did to the old one.
+        forget_seat_input(id);
     }
 
     /// Stash surface `id`: detach its container from the overlay WITHOUT
@@ -1511,7 +1602,7 @@ unsafe fn synth_button(
         (*bev).device = device.to_glib_full();
     }
     let event: gdk::Event = from_glib_full(ev_ptr);
-    gtk::prelude::WidgetExt::event(webview, &event);
+    deliver_injected_event(webview, &event);
     Ok(())
 }
 
@@ -1536,7 +1627,7 @@ unsafe fn synth_motion(webview: &webkit2gtk::WebView, x: f64, y: f64) -> Result<
         (*mev).device = device.to_glib_full();
     }
     let event: gdk::Event = from_glib_full(ev_ptr);
-    gtk::prelude::WidgetExt::event(webview, &event);
+    deliver_injected_event(webview, &event);
     Ok(())
 }
 
@@ -1569,7 +1660,7 @@ unsafe fn synth_scroll(
         (*sev).device = device.to_glib_full();
     }
     let event: gdk::Event = from_glib_full(ev_ptr);
-    gtk::prelude::WidgetExt::event(webview, &event);
+    deliver_injected_event(webview, &event);
     Ok(())
 }
 
@@ -1615,7 +1706,7 @@ unsafe fn synth_key(
         gdk::ffi::gdk_event_set_device(ev_ptr, device.to_glib_full());
     }
     let event: gdk::Event = from_glib_full(ev_ptr);
-    gtk::prelude::WidgetExt::event(webview, &event);
+    deliver_injected_event(webview, &event);
     Ok(())
 }
 
@@ -1795,4 +1886,67 @@ fn cors_response(status: u16, body: Vec<u8>) -> Response<Vec<u8>> {
         .header("Cache-Control", "no-store")
         .body(body)
         .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+#[cfg(test)]
+mod seat_input_tests {
+    use super::*;
+
+    /// The discrimination that gate 9 rests on. The dangerous direction is a
+    /// FALSE POSITIVE: if the agent's own injection were counted as human,
+    /// every agent batch would preempt itself on its second verb and the `do`
+    /// verb would be unusable. `deliver_injected_event` sets the flag around the
+    /// synchronous GTK delivery, so anything observed inside it is ours.
+    #[test]
+    fn injected_events_are_not_counted_as_seat_input() {
+        let id = 4242;
+        take_seat_input_count(id); // clear
+
+        // Simulate what happens INSIDE deliver_injected_event: the flag is set
+        // for the duration of the synchronous delivery, during which the GTK
+        // handler fires and calls note_seat_input.
+        INJECTING_EVENT.with(|f| f.set(true));
+        note_seat_input(id);
+        note_seat_input(id);
+        INJECTING_EVENT.with(|f| f.set(false));
+        assert_eq!(
+            take_seat_input_count(id),
+            0,
+            "the agent's own injection must never register as the human"
+        );
+
+        // A real seat event arrives outside any injection.
+        note_seat_input(id);
+        assert_eq!(take_seat_input_count(id), 1);
+    }
+
+    #[test]
+    fn taking_the_count_consumes_it() {
+        let id = 4243;
+        take_seat_input_count(id);
+        note_seat_input(id);
+        note_seat_input(id);
+        assert_eq!(take_seat_input_count(id), 2);
+        // Consumed: a second read reports no NEW input, so one human click
+        // preempts once rather than forever.
+        assert_eq!(take_seat_input_count(id), 0);
+    }
+
+    #[test]
+    fn surfaces_count_seat_input_independently() {
+        let (a, b) = (4244, 4245);
+        take_seat_input_count(a);
+        take_seat_input_count(b);
+        note_seat_input(a);
+        assert_eq!(take_seat_input_count(b), 0, "input on A must not preempt B");
+        assert_eq!(take_seat_input_count(a), 1);
+    }
+
+    #[test]
+    fn forgetting_a_closed_surface_clears_its_tally() {
+        let id = 4246;
+        note_seat_input(id);
+        forget_seat_input(id);
+        assert_eq!(take_seat_input_count(id), 0);
+    }
 }

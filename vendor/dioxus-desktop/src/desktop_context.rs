@@ -731,6 +731,37 @@ impl DesktopService {
         }
     }
 
+    /// Consume the count of REAL seat inputs (clicks/keys/scrolls, not pointer
+    /// motion) seen on web surface `id` since the last call — the agent control
+    /// plane's human-preempt signal (acceptance gate 9).
+    ///
+    /// Non-zero means the human took the surface: the caller cancels any agent
+    /// batch driving it. This lives next to the webview because only that layer
+    /// can distinguish the agent's own injection from the human — the injected
+    /// events are deliberately indistinguishable to the page (`isTrusted` is
+    /// true for both).
+    pub fn take_web_surface_seat_input(&self, id: u64) -> u64 {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return crate::web_surface::take_seat_input_count(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            0
+        }
+    }
+
     /// Inject a trusted pointer MOVE (real hover) into web surface `id`'s page.
     pub fn inject_web_surface_move(&self, id: u64, x: f64, y: f64) -> Result<(), String> {
         #[cfg(not(any(
