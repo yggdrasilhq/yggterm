@@ -212,7 +212,7 @@ use yggterm_server::{
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, RailHeader, RailScrollBody, RailSectionTitle,
-    SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
+    SideRailOverlay, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
     ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
@@ -884,7 +884,14 @@ const DOCK_PULSE_IDLE_MS: u64 = 5_000;
 const SELF_UPDATE_JOB_KEY: &str = "self-update";
 const UPDATE_RESTART_STALE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 const TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX: f64 = 6.0;
-const TITLEBAR_AUTOHIDE_LINGER_MS: u64 = 420;
+/// The hover sensor a hidden sidebar leaves on its window edge, mirroring the
+/// titlebar's top strip. Same width for both sidebars: an edge is an edge, and a
+/// second number would only invite them to drift apart.
+const SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX: f64 = 6.0;
+/// Revealed sidebars float BELOW the titlebar's 180 — the titlebar spans the
+/// full width and owns the corner, so a sidebar must never paint over it.
+const SIDEBAR_AUTOHIDE_Z_INDEX: u32 = 170;
+const AUTOHIDE_LINGER_MS: u64 = 420;
 const UPDATE_CTA_CSS: &str = r#"
 @keyframes yggterm-update-ellipsis-pulse {
   0%, 20% { opacity: 0.28; }
@@ -3106,16 +3113,33 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';
     const tb = underGlass ? null : document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
     const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
+    // Same treatment for the auto-hidden SIDEBARS: a revealed overlay sidebar is
+    // floating DOM, so a legacy native webview must be clamped BESIDE it or the
+    // reveal is invisible over a page. Collapsed, only the 6px sensor is claimed
+    // — which is what keeps the sensor hoverable over a web surface at all.
+    const clampSide = (selector, edge) => {
+        if (underGlass) { return 0; }
+        const el = document.querySelector(selector);
+        if (!el) { return 0; }
+        const r = el.getBoundingClientRect();
+        if (r.width < 1) { return 0; }
+        return edge === 'left'
+            ? Math.max(0, Math.round(r.right))
+            : Math.max(0, Math.round(window.innerWidth - r.left));
+    };
+    const clampLeft = clampSide('[data-sidebar-auto-hide="true"]', 'left');
+    const clampRight = clampSide('[data-yggui-side-rail-auto-hide="1"]', 'right');
+    const clampBox = (r) => {
+        const top = Math.max(Math.round(r.top), clampTop);
+        const left = Math.max(Math.round(r.left), clampLeft);
+        const right = Math.min(Math.round(r.right), Math.round(window.innerWidth) - clampRight);
+        return [left, top, right - left, Math.round(r.bottom) - top];
+    };
     const out = {};
     for (const el of document.querySelectorAll('[data-ws-page]')) {
-        const r = el.getBoundingClientRect();
-        const top = Math.max(Math.round(r.top), clampTop);
-        const height = Math.round(r.bottom) - top;
-        if (r.width > 1 && height > 1) {
-            out[el.getAttribute('data-ws-page') || ''] = [
-                Math.round(r.left), top,
-                Math.round(r.width), height,
-            ];
+        const [left, top, width, height] = clampBox(el.getBoundingClientRect());
+        if (width > 1 && height > 1) {
+            out[el.getAttribute('data-ws-page') || ''] = [left, top, width, height];
         }
     }
     // Pinned split-tab panes: the (session, tab)-keyed twin of
@@ -3123,14 +3147,12 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // webview regardless of the surface's active tab.
     const pinned = [];
     for (const el of document.querySelectorAll('[data-ws-pinned-session]')) {
-        const r = el.getBoundingClientRect();
-        const top = Math.max(Math.round(r.top), clampTop);
-        const height = Math.round(r.bottom) - top;
-        if (r.width > 1 && height > 1) {
+        const box = clampBox(el.getBoundingClientRect());
+        if (box[2] > 1 && box[3] > 1) {
             pinned.push([
                 el.getAttribute('data-ws-pinned-session') || '',
                 Number(el.getAttribute('data-ws-pinned-tab') || '0'),
-                [Math.round(r.left), top, Math.round(r.width), height],
+                box,
             ]);
         }
     }
@@ -3266,7 +3288,7 @@ async fn web_surface_edge_motion_reveal_loop(
         let mut eval = document::eval("window.__yggtermGlassEdgeMotion = () => dioxus.send(1);");
         while eval.recv::<i32>().await.is_ok() {
             if state.peek().settings.auto_hide_titlebar {
-                titlebar_autohide_reveal(hovered, lingering, linger_generation);
+                autohide_reveal(hovered, lingering, linger_generation);
             }
         }
         // Channel died (webview reload): rebind the hook.
@@ -27070,7 +27092,54 @@ fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
             snapshot.titlebar_overflow_menu_open,
         )
 }
-fn titlebar_autohide_revealed(
+/// Hold the overlay session tree open while the user is mid-gesture ON it.
+/// Collapsing a sidebar out from under an open context menu, a rename field, a
+/// drag, or a resize drag would abort the very interaction that needed it —
+/// the same reasoning as the titlebar's pinned flags.
+fn sidebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
+    sidebar_autohide_pinned_flags(
+        snapshot.alt_overlay_active,
+        snapshot.context_menu_row.is_some(),
+        snapshot.tree_rename_path.is_some(),
+        snapshot.pending_delete.is_some(),
+        snapshot.sidebar_resizing,
+        !snapshot.drag_paths.is_empty(),
+    )
+}
+fn sidebar_autohide_pinned_flags(
+    alt_overlay_active: bool,
+    context_menu_open: bool,
+    renaming: bool,
+    pending_delete: bool,
+    resizing: bool,
+    dragging: bool,
+) -> bool {
+    alt_overlay_active
+        || context_menu_open
+        || renaming
+        || pending_delete
+        || resizing
+        || dragging
+}
+/// Hold the overlay metadata/settings rail open while a modal it launched owns
+/// the screen. Focus inside the rail is handled generically by
+/// `AutoHideSignals::focus_within`, not here.
+fn rail_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
+    rail_autohide_pinned_flags(snapshot.alt_overlay_active, snapshot.theme_editor_open)
+}
+fn rail_autohide_pinned_flags(alt_overlay_active: bool, theme_editor_open: bool) -> bool {
+    alt_overlay_active || theme_editor_open
+}
+/// Which window edge an auto-hidden sidebar reveals from. The reveal STATE
+/// MACHINE is shared with the titlebar (`AutoHideSignals` + the `autohide_*`
+/// functions); only the geometry differs, and it differs by exactly this enum —
+/// a second copy is how two edges start behaving differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SidebarEdge {
+    Left,
+    Right,
+}
+fn autohide_revealed(
     auto_hide_enabled: bool,
     hover_active: bool,
     pinned: bool,
@@ -27078,12 +27147,12 @@ fn titlebar_autohide_revealed(
 ) -> bool {
     !auto_hide_enabled || hover_active || pinned || linger_active
 }
-/// Reveal the auto-hidden titlebar and cancel any pending hide.
+/// Reveal an auto-hidden panel and cancel any pending hide.
 ///
-/// The ONE writer of "the pointer is on the top edge". Bumping the generation
+/// The ONE writer of "the pointer is on this edge". Bumping the generation
 /// retires the in-flight linger task so a re-entry during the grace window is not
 /// hidden out from under the pointer 420ms later.
-fn titlebar_autohide_reveal(
+fn autohide_reveal(
     mut hovered: Signal<bool>,
     mut lingering: Signal<bool>,
     mut linger_generation: Signal<u64>,
@@ -27091,6 +27160,258 @@ fn titlebar_autohide_reveal(
     linger_generation.set(linger_generation() + 1);
     hovered.set(true);
     lingering.set(false);
+}
+/// One auto-hidden edge's reveal state, bundled so a panel carries its whole
+/// state machine as a single prop instead of four loose signals that could be
+/// wired to different edges by accident.
+#[derive(Clone, Copy, PartialEq)]
+struct AutoHideSignals {
+    hovered: Signal<bool>,
+    lingering: Signal<bool>,
+    linger_generation: Signal<u64>,
+    /// Keyboard focus is inside the panel. A revealed rail must not collapse out
+    /// from under a settings field the user is typing into just because the
+    /// pointer wandered back to the viewport.
+    focus_within: Signal<bool>,
+}
+fn use_autohide_signals() -> AutoHideSignals {
+    AutoHideSignals {
+        hovered: use_signal(|| false),
+        lingering: use_signal(|| false),
+        linger_generation: use_signal(|| 0_u64),
+        focus_within: use_signal(|| false),
+    }
+}
+impl AutoHideSignals {
+    fn reveal(self) {
+        autohide_reveal(self.hovered, self.lingering, self.linger_generation);
+    }
+    fn reveal_if_idle(self) {
+        if !(self.hovered)() {
+            self.reveal();
+        }
+    }
+    fn handle_mouse_leave(self) {
+        autohide_handle_mouse_leave(self.hovered, self.lingering, self.linger_generation);
+    }
+    fn set_focus_within(mut self, focused: bool) {
+        self.focus_within.set(focused);
+        if focused {
+            self.reveal();
+        } else {
+            self.handle_mouse_leave();
+        }
+    }
+    fn revealed(self, auto_hide_enabled: bool, pinned: bool) -> bool {
+        autohide_revealed(
+            auto_hide_enabled,
+            (self.hovered)(),
+            pinned || (self.focus_within)(),
+            (self.lingering)(),
+        )
+    }
+}
+/// Pointer left the edge: start the grace window, or clean up if it never
+/// revealed. Returns the generation a linger task must check before hiding.
+///
+/// Leaving without ever having revealed is a NO-OP by contract: `linger` ALONE
+/// satisfies `autohide_revealed`, so starting the grace here would flash the
+/// panel open for 420ms whenever the pointer merely crossed the sensor (the
+/// hide/unhide loop the user reported on the titlebar in 2026-06-27).
+fn autohide_begin_linger(
+    mut hovered: Signal<bool>,
+    mut lingering: Signal<bool>,
+    mut linger_generation: Signal<u64>,
+) -> Option<u64> {
+    match autohide_leave_action(hovered(), lingering()) {
+        AutoHideLeave::Ignore => None,
+        AutoHideLeave::CancelStaleLinger => {
+            lingering.set(false);
+            linger_generation.set(linger_generation() + 1);
+            None
+        }
+        AutoHideLeave::BeginLinger => {
+            hovered.set(false);
+            lingering.set(true);
+            linger_generation.set(linger_generation() + 1);
+            Some(linger_generation())
+        }
+    }
+}
+/// What a pointer-leave means for an auto-hidden edge. Pure, so the guard that
+/// prevents the flash-open loop is testable without a Dioxus runtime.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AutoHideLeave {
+    /// Never revealed — do nothing. The pointer merely crossed the sensor.
+    Ignore,
+    /// Never revealed, but a stale grace window is still pending — retire it.
+    CancelStaleLinger,
+    /// Was hover-revealed — start the grace window.
+    BeginLinger,
+}
+fn autohide_leave_action(hovered: bool, lingering: bool) -> AutoHideLeave {
+    if hovered {
+        AutoHideLeave::BeginLinger
+    } else if lingering {
+        AutoHideLeave::CancelStaleLinger
+    } else {
+        AutoHideLeave::Ignore
+    }
+}
+/// Spawn the grace-window task that hides the panel once the pointer has stayed
+/// away for `AUTOHIDE_LINGER_MS`. A generation mismatch means a re-entry already
+/// claimed the reveal, so this task retires silently.
+fn autohide_spawn_linger_task(
+    hovered: Signal<bool>,
+    mut lingering: Signal<bool>,
+    linger_generation: Signal<u64>,
+    generation: u64,
+) {
+    spawn(async move {
+        sleep(Duration::from_millis(AUTOHIDE_LINGER_MS)).await;
+        if linger_generation() == generation && !hovered() {
+            lingering.set(false);
+        }
+    });
+}
+/// The full mouseleave handler shared by every auto-hidden edge.
+fn autohide_handle_mouse_leave(
+    hovered: Signal<bool>,
+    lingering: Signal<bool>,
+    linger_generation: Signal<u64>,
+) {
+    if let Some(generation) = autohide_begin_linger(hovered, lingering, linger_generation) {
+        autohide_spawn_linger_task(hovered, lingering, linger_generation, generation);
+    }
+}
+/// Geometry of a hidden sidebar: the in-flow footprint is ALWAYS zero, so the
+/// viewport keeps the width it had and the xterm never re-fits.
+///
+/// This is the load-bearing half of the spec's "z axis" hint. A push/reflow
+/// reveal would resize the viewport on every hover, firing `TerminalResize` into
+/// the daemon's PTY grid on a mouse gesture — straight into the squish /
+/// broken-bottom minefield ([[finding-pty-grid-ssot-divergence]]). Overlay is not
+/// a cosmetic preference; it is what keeps hover out of the resize hot path.
+fn sidebar_autohide_overlay_width_px(revealed: bool, sidebar_width: f32) -> f64 {
+    if revealed {
+        sidebar_width.round().max(0.0) as f64
+    } else {
+        SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX
+    }
+}
+/// The floating positioning + chrome for a hidden sidebar.
+///
+/// Collapsed it is an invisible hover sensor pinned to its edge; revealed it is
+/// the same panel painted over the viewport with a depth shadow. `position:
+/// absolute` takes it out of flow entirely, which is what guarantees the
+/// viewport's box never changes across a reveal.
+fn sidebar_autohide_overlay_style(
+    edge: SidebarEdge,
+    revealed: bool,
+    sidebar_width: f32,
+    palette: Palette,
+) -> String {
+    let width = sidebar_autohide_overlay_width_px(revealed, sidebar_width);
+    let anchor = match edge {
+        SidebarEdge::Left => "left:0; right:auto;",
+        SidebarEdge::Right => "right:0; left:auto;",
+    };
+    // The in-flow sidebar's own `palette.sidebar` is `transparent` — it relies
+    // entirely on the opaque `data-yggterm-app-bg` layer painting behind the
+    // whole flex row. A floating overlay has nothing behind it, so it must paint
+    // that material ITSELF or the terminal bleeds straight through (the user saw
+    // exactly this). We reuse the SHELL's own opaque-fill + gradient CSS vars
+    // (SSOT: the same paint the app background computes) so the panel is
+    // guaranteed opaque and visually continuous with the shell chrome.
+    let (background_color, background_image) = if revealed {
+        (
+            format!(
+                "var(--yggterm-opaque-shell-fill, {})",
+                shell_opaque_fill(palette)
+            ),
+            format!("var(--yggterm-shell-gradient, {})", palette.gradient),
+        )
+    } else {
+        ("transparent".to_string(), "none".to_string())
+    };
+    let shadow = if revealed {
+        sidebar_autohide_overlay_shadow(edge, palette)
+    } else {
+        "none"
+    };
+    let transition = if revealed {
+        emphasized_enter_transition(&["width", "min-width", "max-width", "box-shadow"])
+    } else {
+        emphasized_exit_transition(&["width", "min-width", "max-width", "box-shadow"])
+    };
+    format!(
+        // `height:100%` rather than `bottom:0`: the in-flow sidebar has proven
+        // that declaration correct under the shell's CSS `zoom`, and an
+        // auto-hidden sidebar must not render differently from an open one.
+        // Gradient sized/positioned to the shell so the wash lines up with the
+        // chrome rather than restarting inside the panel.
+        "position:absolute; top:0; height:100%; {} width:{}px; min-width:{}px; max-width:{}px; \
+         z-index:{}; background-color:{}; background-image:{}; \
+         background-size:var(--yggterm-shell-background-size, 100% 100vh); \
+         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top {}; \
+         box-shadow:{}; overflow:hidden; transition:{};",
+        anchor,
+        width,
+        width,
+        width,
+        SIDEBAR_AUTOHIDE_Z_INDEX,
+        background_color,
+        background_image,
+        match edge {
+            SidebarEdge::Left => "left",
+            SidebarEdge::Right => "right",
+        },
+        shadow,
+        transition
+    )
+}
+/// Depth cue for a revealed overlay sidebar: a soft shadow cast INTO the
+/// viewport, never a hairline border. Same reasoning as the titlebar's — a 1px
+/// border paints the chrome fill and reads as a bright separator line.
+fn sidebar_autohide_overlay_shadow(edge: SidebarEdge, palette: Palette) -> &'static str {
+    match (edge, palette_is_dark(palette)) {
+        (SidebarEdge::Right, true) => "-14px 0 30px rgba(0,0,0,0.42)",
+        (SidebarEdge::Right, false) => "-14px 0 28px rgba(70,92,116,0.18)",
+        (SidebarEdge::Left, true) => "14px 0 30px rgba(0,0,0,0.42)",
+        (SidebarEdge::Left, false) => "14px 0 28px rgba(70,92,116,0.18)",
+    }
+}
+/// The overlay's CONTENT layer: kept at the sidebar's full width so the panel
+/// slides in as one piece instead of its rows re-wrapping as the box widens.
+fn sidebar_autohide_content_style(revealed: bool, sidebar_width: f32, edge: SidebarEdge) -> String {
+    let width = sidebar_width.round().max(0.0) as f64;
+    let offset = if revealed {
+        0.0
+    } else if edge == SidebarEdge::Right {
+        width
+    } else {
+        -width
+    };
+    let transition = if revealed {
+        emphasized_enter_transition(&["opacity", "transform"])
+    } else {
+        emphasized_exit_transition(&["opacity", "transform"])
+    };
+    format!(
+        "position:absolute; top:0; height:100%; {}:0; width:{}px; display:flex; flex-direction:column; \
+         min-height:0; opacity:{}; transform:translateX({}px); pointer-events:{}; \
+         will-change:transform, opacity; transition:{};",
+        if edge == SidebarEdge::Right {
+            "right"
+        } else {
+            "left"
+        },
+        width,
+        if revealed { "1" } else { "0" },
+        offset,
+        if revealed { "auto" } else { "none" },
+        transition
+    )
 }
 fn titlebar_autohide_chrome_background_color(
     palette: Palette,
@@ -51726,9 +52047,15 @@ fn app() -> Element {
         use_hook(|| Signal::new_in_scope(ShellState::new(bootstrap.clone()), ScopeId::ROOT));
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
-    let mut titlebar_autohide_hovered = use_signal(|| false);
-    let mut titlebar_autohide_lingering = use_signal(|| false);
-    let mut titlebar_autohide_linger_generation = use_signal(|| 0_u64);
+    // One reveal state machine per auto-hidden edge: top (titlebar), left
+    // (session tree), right (metadata rail). Same struct, same handlers — see
+    // `AutoHideSignals`.
+    let titlebar_autohide = use_autohide_signals();
+    let left_sidebar_autohide = use_autohide_signals();
+    let right_rail_autohide = use_autohide_signals();
+    let mut titlebar_autohide_hovered = titlebar_autohide.hovered;
+    let titlebar_autohide_lingering = titlebar_autohide.lingering;
+    let titlebar_autohide_linger_generation = titlebar_autohide.linger_generation;
     let mut last_active_terminal_input_policy =
         use_signal(|| None::<ActiveTerminalInputPolicySignature>);
     let mut startup_sync_started = use_signal(|| false);
@@ -53434,12 +53761,19 @@ fn app() -> Element {
     // titlebar sits on top of everything with only the page dipping under it.
     let titlebar_auto_hide_enabled = snapshot.settings.auto_hide_titlebar;
     let titlebar_reveal_pinned = titlebar_autohide_pinned(&snapshot);
-    let titlebar_revealed = titlebar_autohide_revealed(
-        titlebar_auto_hide_enabled,
-        titlebar_autohide_hovered(),
-        titlebar_reveal_pinned,
-        titlebar_autohide_lingering(),
-    );
+    let titlebar_revealed = titlebar_autohide.revealed(titlebar_auto_hide_enabled, titlebar_reveal_pinned);
+    // A HIDDEN sidebar is an auto-hide sidebar — that IS what hidden means now,
+    // with no settings toggle of its own (user direction 2026-07-21). Closed
+    // means "reveal on hover, over the viewport", not "gone".
+    let left_sidebar_auto_hide = !snapshot.sidebar_open;
+    let left_sidebar_revealed = left_sidebar_autohide.revealed(
+        left_sidebar_auto_hide,
+        sidebar_autohide_pinned(&snapshot),
+    ) && left_sidebar_auto_hide;
+    let right_rail_auto_hide = snapshot.right_panel_mode == RightPanelMode::Hidden;
+    let right_rail_revealed = right_rail_autohide
+        .revealed(right_rail_auto_hide, rail_autohide_pinned(&snapshot))
+        && right_rail_auto_hide;
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
     let shell_radius = if maximized {
@@ -54158,7 +54492,7 @@ fn app() -> Element {
                         // entered — user-rejected 2026-07-10.)
                         onmouseenter: move |_| {
                             if titlebar_auto_hide_enabled {
-                                titlebar_autohide_reveal(
+                                autohide_reveal(
                                     titlebar_autohide_hovered,
                                     titlebar_autohide_lingering,
                                     titlebar_autohide_linger_generation,
@@ -54173,7 +54507,7 @@ fn app() -> Element {
                         // crosses it.
                         onmousemove: move |_| {
                             if titlebar_auto_hide_enabled && !titlebar_autohide_hovered() {
-                                titlebar_autohide_reveal(
+                                autohide_reveal(
                                     titlebar_autohide_hovered,
                                     titlebar_autohide_lingering,
                                     titlebar_autohide_linger_generation,
@@ -54184,34 +54518,11 @@ fn app() -> Element {
                             if !titlebar_auto_hide_enabled {
                                 return;
                             }
-                            // Leaving without ever having revealed must be a
-                            // NO-OP. `linger` ALONE satisfies
-                            // `titlebar_autohide_revealed`, so starting the grace
-                            // here flashed the titlebar open for 420ms whenever the
-                            // pointer merely crossed the sensor — the reported
-                            // hide/unhide loop.
-                            if !titlebar_autohide_hovered() {
-                                if titlebar_autohide_lingering() {
-                                    titlebar_autohide_lingering.set(false);
-                                    titlebar_autohide_linger_generation
-                                        .set(titlebar_autohide_linger_generation() + 1);
-                                }
-                                return;
-                            }
-                            titlebar_autohide_hovered.set(false);
-                            titlebar_autohide_lingering.set(true);
-                            titlebar_autohide_linger_generation
-                                .set(titlebar_autohide_linger_generation() + 1);
-                            let linger_generation = titlebar_autohide_linger_generation();
-                            let hovered_signal = titlebar_autohide_hovered;
-                            let mut lingering_signal = titlebar_autohide_lingering;
-                            let generation_signal = titlebar_autohide_linger_generation;
-                            spawn(async move {
-                                sleep(Duration::from_millis(TITLEBAR_AUTOHIDE_LINGER_MS)).await;
-                                if generation_signal() == linger_generation && !hovered_signal() {
-                                    lingering_signal.set(false);
-                                }
-                            });
+                            autohide_handle_mouse_leave(
+                                titlebar_autohide_hovered,
+                                titlebar_autohide_lingering,
+                                titlebar_autohide_linger_generation,
+                            );
                         },
                         div {
                             style: titlebar_inner_style(titlebar_auto_hide_enabled, titlebar_revealed),
@@ -54531,6 +54842,8 @@ fn app() -> Element {
                     if !fullscreen {
                         Sidebar {
                         snapshot: sidebar_snapshot,
+                        autohide: left_sidebar_autohide,
+                        autohide_revealed: left_sidebar_revealed,
                         on_prev_search_row: move |_| {
                             if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
                                 spawn_open_session_row(state, row);
@@ -54766,6 +55079,8 @@ fn app() -> Element {
                     if !fullscreen {
                         RightRail {
                             snapshot: metadata_snapshot,
+                            autohide: right_rail_autohide,
+                            autohide_revealed: right_rail_revealed,
                             state,
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
@@ -56189,6 +56504,12 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 #[component]
 fn Sidebar(
     snapshot: SharedSnapshot,
+    /// The left edge's reveal state machine. Live only while the sidebar is
+    /// hidden — a hidden sidebar IS an auto-hide sidebar.
+    autohide: AutoHideSignals,
+    /// Is the hidden sidebar currently revealed as an overlay? Computed by the
+    /// shell so the web-surface cover/clamp sees the same answer the DOM does.
+    autohide_revealed: bool,
     rename_depth: Option<usize>,
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
@@ -56219,16 +56540,15 @@ fn Sidebar(
     on_commit_rename: EventHandler<BrowserRow>,
     on_cancel_rename: EventHandler<()>,
 ) -> Element {
+    // A hidden sidebar leaves the FLOW entirely (see
+    // `sidebar_autohide_overlay_style`): the viewport keeps its full width and
+    // the reveal happens on the z axis, so hovering the edge never re-fits the
+    // xterm and never touches the daemon's PTY grid.
+    let auto_hide = !snapshot.sidebar_open;
     let width = if snapshot.sidebar_open {
         snapshot.sidebar_width.round().max(0.0) as usize
     } else {
         0
-    };
-    let opacity = if snapshot.sidebar_open { "1" } else { "0" };
-    let translate = if snapshot.sidebar_open {
-        "translateX(0)"
-    } else {
-        "translateX(-14px)"
     };
     let drag_active = !snapshot.drag_paths.is_empty();
     // PERF: rows are wrapped in `Rc` so the sidebar render loop below can hand a
@@ -56257,36 +56577,91 @@ fn Sidebar(
                 .then(|| row.full_path.clone())
         })
         .collect::<HashSet<_>>();
-    let sidebar_transition = if snapshot.sidebar_open {
-        emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"])
+    let sidebar_transition =
+        emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"]);
+    let outer_style = if auto_hide {
+        format!(
+            "{} zoom:{}%; user-select:none; -webkit-user-select:none; box-sizing:border-box;",
+            sidebar_autohide_overlay_style(
+                SidebarEdge::Left,
+                autohide_revealed,
+                snapshot.sidebar_width,
+                snapshot.palette,
+            ),
+            zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
+        )
     } else {
-        emphasized_exit_transition(&["width", "min-width", "max-width", "opacity", "transform"])
+        format!(
+            "width:{}px; min-width:{}px; max-width:{}px; flex:0 0 {}px; height:100%; min-height:0; align-self:stretch; display:flex; flex-direction:column; \
+             background:{}; overflow:hidden; transition:{}; \
+             opacity:1; transform:translateX(0); pointer-events:auto; zoom:{}%; user-select:none; \
+             -webkit-user-select:none; position:relative; box-sizing:border-box;",
+            width,
+            width,
+            width,
+            width,
+            snapshot.palette.sidebar,
+            sidebar_transition,
+            zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
+        )
+    };
+    let content_style = if auto_hide {
+        sidebar_autohide_content_style(
+            autohide_revealed,
+            snapshot.sidebar_width,
+            SidebarEdge::Left,
+        )
+    } else {
+        "position:relative; display:flex; flex-direction:column; flex:1; min-height:0; width:100%; min-width:0;"
+            .to_string()
     };
     rsx! {
         div {
             id: "yggterm-sidebar",
             "data-sidebar": "1",
             "data-sidebar-open": if snapshot.sidebar_open { "true" } else { "false" },
+            "data-sidebar-auto-hide": if auto_hide { "true" } else { "false" },
+            "data-sidebar-autohide-revealed": if auto_hide && autohide_revealed { "true" } else { "false" },
+            // A revealed overlay sidebar floats over the page hole, so it
+            // declares itself a cover — under glass the shell's input region
+            // gets its rect back, and the legacy native-webview path clamps the
+            // page beside it (`WEB_SURFACE_GEOMETRY_EVAL_JS`). Collapsed, the
+            // 6px sensor stays UNdeclared: the page owns its own left edge.
+            "data-covers-web-surface": if auto_hide && autohide_revealed { "sidebar-left" },
             "data-sidebar-width": "{snapshot.sidebar_width.round() as i64}",
-            style: format!(
-                "width:{}px; min-width:{}px; max-width:{}px; flex:0 0 {}px; height:100%; min-height:0; align-self:stretch; display:flex; flex-direction:column; \
-                 background:{}; overflow:hidden; transition:{}; \
-                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%; user-select:none; \
-                 -webkit-user-select:none; position:relative; box-sizing:border-box;",
-                width,
-                width,
-                width,
-                width,
-                snapshot.palette.sidebar,
-                sidebar_transition,
-                opacity,
-                translate,
-                if snapshot.sidebar_open { "auto" } else { "none" },
-                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
-            ),
+            style: outer_style,
             tabindex: "0",
             onmousedown: |evt| evt.stop_propagation(),
             onclick: |evt| evt.stop_propagation(),
+            onmouseenter: move |_| {
+                if auto_hide {
+                    autohide.reveal();
+                }
+            },
+            // `mouseenter` fires ONCE, at the point of entry. If the collapsing
+            // panel shrinks out from under a resting pointer, no further enter
+            // ever arrives — so a move inside the sensor re-reveals. Early-returns
+            // once revealed, so a revealed panel costs no signal writes.
+            onmousemove: move |_| {
+                if auto_hide {
+                    autohide.reveal_if_idle();
+                }
+            },
+            onmouseleave: move |_| {
+                if auto_hide {
+                    autohide.handle_mouse_leave();
+                }
+            },
+            onfocusin: move |_| {
+                if auto_hide {
+                    autohide.set_focus_within(true);
+                }
+            },
+            onfocusout: move |_| {
+                if auto_hide {
+                    autohide.set_focus_within(false);
+                }
+            },
             onmounted: move |_| {
                 let _ = document::eval(&format!(
                     r#"
@@ -56433,6 +56808,13 @@ fn Sidebar(
                     _ => {}
                 }
             },
+            // The CONTENT layer keeps the sidebar's full width at all times, so
+            // the panel slides in as one piece instead of its rows re-wrapping
+            // while the outer box animates from a 6px sensor to full width.
+            // Same shape as the titlebar's fixed-height inner div.
+            div {
+            "data-sidebar-content": "1",
+            style: content_style,
             if snapshot.search_active {
                 div {
                     style: "padding:12px 12px 0 12px; display:flex; align-items:center; gap:8px;",
@@ -56667,6 +57049,7 @@ fn Sidebar(
                     },
                     ondoubleclick: |evt| evt.stop_propagation(),
                 }
+            }
             }
         }
     }
@@ -86847,6 +87230,11 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
 #[component]
 fn RightRail(
     snapshot: SharedSnapshot,
+    /// The right edge's reveal state machine. Live only while the rail is
+    /// hidden — a hidden rail IS an auto-hide rail.
+    autohide: AutoHideSignals,
+    /// Is the hidden rail currently revealed as an overlay?
+    autohide_revealed: bool,
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
@@ -86920,11 +87308,34 @@ fn RightRail(
         RightPanelMode::AppPane(pane_id) => Some(pane_id.clone()),
         _ => None,
     };
+    // A hidden rail hover-reveals from the right edge as an overlay, exactly as
+    // a hidden session tree does from the left. Same state machine, same
+    // geometry helpers, mirrored edge — and, as on the left, out of flow so the
+    // viewport never resizes on a hover.
+    let rail_overlay = (!visible).then(|| SideRailOverlay {
+        outer_style: sidebar_autohide_overlay_style(
+            SidebarEdge::Right,
+            autohide_revealed,
+            SIDE_RAIL_WIDTH as f32,
+            snapshot.palette,
+        ),
+        content_style: sidebar_autohide_content_style(
+            autohide_revealed,
+            SIDE_RAIL_WIDTH as f32,
+            SidebarEdge::Right,
+        ),
+        revealed: autohide_revealed,
+    });
     rsx! {
         SideRailShell {
             visible: visible,
             width_px: SIDE_RAIL_WIDTH,
             zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+            overlay: rail_overlay,
+            on_reveal: move |_| autohide.reveal(),
+            on_reveal_if_idle: move |_| autohide.reveal_if_idle(),
+            on_mouse_leave: move |_| autohide.handle_mouse_leave(),
+            on_focus_within: move |focused: bool| autohide.set_focus_within(focused),
             body: rsx!{
             if rendered_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone(), on_daemon_hot_restart }
@@ -99920,10 +100331,10 @@ mod tests {
     #[test]
     fn titlebar_autohide_linger_alone_reveals() {
         let (hovered, pinned, lingering) = (false, false, true);
-        assert!(titlebar_autohide_revealed(true, hovered, pinned, lingering));
-        assert!(!titlebar_autohide_revealed(true, false, false, false));
+        assert!(autohide_revealed(true, hovered, pinned, lingering));
+        assert!(!autohide_revealed(true, false, false, false));
         // Auto-hide off means always revealed, whatever the pointer is doing.
-        assert!(titlebar_autohide_revealed(false, false, false, false));
+        assert!(autohide_revealed(false, false, false, false));
     }
 
     // The titlebar is yggterm's chrome, and reaching for the top edge is an
@@ -99981,11 +100392,174 @@ mod tests {
     }
     #[test]
     fn titlebar_autohide_visibility_requires_hover_or_pinned_state() {
-        assert!(titlebar_autohide_revealed(false, false, false, false));
-        assert!(!titlebar_autohide_revealed(true, false, false, false));
-        assert!(titlebar_autohide_revealed(true, true, false, false));
-        assert!(titlebar_autohide_revealed(true, false, true, false));
-        assert!(titlebar_autohide_revealed(true, false, false, true));
+        assert!(autohide_revealed(false, false, false, false));
+        assert!(!autohide_revealed(true, false, false, false));
+        assert!(autohide_revealed(true, true, false, false));
+        assert!(autohide_revealed(true, false, true, false));
+        assert!(autohide_revealed(true, false, false, true));
+    }
+    // ★ THE load-bearing invariant of the hover-reveal sidebars (user spec
+    // 2026-07-21, "open OVER the viewport — z axis"): a hidden sidebar is OUT OF
+    // FLOW in both states, so the viewport's box is byte-identical before,
+    // during and after a reveal. A push/reflow sidebar would resize the viewport
+    // on every hover, re-fitting the xterm and firing `TerminalResize` into the
+    // daemon's PTY grid on a mouse gesture — straight into the squish /
+    // broken-bottom minefield ([[finding-pty-grid-ssot-divergence]]).
+    #[test]
+    fn autohide_sidebar_overlay_never_takes_flow_space() {
+        for edge in [SidebarEdge::Left, SidebarEdge::Right] {
+            for revealed in [false, true] {
+                let style =
+                    sidebar_autohide_overlay_style(edge, revealed, 300.0, palette(UiTheme::ZedLight));
+                assert!(
+                    style.contains("position:absolute;"),
+                    "{edge:?} revealed={revealed} must be out of flow: {style}"
+                );
+                assert!(
+                    !style.contains("flex:"),
+                    "{edge:?} revealed={revealed} must not claim a flex basis: {style}"
+                );
+            }
+        }
+    }
+    // Collapsed leaves exactly the hover sensor on screen — the same 6px strip
+    // trick the titlebar uses, which is what makes the edge reachable at all.
+    #[test]
+    fn autohide_sidebar_collapses_to_a_hover_sensor() {
+        assert_eq!(
+            sidebar_autohide_overlay_width_px(false, 300.0),
+            SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX
+        );
+        assert_eq!(sidebar_autohide_overlay_width_px(true, 300.0), 300.0);
+        let collapsed =
+            sidebar_autohide_overlay_style(SidebarEdge::Left, false, 300.0, palette(UiTheme::ZedLight));
+        assert!(collapsed.contains("width:6px;"), "{collapsed}");
+        assert!(
+            collapsed.contains("background-color:transparent;"),
+            "collapsed sensor must be invisible: {collapsed}"
+        );
+        assert!(collapsed.contains("box-shadow:none;"), "{collapsed}");
+        // ★ THE user-reported regression: a REVEALED overlay must paint an
+        // opaque panel, or the terminal bleeds through it. The in-flow sidebar's
+        // own `palette.sidebar` is `transparent`, so the overlay MUST supply the
+        // shell's opaque fill itself.
+        let revealed =
+            sidebar_autohide_overlay_style(SidebarEdge::Left, true, 300.0, palette(UiTheme::ZedLight));
+        assert!(
+            revealed.contains("background-color:var(--yggterm-opaque-shell-fill"),
+            "revealed overlay must paint an opaque fill: {revealed}"
+        );
+        assert!(
+            !revealed.contains("background-color:transparent"),
+            "revealed overlay must not be transparent: {revealed}"
+        );
+        assert!(
+            revealed.contains("background-image:var(--yggterm-shell-gradient"),
+            "revealed overlay carries the shell gradient: {revealed}"
+        );
+    }
+    #[test]
+    fn autohide_sidebar_edges_anchor_to_their_own_side() {
+        let left =
+            sidebar_autohide_overlay_style(SidebarEdge::Left, true, 300.0, palette(UiTheme::ZedLight));
+        let right = sidebar_autohide_overlay_style(
+            SidebarEdge::Right,
+            true,
+            292.0,
+            palette(UiTheme::ZedLight),
+        );
+        assert!(left.contains("left:0; right:auto;"), "{left}");
+        assert!(right.contains("right:0; left:auto;"), "{right}");
+        // Depth cue points INTO the viewport, mirrored per edge.
+        assert!(left.contains("box-shadow:14px 0"), "{left}");
+        assert!(right.contains("box-shadow:-14px 0"), "{right}");
+        // No border — a 1px border paints the chrome fill and reads as a bright
+        // separator line (the titlebar's 2026-06-27 lesson).
+        assert!(!left.contains("border"), "{left}");
+        assert!(!right.contains("border"), "{right}");
+    }
+    // The content layer holds full width in BOTH states, so the panel slides in
+    // as one piece instead of its rows re-wrapping while the box animates.
+    #[test]
+    fn autohide_sidebar_content_keeps_full_width_and_slides_off_its_own_edge() {
+        let left_hidden = sidebar_autohide_content_style(false, 300.0, SidebarEdge::Left);
+        let left_shown = sidebar_autohide_content_style(true, 300.0, SidebarEdge::Left);
+        let right_hidden = sidebar_autohide_content_style(false, 292.0, SidebarEdge::Right);
+        assert!(left_hidden.contains("width:300px;"), "{left_hidden}");
+        assert!(left_shown.contains("width:300px;"), "{left_shown}");
+        assert!(right_hidden.contains("width:292px;"), "{right_hidden}");
+        assert!(
+            left_hidden.contains("translateX(-300px)"),
+            "left panel slides out to the LEFT: {left_hidden}"
+        );
+        assert!(
+            right_hidden.contains("translateX(292px)"),
+            "right panel slides out to the RIGHT: {right_hidden}"
+        );
+        assert!(left_shown.contains("translateX(0px)"), "{left_shown}");
+        // A collapsed panel must not swallow clicks meant for the viewport; only
+        // the transparent 6px sensor on the outer box stays hoverable.
+        assert!(left_hidden.contains("pointer-events:none;"), "{left_hidden}");
+        assert!(left_shown.contains("pointer-events:auto;"), "{left_shown}");
+    }
+    // Leaving an edge that never revealed must be a NO-OP: `linger` ALONE
+    // satisfies `autohide_revealed`, so starting the grace on a mere crossing
+    // flashes the panel open for 420ms on the way out. This guard used to live
+    // inline in the titlebar's handler; all three edges share it now.
+    #[test]
+    fn autohide_begin_linger_is_a_noop_when_the_edge_never_revealed() {
+        assert_eq!(
+            autohide_leave_action(false, false),
+            AutoHideLeave::Ignore,
+            "a pointer that merely crossed the sensor must not start the grace"
+        );
+        assert_eq!(
+            autohide_leave_action(false, true),
+            AutoHideLeave::CancelStaleLinger
+        );
+        assert_eq!(autohide_leave_action(true, false), AutoHideLeave::BeginLinger);
+        assert_eq!(autohide_leave_action(true, true), AutoHideLeave::BeginLinger);
+    }
+    // A sidebar that collapsed out from under an open context menu, a rename
+    // field, a drag, or a resize drag would abort the very gesture that needed
+    // it. Same reasoning as the titlebar's pinned flags.
+    #[test]
+    fn autohide_sidebar_pins_while_a_gesture_owns_it() {
+        assert!(!sidebar_autohide_pinned_flags(
+            false, false, false, false, false, false
+        ));
+        // alt overlay (KeyTips), context menu, rename, pending delete, resize
+        // drag, row drag — each alone holds the panel open.
+        for index in 0..6 {
+            let mut flags = [false; 6];
+            flags[index] = true;
+            assert!(
+                sidebar_autohide_pinned_flags(
+                    flags[0], flags[1], flags[2], flags[3], flags[4], flags[5]
+                ),
+                "sidebar pin {index} stopped holding the overlay open"
+            );
+        }
+        assert!(!rail_autohide_pinned_flags(false, false));
+        assert!(rail_autohide_pinned_flags(true, false));
+        assert!(rail_autohide_pinned_flags(false, true));
+    }
+    // A revealed overlay is floating DOM, and a LEGACY native webview paints
+    // above all DOM — so the page must be clamped beside it or the reveal is
+    // invisible over a ychrome page. Collapsed, only the sensor is claimed.
+    #[test]
+    fn web_surface_geometry_eval_clamps_both_sidebar_edges() {
+        for needle in [
+            "'[data-sidebar-auto-hide=\"true\"]'",
+            "'[data-yggui-side-rail-auto-hide=\"1\"]'",
+            "const clampLeft",
+            "const clampRight",
+        ] {
+            assert!(
+                WEB_SURFACE_GEOMETRY_EVAL_JS.contains(needle),
+                "geometry eval lost its sidebar clamp: {needle}"
+            );
+        }
     }
     #[test]
     fn closing_snapshot_detaches_terminal_surface_only_when_requested() {
