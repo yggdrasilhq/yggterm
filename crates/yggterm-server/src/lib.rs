@@ -22,7 +22,8 @@ pub use app_control::{
     app_control_responses_dir,
     complete_app_control_request, current_millis, default_recording_output_path,
     default_screenshot_output_path, enqueue_app_control_request, enqueue_screen_recording_request,
-    enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
+    enqueue_screenshot_request, resolve_agent_identity, set_agent_identity,
+    take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{
