@@ -681,7 +681,8 @@ On 2026-05-13, updating jojo from 2.2.49 to 2.2.50 relaunched the GUI on
 2.2.50 but did not preserve the active session as an interactive terminal:
 
 - Active session:
-  `remote-session://dev/019dfde8-d02a-7c23-a270-bab0539e7025`
+  `remote-session://dev/019d0000-0000-7000-8000-000000000001` (placeholder; a
+  real session id never belongs in a public doc)
 - New GUI path:
   `/home/pi/.local/share/yggterm/direct/versions/2.2.50/yggterm`
 - Observed viewport text:
