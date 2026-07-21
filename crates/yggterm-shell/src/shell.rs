@@ -244,6 +244,14 @@ const TERMINAL_IMAGE_PASTE_DEDUPE_MS: u64 = 3_000;
 const BROWSER_TREE_REFRESH_POLL_MS: u64 = 8_000;
 const BROWSER_TREE_ACTIVE_TERMINAL_REFRESH_POLL_MS: u64 = 60_000;
 const BROWSER_TREE_QUIET_REFRESH_POLL_MS: u64 = 60_000;
+/// Consecutive `working=true` polls (the working-flags poll is ~2.5s) a session
+/// must show before a later idle may fire a "session finished working"
+/// notification. `2` requires ~5s of confirmed work, which filters the one-poll
+/// false-`working` blips an idle re-attached remote session periodically reads
+/// (live-evidenced on guihost after the 2.12.1 deploy) while barely delaying a real
+/// completion. Debounces ONLY the notification — the sidebar dot still tracks the
+/// raw `working` flag.
+const WORKING_NOTIFY_CONFIRM_POLLS: u8 = 2;
 const BROWSER_TREE_REFRESH_IN_FLIGHT_RECHECK_MS: u64 = 2_500;
 const BROWSER_TREE_REFRESH_RETRY_MS: u64 = 20_000;
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
@@ -4786,6 +4794,16 @@ struct ShellState {
     // [[finding-stuck-working-dot-noop-signature]] and the daemon-authoritative
     // working state on ManagedSessionView.
     session_working_prev: HashMap<String, bool>,
+    // Notification debounce (NOT the dot): consecutive `working=true` polls seen
+    // for a session. A session must be CONFIRMED working (streak >=
+    // `WORKING_NOTIFY_CONFIRM_POLLS`) before a later idle can fire a "finished"
+    // notification, so a single-poll false-`working` blip — which the 2.5s poll
+    // periodically reads on an otherwise-idle re-attached remote session — can
+    // never trigger a spurious "session finished working" ping. Live-evidenced on
+    // guihost post-2.12.1-deploy: idle remote sessions blipped true for one poll
+    // every 1-3 min, each firing a false done notification. The blinking dot still
+    // tracks the raw `working` flag; only the notification is debounced.
+    session_working_confirm_streak: HashMap<String, u8>,
     // Open libyggterm web surfaces keyed by GUI session_path (OSC 7717,
     // ychrome pilot). SSOT for the viewport web overlay; entries expire when
     // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
@@ -6666,6 +6684,7 @@ impl ShellState {
             notifications: Vec::new(),
             next_notification_id: 1,
             session_working_prev: HashMap::new(),
+            session_working_confirm_streak: HashMap::new(),
             web_surfaces: HashMap::new(),
             web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
@@ -11560,6 +11579,20 @@ impl ShellState {
             false,
         );
     }
+    /// Advance a session's confirmed-working streak for one poll and, on the
+    /// transition to idle, report whether the working state had been CONFIRMED
+    /// (streak reached `WORKING_NOTIFY_CONFIRM_POLLS`) rather than a one-poll blip.
+    /// This is what debounces the "finished" notification against a transient
+    /// false-`working` read; it does NOT touch `session.working` (the dot).
+    fn advance_working_confirm_streak(&mut self, path: &str, working: bool) -> bool {
+        working_confirm_streak_step(
+            &mut self.session_working_confirm_streak,
+            path,
+            working,
+            WORKING_NOTIFY_CONFIRM_POLLS,
+        )
+    }
+
     /// Fire a toast + audio notification when a BACKGROUND agent session
     /// finishes its turn — the confirmed daemon-authoritative `Some(true)` →
     /// `Some(false)` working edge (user decision 2026-06-26: background only, so
@@ -11569,19 +11602,26 @@ impl ShellState {
     /// never fire on a stale/frozen frame. A `None` (no live screen) does NOT
     /// update the remembered verdict, so a transient ownership gap can't drop the
     /// "was working" memory and mis-fire on return.
+    ///
+    /// The "was working" memory is DEBOUNCED (`advance_working_confirm_streak`):
+    /// the session must read `working=true` for `WORKING_NOTIFY_CONFIRM_POLLS`
+    /// consecutive polls before a later idle can notify, so a single-poll false
+    /// `working` blip on an idle re-attached session cannot spam a "finished" ping.
     fn notify_finished_working_sessions(&mut self, source: &str) {
         if !self.settings.in_app_notifications
             && !self.settings.system_notifications
             && !self.settings.notification_sound
         {
-            // Nothing to surface anywhere — still keep the prev-map current so we
-            // don't fire a backlog of edges the moment notifications are enabled.
+            // Nothing to surface anywhere — still keep the prev-map AND the
+            // confirm streak current so we don't fire a backlog of edges the
+            // moment notifications are enabled.
             for session in self.server.live_sessions() {
                 if let Some(working) = session.working {
                     let previous = self
                         .session_working_prev
                         .insert(session.session_path.clone(), working);
                     trace_working_edge_if_changed(&session.session_path, previous, working, source);
+                    let _ = self.advance_working_confirm_streak(&session.session_path, working);
                 }
             }
             return;
@@ -11592,22 +11632,37 @@ impl ShellState {
         for session in self.server.live_sessions() {
             live_paths.insert(session.session_path.clone());
             let Some(working) = session.working else {
-                // Unknown (no live screen): leave the remembered verdict intact.
+                // Unknown (no live screen): leave the remembered verdict AND the
+                // confirm streak intact so a transient ownership gap can neither
+                // drop the "was working" memory nor reset a genuine work streak.
                 continue;
             };
             let previous = self
                 .session_working_prev
                 .insert(session.session_path.clone(), working);
             trace_working_edge_if_changed(&session.session_path, previous, working, source);
-            let was_working = previous == Some(true);
+            // Debounced "was working": only a CONFIRMED work stretch (not a
+            // one-poll false-`working` blip) can fire "finished" when it idles.
+            let was_confirmed_working =
+                self.advance_working_confirm_streak(&session.session_path, working);
             let is_background = active_path.as_deref() != Some(session.session_path.as_str());
-            if was_working && !working && is_background {
+            if was_confirmed_working && is_background {
                 finished.push((session.title.clone(), session.kind));
+            } else if !working && previous == Some(true) && is_background {
+                // A raw working->idle edge that never confirmed = a one-poll
+                // `working` blip; the debounce swallowed a would-be spurious
+                // "finished" ping. Traced so the fix is observable on the live host.
+                append_ui_telemetry_event(
+                    "finished_notification_debounced_blip",
+                    json!({ "session_path": session.session_path, "source": source }),
+                );
             }
         }
-        // Drop remembered verdicts for sessions that are gone so the map can't grow
-        // without bound across a long-lived GUI.
+        // Drop remembered verdicts / streaks for sessions that are gone so the
+        // maps can't grow without bound across a long-lived GUI.
         self.session_working_prev
+            .retain(|path, _| live_paths.contains(path));
+        self.session_working_confirm_streak
             .retain(|path, _| live_paths.contains(path));
         for (title, kind) in finished {
             let cli = match kind {
@@ -18610,6 +18665,30 @@ fn trace_working_edge_if_changed(
             "source": source,
         }),
     );
+}
+
+/// One poll of the "finished working" notification debounce. Advances a session's
+/// consecutive-`working=true` streak; on the transition to idle (`working=false`)
+/// returns whether the work had been CONFIRMED (streak >= `confirm_polls`) rather
+/// than a one-poll false-`working` blip — i.e. whether this idle should notify.
+/// Pure so the blip-vs-real logic is testable without a ShellState.
+/// See [[finding-daemon-handoff-drops-live-rows]] (the 2.12.1 deploy that exposed
+/// the idle-session working blips).
+fn working_confirm_streak_step(
+    streaks: &mut HashMap<String, u8>,
+    path: &str,
+    working: bool,
+    confirm_polls: u8,
+) -> bool {
+    if working {
+        let streak = streaks.entry(path.to_string()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        false
+    } else {
+        streaks
+            .remove(path)
+            .is_some_and(|streak| streak >= confirm_polls)
+    }
 }
 
 /// How often the GUI asks the daemon for bare working flags. Cheap on both
@@ -98402,6 +98481,38 @@ mod tests {
             "managed_session_count": 0,
         }))
         .expect("test runtime status")
+    }
+
+    #[test]
+    fn working_confirm_debounce_filters_a_one_poll_blip_but_fires_real_work() {
+        use super::working_confirm_streak_step as step;
+        let mut s = std::collections::HashMap::<String, u8>::new();
+        let p = "remote-session://example-host/test-session-0001";
+
+        // The observed spam pattern: idle (false), a ONE-poll true blip, idle.
+        assert!(!step(&mut s, p, false, 2), "idle should not notify");
+        assert!(!step(&mut s, p, true, 2), "true never notifies (only idle can)");
+        assert!(
+            !step(&mut s, p, false, 2),
+            "a single-poll working blip must NOT fire finished"
+        );
+        assert!(s.get(p).is_none(), "streak reset after idle");
+
+        // Real work: true for >= 2 consecutive polls, then idle -> notify once.
+        assert!(!step(&mut s, p, true, 2));
+        assert!(!step(&mut s, p, true, 2));
+        assert!(!step(&mut s, p, true, 2));
+        assert!(step(&mut s, p, false, 2), "confirmed work should fire on idle");
+        assert!(
+            !step(&mut s, p, false, 2),
+            "already idle -> no repeat notification"
+        );
+
+        // Alternating flicker (true,false,true,false) never confirms -> never fires.
+        for _ in 0..4 {
+            assert!(!step(&mut s, p, true, 2));
+            assert!(!step(&mut s, p, false, 2), "1-poll flicker must never fire");
+        }
     }
 
     #[test]

@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.12.1
 
+- **No more phantom "session finished working" pings.** An idle background agent
+  session could briefly read as "working" for a single ~2.5s poll and then go
+  idle again, and that false blip fired a "finished working" toast + chime even
+  though the session never actually did anything. The notification now waits for a
+  session to be genuinely working across a couple of polls before it can announce
+  a completion, so a one-poll blip stays silent. The blinking activity dot is
+  unchanged.
 - **Your Live Sessions list no longer shrinks after an app update.** When yggterm
   swapped to a new build, a rare handoff between the old and new background
   services could leave some of your open sessions invisible — the sessions and
