@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.1
+
+- **Your Live Sessions list no longer shrinks after an app update.** When yggterm
+  swapped to a new build, a rare handoff between the old and new background
+  services could leave some of your open sessions invisible — the sessions and
+  their history were always intact, but the rows vanished from the list until you
+  reconnected them by hand. The new service now adopts every session the previous
+  one held — both the ones actively running and the dormant ones — before it takes
+  over, and it loudly records any row it cannot account for. An update no longer
+  costs you your working set.
+
 ## 2.11.6
 
 - **The titlebar buttons close the right sidebar again.** Once an app's
