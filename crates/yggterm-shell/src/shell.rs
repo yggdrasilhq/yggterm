@@ -691,7 +691,49 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 // between (the dot snaps off/on). Paired with `step-end` timing on the
 // animation so the keyframe values jump instead of interpolating (user
 // decision 2026-06-26: "blinking means full off and full on, no fading").
-const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }";
+/// ONE animation drives every blinking dot in the app: `:root` runs the blink and
+/// publishes the current phase as an inherited custom property; each dot merely
+/// reads it (`opacity: var(--yggterm-status-dot-blink)`). No dot owns an
+/// animation of its own.
+///
+/// Why the SHAPE is the fix (this is a performance bug, not a style choice).
+/// A CSS animation's phase is anchored to the moment its element was created, so
+/// N dots created at N different times blink at N different phases. On a
+/// software-GL host (guihost — hardware GL is a trap there, see
+/// [[campaign-yggterm-unified]]) every opacity flip costs a FULL-WINDOW
+/// cairo/pixman blit on the GUI main thread, so cost scales with the number of
+/// distinct phases, not with the handful of pixels that changed. Measured live on
+/// guihost with 5 working dots: per-dot animations = 9.4 presented frames/s and
+/// 10.8% GUI CPU; this root-driven variable = 2.1 frames/s and 5.0% GUI CPU —
+/// flat in the number of dots. Isolating the dots (`contain:paint` /
+/// `will-change`) and dropping `backdrop-filter` were both tried live and did NOT
+/// help; cutting the frame COUNT is the only lever.
+///
+/// Why not per-dot animations with a phase-locking negative `animation-delay`:
+/// changing `animation-delay` does not restart an animation, so a row that
+/// re-renders keeps its original anchor while picking up a freshly computed
+/// delay, and the dots silently drift back apart (caught live — three dots ended
+/// up half a cycle out of step). `:root` never re-renders, so there is nothing to
+/// drift.
+const STATUS_DOT_BLINK_PERIOD_MS: u64 = 1_100;
+const STATUS_DOT_BLINK_VAR: &str = "--yggterm-status-dot-blink";
+const STATUS_DOT_BLINK_CSS: &str =
+    "@keyframes yggterm-status-dot-blink { 0%, 100% { --yggterm-status-dot-blink: 1; } 50% { --yggterm-status-dot-blink: 0; } } \
+     :root { animation: yggterm-status-dot-blink 1100ms step-end infinite; }";
+/// The opacity a status dot renders at. `working` reads the shared blink phase;
+/// idle pins a steady dot.
+///
+/// Both arms emit the SAME property key on purpose: Dioxus applies `style`
+/// property-by-property and never clears a key that a later render drops, so an
+/// arm that omitted `opacity` would leave a finished session blinking forever
+/// (the durable trap from [[spec-sidebar-auto-hide-hover-overlay]]).
+fn status_dot_blink_opacity_css(working: bool) -> String {
+    if working {
+        format!(" opacity: var({STATUS_DOT_BLINK_VAR}, 1);")
+    } else {
+        " opacity: 1;".to_string()
+    }
+}
 /// Session-style rows reveal their trailing actions (✕ …) on ROW HOVER only —
 /// the cwdtree's rule, now shared: a column of always-visible close buttons
 /// reads as clutter next to the tree (user-caught 2026-07-17). Injected once
@@ -27909,11 +27951,7 @@ fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bo
     // blue = lives with the GUI. No halo ring — just the flat dot. Working is a
     // HARD on/off blink via `step-end` (no fade); idle is a steady dot.
     let background = if keep_alive { "#22c55e" } else { "#3b82f6" };
-    let animation = if working {
-        " animation: yggterm-status-dot-blink 1.1s step-end infinite;"
-    } else {
-        ""
-    };
+    let animation = status_dot_blink_opacity_css(working);
     format!(
         "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background};{animation}",
     )
@@ -27931,11 +27969,11 @@ fn live_session_keep_alive_dot_style(palette: Palette) -> String {
 /// The slot is laid out whether or not it blinks: a dot that appears must not
 /// shove the tab's title sideways.
 fn web_tab_loading_dot_style(loading: bool) -> String {
-    let paint = if loading {
-        "background:#22c55e; animation: yggterm-status-dot-blink 1.1s step-end infinite;"
-    } else {
-        "background:transparent;"
-    };
+    let paint = format!(
+        "background:{};{}",
+        if loading { "#22c55e" } else { "transparent" },
+        status_dot_blink_opacity_css(loading)
+    );
     format!(
         "display:inline-block; flex:0 0 auto; width:7px; min-width:7px; height:7px; border-radius:999px; {paint}",
     )
@@ -58892,11 +58930,7 @@ fn SidebarRow(
                             style: format!(
                                 "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{};{}",
                                 machine_indicator_color_value(health),
-                                if busy_icon {
-                                    " animation: yggterm-status-dot-blink 1.1s step-end infinite;"
-                                } else {
-                                    ""
-                                }
+                                status_dot_blink_opacity_css(busy_icon)
                             ),
                         }
                     } else if row_is_group && busy_icon {
@@ -105567,19 +105601,18 @@ mod tests {
         let dark = palette(UiTheme::ZedDark);
         let kept_idle = live_session_status_dot_style(dark, true, false);
         assert!(kept_idle.contains("#22c55e"));
-        assert!(!kept_idle.contains("animation:"));
         let kept_working = live_session_status_dot_style(dark, true, true);
         assert!(kept_working.contains("#22c55e"));
         assert!(kept_working.contains("yggterm-status-dot-blink"));
         // HARD on/off blink (2026-06-26): step-end timing (no fade) + plain
-        // circle (no halo ring). The keyframes snap opacity to a full 0.
-        assert!(kept_working.contains("step-end"));
-        assert!(!kept_working.contains("ease-in-out"));
+        // circle (no halo ring). The keyframes snap the shared phase to a full 0,
+        // and the dot reads that phase as its opacity.
+        assert!(STATUS_DOT_BLINK_CSS.contains("step-end"));
+        assert!(!STATUS_DOT_BLINK_CSS.contains("ease-in-out"));
         assert!(!kept_working.contains("box-shadow"));
-        assert!(STATUS_DOT_BLINK_CSS.contains("opacity: 0;"));
+        assert!(STATUS_DOT_BLINK_CSS.contains("--yggterm-status-dot-blink: 0;"));
         let transient_idle = live_session_status_dot_style(dark, false, false);
         assert!(transient_idle.contains("#3b82f6"));
-        assert!(!transient_idle.contains("animation:"));
         let transient_working = live_session_status_dot_style(dark, false, true);
         assert!(transient_working.contains("#3b82f6"));
         assert!(transient_working.contains("yggterm-status-dot-blink"));
@@ -105588,6 +105621,64 @@ mod tests {
             live_session_keep_alive_dot_style(dark),
             live_session_status_dot_style(dark, true, false)
         );
+    }
+    // The whole point of the shape: exactly ONE animation exists (on `:root`), and
+    // no dot owns one. N dots blinking at N phases cost N full-window blits per
+    // cycle on a software-GL host; a shared inherited phase costs one, forever,
+    // no matter how many dots blink.
+    #[test]
+    fn only_the_root_animates_and_dots_merely_read_the_shared_phase() {
+        let dark = palette(UiTheme::ZedDark);
+        assert!(STATUS_DOT_BLINK_CSS.contains(":root { animation: yggterm-status-dot-blink"));
+        assert_eq!(STATUS_DOT_BLINK_CSS.matches("animation:").count(), 1);
+        // The declared cadence and the documented constant stay one fact.
+        assert!(STATUS_DOT_BLINK_CSS.contains(&format!("{STATUS_DOT_BLINK_PERIOD_MS}ms")));
+        assert!(STATUS_DOT_BLINK_CSS.contains(&format!("{STATUS_DOT_BLINK_VAR}: 0;")));
+        // Every dot style in the app reads the phase; none declares an animation,
+        // so none can acquire a phase of its own.
+        let dot_styles = [
+            live_session_status_dot_style(dark, true, true),
+            live_session_status_dot_style(dark, false, true),
+            web_tab_loading_dot_style(true),
+            status_dot_blink_opacity_css(true),
+        ];
+        for style in &dot_styles {
+            assert!(
+                style.contains("var(--yggterm-status-dot-blink, 1)"),
+                "working dot must read the shared phase: {style}"
+            );
+            assert!(
+                !style.contains("animation:"),
+                "a dot must never own an animation: {style}"
+            );
+        }
+    }
+    // Dioxus applies `style` property-by-property and never clears a key a later
+    // render drops, so working and idle MUST declare the same keys — otherwise a
+    // session that stops working keeps the blink forever.
+    #[test]
+    fn status_dot_declares_the_same_style_keys_working_and_idle() {
+        let dark = palette(UiTheme::ZedDark);
+        let keys = |style: &str| {
+            let mut keys: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&live_session_status_dot_style(dark, true, true)),
+            keys(&live_session_status_dot_style(dark, true, false))
+        );
+        assert_eq!(
+            keys(&web_tab_loading_dot_style(true)),
+            keys(&web_tab_loading_dot_style(false))
+        );
+        assert!(status_dot_blink_opacity_css(false).contains("opacity: 1;"));
+        assert!(!status_dot_blink_opacity_css(false).contains("var("));
     }
     #[test]
     fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {
