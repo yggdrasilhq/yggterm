@@ -1582,6 +1582,13 @@ pub struct ServerRuntimeStatus {
     /// parses — it simply reports no blockers.
     #[serde(default)]
     pub hot_restart_blockers: Vec<HotRestartBlocker>,
+    /// Slice 4.0 (eng-review D7): this daemon enforces the [`ClientRole`] gate, so
+    /// a `Shadow` client may safely rely on takeover being refused.
+    /// `#[serde(default)]` = `false`, so a Shadow probing an OLDER daemon that
+    /// lacks the field reads `false` and fails closed rather than being silently
+    /// treated as `Active`. See [`daemon_enforces_client_roles`].
+    #[serde(default)]
+    pub role_enforcement: bool,
 }
 
 /// A session is working right now (`esc to interrupt` on its screen).
@@ -1989,6 +1996,201 @@ pub enum ServerResponse {
     },
 }
 
+// ===========================================================================
+// Slice 4.0 — client identity + role in the daemon protocol.
+// See docs/agent-control-plane.md "4.0 — Client identity + role". This is a
+// THIRD, distinct identity layer: NOT the app-control cursor identity
+// (`AGENT_IDENTITY_OVERRIDE`, process-global, slice 3) and NOT the PTY runtime
+// owner (`owner_server_pid`). It answers exactly one question per connection:
+// may this client take runtime ownership / drive input, or is it a read-only
+// observer? Encoded as flattened sibling fields of the tagged `ServerRequest`
+// (never a new variant), so it is backward-compatible in both directions.
+// ===========================================================================
+
+/// Error message a `Shadow` client receives when it issues a request outside the
+/// read/observe allowlist — also the journal reason. One source of truth so the
+/// wire string, the gate, and the tests cannot drift.
+pub const SHADOW_CANNOT_OWN: &str = "shadow_cannot_own";
+
+/// A live view-client's role in the daemon protocol (slice 4.0). Anonymous /
+/// pre-4.0 connections deserialize to `Active` (see [`ClientRequestEnvelope`]),
+/// so the user's GUI is unchanged and its 26-row handoff is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientRole {
+    /// Full client (the user's GUI, an agent CLI). May issue any request.
+    #[default]
+    Active,
+    /// Read-only observer (a shadow view client). May issue ONLY the requests
+    /// [`role_gate`] classifies as [`ShadowAccess::Allow`]; every other request
+    /// is refused with [`SHADOW_CANNOT_OWN`] and journaled. A Shadow never
+    /// becomes a PTY owner, never writes keep-alive/owner state, never drives
+    /// winsize/focus.
+    Shadow,
+}
+
+/// Per-connection client identity (slice 4.0). `role` gates takeover; `client_id`
+/// is an optional stable label used only for journaling here (the input-lease
+/// accounting that will consume it lands in slice 4.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub role: ClientRole,
+    pub client_id: Option<String>,
+}
+
+impl ClientIdentity {
+    /// What an anonymous / pre-4.0 connection is treated as: a full `Active`
+    /// client with no id. Zero behavioural change for the user's GUI.
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
+}
+
+/// Wire envelope: a [`ServerRequest`] plus the sender's identity, flattened so
+/// the identity fields are siblings of the request's `kind` tag.
+///
+/// Backward compatibility is the whole point (eng-review D4), proven both
+/// directions by the `client_request_envelope_*` tests:
+/// - an **older daemon** deserializes a new client's bytes as a bare
+///   `ServerRequest`; `client_role`/`client_id` are unknown FIELDS (`ServerRequest`
+///   has no `deny_unknown_fields`) and are safely ignored — never a hard parse
+///   failure, so the row-drop path is not triggered;
+/// - a **newer daemon** deserializes an older client's bare `ServerRequest`; the
+///   absent fields default to `None` = anonymous = `Active`, so the GUI is
+///   unchanged. `skip_serializing_if` keeps an anonymous envelope byte-identical
+///   to the bare enum, so the existing hot path's wire bytes never move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRequestEnvelope {
+    #[serde(flatten)]
+    pub request: ServerRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_role: Option<ClientRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+impl ClientRequestEnvelope {
+    /// Wrap a request with an identity for sending. An anonymous identity yields
+    /// a byte-identical envelope to the bare request (see the struct docs).
+    pub fn new(request: ServerRequest, identity: &ClientIdentity) -> Self {
+        let (client_role, client_id) = match identity.role {
+            // Keep the anonymous/Active wire byte-identical to the bare enum:
+            // emit no role field when there is nothing to distinguish.
+            ClientRole::Active if identity.client_id.is_none() => (None, None),
+            role => (Some(role), identity.client_id.clone()),
+        };
+        Self {
+            request,
+            client_role,
+            client_id,
+        }
+    }
+
+    /// Split the parsed envelope into the request and a fully-resolved identity
+    /// (absent role → anonymous `Active`).
+    pub fn into_parts(self) -> (ServerRequest, ClientIdentity) {
+        let identity = ClientIdentity {
+            role: self.client_role.unwrap_or_default(),
+            client_id: self.client_id,
+        };
+        (self.request, identity)
+    }
+}
+
+/// Whether a `Shadow` client may issue a given request. `Allow` is the
+/// read/observe set; everything else is `Deny`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowAccess {
+    Allow,
+    Deny,
+}
+
+/// The takeover guard (eng-review D3): a **default-deny allowlist** expressed as
+/// an **exhaustive `match` with no wildcard arm**. A `Shadow` may issue only the
+/// enumerated read/observe requests; every ownership-, input-, lifecycle-, or
+/// shared-view-mutation request is `Deny`. Because there is no `_ =>` arm, adding
+/// a new [`ServerRequest`] variant fails the build until its shadow access is
+/// classified here — the ownership boundary cannot develop a silent hole.
+pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
+    match request {
+        // ---- read / observe: safe for a shadow view client ----
+        ServerRequest::Ping
+        | ServerRequest::Status
+        | ServerRequest::WorkingFlags
+        | ServerRequest::Snapshot
+        | ServerRequest::RowOrderLedgerReport { .. }
+        | ServerRequest::TerminalRead { .. }
+        | ServerRequest::TerminalSnapshot { .. }
+        | ServerRequest::TerminalRetainedSnapshot { .. }
+        | ServerRequest::TerminalHistory { .. } => ShadowAccess::Allow,
+        // ---- everything else: ownership, input, lifecycle, or shared-view
+        // mutation. Default-deny, listed explicitly (no wildcard) so a newly
+        // added variant cannot silently inherit Allow. ----
+        ServerRequest::PrepareUpdateRestart
+        | ServerRequest::PrepareClientClose
+        | ServerRequest::HotRestart { .. }
+        | ServerRequest::RetireDaemon { .. }
+        | ServerRequest::OpenStoredSession { .. }
+        | ServerRequest::ConnectSsh { .. }
+        | ServerRequest::ConnectSshCustom { .. }
+        | ServerRequest::StartSshSession { .. }
+        | ServerRequest::StartRemoteCodexSession { .. }
+        | ServerRequest::StartRemoteClaudeSession { .. }
+        | ServerRequest::OpenRemoteSession { .. }
+        | ServerRequest::RefreshRemoteMachine { .. }
+        | ServerRequest::RefreshManagedCli { .. }
+        | ServerRequest::RefreshPreview { .. }
+        | ServerRequest::UpdateSessionCopy { .. }
+        | ServerRequest::RemoveSshTarget { .. }
+        | ServerRequest::RemoveSession { .. }
+        | ServerRequest::DropTerminalRuntime { .. }
+        | ServerRequest::SetSessionKeepAlive { .. }
+        | ServerRequest::ReorderLiveSessions { .. }
+        | ServerRequest::StartLocalSession { .. }
+        | ServerRequest::SwitchAgentSessionMode { .. }
+        | ServerRequest::StartCommandSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
+        | ServerRequest::StartRemoteRuntimeCodexSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeCcSession { .. }
+        | ServerRequest::StartRemoteRuntimeCcSession { .. }
+        | ServerRequest::EnsureShellSession { .. }
+        | ServerRequest::FocusLive { .. }
+        | ServerRequest::SetViewMode { .. }
+        | ServerRequest::TogglePreviewBlock { .. }
+        | ServerRequest::SetAllPreviewBlocksFolded { .. }
+        | ServerRequest::RequestTerminalLaunch
+        | ServerRequest::RequestTerminalLaunchForPath { .. }
+        | ServerRequest::TerminalEnsure { .. }
+        | ServerRequest::TerminalWrite { .. }
+        | ServerRequest::TerminalResize { .. }
+        | ServerRequest::TerminalRestart { .. }
+        | ServerRequest::SyncExternalWindow
+        | ServerRequest::RaiseExternalWindow
+        | ServerRequest::SyncTheme { .. }
+        | ServerRequest::SyncTerminalIdentity { .. }
+        | ServerRequest::Shutdown => ShadowAccess::Deny,
+    }
+}
+
+/// The journal payload emitted when a `Shadow` request is refused. Factored out
+/// so its shape is unit-testable without a live [`DaemonRuntime`].
+fn shadow_refused_trace_fields(request_name: &str, client_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "request": request_name,
+        "client_id": client_id,
+    })
+}
+
+/// Client-side fail-closed check (eng-review D7): a `Shadow` must refuse to
+/// operate against a daemon that does not advertise role-enforcement, because a
+/// daemon that silently ignores the role would treat the Shadow as `Active` — a
+/// privilege *escalation* exactly during the mixed-version window when the guard
+/// matters most. Active/anonymous clients are unaffected. Consumed by the shadow
+/// view client (slice 4.3); pure and unit-tested here.
+pub fn daemon_enforces_client_roles(status: &ServerRuntimeStatus) -> bool {
+    status.role_enforcement
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotRestartResult {
     Restarting {
@@ -2358,6 +2560,10 @@ impl DaemonRuntime {
                 && running_build_id != on_disk_build_id,
             hot_restart_block_reason,
             hot_restart_blockers,
+            // This daemon carries the slice-4.0 role gate, so it always enforces.
+            // A pre-4.0 daemon lacks the field entirely; its status deserializes
+            // `false`, and a Shadow client fails closed against it (D7).
+            role_enforcement: true,
         }
     }
 
@@ -11037,8 +11243,31 @@ fn daemon_queue_remote_machine_refresh(
 fn daemon_request_response(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     request: ServerRequest,
+    identity: &ClientIdentity,
 ) -> ServerResponse {
     let request_name = server_request_name(&request);
+    // Slice 4.0 takeover guard: a `Shadow` client may issue only the
+    // read/observe requests `role_gate` allowlists. Every ownership-, input-,
+    // lifecycle-, or shared-view-mutation request is refused with
+    // `shadow_cannot_own` and journaled BEFORE it can touch daemon state — so a
+    // shadow view client can never claim a PTY, reflow the user's session, or
+    // drive input. Anonymous/Active clients (the user's GUI) never hit this.
+    if identity.role == ClientRole::Shadow && role_gate(&request) == ShadowAccess::Deny {
+        let home_dir = lock_daemon_runtime(runtime, "role_gate_journal")
+            .store
+            .home_dir()
+            .to_path_buf();
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "role_gate",
+            "shadow_refused",
+            shadow_refused_trace_fields(request_name, identity.client_id.as_deref()),
+        );
+        return ServerResponse::Error {
+            message: SHADOW_CANNOT_OWN.to_string(),
+        };
+    }
     if let ServerRequest::RefreshRemoteMachine { machine_key } = request {
         return daemon_queue_remote_machine_refresh(runtime, machine_key, request_name);
     }
@@ -11994,7 +12223,7 @@ fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result
     Ok(())
 }
 
-fn read_request<R: std::io::Read>(reader: R) -> Result<ServerRequest> {
+fn read_request<R: std::io::Read>(reader: R) -> Result<(ServerRequest, ClientIdentity)> {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let bytes = reader
@@ -12003,7 +12232,12 @@ fn read_request<R: std::io::Read>(reader: R) -> Result<ServerRequest> {
     if bytes == 0 {
         bail!("daemon client closed connection before sending a request");
     }
-    serde_json::from_str(line.trim_end()).context("parsing daemon request")
+    // Parse via the identity envelope (slice 4.0). A bare `ServerRequest` from a
+    // pre-4.0 client parses too: the absent identity fields default to anonymous
+    // = `Active`, so the user's GUI is unchanged.
+    let envelope: ClientRequestEnvelope =
+        serde_json::from_str(line.trim_end()).context("parsing daemon request")?;
+    Ok(envelope.into_parts())
 }
 
 #[cfg(unix)]
@@ -12012,12 +12246,12 @@ fn handle_unix_stream(
     runtime: Arc<Mutex<DaemonRuntime>>,
     last_activity_ms: Arc<AtomicU64>,
 ) -> Result<DaemonRequestOutcome> {
-    let request = read_unix_request_with_timeout(
+    let (request, identity) = read_unix_request_with_timeout(
         &stream,
         std::time::Duration::from_millis(DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS),
     )?;
     mark_daemon_activity(last_activity_ms.as_ref());
-    let response = daemon_request_response(&runtime, request.clone());
+    let response = daemon_request_response(&runtime, request.clone(), &identity);
     let outcome = daemon_request_outcome_for_response(&request, &response);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
@@ -12028,7 +12262,7 @@ fn handle_unix_stream(
 fn read_unix_request_with_timeout(
     stream: &std::os::unix::net::UnixStream,
     timeout: std::time::Duration,
-) -> Result<ServerRequest> {
+) -> Result<(ServerRequest, ClientIdentity)> {
     wait_for_unix_daemon_client_request(stream, timeout)?;
     let read_stream = stream.try_clone().context("cloning unix stream")?;
     configure_unix_daemon_client_read_timeout(&read_stream, timeout)?;
@@ -12089,9 +12323,9 @@ fn handle_tcp_stream(
             DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS,
         )))
         .context("setting daemon tcp client read timeout")?;
-    let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
+    let (request, identity) = read_request(stream.try_clone().context("cloning tcp stream")?)?;
     mark_daemon_activity(last_activity_ms.as_ref());
-    let response = daemon_request_response(&runtime, request.clone());
+    let response = daemon_request_response(&runtime, request.clone(), &identity);
     let outcome = daemon_request_outcome_for_response(&request, &response);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
@@ -12645,7 +12879,11 @@ mod tests {
     fn terminal_restart_and_resize_carry_grid_to_remote_pty() {
         let source = include_str!("daemon.rs");
         let restart_block = source
-            .split("ServerRequest::TerminalRestart {")
+            // Anchor on the handler's field binding, not the bare `{`, so the
+            // slice-4.0 `role_gate` arm (`ServerRequest::TerminalRestart { .. }`)
+            // is not mistaken for the handler (same tight anchor the sibling
+            // `terminal_restart_records_client_grid_locally` test uses).
+            .split("ServerRequest::TerminalRestart {\n                path,")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::SyncExternalWindow").next())
             .expect("TerminalRestart handler present");
@@ -13038,6 +13276,167 @@ mod tests {
             message.contains("reading daemon request"),
             "partial request timeout should be reported as a daemon request read failure: {message}"
         );
+    }
+
+    // ---- slice 4.0: client identity + role gate ----
+
+    #[test]
+    fn role_gate_allows_only_read_observe_for_shadow() {
+        use super::{ServerRequest, ShadowAccess, role_gate};
+        // The read/observe allowlist — a shadow view client may issue these.
+        let allowed = [
+            ServerRequest::Ping,
+            ServerRequest::Status,
+            ServerRequest::WorkingFlags,
+            ServerRequest::Snapshot,
+            ServerRequest::RowOrderLedgerReport { scope: None },
+            ServerRequest::TerminalRead {
+                path: "p".into(),
+                cursor: 0,
+            },
+            ServerRequest::TerminalSnapshot { path: "p".into() },
+            ServerRequest::TerminalRetainedSnapshot { path: "p".into() },
+            ServerRequest::TerminalHistory { path: "p".into() },
+        ];
+        for req in &allowed {
+            assert_eq!(
+                role_gate(req),
+                ShadowAccess::Allow,
+                "shadow must be allowed to observe: {req:?}"
+            );
+        }
+        // A representative slice of ownership / input / lifecycle / shared-view
+        // mutation — every one must be refused. (The compiler proves the FULL set
+        // via the exhaustive no-wildcard match in `role_gate`.)
+        let denied = [
+            ServerRequest::DropTerminalRuntime {
+                runtime_key: "k".into(),
+                reason: None,
+            },
+            ServerRequest::SetSessionKeepAlive {
+                path: "p".into(),
+                keep_alive: true,
+            },
+            ServerRequest::TerminalWrite {
+                path: "p".into(),
+                data: "x".into(),
+            },
+            ServerRequest::TerminalResize {
+                path: "p".into(),
+                cols: 80,
+                rows: 24,
+            },
+            ServerRequest::TerminalEnsure { path: "p".into() },
+            ServerRequest::FocusLive {
+                key: "k".into(),
+                view_mode: None,
+            },
+            ServerRequest::HotRestart {
+                daemon_executable: "x".into(),
+                expected_version: None,
+                expected_build_id: None,
+                reason: None,
+                force: false,
+            },
+            ServerRequest::Shutdown,
+        ];
+        for req in &denied {
+            assert_eq!(
+                role_gate(req),
+                ShadowAccess::Deny,
+                "shadow must be refused ownership/mutation: {req:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_request_envelope_roundtrips_and_is_backward_compatible() {
+        use super::{ClientIdentity, ClientRequestEnvelope, ClientRole, ServerRequest};
+        let req = ServerRequest::TerminalRead {
+            path: "p".into(),
+            cursor: 9,
+        };
+        // (a) An anonymous envelope serializes BYTE-IDENTICAL to the bare request,
+        // so the user's GUI wire never moves (zero regression / 26-row handoff).
+        let bare = serde_json::to_string(&req).unwrap();
+        let anon = ClientRequestEnvelope::new(req.clone(), &ClientIdentity::anonymous());
+        assert_eq!(serde_json::to_string(&anon).unwrap(), bare);
+
+        // (b) new client -> new daemon: the role rides and round-trips.
+        let shadow = ClientRequestEnvelope::new(
+            req.clone(),
+            &ClientIdentity {
+                role: ClientRole::Shadow,
+                client_id: Some("view-1".into()),
+            },
+        );
+        let wire = serde_json::to_string(&shadow).unwrap();
+        let (back_req, back_id) = serde_json::from_str::<ClientRequestEnvelope>(&wire)
+            .unwrap()
+            .into_parts();
+        assert_eq!(back_id.role, ClientRole::Shadow);
+        assert_eq!(back_id.client_id.as_deref(), Some("view-1"));
+        assert!(matches!(
+            back_req,
+            ServerRequest::TerminalRead { cursor: 9, .. }
+        ));
+
+        // (c) old client -> new daemon: a bare request parses; role defaults Active.
+        let (_r, id) = serde_json::from_str::<ClientRequestEnvelope>(&bare)
+            .unwrap()
+            .into_parts();
+        assert_eq!(id.role, ClientRole::Active);
+        assert!(id.client_id.is_none());
+
+        // (d) new client -> OLD daemon: envelope-with-role parses as a bare request
+        // (unknown fields ignored — no hard fail, so no row-drop path).
+        let old_daemon: ServerRequest = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            old_daemon,
+            ServerRequest::TerminalRead { cursor: 9, .. }
+        ));
+    }
+
+    #[test]
+    fn shadow_fails_closed_against_non_enforcing_daemon() {
+        use super::daemon_enforces_client_roles;
+        // A pre-4.0 daemon's status lacks `role_enforcement` → it deserializes to
+        // `false`, and a Shadow must treat that as non-enforcing (fail closed).
+        let old: super::ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.11.6",
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+        }))
+        .unwrap();
+        assert!(
+            !daemon_enforces_client_roles(&old),
+            "a pre-4.0 daemon must read as non-enforcing so the Shadow fails closed"
+        );
+        // A 4.0+ daemon advertises enforcement.
+        let new: super::ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "3.0.0",
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "role_enforcement": true,
+        }))
+        .unwrap();
+        assert!(daemon_enforces_client_roles(&new));
+    }
+
+    #[test]
+    fn shadow_refusal_journal_carries_request_and_client_id() {
+        use super::{SHADOW_CANNOT_OWN, shadow_refused_trace_fields};
+        assert_eq!(SHADOW_CANNOT_OWN, "shadow_cannot_own");
+        let fields = shadow_refused_trace_fields("terminal_write", Some("view-1"));
+        assert_eq!(fields["request"], "terminal_write");
+        assert_eq!(fields["client_id"], "view-1");
+        // An anonymous shadow (no client_id) journals a null id, not a crash.
+        let anon = shadow_refused_trace_fields("terminal_write", None);
+        assert!(anon["client_id"].is_null());
     }
 
     #[cfg(unix)]
