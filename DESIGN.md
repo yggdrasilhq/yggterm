@@ -133,6 +133,19 @@ Yggdrasil shells should support a reusable visual theme editor.
   separator line reads as a stray white hairline, most visibly where the chrome
   overhangs the lighter sidebar. The bottom border stays transparent; depth is
   the shadow's job (`titlebar_autohide_chrome_shadow`).
+- **A hidden sidebar is an auto-hide sidebar.** Hiding the session tree or the
+  metadata rail does not remove it; it collapses to a thin hover strip on its
+  own window edge and reveals on hover, over the workspace, on the z axis. There
+  is no settings toggle — this is simply what hidden means. Both edges use the
+  same reveal state machine as the titlebar (`AutoHideSignals`), the same
+  restrained desktop-fast motion, and the same depth vocabulary: soft drop
+  shadow cast into the viewport, mirrored per edge, and never a border hairline
+  (`sidebar_autohide_overlay_shadow`).
+- A revealed sidebar overlay must never resize the workspace. It is positioned
+  out of flow, so the terminal keeps its exact `cols × rows` before, during and
+  after a reveal. This is a correctness rule, not a preference: a reflowing
+  sidebar would re-fit the xterm and push a new PTY grid to the daemon on every
+  hover.
 - Transparent desktop chrome must never be alpha-only. The stable material
   stack is theme tint, gradient wash, and enough fill opacity to stay readable
   without compositor blur.
