@@ -23,6 +23,38 @@ fix) once the fix is verified live on jojo.
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
 
+- **Daemon handoff can drop Live Sessions rows — DETECTION shipped, PREVENTION
+  owed (jojo, 2026-07-21).** A version-bump hot-restart left the user with 13 of
+  26 rows ~20 min AFTER the swap (not at handoff): the predecessor daemon held
+  the DORMANT rows, its disk-binary poll retired it later, and its non-live rows
+  went with it — the live PTY rows survived because they were handed off. Rows
+  are INVISIBLE, not lost (JSONL + PTY intact); the successor claimed every
+  version-socket alias, so it is the only daemon the GUI can reach. Recovery
+  recipe (proven) in [[finding-daemon-handoff-drops-live-rows]]: `server connect`
+  each missing path, then `server reorder --stdin --scope gui:<host>`.
+  **Shipped to branch `feat/slice-4.0-client-identity-role`, NOT deployed:** an
+  observation-only guard `assert_retire_row_coverage` runs at BOTH retirement
+  points (cold shutdown + progressive-migration owner-empty) and, when a
+  reachable successor does not cover a row this daemon is about to drop, writes a
+  `daemon_retire_row_coverage_gap` trace event + a durable `agent-incidents.jsonl`
+  record — so the NEXT deploy's drop is caught by the agent, not the user (last
+  time the user caught it, not the agent). `ServerRuntimeStatus` now carries
+  dormant-row keys (`stored_terminal_session_keys` + `advertises_stored_session_keys`,
+  fail-safe like `role_enforcement`) so the check has no false positives across a
+  mixed-version window. Additive fields — no protocol-shape-stamp bump.
+  **PREVENTION still owed, and the root cause is now sharper:** the successor-side
+  recovery meant to ADOPT a predecessor's rows —
+  `recover_missing_preserved_owner_live_sessions_from_reachable_daemons` (plus
+  `restore_missing_preserved_owner_live_sessions`,
+  `prune_unrepresented_preserved_owner_runtime_sessions`,
+  `focus_live_session_without_launch_if_active_missing`) — is DEAD CODE: zero call
+  sites, the compiler flags them `never used`. That is *why* it "never fired." The
+  fix is to WIRE that recovery into the successor lifecycle (startup + periodic)
+  and extend it to dormant rows, OR gate the version-socket-alias claim on
+  adoption. Riskiest daemon path; verify with a two-daemon sandbox
+  (`YGGTERM_HOME=<tmp> yggterm-headless server daemon`), never a destructive live
+  handoff on a busy host.
+
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
   holes (`t ik` for `think`, including the user's own composer echo), merged

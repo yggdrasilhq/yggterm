@@ -3583,6 +3583,29 @@ impl YggtermServer {
         &self.live_session_order
     }
 
+    /// Keys of every DORMANT (stored, non-live) session this daemon holds — the
+    /// Live Sessions rows that have no owned PTY. Mirrors the `persisted_state`
+    /// stored-session filter exactly, so this reports the set that would be
+    /// persisted. Surfaced in `ServerRuntimeStatus` so a SUCCESSOR daemon can
+    /// verify it covers a retiring predecessor's dormant rows before they vanish
+    /// (B4: the delayed Live-Sessions row-drop, where live PTY rows are handed
+    /// off but dormant rows retire with the predecessor).
+    /// See [[finding-daemon-handoff-drops-live-rows]].
+    pub fn stored_session_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .sessions
+            .iter()
+            .filter(|(path, session)| {
+                session.source == SessionSource::Stored
+                    && !stored_document_owns_runtime_uri(session.kind, path)
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
         let current = self.live_session_order.clone();
         let mut seen = HashSet::<String>::new();
@@ -23223,6 +23246,9 @@ mod tests {
             terminal_session_keys,
             preserved_terminal_owner_count: 0,
             preserved_terminal_owner_keys: Vec::new(),
+            stored_terminal_session_count: 0,
+            stored_terminal_session_keys: Vec::new(),
+            advertises_stored_session_keys: true,
             terminal_retained_chunks: 0,
             terminal_retained_bytes: 0,
             terminal_session_buffer_limit_bytes: 0,
@@ -33427,6 +33453,9 @@ terminal_window_id: None,
             terminal_session_keys: Vec::new(),
             preserved_terminal_owner_count: 0,
             preserved_terminal_owner_keys: Vec::new(),
+            stored_terminal_session_count: 0,
+            stored_terminal_session_keys: Vec::new(),
+            advertises_stored_session_keys: true,
             terminal_retained_chunks: 0,
             terminal_retained_bytes: 0,
             terminal_session_buffer_limit_bytes: 0,
