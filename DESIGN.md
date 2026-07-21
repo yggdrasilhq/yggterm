@@ -625,6 +625,8 @@ One coherent light vocabulary for session state, used by Live Sessions today and
 
 Rules: color encodes durability class, blink encodes activity, and reserved colors are introduced only with a spec update here. Automated Sessions (experimental/automations) must adopt this vocabulary unchanged so a user reads one signal system across the whole sidebar.
 
+**One clock for every blink.** All blinking indicators — live-session dots, machine dots, group dots, web-tab loading lights — flip on the *same* tick. The app owns exactly ONE blink animation, on `:root`, which publishes the current phase as the inherited custom property `--yggterm-status-dot-blink`; an indicator blinks by reading that phase (`opacity: var(--yggterm-status-dot-blink, 1)`), never by declaring an animation of its own. This is both a design rule (a sidebar of dots pulsing in unison reads as one system; dots blinking at random phases read as noise) and a hard performance constraint: on a software-GL host every opacity flip costs a full-window CPU blit, so N independently-phased indicators cost N times the frames of one. Any new indicator MUST join the shared clock.
+
 ### Stage-curtain loading rule
 
 Session loads must look like a stage production: the audience never sees the mess. Concretely:
