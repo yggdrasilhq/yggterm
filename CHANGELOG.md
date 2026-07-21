@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.11.6
 
+- **The titlebar buttons close the right sidebar again.** Once an app's
+  contributed pane (e.g. a vault pane) had held the rail and its app stopped
+  offering it, the rail got stuck open: ⓘ, ⚙, the bell and Connect SSH each
+  re-opened their panel instead of closing it, and clicking the same button twice
+  never converged. The panel the buttons compared against was the internal one
+  still pinned to the departed pane, not the one on screen; they now both read
+  the same value. A pane whose app is gone for good also stops holding the rail
+  slot, so the state cannot be entered in the first place.
 - **Remote sessions no longer come back with a broken bottom after you switch
   away and back.** A session first shown in a tall window persisted an 81-row
   grid; a later, shorter (63-row) window never corrected it because the client
