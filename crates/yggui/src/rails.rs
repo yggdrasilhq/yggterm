@@ -1,7 +1,5 @@
 use dioxus::prelude::*;
 
-use crate::motion::{emphasized_enter_transition, emphasized_exit_transition};
-
 const RAIL_SCROLLBAR_CSS: &str = r#"
 .yggui-rail-scroll {
   scrollbar-width: thin;
@@ -38,118 +36,80 @@ const RAIL_SCROLLBAR_CSS: &str = r#"
 }
 "#;
 
-/// How a hidden side rail behaves: gone, or revealed on hover as a floating
-/// overlay. The host owns the reveal state machine (hover/linger/focus) and hands
-/// the rail only the two styles it must paint with — the rail never decides when
-/// it is revealed.
-#[derive(Clone, PartialEq, Props)]
-pub struct SideRailOverlay {
-    /// Fully-formed outer style for the floating box (positioning, width,
-    /// z-index, chrome). Authored by the host so both sidebars share ONE
-    /// geometry helper.
-    pub outer_style: String,
-    /// Fully-formed style for the content layer, which holds the rail's full
-    /// width at all times so nothing re-wraps as the box animates.
-    pub content_style: String,
-    pub revealed: bool,
+/// The reveal wiring for an auto-hidden side rail: the host owns the state
+/// machine (hover / linger / focus) and hands the rail only handlers to call —
+/// the rail never decides when it is revealed. `None` keeps the classic docked
+/// rail with no hover behaviour.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SideRailReveal {
+    pub on_reveal: EventHandler<()>,
+    pub on_reveal_if_idle: EventHandler<()>,
+    pub on_mouse_leave: EventHandler<()>,
+    pub on_focus_within: EventHandler<bool>,
 }
 
 #[component]
 pub fn SideRailShell(
+    /// Docked (in-flow) or auto-hidden — drives the `data-*` state attributes.
     visible: bool,
-    width_px: usize,
-    zoom_percent: f32,
-    /// Present when the rail is HIDDEN and should hover-reveal over the viewport
-    /// instead of collapsing to nothing. `None` keeps the classic in-flow rail.
-    overlay: Option<SideRailOverlay>,
-    /// Pointer/focus handlers for the overlay's edge. Ignored without `overlay`.
-    on_reveal: Option<EventHandler<()>>,
-    on_reveal_if_idle: Option<EventHandler<()>>,
-    on_mouse_leave: Option<EventHandler<()>>,
-    on_focus_within: Option<EventHandler<bool>>,
+    auto_hide: bool,
+    revealed: bool,
+    /// Fully-formed outer + content styles, authored by the host so the left
+    /// tree and the right rail share ONE geometry helper (`sidebar_panel_*`).
+    /// The host emits a FIXED property key set across every mode; the rail must
+    /// not add or drop keys here (Dioxus applies `style` property-by-property and
+    /// does not clear dropped keys — that lingering was the docked-rail-ghost bug).
+    outer_style: String,
+    content_style: String,
+    /// Present only for an auto-hidden rail. Ignored when docked.
+    reveal: Option<SideRailReveal>,
+    /// A resize grip on the rail's inner (left) edge — the host authors it so the
+    /// drag machinery stays in the shell. `None` for a non-resizable rail.
+    resize_handle: Option<Element>,
     body: Element,
 ) -> Element {
-    let rail_width = if visible { width_px } else { 0 };
-    let opacity = if visible { "1" } else { "0" };
-    let translate = if visible {
-        "translateX(0)"
-    } else {
-        "translateX(14px)"
-    };
-    let pointer_events = if visible { "auto" } else { "none" };
-    let transition = if visible {
-        emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"])
-    } else {
-        emphasized_exit_transition(&["width", "min-width", "max-width", "opacity", "transform"])
-    };
-    let in_flow_style = format!(
-        "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
-         background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
-         -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-         transition:{}; opacity:{}; transform:{}; \
-         pointer-events:{}; zoom:{}%;",
-        rail_width,
-        rail_width,
-        rail_width,
-        transition,
-        opacity,
-        translate,
-        pointer_events,
-        zoom_percent
-    );
-    let overlay_revealed = overlay.as_ref().is_some_and(|overlay| overlay.revealed);
-    let outer_style = match overlay.as_ref() {
-        Some(overlay) => format!(
-            "{} text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; \
-             -moz-osx-font-smoothing:grayscale; zoom:{}%;",
-            overlay.outer_style, zoom_percent
-        ),
-        None => in_flow_style,
-    };
-    let content_style = match overlay.as_ref() {
-        Some(overlay) => overlay.content_style.clone(),
-        None => "display:flex; flex-direction:column; flex:1; min-height:0; width:100%; min-width:0;"
-            .to_string(),
-    };
     rsx! {
         div {
             "data-yggui-side-rail": "1",
             "data-yggui-side-rail-visible": if visible { "1" } else { "0" },
-            "data-yggui-side-rail-auto-hide": if overlay.is_some() { "1" } else { "0" },
-            "data-yggui-side-rail-autohide-revealed": if overlay_revealed { "1" } else { "0" },
-            "data-covers-web-surface": if overlay_revealed { "sidebar-right" },
+            "data-yggui-side-rail-auto-hide": if auto_hide { "1" } else { "0" },
+            "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
+            "data-covers-web-surface": if revealed { "sidebar-right" },
             style: outer_style,
             onmousedown: |evt| evt.stop_propagation(),
             onclick: |evt| evt.stop_propagation(),
             onmouseenter: move |_| {
-                if let Some(handler) = on_reveal.as_ref() {
-                    handler.call(());
+                if let Some(reveal) = reveal.as_ref() {
+                    reveal.on_reveal.call(());
                 }
             },
             onmousemove: move |_| {
-                if let Some(handler) = on_reveal_if_idle.as_ref() {
-                    handler.call(());
+                if let Some(reveal) = reveal.as_ref() {
+                    reveal.on_reveal_if_idle.call(());
                 }
             },
             onmouseleave: move |_| {
-                if let Some(handler) = on_mouse_leave.as_ref() {
-                    handler.call(());
+                if let Some(reveal) = reveal.as_ref() {
+                    reveal.on_mouse_leave.call(());
                 }
             },
             onfocusin: move |_| {
-                if let Some(handler) = on_focus_within.as_ref() {
-                    handler.call(true);
+                if let Some(reveal) = reveal.as_ref() {
+                    reveal.on_focus_within.call(true);
                 }
             },
             onfocusout: move |_| {
-                if let Some(handler) = on_focus_within.as_ref() {
-                    handler.call(false);
+                if let Some(reveal) = reveal.as_ref() {
+                    reveal.on_focus_within.call(false);
                 }
             },
             div {
                 "data-yggui-side-rail-content": "1",
                 style: content_style,
                 {body}
+            }
+            if let Some(resize_handle) = resize_handle {
+                {resize_handle}
             }
         }
     }

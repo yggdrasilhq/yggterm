@@ -211,8 +211,9 @@ use yggterm_server::{
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
-    HoveredChromeControl as HoveredControl, RailHeader, RailScrollBody, RailSectionTitle,
-    SideRailOverlay, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
+    HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
+    RailHeader, RailScrollBody, RailSectionTitle,
+    SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
     ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
@@ -404,9 +405,14 @@ const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
 const SIDEBAR_SEARCH_CACHE_LIMIT: usize = 256;
 const SIDEBAR_SEARCH_RENDER_LIMIT: usize = 120;
+/// Default width of the right rail; the persisted `rail_width` overrides it.
 const SIDE_RAIL_WIDTH: usize = 292;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+/// The right rail is independently draggable (user 2026-07-21). A metadata rail
+/// wants a touch more room than the tree, hence its own clamp.
+const RAIL_MIN_WIDTH: f32 = 240.0;
+const RAIL_MAX_WIDTH: f32 = 460.0;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const SNAPSHOT_LIVE_TERMINAL_LINE_LIMIT: usize = 48;
 const SNAPSHOT_RETAINED_TERMINAL_LINE_LIMIT: usize = 40;
@@ -888,6 +894,13 @@ const TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX: f64 = 6.0;
 /// titlebar's top strip. Same width for both sidebars: an edge is an edge, and a
 /// second number would only invite them to drift apart.
 const SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX: f64 = 6.0;
+/// Margin around the floating reveal card (all four sides), so it reads as an
+/// island the viewport shows around rather than a slab jammed to the edge.
+const SIDEBAR_OVERLAY_GAP_PX: f64 = 10.0;
+/// Corner radius of the floating reveal card. Matches the viewport's own corner
+/// radius (`terminal_frame_style` host_radius = 10px) so the floating panel and
+/// the terminal read as the same rounded language (user 2026-07-21).
+const SIDEBAR_OVERLAY_RADIUS_PX: f64 = 10.0;
 /// Revealed sidebars float BELOW the titlebar's 180 — the titlebar spans the
 /// full width and owns the corner, so a sidebar must never paint over it.
 const SIDEBAR_AUTOHIDE_Z_INDEX: u32 = 170;
@@ -4702,6 +4715,10 @@ struct ShellState {
     sidebar_open: bool,
     sidebar_width: f32,
     sidebar_resize_drag: Option<SidebarResizeDrag>,
+    /// Right rail width + in-flight resize drag — the mirror of the two fields
+    /// above, for the independently-draggable metadata rail.
+    rail_width: f32,
+    rail_resize_drag: Option<SidebarResizeDrag>,
     right_panel_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
@@ -5304,6 +5321,8 @@ struct RenderSnapshot {
     sidebar_open: bool,
     sidebar_width: f32,
     sidebar_resizing: bool,
+    rail_width: f32,
+    rail_resizing: bool,
     right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
@@ -6425,6 +6444,9 @@ fn pending_interactive_session_request<'a>(
 fn clamp_sidebar_width(width: f32) -> f32 {
     width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
 }
+fn clamp_rail_width(width: f32) -> f32 {
+    width.clamp(RAIL_MIN_WIDTH, RAIL_MAX_WIDTH)
+}
 #[derive(Default)]
 struct PreviewBlockCache {
     order: VecDeque<u64>,
@@ -6488,6 +6510,7 @@ impl ShellState {
         };
         let sidebar_open = settings.show_tree;
         let sidebar_width = clamp_sidebar_width(settings.tree_width);
+        let rail_width = clamp_rail_width(settings.rail_width);
         // Captured before `settings` is moved into the ShellState struct below
         // ([[campaign-split-view-groups]] persistence restore).
         let restored_split_groups = settings.split_groups.clone();
@@ -6565,6 +6588,8 @@ impl ShellState {
             sidebar_open,
             sidebar_width,
             sidebar_resize_drag: None,
+            rail_width,
+            rail_resize_drag: None,
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: initial_window_maximized,
@@ -7307,6 +7332,8 @@ impl ShellState {
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
             sidebar_resizing: self.sidebar_resize_drag.is_some(),
+            rail_width: self.rail_width,
+            rail_resizing: self.rail_resize_drag.is_some(),
             right_panel_mode: {
                 // A contributed pane the active session no longer offers (session
                 // switch, or the app died) falls back to the user's own view
@@ -9675,6 +9702,43 @@ impl ShellState {
             self.persist_settings();
             self.last_action =
                 format!("sidebar resized to {}px", self.sidebar_width.round() as i64);
+        }
+    }
+    // The right rail's resize is the MIRROR of the left tree's: same drag record,
+    // but the handle lives on the rail's INNER (left) edge, so dragging LEFT (a
+    // negative x delta) makes it WIDER — hence the negated delta below.
+    fn start_rail_resize(&mut self, client_x: f64) {
+        self.rail_resize_drag = Some(SidebarResizeDrag {
+            origin_client_x: client_x,
+            origin_width: self.rail_width,
+        });
+        self.last_action = "rail resize started".to_string();
+    }
+    fn update_rail_resize(&mut self, client_x: f64) {
+        let Some(drag) = self.rail_resize_drag else {
+            return;
+        };
+        let delta = (drag.origin_client_x - client_x) as f32;
+        let next_width = clamp_rail_width(drag.origin_width + delta);
+        if (next_width - self.rail_width).abs() < 0.5 {
+            return;
+        }
+        self.rail_width = next_width;
+        self.settings.rail_width = next_width;
+        self.persist_settings();
+        self.last_action = format!("rail width {}px", next_width.round() as i64);
+    }
+    fn handle_rail_resize_pointer(&mut self, client_x: f64) {
+        if self.rail_resize_drag.is_none() {
+            return;
+        }
+        self.update_rail_resize(client_x);
+    }
+    fn finish_rail_resize(&mut self) {
+        if self.rail_resize_drag.take().is_some() {
+            self.settings.rail_width = self.rail_width;
+            self.persist_settings();
+            self.last_action = format!("rail resized to {}px", self.rail_width.round() as i64);
         }
     }
     fn toggle_metadata_panel(&mut self) {
@@ -27284,45 +27348,143 @@ fn autohide_handle_mouse_leave(
         autohide_spawn_linger_task(hovered, lingering, linger_generation, generation);
     }
 }
-/// Geometry of a hidden sidebar: the in-flow footprint is ALWAYS zero, so the
-/// viewport keeps the width it had and the xterm never re-fits.
+/// The three visual states a sidebar (left tree / right rail) can be in.
 ///
-/// This is the load-bearing half of the spec's "z axis" hint. A push/reflow
-/// reveal would resize the viewport on every hover, firing `TerminalResize` into
-/// the daemon's PTY grid on a mouse gesture — straight into the squish /
-/// broken-bottom minefield ([[finding-pty-grid-ssot-divergence]]). Overlay is not
-/// a cosmetic preference; it is what keeps hover out of the resize hot path.
-fn sidebar_autohide_overlay_width_px(revealed: bool, sidebar_width: f32) -> f64 {
-    if revealed {
-        sidebar_width.round().max(0.0) as f64
-    } else {
-        SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX
+/// ★ Dioxus applies the `style` attribute PROPERTY-BY-PROPERTY, and does NOT
+/// clear a property that the previous render set but the new one omits. So the
+/// two style builders below emit the SAME property keys in EVERY mode — only the
+/// VALUES change. Diverging key sets was a real bug: toggling a revealed rail
+/// back to always-visible left `position:absolute; z-index; box-shadow` lingering
+/// from the overlay style, so the "docked" rail floated as a transparent ghost
+/// over the viewport (user-reported 2026-07-21). Fixed keys ⇒ every switch fully
+/// resets. Do not add a property to one arm without adding it (with a reset
+/// value) to the others.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SidebarPanelMode {
+    /// Docked, always-visible. Unchanged from the classic sidebar — the user
+    /// asked that always-visible look exactly as before.
+    InFlow,
+    /// Auto-hidden: only the edge hover sensor is on screen.
+    Collapsed,
+    /// Auto-hidden and hovered: a floating inset card over the viewport.
+    Revealed,
+}
+/// The OUTER positioning shell of a sidebar. In every mode it is transparent and
+/// shadowless — the CARD (`sidebar_panel_card_style`) carries the paint. When
+/// auto-hidden it leaves flow entirely (`position:absolute`), which is the
+/// load-bearing half of the spec's "z axis" hint: the viewport box never
+/// changes across a reveal, so the xterm never re-fits and no `TerminalResize`
+/// hits the daemon PTY grid ([[finding-pty-grid-ssot-divergence]]).
+///
+/// Revealed, the outer is WIDER than the card (card width + a margin either
+/// side) so the pointer resting on the floating card — and the gap around it —
+/// stays "inside" and the panel does not collapse out from under the cursor.
+fn sidebar_panel_outer_style(
+    edge: SidebarEdge,
+    mode: SidebarPanelMode,
+    sidebar_width: f32,
+    zoom_percent: f32,
+) -> String {
+    let card = sidebar_width.round().max(0.0) as f64;
+    let z_index = match mode {
+        SidebarPanelMode::InFlow => "auto".to_string(),
+        _ => SIDEBAR_AUTOHIDE_Z_INDEX.to_string(),
+    };
+    let (position, overflow, hit_width, anchor, flex) = match mode {
+        SidebarPanelMode::InFlow => (
+            "relative",
+            "hidden",
+            card,
+            "left:auto; right:auto;",
+            format!("flex:0 0 {card}px;"),
+        ),
+        SidebarPanelMode::Collapsed => (
+            "absolute",
+            "visible",
+            SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX,
+            sidebar_edge_anchor(edge),
+            "flex:0 0 auto;".to_string(),
+        ),
+        SidebarPanelMode::Revealed => (
+            "absolute",
+            "visible",
+            card + 2.0 * SIDEBAR_OVERLAY_GAP_PX,
+            sidebar_edge_anchor(edge),
+            "flex:0 0 auto;".to_string(),
+        ),
+    };
+    format!(
+        "position:{}; top:0; bottom:0; {} width:{}px; min-width:{}px; max-width:{}px; height:100%; \
+         align-self:stretch; z-index:{}; display:flex; flex-direction:column; {} background:transparent; \
+         box-shadow:none; overflow:{}; opacity:1; transform:none; pointer-events:auto; \
+         zoom:{}%; user-select:none; -webkit-user-select:none; box-sizing:border-box; \
+         transition:width {ms}ms {ease}, min-width {ms}ms {ease}, max-width {ms}ms {ease};",
+        position,
+        anchor,
+        hit_width,
+        hit_width,
+        hit_width,
+        z_index,
+        flex,
+        overflow,
+        zoom_percent,
+        ms = MOTION_ENTER_DURATION_MS,
+        ease = MOTION_EMPHASIZED_DECELERATE,
+    )
+}
+fn sidebar_edge_anchor(edge: SidebarEdge) -> &'static str {
+    match edge {
+        SidebarEdge::Left => "left:0; right:auto;",
+        SidebarEdge::Right => "right:0; left:auto;",
     }
 }
-/// The floating positioning + chrome for a hidden sidebar.
+/// The CARD — the visible panel. In-flow it fills the outer transparently (the
+/// docked look, unchanged: `palette.sidebar` is transparent and the app-bg
+/// paints behind it). Auto-hidden it is a floating island: inset by a margin on
+/// all four sides, rounded, soft-shadowed, and painting the shell's OWN opaque
+/// fill + gradient so the viewport never bleeds through it and the panel reads as
+/// continuous with the chrome. Modelled on Zen's hover sidebar (user reference
+/// 2026-07-21). Collapsed it is the same geometry at opacity 0, off-slid.
 ///
-/// Collapsed it is an invisible hover sensor pinned to its edge; revealed it is
-/// the same panel painted over the viewport with a depth shadow. `position:
-/// absolute` takes it out of flow entirely, which is what guarantees the
-/// viewport's box never changes across a reveal.
-fn sidebar_autohide_overlay_style(
+/// Emits the SAME property keys in every mode — see `SidebarPanelMode`.
+fn sidebar_panel_card_style(
     edge: SidebarEdge,
-    revealed: bool,
+    mode: SidebarPanelMode,
     sidebar_width: f32,
     palette: Palette,
 ) -> String {
-    let width = sidebar_autohide_overlay_width_px(revealed, sidebar_width);
-    let anchor = match edge {
-        SidebarEdge::Left => "left:0; right:auto;",
-        SidebarEdge::Right => "right:0; left:auto;",
+    let gap = SIDEBAR_OVERLAY_GAP_PX;
+    let card = sidebar_width.round().max(0.0) as f64;
+    let revealed = mode == SidebarPanelMode::Revealed;
+    let floating = mode != SidebarPanelMode::InFlow;
+    let (position, inset, radius) = if floating {
+        // Inset by a margin on all four sides, pinned to its own edge — a
+        // floating island the viewport shows around.
+        let (near, far) = match edge {
+            SidebarEdge::Left => ("left", "right"),
+            SidebarEdge::Right => ("right", "left"),
+        };
+        (
+            "absolute",
+            format!("top:{gap}px; bottom:{gap}px; {near}:{gap}px; {far}:auto;"),
+            SIDEBAR_OVERLAY_RADIUS_PX,
+        )
+    } else {
+        (
+            "relative",
+            "top:auto; bottom:auto; left:auto; right:auto;".to_string(),
+            0.0,
+        )
     };
-    // The in-flow sidebar's own `palette.sidebar` is `transparent` — it relies
-    // entirely on the opaque `data-yggterm-app-bg` layer painting behind the
-    // whole flex row. A floating overlay has nothing behind it, so it must paint
-    // that material ITSELF or the terminal bleeds straight through (the user saw
-    // exactly this). We reuse the SHELL's own opaque-fill + gradient CSS vars
-    // (SSOT: the same paint the app background computes) so the panel is
-    // guaranteed opaque and visually continuous with the shell chrome.
+    // Floating: an EXPLICIT width (the sidebar width) — NOT `auto`, or the card
+    // grows to fit its widest row (long session titles blew it out to ~500px).
+    // Height comes from the top/bottom insets. Docked: fill the outer.
+    let width = if floating {
+        format!("{card}px")
+    } else {
+        "100%".to_string()
+    };
+    let height = if floating { "auto" } else { "100%" };
     let (background_color, background_image) = if revealed {
         (
             format!(
@@ -27335,31 +27497,34 @@ fn sidebar_autohide_overlay_style(
         ("transparent".to_string(), "none".to_string())
     };
     let shadow = if revealed {
-        sidebar_autohide_overlay_shadow(edge, palette)
+        sidebar_card_shadow(palette)
     } else {
         "none"
     };
-    let transition = if revealed {
-        emphasized_enter_transition(&["width", "min-width", "max-width", "box-shadow"])
+    // Collapsed slides the card a little toward its edge so the reveal is a slide
+    // + fade, not a hard pop. Revealed / in-flow sit at rest.
+    let translate = if revealed || !floating {
+        0.0
     } else {
-        emphasized_exit_transition(&["width", "min-width", "max-width", "box-shadow"])
+        match edge {
+            SidebarEdge::Left => -(gap + 12.0),
+            SidebarEdge::Right => gap + 12.0,
+        }
     };
     format!(
-        // `height:100%` rather than `bottom:0`: the in-flow sidebar has proven
-        // that declaration correct under the shell's CSS `zoom`, and an
-        // auto-hidden sidebar must not render differently from an open one.
-        // Gradient sized/positioned to the shell so the wash lines up with the
-        // chrome rather than restarting inside the panel.
-        "position:absolute; top:0; height:100%; {} width:{}px; min-width:{}px; max-width:{}px; \
-         z-index:{}; background-color:{}; background-image:{}; \
+        "position:{}; {} width:{}; height:{}; \
+         border-radius:{}px; background-color:{}; background-image:{}; \
          background-size:var(--yggterm-shell-background-size, 100% 100vh); \
-         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top {}; \
-         box-shadow:{}; overflow:hidden; transition:{};",
-        anchor,
+         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); \
+         background-position:top {}; box-shadow:{}; opacity:{}; transform:translateX({}px); \
+         pointer-events:{}; overflow:hidden; display:flex; flex-direction:column; \
+         min-height:0; min-width:0; will-change:transform, opacity; \
+         transition:opacity {ms}ms {ease}, transform {ms}ms {ease}, box-shadow {ms}ms {ease};",
+        position,
+        inset,
         width,
-        width,
-        width,
-        SIDEBAR_AUTOHIDE_Z_INDEX,
+        height,
+        radius,
         background_color,
         background_image,
         match edge {
@@ -27367,51 +27532,23 @@ fn sidebar_autohide_overlay_style(
             SidebarEdge::Right => "right",
         },
         shadow,
-        transition
+        if revealed || !floating { "1" } else { "0" },
+        translate,
+        if revealed || !floating { "auto" } else { "none" },
+        ms = MOTION_ENTER_DURATION_MS,
+        ease = MOTION_EMPHASIZED_DECELERATE,
     )
 }
-/// Depth cue for a revealed overlay sidebar: a soft shadow cast INTO the
-/// viewport, never a hairline border. Same reasoning as the titlebar's — a 1px
-/// border paints the chrome fill and reads as a bright separator line.
-fn sidebar_autohide_overlay_shadow(edge: SidebarEdge, palette: Palette) -> &'static str {
-    match (edge, palette_is_dark(palette)) {
-        (SidebarEdge::Right, true) => "-14px 0 30px rgba(0,0,0,0.42)",
-        (SidebarEdge::Right, false) => "-14px 0 28px rgba(70,92,116,0.18)",
-        (SidebarEdge::Left, true) => "14px 0 30px rgba(0,0,0,0.42)",
-        (SidebarEdge::Left, false) => "14px 0 28px rgba(70,92,116,0.18)",
+/// Depth for a floating sidebar card: a soft ambient drop shadow on all sides
+/// (an island lifted off the surface), never a hairline border — a 1px border
+/// paints the chrome fill and reads as a bright separator line (the titlebar's
+/// 2026-06-27 lesson).
+fn sidebar_card_shadow(palette: Palette) -> &'static str {
+    if palette_is_dark(palette) {
+        "0 16px 48px rgba(0,0,0,0.55), 0 2px 10px rgba(0,0,0,0.38)"
+    } else {
+        "0 16px 44px rgba(70,92,116,0.26), 0 2px 10px rgba(70,92,116,0.16)"
     }
-}
-/// The overlay's CONTENT layer: kept at the sidebar's full width so the panel
-/// slides in as one piece instead of its rows re-wrapping as the box widens.
-fn sidebar_autohide_content_style(revealed: bool, sidebar_width: f32, edge: SidebarEdge) -> String {
-    let width = sidebar_width.round().max(0.0) as f64;
-    let offset = if revealed {
-        0.0
-    } else if edge == SidebarEdge::Right {
-        width
-    } else {
-        -width
-    };
-    let transition = if revealed {
-        emphasized_enter_transition(&["opacity", "transform"])
-    } else {
-        emphasized_exit_transition(&["opacity", "transform"])
-    };
-    format!(
-        "position:absolute; top:0; height:100%; {}:0; width:{}px; display:flex; flex-direction:column; \
-         min-height:0; opacity:{}; transform:translateX({}px); pointer-events:{}; \
-         will-change:transform, opacity; transition:{};",
-        if edge == SidebarEdge::Right {
-            "right"
-        } else {
-            "left"
-        },
-        width,
-        if revealed { "1" } else { "0" },
-        offset,
-        if revealed { "auto" } else { "none" },
-        transition
-    )
 }
 fn titlebar_autohide_chrome_background_color(
     palette: Palette,
@@ -35986,6 +36123,8 @@ fn describe_app_state_snapshot(
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,
             "sidebar_resizing": shell.sidebar_resize_drag.is_some(),
+            "rail_width": shell.rail_width,
+            "rail_resizing": shell.rail_resize_drag.is_some(),
             "right_panel_mode": right_panel_mode_label(&snapshot.right_panel_mode),
             "preview_layout": preview_layout_mode_label(shell.preview_layout),
             "search_query": shell.search_query,
@@ -53920,6 +54059,7 @@ fn app() -> Element {
                     state.with_mut(|shell| shell.clear_drag_state());
                 }
                 state.with_mut(|shell| shell.finish_sidebar_resize());
+                state.with_mut(|shell| shell.finish_rail_resize());
             },
             onmousemove: move |evt| {
                 let pointer = evt.client_coordinates();
@@ -53941,6 +54081,9 @@ fn app() -> Element {
                     state.with_mut(|shell| {
                         shell.handle_sidebar_resize_pointer(pointer.x, primary_down)
                     });
+                }
+                if state.read().rail_resize_drag.is_some() {
+                    state.with_mut(|shell| shell.handle_rail_resize_pointer(pointer.x));
                 }
             },
             onkeydown: move |evt| {
@@ -54800,6 +54943,23 @@ fn app() -> Element {
                         },
                     }
                 }
+                // The twin for the right rail: a full-window pointer trap so the
+                // drag keeps tracking over the terminal/webview, which would
+                // otherwise swallow the mousemove.
+                if snapshot.rail_resizing {
+                    div {
+                        "data-rail-resize-overlay": "1",
+                        style: "position:absolute; inset:0; z-index:260; background:transparent; cursor:ew-resize;",
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onmousemove: move |evt| {
+                            let pointer = evt.client_coordinates();
+                            state.with_mut(|shell| shell.handle_rail_resize_pointer(pointer.x));
+                        },
+                        onmouseup: move |_| {
+                            state.with_mut(|shell| shell.finish_rail_resize());
+                        },
+                    }
+                }
                 if fullscreen {
                     div {
                         style: "position:absolute; top:12px; right:14px; z-index:180;",
@@ -55081,6 +55241,9 @@ fn app() -> Element {
                             snapshot: metadata_snapshot,
                             autohide: right_rail_autohide,
                             autohide_revealed: right_rail_revealed,
+                            on_start_rail_resize: move |client_x: f64| {
+                                state.with_mut(|shell| shell.start_rail_resize(client_x))
+                            },
                             state,
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
@@ -56540,15 +56703,17 @@ fn Sidebar(
     on_commit_rename: EventHandler<BrowserRow>,
     on_cancel_rename: EventHandler<()>,
 ) -> Element {
-    // A hidden sidebar leaves the FLOW entirely (see
-    // `sidebar_autohide_overlay_style`): the viewport keeps its full width and
-    // the reveal happens on the z axis, so hovering the edge never re-fits the
-    // xterm and never touches the daemon's PTY grid.
+    // A hidden sidebar leaves the FLOW entirely (see `sidebar_panel_outer_style`):
+    // the viewport keeps its full width and the reveal happens on the z axis, so
+    // hovering the edge never re-fits the xterm and never touches the daemon's
+    // PTY grid.
     let auto_hide = !snapshot.sidebar_open;
-    let width = if snapshot.sidebar_open {
-        snapshot.sidebar_width.round().max(0.0) as usize
+    let mode = if snapshot.sidebar_open {
+        SidebarPanelMode::InFlow
+    } else if autohide_revealed {
+        SidebarPanelMode::Revealed
     } else {
-        0
+        SidebarPanelMode::Collapsed
     };
     let drag_active = !snapshot.drag_paths.is_empty();
     // PERF: rows are wrapped in `Rc` so the sidebar render loop below can hand a
@@ -56577,44 +56742,18 @@ fn Sidebar(
                 .then(|| row.full_path.clone())
         })
         .collect::<HashSet<_>>();
-    let sidebar_transition =
-        emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"]);
-    let outer_style = if auto_hide {
-        format!(
-            "{} zoom:{}%; user-select:none; -webkit-user-select:none; box-sizing:border-box;",
-            sidebar_autohide_overlay_style(
-                SidebarEdge::Left,
-                autohide_revealed,
-                snapshot.sidebar_width,
-                snapshot.palette,
-            ),
-            zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
-        )
-    } else {
-        format!(
-            "width:{}px; min-width:{}px; max-width:{}px; flex:0 0 {}px; height:100%; min-height:0; align-self:stretch; display:flex; flex-direction:column; \
-             background:{}; overflow:hidden; transition:{}; \
-             opacity:1; transform:translateX(0); pointer-events:auto; zoom:{}%; user-select:none; \
-             -webkit-user-select:none; position:relative; box-sizing:border-box;",
-            width,
-            width,
-            width,
-            width,
-            snapshot.palette.sidebar,
-            sidebar_transition,
-            zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
-        )
-    };
-    let content_style = if auto_hide {
-        sidebar_autohide_content_style(
-            autohide_revealed,
-            snapshot.sidebar_width,
-            SidebarEdge::Left,
-        )
-    } else {
-        "position:relative; display:flex; flex-direction:column; flex:1; min-height:0; width:100%; min-width:0;"
-            .to_string()
-    };
+    // ONE fixed-key geometry for every state (docked / collapsed sensor /
+    // revealed floating card). Fixed keys are load-bearing — see
+    // `SidebarPanelMode`: diverging keys left overlay props lingering when the
+    // panel toggled back to docked.
+    let outer_style = sidebar_panel_outer_style(
+        SidebarEdge::Left,
+        mode,
+        snapshot.sidebar_width,
+        zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+    );
+    let content_style =
+        sidebar_panel_card_style(SidebarEdge::Left, mode, snapshot.sidebar_width, snapshot.palette);
     rsx! {
         div {
             id: "yggterm-sidebar",
@@ -87235,6 +87374,8 @@ fn RightRail(
     autohide: AutoHideSignals,
     /// Is the hidden rail currently revealed as an overlay?
     autohide_revealed: bool,
+    /// Begin a rail-width drag (client x at grab). Mirrors the tree's resize.
+    on_start_rail_resize: EventHandler<f64>,
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
@@ -87308,34 +87449,60 @@ fn RightRail(
         RightPanelMode::AppPane(pane_id) => Some(pane_id.clone()),
         _ => None,
     };
-    // A hidden rail hover-reveals from the right edge as an overlay, exactly as
-    // a hidden session tree does from the left. Same state machine, same
-    // geometry helpers, mirrored edge — and, as on the left, out of flow so the
-    // viewport never resizes on a hover.
-    let rail_overlay = (!visible).then(|| SideRailOverlay {
-        outer_style: sidebar_autohide_overlay_style(
-            SidebarEdge::Right,
-            autohide_revealed,
-            SIDE_RAIL_WIDTH as f32,
-            snapshot.palette,
-        ),
-        content_style: sidebar_autohide_content_style(
-            autohide_revealed,
-            SIDE_RAIL_WIDTH as f32,
-            SidebarEdge::Right,
-        ),
-        revealed: autohide_revealed,
+    // A hidden rail hover-reveals from the right edge as a floating card, exactly
+    // as a hidden session tree does from the left — SAME geometry helper, mirrored
+    // edge, same fixed-key styles. Docked, it is the classic in-flow rail. Out of
+    // flow when auto-hidden, so a hover never resizes the viewport.
+    let mode = if visible {
+        SidebarPanelMode::InFlow
+    } else if autohide_revealed {
+        SidebarPanelMode::Revealed
+    } else {
+        SidebarPanelMode::Collapsed
+    };
+    let rail_width = snapshot.rail_width;
+    let outer_style = sidebar_panel_outer_style(
+        SidebarEdge::Right,
+        mode,
+        rail_width,
+        zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+    );
+    let content_style = sidebar_panel_card_style(SidebarEdge::Right, mode, rail_width, snapshot.palette);
+    let rail_reveal = (!visible).then(|| SideRailReveal {
+        on_reveal: EventHandler::new(move |_| autohide.reveal()),
+        on_reveal_if_idle: EventHandler::new(move |_| autohide.reveal_if_idle()),
+        on_mouse_leave: EventHandler::new(move |_| autohide.handle_mouse_leave()),
+        on_focus_within: EventHandler::new(move |focused: bool| autohide.set_focus_within(focused)),
+    });
+    // Docked only: a grip on the rail's INNER (left) edge, mirroring the tree's
+    // handle on its right edge. Hidden when the rail is an overlay (resizing a
+    // hover card is not a thing).
+    let rail_resize_handle = visible.then(|| {
+        rsx! {
+            div {
+                "data-rail-resize-handle": "1",
+                style: format!(
+                    "position:absolute; top:0; left:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+                     background:transparent;",
+                    SIDEBAR_RESIZE_HANDLE_WIDTH
+                ),
+                onmousedown: move |evt| {
+                    evt.stop_propagation();
+                    on_start_rail_resize.call(evt.client_coordinates().x);
+                },
+                ondoubleclick: |evt| evt.stop_propagation(),
+            }
+        }
     });
     rsx! {
         SideRailShell {
             visible: visible,
-            width_px: SIDE_RAIL_WIDTH,
-            zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
-            overlay: rail_overlay,
-            on_reveal: move |_| autohide.reveal(),
-            on_reveal_if_idle: move |_| autohide.reveal_if_idle(),
-            on_mouse_leave: move |_| autohide.handle_mouse_leave(),
-            on_focus_within: move |focused: bool| autohide.set_focus_within(focused),
+            auto_hide: !visible,
+            revealed: autohide_revealed && !visible,
+            outer_style: outer_style,
+            content_style: content_style,
+            reveal: rail_reveal,
+            resize_handle: rail_resize_handle,
             body: rsx!{
             if rendered_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone(), on_daemon_hot_restart }
@@ -100408,99 +100575,140 @@ mod tests {
     #[test]
     fn autohide_sidebar_overlay_never_takes_flow_space() {
         for edge in [SidebarEdge::Left, SidebarEdge::Right] {
-            for revealed in [false, true] {
-                let style =
-                    sidebar_autohide_overlay_style(edge, revealed, 300.0, palette(UiTheme::ZedLight));
+            for mode in [SidebarPanelMode::Collapsed, SidebarPanelMode::Revealed] {
+                let style = sidebar_panel_outer_style(edge, mode, 300.0, 100.0);
                 assert!(
                     style.contains("position:absolute;"),
-                    "{edge:?} revealed={revealed} must be out of flow: {style}"
+                    "{edge:?} {mode:?} must be out of flow: {style}"
                 );
                 assert!(
-                    !style.contains("flex:"),
-                    "{edge:?} revealed={revealed} must not claim a flex basis: {style}"
+                    style.contains("flex:0 0 auto;"),
+                    "{edge:?} {mode:?} must not claim a flex basis: {style}"
                 );
             }
         }
+    }
+    // ★ THE fixed-property-key invariant (the docked-rail-ghost fix): the outer
+    // AND the card must emit the SAME set of CSS property keys in EVERY mode, so
+    // switching modes fully RESETS every property. Dioxus applies `style`
+    // property-by-property and never clears a key the new render omits — a
+    // divergent key set left `position:absolute; z-index; box-shadow` lingering
+    // when a revealed rail toggled back to docked, so it floated as a transparent
+    // ghost over the viewport (user-reported 2026-07-21).
+    #[test]
+    fn autohide_sidebar_style_keys_are_identical_across_modes() {
+        let keys = |style: &str| -> Vec<String> {
+            let mut ks: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            ks.sort();
+            ks
+        };
+        for edge in [SidebarEdge::Left, SidebarEdge::Right] {
+            let outer: Vec<_> = [
+                SidebarPanelMode::InFlow,
+                SidebarPanelMode::Collapsed,
+                SidebarPanelMode::Revealed,
+            ]
+            .into_iter()
+            .map(|m| keys(&sidebar_panel_outer_style(edge, m, 300.0, 100.0)))
+            .collect();
+            assert_eq!(outer[0], outer[1], "{edge:?} outer InFlow vs Collapsed keys");
+            assert_eq!(outer[1], outer[2], "{edge:?} outer Collapsed vs Revealed keys");
+            let card: Vec<_> = [
+                SidebarPanelMode::InFlow,
+                SidebarPanelMode::Collapsed,
+                SidebarPanelMode::Revealed,
+            ]
+            .into_iter()
+            .map(|m| keys(&sidebar_panel_card_style(edge, m, 300.0, palette(UiTheme::ZedLight))))
+            .collect();
+            assert_eq!(card[0], card[1], "{edge:?} card InFlow vs Collapsed keys");
+            assert_eq!(card[1], card[2], "{edge:?} card Collapsed vs Revealed keys");
+        }
+    }
+    // The DOCKED look must be unchanged: relative flow, transparent (the app-bg
+    // paints behind it), no floating chrome. The user said always-visible should
+    // look exactly as before.
+    #[test]
+    fn autohide_sidebar_docked_stays_in_flow_and_transparent() {
+        let outer =
+            sidebar_panel_outer_style(SidebarEdge::Right, SidebarPanelMode::InFlow, 292.0, 100.0);
+        assert!(outer.contains("position:relative;"), "{outer}");
+        assert!(outer.contains("flex:0 0 292px;"), "{outer}");
+        assert!(outer.contains("width:292px;"), "{outer}");
+        let card =
+            sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::InFlow, 292.0, palette(UiTheme::ZedLight));
+        assert!(card.contains("position:relative;"), "{card}");
+        assert!(card.contains("background-color:transparent;"), "{card}");
+        assert!(card.contains("box-shadow:none;"), "{card}");
+        assert!(card.contains("border-radius:0px;"), "{card}");
+        assert!(card.contains("width:100%;"), "{card}");
     }
     // Collapsed leaves exactly the hover sensor on screen — the same 6px strip
     // trick the titlebar uses, which is what makes the edge reachable at all.
     #[test]
     fn autohide_sidebar_collapses_to_a_hover_sensor() {
-        assert_eq!(
-            sidebar_autohide_overlay_width_px(false, 300.0),
-            SIDEBAR_AUTOHIDE_SENSOR_WIDTH_PX
-        );
-        assert_eq!(sidebar_autohide_overlay_width_px(true, 300.0), 300.0);
         let collapsed =
-            sidebar_autohide_overlay_style(SidebarEdge::Left, false, 300.0, palette(UiTheme::ZedLight));
+            sidebar_panel_outer_style(SidebarEdge::Left, SidebarPanelMode::Collapsed, 300.0, 100.0);
         assert!(collapsed.contains("width:6px;"), "{collapsed}");
-        assert!(
-            collapsed.contains("background-color:transparent;"),
-            "collapsed sensor must be invisible: {collapsed}"
-        );
+        assert!(collapsed.contains("background:transparent;"), "{collapsed}");
         assert!(collapsed.contains("box-shadow:none;"), "{collapsed}");
-        // ★ THE user-reported regression: a REVEALED overlay must paint an
-        // opaque panel, or the terminal bleeds through it. The in-flow sidebar's
-        // own `palette.sidebar` is `transparent`, so the overlay MUST supply the
-        // shell's opaque fill itself.
-        let revealed =
-            sidebar_autohide_overlay_style(SidebarEdge::Left, true, 300.0, palette(UiTheme::ZedLight));
+        // The revealed OUTER is wider than the card by a margin either side so the
+        // pointer resting on the floating card stays "inside".
+        let revealed_outer =
+            sidebar_panel_outer_style(SidebarEdge::Left, SidebarPanelMode::Revealed, 300.0, 100.0);
+        assert!(revealed_outer.contains("width:320px;"), "{revealed_outer}");
+        // ★ THE user-reported regression: a REVEALED card must paint an opaque
+        // panel or the terminal bleeds through. `palette.sidebar` is transparent,
+        // so the card MUST supply the shell's opaque fill itself.
+        let revealed_card =
+            sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Revealed, 300.0, palette(UiTheme::ZedLight));
         assert!(
-            revealed.contains("background-color:var(--yggterm-opaque-shell-fill"),
-            "revealed overlay must paint an opaque fill: {revealed}"
+            revealed_card.contains("background-color:var(--yggterm-opaque-shell-fill"),
+            "revealed card must paint an opaque fill: {revealed_card}"
         );
         assert!(
-            !revealed.contains("background-color:transparent"),
-            "revealed overlay must not be transparent: {revealed}"
+            !revealed_card.contains("background-color:transparent"),
+            "revealed card must not be transparent: {revealed_card}"
         );
         assert!(
-            revealed.contains("background-image:var(--yggterm-shell-gradient"),
-            "revealed overlay carries the shell gradient: {revealed}"
+            revealed_card.contains("background-image:var(--yggterm-shell-gradient"),
+            "revealed card carries the shell gradient: {revealed_card}"
         );
     }
+    // The floating card is inset on all four sides and rounded — Zen's island
+    // look — pinned to its own edge, and the depth is a soft all-sides shadow,
+    // never a border hairline (the titlebar's 2026-06-27 lesson).
     #[test]
-    fn autohide_sidebar_edges_anchor_to_their_own_side() {
-        let left =
-            sidebar_autohide_overlay_style(SidebarEdge::Left, true, 300.0, palette(UiTheme::ZedLight));
-        let right = sidebar_autohide_overlay_style(
-            SidebarEdge::Right,
-            true,
-            292.0,
-            palette(UiTheme::ZedLight),
-        );
-        assert!(left.contains("left:0; right:auto;"), "{left}");
-        assert!(right.contains("right:0; left:auto;"), "{right}");
-        // Depth cue points INTO the viewport, mirrored per edge.
-        assert!(left.contains("box-shadow:14px 0"), "{left}");
-        assert!(right.contains("box-shadow:-14px 0"), "{right}");
-        // No border — a 1px border paints the chrome fill and reads as a bright
-        // separator line (the titlebar's 2026-06-27 lesson).
-        assert!(!left.contains("border"), "{left}");
-        assert!(!right.contains("border"), "{right}");
+    fn autohide_sidebar_revealed_card_is_an_inset_rounded_island() {
+        let left = sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Revealed, 300.0, palette(UiTheme::ZedLight));
+        let right = sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::Revealed, 292.0, palette(UiTheme::ZedLight));
+        // Inset by the overlay gap on top/bottom and pinned to its own side.
+        assert!(left.contains("top:10px; bottom:10px; left:10px; right:auto;"), "{left}");
+        assert!(right.contains("top:10px; bottom:10px; right:10px; left:auto;"), "{right}");
+        assert!(left.contains("border-radius:10px;"), "{left}");
+        // Soft ambient shadow, no border.
+        assert!(left.contains("box-shadow:0 16px"), "{left}");
+        assert!(!left.contains("border:"), "{left}");
+        assert!(!right.contains("border:"), "{right}");
+        // At rest when revealed.
+        assert!(left.contains("transform:translateX(0px);"), "{left}");
+        assert!(left.contains("pointer-events:auto;"), "{left}");
     }
-    // The content layer holds full width in BOTH states, so the panel slides in
-    // as one piece instead of its rows re-wrapping while the box animates.
+    // A collapsed card is invisible and un-clickable (opacity 0, no pointer
+    // events), slid a touch toward its own edge for a slide+fade reveal.
     #[test]
-    fn autohide_sidebar_content_keeps_full_width_and_slides_off_its_own_edge() {
-        let left_hidden = sidebar_autohide_content_style(false, 300.0, SidebarEdge::Left);
-        let left_shown = sidebar_autohide_content_style(true, 300.0, SidebarEdge::Left);
-        let right_hidden = sidebar_autohide_content_style(false, 292.0, SidebarEdge::Right);
-        assert!(left_hidden.contains("width:300px;"), "{left_hidden}");
-        assert!(left_shown.contains("width:300px;"), "{left_shown}");
-        assert!(right_hidden.contains("width:292px;"), "{right_hidden}");
-        assert!(
-            left_hidden.contains("translateX(-300px)"),
-            "left panel slides out to the LEFT: {left_hidden}"
-        );
-        assert!(
-            right_hidden.contains("translateX(292px)"),
-            "right panel slides out to the RIGHT: {right_hidden}"
-        );
-        assert!(left_shown.contains("translateX(0px)"), "{left_shown}");
-        // A collapsed panel must not swallow clicks meant for the viewport; only
-        // the transparent 6px sensor on the outer box stays hoverable.
-        assert!(left_hidden.contains("pointer-events:none;"), "{left_hidden}");
-        assert!(left_shown.contains("pointer-events:auto;"), "{left_shown}");
+    fn autohide_sidebar_collapsed_card_is_hidden_and_slid_off_its_edge() {
+        let left = sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Collapsed, 300.0, palette(UiTheme::ZedLight));
+        let right = sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::Collapsed, 292.0, palette(UiTheme::ZedLight));
+        assert!(left.contains("opacity:0;"), "{left}");
+        assert!(left.contains("pointer-events:none;"), "{left}");
+        assert!(left.contains("transform:translateX(-22px);"), "left slides left: {left}");
+        assert!(right.contains("transform:translateX(22px);"), "right slides right: {right}");
     }
     // Leaving an edge that never revealed must be a NO-OP: `linger` ALONE
     // satisfies `autohide_revealed`, so starting the grace on a mere crossing
@@ -101007,6 +101215,31 @@ mod tests {
         assert!(shell.sidebar_resize_drag.is_none());
         assert_eq!(shell.sidebar_width, 420.0);
         assert_eq!(shell.settings.tree_width, 420.0);
+    }
+    // The rail drag is the MIRROR of the tree drag: its handle is on the INNER
+    // (left) edge, so dragging LEFT (a smaller client x) makes it WIDER. Persists
+    // to its OWN setting, independent of the tree width.
+    #[test]
+    fn rail_resize_drags_from_the_inner_edge_and_persists_independently() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        shell.rail_width = 300.0;
+        shell.settings.rail_width = 300.0;
+        let tree_before = shell.sidebar_width;
+
+        shell.start_rail_resize(1000.0);
+        // Drag the inner edge 80px to the LEFT → +80px width.
+        shell.handle_rail_resize_pointer(920.0);
+        assert!(shell.rail_resize_drag.is_some());
+        assert_eq!(shell.rail_width, 380.0);
+        assert_eq!(shell.settings.rail_width, 380.0);
+        // Clamps at the rail max, and never touches the tree.
+        shell.handle_rail_resize_pointer(0.0);
+        assert_eq!(shell.rail_width, RAIL_MAX_WIDTH);
+        assert_eq!(shell.sidebar_width, tree_before);
+
+        shell.finish_rail_resize();
+        assert!(shell.rail_resize_drag.is_none());
+        assert_eq!(shell.settings.rail_width, RAIL_MAX_WIDTH);
     }
     #[test]
     fn terminal_eval_script_scrollbar_is_draggable_not_pushed_off_screen() {
@@ -122137,6 +122370,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -122776,6 +123011,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -122950,6 +123187,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -123124,6 +123363,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -123301,6 +123542,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -123482,6 +123725,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -123655,6 +123900,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -123828,6 +124075,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -124035,6 +124284,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(active_session.session_path.clone()),
@@ -124211,6 +124462,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -124419,6 +124672,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -124804,6 +125059,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_open: true,
             sidebar_width: 300.0,
             sidebar_resizing: false,
+            rail_width: 292.0,
+            rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: Vec::new(),
             selected_path: None,
