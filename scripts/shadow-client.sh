@@ -23,6 +23,11 @@
 #
 # Requires: sway (wlroots headless backend) and grim. Both must be on PATH.
 #
+# ⚠ Two yggterm clients on one home resolve the SAME GTK application id, and the
+# second silently becomes a GApplication *remote*: it exits 0 with no window and
+# no error, which looks exactly like a broken headless GL stack. `start` below
+# therefore always passes YGGTERM_DESKTOP_APP_ID_SUFFIX. Do not drop it.
+#
 # ⚠ Read-only geometry (eng-review D8): a shadow NEVER drives PTY winsize,
 # terminal focus, or scroll — a differently-sized shadow view issuing SIGWINCH
 # would reflow the CLI and scramble the USER's live frame without ever claiming
@@ -146,7 +151,14 @@ EOF
 
     # The client declares its role; the daemon enforces it. If the daemon is too
     # old to enforce roles, the client REFUSES to attach (fail closed, D7).
+    #
+    # ⚠ The app-id suffix is REQUIRED, not cosmetic. Two yggterm clients sharing
+    # a home resolve the SAME GTK application id, so the second becomes a
+    # GApplication *remote* instance: its launch returns instantly and the
+    # process exits 0 with no window and no error. A shadow exists precisely to
+    # run alongside the user's GUI on one daemon, so it must carry its own id.
     WAYLAND_DISPLAY="$display" GDK_BACKEND=wayland \
+      YGGTERM_DESKTOP_APP_ID_SUFFIX="shadow-$NAME" \
       setsid "$YGGTERM_BIN" --client-role shadow --client-id "$NAME" \
       > "$CLIENT_LOG" 2>&1 &
     echo $! > "$CLIENT_PID_FILE"
