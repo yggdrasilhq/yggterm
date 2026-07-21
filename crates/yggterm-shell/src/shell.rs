@@ -7410,19 +7410,12 @@ impl ShellState {
             sidebar_resizing: self.sidebar_resize_drag.is_some(),
             rail_width: self.rail_width,
             rail_resizing: self.rail_resize_drag.is_some(),
-            right_panel_mode: {
-                // A contributed pane the active session no longer offers (session
-                // switch, or the app died) falls back to the user's own view
-                // rather than blanking the rail. Uses the same `sidebar_panes`
-                // the field below carries, so the two cannot disagree.
-                let offers_pane = match &self.right_panel_mode {
-                    RightPanelMode::AppPane(pane_id) => {
-                        sidebar_panes.iter().any(|pane| pane.id == *pane_id)
-                    }
-                    _ => true,
-                };
-                self.effective_right_panel_mode(offers_pane, current_millis())
-            },
+            // A contributed pane the active session no longer offers (session
+            // switch, or the app died) falls back to the user's own view rather
+            // than blanking the rail. Resolved by `displayed_right_panel_mode`,
+            // the SAME owner every toggle compares against, so what the rail
+            // renders and what a titlebar button acts on cannot disagree.
+            right_panel_mode: self.displayed_right_panel_mode(),
             right_panel_restore_mode: self.right_panel_restore_mode.clone(),
             rows,
             selected_path,
@@ -8574,6 +8567,10 @@ impl ShellState {
         if self.document_surface_stale.as_deref() == Some(session_path) {
             self.document_surface_stale = None;
         }
+        // NOT a tenancy release: a closed contribution is routinely re-declared
+        // (session switch, a surface reopening), and the pane must come back for
+        // free when it is. Only EXPIRY — no declare for a full window while we
+        // were listening — means the app is actually gone.
     }
     /// The one session whose OSC reads are live right now (active, visible,
     /// terminal view). Only ITS `last_seen_ms` is a trustworthy liveness
@@ -8651,6 +8648,10 @@ impl ShellState {
                     > WEB_SURFACE_STALE_AFTER_MS
             })
         });
+        // An expiry above may have taken the last declaration of the pane that
+        // holds the rail — end that tenancy here rather than leaving the slot
+        // pinned to an app that is gone.
+        self.release_vanished_app_pane();
     }
     /// Read-only precheck for the timer-driven sweep: true when running the
     /// sweep would actually change state (clock reset, overlay flip, or an
@@ -9828,7 +9829,7 @@ impl ShellState {
         }
     }
     fn toggle_metadata_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::Metadata {
+        let next_mode = if self.displayed_right_panel_mode() == RightPanelMode::Metadata {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Metadata
@@ -9836,7 +9837,7 @@ impl ShellState {
         self.set_right_panel_mode(next_mode);
     }
     fn toggle_settings_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::Settings {
+        let next_mode = if self.displayed_right_panel_mode() == RightPanelMode::Settings {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Settings
@@ -9954,7 +9955,7 @@ impl ShellState {
     /// (user report 2026-07-13). Leaving vertical mode is the settings pane's
     /// "Vertical tabs" toggle, which is where a MODE change belongs.
     fn toggle_web_tabs_panel(&mut self) {
-        if self.right_panel_mode == RightPanelMode::WebTabs {
+        if self.displayed_right_panel_mode() == RightPanelMode::WebTabs {
             // The rail is what's showing → hide it. Chromeless browsing: no
             // rail, no strip, the page gets the whole viewport.
             self.set_right_panel_mode(RightPanelMode::Hidden);
@@ -10013,6 +10014,30 @@ impl ShellState {
     ///
     /// A pane some OTHER live contribution still offers is left alone — that is
     /// the session-switch case, where the pane collapses and re-reveals on return.
+    ///
+    /// This is the half that was documented but never written. Without it the
+    /// raw `right_panel_mode` stays pinned on a pane nothing declares any more:
+    /// invisible, because the display falls back to the remembered base, but
+    /// every later `set_right_panel_mode` is then treated as a base edit, so
+    /// `right_panel_restore_mode` stops tracking and the slot can never be
+    /// reclaimed. That stranded tenancy is what put a live GUI into the
+    /// un-closable right sidebar reported on 2026-07-21.
+    fn release_vanished_app_pane(&mut self) {
+        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        let still_declared = self.sidebar_contributions.values().any(|contribution| {
+            contribution
+                .panes
+                .iter()
+                .any(|pane| pane.placement == PanePlacement::Rail && pane.id == pane_id)
+        });
+        if still_declared {
+            return;
+        }
+        self.close_app_pane();
+    }
     /// The right-panel mode to DISPLAY, which differs from `right_panel_mode`
     /// only when an app's pane is selected but the ACTIVE session's app does not
     /// offer it — a switch to a session with no such app, or the app having died.
@@ -10022,6 +10047,28 @@ impl ShellState {
     /// remembered view instead of blanking. This is a pure derivation, not a
     /// mutation, so switching BACK to the app's session re-reveals the pane for
     /// free — the user who works with the sidebar open never sees it vanish.
+    /// The mode the user is LOOKING AT right now — `effective_right_panel_mode`
+    /// with the tenancy question already answered from the active session's own
+    /// declarations. One owner for "what is on screen", so the snapshot that
+    /// renders the rail and every toggle that acts on it read the same value.
+    ///
+    /// Every `toggle_*_panel` MUST compare against this, never the raw
+    /// `right_panel_mode`. A contributed pane the active session no longer
+    /// offers keeps the raw field pinned on `AppPane` while the user sees the
+    /// remembered base underneath it; a toggle comparing the raw value then
+    /// never matches, so its "already showing → hide" branch is unreachable and
+    /// every titlebar button re-opens the rail instead of closing it. That is
+    /// the "I cannot close my right sidebar by clicking any of the titlebar
+    /// buttons" report (2026-07-21).
+    fn displayed_right_panel_mode(&self) -> RightPanelMode {
+        // Only an app-pane mode can be a tenant, so the (cloning) declaration
+        // lookup stays off the common path.
+        let offers_pane = match &self.right_panel_mode {
+            RightPanelMode::AppPane(pane_id) => self.active_session_offers_pane(pane_id),
+            _ => true,
+        };
+        self.effective_right_panel_mode(offers_pane, current_millis())
+    }
     fn effective_right_panel_mode(
         &self,
         active_session_offers_pane: bool,
@@ -10334,7 +10381,7 @@ impl ShellState {
         )
     }
     fn toggle_connect_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::Connect {
+        let next_mode = if self.displayed_right_panel_mode() == RightPanelMode::Connect {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Connect
@@ -10350,7 +10397,7 @@ impl ShellState {
         self.last_action = "editing ssh prefix".to_string();
     }
     fn toggle_notifications_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::Notifications {
+        let next_mode = if self.displayed_right_panel_mode() == RightPanelMode::Notifications {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Notifications
@@ -97386,6 +97433,97 @@ mod tests {
             shell.effective_right_panel_mode(false, current_millis()),
             RightPanelMode::Metadata,
             "the tab tree bled into a non-web session instead of restoring the user's view"
+        );
+    }
+
+    // The tenancy release that was documented but never written: when the LAST
+    // declaration of the pane holding the rail expires, the slot goes back to the
+    // user's own view instead of staying pinned to a dead app forever.
+    #[test]
+    fn an_expired_contribution_releases_the_pane_holding_the_rail() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        declare_pane(&mut shell, "local://ws", "vault", 2_000);
+        shell.open_app_pane("vault");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("vault".into())
+        );
+
+        // Still declared → the tenancy holds (this is also the session-switch
+        // case, where the pane must re-reveal on return).
+        shell.sidebar_reads_live_since = Some(("local://ws".to_string(), 2_000));
+        shell.sweep_stale_sidebar_contributions(2_000);
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("vault".into()),
+            "a live declaration must keep its pane"
+        );
+
+        // The app stops declaring; the contribution expires and takes the
+        // tenancy with it.
+        shell.sweep_stale_sidebar_contributions(2_000 + SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS + 1);
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::Metadata,
+            "the dead app kept the rail slot pinned; the user's own view never came back"
+        );
+        assert_eq!(shell.right_panel_mode_before_app_pane, None);
+    }
+
+    // USER BUG 2026-07-21: "I cannot close my right sidebar by clicking any of the
+    // titlebar buttons." A pane the active session no longer offers keeps the RAW
+    // `right_panel_mode` pinned on `AppPane` while the user sees the remembered
+    // base beneath it. The toggles compared that raw value, so `== Settings` was
+    // never true, their hide branch was unreachable, and every button re-opened
+    // the rail — the displaced-base arm of `set_right_panel_mode` then swallowed
+    // the write, so a second identical click could not converge either. The
+    // toggles now compare `displayed_right_panel_mode`, the same value the rail
+    // renders.
+    #[test]
+    fn titlebar_toggles_close_the_rail_while_a_displaced_pane_holds_the_slot() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+
+        // The app's pane borrows the rail, then stops being declared (app exited,
+        // contribution swept) — the raw mode stays `AppPane`, the display falls
+        // back to Metadata.
+        declare_pane(&mut shell, "local://ws", "vault", current_millis());
+        shell.open_app_pane("vault");
+        shell.sidebar_contributions.clear();
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("vault".into()),
+            "the tenancy is expected to survive so returning to the app re-reveals it"
+        );
+        assert_eq!(
+            shell.displayed_right_panel_mode(),
+            RightPanelMode::Metadata,
+            "the user is looking at their own remembered view, not the pane"
+        );
+
+        // The ⓘ button — the one showing — must CLOSE the rail.
+        shell.toggle_metadata_panel();
+        assert_eq!(
+            shell.displayed_right_panel_mode(),
+            RightPanelMode::Hidden,
+            "clicking the active panel's titlebar button did not close the rail"
+        );
+
+        // And it still toggles back open.
+        shell.toggle_metadata_panel();
+        assert_eq!(shell.displayed_right_panel_mode(), RightPanelMode::Metadata);
+
+        // Switching panels, then closing with that panel's own button, works too.
+        shell.toggle_settings_panel();
+        assert_eq!(shell.displayed_right_panel_mode(), RightPanelMode::Settings);
+        shell.toggle_settings_panel();
+        assert_eq!(
+            shell.displayed_right_panel_mode(),
+            RightPanelMode::Hidden,
+            "a second click on the same button must converge, not re-open"
         );
     }
 
