@@ -6112,7 +6112,24 @@ impl DaemonRuntime {
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
                     match terminal_resize(&owner_endpoint, &runtime_path, cols, rows) {
-                        Ok(_) => return Ok(ServerResponse::Ack { message: None }),
+                        Ok(_) => {
+                            // SSOT (PTY-grid divergence / broken-bottom): the ATTACHED
+                            // client's viewport is authoritative for the grid. The owner
+                            // daemon records it on its side, but THIS forwarding daemon
+                            // must record it too — its persisted grid drives both the
+                            // metadata rail's "PTY size" AND the Run #19 re-pin on the
+                            // next `terminal_ensure` (effective_initial_size falls back to
+                            // session_pty_grid when the ensure carries no client grid). If
+                            // we forward-and-forget, a stale taller grid from an earlier
+                            // window keeps re-pinning the remote PTY on every ensure while
+                            // the current 63-row client never corrects it (it only sends a
+                            // resize on CHANGE) — the self-sustaining broken bottom. Record
+                            // + synchronous-flush-on-change, exactly like the local branch.
+                            if self.server.record_session_pty_grid(&path, cols, rows) {
+                                let _ = self.persist_state_only();
+                            }
+                            return Ok(ServerResponse::Ack { message: None });
+                        }
                         Err(error) => {
                             self.handle_preserved_owner_request_error(
                                 &runtime_path,
@@ -12653,6 +12670,40 @@ mod tests {
         assert!(
             ensure_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
             "EVERY ensure of a remote session must forward the grid to the remote daemon's PTY"
+        );
+    }
+
+    // PTY-grid SSOT (broken-bottom CONVERGE): the FORWARDING (preserved-owner)
+    // branch of TerminalResize must record the client's asserted grid locally,
+    // not just forward it. This daemon's persisted grid drives BOTH the rail's
+    // "PTY size" AND the Run #19 re-pin on the next ensure — so forward-and-forget
+    // lets a stale taller grid from an earlier window re-pin the remote PTY on
+    // every ensure while the current shorter client never corrects it (the client
+    // sends a resize on CHANGE only). That is the self-sustaining broken bottom.
+    #[test]
+    fn terminal_resize_forwarding_branch_records_client_grid() {
+        let source = include_str!("daemon.rs");
+        let resize_block = source
+            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
+            .expect("TerminalResize handler present");
+        // Isolate the preserved-owner (forwarding) arm: from the endpoint lookup
+        // up to the start of the local-ownership branch.
+        let forward_arm = resize_block
+            .split("preserved_owner_endpoint_for_request(&runtime_path)")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("self.terminals.resize(&runtime_path, cols, rows)?;")
+                    .next()
+            })
+            .expect("preserved-owner forwarding arm present");
+        assert!(
+            forward_arm.contains("record_session_pty_grid"),
+            "the forwarding (preserved-owner) TerminalResize branch must record the \
+             client's grid locally, or a stale persisted grid re-pins the remote PTY \
+             on the next ensure (broken bottom)"
         );
     }
 
