@@ -424,6 +424,29 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     positional
 }
 
+/// Apply `--client-role <active|shadow>` / `--client-id <name>` to this
+/// process's daemon-client identity (slice 4.3).
+///
+/// A shadow view client declares itself here so the daemon's slice-4.0 role gate
+/// refuses it any ownership-claiming request. Absent flags leave the process
+/// anonymous = `Active`, which is what the user's GUI is.
+fn apply_client_identity_args(args: &[String]) -> Result<()> {
+    let role = match cli_flag_value(args, "--client-role") {
+        Some(value) => yggterm_server::parse_client_role(value)?,
+        None => yggterm_server::ClientRole::Active,
+    };
+    let client_id = cli_flag_value(args, "--client-id")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    // Nothing declared: stay anonymous so the wire is byte-identical.
+    if role == yggterm_server::ClientRole::Active && client_id.is_none() {
+        return Ok(());
+    }
+    yggterm_server::set_client_identity(yggterm_server::ClientIdentity { role, client_id });
+    Ok(())
+}
+
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let inline_prefix = format!("{flag}=");
     for (index, value) in args.iter().enumerate() {
@@ -1260,6 +1283,12 @@ fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     // Agent presence (cursor v1) — see the twin in the headless binary.
     yggterm_server::set_agent_identity(cli_flag_value(&args, "--agent"));
+    // Daemon-client identity + role (slice 4.3). A DIFFERENT layer from
+    // `--agent` above: that colours an agent's cursor, this decides whether this
+    // process may take runtime ownership at all. Declared once here so every
+    // outgoing daemon request carries it. An unparseable role is fatal rather
+    // than a silent downgrade to Active (eng-review D7).
+    apply_client_identity_args(&args)?;
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
@@ -2994,6 +3023,15 @@ fn main() -> Result<()> {
         );
     }
     let endpoint = resolved_daemon.endpoint;
+    // Slice 4.3 fail-closed gate (eng-review D7, acceptance gate 15): a Shadow
+    // view client refuses to attach to a daemon that does not advertise role
+    // enforcement — such a daemon ignores the role and would treat this
+    // read-only client as fully Active, exactly during the mixed-version window
+    // when the guard matters most. No-op for the user's (Active) GUI.
+    //
+    // Deliberately placed BEFORE `warm_daemon_start`, so a refused shadow never
+    // spawns or touches a daemon at all.
+    yggterm_server::verify_shadow_client_can_attach(&endpoint)?;
     install_signal_shutdown(store.home_dir().to_path_buf(), endpoint.clone());
     warm_daemon_start(
         endpoint.clone(),

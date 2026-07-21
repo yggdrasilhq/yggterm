@@ -35,6 +35,8 @@ pub use daemon::{
     ShadowAccess, daemon_enforces_client_roles, role_gate,
     ProfileWriteLockStatus, acquire_profile_write_lock, profile_write_lock_report,
     release_profile_write_lock,
+    current_client_identity, parse_client_role, set_client_identity,
+    verify_shadow_client_can_attach,
     HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
     ServerResponse, ServerRuntimeStatus, hot_restart_block_reason_summary,

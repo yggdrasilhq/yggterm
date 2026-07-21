@@ -2225,6 +2225,76 @@ fn shadow_refused_trace_fields(request_name: &str, client_id: Option<&str>) -> s
     })
 }
 
+/// This process's identity as a DAEMON client (slice 4.3), set once at startup
+/// from `--client-role` / `--client-id` and stamped on every outgoing request.
+///
+/// Scope note — why a process-global is right *here* when it was wrong for the
+/// slice-3 cursor identity: the daemon protocol is one-shot (one request per
+/// connection), so "per-connection identity" means "the identity this process
+/// declares on each request". A view client IS one client for its whole
+/// lifetime. This is a THIRD layer, deliberately not
+/// `app_control::AGENT_IDENTITY_OVERRIDE` (which colours an agent's cursor) and
+/// not the PTY runtime owner.
+static CLIENT_IDENTITY: std::sync::RwLock<Option<ClientIdentity>> = std::sync::RwLock::new(None);
+
+/// Declare this process's daemon-client identity/role. Call once, before any
+/// daemon request is sent. Anonymous (never called) = `Active`, which is what
+/// the user's GUI and every CLI invocation are.
+pub fn set_client_identity(identity: ClientIdentity) {
+    if let Ok(mut slot) = CLIENT_IDENTITY.write() {
+        *slot = Some(identity);
+    }
+}
+
+/// The identity stamped on this process's outgoing daemon requests.
+pub fn current_client_identity() -> ClientIdentity {
+    CLIENT_IDENTITY
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(ClientIdentity::anonymous)
+}
+
+/// Parse a `--client-role` value. Unknown values are an ERROR rather than a
+/// silent fallback: silently downgrading an intended `Shadow` to `Active` is
+/// the privilege escalation D7 exists to prevent.
+pub fn parse_client_role(value: &str) -> Result<ClientRole> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "active" => Ok(ClientRole::Active),
+        "shadow" => Ok(ClientRole::Shadow),
+        other => bail!("unknown --client-role {other:?} (expected \"active\" or \"shadow\")"),
+    }
+}
+
+/// Startup gate for a `Shadow` client (eng-review D7, acceptance gate 15).
+///
+/// A Shadow MUST refuse to run against a daemon that does not advertise
+/// role-enforcement: such a daemon ignores the role field entirely and would
+/// treat this read-only client as fully `Active` — an escalation precisely
+/// during the mixed-version window. Active/anonymous clients skip this.
+///
+/// Returns `Ok(())` when it is safe to proceed.
+pub fn verify_shadow_client_can_attach(endpoint: &ServerEndpoint) -> Result<()> {
+    let identity = current_client_identity();
+    if identity.role != ClientRole::Shadow {
+        return Ok(());
+    }
+    let status = match send_request(endpoint, &ServerRequest::Status)? {
+        ServerResponse::Status(status) => status,
+        other => bail!("unexpected response probing daemon role enforcement: {other:?}"),
+    };
+    if !daemon_enforces_client_roles(&status) {
+        bail!(
+            "refusing to attach as a shadow client: daemon {} does not advertise \
+             role enforcement, so it would treat this read-only client as Active \
+             (upgrade the daemon to {} or newer)",
+            status.server_version,
+            SERVER_PROTOCOL_VERSION,
+        );
+    }
+    Ok(())
+}
+
 /// Stable wire name for an acquire outcome (slice 4.2) — one owner for the
 /// journal and the response so they cannot drift.
 fn profile_write_lock_outcome_name(
@@ -12674,9 +12744,11 @@ fn trim_process_heap_if_supported() {
 fn trim_process_heap_if_supported() {}
 
 fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
-    // Anonymous = Active, and an anonymous envelope serializes byte-identical to
-    // the bare request, so every existing caller's wire is unchanged.
-    send_request_as(endpoint, request, &ClientIdentity::anonymous())
+    // Stamp this PROCESS's declared identity (slice 4.3) so a shadow view client
+    // carries its role on EVERY request without each call site remembering to.
+    // Unset = anonymous = Active, and an anonymous envelope serializes
+    // byte-identical to the bare request, so the GUI's wire is unchanged.
+    send_request_as(endpoint, request, &current_client_identity())
 }
 
 /// Send a request declaring this client's slice-4.0 identity/role.
@@ -13768,6 +13840,69 @@ mod tests {
         }))
         .unwrap();
         assert!(daemon_enforces_client_roles(&new));
+    }
+
+    // ---- slice 4.3: shadow view client identity ----
+
+    #[test]
+    fn parse_client_role_rejects_unknown_values_instead_of_downgrading() {
+        use super::{ClientRole, parse_client_role};
+        assert_eq!(parse_client_role("active").unwrap(), ClientRole::Active);
+        assert_eq!(parse_client_role("shadow").unwrap(), ClientRole::Shadow);
+        // Case/whitespace tolerant...
+        assert_eq!(parse_client_role("  SHADOW ").unwrap(), ClientRole::Shadow);
+        // ...but an unknown role is an ERROR. Falling back to Active would
+        // silently promote a client the caller meant to be read-only — the
+        // privilege escalation D7 exists to prevent.
+        for bad in ["", "shadowy", "read-only", "root"] {
+            let error = parse_client_role(bad).expect_err("unknown role must not default");
+            assert!(
+                format!("{error}").contains("unknown --client-role"),
+                "error should name the flag: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shadow_process_stamps_its_role_on_every_request() {
+        use super::{ClientIdentity, ClientRequestEnvelope, ClientRole, ServerRequest};
+        // The point of the process-global: a call site that knows nothing about
+        // roles still emits them, so no request can escape the gate by omission.
+        let shadow = ClientIdentity {
+            role: ClientRole::Shadow,
+            client_id: Some("shadow-view-1".into()),
+        };
+        for request in [
+            ServerRequest::Status,
+            ServerRequest::Snapshot,
+            ServerRequest::TerminalSnapshot { path: "p".into() },
+        ] {
+            let wire =
+                serde_json::to_string(&ClientRequestEnvelope::new(request, &shadow)).unwrap();
+            assert!(
+                wire.contains("\"client_role\":\"shadow\""),
+                "every request from a shadow process must carry its role: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_attach_gate_refuses_a_daemon_that_cannot_enforce_roles() {
+        use super::daemon_enforces_client_roles;
+        // `verify_shadow_client_can_attach` needs a live socket, so assert on the
+        // predicate it gates against — the D7 decision itself.
+        let pre_4_0: super::ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.11.6",
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+        }))
+        .unwrap();
+        assert!(
+            !daemon_enforces_client_roles(&pre_4_0),
+            "a daemon predating the role gate must not be treated as enforcing"
+        );
     }
 
     // ---- slice 4.2: profile write-lock protocol wiring ----
