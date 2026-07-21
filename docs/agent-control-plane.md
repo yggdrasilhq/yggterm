@@ -1058,12 +1058,17 @@ each mapped to where it belongs:
    helper (build-and-POST carrying the page's CSRF) would harden `do` against
    markup the agent does not control.
 
-**Deploy state (2026-07-22, jojo v2.12.1).** The slice-2b engine verbs are
-committed/proven on a dev build but are **not in the live host's binary**:
-`server app web --help` there lists only `eval`/`screenshot`/`devtools` (all
-`--session`-capable) — `do`/`read`/`wait` are absent, and a `--session` eval on a
-backgrounded surface returned `not live` this run (hold-expiry or missing
-soft-stash reach — undetermined). So the shadow path is real in the tree but a
-co-browse on the deployed binary still uses the foreground; the restore-active-
-session etiquette is the interim mitigation. A deploy of the pushed slice-2b work
-to jojo is a prerequisite for testing undisturbed co-browse end to end.
+**Deploy state (2026-07-22, jojo v2.12.1) — CORRECTED.** The slice-2b engine
+verbs ARE deployed: `do`/`read`/`wait`/`lease` all run on the live 2.12.1 binary
+(slice-2b `f6128ec` is an ancestor of the 2.12.1 release, so they shipped in it).
+An earlier draft of this note claimed they were absent — that was a bad instrument
+read: `server app web --help` prints a STATIC usage string that listed only
+`eval`/`screenshot`/`devtools`, so `--help` looked like the whole surface. The
+real probe is running the verb (an old binary answers `unsupported app web
+action`; the live one returns structured JSON / validates `--until`). The usage
+string is now fixed to list every verb. Genuine remaining gaps: (a) headless
+surface-create (create-but-never-reveal) is still unbuilt, so a NEW co-browse
+surface must be revealed once; (b) `--session` on a backgrounded surface is
+bounded by the ~600s reap hold unless a `lease` extends it — the single `not live`
+seen this run is consistent with hold-expiry, not a missing feature. Lesson for
+the file: never conclude "not deployed" from a usage string.
