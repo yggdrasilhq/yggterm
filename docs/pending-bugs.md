@@ -17,11 +17,16 @@ fix) once the fix is verified live on jojo.
   `.xterm-screen`), and `ensureVisibleHost` short-circuits on `emitPaint()`,
   whose `visible` is satisfied by any child.
   **Probes shipped 2026-07-22 (`terminal_host_element_detached`, host-attachment
-  fields in `app state`, mutation breadcrumbs); the FIX is not done.** The
-  one-line repair: make `!liveHost.contains(term.element)` a reopen trigger
-  regardless of what occupies the host. Full write-up, the trace signature that
-  dates past occurrences, and the three open questions (which wipe leaves the
-  husk; whether the never-released reveal ghost is involved; why ~7% of mounts):
+  fields in `app state`, mutation breadcrumbs).** **FIX LANDED in code 2026-07-22
+  (`rebindCurrentHost` now treats `termElementOutsideHost` — `term.element` not in
+  the live host — as a fourth reopen trigger, so the reopen re-appends
+  term.element and drops the husk; guarded by
+  `terminal_eval_script_probes_detached_term_element`). LIVE PROOF still owed —
+  activates on the next jojo deploy; watch the `rebind_host` debug event for
+  `term_outside_host=true reopened=true reattached=true`.** Full write-up, the
+  trace signature that dates past occurrences, and the three open questions (which
+  wipe leaves the husk; whether the never-released reveal ghost is involved; why
+  ~7% of mounts):
   [`docs/xterm-bugs.md#detached-term-element-blank-viewport`](xterm-bugs.md#detached-term-element-blank-viewport).
   Recovery with no restart: re-append `term.element` and drop the husk via
   `server app dom-eval`.
