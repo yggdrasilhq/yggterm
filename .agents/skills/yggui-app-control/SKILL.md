@@ -321,6 +321,73 @@ Companion trace events (mine `~/.yggterm/event-trace.jsonl`):
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app dom-eval 'return {active: String(document.activeElement.tagName)}'"
 ```
 
+### ⛔ The `return` trap — a missing `return` is indistinguishable from "absent"
+
+The script is spliced into an **async function body**, not evaluated as an
+expression:
+
+```js
+result = await (async () => { <YOUR SCRIPT> })();
+dioxus.send(result === undefined ? null : result);
+```
+
+So an expression-style probe yields `{"result": null}` — **the exact same
+response as a property that does not exist.** This burned a real investigation:
+probing a freshly deployed telemetry field returned `null`, which read as "the
+probe did not ship", and the next move was nearly to re-deploy a working binary.
+
+**Always put a `sanity` term in the probe.** If `sanity` comes back, `null` means
+absent; if `sanity` is missing too, your script never returned:
+
+```bash
+# WRONG — silently null, proves nothing
+... dom-eval 'Object.keys(window.__yggtermXtermHosts)'
+# RIGHT — self-validating
+... dom-eval 'return JSON.stringify({sanity: 1+1, hosts: Object.keys(window.__yggtermXtermHosts||{})})'
+```
+
+### Multi-line probes: send a FILE, not a quoted string
+
+Nested quoting through `ssh` + shell + JSON mangles anything non-trivial. Write
+the probe locally, `scp` it, and expand it on the remote side:
+
+```bash
+cat > /tmp/probe.js <<'EOF'
+var h = window.__yggtermXtermHosts || {};
+return JSON.stringify({
+  sanity: 1 + 1,
+  entries: Object.keys(h).map(function (k) {
+    return {host: k, paintRatePerSec: h[k].paintRatePerSec, repaintStormMs: h[k].repaintStormMs};
+  })
+});
+EOF
+scp -q /tmp/probe.js "$LIVE_HOST":/tmp/probe.js
+ssh -n "$LIVE_HOST" '~/.local/bin/yggterm-headless server app dom-eval "$(cat /tmp/probe.js)"'
+```
+
+### Reading the terminal render probes (what proves the GUI is the NEW build)
+
+`window.__yggtermXtermHosts[<hostId>]` carries the live per-host render
+telemetry. `paintRatePerSec` / `repaintStormMs` (the ~50 Hz repaint-storm probe)
+only appear **after a paint window elapses**, so an idle terminal legitimately
+has no values yet — `('paintRatePerSec' in v)` is the field-exists check, and it
+is the cheapest proof that a GUI-side probe actually shipped:
+
+```json
+{"host": "yggterm-terminal-remote-cc---dev-1c2de8c",
+ "hasPaintRateField": true, "paintRatePerSec": 1, "repaintStormMs": 0}
+```
+
+`hasPaintRateField: true` ⇒ the new eval script is running. `repaintStormMs > 0`
+⇒ a sustained ≥30 paints/s storm is happening RIGHT NOW — the garbled-blink
+pathology that plain paint-count health scores "healthy".
+
+The daemon-side twin is `server status → remote_yggterm_retry_total`: **present
+but 0** proves the probe shipped; *climbing fast between polls* is the wedged
+remote-command spin. Since it is `#[serde(default)]`, a pre-probe daemon also
+reports `0` — distinguish them by asking whether the key exists at all, not by
+its value.
+
 ## Split groups (viewport panes — terminal, document, pinned web tab)
 
 ```bash
