@@ -50,6 +50,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
+| [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | OPEN — probes shipped 2026-07-22; persistence root-caused, husk provenance NOT determined |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
 
 ---
@@ -1569,6 +1570,148 @@ No second writer is introduced — the size-war lesson still holds.
 confirmed: `remote` is the NAMED concept and everything else is the unnamed
 fallback — here the axis is Codex-vs-CC), `[[campaign-telemetry-infinite]]`,
 `[[spec-unify-local-remote]]` (drive from `SessionKind`, not a URL prefix).
+
+## detached-term-element-blank-viewport
+
+**STATUS:** OPEN — probes shipped 2026-07-22, root cause of PERSISTENCE proven,
+provenance of the husk NOT yet determined. No behavioural fix yet.
+
+### Symptom
+
+The terminal viewport is entirely blank — background colour only, no glyphs, no
+cursor — while the sidebar, metadata rail and the rest of the app render
+normally. The session is genuinely alive: the daemon holds the correct screen,
+the agent keeps working, and reattaching from a shell shows real content. Every
+health field says the session is fine.
+
+### Reproduction
+
+Not yet captured deterministically. Observed live 2026-07-22 on the desktop
+host: a Claude Code session remounted (mount epoch 2), went blank at mount, and
+stayed blank for 16 minutes across two `window_foreground` repaint cycles until
+the user noticed. In the trace generation covering that day: **14 healthy mounts
+vs 1 broken** — roughly a 7% mount race.
+
+### Root cause
+
+Two independent layers.
+
+**1. The state.** `term.element` is DETACHED from the DOM — `isConnected ===
+false`, rect 0×0 — while still holding its canvases and a full live buffer that
+keeps receiving daemon writes. What occupies the host div instead is an empty
+**husk**: `div.terminal.xterm` containing only `.xterm-viewport` — no
+`.xterm-screen`, no `.xterm-rows`, no canvas. Document-wide `.xterm-rows` count
+= 0 and canvas count = 0. Nothing on the page can paint a glyph.
+
+The signature in the trace is a 20 ms "renderer flip" that is not a flip at all:
+
+```
+renderer_decision phase=init        actual=gpu_canvas  canvas_elements=3
+renderer_decision phase=after_paint actual=dom         canvas_elements=0
+```
+
+`renderer_decision` counts canvases *under the host*; by `after_paint` the term
+had already left. All four `xterm_first_paint_sample` probes (t0/t16/t64/t256)
+read `len=0 text=""` — it never painted once.
+
+**2. Why it never self-heals** (predicates evaluated against the live broken
+DOM, all three false):
+
+| `rebindCurrentHost` reopen guard | value | why |
+|---|---|---|
+| `hostMissingXtermRoot` | false | the husk matches `.xterm` |
+| `hostMissingRenderableLayer` | false | the check *requires* `.xterm-screen`; the husk has none, so it short-circuits |
+| `termElementDisconnected && !host.querySelector('.xterm')` | false | the husk matches `.xterm` |
+
+→ `sameHostNeedsReopen === false`, so the repair early-returns and never
+re-appends. The husk is exactly the shape the guards do not model: an `.xterm`
+root **with no screen**. Separately `ensureVisibleHost` returns at its first
+branch because `emitPaint()` reports success (`paintCount` 43,
+`lastVisiblePaint` true) — `visible` is satisfied by any child in the host,
+including the husk — so the `host.innerHTML=""` + `term.open(host)` rebuild
+never runs.
+
+**Why telemetry scored it healthy.** Every health field read the xterm *object*,
+never the DOM: `render_health_status: "healthy"` with
+`render_health_ink_sample: {sampled_pixels: 0, canvas_count: 0}` — a zero sample
+means "could not measure", but was scored as healthy;
+`renderer_surface_missing: false`; `dom_paint_hit_test_problem: ""`;
+`cursor_line_text`, `text_tail`, `launch_phase: Running` and the daemon's
+`terminal_lines` all correct. The truth was already in app state and unused:
+`rows_present: false`, `rows_rect: null`, `screen_present: false`,
+`canvas_count: 0`.
+
+### NOT determined — open questions for the next agent
+
+1. **Which code path leaves the husk?** An `.xterm` root holding only a viewport
+   is not a shape xterm.js produces in one pass: `open()` builds the viewport
+   and screen into a fragment and attaches them together. Candidates: the mount
+   wipe immediately before the reveal-ghost attach; a second `term.open()` on an
+   already-open Terminal (creates a fresh element and reassigns `term.element`,
+   orphaning the old one); `stretchXtermRoot`'s `.xterm-scrollable-element`
+   handling. The mutation breadcrumbs added 2026-07-22 answer this on the next
+   occurrence — read `last_host_mutation.site` + `.stack` from the detach event.
+2. **Was the reveal ghost involved?** `reveal_ghost_attached` fired at the
+   broken mount and **no `reveal_ghost_released` ever followed** for that host.
+   The ghost is appended to the host and removed on a 2400 ms timer or first
+   keydown; a wipe between attach and release would drop it silently.
+3. **Why does it only hit ~7% of mounts?** Timing is unknown; the whole failure
+   fits inside 20 ms of the mount.
+
+### Workaround / fix
+
+None shipped. The **one-line repair** the evidence points at: make
+`!liveHost.contains(term.element)` a reopen trigger in `rebindCurrentHost`
+regardless of what occupies the host — that alone would have healed this within
+a frame. Companion: `emitPaint()` should not count a host whose child set does
+not include `term.element` as `visible`, so `ensureVisibleHost` reaches its
+rebuild branch. Live recovery without any restart, for a session already stuck:
+re-append `term.element` into the host and drop the husk via `app dom-eval`.
+
+### Code locations
+
+- `crates/yggterm-shell/src/shell.rs` — `terminalHostAttachmentState()`: DOM-truth
+  attachment probe, husk signature, and the three repair guards evaluated live
+- `crates/yggterm-shell/src/shell.rs` — `syncHostAttachmentEntry()`: episode
+  tracking + the `terminal_host_element_detached` trace event
+- `crates/yggterm-shell/src/shell.rs` — `updateRenderHealth()`: detached element
+  is now its own unhealthy verdict; zero ink samples marked `unsampleable`
+- `crates/yggterm-shell/src/shell.rs` — `emitPaint()`: records
+  `lastVisiblePaintTermElementAttached` / `lastVisiblePaintWasHusk`
+- `crates/yggterm-shell/src/shell.rs` — `window.__yggtermRecordHostMutation`:
+  breadcrumb (site + stack) at every host wipe and every `term.open`
+- `rebindCurrentHost` / `ensureVisibleHost` — the two repair paths that decline
+
+### Tests
+
+`terminal_eval_script_probes_detached_term_element` — asserts the attachment
+probe, the alarm condition, the guard record, the detach event, the
+`unsampleable` ink marking, the husk companion field, and that every mutation
+site carries a breadcrumb defined before the first wipe.
+
+### Telemetry
+
+- `terminal_host_element_detached` — once per detach episode then at most every
+  30 s while it persists. Carries `unrepairable`, `orphan_root_without_screen`,
+  `xterm_roots`, `screen_in_host`, `rows_in_host`, `screen_canvases`,
+  `repair_would_reopen`, and the correlated `last_mutation_site` /
+  `last_mutation_age_ms` / `last_mutation_stack`.
+- `app state` → `active_terminal_hosts[]`: `host_attachment_state`,
+  `term_element_connected`, `host_contains_term_element`,
+  `term_element_detached_since_ms`, `term_element_detached_count`,
+  `last_visible_paint_term_element_attached`, `last_visible_paint_was_husk`,
+  `last_host_mutation`, `host_mutation_count`.
+- `render_health_status` now goes `unhealthy` with reason
+  `term_element_detached_from_host` (or `…_unrepairable` when every repair guard
+  declines). **Alarm on `unrepairable_detached` — it means permanently blank
+  until a manual remount.**
+
+### Related memory
+
+`[[campaign-telemetry-infinite]]`, `[[feedback-verify-visual-with-faithful-pixel]]`,
+`[[xterm-host-registry-leak]]` (same registry, different failure).
+
+---
 
 ## Template (copy for new entries)
 
