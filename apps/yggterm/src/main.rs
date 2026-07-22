@@ -114,6 +114,14 @@ const KEYTIPS_AUDIT_JS: &str = r#"
     let reachable = 0, excused = 0;
     visible.forEach(function(el){
         if (el.hasAttribute('data-keytip-node')) { reachable++; return; }
+        // A control whose badge marker is a CHILD span -- the shipped pattern for
+        // every wired button, so the badge paints over the control -- is reachable
+        // no matter what encloses it. This MUST precede the exempt-ancestor test:
+        // otherwise wiring a control that still sits inside a subtree-exempt panel
+        // reports it as a violation, and the metric cannot show its own fix.
+        // Measured 2026-07-22: the already-wired settings/theme.light|dark buttons
+        // were both counted as `suppressed_by: settings-panel`.
+        if (el.querySelector('[data-keytip-node]')) { reachable++; return; }
         if (el.hasAttribute('data-keytip-exempt')) {
             excused++;
             const why = el.getAttribute('data-keytip-exempt') || '(no reason)';
@@ -128,7 +136,9 @@ const KEYTIPS_AUDIT_JS: &str = r#"
             subtreeSuppressed.push(row);
             return;
         }
-        if (el.querySelector('[data-keytip-node], [data-keytip-exempt]')) { reachable++; return; }
+        // The declared-descendant case is handled above; what is left here is a
+        // container whose only marked descendant is exempt.
+        if (el.querySelector('[data-keytip-exempt]')) { reachable++; return; }
         orphans.push(describe(el));
     });
     const violations = orphans.length + subtreeSuppressed.length;
@@ -926,6 +936,7 @@ fn print_server_app_help() {
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app keytips audit
+  yggterm server app command <list|invoke <id>>
   yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
   yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
   yggterm server app web do <click|move|scroll|type|key> [--selector <css>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--session <path>]
@@ -2515,6 +2526,27 @@ fn main() -> Result<()> {
                     // done for the ALT+ layer is `orphan_count: 0`.
                     "audit" => run_app_control_dom_eval(KEYTIPS_AUDIT_JS, timeout_ms),
                     other => anyhow::bail!("unsupported app keytips action: {other}"),
+                }
+            }
+            // The `command invoke <id>` probe that `execute_shell_command`'s doc
+            // comment has always promised. Both handlers were already plumbed
+            // through to the shell (`AppControlCommand::InvokeCommand`); only the
+            // CLI arm was missing, so the one dispatch every ALT+ KeyTip runs
+            // through had no probe and keyboard-path fixes could not be exercised
+            // live. Routing here means a probe drives the SAME terminus as the
+            // chord, rather than a lookalike.
+            "command" | "commands" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("list");
+                match action {
+                    "list" => yggterm_server::run_app_control_list_commands(timeout_ms),
+                    "invoke" => {
+                        let id = args
+                            .get(4)
+                            .map(String::as_str)
+                            .context("missing command id for server app command invoke")?;
+                        yggterm_server::run_app_control_invoke_command(id.to_string(), timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app command action: {other}"),
                 }
             }
             "start-action" | "start" => {
@@ -4921,6 +4953,29 @@ mod tests {
         signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
         superseded_client_retirement_strategy_label,
     };
+    use super::KEYTIPS_AUDIT_JS;
+
+    // §12.1: a control whose badge marker is a child span is REACHABLE, whatever
+    // encloses it. If the exempt-ancestor test ran first, wiring a control inside
+    // a panel that still carries a subtree exemption would report it as a
+    // violation — the metric could not show its own fix. Measured 2026-07-22: the
+    // already-wired settings/theme.light|dark buttons were both counted as
+    // `suppressed_by: settings-panel`. The ORDER is the invariant, so assert the
+    // order rather than the mere presence of the checks.
+    #[test]
+    fn audit_counts_a_declared_descendant_before_testing_for_an_exempt_ancestor() {
+        let declared_descendant = KEYTIPS_AUDIT_JS
+            .find("if (el.querySelector('[data-keytip-node]')) { reachable++; return; }")
+            .expect("audit must credit a control that contains a declared marker");
+        let exempt_ancestor = KEYTIPS_AUDIT_JS
+            .find("el.closest('[data-keytip-exempt]')")
+            .expect("audit must still detect subtree suppression");
+        assert!(
+            declared_descendant < exempt_ancestor,
+            "the declared-descendant credit must precede the exempt-ancestor test, \
+             else a wired control inside an exempt subtree reads as a violation"
+        );
+    }
 
     // F.1 tail: under-glass is DEFAULT ON — unset env arms it; only an
     // explicit =0 or the legacy force turns it off. The legacy force wins

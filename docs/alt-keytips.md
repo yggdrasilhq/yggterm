@@ -435,6 +435,41 @@ done becomes **`excused` is small and each entry is individually justified**, no
 `orphan == 0`. An exempt SUBTREE must be forbidden outright — exemption is
 per-element, with a reason string, or it is a hiding place.
 
+**⛔ The corrected audit was ITSELF miscounting — fixed 2026-07-22.** It tested
+`closest('[data-keytip-exempt]')` BEFORE `querySelector('[data-keytip-node]')`,
+so a control that is genuinely wired but still sits inside a subtree-exempt panel
+was reported as a violation. Measured live on the desktop host: the already-wired
+`settings/theme.light|dark` buttons were both counted as
+`suppressed_by: settings-panel`. **A metric that cannot show its own fix is worse
+than no metric** — wiring a control inside the settings panel would not have moved
+the number, so the work would have looked useless. The declared-descendant credit
+now runs first (pinned by
+`audit_counts_a_declared_descendant_before_testing_for_an_exempt_ancestor`).
+Live delta on the same GUI, settings panel open: `reachable 8 -> 10`,
+`violations 32 -> 30`, `settings-panel suppressed 25 -> 23`.
+
+### 12.1a The settings panel's exemption is now TRUE, not merely claimed
+
+The blanket `data-keytip-exempt="settings-panel"` justifies itself in a comment as
+*"a Tab-navigable configuration surface reached by ALT,G."* Measured 2026-07-22,
+that was half true: all 25 controls ARE natively focusable (no `tabindex=-1`,
+nothing disabled) and **nothing in the shell intercepts Tab** — but opening the
+panel left `document.activeElement` on `<body>`, so the Tab chain never began
+inside the panel and the user still reached for the mouse.
+
+`ShellCommand::ToggleSettings` now focuses the head of that chain on a
+keyboard-open, exactly as `ToggleSidebar` already focused a row (§8), reusing the
+existing `focus_settings_field` owner (which claims UI focus via
+`__yggtermUiFocusClaimUntilMs` and blurs the xterm helper, so the terminal cannot
+steal it back). One owner: the renderer stamps `SETTINGS_FIRST_FIELD_KEY` as that
+row's `data-settings-field-key` and the focus script queries the same attribute.
+
+⚠ **This does not retire the exemption.** The 23 remaining controls are still
+subtree-suppressed and still count as violations — reaching them by Tab is a
+chain, not a badge. Un-exempting them properly is §12.2's inversion, and
+hand-declaring 23 commands is exactly the pressure that produced the bulk
+exemption in the first place. What changed is that the excuse is now honest.
+
 ### 12.2 Component-level auto-assignment (user direction 2026-07-22)
 
 Declaring every affordance by hand does not scale and has already failed once (see
