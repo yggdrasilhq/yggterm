@@ -1492,6 +1492,20 @@ struct SidebarRefetch {
     zoom: bool,
     appearance: bool,
     document: bool,
+    /// The app's RAIL pane must be refetched because the document changed under
+    /// it. A document app's rail (yedit's documents list) describes the SAME
+    /// thing the viewport shows, so it goes stale on exactly the event the
+    /// viewport refetches on — a `document_version` bump on a session we already
+    /// hold. Without this the rail was only ever fetched on rail-open or
+    /// active-session-change, so opening a new document left the documents list
+    /// showing the previous set until the user forced a refetch by switching
+    /// view mode (user bug #5, 2026-07-18).
+    ///
+    /// Keyed off the one declare that already owns document freshness — NOT a
+    /// second version stamp, which could disagree with `document_version`.
+    /// False on a first declare: the rail auto-open path fetches the schema
+    /// itself, and firing both would double-fetch and race the seq guard.
+    document_rail: bool,
 }
 
 /// The command envelope ([[campaign-libyggterm]] Phase 5, §5): the platform
@@ -8245,7 +8259,8 @@ impl ShellState {
             // The document surface is non-gating too: the OLD schema stays on
             // screen while the refetch is in flight, so a save that bumps the
             // stamp never blanks the page under the user.
-            if existing.document_version != document_version {
+            let document_version_changed = existing.document_version != document_version;
+            if document_version_changed {
                 existing.document_version = document_version.clone();
                 existing.document_loaded = false;
                 existing.document_attempts = 0;
@@ -8266,6 +8281,12 @@ impl ShellState {
                 document: !document_version.is_empty()
                     && !existing.document_loaded
                     && existing.document_attempts < MAX_DOCUMENT_FETCH_ATTEMPTS,
+                // Only on the EDGE. The `document` flag above re-arms on every
+                // heartbeat until the fetch lands (that is its retry budget); the
+                // rail has no such budget and must not refetch once per ping, or
+                // a typed search box in the rail would be rebuilt under the user
+                // every few seconds.
+                document_rail: document_version_changed,
             };
         }
         let Some((control_url, forward_child)) = resolved else {
@@ -8303,6 +8324,8 @@ impl ShellState {
             zoom: !zoom_version.is_empty(),
             appearance: !appearance_version.is_empty(),
             document: !document_version.is_empty(),
+            // First declare: the rail auto-open below fetches the schema.
+            document_rail: false,
         }
     }
     /// The yggterm session path a routing `env_id` maps to, if a contribution
@@ -66518,6 +66541,56 @@ fn TerminalCanvas(
                                             });
                                             spawn(document_pane_fetch_schema(state, session, seq));
                                         }
+                                        // ...and the app's RAIL pane describes the
+                                        // same document set, so it went stale on
+                                        // the very same bump. Refetch it ONLY when
+                                        // the rail is actually showing this
+                                        // session's pane right now (user bug #5).
+                                        let rail_refetch = refetch.document_rail.then(|| {
+                                            state.with_mut(|shell| {
+                                                // The declaring session must be the
+                                                // ACTIVE one: a background app's
+                                                // re-declare must never reach across
+                                                // and clobber the rail the user is
+                                                // looking at (same rule the "close"
+                                                // arm enforces).
+                                                if shell.server.active_session_path()
+                                                    != Some(contribution_session_path.as_str())
+                                                {
+                                                    return None;
+                                                }
+                                                // Read the DISPLAYED mode, never the
+                                                // raw field: a contributed pane is a
+                                                // tenant, and the raw mode stays
+                                                // pinned on AppPane while a fallback
+                                                // is on screen. Comparing the raw
+                                                // field is the 2a2ec42 right-rail
+                                                // trap.
+                                                let RightPanelMode::AppPane(open_pane) =
+                                                    shell.displayed_right_panel_mode()
+                                                else {
+                                                    return None;
+                                                };
+                                                // Only the app's RAIL pane tracks the
+                                                // document set.
+                                                let declares_rail_pane = shell
+                                                    .sidebar_contributions
+                                                    .get(&contribution_session_path)
+                                                    .is_some_and(|contribution| {
+                                                        contribution.panes.iter().any(|pane| {
+                                                            pane.placement == PanePlacement::Rail
+                                                                && pane.id == open_pane
+                                                        })
+                                                    });
+                                                if !declares_rail_pane {
+                                                    return None;
+                                                }
+                                                Some((open_pane, shell.app_pane_next_request()))
+                                            })
+                                        });
+                                        if let Some(Some((pane_id, seq))) = rail_refetch {
+                                            spawn(app_pane_fetch_schema(state, pane_id, seq));
+                                        }
                                         // A document app's RAIL pane opens WITH
                                         // its document (the ychrome tab-rail
                                         // shape) — once. A user-closed rail
@@ -104814,6 +104887,90 @@ mod tests {
             now_ms,
             Some(("http://127.0.0.1:1".to_string(), None)),
         );
+    }
+
+    /// Re-declare a session that ALREADY has a contribution, carrying a
+    /// document stamp — the exact shape yedit emits when the user opens a new
+    /// document into a running editor.
+    fn redeclare_with_document(
+        shell: &mut ShellState,
+        session: &str,
+        document_version: &str,
+        now_ms: u64,
+    ) -> SidebarRefetch {
+        shell.upsert_sidebar_contribution(
+            session,
+            vec![
+                SidebarPaneDeclaration {
+                    id: "documents".to_string(),
+                    icon: "📄".to_string(),
+                    title: "Documents".to_string(),
+                    placement: PanePlacement::Rail,
+                },
+                SidebarPaneDeclaration {
+                    id: "editor".to_string(),
+                    icon: "✎".to_string(),
+                    title: "Editor".to_string(),
+                    placement: PanePlacement::Viewport,
+                },
+            ],
+            None,
+            None,
+            None,
+            None,
+            Some(document_version.to_string()),
+            None,
+            now_ms,
+            Some(("http://127.0.0.1:1".to_string(), None)),
+        )
+    }
+
+    // User bug #5 (2026-07-18): opening a new document into a running yedit left
+    // the rail's documents list showing the OLD set until the user forced a
+    // refetch by switching view mode. The viewport refetched (it keys off
+    // `document_version`) but nothing told the rail, which was only ever fetched
+    // on rail-open / active-session-change.
+    //
+    // The rail must refetch on exactly the same EDGE the viewport does — and only
+    // on the edge, because an unchanged stamp arrives on every ~4s heartbeat and
+    // a per-ping rail refetch would rebuild a typed search box under the user.
+    #[test]
+    fn a_document_stamp_bump_refetches_the_rail_not_every_heartbeat() {
+        let session = "local://yedit";
+        let bootstrap = test_shell_bootstrap_with_active_session(session);
+        let mut shell = ShellState::new(bootstrap);
+
+        // First declare: the rail auto-open path owns the fetch, so the edge
+        // flag must stay false or the schema is fetched twice and the two
+        // replies race the request-seq guard.
+        let first = redeclare_with_document(&mut shell, session, "v1", 1_000);
+        assert!(
+            !first.document_rail,
+            "a first declare must leave the rail fetch to the auto-open path"
+        );
+
+        // The user opens a new document: yedit re-declares the SAME session with
+        // a bumped stamp. Viewport AND rail are now stale.
+        let opened = redeclare_with_document(&mut shell, session, "v2", 2_000);
+        assert!(opened.document, "the viewport refetches on a stamp bump");
+        assert!(
+            opened.document_rail,
+            "bug #5: the documents rail must refetch on the same bump as the viewport"
+        );
+
+        // Heartbeats keep arriving with an UNCHANGED stamp. The rail must stay put.
+        for (tick, now_ms) in [(1u32, 6_000u64), (2, 10_000), (3, 14_000)] {
+            let beat = redeclare_with_document(&mut shell, session, "v2", now_ms);
+            assert!(
+                !beat.document_rail,
+                "heartbeat {tick} refetched the rail on an unchanged stamp — \
+                 this rebuilds a typed rail search box under the user"
+            );
+        }
+
+        // A further real edit bumps again and must re-arm.
+        let saved = redeclare_with_document(&mut shell, session, "v3", 18_000);
+        assert!(saved.document_rail, "a later stamp bump must re-arm the rail refetch");
     }
 
     fn declare_with_policy(
