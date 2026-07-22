@@ -1449,6 +1449,62 @@ fn main() -> Result<()> {
         };
         return run_server_connect(&endpoint, &path, view, placement);
     }
+    // `yggterm server write-lock <acquire|hold|report|release> [--profile <name>]`
+    // — drive the daemon-owned profile write-lock (slice 4.1/4.2) directly, to
+    // prove Active-priority preemption and inspect who holds a jar. Identity
+    // (Active|Shadow) is this process's --client-role/--client-id, already applied
+    // above: `--client-role shadow --client-id s1 ... acquire` takes a PREEMPTIBLE
+    // lock, and a later default (Active) `acquire` on the same profile PREEMPTS it
+    // (`preempted_shadow`). The daemon reclaims a DEAD holder's lock, so a
+    // short-lived `acquire` cannot be contended — use `hold`, which keeps the
+    // process alive holding the lock (SIGTERM/Ctrl-C to release), to stand up a
+    // live holder for a preemption test. See docs/agent-control-plane.md.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "write-lock" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let verb = args.get(2).map(String::as_str).unwrap_or("");
+        let profile = cli_flag_value(&args, "--profile");
+        let pid = std::process::id();
+        match verb {
+            "acquire" | "hold" => {
+                let status = yggterm_server::acquire_profile_write_lock(&endpoint, profile, pid)?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                if verb == "hold" {
+                    if !status.writable {
+                        // Did not get the lock (a peer holds it): nothing to hold.
+                        std::process::exit(1);
+                    }
+                    // Flush before parking: stdout is block-buffered when piped, so
+                    // without this the JSON above never reaches a redirected log.
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    eprintln!(
+                        "holding profile write-lock {:?} as pid {} — SIGTERM/Ctrl-C to release",
+                        status.profile, pid
+                    );
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
+                return Ok(());
+            }
+            "report" => {
+                let status = yggterm_server::profile_write_lock_report(&endpoint)?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            "release" => {
+                let status =
+                    yggterm_server::release_profile_write_lock(&endpoint, profile, pid)?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            other => anyhow::bail!(
+                "usage: yggterm server write-lock <acquire|hold|report|release> \
+                 [--profile <name>] (got {other:?})"
+            ),
+        }
+    }
     // `yggterm server order [--json]` — dump the Live Sessions row order, one
     // path per line. Round-trips with `server reorder --stdin`, so an order can
     // always be captured before a disruptive operation and restored after:

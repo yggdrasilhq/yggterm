@@ -2259,9 +2259,19 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::WorkingFlags
         | ServerRequest::Snapshot
         | ServerRequest::RowOrderLedgerReport { .. }
-        // Reporting which client holds a profile write-lock is read-only;
-        // ACQUIRING one is a write claim and is denied below.
         | ServerRequest::ProfileWriteLockReport
+        // The profile write-lock is a PREEMPTIBLE coordination lease over a web
+        // jar, NOT terminal ownership. A Shadow may hold it to drive a web
+        // surface, but an Active client (the human) preempts it instantly (slice
+        // 4.1a `PreemptedShadow`), so a Shadow can never lock the user out. This
+        // is exactly what makes 4.1 Active-priority contention reachable: denying
+        // acquire here makes `PreemptedShadow` dead code and forces a shadow to
+        // either write a jar with no lock (the corruption 4.2 exists to prevent)
+        // or never co-browse at all. Contrast the PTY-ownership paths below
+        // (TerminalWrite/Resize/Restart/FocusLive) — those hijack the user's live
+        // session and are NOT preemptible, so they stay denied.
+        | ServerRequest::AcquireProfileWriteLock { .. }
+        | ServerRequest::ReleaseProfileWriteLock { .. }
         | ServerRequest::TerminalRead { .. }
         | ServerRequest::TerminalSnapshot { .. }
         | ServerRequest::TerminalRetainedSnapshot { .. }
@@ -2289,10 +2299,6 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::DropTerminalRuntime { .. }
         | ServerRequest::SetSessionKeepAlive { .. }
         | ServerRequest::ReorderLiveSessions { .. }
-        // A Shadow is read-only by construction: it must never claim the right
-        // to WRITE a profile jar, nor release a lock it cannot hold.
-        | ServerRequest::AcquireProfileWriteLock { .. }
-        | ServerRequest::ReleaseProfileWriteLock { .. }
         | ServerRequest::StartLocalSession { .. }
         | ServerRequest::SwitchAgentSessionMode { .. }
         | ServerRequest::StartCommandSession { .. }
@@ -9468,7 +9474,7 @@ pub fn row_order_ledger_report(
 }
 
 /// Outcome of a profile write-lock request, as the client sees it (slice 4.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProfileWriteLockStatus {
     /// `granted` | `already_held` | `reclaimed_from_dead` | `profile_busy` |
     /// `ephemeral` | `released` | `not_held` | `not_holder` | `report`.
@@ -14176,15 +14182,27 @@ mod tests {
     // ---- slice 4.0: client identity + role gate ----
 
     #[test]
-    fn role_gate_allows_only_read_observe_for_shadow() {
+    fn role_gate_allows_read_observe_and_the_preemptible_write_lock_for_shadow() {
         use super::{ServerRequest, ShadowAccess, role_gate};
-        // The read/observe allowlist — a shadow view client may issue these.
+        // The shadow allowlist: read/observe, plus the PREEMPTIBLE profile
+        // write-lock (acquire/release/report) — safe because an Active client
+        // preempts it instantly (slice 4.1a), unlike non-preemptible PTY
+        // ownership below.
         let allowed = [
             ServerRequest::Ping,
             ServerRequest::Status,
             ServerRequest::WorkingFlags,
             ServerRequest::Snapshot,
             ServerRequest::RowOrderLedgerReport { scope: None },
+            ServerRequest::ProfileWriteLockReport,
+            ServerRequest::AcquireProfileWriteLock {
+                profile: Some("work".into()),
+                pid: 1,
+            },
+            ServerRequest::ReleaseProfileWriteLock {
+                profile: Some("work".into()),
+                pid: 1,
+            },
             ServerRequest::TerminalRead {
                 path: "p".into(),
                 cursor: 0,
@@ -14388,27 +14406,31 @@ mod tests {
     // ---- slice 4.2: profile write-lock protocol wiring ----
 
     #[test]
-    fn shadow_may_report_profile_locks_but_never_claim_one() {
+    fn shadow_may_hold_the_preemptible_write_lock_it_can_be_preempted_from() {
         use super::{ServerRequest, ShadowAccess, role_gate};
         // Reporting is read-only.
         assert_eq!(
             role_gate(&ServerRequest::ProfileWriteLockReport),
             ShadowAccess::Allow
         );
-        // Claiming (or releasing) write access is not.
+        // Acquiring/releasing the profile write-lock IS allowed: it is a
+        // preemptible coordination lease (an Active client takes it over
+        // instantly, slice 4.1a), so a Shadow holding it never locks the user
+        // out — this is what makes `PreemptedShadow` reachable. (Contrast PTY
+        // ownership, which is not preemptible and stays denied.)
         assert_eq!(
             role_gate(&ServerRequest::AcquireProfileWriteLock {
                 profile: Some("work".into()),
                 pid: 1,
             }),
-            ShadowAccess::Deny
+            ShadowAccess::Allow
         );
         assert_eq!(
             role_gate(&ServerRequest::ReleaseProfileWriteLock {
                 profile: Some("work".into()),
                 pid: 1,
             }),
-            ShadowAccess::Deny
+            ShadowAccess::Allow
         );
     }
 

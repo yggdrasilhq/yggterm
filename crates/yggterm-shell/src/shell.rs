@@ -4094,14 +4094,20 @@ async fn web_surface_native_reconcile_loop(
                                     write_lock_pid,
                                 ) {
                                     Ok(status) => status.writable,
-                                    // Daemon unreachable, or too old to know the
-                                    // lock (pre-4.2): a shadow client cannot exist
-                                    // against such a daemon (it fails closed on
-                                    // attach), so there is no second writer to fear
-                                    // — open jar-backed, preserving legacy behavior.
-                                    // Never silently drop the user's jar on an
-                                    // acquire error.
-                                    Err(_) => true,
+                                    // Acquire errored (daemon unreachable, or an
+                                    // old-gate daemon that refuses a Shadow's
+                                    // acquire with shadow_cannot_own). Fall back by
+                                    // ROLE: the user's Active GUI opens jar-backed
+                                    // (legacy behavior — it is the authority and no
+                                    // shadow can exist on such a daemon, so there is
+                                    // no second writer to fear; never silently drop
+                                    // the user's jar). A Shadow FAILS CLOSED and
+                                    // opens read-only — it must never write a jar it
+                                    // could not confirm it holds.
+                                    Err(_) => {
+                                        yggterm_server::current_client_identity().role
+                                            == yggterm_server::ClientRole::Active
+                                    }
                                 };
                                 if writable {
                                     held_profile_write_locks.insert(lock_key.clone());
