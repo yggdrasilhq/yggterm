@@ -2,6 +2,14 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.3
+
+- **Better self-diagnosis for two rendering/connection glitches.** Added telemetry
+  so the app can now automatically flag (a) a viewport that starts repainting
+  abnormally fast (the rare "blinking" corruption) and (b) a background service
+  stuck retrying a remote session — states that previously looked "healthy" to the
+  instruments. No behaviour change; these help catch the issues faster next time.
+
 ## 2.12.2
 
 - **Fixed a terminal that could come up blank.** In a rare case a session's
