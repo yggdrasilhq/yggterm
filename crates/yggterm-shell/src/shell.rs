@@ -78391,11 +78391,36 @@ fn terminal_eval_script_with_canvas_renderer(
                 // `.xterm` in the host IS term.element, so `contains` is true and this
                 // stays false — it can only fire when term.element is genuinely elsewhere,
                 // which is itself the bug.
+                // ⛔ …AND THAT REASONING WAS WRONG FOR A BACKGROUNDED HOST — fixed
+                // 2026-07-22 after it shipped as a live regression in 2.12.2.
+                // A backgrounded session's host leaves the DOM ENTIRELY (see
+                // [[finding-status-dot-blink-idle-cpu]], which measured exactly
+                // this), taking `term.element` with it. Every DOM-placement guard
+                // then reads "broken" forever on every parked session, and
+                // `emit_resize` re-fires them continuously: measured on guihost,
+                // **3931 `rebind_host` events in 5 minutes (~13/s)**, all
+                // `reason=emit_resize term_outside_host=true term_disconnected=true`.
+                // Cost: WebKitWebProcess pinned at 26%, the viewport visibly
+                // blinking ~2x/second, and — because the churn never let focus
+                // settle on the xterm helper textarea — a session the user had just
+                // switched to would come up blank and REFUSE KEYBOARD INPUT.
+                //
+                // A host that is not in the document has nothing to repair and
+                // nobody looking at it. Placement is only meaningful for a host that
+                // is actually on screen, so every placement guard is gated on that.
+                // The original husk case is untouched: there the host IS on screen
+                // (the user is staring at the blank viewport), so this reads true.
+                const hostConnected = Boolean(liveHost && liveHost.isConnected);
+                // Kept RAW (not pre-gated) so the trace still reports what was
+                // actually observed; `hostConnected` below is what DECLINES to act
+                // on it. A future autopsy should be able to read "the element was
+                // outside, and we correctly did nothing because the host was parked".
                 const termElementOutsideHost = Boolean(termElement && !liveHost.contains(termElement));
                 const sameHostNeedsReopen =
                     Boolean(
                         reopen
                         && sameHost
+                        && hostConnected
                         && (
                             hostMissingXtermRoot
                             || hostMissingRenderableLayer
@@ -78453,7 +78478,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 repairMissingRendererSurface(reason);
                 sendTerminalEvent({{
                     kind: "debug",
-                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
+                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_connected=${{hostConnected}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
                 }});
             }} catch (_error) {{}}
             return host;
@@ -100624,6 +100649,23 @@ mod tests {
         assert!(
             script.contains("|| termElementOutsideHost"),
             "the outside-host witness must be wired into the reopen decision"
+        );
+        // …and the REGRESSION that fix shipped (live on guihost, 2.12.2): a
+        // BACKGROUNDED host leaves the DOM entirely, so every placement guard read
+        // "broken" forever and emit_resize re-fired the reopen ~13x/second (3931
+        // rebind_host events in 5 minutes). A host that is not in the document has
+        // nothing to repair and nobody looking at it.
+        assert!(
+            script.contains("const hostConnected = Boolean(liveHost && liveHost.isConnected);"),
+            "a parked (backgrounded) host must be recognised, not 'repaired' forever"
+        );
+        assert!(
+            script.contains("&& hostConnected\n"),
+            "the same-host reopen decision must require the host to be in the document"
+        );
+        assert!(
+            script.contains("host_connected=${hostConnected}"),
+            "the autopsy needs to see WHY an outside-host observation was declined"
         );
         // REPAINT-STORM PROBE (2026-07-22): the ~50Hz garbled-blink pathology is
         // invisible to paint-count health; the paint-RATE probe must ship so
