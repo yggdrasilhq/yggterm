@@ -93,19 +93,60 @@ const KEYTIPS_AUDIT_JS: &str = r#"
         if (cs.pointerEvents === 'none') return false;      // cannot be clicked -> not an affordance
         return true;
     }
+    // §12.1: report REACHABLE / EXCUSED / ORPHAN as three numbers, not one.
+    // The old audit counted `data-keytip-exempt` as satisfied and returned a
+    // single orphan_count, so exempting a SUBTREE silently retired every control
+    // inside it. Measured 2026-07-22: it read 0 while 6 of 71 affordances were
+    // reachable (25 hidden under settings-panel alone). Subtree suppression is
+    // now a VIOLATION class of its own — exemption is per-element or it is a
+    // hiding place.
+    function describe(el){
+        const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('data-app-verb') || el.id || '')
+            .replace(/\s+/g, ' ').trim().slice(0, 60);
+        return { tag: el.tagName.toLowerCase(), id: el.id || '', cls: (el.className && el.className.baseVal !== undefined ? el.className.baseVal : String(el.className || '')).slice(0, 60), label: label };
+    }
     const all = Array.prototype.slice.call(document.querySelectorAll(SEL));
     const visible = all.filter(vis);
     const orphans = [];
+    const subtreeSuppressed = [];
+    const excusedReasons = {};
+    const suppressedBySubtree = {};
+    let reachable = 0, excused = 0;
     visible.forEach(function(el){
-        if (el.hasAttribute('data-keytip-node')) return;      // declared
-        if (el.hasAttribute('data-keytip-exempt')) return;    // explicitly exempt
-        if (el.closest('[data-keytip-exempt]')) return;       // under an exempt subtree
-        if (el.querySelector('[data-keytip-node], [data-keytip-exempt]')) return; // marker inside
-        const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('data-app-verb') || el.id || '')
-            .replace(/\s+/g, ' ').trim().slice(0, 60);
-        orphans.push({ tag: el.tagName.toLowerCase(), id: el.id || '', cls: (el.className && el.className.baseVal !== undefined ? el.className.baseVal : String(el.className || '')).slice(0, 60), label: label });
+        if (el.hasAttribute('data-keytip-node')) { reachable++; return; }
+        if (el.hasAttribute('data-keytip-exempt')) {
+            excused++;
+            const why = el.getAttribute('data-keytip-exempt') || '(no reason)';
+            excusedReasons[why] = (excusedReasons[why] || 0) + 1;
+            return;
+        }
+        const exemptAncestor = el.closest('[data-keytip-exempt]');
+        if (exemptAncestor) {
+            const why = exemptAncestor.getAttribute('data-keytip-exempt') || '(no reason)';
+            suppressedBySubtree[why] = (suppressedBySubtree[why] || 0) + 1;
+            const row = describe(el); row.suppressed_by = why;
+            subtreeSuppressed.push(row);
+            return;
+        }
+        if (el.querySelector('[data-keytip-node], [data-keytip-exempt]')) { reachable++; return; }
+        orphans.push(describe(el));
     });
-    return { visible_interactables: visible.length, orphan_count: orphans.length, orphans: orphans.slice(0, 300) };
+    const violations = orphans.length + subtreeSuppressed.length;
+    return {
+        visible_interactables: visible.length,
+        reachable: reachable,
+        excused: excused,
+        excused_reasons: excusedReasons,
+        subtree_suppressed_count: subtreeSuppressed.length,
+        suppressed_by_subtree: suppressedBySubtree,
+        subtree_suppressed: subtreeSuppressed.slice(0, 300),
+        orphan_count: orphans.length,
+        orphans: orphans.slice(0, 300),
+        // The number that must go to zero. Subtree suppression counts against
+        // it, so the old escape hatch can no longer flatter the score.
+        violations: violations,
+        reachable_pct: visible.length ? Math.round((reachable / visible.length) * 100) : 100
+    };
 "#;
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";

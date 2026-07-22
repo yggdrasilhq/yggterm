@@ -9014,13 +9014,21 @@ impl ShellState {
     /// predicate — the two lists answer the same question for the two
     /// stacking modes.
     fn has_modal_over_viewport(&self) -> bool {
-        self.pending_fido2.is_some()
-            || self.pending_delete.is_some()
-            || self.copy_edit_dialog.is_some()
+        self.top_modal().is_some()
+    }
+    /// Which over-viewport modal currently owns the screen. ONE owner for both
+    /// "is a modal up" and "which one gets the keyboard" (§12.3) — a second
+    /// ordering could disagree about which dialog an Enter belongs to.
+    fn top_modal(&self) -> Option<TopModal> {
+        top_modal_of(
+            self.pending_fido2.is_some(),
+            self.pending_delete.is_some(),
+            self.copy_edit_dialog.is_some(),
             // A native web surface draws above ALL DOM, so a modal raised over a
             // browsing session is invisible unless the reconciler stashes the
             // surface first. This one is ALWAYS raised over a web surface.
-            || self.pending_classic_tabs_switch
+            self.pending_classic_tabs_switch,
+        )
     }
     fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
@@ -26116,6 +26124,75 @@ fn queue_copy_edit_for_active_session(mut state: Signal<ShellState>, field: Copy
     sync_active_terminal_input_policy(state);
 }
 
+/// §12.3 — the dialog keys every modal must accept, handled ONCE at the modal
+/// boundary instead of per modal. Before this, a modal reached by chords
+/// (`ALT,E,L` → `ALT,J,↑` → `ALT,E,X`) opened and then accepted no keys at all,
+/// because the JS bridge only captures while the ALT overlay is up and the
+/// overlay closes as soon as the chord dispatches — so the user had to finish a
+/// keyboard-only flow with the mouse.
+///
+/// Returns true when a modal consumed the key.
+///
+/// ⛔ **`Enter` deliberately does NOT approve the FIDO2 presence dialog.** Every
+/// other modal here is one the USER opened, so "Enter = the primary button" is
+/// the ordinary dialog convention. A FIDO2 ceremony is initiated by a *page*, can
+/// appear while the user is typing, and approving it releases a credential — a
+/// stray Enter must never be able to do that. Escape declines it (dismissing is
+/// always safe); approval stays an explicit gesture.
+fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
+    let Some(top) = state.with(|shell| shell.top_modal()) else {
+        return false;
+    };
+    // Backspace means "step back out of this scope"; a modal is the innermost
+    // scope, so leaving it IS the dismiss. (The JS side never sends Backspace
+    // while a text field has focus — there it is ordinary text editing.)
+    let dismiss = matches!(key, "Escape" | "Backspace");
+    let accept = key == "Enter";
+    if !dismiss && !accept {
+        return false;
+    }
+    match top {
+        TopModal::Fido2 => {
+            let Some(dialog) = state.with(|shell| shell.pending_fido2.clone()) else {
+                return false;
+            };
+            if dismiss {
+                resolve_fido2_dialog(state, dialog, false, None);
+                return true;
+            }
+            // Enter is swallowed, not acted on: the modal is up, so the key must
+            // not fall through to the surface behind it either.
+            true
+        }
+        TopModal::Delete => {
+            if dismiss {
+                state.with_mut(|shell| shell.cancel_delete_dialog());
+            } else {
+                queue_delete_selected_items(state, true);
+            }
+            true
+        }
+        TopModal::CopyEdit => {
+            if dismiss {
+                cancel_copy_edit(state);
+            } else {
+                commit_copy_edit(state);
+            }
+            true
+        }
+        TopModal::ClassicTabsSwitch => {
+            state.with_mut(|shell| {
+                if dismiss {
+                    shell.cancel_classic_tabs_switch();
+                } else {
+                    shell.confirm_classic_tabs_switch();
+                }
+            });
+            true
+        }
+    }
+}
+
 fn update_copy_edit_value(mut state: Signal<ShellState>, value: String) {
     state.with_mut(|shell| {
         if let Some(dialog) = shell.copy_edit_dialog.as_mut() {
@@ -27629,6 +27706,50 @@ fn titlebar_autohide_pinned_flags(
 /// `data-covers-web-surface` element mounts (`pointer-events:none`, so DOM
 /// behavior is untouched — the cover only feeds the GTK input region), and
 /// the synchronous cover push makes it effective the instant it is visible.
+/// The over-viewport modals, in TOP-OF-STACK order. Rendering order in the
+/// component tree is the reverse (later siblings paint above), so this list is
+/// deliberately written topmost-first and must stay in sync with that tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TopModal {
+    Fido2,
+    Delete,
+    CopyEdit,
+    ClassicTabsSwitch,
+}
+
+/// Pure precedence: which modal is on top given what is open. Split out so the
+/// live `ShellState` and the `RenderSnapshot` cannot disagree about the answer.
+fn top_modal_of(
+    fido2: bool,
+    delete: bool,
+    copy_edit: bool,
+    classic_tabs_switch: bool,
+) -> Option<TopModal> {
+    if fido2 {
+        return Some(TopModal::Fido2);
+    }
+    if delete {
+        return Some(TopModal::Delete);
+    }
+    if copy_edit {
+        return Some(TopModal::CopyEdit);
+    }
+    if classic_tabs_switch {
+        return Some(TopModal::ClassicTabsSwitch);
+    }
+    None
+}
+
+/// Snapshot-side view of the same precedence, for the render pass.
+fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
+    top_modal_of(
+        snapshot.pending_fido2.is_some(),
+        snapshot.pending_delete.is_some(),
+        snapshot.copy_edit_dialog.is_some(),
+        snapshot.pending_classic_tabs_switch,
+    )
+}
+
 fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
     snapshot.titlebar_new_menu_open
         || snapshot.titlebar_session_menu_open
@@ -29457,6 +29578,22 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   function isAlt(e){ return e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight'; }
   // Authoritative overlay state: the breadcrumb is rendered iff the overlay is up.
   function overlayOpen(){ return !!document.querySelector('[data-yggterm-keytip-breadcrumb]'); }
+  // Authoritative modal state, same trick: the marker is rendered iff an
+  // over-viewport modal is up (Rust's `render_top_modal` decides, so the DOM
+  // cannot disagree with the dispatcher about which dialog is on top).
+  function modalOpen(){ return !!document.querySelector('[data-yggterm-modal-open]'); }
+  // A focused text field owns Backspace/Enter — they are editing there, not
+  // dialog keys. contenteditable counts; a checkbox/button does not.
+  function editingText(){
+    var el = document.activeElement;
+    if (!el) { return false; }
+    if (el.isContentEditable) { return true; }
+    var tag = (el.tagName || '').toLowerCase();
+    if (tag === 'textarea') { return true; }
+    if (tag !== 'input') { return false; }
+    var t = (el.getAttribute('type') || 'text').toLowerCase();
+    return ['text','search','url','email','password','number','tel','password'].indexOf(t) >= 0;
+  }
   // Direct accelerators (§11): a small PTY-safe set the shell captures below the
   // webview so they fire even from a focused terminal. The effective set (defaults
   // + keymap.json overrides) lives in window.__yggtermAltAccels; each entry is
@@ -29493,6 +29630,20 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     }
     armed = false; // any non-ALT key cancels tap candidacy
     if (!overlayOpen()) {
+      // §12.3: a modal owns the dialog keys even with the overlay CLOSED — the
+      // overlay dismisses the instant a chord dispatches, so without this a
+      // chord-opened modal accepts nothing and the flow ends at the mouse.
+      if (modalOpen() && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        var mk = e.key;
+        if (mk === 'Escape' || mk === 'Enter' || mk === 'Backspace') {
+          // Never steal from a focused text field: Backspace there is editing,
+          // and Enter in a textarea is a newline. Escape still dismisses.
+          if (mk !== 'Escape' && editingText()) { return; }
+          e.preventDefault(); e.stopPropagation();
+          if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ modal_key: mk }); }
+          return;
+        }
+      }
       return; // overlay closed: keys flow to the app/PTY untouched (invariant 7)
     }
     // Overlay open: this key belongs to the chord. Capture it here — below the
@@ -29662,6 +29813,13 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             state.with_mut(|shell| shell.clear_alt_overlay());
             dispatch_keytip_node(state, &command);
         }
+        return;
+    }
+    // §12.3: a dialog key for an open modal, sent while the ALT overlay is
+    // CLOSED. Kept as its own message so it can never be confused with a chord
+    // character, and so the modal boundary owns the decision.
+    if let Some(modal_key) = msg.get("modal_key").and_then(|value| value.as_str()) {
+        modal_key_dispatch(state, modal_key);
         return;
     }
     let Some(key) = msg.get("key").and_then(|value| value.as_str()) else {
@@ -56194,6 +56352,23 @@ fn app() -> Element {
                         style: "position:fixed; inset:0; pointer-events:none; background:transparent; z-index:0;",
                     }
                 }
+                // §12.3 modal marker: the JS key bridge reads this to know a
+                // dialog owns Enter/Escape/Backspace while the ALT overlay is
+                // closed. Rendered from `render_top_modal`, the same precedence
+                // `modal_key_dispatch` uses, so the DOM and the dispatcher can
+                // never disagree about which dialog is on top.
+                if let Some(top_modal) = render_top_modal(&snapshot) {
+                    div {
+                        "data-yggterm-modal-open": match top_modal {
+                            TopModal::Fido2 => "fido2",
+                            TopModal::Delete => "delete",
+                            TopModal::CopyEdit => "copy-edit",
+                            TopModal::ClassicTabsSwitch => "classic-tabs-switch",
+                        },
+                        "data-keytip-exempt": "modal-marker",
+                        style: "display:none;",
+                    }
+                }
                 if let Some(pending_delete) = snapshot.pending_delete.clone() {
                     DeleteConfirmOverlay {
                         pending: pending_delete,
@@ -82462,6 +82637,31 @@ fn terminal_eval_script_with_canvas_renderer(
                 persistScrollStateToLocalStorage('periodic_screen_restore');
             }} catch (_error) {{}}
         }}, 4000);
+        // REPAINT-STORM PROBE STALENESS FIX (2026-07-22, found while chasing a
+        // live "high-FPS blink on switch" report). The rate window only closes
+        // inside emitPaint, so a host that STOPS painting keeps reporting its
+        // last rate forever: a quiescent host read 16/s for 38s straight, which
+        // is indistinguishable from a live 16/s burst, and a storm that ended
+        // never cleared `repaintStormMs`. Close an expired window from a timer
+        // too, so the rate decays to 0 and the storm flag resolves on its own.
+        // `paintRateAtMs` lets a reader see how fresh the number is at all.
+        const paintRateDecayTimer = window.setInterval(() => {{
+            try {{
+                if (paintRateWindowStartMs === 0) {{ return; }}
+                const decayNowMs = Date.now();
+                if (decayNowMs - paintRateWindowStartMs < 1000) {{ return; }}
+                const observedRate = paintRateWindowCount;
+                paintRateWindowStartMs = decayNowMs;
+                paintRateWindowCount = 0;
+                if (observedRate < 30) {{ repaintStormSinceMs = 0; }}
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].paintRatePerSec = observedRate;
+                    window.__yggtermXtermHosts[hostId].repaintStormMs =
+                        repaintStormSinceMs ? Math.max(0, decayNowMs - repaintStormSinceMs) : 0;
+                    window.__yggtermXtermHosts[hostId].paintRateAtMs = decayNowMs;
+                }}
+            }} catch (_error) {{}}
+        }}, 1000);
         // Settle-follow watchdog — the EXECUTOR for scroll_mode.rs
         // `should_settle_follow` (Following + viewport stranded below base →
         // re-assert to the current baseY). The oracle shipped with tests but no
@@ -100370,6 +100570,16 @@ mod tests {
             "the DOM is the only witness to a detached term element"
         );
         assert!(
+            script.contains("const paintRateDecayTimer = window.setInterval(() => {"),
+            "the paint-rate window must also close on a timer: a host that STOPS \
+             painting kept reporting its last rate forever, so a quiescent host \
+             was indistinguishable from a live burst and an ended storm never cleared"
+        );
+        assert!(
+            script.contains("paintRateAtMs"),
+            "a rate reading must carry its own freshness stamp"
+        );
+        assert!(
             script.contains("unrepairable_detached:"),
             "detached AND every repair guard declining is the alarm condition"
         );
@@ -101051,6 +101261,64 @@ mod tests {
     // it relies on the full-window transient cover for input. Every modal
     // `has_modal_over_viewport` counts must therefore also open the
     // transient cover, or it becomes a click-through window over a page.
+    #[test]
+    // §12.3. The user's failing chain was ALT,E,L -> ALT,J,up -> ALT,E,X, which
+    // opens a modal that then accepted NO keys, so a keyboard-only flow had to
+    // finish at the mouse. The bridge only captured while the ALT overlay was up,
+    // and the overlay closes the moment a chord dispatches.
+    #[test]
+    fn a_modal_owns_the_dialog_keys_even_with_the_alt_overlay_closed() {
+        let script = keytip_bridge_js(&KeymapConfig::default());
+
+        assert!(
+            script.contains("function modalOpen()"),
+            "the bridge needs its own authoritative modal probe, like overlayOpen()"
+        );
+        assert!(
+            script.contains("data-yggterm-modal-open"),
+            "modal detection must read the marker Rust renders from render_top_modal"
+        );
+        assert!(
+            script.contains("modal_key:"),
+            "a dialog key must arrive as its own message, never as a chord char"
+        );
+        // The trap: the copy-edit dialog holds a text input. Capturing Backspace
+        // globally would eat the user's editing.
+        assert!(
+            script.contains("function editingText()"),
+            "Backspace/Enter belong to a focused text field, not to the dialog"
+        );
+        assert!(
+            script.contains("if (mk !== 'Escape' && editingText()) { return; }"),
+            "Escape must still dismiss from inside a text field, Backspace must not"
+        );
+    }
+
+    // ONE precedence list decides both "is a modal up" and "who gets the Enter".
+    #[test]
+    fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
+        assert_eq!(top_modal_of(false, false, false, false), None);
+        assert_eq!(top_modal_of(true, false, false, false), Some(TopModal::Fido2));
+        assert_eq!(top_modal_of(false, true, false, false), Some(TopModal::Delete));
+        assert_eq!(top_modal_of(false, false, true, false), Some(TopModal::CopyEdit));
+        assert_eq!(
+            top_modal_of(false, false, false, true),
+            Some(TopModal::ClassicTabsSwitch)
+        );
+        // Stacked: the topmost-rendered dialog wins the keyboard.
+        assert_eq!(top_modal_of(true, true, true, true), Some(TopModal::Fido2));
+        assert_eq!(top_modal_of(false, true, true, true), Some(TopModal::Delete));
+
+        // And `has_modal_over_viewport` must be exactly "something is on top",
+        // so the two can never drift apart.
+        let mut shell = shell_with_contribution("local://ws", 1_000);
+        assert!(!shell.has_modal_over_viewport());
+        assert_eq!(shell.top_modal(), None);
+        shell.pending_classic_tabs_switch = true;
+        assert!(shell.has_modal_over_viewport());
+        assert_eq!(shell.top_modal(), Some(TopModal::ClassicTabsSwitch));
+    }
+
     #[test]
     fn every_over_viewport_modal_opens_the_transient_cover() {
         let mut shell = shell_with_contribution("local://ws", 1_000);
