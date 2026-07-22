@@ -2408,6 +2408,7 @@ fn profile_write_lock_outcome_name(
         AcquireOutcome::Granted => "granted",
         AcquireOutcome::AlreadyHeld => "already_held",
         AcquireOutcome::ReclaimedFromDead { .. } => "reclaimed_from_dead",
+        AcquireOutcome::PreemptedShadow { .. } => "preempted_shadow",
         AcquireOutcome::Busy { .. } => crate::profile_write_lock::PROFILE_BUSY,
         AcquireOutcome::Ephemeral => "ephemeral",
     }
@@ -2429,10 +2430,12 @@ fn profile_write_lock_acquire_response(
         AcquireOutcome::Busy { held_by } => {
             (Some(held_by.client_id.clone()), Some(held_by.pid))
         }
-        // Held by the requester now.
+        // Held by the requester now (including after an Active-priority
+        // preemption of a Shadow, slice 4.1).
         AcquireOutcome::Granted
         | AcquireOutcome::AlreadyHeld
-        | AcquireOutcome::ReclaimedFromDead { .. } => {
+        | AcquireOutcome::ReclaimedFromDead { .. }
+        | AcquireOutcome::PreemptedShadow { .. } => {
             (Some(requester.client_id.clone()), Some(requester.pid))
         }
         // Nothing is ever recorded for an ephemeral profile.
@@ -6092,6 +6095,9 @@ impl DaemonRuntime {
                         format!("anonymous:{pid}")
                     }),
                     pid,
+                    // Slice 4.1: the grant records its role so an Active client
+                    // can preempt a Shadow holder (Active-priority).
+                    identity.role,
                 );
                 let resolved = yggterm_core::web_profile::normalize_web_profile(profile.as_deref());
                 let outcome = self.profile_write_locks.acquire(
@@ -6122,6 +6128,7 @@ impl DaemonRuntime {
                         .clone()
                         .unwrap_or_else(|| format!("anonymous:{pid}")),
                     pid,
+                    identity.role,
                 );
                 let resolved = yggterm_core::web_profile::normalize_web_profile(profile.as_deref());
                 let outcome = self.profile_write_locks.release(profile.as_deref(), &holder);
@@ -14409,8 +14416,8 @@ mod tests {
     fn acquire_response_names_the_blocking_holder_and_gates_writability() {
         use super::{ServerResponse, profile_write_lock_acquire_response};
         use crate::profile_write_lock::{AcquireOutcome, ProfileWriteLockHolder};
-        let requester = ProfileWriteLockHolder::new("shadow", 200);
-        let incumbent = ProfileWriteLockHolder::new("gui", 100);
+        let requester = ProfileWriteLockHolder::new("shadow", 200, crate::ClientRole::Shadow);
+        let incumbent = ProfileWriteLockHolder::new("gui", 100, crate::ClientRole::Active);
 
         // Refused: the response must name who actually holds it, and must NOT
         // report the profile as writable.
@@ -14476,13 +14483,19 @@ mod tests {
         );
         assert_eq!(
             profile_write_lock_outcome_name(&AcquireOutcome::ReclaimedFromDead {
-                previous: ProfileWriteLockHolder::new("gone", 1),
+                previous: ProfileWriteLockHolder::new("gone", 1, crate::ClientRole::Active),
             }),
             "reclaimed_from_dead"
         );
         assert_eq!(
+            profile_write_lock_outcome_name(&AcquireOutcome::PreemptedShadow {
+                previous: ProfileWriteLockHolder::new("shadow", 2, crate::ClientRole::Shadow),
+            }),
+            "preempted_shadow"
+        );
+        assert_eq!(
             profile_write_lock_outcome_name(&AcquireOutcome::Busy {
-                held_by: ProfileWriteLockHolder::new("gui", 1),
+                held_by: ProfileWriteLockHolder::new("gui", 1, crate::ClientRole::Active),
             }),
             "profile_busy"
         );
