@@ -32,7 +32,9 @@
 //!
 //! Slice 4.1 extends THIS state across clients by keying on `(client_id, role)`;
 //! [`AgentBatch::client_id`] is that seat, unused (`None`) while there is one
-//! client. 4.1 must not add a parallel lease table beside it.
+//! client. 4.1 must not add a parallel lease table beside it. Slice 4.1c's
+//! write-lock-loss preemption reuses [`AgentInputArbiter::preempt_surface`] —
+//! the shared cancel-all-batches primitive — rather than a second cancel path.
 //!
 //! # What still needs plumbing (be honest about this)
 //!
@@ -153,11 +155,14 @@ impl AgentInputArbiter {
         AdmitOutcome::Allowed
     }
 
-    /// **Real seat input arrived on `surface`.** Every batch driving it is
-    /// cancelled, so no further verb from those runs is admitted. The human's
-    /// input is never queued behind an agent — the pump is already serial, and
-    /// after this call the agent simply has nothing left to dispatch.
-    pub fn note_human_input(&mut self, surface: &SurfaceKey) -> PreemptReport {
+    /// **A preemption event landed on `surface`** — cancel every batch driving
+    /// it, so no further verb from those runs is admitted. This is the SHARED
+    /// primitive behind both preemption causes, one mechanism / one table:
+    /// - real seat input (gate 9, [`Self::note_human_input`]);
+    /// - slice-4.1c write-lock loss (a `Shadow` whose profile write-lock an
+    ///   `Active` client preempted must stop injecting into that jar).
+    /// The CAUSE lives only in the caller's journal, never in a second lane map.
+    pub fn preempt_surface(&mut self, surface: &SurfaceKey) -> PreemptReport {
         let Some(lane) = self.lanes.get_mut(surface) else {
             return PreemptReport::default();
         };
@@ -169,6 +174,14 @@ impl AgentInputArbiter {
             report.cancelled_batches.push(batch_id);
         }
         report
+    }
+
+    /// **Real seat input arrived on `surface`** (gate 9). Delegates to
+    /// [`Self::preempt_surface`]: the human's input is never queued behind an
+    /// agent — the pump is already serial, and after this call the agent simply
+    /// has nothing left to dispatch.
+    pub fn note_human_input(&mut self, surface: &SurfaceKey) -> PreemptReport {
+        self.preempt_surface(surface)
     }
 
     /// Has this batch been preempted on this surface?
@@ -283,6 +296,25 @@ mod tests {
 
         arb.forget(&s);
         assert!(!arb.is_preempted(&s, "agent-a"));
+    }
+
+    // Slice 4.1c: write-lock loss cancels the batch through the SAME primitive
+    // seat input uses — a preempted Shadow's later verbs are refused, exactly as
+    // after a human touch. (`note_human_input` is a named alias for this cause.)
+    #[test]
+    fn preempt_surface_is_the_shared_primitive_for_write_lock_loss() {
+        let s = surface();
+        let mut arb = AgentInputArbiter::new();
+        let shadow_batch = AgentBatch {
+            batch_id: "shadow-run".into(),
+            client_id: Some("shadow-1".into()),
+        };
+        assert_eq!(arb.admit(&s, &shadow_batch, 1), AdmitOutcome::Allowed);
+        // The user's Active GUI preempted the shadow's profile write-lock.
+        let report = arb.preempt_surface(&s);
+        assert_eq!(report.cancelled_batches, vec!["shadow-run".to_string()]);
+        // The shadow's next verb is refused — it may not write the jar it lost.
+        assert_eq!(arb.admit(&s, &shadow_batch, 1), AdmitOutcome::Preempted);
     }
 
     #[test]
