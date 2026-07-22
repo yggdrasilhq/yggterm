@@ -664,11 +664,32 @@ protocol:
     (+2 unit tests); workspace green. **Owed:** the coordinated daemon+GUI deploy
     to jojo for live proof (needs 4.1a on jojo's daemon, which predates it), best
     landed together with 4.1c.
-  - **4.1c (owed):** the Shadow's `do` chokepoint checks `ProfileWriteLockReport`
-    (already Allow-for-Shadow) before injecting; on loss it refuses `preempted`
-    and cancels its batch via the gate-9 arbiter keyed by `client_id`.
-  4.1c (and 4.1b's live proof) need a coordinated daemon+GUI deploy to jojo (no
-  protocol bump, so no version fight, but still the deploy rules).
+  - **4.1c ✅ LANDED (main, this session).** The Shadow's `do` chokepoint
+    (`web_surface_do_for`, shell.rs) now checks `ProfileWriteLockReport` (already
+    Allow-for-Shadow) before injecting: if the report no longer names this shadow
+    as the holder of the surface's active-tab profile — because an Active client
+    preempted it (4.1a) — the verb is refused `preempted` and the batch cancelled
+    through the SHARED preempt primitive `AgentInputArbiter::preempt_surface` (the
+    same one seat input uses; `note_human_input` is now a named alias for that
+    cause — one table, not two). So the shadow's later verbs are refused by the
+    gate-9 `admit` path until it re-observes and, if it regains the lock, starts a
+    fresh batch. **Only Shadows pay the round-trip** (an Active client holds the
+    lock by construction, or drives its own ephemeral read-only surface from 4.1b);
+    ephemeral profiles are exempt (own in-memory context, no shared jar); and it
+    **fails CLOSED** — a shadow that cannot reach the daemon to confirm refuses,
+    matching the shadow doctrine (D7). This closes the residual two-writer window
+    4.1b left: a shadow whose jar-backed context outlives its preemption can no
+    longer take *agent-driven* writes to the jar. (Residual, documented: the
+    preempted shadow's live WebContext can still emit background/JS writes until
+    its surface closes — a heavier destroy-on-loss mitigation is out of 4.1c's
+    scope.) Pure `write_lock_report_holds` (+ unit test) + the arbiter
+    shared-primitive test; workspace green.
+  **4.1b/4.1c LIVE proof still owed** — a coordinated daemon+GUI deploy to jojo
+  (no protocol bump, so no version fight, but the deploy rules apply), and jojo's
+  2.12.1 daemon predates 4.1a, so PreemptedShadow must land there first. No CLI
+  verb drives the write-lock over the wire yet, so a sandbox end-to-end proof
+  needs a throwaway probe bin or a new hidden verb (gate-11/16 proofs want the
+  same).
 - The transport-independent *core* — client-keyed batches with Active-priority
   preemption — is pure logic that both shapes reuse and is what
   `AgentBatch::client_id` already seats. It is unit-testable with no daemon and no
