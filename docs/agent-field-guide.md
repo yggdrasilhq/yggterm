@@ -25,10 +25,23 @@ Every entry below cost a session at least once.
 | `/proc/<pid>/environ` | The process called `std::env::set_var` at runtime (yggterm does this for GL and arming decisions) | The app's own reported state |
 | The daemon's `terminal_lines` | You are chasing a CLIENT paint bug. That is the daemon's vt100 screen — comparing it to itself proves nothing about what the client painted | A faithful pixel, or the client buffer |
 | A verb's own `accepted` / `is_trusted` | Always treat as an assumption, not an observation | Read back the page-side *effect* |
+| `dom-eval` returning `{"result": null}` | Your script had no `return`. The body is spliced into an async function, so an *expression* yields `undefined` → `null` — identical to a field that does not exist | Include a `sanity: 1+1` term in every probe |
+| `yggterm --version` | You need the **protocol** version. It reports the `yggterm` package; the daemon uses `yggterm-server`'s, which a version-only bump may not recompile | The daemon's own socket name, `server-<v>.sock` |
+| `server reorder`'s response | The rows have no live runtime. It reports `"requested": N` and echoes your list even when it reordered nothing | Re-read `server app rows` |
+| `--help` for any `server app` verb | Often — the help text goes stale while the parser gains verbs | The match arm in `apps/yggterm/src/main.rs` |
+| A `#[serde(default)]` telemetry field reading `0` | The peer predates the field entirely — absent and zero are the same wire value | Ask whether the KEY exists, not its value |
 
 **The rule underneath all of them:** if the symptom is visual, the proof is a
 faithful pixel. Telemetry that says "healthy" while the user sees a broken screen
 means the telemetry is wrong, not the user.
+
+**The generalisation worth carrying to any codebase:** the dangerous instrument
+is not one that fails loudly — it is one whose *failure value is indistinguishable
+from a legitimate negative result*. `null`, `0`, `[]`, and "unchanged" are all
+answers a broken probe gives just as readily as a healthy system does. Whenever a
+probe can return one of those, make it carry a term that proves the probe itself
+ran (a `sanity` value, a key-existence check, a known-nonzero control). A probe
+that cannot fail loudly must be made to succeed loudly.
 
 ## 2. Profiling recipes that work
 
@@ -77,32 +90,139 @@ campaign notes before "fixing" that. Consequences that drive real bugs:
 
 ## 4. Deploy protocol
 
-**Know what you are changing.** A GUI-only change (shell.rs) needs no version
-bump and no daemon restart: replace the binary, SIGTERM the GUI, relaunch via
-`yggterm-headless server app launch`. A daemon change needs the hot-restart path
-so sessions survive — never `kill -9` a daemon.
+### 4.0 First decide which KIND of deploy this is — it changes everything
 
-Before deploying:
-1. Check the **running** version of every component the fix touches. A compiled
-   binary on disk is not a running fix; the daemon defers its own retirement
-   while any owned session is working, so it can stay pinned for many hours.
-2. Refuse to deploy into a multi-daemon home. Two daemons on one host is a stop
-   signal — consolidate first.
+| Change lives in | Version | What restarts | Cost to the user |
+|---|---|---|---|
+| CLI path only (arg parsing, screenshot post-processing, manifest building) | any | nothing | **zero** — run the new binary as a client from `/tmp` |
+| GUI only (`shell.rs`) | **KEEP THE CURRENT VERSION** | GUI only | small — one blank re-attach |
+| Daemon (`daemon.rs`, `lib.rs`, protocol) | bump | GUI **and** daemon together | real — re-attach symptom class on every live session |
 
-After deploying:
-3. **Count the session rows.** A handoff that does not complete while the
-   successor claims the socket aliases leaves the GUI talking to a daemon that
-   holds a fraction of the sessions. Nothing is lost, but invisible is lost from
-   where the user sits. This has happened; it was the user who noticed.
-4. Check contract violations are empty and the daemon PID is what you expect.
-5. Exercise the fix and quote the evidence. If you cannot exercise it, say so
-   plainly — "code is on disk, the running daemon predates the fix" — rather
-   than "shipped".
+⛔ **A GUI-only patch must NOT bump the version.** A newer GUI classifies the
+older daemon as stale and spawns a successor — which is exactly the daemon
+handoff (and its frame corruption) you were avoiding. Same version = the daemon
+is untouched, its PID does not change, and PTYs never move.
+
+⛔ **Never leave the GUI and daemon on different versions.** An *older GUI*
+fights a *newer daemon*: it classifies it as stale and tries to displace it
+forever (measured: ~24,000 events at ~2,500/min for 27 minutes, user saw frozen
+frames and "daemon connection lost"). The `version_mismatch` warning only fires
+when the GUI is newer, which is why the dangerous direction looks safe.
+
+### 4.1 The version-stamp landmine — VERIFY, never trust `--version`
+
+`SERVER_PROTOCOL_VERSION` is `env!("CARGO_PKG_VERSION")` of the **yggterm-server**
+crate. A version-only bump in `Cargo.toml` does **not** always force that crate to
+recompile, so a release build can ship a binary whose `--version` reads 2.12.2
+(the `yggterm` package) while its baked protocol constant is still 2.11.0. The
+deployed GUI then reads its own protocol as older than the live daemon, silently
+refuses to swap, and you get a mixed-version wedge: a retry spin, a session that
+cannot reconnect, broken typing, and a ~50 Hz garbled blink. **This cost hours.**
+
+```bash
+cargo clean -p yggterm-server          # before ANY release build after a bump
+cargo build --release --bin yggterm --bin yggterm-headless
+```
+
+**Then prove the stamp** — `--version` cannot prove it, because it reads a
+different crate's version. The socket name is derived from the protocol constant
+(`format!("server-{}.sock", SERVER_PROTOCOL_VERSION.replace('.', "-"))`), so a
+throwaway daemon in an isolated home spells it out:
+
+```bash
+SB=$(mktemp -d)
+YGGTERM_HOME="$SB" ./target/release/yggterm-headless server daemon > "$SB/d.log" 2>&1 &
+sleep 3; grep -o 'server-[0-9-]*\.sock' "$SB/d.log"   # -> server-2-12-3.sock
+kill %1
+```
+
+⚠ The socket does **not** live under `YGGTERM_HOME` when that path is long — it
+falls back to `/run/user/<uid>/yggterm/h-<hash>/`. Read the path out of the
+daemon's own log line, don't `find` the home dir. Clean up that runtime dir too.
+
+### 4.2 Deploy to all FOUR paths
+
+The live host runs the daemon from `~/.local/bin/`, but remote wrappers invoke
+`~/.yggterm/bin/`. Miss one and you get a split-version fleet:
+
+```
+~/.local/bin/yggterm    ~/.local/bin/yggterm-headless
+~/.yggterm/bin/yggterm  ~/.yggterm/bin/yggterm-headless
+```
+
+`cp -a` each to `*.rollback` first, then **`mv` the new binary in — never `cp`**
+(cp over a running binary is `ETXTBSY`).
+
+### 4.3 The recipe that works (cross-version, no fight)
+
+```bash
+# 0. CAPTURE THE GROUND TRUTH FIRST — this list is what makes recovery exact
+ssh $H '~/.local/bin/yggterm-headless server app rows' > rows-before.json
+# 1. scp -> rollbacks -> mv into all four paths (above)
+# 2. GUI and daemon TOGETHER, in one window:
+ssh $H 'kill -TERM <gui-pid>'                       # wait for actual exit
+ssh $H 'yggterm-headless server app launch --wait-visible'
+```
+
+The new GUI spawns the new-version daemon, which adopts from the old daemon that
+is *still alive holding PTY fds* — doing both together skips the version-fight
+window entirely. The old daemon staying alive is correct and deliberate:
+`hot_restart_should_defer_for_session_survival` returns true while it owns PTY
+fds, so sessions are parented by the **daemon**, never the GUI.
+
+⚠ The hot-restart is **blocked while any owned session is "working"** — and the
+agent's own session counts, so `hot_restart_block_reason` will name *you*. The
+tool that forces it safely is `yggterm-headless server update-daemons --force`
+(progressive, preserves PTYs, ungated handoff) — run it from a **correctly
+stamped** binary or it will refuse for the wrong reason.
+
+### 4.4 After deploying — the checks, in order
+
+1. **Row count before vs after.** Expect a drop; see §4.5. Nothing is lost, but
+   *invisible is lost from where the user sits*, and it was the user who noticed
+   last time.
+2. `server status` → `server_version`, `server_pid`, `role_enforcement`.
+3. **A faithful pixel.** `server app screenshot` and then **Read the PNG**. Check
+   `capture_faithful: true`; a `linux_webkit_snapshot` fallback frame is
+   canvas-blind and lies about the terminal.
+4. **Exercise the fix and quote the evidence.** If you cannot, say so plainly —
+   "code is on disk, the running daemon predates the fix" — never "shipped".
 
 **Deploying re-introduces transient symptoms.** A daemon swap re-resumes agent
 CLIs on fresh PTYs, and that window looks exactly like the squish/broken-bottom
 bug class. Never measure a symptom the deploy itself causes, and never declare a
 post-deploy surface healthy without looking at it.
+
+### 4.5 Expect to lose Live Sessions rows — and know the recovery
+
+Every daemon swap drops the rows that no daemon actively owns (root cause and the
+designed fix: `docs/pending-bugs.md`, "B4 ROOT CAUSE"). Measured on 2.12.2 →
+2.12.3: **25 rows → 12**. Exactly the predecessor's owned keys survive.
+
+```bash
+# after the deploy, diff against the ground truth captured in §4.3
+comm -23 paths-before.txt paths-after.txt > missing.txt
+while read -r p; do
+  ssh -n $H "~/.local/bin/yggterm server connect '$p'"
+done < missing.txt
+```
+
+Three traps in those four lines, all of which have bitten:
+
+- ⚠ **`connect` is on the `yggterm` binary, NOT `yggterm-headless`** — headless
+  answers "unsupported server command".
+- ⚠ **`ssh -n` or the loop silently reconnects only the FIRST row.** Plain `ssh`
+  reads stdin, so it swallows the rest of `missing.txt`. The loop *looks* like it
+  worked because the one row it did process succeeded.
+- ⚠ **`yggterm server reorder` cannot restore dormant rows' order.**
+  `replace_live_session_order` filters on `managed_session_is_live_runtime_session`,
+  so rows without a live runtime are ignored — the call still reports
+  `"requested": 19` and echoes your list back, which reads exactly like success.
+  Verify order by re-reading `server app rows`, never by the reorder response.
+
+Rows reappear 5–10 s later. Re-check the count **again once the predecessor has
+actually exited** — the drop can be delayed: the predecessor holds dormant rows
+until its own disk-binary poll retires it, which can be ~20 minutes later.
 
 ## 5. Destructive operations — know before you type
 
