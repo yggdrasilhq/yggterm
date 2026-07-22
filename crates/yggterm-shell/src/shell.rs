@@ -78103,10 +78103,20 @@ fn terminal_eval_script_with_canvas_renderer(
                     && liveHost.querySelectorAll('.xterm-screen canvas').length === 0
                 );
                 const sameHost = liveHost === host;
-                // If the live host already has a mounted xterm root, do not treat a stale
-                // disconnected term.element reference as a reason to reopen the same host.
-                // Reopening in that state can repeatedly clear a healthy surface back to the
-                // launcher scaffold during resize-driven rebinds.
+                // The husk trap (guihost 2026-07-22): `term.element` sits DETACHED while an
+                // empty `div.terminal.xterm` husk (only `.xterm-viewport`, no
+                // `.xterm-screen`) occupies the host. All three guards above read false —
+                // the husk matches `.xterm` (so hostMissingXtermRoot and the querySelector
+                // in guard 3 are false), and hostMissingRenderableLayer needs an
+                // `.xterm-screen` the husk lacks — so nothing reopens and the viewport is
+                // blank forever. The witness the guards missed: our term.element is simply
+                // not in the live host. When it is not, whatever occupies the host is NOT
+                // our terminal, so a reopen (which re-appends term.element and drops the
+                // husk) is always correct. This does NOT wipe a healthy surface: a healthy
+                // `.xterm` in the host IS term.element, so `contains` is true and this
+                // stays false — it can only fire when term.element is genuinely elsewhere,
+                // which is itself the bug.
+                const termElementOutsideHost = Boolean(termElement && !liveHost.contains(termElement));
                 const sameHostNeedsReopen =
                     Boolean(
                         reopen
@@ -78114,6 +78124,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         && (
                             hostMissingXtermRoot
                             || hostMissingRenderableLayer
+                            || termElementOutsideHost
                             || (termElementDisconnected && !liveHost.querySelector('.xterm'))
                         )
                     );
@@ -78167,7 +78178,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 repairMissingRendererSurface(reason);
                 sendTerminalEvent({{
                     kind: "debug",
-                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
+                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
                 }});
             }} catch (_error) {{}}
             return host;
@@ -100252,6 +100263,17 @@ mod tests {
         assert!(
             script.contains("'term_element_detached_from_host_unrepairable'"),
             "the unrepairable case needs its own reason string"
+        );
+        // The FIX (2026-07-22): term.element outside the live host is itself a
+        // reopen trigger, so the husk no longer wedges the viewport blank — the
+        // reopen re-appends term.element and drops the husk.
+        assert!(
+            script.contains("const termElementOutsideHost ="),
+            "term.element not in the host must force a reopen regardless of the husk"
+        );
+        assert!(
+            script.contains("|| termElementOutsideHost"),
+            "the outside-host witness must be wired into the reopen decision"
         );
         assert!(
             script.contains("lastVisiblePaintWasHusk"),
