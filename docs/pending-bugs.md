@@ -37,12 +37,78 @@ fix) once the fix is verified live on jojo.
   **Generalise: any repair/reopen trigger must first ask whether the thing it is
   repairing is on screen at all.** A repair loop on a parked host is invisible
   except as heat. Full write-up, the
-  trace signature that dates past occurrences, and the three open questions (which
-  wipe leaves the husk; whether the never-released reveal ghost is involved; why
-  ~7% of mounts):
+  trace signature that dates past occurrences, and the open questions:
   [`docs/xterm-bugs.md#detached-term-element-blank-viewport`](xterm-bugs.md#detached-term-element-blank-viewport).
   Recovery with no restart: re-append `term.element` and drop the husk via
   `server app dom-eval`.
+  **★ THE REPAIR HALF IS NOW FIXED (`7247eb7`, live-proven 2026-07-22).** The
+  reason no repair path ever healed this: **`term.open()` is a no-op on an
+  already-opened terminal** (it early-returns once `term.element` exists,
+  without re-parenting), so every "wipe the host, then re-open" recovery rebuilt
+  nothing and stranded the surface outside the DOM. `ensureVisibleHost`'s
+  last-resort `rebuild_blank_host` was exactly that shape. Now one owner,
+  `attachTerminalSurfaceToHost`, MOVES `term.element` back, called
+  unconditionally after every wipe; pinned by
+  `tools/xterm-harness/host_reopen_is_a_noop.test.js` against the real bundle.
+  **Two leads corrected by live measurement:** the husk is born **AT MOUNT**,
+  not on switch-back under heavy streaming (every earliest-episode autopsy shows
+  the same same-millisecond `constructed` → `renderer_decision` →
+  `snapshot_restored` → `rebind_host term_outside_host=true` → detach sequence);
+  and **the reveal ghost is NOT involved** (zero ghost nodes live; the
+  attach≫release gap is an accounting artefact — `releaseRevealGhost` is gated on
+  `isConnected`, so a wipe that already removed the ghost suppresses the event).
+  **STILL OPEN: what creates the husk.** Narrowed to a synchronous window inside
+  `term.open()` — it appends the bare `.xterm` root to the parent FIRST and the
+  screen fragment LAST — and correlated with same-epoch re-mounts (18/18 husked
+  hosts were `constructed` ≥2×, median gap 5.4 s vs 219 s baseline; but 127/225
+  hosts remount without husking, so it is necessary, not sufficient). Read
+  `orphan_desc=` on the next `terminal_host_element_detached`: it now names the
+  orphan's owner host entry.
+
+- **★ A GUI RESTART CAN LEAVE APP CONTROL PERMANENTLY UNREACHABLE — the client
+  instance record vanishes after a SUCCESSFUL register (jojo, 2026-07-22).**
+  After a routine GUI-only swap the GUI was alive, visible, and usable by the
+  user, but every `server app …` verb failed with **"no live Yggterm GUI client
+  is registered for app control"** — i.e. the entire agent control plane was
+  down, with no symptom the user would ever notice. The whole yggui workflow
+  (screenshot, state, dom-eval, probes) is dead in this state.
+  **Evidence, not inference.** The trace shows a normal, successful
+  registration: `launch_shell_register_begin` → `register` (with the exact
+  record path under `client-instances/unix--home-pi--yggterm-server-2-12-3-sock/`)
+  → `launch_shell_register_end {ok: true}` → `duplicate_app_instance_suppressed`
+  — a sequence **byte-identical to the two prior GUIs that registered fine**.
+  Yet the directory was empty afterwards, with an mtime in the same second as
+  the register. So the record was written and then deleted, while its process
+  stayed alive.
+  **Falsified, so don't re-derive:** the scan predicate is fine — a
+  hand-reconstructed record with the live pid and correct `process_start_ticks`
+  **survives** repeated `active_client_instance_paths_for_scan` passes, so
+  `client_instance_record_matches_live_process` is not the deleter. Nor is
+  `terminate_superseded_client_instances`: it skips its own record explicitly
+  (`linux_client_record_requires_app_id_isolation` returns false when
+  `record_pid == current_pid`). **The deleter is unidentified — do not guess it,
+  instrument it:** the cheap next step is a trace event at every
+  `fs::remove_file` in `cleanup_stale_client_instances` carrying the removing
+  pid, the removed pid, and which predicate rejected it.
+  **★ RECOVERY WITHOUT ANOTHER RESTART (verified — this is the valuable half).**
+  `CLIENT_INSTANCE` is a `OnceCell`, so the GUI never re-registers; but the
+  record is just a file, and recreating it restores control immediately. With
+  the live GUI pid:
+  ```bash
+  D=~/.yggterm/client-instances/unix--home-pi--yggterm-server-<VER>-sock
+  TICKS=$(awk '{print $22}' /proc/<GUIPID>/stat)   # field 22 = starttime
+  printf '{"pid":<GUIPID>,"started_at_ms":<MS>,"client_id":null,
+  "linux_desktop_app_id":"dev.yggterm.Yggterm","process_start_ticks":'$TICKS',
+  "executable_path":"/home/pi/.local/bin/yggterm","display":":1",
+  "wayland_display":"wayland-0","xdg_session_id":"","xdg_runtime_dir":"/run/user/1000",
+  "xauthority":""}' > $D/<GUIPID>-<MS>.json
+  ```
+  The filename **must** be `<pid>-<started_at_ms>.json` (the pid is parsed back
+  out of it and must match the record) and `<MS>` should be the `started_at_ms`
+  from the `register` trace event. Confirm with `server app clients`.
+  ⚠ **Check `server app clients` after every GUI restart** — a restart that
+  looks clean can silently take the control plane down, and the failure is
+  invisible until an agent tries to use it.
 
 - **THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
   A deploy that lands new binaries does NOT mean the new code is running. The
