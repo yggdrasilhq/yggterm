@@ -1573,8 +1573,12 @@ fallback — here the axis is Codex-vs-CC), `[[campaign-telemetry-infinite]]`,
 
 ## detached-term-element-blank-viewport
 
-**STATUS:** OPEN — probes shipped 2026-07-22, root cause of PERSISTENCE proven,
-provenance of the husk NOT yet determined. No behavioural fix yet.
+**STATUS:** OPEN — but the repair half is now FIXED and proven. 2026-07-22
+(later): the reason no repair path ever healed this was found and closed —
+`term.open()` is a **no-op** on an already-opened terminal, so every
+"wipe the host, then re-open" recovery in `shell.rs` rebuilt nothing. Fixed by
+one owner, `attachTerminalSurfaceToHost`, with a deterministic harness guard.
+**Still open:** what creates the husk in the first place.
 
 ### Symptom
 
@@ -1641,32 +1645,83 @@ means "could not measure", but was scored as healthy;
 `rows_present: false`, `rows_rect: null`, `screen_present: false`,
 `canvas_count: 0`.
 
+**3. Why no repair path could ever heal it — PROVEN 2026-07-22 (later).**
+Even once the guards were widened, every recovery still failed, because all of
+them were built on an assumption that is false in the vendored xterm.js:
+
+```js
+open(e) { if (!e) throw ...;
+  if (e.isConnected || this._logService.debug(...),
+      this.element?.ownerDocument.defaultView && this._coreBrowserService)
+    return void (...)          // ← EARLY RETURN. No appendChild(e).
+```
+
+**`term.open(parent)` does nothing at all once `term.element` exists** — it does
+not re-parent, does not rebuild, does not throw. So `host.innerHTML = ""`
+followed by `term.open(host)` is pure loss: an empty host and a stranded
+`term.element`. `ensureVisibleHost`'s `rebuild_blank_host` — the *last-resort*
+recovery, capped at one attempt per mount — was exactly this shape, so the one
+path meant to rescue a blank viewport was guaranteed to make it permanent.
+(It happens never to have fired in 20 trace generations, so it was a latent
+landmine rather than the observed cause; `rebindCurrentHost`'s conditional
+re-append is what saved most cases.)
+
+Proven deterministically against the shipped bundle, not inferred:
+`tools/xterm-harness/host_reopen_is_a_noop.test.js`.
+
 ### NOT determined — open questions for the next agent
 
-1. **Which code path leaves the husk?** An `.xterm` root holding only a viewport
-   is not a shape xterm.js produces in one pass: `open()` builds the viewport
-   and screen into a fragment and attaches them together. Candidates: the mount
-   wipe immediately before the reveal-ghost attach; a second `term.open()` on an
-   already-open Terminal (creates a fresh element and reassigns `term.element`,
-   orphaning the old one); `stretchXtermRoot`'s `.xterm-scrollable-element`
-   handling. The mutation breadcrumbs added 2026-07-22 answer this on the next
-   occurrence — read `last_host_mutation.site` + `.stack` from the detach event.
-2. **Was the reveal ghost involved?** `reveal_ghost_attached` fired at the
-   broken mount and **no `reveal_ghost_released` ever followed** for that host.
-   The ghost is appended to the host and removed on a 2400 ms timer or first
-   keydown; a wipe between attach and release would drop it silently.
-3. **Why does it only hit ~7% of mounts?** Timing is unknown; the whole failure
-   fits inside 20 ms of the mount.
+1. **Which code path leaves the husk?** STILL OPEN, but narrowed. An `.xterm`
+   root holding only a viewport is not a shape xterm.js produces in one pass:
+   `open()` builds the viewport and screen into a fragment and attaches them
+   together — *except* that it appends the bare root to the parent FIRST and the
+   fragment LAST, so there is a synchronous window in which the host holds an
+   `.xterm` root with no screen. Anything that throws inside that window leaves
+   the husk. Read `orphan_desc=` on the next `terminal_host_element_detached`:
+   it now names the orphan's classes, child classes, canvas count, and the host
+   entry that OWNS it (`owner=<hostId>` / `self` / `none`).
+2. **~~Was the reveal ghost involved?~~ NO — falsified 2026-07-22.** The
+   `reveal_ghost_attached` ≫ `reveal_ghost_released` gap looked damning (27 vs 9
+   in one generation) but is an accounting artefact: `releaseRevealGhost` is
+   gated on `revealGhostFrame.isConnected`, so any host wipe that already removed
+   the ghost suppresses the release event. Measured live: **zero**
+   `.yggterm-reveal-ghost` nodes in the document. The ghost is also a bare
+   `<canvas class="yggterm-reveal-ghost">`, not an `.xterm` div, so it cannot be
+   the orphan root regardless.
+3. **Why does it only hit some mounts?** Two measurements narrow it:
+   - **The husk is born AT MOUNT, not on switch-back.** Every earliest-episode
+     autopsy shows the same same-millisecond sequence: `constructed` →
+     `renderer_decision phase=init` → `xterm_session_snapshot_restored` →
+     `rebind_host reason=emit_paint same_host=true term_disconnected=true
+     term_outside_host=true` → the detach event. This **corrects** the earlier
+     "only on heavy streaming, only on switch-BACK (large backlog replay)" lead.
+   - **18 of 18 husked hosts were `constructed` more than once at the SAME mount
+     epoch**, and the reconstruct gap preceding a husk is far tighter than
+     baseline (median 5.4 s vs 219 s; p75 101 s vs 1400 s). 127 of 225 hosts
+     remount ≥2× without husking, so a tight same-epoch re-mount is **necessary
+     but not sufficient**. Suspect two live closures for one `hostId`.
 
 ### Workaround / fix
 
-None shipped. The **one-line repair** the evidence points at: make
-`!liveHost.contains(term.element)` a reopen trigger in `rebindCurrentHost`
-regardless of what occupies the host — that alone would have healed this within
-a frame. Companion: `emitPaint()` should not count a host whose child set does
-not include `term.element` as `visible`, so `ensureVisibleHost` reaches its
-rebuild branch. Live recovery without any restart, for a session already stuck:
-re-append `term.element` into the host and drop the husk via `app dom-eval`.
+**Shipped 2026-07-22: one owner for restoring the surface into a host.**
+`attachTerminalSurfaceToHost(targetHost, site, allowOpen)` moves `term.element`
+back (`appendChild` re-parents a node that lives elsewhere) and only falls back
+to `term.open()` when the terminal has genuinely never been opened. Both
+recovery paths — `rebindCurrentHost` and `ensureVisibleHost`'s
+`rebuild_blank_host` — now go through it, unconditionally, in the same
+synchronous task as their wipe. **Invariant: a host wipe must be followed by a
+restore; there is no branch under which leaving the host empty is correct.** The
+old rebind re-appended only under three conditions and otherwise trusted
+`term.open()`; the old rebuild-blank path trusted it exclusively.
+
+⛔ Superseded advice: the earlier "one-line repair" (make
+`!liveHost.contains(term.element)` a reopen trigger) **shipped as `820d0d5` and
+was a regression** — it fires forever on backgrounded hosts, whose host leaves
+the DOM entirely. Gated on `liveHost.isConnected` in `f0aca70` and bounded by a
+circuit breaker in `f27d5db`. Do not re-derive it.
+
+Live recovery without any restart, for a session already stuck: re-append
+`term.element` into the host and drop the husk via `app dom-eval`.
 
 ### Code locations
 

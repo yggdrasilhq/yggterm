@@ -78201,6 +78201,41 @@ fn terminal_eval_script_with_canvas_renderer(
                 // The husk signature: an `.xterm` root the repair guards accept as
                 // proof of a mounted terminal, with no screen/rows/canvas under it.
                 orphan_root_without_screen: Boolean(orphanRoots.length > 0 && !screenInHost),
+                // ORPHAN FORENSICS (2026-07-22). Knowing an orphan root EXISTS was
+                // never enough to fix the husk — the open question is where it came
+                // from. `.xterm` roots have exactly one manufacturer (`term.open`),
+                // so an orphan is some OTHER terminal's element; naming that owner
+                // turns "the host is poisoned" into "closure X wiped closure Y".
+                // Bounded to two roots and short strings: this rides the detach
+                // event, and a DOM-event flood starves the GTK input region.
+                orphan_root_desc: orphanRoots.slice(0, 2).map((root) => {{
+                    let owner = 'none';
+                    try {{
+                        const reg = window.__yggtermXtermHosts || {{}};
+                        for (const key of Object.keys(reg)) {{
+                            if (reg[key] && reg[key].termElementRef === root) {{
+                                owner = key === hostId ? 'self' : key;
+                                break;
+                            }}
+                        }}
+                    }} catch (_error) {{}}
+                    const kidClasses = Array.from(root.children).slice(0, 4).map((child) =>
+                        String(child.className || child.tagName || '').trim().split(/\s+/)[0] || '?'
+                    ).join(',');
+                    return `cls=${{String(root.className || '').trim().replace(/\s+/g, '+')}}`
+                        + ` kids=${{Number(root.childElementCount || 0)}}`
+                        + ` kidcls=${{kidClasses}}`
+                        + ` has_screen=${{Boolean(root.querySelector('.xterm-screen'))}}`
+                        + ` canvases=${{Number(root.querySelectorAll('canvas').length || 0)}}`
+                        + ` connected=${{Boolean(root.isConnected)}}`
+                        + ` owner=${{owner}}`;
+                }}).join(' || '),
+                // Two divs sharing our id would make `getElementById` a coin flip and
+                // every "same host?" comparison meaningless. Cheap to rule in or out.
+                host_id_element_count: Number(document.querySelectorAll(`[id="${{hostId}}"]`).length || 0),
+                host_child_classes: Array.from(liveHost.children).slice(0, 4).map((child) =>
+                    String(child.className || child.tagName || '').trim().split(/\s+/).join('.')
+                ).join(','),
                 repair_guard_host_missing_xterm_root: guardHostMissingXtermRoot,
                 repair_guard_host_missing_renderable_layer: guardHostMissingRenderableLayer,
                 repair_guard_stale_clause: guardStaleClause,
@@ -78231,6 +78266,9 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.hostContainsTermElement = state.host_contains_term_element;
                     entry.termElementDetachedSinceMs = termElementDetachedSinceMs;
                     entry.termElementDetachedCount = termElementDetachedCount;
+                    // Published so a SIBLING closure's orphan forensics can name us
+                    // as the owner of a root it found squatting in its host.
+                    entry.termElementRef = term && term.element ? term.element : null;
                 }}
                 // Report each detach episode once, then at most every 30s while it
                 // persists — enough for the trace to show duration without flooding.
@@ -78254,6 +78292,9 @@ fn terminal_eval_script_with_canvas_renderer(
                             + ` rows_in_host=${{state.rows_in_host}}`
                             + ` screen_canvases=${{state.screen_canvas_count}}`
                             + ` repair_would_reopen=${{state.repair_would_reopen}}`
+                            + ` host_id_elements=${{state.host_id_element_count}}`
+                            + ` host_kids=${{state.host_child_classes}}`
+                            + ` orphan_desc=[${{state.orphan_root_desc}}]`
                             + ` last_mutation_site=${{lastMutation ? String(lastMutation.site || '') : 'none'}}`
                             + ` last_mutation_age_ms=${{lastMutation ? Math.max(0, now - Number(lastMutation.at_ms || now)) : -1}}`
                             + ` last_mutation_stack=${{lastMutation ? String(lastMutation.stack || '') : ''}}`
@@ -78366,6 +78407,56 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             return repaired && !after.missingTextLayer;
         }};
+        // ⛔⛔ SSOT: THE ONLY WAY TO PUT OUR TERMINAL SURFACE BACK INTO A HOST.
+        //
+        // `term.open(host)` CANNOT rebuild a host we just wiped. Read the bundled
+        // `assets/xterm/xterm.js` (this is not a guess — it is the shipped bytes):
+        //
+        //     open(e) ... if(!e) throw ...;
+        //       if(e.isConnected||this._logService.debug(...),
+        //          this.element?.ownerDocument.defaultView && this._coreBrowserService)
+        //         return void(...)          // ← EARLY RETURN, no appendChild(e)
+        //
+        // Once `term.element` exists — i.e. after the very first mount — `open()`
+        // returns WITHOUT appending the element to the new parent. So every
+        // "wipe the host, then term.open() to rebuild it" recovery in this file was
+        // a NO-OP that left an empty host and a detached `term.element`: a
+        // permanently blank viewport that only a remount could clear. The only
+        // re-attach that works after the first mount is moving `term.element`
+        // ourselves.
+        //
+        // INVARIANT: a wipe of the host MUST be followed by this call in the SAME
+        // synchronous task, so the cleared host never reaches the compositor, and
+        // there is no branch under which "leave the host empty" is correct.
+        const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {{
+            const existing = term && term.element ? term.element : null;
+            let mode = 'none';
+            if (existing) {{
+                try {{
+                    // appendChild MOVES a node that is parented elsewhere, so this
+                    // is both the "reattach" and the "steal it back" case.
+                    targetHost.appendChild(existing);
+                    mode = 'reattached';
+                }} catch (_error) {{
+                    mode = 'reattach_failed';
+                }}
+            }} else if (allowOpen !== false) {{
+                try {{
+                    term.open(targetHost);
+                    mode = 'opened';
+                }} catch (_error) {{
+                    mode = 'open_failed';
+                }}
+            }}
+            window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+                host_id: hostId,
+                site: String(site || 'attach_terminal_surface'),
+                mode,
+                term_element_inside_after: Boolean(term && term.element && targetHost.contains(term.element)),
+                screen_in_host_after: Boolean(targetHost.querySelector('.xterm-screen')),
+            }});
+            return mode;
+        }};
         const rebindCurrentHost = (reason, reopen) => {{
             try {{
                 const liveHost = document.getElementById(hostId);
@@ -78374,6 +78465,9 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 const termElement = term && term.element ? term.element : null;
                 const termElementDisconnected = Boolean(termElement && !termElement.isConnected);
+                // Which host currently holds our element is no longer part of the
+                // restore decision: after the wipe below the answer is always "none",
+                // so the restore is unconditional. Reported for the autopsy only.
                 const termElementHost = termElement && termElement.closest
                     ? termElement.closest('[id^="yggterm-terminal-"]')
                     : null;
@@ -78517,20 +78611,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 host.innerHTML = "";
                 applyHostSurfaceContract();
                 host.style.cursor = inputEnabled ? 'text' : 'default';
-                let termElementReattached = false;
-                if (termElement && (termElementDisconnected || termElementHost !== host || sameHostNeedsReopen)) {{
-                    try {{
-                        host.appendChild(termElement);
-                        termElementReattached = true;
-                    }} catch (_error) {{}}
-                }}
-                if (reopen) {{
-                    if (!termElementReattached) {{
-                        try {{
-                            term.open(host);
-                        }} catch (_error) {{}}
-                    }}
-                }}
+                // The host was wiped one statement ago, so the surface is ALWAYS
+                // gone from it. The old code only re-appended `term.element` under
+                // three conditions and otherwise trusted `term.open(host)` to
+                // rebuild — which it never does (see attachTerminalSurfaceToHost).
+                // Restoring unconditionally is the invariant, not an optimisation.
+                const attachMode = attachTerminalSurfaceToHost(host, 'rebind_host_attach', reopen);
+                const termElementReattached = attachMode === 'reattached';
                 try {{
                     if (resizeObserver) {{
                         resizeObserver.observe(host);
@@ -78543,7 +78630,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 repairMissingRendererSurface(reason);
                 sendTerminalEvent({{
                     kind: "debug",
-                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_connected=${{hostConnected}} circuit_open=${{reopenCircuitOpen}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
+                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} attach_mode=${{attachMode}} term_element_host=${{termElementHost ? String(termElementHost.id || '') : 'none'}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_connected=${{hostConnected}} circuit_open=${{reopenCircuitOpen}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
                 }});
             }} catch (_error) {{}}
             return host;
@@ -82450,15 +82537,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 term_element_was_inside: Boolean(term && term.element && host.contains(term.element)),
             }});
             host.innerHTML = "";
-            try {{
-                term.open(host);
-                window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
-                    host_id: hostId,
-                    site: 'rebuild_blank_host_term_open',
-                    reason: String(reason || ''),
-                    term_element_inside_after: Boolean(term && term.element && host.contains(term.element)),
-                }});
-            }} catch (_error) {{}}
+            // ⛔ This is the LAST-RESORT recovery, so it is the one place a no-op
+            // rebuild is most expensive: it ran only when the viewport was already
+            // blank, and `term.open()` on an already-opened terminal rebuilt
+            // NOTHING — the wipe above was pure loss and the host stayed empty for
+            // good (rebuildAttempts caps this path at one try per mount).
+            attachTerminalSurfaceToHost(host, 'rebuild_blank_host_attach', true);
             requestVisiblePaint();
         }};
         const focusTerminal = () => {{
@@ -100777,7 +100861,6 @@ mod tests {
             "site: 'mount_init_wipe'",
             "site: 'rebind_host_wipe'",
             "site: 'rebuild_blank_host_wipe'",
-            "site: 'rebuild_blank_host_term_open'",
             "site: 'mount_term_open'",
         ] {
             assert!(
@@ -104090,6 +104173,10 @@ mod tests {
             script.contains("const termElementHost = termElement && termElement.closest"),
             "rebind helper should resolve the detached xterm element owner host"
         );
+        assert!(
+            script.contains("term_element_host=${termElementHost"),
+            "the owner host must reach the trace — it is diagnostics, not a decision"
+        );
         // The decision is now two-stage: the raw condition (`sameHostRepairWanted`)
         // and the post-circuit-breaker verdict (`sameHostNeedsReopen`). Both must
         // exist — the condition is what detects the fault, the verdict is what
@@ -104107,8 +104194,9 @@ mod tests {
             "same-host reopen should not clear an already-mounted xterm root just because term.element went stale"
         );
         assert!(
-            script.contains("host.appendChild(termElement);"),
-            "rebind helper should reattach the existing xterm element before reopening"
+            script.contains("targetHost.appendChild(existing);"),
+            "the surface owner must MOVE the existing xterm element back — term.open() \
+             early-returns once term.element exists and would rebuild nothing"
         );
         assert!(
             script.contains("const terminalRendererSurfaceState = () => {"),
@@ -105858,6 +105946,79 @@ mod tests {
                 .contains(".xterm .xterm-rows span {\n                    width: 100% !important;")
         );
     }
+    #[test]
+    fn terminal_eval_script_restores_the_surface_after_every_host_wipe() {
+        // `open()` in the bundled xterm.js (assets/xterm/xterm.js) early-returns as
+        // soon as `term.element` exists, WITHOUT re-parenting it. So the old
+        // "wipe the host, then term.open() to rebuild it" recovery rebuilt nothing
+        // and stranded the terminal outside the DOM — a permanently blank viewport.
+        // Every wipe must be followed by the one owner that MOVES the element back.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {"),
+            "restoring the surface into a host must have exactly one owner"
+        );
+        for call in [
+            "attachTerminalSurfaceToHost(host, 'rebind_host_attach', reopen)",
+            "attachTerminalSurfaceToHost(host, 'rebuild_blank_host_attach', true)",
+        ] {
+            assert!(
+                script.contains(call),
+                "every recovery must restore through the one owner: {call}"
+            );
+        }
+        for (wipe_site, restore_site) in [
+            ("site: 'rebind_host_wipe'", "'rebind_host_attach'"),
+            ("site: 'rebuild_blank_host_wipe'", "'rebuild_blank_host_attach'"),
+        ] {
+            let wipe = script.find(wipe_site).expect("wipe breadcrumb present");
+            let restore = script.find(restore_site).expect("restore present");
+            assert!(
+                wipe < restore,
+                "the restore for {wipe_site} must follow its wipe in the same task"
+            );
+        }
+        assert_eq!(
+            script.matches("term.open(host);").count(),
+            1,
+            "`term.open(host);` may appear exactly once — the mount, where term.element \
+             does not exist yet. A second one is a no-op rebuild of a wiped host."
+        );
+        assert_eq!(
+            script.matches("term.open(targetHost);").count(),
+            1,
+            "the never-opened fallback belongs to attachTerminalSurfaceToHost alone"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_names_the_orphan_root_that_poisons_a_host() {
+        // Knowing an orphan `.xterm` root exists was never enough to fix the husk.
+        // `.xterm` roots have one manufacturer (`term.open`), so an orphan belongs
+        // to some other closure; the autopsy has to be able to name that owner.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("orphan_root_desc:"),
+            "the husk signature must carry a description of the squatting root"
+        );
+        assert!(
+            script.contains("entry.termElementRef = term && term.element ? term.element : null;"),
+            "each host entry must publish its element so a sibling can name it as owner"
+        );
+        assert!(
+            script.contains("reg[key].termElementRef === root"),
+            "orphan forensics must resolve the owner through the published element"
+        );
+        for field in ["orphan_desc=", "host_id_elements=", "host_kids="] {
+            assert!(
+                script.contains(field),
+                "the detach event must carry the forensic field {field}"
+            );
+        }
+    }
+
     #[test]
     fn terminal_eval_script_bootstraps_terminal_fit_and_webgl_assets() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
