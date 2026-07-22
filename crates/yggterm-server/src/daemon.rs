@@ -1625,6 +1625,12 @@ pub struct ServerRuntimeStatus {
     /// `role_enforcement` (D7).
     #[serde(default)]
     pub advertises_stored_session_keys: bool,
+    /// PROBE (2026-07-22): running total of remote-yggterm command retries after a
+    /// cache reset. A wedged remote target (the "cache reset" spin that stranded a
+    /// session's viewport) shows as this CLIMBING fast between polls. `#[serde(default)]`
+    /// so a pre-probe daemon deserializes 0, never a false spike.
+    #[serde(default)]
+    pub remote_yggterm_retry_total: u64,
     #[serde(default)]
     pub terminal_retained_chunks: usize,
     #[serde(default)]
@@ -2830,6 +2836,7 @@ impl DaemonRuntime {
             stored_terminal_session_keys,
             stored_terminal_sessions,
             advertises_stored_session_keys: true,
+            remote_yggterm_retry_total: crate::remote_yggterm_retry_total(),
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
             terminal_session_buffer_limit_bytes: crate::terminal::MAX_BUFFER_BYTES,

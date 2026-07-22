@@ -77885,6 +77885,17 @@ fn terminal_eval_script_with_canvas_renderer(
         let termElementDetachedSinceMs = 0;
         let termElementDetachedCount = 0;
         let lastTermElementDetachedReportAtMs = 0;
+        // REPAINT-STORM PROBE (2026-07-22, user-requested). The frame-corruption
+        // pathology repaints the viewport at ~50Hz (a continuous garbled blink)
+        // under heavy agent streaming — and it is INVISIBLE to paint-count health,
+        // which only asks whether SOME paint happened, never how fast. Track the
+        // paint RATE in a rolling 1s window and flag a SUSTAINED storm (a rate far
+        // above a normal active terminal's handful/s), so telemetry catches the
+        // blink next time instead of scoring a churning viewport "healthy".
+        let paintRateWindowStartMs = 0;
+        let paintRateWindowCount = 0;
+        let repaintStormSinceMs = 0;
+        let lastRepaintStormReportAtMs = 0;
         // DETACHED-TERM PROBE (2026-07-22). The blank-viewport class that every
         // existing health field scored "healthy": `term.element` is out of the
         // host, so nothing can paint, while the xterm OBJECT (buffer, cursor,
@@ -80428,6 +80439,46 @@ fn terminal_eval_script_with_canvas_renderer(
                 }});
             }}
             paintCount += 1;
+            // Repaint-storm detection (the ~50Hz garbled-blink pathology). Count
+            // paints in a rolling 1s window; a sustained rate far above a normal
+            // active terminal (a few/s) is a repaint storm, not real content. A
+            // storm sustained >=2s is reported once, then every 30s while it
+            // persists (the detach-probe cadence — no flood), and surfaced on the
+            // host entry so `server app state` sees it live.
+            {{
+                const stormNowMs = Date.now();
+                if (paintRateWindowStartMs === 0) {{ paintRateWindowStartMs = stormNowMs; }}
+                paintRateWindowCount += 1;
+                if (stormNowMs - paintRateWindowStartMs >= 1000) {{
+                    const paintRatePerSec = paintRateWindowCount;
+                    paintRateWindowStartMs = stormNowMs;
+                    paintRateWindowCount = 0;
+                    const REPAINT_STORM_RATE = 30;
+                    if (paintRatePerSec >= REPAINT_STORM_RATE) {{
+                        if (repaintStormSinceMs === 0) {{ repaintStormSinceMs = stormNowMs; }}
+                    }} else {{
+                        repaintStormSinceMs = 0;
+                    }}
+                    if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                        window.__yggtermXtermHosts[hostId].paintRatePerSec = paintRatePerSec;
+                        window.__yggtermXtermHosts[hostId].repaintStormMs =
+                            repaintStormSinceMs ? Math.max(0, stormNowMs - repaintStormSinceMs) : 0;
+                    }}
+                    if (repaintStormSinceMs
+                        && stormNowMs - repaintStormSinceMs >= 2000
+                        && (stormNowMs - lastRepaintStormReportAtMs > 30000
+                            || lastRepaintStormReportAtMs === 0)) {{
+                        lastRepaintStormReportAtMs = stormNowMs;
+                        sendTerminalEvent({{
+                            kind: "debug",
+                            message: `terminal_repaint_storm host=${{hostId}}`
+                                + ` rate_per_sec=${{paintRatePerSec}}`
+                                + ` storm_ms=${{Math.max(0, stormNowMs - repaintStormSinceMs)}}`
+                                + ` cols=${{term.cols}} rows=${{term.rows}}`,
+                        }});
+                    }}
+                }}
+            }}
             return visible;
         }};
         const currentBufferKind = () => {{
@@ -100280,6 +100331,17 @@ mod tests {
         assert!(
             script.contains("|| termElementOutsideHost"),
             "the outside-host witness must be wired into the reopen decision"
+        );
+        // REPAINT-STORM PROBE (2026-07-22): the ~50Hz garbled-blink pathology is
+        // invisible to paint-count health; the paint-RATE probe must ship so
+        // telemetry catches a churning viewport instead of scoring it "healthy".
+        assert!(
+            script.contains("terminal_repaint_storm host="),
+            "a sustained repaint storm must reach the event trace"
+        );
+        assert!(
+            script.contains("REPAINT_STORM_RATE"),
+            "the repaint-rate threshold that flags the ~50Hz blink must be present"
         );
         assert!(
             script.contains("lastVisiblePaintWasHusk"),
