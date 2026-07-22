@@ -684,12 +684,32 @@ protocol:
     its surface closes — a heavier destroy-on-loss mitigation is out of 4.1c's
     scope.) Pure `write_lock_report_holds` (+ unit test) + the arbiter
     shared-primitive test; workspace green.
-  **4.1b/4.1c LIVE proof still owed** — a coordinated daemon+GUI deploy to jojo
-  (no protocol bump, so no version fight, but the deploy rules apply), and jojo's
-  2.12.1 daemon predates 4.1a, so PreemptedShadow must land there first. No CLI
-  verb drives the write-lock over the wire yet, so a sandbox end-to-end proof
-  needs a throwaway probe bin or a new hidden verb (gate-11/16 proofs want the
-  same).
+  - **★ 4.1 gate correction (main, this session) — the sandbox wire proof caught
+    a bug unit tests could not.** The 4.0 `role_gate` DENIED a Shadow's
+    `AcquireProfileWriteLock`/`ReleaseProfileWriteLock` (`shadow_cannot_own`),
+    treating the write-lock as ownership. But 4.1a's whole `PreemptedShadow`
+    branch REQUIRES a Shadow to hold the lock first (its own
+    `active_preempts_a_live_shadow_holder` test acquires as Shadow), so with the
+    gate denying acquire that branch was **dead code** and a shadow could never
+    co-browse. Fixed: the write-lock is a PREEMPTIBLE coordination lease (an
+    Active client preempts it instantly), NOT terminal ownership — so acquire/
+    release are now Allow-for-Shadow, while non-preemptible PTY ownership
+    (TerminalWrite/Resize/Restart/FocusLive) stays denied. The unit tests that
+    asserted Deny were flipped; the 4.1b shadow `Err` fallback is now role-aware
+    (an Active GUI opens jar-backed on a daemon error, a Shadow FAILS CLOSED to
+    read-only — never writes a jar it could not confirm it holds).
+  - **★ Wire proof shipped + PASSING (this session).** New hidden CLI verb
+    `yggterm server write-lock <acquire|hold|report|release> [--profile <name>]`
+    drives the daemon lock directly (identity from `--client-role`/`--client-id`,
+    which — same trap as `--agent` — must come AFTER the subcommand). `hold`
+    parks holding the lock so a live holder can be contended. Proven against an
+    isolated sandbox daemon: a live Shadow holder of `work` is **preempted** by an
+    Active acquire (`preempted_shadow`, writable); a Shadow never preempts a peer
+    Shadow, and an Active never preempts a peer Active (both `profile_busy`). This
+    verb also unblocks the gate-11/16 live proofs.
+  **4.1b/4.1c LIVE proof still owed** on jojo — a coordinated daemon+GUI deploy
+  (jojo's 2.12.1 daemon predates 4.1a AND this gate fix, so PreemptedShadow is not
+  live there until the swap).
 - The transport-independent *core* — client-keyed batches with Active-priority
   preemption — is pure logic that both shapes reuse and is what
   `AgentBatch::client_id` already seats. It is unit-testable with no daemon and no
