@@ -15593,6 +15593,13 @@ fn capture_embedded_app_screen_recording(
 pub struct ClientInstanceRecord {
     pub pid: u32,
     pub started_at_ms: u128,
+    /// The slice-4 daemon-client identity (`--client-id`) this GUI process runs
+    /// under, so `server app … --client <name>` can resolve a NAME to its worker
+    /// pid. `None` = the user's anonymous GUI (addressable by `--pid` or, when
+    /// sole, by default). One source: `current_client_identity().client_id`,
+    /// stamped at registration.
+    #[serde(default)]
+    pub client_id: Option<String>,
     #[serde(default)]
     pub linux_desktop_app_id: Option<String>,
     #[serde(default)]
@@ -15741,6 +15748,16 @@ fn requested_app_control_pid_from_env() -> Option<u32> {
         .filter(|pid| *pid > 0)
 }
 
+/// The `--client <name>` target (slice 4.3): a daemon-client identity to resolve
+/// to a worker pid, set by the CLI into `YGGTERM_APP_CONTROL_CLIENT`. Blank = no
+/// client filter. Explicit `--pid` still wins over this (see `choose_app_control_pid`).
+fn requested_app_control_client_from_env() -> Option<String> {
+    std::env::var("YGGTERM_APP_CONTROL_CLIENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn format_available_client_instances(records: &[ClientInstanceRecord]) -> String {
     if records.is_empty() {
         return "none".to_string();
@@ -15749,8 +15766,9 @@ fn format_available_client_instances(records: &[ClientInstanceRecord]) -> String
         .iter()
         .map(|record| {
             format!(
-                "pid={} exe={} display={} wayland={} session={}",
+                "pid={} client={} exe={} display={} wayland={} session={}",
                 record.pid,
+                record.client_id.as_deref().unwrap_or("-"),
                 record.executable_path.as_deref().unwrap_or("-"),
                 record.display.as_deref().unwrap_or("-"),
                 record.wayland_display.as_deref().unwrap_or("-"),
@@ -15761,9 +15779,19 @@ fn format_available_client_instances(records: &[ClientInstanceRecord]) -> String
         .join(", ")
 }
 
+/// Resolve which registered GUI worker an app-control request targets.
+///
+/// Precedence, most specific first:
+/// 1. `--pid` (`requested_pid`) — an exact worker, authoritative; a `--client`
+///    given alongside it is ignored (the pid already names one process).
+/// 2. `--client <name>` (`requested_client`) — the sole worker whose slice-4
+///    `client_id` matches; this is how a probe names a shadow view client.
+/// 3. Otherwise: the sole worker, or (for read-only commands with several) the
+///    newest; a mutating command with several unnamed workers must target one.
 fn choose_app_control_pid(
     records: &[ClientInstanceRecord],
     requested_pid: Option<u32>,
+    requested_client: Option<&str>,
     require_explicit_target: bool,
 ) -> anyhow::Result<Option<u32>> {
     if let Some(requested_pid) = requested_pid {
@@ -15778,11 +15806,32 @@ fn choose_app_control_pid(
                 )
             });
     }
+    if let Some(requested_client) = requested_client {
+        let mut matches = records
+            .iter()
+            .filter(|record| record.client_id.as_deref() == Some(requested_client));
+        let first = matches.next().with_context(|| {
+            format!(
+                "no live Yggterm GUI client with --client {requested_client:?}; available: {}",
+                format_available_client_instances(records)
+            )
+        })?;
+        // Two live clients under one name is a launcher bug, not a routing choice
+        // to guess through — fail loudly rather than silently pick one.
+        if matches.next().is_some() {
+            anyhow::bail!(
+                "more than one live Yggterm GUI client answers to --client {requested_client:?}; \
+                 disambiguate with --pid <pid>. available: {}",
+                format_available_client_instances(records)
+            );
+        }
+        return Ok(Some(first.pid));
+    }
     match records {
         [] => Ok(None),
         [record] => Ok(Some(record.pid)),
         many if require_explicit_target => anyhow::bail!(
-            "multiple live Yggterm GUI clients are registered; rerun with --pid <pid> or set YGGTERM_APP_CONTROL_PID. available: {}",
+            "multiple live Yggterm GUI clients are registered; rerun with --pid <pid> / --client <name> or set YGGTERM_APP_CONTROL_PID. available: {}",
             format_available_client_instances(many)
         ),
         many => Ok(many
@@ -15801,10 +15850,16 @@ fn ensure_live_app_control_pid(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_budget_ms);
     let endpoint = default_endpoint(home);
     let requested_pid = requested_app_control_pid_from_env();
+    let requested_client = requested_app_control_client_from_env();
     let require_explicit_target = app_control_command_requires_explicit_target(command);
     loop {
         let records = active_client_instance_records(home, &endpoint)?;
-        match choose_app_control_pid(&records, requested_pid, require_explicit_target) {
+        match choose_app_control_pid(
+            &records,
+            requested_pid,
+            requested_client.as_deref(),
+            require_explicit_target,
+        ) {
             Ok(Some(pid)) => return Ok(Some(pid)),
             Ok(None) => {}
             Err(error) => return Err(error),
@@ -22455,6 +22510,7 @@ mod tests {
         let record = ClientInstanceRecord {
             pid: 123,
             started_at_ms: 456,
+            client_id: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: None,
             executable_path: None,
@@ -33254,6 +33310,7 @@ terminal_window_id: None,
         ClientInstanceRecord {
             pid,
             started_at_ms,
+            client_id: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: None,
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -33265,18 +33322,25 @@ terminal_window_id: None,
         }
     }
 
+    fn named_client_record(pid: u32, started_at_ms: u128, client_id: &str) -> ClientInstanceRecord {
+        ClientInstanceRecord {
+            client_id: Some(client_id.to_string()),
+            ..client_record(pid, started_at_ms, ":10")
+        }
+    }
+
     #[test]
     fn choose_app_control_pid_prefers_requested_pid() {
         let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
-        let pid =
-            choose_app_control_pid(&records, Some(100), true).expect("requested pid should exist");
+        let pid = choose_app_control_pid(&records, Some(100), None, true)
+            .expect("requested pid should exist");
         assert_eq!(pid, Some(100));
     }
 
     #[test]
     fn choose_app_control_pid_requires_explicit_target_for_mutations() {
         let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
-        let error = choose_app_control_pid(&records, None, true).expect_err("should refuse");
+        let error = choose_app_control_pid(&records, None, None, true).expect_err("should refuse");
         assert!(
             error
                 .to_string()
@@ -33287,8 +33351,59 @@ terminal_window_id: None,
     #[test]
     fn choose_app_control_pid_uses_newest_for_read_only_commands() {
         let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
-        let pid = choose_app_control_pid(&records, None, false).expect("should choose newest");
+        let pid = choose_app_control_pid(&records, None, None, false).expect("should choose newest");
         assert_eq!(pid, Some(200));
+    }
+
+    #[test]
+    fn choose_app_control_pid_resolves_named_client() {
+        // `--client <name>` picks the worker whose slice-4 client_id matches, even
+        // among several — this is how a probe names a shadow view client. The
+        // user's anonymous GUI (client_id None) is never matched by a name.
+        let records = vec![
+            client_record(100, 10, ":10"),
+            named_client_record(200, 20, "shadow-a"),
+            named_client_record(300, 30, "shadow-b"),
+        ];
+        let pid = choose_app_control_pid(&records, None, Some("shadow-b"), true)
+            .expect("named client should resolve even for a mutating command");
+        assert_eq!(pid, Some(300));
+    }
+
+    #[test]
+    fn choose_app_control_pid_unknown_named_client_errors_with_available() {
+        let records = vec![named_client_record(200, 20, "shadow-a")];
+        let error = choose_app_control_pid(&records, None, Some("shadow-missing"), false)
+            .expect_err("an unknown --client must fail loudly");
+        let message = error.to_string();
+        assert!(message.contains("no live Yggterm GUI client with --client"));
+        assert!(message.contains("shadow-a"), "lists the available clients");
+    }
+
+    #[test]
+    fn choose_app_control_pid_explicit_pid_wins_over_client() {
+        // Both given: the pid is authoritative (it already names one process); the
+        // client filter is not applied on top of it.
+        let records = vec![
+            named_client_record(200, 20, "shadow-a"),
+            named_client_record(300, 30, "shadow-b"),
+        ];
+        let pid = choose_app_control_pid(&records, Some(200), Some("shadow-b"), true)
+            .expect("explicit pid resolves regardless of --client");
+        assert_eq!(pid, Some(200));
+    }
+
+    #[test]
+    fn choose_app_control_pid_ambiguous_named_client_fails_loudly() {
+        // A launcher bug (two live workers under one name) must not be silently
+        // resolved to one of them.
+        let records = vec![
+            named_client_record(200, 20, "shadow-a"),
+            named_client_record(300, 30, "shadow-a"),
+        ];
+        let error = choose_app_control_pid(&records, None, Some("shadow-a"), false)
+            .expect_err("two clients under one name is ambiguous");
+        assert!(error.to_string().contains("more than one live Yggterm GUI client"));
     }
 
     #[cfg(unix)]
@@ -33306,6 +33421,7 @@ terminal_window_id: None,
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 42,
+            client_id: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -33345,6 +33461,7 @@ terminal_window_id: None,
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 42,
+            client_id: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),

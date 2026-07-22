@@ -891,7 +891,12 @@ fn print_server_app_help() {
   yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
-  yggterm server app web devtools [--close] [--session <path>]"
+  yggterm server app web devtools [--close] [--session <path>]
+
+targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
+  worker handles the verb; --client names a client by its --client-id (a shadow
+  view client, slice 4.3) — see `server app clients`. --pid wins if both given;
+  with one GUI and no target it routes there automatically."
     );
 }
 
@@ -1795,6 +1800,26 @@ fn main() -> Result<()> {
         } else {
             unsafe {
                 std::env::remove_var("YGGTERM_APP_CONTROL_PID");
+            }
+        }
+        // `--client <name>` (slice 4.3): route this verb to the GUI worker whose
+        // daemon-client identity (`--client-id`) matches — how a probe names a
+        // shadow view client. Resolved to a pid by `choose_app_control_pid`;
+        // `--pid` still wins if both are given.
+        let preferred_client = args.windows(2).find_map(|window| {
+            if window[0] == "--client" && !window[1].starts_with("--") {
+                Some(window[1].clone())
+            } else {
+                None
+            }
+        });
+        if let Some(preferred_client) = preferred_client {
+            unsafe {
+                std::env::set_var("YGGTERM_APP_CONTROL_CLIENT", preferred_client);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT");
             }
         }
         let timeout_ms = args
@@ -5479,6 +5504,7 @@ mod tests {
         let old = ClientInstanceRecord {
             pid: 1234,
             started_at_ms: 1,
+            client_id: None,
             linux_desktop_app_id: None,
             process_start_ticks: Some(77),
             executable_path: Some(
@@ -5509,6 +5535,7 @@ mod tests {
         let same_exe = ClientInstanceRecord {
             pid: 1234,
             started_at_ms: 1,
+            client_id: None,
             linux_desktop_app_id: None,
             process_start_ticks: Some(77),
             executable_path: Some(current_text),
@@ -5525,6 +5552,7 @@ mod tests {
         let other_display = ClientInstanceRecord {
             pid: 5678,
             started_at_ms: 1,
+            client_id: None,
             linux_desktop_app_id: None,
             process_start_ticks: Some(88),
             executable_path: Some(
