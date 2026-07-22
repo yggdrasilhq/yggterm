@@ -822,14 +822,36 @@ Acceptance gates 13, 19.
   engine epoch, profile grant, caller identity, expiry}`. A stale, forged,
   post-reboot, or cross-host `--page` is rejected — it must not resurrect a page,
   reach another host's page, or expose its cookies.
-- **4.4 needs its own trust + placement sub-spec before it builds (eng-review
-  D9).** "Idle host" is not a security principal: define who may schedule onto a
-  host, what identity the engine runs as, whether it may use personal browser
-  credentials, reachable network origins, how SSH transport binds a request to its
-  target, and audit attribution — plus a placement/revocation model (host
-  discovery, capacity, health/version compat, timeout/kill, host-becomes-busy
-  preemption, orphan cleanup, page migration). **4.4 gets its own eng-review
-  gate**; 4.0–4.3 do not depend on it.
+- **4.4 trust + placement sub-spec — DECIDED by user 2026-07-22** (the eng-review
+  D9 gate; single-user fleet, so "idle host" resolves to "one of the user's own
+  hosts, driven by the user's own agents"):
+  - **Credentials/profiles: real host-local profiles, UNGATED.** The farm uses a
+    host's real per-host profile exactly like the GUI — no separate farm profile,
+    no per-run credential grant. Justified: every host and credential is the
+    single user's own; there is no second tenant to fence out. (I advised the
+    gated variant; the user chose ungated deliberately.) Profiles stay
+    **host-local + non-shareable** (no "same profile, two hosts").
+  - **Scheduling: EXPLICIT-ONLY.** A page is created only when a verb NAMES the
+    target host. No automatic idle-host placement — automation never lands on a
+    host the caller did not name.
+  - **`--page` stays an opaque, unguessable capability** scoped to `{host
+    identity, engine epoch, expiry}` — the one protection kept regardless of the
+    ungated-profile choice: a stale/forged/post-reboot/cross-host `--page` is
+    rejected so it can never resurrect a dead page or reach another host's page.
+  - Still owed as ENGINEERING defaults (not user decisions): host-becomes-busy
+    preemption, TTL/timeout-kill, orphan cleanup, health/version-compat, page
+    migration — standard lifecycle, to be built with the engine.
+- **⛔ BUILD REALITY (confirmed 2026-07-22): the engine 4.4 rides DOES NOT EXIST
+  yet.** ychrome has no engine module / no `/engine/*` / no `WPEDisplayHeadless`;
+  `wpe-webkit-2.0` is not installed on the fleet (Debian availability uncertain,
+  per `ychrome/docs/agent-engine.md` §9 risk register). ychrome's own §8 makes
+  **Phase A a gating spike** (prove WPEDisplayHeadless + one WPEWebView + PNG
+  readback + isTrusted-input differential + a bindings decision) that has NOT been
+  done. So 4.4's build = the full ychrome agent-engine project (Phase A spike → B
+  engine daemon+API → C fleet), THEN the yggterm `--page` verb wiring — a
+  multi-session native-engine effort, not a finish-now task. The trust gate above
+  is resolved; the BUILD is the ychrome campaign, tracked in
+  `ychrome/docs/agent-engine.md`.
 
 Acceptance gates 14, 17, 18.
 
