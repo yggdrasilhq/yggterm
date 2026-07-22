@@ -44873,6 +44873,59 @@ fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
     }
 }
 
+/// The active tab's host-owned profile for a session's web surface (slice 4.1c).
+/// This names the jar whose write-lock a Shadow must hold to inject.
+fn web_surface_active_profile(state: &Signal<ShellState>, session_path: &str) -> Option<String> {
+    let shell = state.peek();
+    let surface = shell.web_surfaces.get(session_path)?;
+    surface
+        .tabs
+        .iter()
+        .find(|tab| tab.id == surface.active_tab)
+        .map(|tab| tab.profile.clone())
+}
+
+/// Does the daemon's write-lock report show `holder_id` holding `profile`'s
+/// lock? The daemon stores NORMALIZED profile names, so the comparison
+/// normalizes too (`"work"` here and there is one jar, one lock). Pure — the
+/// slice-4.1c authorization decision, unit-tested.
+fn write_lock_report_holds(
+    report: &yggterm_server::ProfileWriteLockStatus,
+    profile: &str,
+    holder_id: &str,
+) -> bool {
+    let key = normalize_web_surface_profile(Some(profile));
+    report
+        .locks
+        .iter()
+        .any(|(locked_profile, client_id, _pid)| locked_profile == &key && client_id == holder_id)
+}
+
+/// Slice 4.1c — the Shadow lost this profile's write-lock (an Active client
+/// preempted it): cancel every agent batch driving the surface through the
+/// SHARED preempt primitive (the same one seat input uses), and journal it.
+/// After this, the shadow's later verbs are refused by the gate-9 `admit` path
+/// until it re-observes and — if it regains the lock — starts a fresh batch.
+fn note_write_lock_preempt_on_web_surface(session_path: &str, generation: u64, profile: &str) {
+    let surface = crate::agent_input_arbiter::SurfaceKey::new(session_path, generation);
+    let report = agent_input_arbiter_lock().preempt_surface(&surface);
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "agent_input",
+            crate::agent_input_arbiter::PREEMPTED,
+            json!({
+                "session_path": session_path,
+                "generation": generation,
+                "profile": profile,
+                "cancelled_batches": report.cancelled_batches,
+                "trigger": "write_lock_lost",
+            }),
+        );
+    }
+}
+
 async fn web_surface_do_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -44928,6 +44981,45 @@ async fn web_surface_do_for(
                 "session_path": session,
                 "detail": "the user took this surface; start a new batch after re-observing",
             });
+        }
+    }
+    // Slice 4.1c — Shadow write-lock preempt gate. A Shadow view client must not
+    // inject into a profile whose daemon-owned write-lock it no longer holds:
+    // once the user's Active GUI preempts it (4.1a), the shadow's still-open
+    // jar-backed WebContext must stop taking agent-driven writes, or two clients
+    // write one jar. ONLY Shadows check — an Active client holds the lock by
+    // construction, or drives its own ephemeral read-only surface (4.1b), so the
+    // user's GUI never pays this round-trip. An ephemeral profile has its own
+    // in-memory context and no shared jar to fight over, so it is exempt. Fail
+    // CLOSED: a Shadow that cannot confirm it holds the lock refuses, matching
+    // the daemon's shadow-fails-closed doctrine (D7).
+    {
+        let identity = yggterm_server::current_client_identity();
+        if identity.role == yggterm_server::ClientRole::Shadow
+            && let Some(profile) = web_surface_active_profile(state, &session)
+            && !yggterm_core::web_profile::web_profile_is_ephemeral(&normalize_web_surface_profile(
+                Some(profile.as_str()),
+            ))
+        {
+            let holder_id = identity
+                .client_id
+                .clone()
+                .unwrap_or_else(|| format!("anonymous:{}", std::process::id()));
+            let endpoint = state.peek().bootstrap.server_endpoint.clone();
+            let holds = match yggterm_server::profile_write_lock_report(&endpoint) {
+                Ok(report) => write_lock_report_holds(&report, &profile, &holder_id),
+                // Cannot verify => do not write someone else's jar (fail closed).
+                Err(_) => false,
+            };
+            if !holds {
+                note_write_lock_preempt_on_web_surface(&session, handle.generation, &profile);
+                return json!({
+                    "accepted": false,
+                    "reason": crate::agent_input_arbiter::PREEMPTED,
+                    "session_path": session,
+                    "detail": "the profile write-lock was preempted by an Active client; this shadow may not write the jar until it re-acquires",
+                });
+            }
         }
     }
     let native_id = handle.native_id;
@@ -45265,6 +45357,50 @@ mod web_do_verb_tests {
             web_profile_write_locks_to_release(&set(&["c", "a", "b"]), &set(&[])),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    // Slice 4.1c — a Shadow may inject only while the write-lock report still
+    // names IT for the surface's profile; once an Active client preempts it, the
+    // report names the other holder and the `do` is refused.
+    #[test]
+    fn shadow_holds_a_profile_only_when_the_report_names_it() {
+        let report = |locks: &[(&str, &str, u32)]| yggterm_server::ProfileWriteLockStatus {
+            outcome: "report".to_string(),
+            writable: false,
+            profile: String::new(),
+            held_by_client_id: None,
+            held_by_pid: None,
+            locks: locks
+                .iter()
+                .map(|(p, c, pid)| (p.to_string(), c.to_string(), *pid))
+                .collect(),
+        };
+        // The report names this shadow for "work": it holds it.
+        assert!(write_lock_report_holds(
+            &report(&[("work", "shadow-1", 7)]),
+            "work",
+            "shadow-1"
+        ));
+        // An Active GUI preempted it — the holder is now someone else: NOT held.
+        assert!(!write_lock_report_holds(
+            &report(&[("work", "gui", 3)]),
+            "work",
+            "shadow-1"
+        ));
+        // A lock this shadow holds on a DIFFERENT profile does not authorize "work".
+        assert!(!write_lock_report_holds(
+            &report(&[("personal", "shadow-1", 7)]),
+            "work",
+            "shadow-1"
+        ));
+        // Normalization: a messy profile name still matches the stored jar key.
+        assert!(write_lock_report_holds(
+            &report(&[("work", "shadow-1", 7)]),
+            " work ",
+            "shadow-1"
+        ));
+        // Nobody holds anything: NOT held (fail-closed refuses).
+        assert!(!write_lock_report_holds(&report(&[]), "work", "shadow-1"));
     }
 
     // A generation must never be reused, or a stale handle could be mistaken
