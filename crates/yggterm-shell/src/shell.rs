@@ -8493,6 +8493,45 @@ impl ShellState {
     /// stays declare-only, so a ping racing a close cannot resurrect anything.
     /// Stamps the reply omits read "unchanged", never "cleared".
     #[allow(clippy::too_many_arguments)]
+    /// The app RAIL pane that must be refetched because `session_path`'s
+    /// document changed under it, plus the request sequence to fetch it with.
+    /// `None` when the rail is not currently showing this session's pane.
+    ///
+    /// ONE owner, called from BOTH the declare arm and the ping arm. yedit is a
+    /// THIN CLIENT: `yedit <file>` hands the document to the daemon and exits
+    /// immediately, so after the first declare there are no more declares — every
+    /// later document change is observed only by the GUI's `/ping` heartbeat.
+    /// Wiring this into the declare arm alone therefore fixed nothing in the case
+    /// the user actually hits (bug #5, live-reproduced 2026-07-22). Any future
+    /// stamp-driven refresh must be dispatched from both arms.
+    fn document_rail_pane_to_refetch(&mut self, session_path: &str) -> Option<(String, u64)> {
+        // The declaring session must be the ACTIVE one: a background app's
+        // heartbeat must never reach across and clobber the rail the user is
+        // looking at (the same rule the "close" arm enforces).
+        if self.server.active_session_path() != Some(session_path) {
+            return None;
+        }
+        // Read the DISPLAYED mode, never the raw field: a contributed pane is a
+        // tenant, and the raw mode stays pinned on AppPane while a fallback is on
+        // screen. Comparing the raw field is the 2a2ec42 right-rail trap.
+        let RightPanelMode::AppPane(open_pane) = self.displayed_right_panel_mode() else {
+            return None;
+        };
+        // Only the app's RAIL pane tracks the document set.
+        let declares_rail_pane = self
+            .sidebar_contributions
+            .get(session_path)
+            .is_some_and(|contribution| {
+                contribution.panes.iter().any(|pane| {
+                    pane.placement == PanePlacement::Rail && pane.id == open_pane
+                })
+            });
+        if !declares_rail_pane {
+            return None;
+        }
+        Some((open_pane, self.app_pane_next_request()))
+    }
+
     fn apply_sidebar_ping(
         &mut self,
         session_path: &str,
@@ -19023,6 +19062,15 @@ async fn ping_and_apply_contribution(
     if refetch.document {
         let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
         spawn(document_pane_fetch_schema(state, session_path.clone(), seq));
+    }
+    // The rail's document list went stale on the same stamp. THIS is the arm that
+    // matters for a thin-client app: `yedit <file>` exits immediately, so after
+    // the first declare every later document change arrives only as a ping.
+    if refetch.document_rail
+        && let Some((pane_id, seq)) =
+            state.with_mut(|shell| shell.document_rail_pane_to_refetch(&session_path))
+    {
+        spawn(app_pane_fetch_schema(state, pane_id, seq));
     }
     // Command envelope (Phase 5): navigate the tabs the drain minted, activating
     // the session when the command asked to raise, then journal the batch.
@@ -66543,52 +66591,14 @@ fn TerminalCanvas(
                                         }
                                         // ...and the app's RAIL pane describes the
                                         // same document set, so it went stale on
-                                        // the very same bump. Refetch it ONLY when
-                                        // the rail is actually showing this
-                                        // session's pane right now (user bug #5).
-                                        let rail_refetch = refetch.document_rail.then(|| {
-                                            state.with_mut(|shell| {
-                                                // The declaring session must be the
-                                                // ACTIVE one: a background app's
-                                                // re-declare must never reach across
-                                                // and clobber the rail the user is
-                                                // looking at (same rule the "close"
-                                                // arm enforces).
-                                                if shell.server.active_session_path()
-                                                    != Some(contribution_session_path.as_str())
-                                                {
-                                                    return None;
-                                                }
-                                                // Read the DISPLAYED mode, never the
-                                                // raw field: a contributed pane is a
-                                                // tenant, and the raw mode stays
-                                                // pinned on AppPane while a fallback
-                                                // is on screen. Comparing the raw
-                                                // field is the 2a2ec42 right-rail
-                                                // trap.
-                                                let RightPanelMode::AppPane(open_pane) =
-                                                    shell.displayed_right_panel_mode()
-                                                else {
-                                                    return None;
-                                                };
-                                                // Only the app's RAIL pane tracks the
-                                                // document set.
-                                                let declares_rail_pane = shell
-                                                    .sidebar_contributions
-                                                    .get(&contribution_session_path)
-                                                    .is_some_and(|contribution| {
-                                                        contribution.panes.iter().any(|pane| {
-                                                            pane.placement == PanePlacement::Rail
-                                                                && pane.id == open_pane
-                                                        })
-                                                    });
-                                                if !declares_rail_pane {
-                                                    return None;
-                                                }
-                                                Some((open_pane, shell.app_pane_next_request()))
+                                        // the very same bump (user bug #5).
+                                        if refetch.document_rail
+                                            && let Some((pane_id, seq)) = state.with_mut(|shell| {
+                                                shell.document_rail_pane_to_refetch(
+                                                    &contribution_session_path,
+                                                )
                                             })
-                                        });
-                                        if let Some(Some((pane_id, seq))) = rail_refetch {
+                                        {
                                             spawn(app_pane_fetch_schema(state, pane_id, seq));
                                         }
                                         // A document app's RAIL pane opens WITH
@@ -104971,6 +104981,47 @@ mod tests {
         // A further real edit bumps again and must re-arm.
         let saved = redeclare_with_document(&mut shell, session, "v3", 18_000);
         assert!(saved.document_rail, "a later stamp bump must re-arm the rail refetch");
+    }
+
+    // The arm that actually carries bug #5. yedit is a THIN CLIENT: `yedit <file>`
+    // hands the document to the daemon and exits, so a session gets exactly ONE
+    // declare and every later document change is observed only by the GUI's /ping
+    // heartbeat. A fix wired into the declare arm alone changes nothing for the
+    // user — live-reproduced on guihost 2026-07-22, where the rail still showed the
+    // stale file list after a second document was opened.
+    #[test]
+    fn a_ping_carrying_a_new_document_stamp_also_refetches_the_rail() {
+        let session = "local://yedit";
+        let bootstrap = test_shell_bootstrap_with_active_session(session);
+        let mut shell = ShellState::new(bootstrap);
+
+        // One declare, then the CLI is gone.
+        redeclare_with_document(&mut shell, session, "64:false", 1_000);
+
+        // Idle heartbeats: the stamp has not moved, so the rail must not churn.
+        let idle = shell
+            .apply_sidebar_ping(session, None, None, None, None, Some("64:false".into()), 5_000)
+            .expect("a ping for a held contribution reports refetches");
+        assert!(!idle.document_rail, "an unchanged ping stamp churned the rail");
+
+        // The user opens another document: yedit bumps the stamp, and the ONLY
+        // signal the GUI gets is this ping.
+        let opened = shell
+            .apply_sidebar_ping(session, None, None, None, None, Some("66:false".into()), 9_000)
+            .expect("a ping for a held contribution reports refetches");
+        assert!(opened.document, "the viewport refetches on a ping stamp bump");
+        assert!(
+            opened.document_rail,
+            "bug #5: a ping-only stamp bump must refetch the documents rail — \
+             this is the path a thin-client app actually takes"
+        );
+
+        // And it is an EDGE, not a level: the next heartbeat carries the same
+        // stamp and must leave the rail (and its typed search box) alone.
+        let settled = shell
+            .apply_sidebar_ping(session, None, None, None, None, Some("66:false".into()), 13_000)
+            .expect("a ping for a held contribution reports refetches");
+        assert!(!settled.document_rail, "the rail refetched twice for one document change");
     }
 
     fn declare_with_policy(
