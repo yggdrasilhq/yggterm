@@ -633,6 +633,26 @@ protocol:
     `ServerRequest` variants → `protocol_shape_stamp` bump → a live-host **daemon**
     deploy (the row-dropping-handoff path), which the doc's "4.1 rides the existing
     handshake" line was trying to avoid.
+- **★ DECIDED: shape (A) (user, 2026-07-22).** The profile write-lock IS the
+  input authority for a web surface (two `WebContext`s on one profile corrupt it,
+  so writers are already mutually exclusive), so 4.1 = make the 4.2 write-lock
+  Active-preemptible. Grounding it removed the protocol-bump worry entirely: the
+  role rides the **already-deployed 4.0 envelope**, so Active-priority contention
+  is a daemon-logic change with **no `ServerRequest`/`Response` shape change** (no
+  `protocol_shape_stamp` bump, no version fight). Sub-slices:
+  - **4.1a ✅ LANDED (`3fe9662`, main).** `ProfileWriteLockHolder.role`, new
+    `AcquireOutcome::PreemptedShadow` (Active takes over a live Shadow holder;
+    every peer-vs-peer contention stays `profile_busy`), role sourced from the
+    envelope in the acquire/release handlers. Unit-tested (14 write-lock tests).
+    Inert in production until 4.1b/c wire it.
+  - **4.1b (owed):** the GUI acquires the write-lock around a writable web surface
+    (`shell.rs:~4037`, at `open_web_surface`) and releases on close; on `Busy`
+    (a peer holds it) the surface opens read-only rather than a second writer.
+  - **4.1c (owed):** the Shadow's `do` chokepoint checks `ProfileWriteLockReport`
+    (already Allow-for-Shadow) before injecting; on loss it refuses `preempted`
+    and cancels its batch via the gate-9 arbiter keyed by `client_id`.
+  4.1b/c need a coordinated daemon+GUI deploy to jojo (no protocol bump, so no
+  version fight, but still the deploy rules).
 - The transport-independent *core* — client-keyed batches with Active-priority
   preemption — is pure logic that both shapes reuse and is what
   `AgentBatch::client_id` already seats. It is unit-testable with no daemon and no
