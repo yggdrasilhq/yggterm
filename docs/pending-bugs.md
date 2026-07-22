@@ -6,6 +6,26 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
+  viewport paints nothing — background only — while the session is alive, the
+  daemon screen is correct, and **every health field reports healthy**. Cause:
+  `term.element` is out of the DOM (`isConnected:false`, rect 0×0) while an
+  empty husk — `div.terminal.xterm` holding only `.xterm-viewport`, no
+  `.xterm-screen`/rows/canvas — occupies the host. It never self-heals because
+  all three `rebindCurrentHost` reopen guards read false against that husk (it
+  matches `.xterm`; the renderable-layer check requires the absent
+  `.xterm-screen`), and `ensureVisibleHost` short-circuits on `emitPaint()`,
+  whose `visible` is satisfied by any child.
+  **Probes shipped 2026-07-22 (`terminal_host_element_detached`, host-attachment
+  fields in `app state`, mutation breadcrumbs); the FIX is not done.** The
+  one-line repair: make `!liveHost.contains(term.element)` a reopen trigger
+  regardless of what occupies the host. Full write-up, the trace signature that
+  dates past occurrences, and the three open questions (which wipe leaves the
+  husk; whether the never-released reveal ghost is involved; why ~7% of mounts):
+  [`docs/xterm-bugs.md#detached-term-element-blank-viewport`](xterm-bugs.md#detached-term-element-blank-viewport).
+  Recovery with no restart: re-append `term.element` and drop the husk via
+  `server app dom-eval`.
+
 - **THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
   A deploy that lands new binaries does NOT mean the new code is running. The
   daemon's idle gate defers its own retirement while any owned session is
