@@ -2405,6 +2405,25 @@ fn web_surface_reap_due(
     hold_due && lease_due
 }
 
+/// Slice 4.1b — profiles whose daemon-owned write-lock this GUI should RELEASE:
+/// the ones it holds that no longer back any open surface. `held` is the set of
+/// normalized profile names this process currently holds the write-lock for;
+/// `in_use` is the normalized profiles of every surface still in the
+/// reconciler's `applied` map (a STASHED surface keeps its entry, hence its
+/// jar, hence its lock — only a destroyed surface drops out of `in_use`).
+///
+/// Pure + sorted so the lock-lifecycle is deterministic and unit-tested against
+/// its two failure modes: leaking a lock forever (holding one no surface uses)
+/// and releasing one a live surface still needs.
+fn web_profile_write_locks_to_release(
+    held: &std::collections::HashSet<String>,
+    in_use: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut stale: Vec<String> = held.difference(in_use).cloned().collect();
+    stale.sort();
+    stale
+}
+
 /// The agent lease on one (session, tab), read from the desired-state owner
 /// (`ShellState`) — the reconciler's `applied` map is a MIRROR, so the lease
 /// must not live there or it would be a second copy that can diverge.
@@ -3378,6 +3397,19 @@ async fn web_surface_native_reconcile_loop(
     trace_home: std::path::PathBuf,
 ) {
     let mut applied: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
+    // Slice 4.1b — profiles this GUI holds the daemon-owned write-lock for. One
+    // lock per profile jar (not per surface): acquired when a profile's first
+    // persistent surface opens, released (below, end of tick) when its last
+    // surface is gone. Persists across ticks alongside `applied`. A profile
+    // opened READ-ONLY because another live client held the lock is NOT recorded
+    // here (we hold nothing to release), so a later surface re-attempts acquire.
+    let mut held_profile_write_locks: std::collections::HashSet<String> = HashSet::new();
+    // The daemon endpoint + this process's pid, for the write-lock round-trips.
+    // Stable for the process lifetime, so read once. pid ties the lock to this
+    // process so a GUI crash cannot wedge the profile (daemon reclaims a dead
+    // holder's lock).
+    let write_lock_endpoint = state.peek().bootstrap.server_endpoint.clone();
+    let write_lock_pid = std::process::id();
     // (open pane, the page it was drawn for). A pane that is still the same pane
     // but is now looking at a different page has to be redrawn — see the refetch
     // below.
@@ -4035,6 +4067,62 @@ async fn web_surface_native_reconcile_loop(
                     // host. None => engine-native ephemeral context (the
                     // reserved "temp" profile; also home-resolve failure).
                     let profile_dir = web_surface_profile_dir(&profile);
+                    // Slice 4.1b — claim the daemon-owned single-writer lock over
+                    // this profile's jar BEFORE opening a WebContext on it. Two
+                    // WebContexts writing one jar corrupt it, so when another live
+                    // client (a shadow view, a second GUI) already holds the lock
+                    // this surface opens READ-ONLY (ephemeral, no jar: profile_dir
+                    // None) instead of a second writer. The user's Active GUI
+                    // preempts a Shadow holder (4.1a PreemptedShadow => writable),
+                    // so this read-only path only bites Active-vs-Active — a rare
+                    // second GUI on the same profile — and every shadow that tries
+                    // to write a profile the user holds. Ephemeral profiles keep
+                    // their own in-memory context and need no lock.
+                    let surface_profile_dir: Option<std::path::PathBuf> = match &profile_dir {
+                        None => None,
+                        Some(jar) => {
+                            let lock_key = normalize_web_surface_profile(Some(profile.as_str()));
+                            let writable = if held_profile_write_locks.contains(&lock_key) {
+                                // Already this process's lock (idempotent
+                                // AlreadyHeld): every surface on the profile shares
+                                // the one lock, no re-acquire round-trip.
+                                true
+                            } else {
+                                let writable = match yggterm_server::acquire_profile_write_lock(
+                                    &write_lock_endpoint,
+                                    Some(profile.as_str()),
+                                    write_lock_pid,
+                                ) {
+                                    Ok(status) => status.writable,
+                                    // Daemon unreachable, or too old to know the
+                                    // lock (pre-4.2): a shadow client cannot exist
+                                    // against such a daemon (it fails closed on
+                                    // attach), so there is no second writer to fear
+                                    // — open jar-backed, preserving legacy behavior.
+                                    // Never silently drop the user's jar on an
+                                    // acquire error.
+                                    Err(_) => true,
+                                };
+                                if writable {
+                                    held_profile_write_locks.insert(lock_key.clone());
+                                }
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "web_surface",
+                                    "profile_write_lock",
+                                    json!({
+                                        "profile": lock_key,
+                                        "writable": writable,
+                                        "session_path": session_path,
+                                        "tab_id": tab_id,
+                                    }),
+                                );
+                                writable
+                            };
+                            if writable { Some(jar.clone()) } else { None }
+                        }
+                    };
                     // Adblock + userscripts belong to the APP, which serves the
                     // effective policy from its own host. No contribution ⇒ no
                     // policy, and that is right: adblock is browsing config, and
@@ -4060,7 +4148,7 @@ async fn web_surface_native_reconcile_loop(
                         native_id,
                         &effective_url,
                         socks_port,
-                        profile_dir.as_deref(),
+                        surface_profile_dir.as_deref(),
                         &userscripts,
                         adblock_ruleset.as_deref(),
                         user_agent.as_deref(),
@@ -4297,6 +4385,33 @@ async fn web_surface_native_reconcile_loop(
                         None => "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');".to_string(),
                     });
                 }
+            }
+        }
+        // Slice 4.1b — end-of-tick write-lock release. `applied` is now the
+        // final surface set for this tick (all closes/stash-expiries/recreates
+        // done). Release the write-lock for any profile whose last surface is
+        // gone, freeing that jar for the next client (a shadow, a second GUI).
+        // A stashed surface still holds its `applied` entry, so its jar stays
+        // locked — the lock only drops when the surface is truly destroyed.
+        if !held_profile_write_locks.is_empty() {
+            let in_use: std::collections::HashSet<String> = applied
+                .values()
+                .map(|entry| normalize_web_surface_profile(Some(entry.profile.as_str())))
+                .collect();
+            for profile in web_profile_write_locks_to_release(&held_profile_write_locks, &in_use) {
+                let _ = yggterm_server::release_profile_write_lock(
+                    &write_lock_endpoint,
+                    Some(profile.as_str()),
+                    write_lock_pid,
+                );
+                held_profile_write_locks.remove(&profile);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "profile_write_lock_release",
+                    json!({ "profile": profile }),
+                );
             }
         }
         publish_web_surface_native_ids(&applied);
@@ -45114,6 +45229,42 @@ mod web_do_verb_tests {
         // Zero hold still honors a live lease.
         assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000)));
         assert!(web_surface_reap_due(2_000, None, 0, None));
+    }
+
+    // Slice 4.1b — the write-lock lifecycle: a held lock is released the moment
+    // its last surface is gone, and NEVER while a surface still uses it (a
+    // stashed surface keeps its `applied` entry, so it stays in `in_use`).
+    #[test]
+    fn write_lock_released_only_when_no_surface_uses_the_profile() {
+        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        };
+        // A profile with no remaining surface is released; one still in use is kept.
+        assert_eq!(
+            web_profile_write_locks_to_release(&set(&["work", "personal"]), &set(&["work"])),
+            vec!["personal".to_string()]
+        );
+        // Every held profile still backs a surface (incl. a merely-stashed one):
+        // release nothing, so the lock is never yanked from a live jar.
+        assert!(
+            web_profile_write_locks_to_release(&set(&["work"]), &set(&["work", "personal"]))
+                .is_empty()
+        );
+        // Holding nothing releases nothing, even with surfaces open.
+        assert!(web_profile_write_locks_to_release(&set(&[]), &set(&["work"])).is_empty());
+    }
+
+    #[test]
+    fn write_lock_release_order_is_deterministic() {
+        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        };
+        // All held, none in use: every one released, in a STABLE sorted order
+        // (the no-non-determinism rule — HashSet iteration order is not stable).
+        assert_eq!(
+            web_profile_write_locks_to_release(&set(&["c", "a", "b"]), &set(&[])),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     // A generation must never be reused, or a stale handle could be mistaken
