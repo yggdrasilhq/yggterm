@@ -193,7 +193,12 @@ fn print_server_app_help() {
   yggterm-headless server app start-page [--pid <pid>]
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
-  yggterm-headless server app terminal send <session> (--data <data>|--stdin)"
+  yggterm-headless server app terminal send <session> (--data <data>|--stdin)
+
+targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
+  worker handles the verb; --client names a client by its --client-id (a shadow
+  view client, slice 4.3) — see `server app clients`. --pid wins if both given;
+  with one GUI and no target it routes there automatically."
     );
 }
 
@@ -1382,6 +1387,24 @@ fn main() -> Result<()> {
         } else {
             unsafe {
                 std::env::remove_var("YGGTERM_APP_CONTROL_PID");
+            }
+        }
+        // `--client <name>` (slice 4.3): route this verb to the GUI worker whose
+        // `--client-id` matches (naming a shadow view client). `--pid` still wins.
+        let preferred_client = args.windows(2).find_map(|window| {
+            if window[0] == "--client" && !window[1].starts_with("--") {
+                Some(window[1].clone())
+            } else {
+                None
+            }
+        });
+        if let Some(preferred_client) = preferred_client {
+            unsafe {
+                std::env::set_var("YGGTERM_APP_CONTROL_CLIENT", preferred_client);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT");
             }
         }
         let timeout_ms = args

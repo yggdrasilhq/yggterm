@@ -604,6 +604,40 @@ Acceptance gates 10, 15.
   disconnect/restart, queued and pending input for that client is cancelled, not
   replayed.
 
+**★ TRANSPORT FORK — a build-time finding that needs the user's call (2026-07-22).**
+Grounding the "extend the one arbiter across clients" language against the tree
+surfaces a fork the spec did not settle, and it decides whether 4.1 bumps the
+protocol:
+- **A Shadow's *only* drivable input is web-surface input.** Terminal input is
+  role-gated away entirely — `role_gate` denies `TerminalWrite` to a Shadow (gate
+  10) — so the "keystroke" in gate 11 can only be the Active client's *own* seat
+  input, and the input a Shadow drives is clicks/typing into an *under-glass web
+  surface*, never PTY bytes.
+- **Web-surface input is per-GUI-process and never reaches the daemon.** The
+  gate-9 arbiter (`AgentInputArbiter`) is a **process-global** in the GUI, and a
+  Shadow is a **separate GUI process** with its own webview + its own arbiter. So
+  "one arbiter extended across clients" cannot be literally one shell-side arbiter
+  — the two clients share no shell state. The only cross-process meeting point is
+  the daemon, which does not see web injections.
+- **Therefore two coherent shapes, and they differ on the protocol:**
+  - **(A) Subsume into the 4.2 profile write-lock.** Whoever holds the profile
+    write-lock is the sole web-surface writer; 4.1's "input lease" becomes
+    *Active-priority preemption* of that lock (the Active client can reclaim it
+    from a Shadow on seat input). Extends 4.2's already-deployed lock rather than
+    adding a second lease table — matches "one arbiter, rides the existing
+    handshake" — **but** 4.2 grants for process-lifetime with no preemptive
+    revoke, so adding revoke likely needs a small protocol addition
+    (`PreemptProfileWriteLock` or a flag) → a bump + daemon deploy after all.
+  - **(B) New daemon-side transient input lease** keyed by `(client_id, role)`,
+    Active-priority, revoke-on-seat-input. Cleanest conceptually, but new
+    `ServerRequest` variants → `protocol_shape_stamp` bump → a live-host **daemon**
+    deploy (the row-dropping-handoff path), which the doc's "4.1 rides the existing
+    handshake" line was trying to avoid.
+- The transport-independent *core* — client-keyed batches with Active-priority
+  preemption — is pure logic that both shapes reuse and is what
+  `AgentBatch::client_id` already seats. It is unit-testable with no daemon and no
+  deploy; only its **wiring** waits on the fork above.
+
 Acceptance gate 11.
 
 ### 4.2 — Profile write-lock (single-writer, profile-safety)
@@ -632,6 +666,25 @@ Acceptance gate 12.
   target client; its screenshots/switches touch only its shadow view (captured
   via `grim`). The user's GUI is never driven — the pt10 "whooping" annoyance is
   gone.
+  **✅ `--client <name>` ROUTING BUILT + verified (2026-07-22).** No protocol
+  change: app-control already targets a worker by pid (`AppControlRequest.preferred_pid`,
+  `app_control_requests_pending_for_worker`), so `--client` is a resolve-name→pid
+  layer, GUI-only deploy. Each GUI worker now records its slice-4 `client_id`
+  (`current_client_identity().client_id`) in its `ClientInstanceRecord`, and the
+  one resolver `choose_app_control_pid` gained a `requested_client` arg
+  (`YGGTERM_APP_CONTROL_CLIENT`, set from `--client`): `--pid` wins if both given;
+  else the sole worker whose `client_id` matches; two workers under one name fail
+  loudly rather than guess. Wired into both CLI entry points (`yggterm` +
+  `yggterm-headless`) and the `--help`; `server app clients` surfaces `client_id`
+  so names are discoverable. Proven end-to-end through the real binary on a dev
+  sandbox: `clients` lists the id; an unknown `--client` errors with the available
+  list; a known `--client` resolves to the pid and enqueues a *targeted* request
+  (a timeout against a non-worker stand-in, **not** a "no live client" error).
+  7 resolver unit tests + all touched crate tests green. **Still owed:** the live
+  demo of a real shadow GUI worker *claiming* a `--client`-targeted request — but
+  that is the pre-existing, unit-tested pid-routing path unchanged; only the
+  name→pid layer is new. This unblocks the LIVE proofs for gate 11 & gate 16
+  (they need a way to aim a verb at a specific view client).
 - Both clients read the **same daemon truth** (Phase-2 doctrine: daemon = truth,
   view client = disposable); the shadow adds a view, never a second source of
   state.
@@ -853,6 +906,28 @@ not a code claim.
     Shadow views at different viewport sizes leave the active terminal's rows,
     columns, and pixels **byte-identical**; a Shadow attempting to set winsize /
     focus / scroll is refused and the user's live frame does not repaint.
+    **✅ ENFORCED BY CONSTRUCTION at the 4.0 role boundary (verified in tree
+    2026-07-22).** The D8 reflow risk is closed *at the protocol*, not merely by a
+    later 4.3 guard: `role_gate` (daemon.rs) already denies a `Shadow` every path
+    that could reflow the user's PTY — `TerminalResize` (winsize/SIGWINCH),
+    `TerminalWrite` (keystrokes), `TerminalRestart` (carries `initial_cols/rows`),
+    and `FocusLive`. The *only* PTY-resize path in the daemon is the
+    `TerminalResize` handler; the entire Shadow **Allow-set**
+    (`TerminalRead`/`TerminalSnapshot`/`TerminalRetainedSnapshot`/`TerminalHistory`/
+    `Snapshot`) carries only `path`/`cursor` — **no `cols`/`rows`** — so an observe
+    request cannot smuggle a reflow either. A Shadow therefore has *no wire* to
+    reflow, keystroke, or focus the user's session, regardless of its own view
+    size. Regression-guarded by `role_gate_allows_only_read_observe_for_shadow` +
+    the exhaustive no-wildcard `match` (a new geometry-bearing variant fails the
+    build until classified). **Still owed:** (a) the live end-to-end demonstration
+    (two views at different sizes, compositor grab byte-identical); (b) the
+    shadow's OWN-view **canonical/letterboxed grid** so its render is coherent when
+    the daemon refuses its fit-resize — a shadow-side *cosmetic*, not a user-safety
+    gap (the refusal already protects the user; only the shadow's own frame is
+    mismatched until this lands). The shell layer does not yet know it is a Shadow
+    (`crates/yggterm-shell` has no `ClientRole::Shadow` reference), so today a
+    shadow GUI would fire a fit-`TerminalResize` on focus and be *denied* — safe
+    for the user, incoherent for the shadow until the canonical grid is built.
 17. **Profile integrity under concurrency (4.2, eng-review D9).** Two clients
     cannot mutate any shared profile component (jar, WAL/SHM, IndexedDB, service
     workers, caches) at once — the second writer gets `profile_busy`; a crash /
