@@ -21,9 +21,22 @@ fix) once the fix is verified live on jojo.
   (`rebindCurrentHost` now treats `termElementOutsideHost` — `term.element` not in
   the live host — as a fourth reopen trigger, so the reopen re-appends
   term.element and drops the husk; guarded by
-  `terminal_eval_script_probes_detached_term_element`). LIVE PROOF still owed —
-  activates on the next jojo deploy; watch the `rebind_host` debug event for
-  `term_outside_host=true reopened=true reattached=true`.** Full write-up, the
+  `terminal_eval_script_probes_detached_term_element`).**
+  ⛔ **THAT FIX SHIPPED A REGRESSION IN 2.12.2 — corrected in `f0aca70`.** Its
+  premise ("it can only fire when term.element is genuinely elsewhere, which is
+  itself the bug") is FALSE for a **backgrounded** host: a parked session's host
+  leaves the DOM entirely, taking `term.element` with it, so the trigger read
+  "broken" forever on every parked session and `emit_resize` re-fired the reopen
+  continuously. Measured live: **3931 `rebind_host` events in 5 minutes (~13/s)**,
+  WebKitWebProcess pinned at 26%, the viewport blinking ~2x/s, mount generations
+  churning `m8 -> m9 -> m10` in 364 ms, and — because the churn never let focus
+  settle on the xterm helper textarea — **a session the user switched to came up
+  blank and REFUSED KEYBOARD INPUT.** The same-host reopen is now gated on
+  `liveHost.isConnected`. After: 0 rebinds in 25 s idle, one per switch,
+  WebKit 26.0% -> 16.1%, GUI 10.7% -> 4.8%.
+  **Generalise: any repair/reopen trigger must first ask whether the thing it is
+  repairing is on screen at all.** A repair loop on a parked host is invisible
+  except as heat. Full write-up, the
   trace signature that dates past occurrences, and the three open questions (which
   wipe leaves the husk; whether the never-released reveal ghost is involved; why
   ~7% of mounts):
