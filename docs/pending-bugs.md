@@ -48,6 +48,52 @@ fix) once the fix is verified live on jojo.
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
 
+- **B4 ROOT CAUSE FOUND (jojo, 2026-07-22): the cold-restore refusal is
+  ALL-OR-NOTHING, and rows owned by NOBODY have no recovery source.** Measured
+  end-to-end on the live 2.12.2 → 2.12.3 swap: the sidebar went **25 rows → 12**,
+  losing 13 `remote-cc://dev/*` rows. This is NOT the dormant-adoption gap that
+  `ad4a595` closed — that fix is present and ran.
+  **Mechanism, with the trace evidence:**
+  1. The successor boots, sees other live daemons, and
+     `may_cold_restore_live_sessions` refuses → `daemon.rs` runs
+     `saved.live_sessions.clear()`, wiping **all 19** persisted live rows
+     (`cold_restore_of_live_sessions_refused {skipped_live_sessions: 19}`).
+  2. The deep reconcile then runs and can only re-adopt a row that some
+     **reachable daemon actively holds**:
+     `recover_missing_preserved_owner_live_sessions_from_reachable_daemons` needs
+     a live runtime, `adopt_missing_dormant_sessions_from_reachable_daemons` needs
+     the row in the predecessor's `stored_terminal_sessions`.
+     Trace: `preserved_owner_deep_reconcile_ran {before: 7, after: 7}` — adopted
+     nothing.
+  3. **Exactly the predecessor's 6 `terminal_session_keys` survived.** The other
+     13 were live-listed but owned by no daemon (the normal state for an agent-CLI
+     row whose PTY has exited but which is still attachable), so no adoption path
+     could see them and they went invisible.
+  **Why the obvious one-line fix is WRONG:** simply retaining unowned rows from
+  the file re-opens the 2026-07-09 incident the refusal exists to prevent (19
+  *closed* sessions resurrected from a stale `server-state.json`) — see
+  `cold_restore_of_live_sessions_is_refused_beside_a_live_owner`. The file is not
+  the truth while a predecessor is alive.
+  **Correct fix (designed, NOT built):** mirror what `stored_terminal_sessions`
+  already does for dormant rows — have the predecessor **advertise its live rows
+  on `ServerRuntimeStatus`** (`live_terminal_sessions: Vec<PersistedLiveSession>` +
+  an `advertises_live_session_rows` fail-safe flag, both `#[serde(default)]`, which
+  does NOT trip the protocol shape stamp since `ServerRuntimeStatus` is not part of
+  `ServerRequest`/`ServerResponse` — precedent: `remote_yggterm_retry_total`), and
+  add a third reconcile pass that adopts the live rows this daemon lacks. Source
+  the field from `persisted_state().live_sessions` so persistence and the wire
+  cannot diverge (no mirrored filter). Then the refusal can stay all-or-nothing:
+  the live predecessor, not the file, supplies the rows.
+  **Recovery until then** (works, verified this run): capture
+  `server app rows` **BEFORE** any deploy, diff after, then
+  `yggterm server connect '<path>'` each missing row — ⚠ `connect` is on the
+  `yggterm` binary, not `yggterm-headless`, and ⚠ use `ssh -n` in the loop or ssh
+  eats the loop's stdin and you silently reconnect only the first row. Rows return
+  in 5–10 s. Note `yggterm server reorder` only reorders rows with a **live
+  runtime** (`replace_live_session_order` filters on
+  `managed_session_is_live_runtime_session`), so it cannot restore the order of
+  reconnected dormant rows — cosmetic, but do not expect byte-identical order.
+
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
   holes (`t ik` for `think`, including the user's own composer echo), merged
