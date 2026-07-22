@@ -5214,6 +5214,10 @@ impl Drop for DaemonSpawnLock {
 struct ClientInstanceRecord {
     pid: u32,
     started_at_ms: u64,
+    /// Slice-4 daemon-client identity (`--client-id`) so `--client <name>` can
+    /// resolve NAME → this worker's pid. `None` = the user's anonymous GUI.
+    #[serde(default)]
+    client_id: Option<String>,
     #[serde(default)]
     linux_desktop_app_id: Option<String>,
     #[serde(default)]
@@ -51332,6 +51336,7 @@ fn register_client_instance(
     let record = ClientInstanceRecord {
         pid,
         started_at_ms,
+        client_id: yggterm_server::current_client_identity().client_id,
         linux_desktop_app_id: linux_desktop_app_id.map(str::to_string),
         process_start_ticks: process_start_ticks(pid),
         executable_path: current_client_executable_path(),
@@ -51358,6 +51363,7 @@ fn register_client_instance(
             "pid": pid,
             "path": path.display().to_string(),
             "started_at_ms": started_at_ms,
+            "client_id": record.client_id,
             "linux_desktop_app_id": record.linux_desktop_app_id,
             "executable_path": record.executable_path,
             "display": record.display,
@@ -107590,6 +107596,7 @@ mod tests {
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 1,
+            client_id: None,
             linux_desktop_app_id: Some(YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -107643,6 +107650,7 @@ mod tests {
         let legacy_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 1,
+            client_id: None,
             linux_desktop_app_id: Some(YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-old".to_string()),
