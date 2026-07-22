@@ -208,6 +208,42 @@ the PTY.
   instant death). Automatic forward re-resolve on ping failure is DEFERRED
   until a remote document app exists.
 
+### ⛔ Trap: there are TWO refetch dispatch arms. Wiring one fixes nothing.
+
+"Any stamp that moved dispatches the same refetch a declare would" is the
+*contract*, not a single code path. In `shell.rs` it is implemented **twice**:
+
+| Arm | Entry point | Fires when |
+|---|---|---|
+| declare | the OSC declare handler (`upsert_sidebar_contribution` inline) | the app re-declares over the PTY |
+| ping | `apply_sidebar_ping` → the `// Same dispatch as the declare arm` block | the GUI polls `<control>/ping` |
+
+**For a two-tier app the ping arm is the ONLY one that ever runs after startup.**
+`yedit <file>` declares once, hands the document to its daemon, and **exits** —
+the shell prompt comes straight back. So the session gets exactly one declare
+ever, and every subsequent content change arrives as a ping.
+
+This cost a full build → deploy → live-test cycle on 2026-07-22. A new refetch
+(the documents-rail refresh, user bug #5) was wired into the declare arm, unit
+tested, deployed — and the live symptom was **completely unchanged**, because the
+user's action (open a second document) never produces a declare. The unit test
+passed while the feature did nothing.
+
+**Rules that follow:**
+1. Adding a stamp-driven refresh means editing **both** arms, in the same commit.
+2. Put the decision in ONE helper on `ShellState` and call it from both — do not
+   copy the tenancy/active-session checks to the second callsite, or they will
+   drift.
+3. **Test the ping arm specifically.** `apply_sidebar_ping` returns the
+   `SidebarRefetch` directly, so it is cheap to assert against; a declare-arm-only
+   test is not evidence for a thin-client app.
+4. When live-testing, verify the app actually re-declares before believing a
+   declare-path fix — `pgrep` the client, or watch for the shell prompt returning.
+
+**Generalises past this repo:** whenever a contract says "X and Y both trigger Z",
+grep for how many places implement Z before editing one of them. A green unit test
+against the arm the user never takes is the most expensive kind of false proof.
+
 ### The command envelope — app→GUI ingress (SPEC agreed 2026-07-18, NOT BUILT)
 
 The ping reply is the ONLY app→GUI data path (the app can never call the
