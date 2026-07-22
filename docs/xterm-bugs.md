@@ -50,7 +50,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
-| [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | OPEN — probes shipped 2026-07-22; persistence root-caused, husk provenance NOT determined |
+| [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PARTIAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B OPEN — a fully-opened terminal that later loses its screen has an armed early-return guard, so only a remount helps (reported as `rebuild_from_husk_failed`) |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
 
 ---
@@ -1671,15 +1671,29 @@ Proven deterministically against the shipped bundle, not inferred:
 
 ### NOT determined — open questions for the next agent
 
-1. **Which code path leaves the husk?** STILL OPEN, but narrowed. An `.xterm`
-   root holding only a viewport is not a shape xterm.js produces in one pass:
-   `open()` builds the viewport and screen into a fragment and attaches them
-   together — *except* that it appends the bare root to the parent FIRST and the
-   fragment LAST, so there is a synchronous window in which the host holds an
-   `.xterm` root with no screen. Anything that throws inside that window leaves
-   the husk. Read `orphan_desc=` on the next `terminal_host_element_detached`:
-   it now names the orphan's classes, child classes, canvas count, and the host
-   entry that OWNS it (`owner=<hostId>` / `self` / `none`).
+1. **~~Which code path leaves the husk?~~ ANSWERED 2026-07-22 — a PARTIAL
+   `term.open()`.** No longer a lead: it is pinned deterministically against the
+   shipped bundle by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`.
+   `open()` appends the bare root to the parent FIRST and the viewport/screen
+   fragment LAST, so any throw inside that window leaves exactly the husk —
+   `xterm_roots=1 screen_in_host=false rows_in_host=false screen_canvases=0`,
+   with `term.element` set AND connected, which is why every placement guard read
+   it as healthy. The mount's `term.open(host)` was unguarded, so the same throw
+   also abandoned the rest of the mount — matching the "born at mount, in one
+   millisecond" autopsy exactly.
+   **The orphan roots are a consequence, not a separate mystery.** `open()`'s
+   early-return guard is `this.element && this._coreBrowserService`, and
+   `_coreBrowserService` is assigned late *inside* `open()`. A partial open sets
+   `element` without arming the guard, so the next `open()` falls through and
+   builds a SECOND root while the husk stays parented — an orphan whose owner no
+   longer matches. This explains the 18/18 `constructed ≥2×` correlation without
+   needing two live closures for one `hostId`.
+   **Fixed** by `terminalSurfaceIsComplete` + a mount retry that discards the
+   husk first, and by `attachTerminalSurfaceToHost` rebuilding rather than moving
+   a husk. **Species B remains open:** a terminal that opened completely and lost
+   its screen afterwards has an armed guard, so `open()` is a no-op and only a
+   remount helps; the code now reports that honestly as
+   `mode=rebuild_from_husk_failed` instead of claiming a repair.
 2. **~~Was the reveal ghost involved?~~ NO — falsified 2026-07-22.** The
    `reveal_ghost_attached` ≫ `reveal_ghost_released` gap looked damning (27 vs 9
    in one generation) but is an accounting artefact: `releaseRevealGhost` is

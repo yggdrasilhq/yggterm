@@ -57,13 +57,42 @@ fix) once the fix is verified live on jojo.
   and **the reveal ghost is NOT involved** (zero ghost nodes live; the
   attach≫release gap is an accounting artefact — `releaseRevealGhost` is gated on
   `isConnected`, so a wipe that already removed the ghost suppresses the event).
-  **STILL OPEN: what creates the husk.** Narrowed to a synchronous window inside
-  `term.open()` — it appends the bare `.xterm` root to the parent FIRST and the
-  screen fragment LAST — and correlated with same-epoch re-mounts (18/18 husked
-  hosts were `constructed` ≥2×, median gap 5.4 s vs 219 s baseline; but 127/225
-  hosts remount without husking, so it is necessary, not sufficient). Read
-  `orphan_desc=` on the next `terminal_host_element_detached`: it now names the
-  orphan's owner host entry.
+  **★★ THE CREATION HALF IS NOW ROOT-CAUSED AND FIXED (2026-07-22).** The husk
+  is born in a **PARTIAL `term.open()`**, and this is proven deterministically
+  against the shipped bundle by
+  `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js` — not inferred
+  from a live symptom. `open()` appends the bare `.xterm` root to the host
+  **first** and appends the viewport/screen fragment **last**, so any throw in
+  between leaves a connected, empty root: exactly
+  `orphan_root_without_screen=true xterm_roots=1 screen_in_host=false
+  rows_in_host=false screen_canvases=0`. The mount's `term.open(host)` was
+  **unguarded**, so that throw also abandoned the rest of the mount (OSC
+  suppressors, bell, observers) — which is why the autopsy always showed the
+  husk born at mount, in one millisecond.
+  **Why it looked unrepairable, and why it is not.** `open()`'s early-return
+  guard is `this.element && this._coreBrowserService`, and `_coreBrowserService`
+  is assigned **late** inside `open()`. A partial open therefore sets `element`
+  but never arms the guard, so a second `open()` really does rebuild — but only
+  if the husk root is removed first; leave it and the rebuild strands it as an
+  **orphan beside the new root**. That is where the autopsy's orphan roots come
+  from, and it explains the 18/18 "constructed ≥2×" correlation without needing
+  two live closures.
+  **Fix:** `terminalSurfaceIsComplete` is now the one owner of "surface or
+  husk?". The mount retries an incomplete open (after discarding the husk) and
+  emits `terminal_mount_open_incomplete`; `attachTerminalSurfaceToHost` refuses
+  to MOVE a husk and rebuilds it instead. Guarded by
+  `terminal_eval_script_rebuilds_a_husk_instead_of_moving_it`.
+  **⚠ THERE ARE TWO HUSK SPECIES — the second is still open.** Species A
+  (partial open, guard unarmed) is repaired by the above. Species B is a
+  terminal that opened **completely** and lost its screen subtree afterwards:
+  its guard IS armed, so `open()` early-returns and the rebuild cannot take. The
+  new code detects this, reports `mode=rebuild_from_husk_failed`, and puts the
+  husk back so the surface is no worse than it was found. **Species B was
+  observed live within minutes of the fix deploying** (during the documented
+  post-deploy re-attach window; a subsequent remount cleared it and the visible
+  surface stayed healthy). **Next probe:** who removes `.xterm-screen` from an
+  already-opened terminal — `host.innerHTML=""` cannot, since removing a node
+  does not empty it. Only a remount helps species B today.
 
 - **★ A GUI RESTART CAN LEAVE APP CONTROL PERMANENTLY UNREACHABLE — the client
   instance record vanishes after a SUCCESSFUL register (jojo, 2026-07-22).**
