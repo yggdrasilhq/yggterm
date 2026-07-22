@@ -40,18 +40,25 @@ use yggterm_core::web_profile::{normalize_web_profile, web_profile_is_ephemeral}
 pub const PROFILE_BUSY: &str = "profile_busy";
 
 /// Who holds a profile write-lock. `client_id` is the slice-4.0 per-request
-/// client identity; `pid` is what makes crash recovery possible.
+/// client identity; `pid` is what makes crash recovery possible; `role` is the
+/// slice-4.0 [`ClientRole`] the grant was made under, which drives slice-4.1
+/// Active-priority preemption (the human's Active client always wins over a
+/// Shadow view client). Role is a property of the grant, never part of
+/// [`Self::is`] identity — a client's role is frozen per 4.0, so `client_id`
+/// already determines it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileWriteLockHolder {
     pub client_id: String,
     pub pid: u32,
+    pub role: crate::ClientRole,
 }
 
 impl ProfileWriteLockHolder {
-    pub fn new(client_id: impl Into<String>, pid: u32) -> Self {
+    pub fn new(client_id: impl Into<String>, pid: u32, role: crate::ClientRole) -> Self {
         Self {
             client_id: client_id.into(),
             pid,
+            role,
         }
     }
 
@@ -60,6 +67,7 @@ impl ProfileWriteLockHolder {
     /// that restarted under a new pid is a different process. Requiring both
     /// keeps a restarted client from inheriting its own dead lock silently —
     /// it reacquires through the normal (journaled) reclaim path instead.
+    /// `role` is deliberately NOT compared: identity is `client_id` + `pid`.
     fn is(&self, other: &ProfileWriteLockHolder) -> bool {
         self.client_id == other.client_id && self.pid == other.pid
     }
@@ -109,7 +117,13 @@ pub enum AcquireOutcome {
     /// The previous holder's process was gone; its lock was reclaimed and
     /// granted to the requester. Carried out so the daemon can journal it.
     ReclaimedFromDead { previous: ProfileWriteLockHolder },
-    /// A different, live client holds it.
+    /// Slice 4.1 — Active-priority preemption. A live `Shadow` held the lock and
+    /// an `Active` client (the human) took it over. The Shadow is displaced (its
+    /// next verb sees a different holder via `ProfileWriteLockReport` and its
+    /// batch is cancelled `preempted`); carried out so the daemon can journal it.
+    PreemptedShadow { previous: ProfileWriteLockHolder },
+    /// A different, live client holds it and may NOT be preempted (an `Active`
+    /// holder, or a `Shadow` requesting against another `Shadow`).
     Busy { held_by: ProfileWriteLockHolder },
     /// An ephemeral profile keeps no shared state on disk, so every surface
     /// gets its own in-memory context and no lock is required.
@@ -123,6 +137,7 @@ impl AcquireOutcome {
             Self::Granted
             | Self::AlreadyHeld
             | Self::ReclaimedFromDead { .. }
+            | Self::PreemptedShadow { .. }
             | Self::Ephemeral => true,
             Self::Busy { .. } => false,
         }
@@ -170,17 +185,30 @@ impl ProfileWriteLockTable {
             return AcquireOutcome::Ephemeral;
         }
         let mut reclaimed = None;
+        let mut preempted = None;
         if let Some(current) = self.entries.get(&profile) {
             if current.holder.is(&holder) {
                 return AcquireOutcome::AlreadyHeld;
             }
             if liveness.is_alive(current.holder.pid) {
-                return AcquireOutcome::Busy {
-                    held_by: current.holder.clone(),
-                };
+                // Slice 4.1 — Active-priority preemption. The human's Active
+                // client always wins over a live Shadow view client; a Shadow
+                // never displaces anyone. Every other contention (Active vs a
+                // peer Active, Shadow vs Active, Shadow vs Shadow) stays
+                // profile_busy: equal-or-higher standing is never displaced.
+                if holder.role == crate::ClientRole::Active
+                    && current.holder.role == crate::ClientRole::Shadow
+                {
+                    preempted = Some(current.holder.clone());
+                } else {
+                    return AcquireOutcome::Busy {
+                        held_by: current.holder.clone(),
+                    };
+                }
+            } else {
+                // Holder is gone: its lock is recoverable, not permanent.
+                reclaimed = Some(current.holder.clone());
             }
-            // Holder is gone: its lock is recoverable, not permanent.
-            reclaimed = Some(current.holder.clone());
         }
         self.entries.insert(
             profile.clone(),
@@ -190,9 +218,10 @@ impl ProfileWriteLockTable {
                 acquired_at_ms: now_ms,
             },
         );
-        match reclaimed {
-            Some(previous) => AcquireOutcome::ReclaimedFromDead { previous },
-            None => AcquireOutcome::Granted,
+        match (preempted, reclaimed) {
+            (Some(previous), _) => AcquireOutcome::PreemptedShadow { previous },
+            (None, Some(previous)) => AcquireOutcome::ReclaimedFromDead { previous },
+            (None, None) => AcquireOutcome::Granted,
         }
     }
 
@@ -275,7 +304,11 @@ mod tests {
     }
 
     fn holder(id: &str, pid: u32) -> ProfileWriteLockHolder {
-        ProfileWriteLockHolder::new(id, pid)
+        ProfileWriteLockHolder::new(id, pid, crate::ClientRole::Active)
+    }
+
+    fn shadow(id: &str, pid: u32) -> ProfileWriteLockHolder {
+        ProfileWriteLockHolder::new(id, pid, crate::ClientRole::Shadow)
     }
 
     // Gate 12: acquire -> second writer profile_busy -> release -> re-acquire.
@@ -445,6 +478,68 @@ mod tests {
         assert_eq!(
             table.release(Some("temp"), &holder("gui", 100)),
             ReleaseOutcome::Ephemeral
+        );
+    }
+
+    // Slice 4.1 gate 11 (write-lock half): the human always wins.
+    #[test]
+    fn active_preempts_a_live_shadow_holder() {
+        let live = FakeLiveness::all_alive();
+        let mut table = ProfileWriteLockTable::new();
+        let shadow_holder = shadow("shadow-1", 200);
+        let user = holder("gui", 100);
+        // A shadow is driving the profile.
+        assert_eq!(
+            table.acquire(Some("work"), shadow_holder.clone(), 1, &live),
+            AcquireOutcome::Granted
+        );
+        // The user (Active) focuses the same profile: it takes over, not busy.
+        let outcome = table.acquire(Some("work"), user.clone(), 2, &live);
+        assert_eq!(
+            outcome,
+            AcquireOutcome::PreemptedShadow {
+                previous: shadow_holder
+            }
+        );
+        assert!(outcome.is_writable());
+        // Exactly ONE writer after preemption — the Active client.
+        assert_eq!(table.entries().count(), 1);
+        assert_eq!(table.holder(Some("work")).unwrap().holder, user);
+    }
+
+    #[test]
+    fn a_shadow_never_preempts_an_active_holder() {
+        let live = FakeLiveness::all_alive();
+        let mut table = ProfileWriteLockTable::new();
+        let user = holder("gui", 100);
+        table.acquire(Some("work"), user.clone(), 1, &live);
+        // A shadow asking for a profile the user holds is refused, never a takeover.
+        let busy = table.acquire(Some("work"), shadow("shadow-1", 200), 2, &live);
+        assert_eq!(busy, AcquireOutcome::Busy { held_by: user.clone() });
+        assert!(!busy.is_writable());
+        assert_eq!(table.holder(Some("work")).unwrap().holder, user);
+    }
+
+    #[test]
+    fn preemption_is_active_over_shadow_only_not_peer_over_peer() {
+        let live = FakeLiveness::all_alive();
+        // Active vs a peer Active stays busy (two GUIs never displace each other).
+        let mut table = ProfileWriteLockTable::new();
+        let first_gui = holder("gui-a", 100);
+        table.acquire(Some("work"), first_gui.clone(), 1, &live);
+        assert_eq!(
+            table.acquire(Some("work"), holder("gui-b", 200), 2, &live),
+            AcquireOutcome::Busy { held_by: first_gui }
+        );
+        // Shadow vs a peer Shadow stays busy (no priority between shadows).
+        let mut table2 = ProfileWriteLockTable::new();
+        let first_shadow = shadow("shadow-a", 300);
+        table2.acquire(Some("work"), first_shadow.clone(), 1, &live);
+        assert_eq!(
+            table2.acquire(Some("work"), shadow("shadow-b", 400), 2, &live),
+            AcquireOutcome::Busy {
+                held_by: first_shadow
+            }
         );
     }
 
