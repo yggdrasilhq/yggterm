@@ -464,6 +464,18 @@ existing `focus_settings_field` owner (which claims UI focus via
 steal it back). One owner: the renderer stamps `SETTINGS_FIRST_FIELD_KEY` as that
 row's `data-settings-field-key` and the focus script queries the same attribute.
 
+⛔ **`settings.toggle` DISPATCHES THROUGH TWO ARMS, and the chord takes the one
+that is easy to miss.** The registry gives it `descends_into: Some("settings")`,
+so ALT,G — the primary keyboard route — lands in `dispatch_keytip_open`, NOT in
+`execute_shell_command`'s Run arm. Fixing only the Run arm left the real chord
+unfixed **while the `command invoke` probe passed**, which is the same shape as
+the yedit declare/ping trap (`shell.rs` implements a dispatch twice; the thin
+path is the one the user actually takes). Both arms focus the panel head now.
+Focusing during a chord is safe and was verified live: the chord walker is a
+**window-level** keydown listener that claims chord keys "at any focus" and
+preventDefaults them while the overlay is open, so `ALT,G,L` still flipped the
+theme with focus sitting on the Auto-hide Titlebar button.
+
 ⚠ **This does not retire the exemption.** The 23 remaining controls are still
 subtree-suppressed and still count as violations — reaching them by Tab is a
 chain, not a badge. Un-exempting them properly is §12.2's inversion, and
