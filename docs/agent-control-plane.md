@@ -507,6 +507,14 @@ the GUI process; the headless farm has no GUI to route through. The verb
 
 ## Slice 4 build plan — true shadow clients + idle-host farm (3.0.0)
 
+> **STATUS (2026-07-22): 4.0–4.3 SHIPPED + live (jojo 2.12.2). 4.4 (the oc WPE
+> headless FARM ENGINE) is ON HOLD by user decision — standing.** The expensive
+> from-scratch engine (`wpe-webkit-2.0` substrate not installed; see §4.4 build
+> reality) stays parked because the cheaper path already delivers the outcome:
+> the slice-2b engine verbs driving the real GUI surfaces + the 4.3 headless
+> shadow client cover it ("no full client needed for most of it"). Do not reopen
+> 4.4 unless the user asks; the trust gate is pre-decided in §4.4 if they do.
+
 Slices 2–3 gave the agent everything the *soft-stashed GUI surfaces* can give:
 read/do/wait/capture/lease on a surface the user is not watching, an agent-only
 grid, per-agent cursors. Slice 4 is the **residual the GUI-hosted plane cannot
