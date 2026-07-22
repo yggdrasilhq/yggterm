@@ -30,6 +30,7 @@ Every entry below cost a session at least once.
 | `server reorder`'s response | The rows have no live runtime. It reports `"requested": N` and echoes your list even when it reordered nothing | Re-read `server app rows` |
 | `--help` for any `server app` verb | Often — the help text goes stale while the parser gains verbs | The match arm in `apps/yggterm/src/main.rs` |
 | A `#[serde(default)]` telemetry field reading `0` | The peer predates the field entirely — absent and zero are the same wire value | Ask whether the KEY exists, not its value |
+| A third-party call you *believe* has an effect (`term.open(host)`, a `.focus()`, a `.dispose()`) | The library early-returns on a state you are already in. It does not throw, so the whole repair is a silent no-op and the code around it looks right forever | Assert the EFFECT (`host.childElementCount`, `document.activeElement`), or pin the behaviour in `tools/xterm-harness` |
 
 **The rule underneath all of them:** if the symptom is visual, the proof is a
 faithful pixel. Telemetry that says "healthy" while the user sees a broken screen
@@ -42,6 +43,19 @@ answers a broken probe gives just as readily as a healthy system does. Whenever 
 probe can return one of those, make it carry a term that proves the probe itself
 ran (a `sanity` value, a key-existence check, a known-nonzero control). A probe
 that cannot fail loudly must be made to succeed loudly.
+
+**★ The same rule applies to REPAIRS, not just probes (learned 2026-07-22, at the
+cost of several sessions).** A repair built on a primitive that silently does
+nothing is indistinguishable from a repair that ran and failed to help — so the
+investigation goes looking for a *second* bug that does not exist. `term.open()`
+was the case: it early-returns once `term.element` exists, so `host.innerHTML=""`
++ `term.open(host)` looked like a rebuild and was pure loss. Three sessions of
+husk investigation widened the *guards* around a repair that could never have
+worked. **Before deciding a fix didn't fix it, verify the primitive underneath it
+does what you assume** — and when the primitive belongs to a vendored library,
+prove it in `tools/xterm-harness/` (jsdom + the EXACT shipped bundle, minutes to
+write) instead of arguing from a live symptom. The harness turns
+"upstream probably does X" into a test that fails when a version bump changes X.
 
 ## 2. Profiling recipes that work
 
