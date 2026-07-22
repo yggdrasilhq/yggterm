@@ -2,6 +2,18 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.2
+
+- **Fixed a terminal that could come up blank.** In a rare case a session's
+  viewport painted nothing but its background — no text, no cursor — even though
+  the session was alive and its output was intact underneath. It happened when the
+  terminal's rendering surface got detached from its slot while an empty shell was
+  left in its place, and the usual self-repair could not see the problem, so the
+  blank persisted until you switched away and back. The app now notices when the
+  live surface is missing and re-attaches it automatically, and it grew new
+  health checks so this class of blank can never again be scored "healthy" while
+  you are staring at an empty screen.
+
 ## 2.12.1
 
 - **No more phantom "session finished working" pings.** An idle background agent
