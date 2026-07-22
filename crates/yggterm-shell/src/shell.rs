@@ -77413,7 +77413,69 @@ fn terminal_eval_script_with_canvas_renderer(
                 return null;
             }}
         }};
-        term.open(host);
+        // ⛔ THE HUSK IS BORN HERE. Proven deterministically against the shipped
+        // bundle in tools/xterm-harness/husk_is_born_in_a_partial_open.test.js.
+        //
+        // `Terminal.open` appends the bare `.xterm` root to the host FIRST and the
+        // screen fragment LAST (read the bytes in assets/xterm/xterm.js), so ANY
+        // throw in between leaves a connected, EMPTY root behind — which is the
+        // live signature the autopsy calls unrepairable:
+        //   `orphan_root_without_screen=true xterm_roots=1 screen_in_host=false
+        //    rows_in_host=false screen_canvases=0`
+        // Every DOM-placement guard reads that husk as "a terminal is present"
+        // while the viewport stays blank forever. Unguarded, the same throw also
+        // abandoned the REST of this mount (OSC suppressors, bell, observers).
+        //
+        // It is repairable, and only from here. A partial open never reaches the
+        // assignment of `_coreBrowserService`, so `open()`'s early-return guard
+        // (`this.element && this._coreBrowserService`) does NOT hold and a second
+        // open really does rebuild the surface — but only if the husk root is
+        // removed first. Leave it in place and the retry strands it as an ORPHAN
+        // beside the new root, which is exactly where the orphan roots in the
+        // autopsy come from (18/18 husked hosts had been constructed >= 2x).
+        const terminalSurfaceIsComplete = (root) =>
+            Boolean(root && root.querySelector('.xterm-screen'));
+        const discardHuskTerminalRoots = (targetHost, site) => {{
+            let removed = 0;
+            try {{
+                const roots = targetHost ? targetHost.querySelectorAll('.xterm') : [];
+                for (const root of Array.from(roots)) {{
+                    if (terminalSurfaceIsComplete(root)) {{
+                        continue;
+                    }}
+                    try {{
+                        root.remove();
+                        removed += 1;
+                    }} catch (_error) {{}}
+                }}
+            }} catch (_error) {{}}
+            if (removed) {{
+                window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+                    host_id: hostId,
+                    site: String(site || 'discard_husk_roots'),
+                    removed_husk_roots: removed,
+                }});
+            }}
+            return removed;
+        }};
+        const openTerminalSurfaceAtMount = () => {{
+            try {{
+                term.open(host);
+            }} catch (error) {{
+                return error && error.message ? String(error.message) : String(error);
+            }}
+            return '';
+        }};
+        let mountOpenError = openTerminalSurfaceAtMount();
+        let mountOpenRetried = false;
+        if (!terminalSurfaceIsComplete(term && term.element ? term.element : null)) {{
+            discardHuskTerminalRoots(host, 'mount_partial_open_discard');
+            mountOpenRetried = true;
+            const retryError = openTerminalSurfaceAtMount();
+            if (retryError) {{
+                mountOpenError = retryError;
+            }}
+        }}
         window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
             host_id: hostId,
             site: 'mount_term_open',
@@ -77421,7 +77483,20 @@ fn terminal_eval_script_with_canvas_renderer(
             term_element_inside_after: Boolean(term && term.element && host.contains(term.element)),
             xterm_roots_in_host: Number(host.querySelectorAll('.xterm').length || 0),
             screen_in_host: Boolean(host.querySelector('.xterm-screen')),
+            open_retried: mountOpenRetried,
+            open_error: mountOpenError,
         }});
+        if (mountOpenRetried || mountOpenError) {{
+            // Never silent: a mount that needed the husk repair is the ONLY place
+            // that can tell us how the partial open happened in the field.
+            sendTerminalEvent({{
+                kind: "debug",
+                message: `terminal_mount_open_incomplete host=${{hostId}}`
+                    + ` retried=${{mountOpenRetried}} error=${{mountOpenError || 'none'}}`
+                    + ` screen_in_host=${{Boolean(host.querySelector('.xterm-screen'))}}`
+                    + ` xterm_roots=${{host.querySelectorAll('.xterm').length}}`,
+            }});
+        }}
         const suppressedOsc4Disposable = registerTerminalProtocolResponseSuppressor(4);
         const suppressedOsc10Disposable = registerTerminalProtocolResponseSuppressor(10);
         const suppressedOsc11Disposable = registerTerminalProtocolResponseSuppressor(11);
@@ -78430,8 +78505,19 @@ fn terminal_eval_script_with_canvas_renderer(
         // there is no branch under which "leave the host empty" is correct.
         const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {{
             const existing = term && term.element ? term.element : null;
+            // A HUSK is not a surface. `term.element` can be a bare `.xterm` root
+            // with no screen under it (born in a partial `term.open` — see the
+            // mount above and husk_is_born_in_a_partial_open.test.js), and moving
+            // that back into the host is powerless: the root travels, the screen
+            // does not exist. That is precisely why the live autopsy kept saying
+            // `unrepairable=true` while this owner reported a successful reattach.
+            // Drop it and open again — a partial open leaves the early-return
+            // guard unarmed, so the rebuild really happens. The husk must be
+            // removed BEFORE the open or it is stranded as an orphan beside the
+            // new root.
+            const existingIsHusk = Boolean(existing) && !terminalSurfaceIsComplete(existing);
             let mode = 'none';
-            if (existing) {{
+            if (existing && !existingIsHusk) {{
                 try {{
                     // appendChild MOVES a node that is parented elsewhere, so this
                     // is both the "reattach" and the "steal it back" case.
@@ -78441,17 +78527,44 @@ fn terminal_eval_script_with_canvas_renderer(
                     mode = 'reattach_failed';
                 }}
             }} else if (allowOpen !== false) {{
+                if (existingIsHusk) {{
+                    try {{
+                        existing.remove();
+                    }} catch (_error) {{}}
+                }}
                 try {{
                     term.open(targetHost);
-                    mode = 'opened';
+                    mode = existingIsHusk ? 'rebuilt_from_husk' : 'opened';
                 }} catch (_error) {{
-                    mode = 'open_failed';
+                    mode = existingIsHusk ? 'rebuild_from_husk_failed' : 'open_failed';
+                }}
+                if (
+                    existingIsHusk
+                    && !terminalSurfaceIsComplete(term && term.element ? term.element : null)
+                ) {{
+                    // The rebuild did not take — this terminal got far enough to arm
+                    // the early-return guard, so `open()` was a no-op and only a
+                    // remount can help. Put the husk back so the surface is no worse
+                    // than we found it and the autopsy can still name the root.
+                    mode = 'rebuild_from_husk_failed';
+                    try {{
+                        targetHost.appendChild(existing);
+                    }} catch (_error) {{}}
+                }}
+            }} else if (existing) {{
+                // Opening was forbidden by the caller, so the husk is all we have.
+                try {{
+                    targetHost.appendChild(existing);
+                    mode = 'reattached_husk';
+                }} catch (_error) {{
+                    mode = 'reattach_failed';
                 }}
             }}
             window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
                 host_id: hostId,
                 site: String(site || 'attach_terminal_surface'),
                 mode,
+                existing_is_husk: existingIsHusk,
                 term_element_inside_after: Boolean(term && term.element && targetHost.contains(term.element)),
                 screen_in_host_after: Boolean(targetHost.querySelector('.xterm-screen')),
             }});
@@ -105989,6 +106102,76 @@ mod tests {
             script.matches("term.open(targetHost);").count(),
             1,
             "the never-opened fallback belongs to attachTerminalSurfaceToHost alone"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_rebuilds_a_husk_instead_of_moving_it() {
+        // The husk is born in a PArecordsAL `term.open`: the bundle appends the bare
+        // `.xterm` root to the host first and the screen fragment last, so a throw
+        // in between leaves a connected, empty root that every placement guard
+        // reads as healthy. Proven against the shipped bundle in
+        // tools/xterm-harness/husk_is_born_in_a_partial_open.test.js.
+        //
+        // Two things must stay true or the husk becomes permanent again:
+        //   1. the mount must notice an incomplete open and retry it, and
+        //   2. the surface owner must never MOVE a husk and call that a repair.
+        // Both repairs have to drop the husk root BEFORE opening, or the retry
+        // strands it as an orphan beside the new root.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const terminalSurfaceIsComplete = (root) =>"),
+            "\"is this a real surface or a husk?\" must have exactly one owner"
+        );
+        assert!(
+            script.contains("const existingIsHusk = Boolean(existing) && !terminalSurfaceIsComplete(existing);"),
+            "the surface owner must classify term.element before trusting it"
+        );
+        assert!(
+            script.contains("if (existing && !existingIsHusk) {"),
+            "only a COMPLETE surface may be restored by moving it back"
+        );
+        assert!(
+            script.contains("mode = existingIsHusk ? 'rebuilt_from_husk' : 'opened';"),
+            "a husk must be rebuilt through open(), not reattached"
+        );
+        assert!(
+            script.contains("mode = 'rebuild_from_husk_failed';"),
+            "a rebuild that did not take must be reported, not assumed"
+        );
+        // Ordering: the husk has to leave the DOM before the open that replaces it.
+        let husk_removed = script
+            .find("if (existingIsHusk) {\n                    try {\n                        existing.remove();")
+            .expect("the husk is dropped before the rebuild");
+        let rebuild_open = script
+            .find("term.open(targetHost);")
+            .expect("the rebuild open is present");
+        assert!(
+            husk_removed < rebuild_open,
+            "dropping the husk AFTER the open would strand it as an orphan root"
+        );
+        // The mount half: notice an incomplete open, discard, retry, and say so.
+        for fragment in [
+            "let mountOpenError = openTerminalSurfaceAtMount();",
+            "if (!terminalSurfaceIsComplete(term && term.element ? term.element : null)) {",
+            "discardHuskTerminalRoots(host, 'mount_partial_open_discard');",
+            "terminal_mount_open_incomplete host=",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "the mount must repair a partial open and report it: {fragment}"
+            );
+        }
+        let mount_discard = script
+            .find("discardHuskTerminalRoots(host, 'mount_partial_open_discard');")
+            .expect("mount discard present");
+        let mount_retry = script
+            .find("const retryError = openTerminalSurfaceAtMount();")
+            .expect("mount retry present");
+        assert!(
+            mount_discard < mount_retry,
+            "the mount must discard the husk before retrying the open"
         );
     }
 
