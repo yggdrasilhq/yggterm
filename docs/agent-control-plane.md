@@ -645,14 +645,30 @@ protocol:
     every peer-vs-peer contention stays `profile_busy`), role sourced from the
     envelope in the acquire/release handlers. Unit-tested (14 write-lock tests).
     Inert in production until 4.1b/c wire it.
-  - **4.1b (owed):** the GUI acquires the write-lock around a writable web surface
-    (`shell.rs:~4037`, at `open_web_surface`) and releases on close; on `Busy`
-    (a peer holds it) the surface opens read-only rather than a second writer.
+  - **4.1b ✅ LANDED (main, this session).** The GUI's native web-surface
+    reconciler (`web_surface_native_reconcile_loop` in `shell.rs`) acquires the
+    profile write-lock the first time a profile's persistent surface opens and
+    releases it (end-of-tick) when that profile's last surface is gone — one lock
+    per jar, not per surface, reference-tracked against the reconciler's `applied`
+    set (a merely-*stashed* surface keeps its entry, hence its lock). On `Busy`
+    (a peer holds the lock) the surface opens **read-only** — an ephemeral, no-jar
+    `WebContext` (`profile_dir: None`) — never a second writer. Because an Active
+    GUI preempts a Shadow holder (4.1a), this read-only path only bites
+    Active-vs-Active (a rare second GUI on one profile) and a Shadow writing a
+    profile the user holds. **Role-sourcing fix (SSOT):** the acquire/release
+    client helpers now stamp the calling *process's* slice-4.0 identity
+    (`send_request` → `current_client_identity()`) instead of the 4.2-era hardcoded
+    `Active`, so a shadow view client acquires as `Shadow` (preemptible) and the
+    user's GUI as `Active` (preempts) — the same wire path gate 15 already
+    live-proves. Pure lock-leak guard `web_profile_write_locks_to_release`
+    (+2 unit tests); workspace green. **Owed:** the coordinated daemon+GUI deploy
+    to jojo for live proof (needs 4.1a on jojo's daemon, which predates it), best
+    landed together with 4.1c.
   - **4.1c (owed):** the Shadow's `do` chokepoint checks `ProfileWriteLockReport`
     (already Allow-for-Shadow) before injecting; on loss it refuses `preempted`
     and cancels its batch via the gate-9 arbiter keyed by `client_id`.
-  4.1b/c need a coordinated daemon+GUI deploy to jojo (no protocol bump, so no
-  version fight, but still the deploy rules).
+  4.1c (and 4.1b's live proof) need a coordinated daemon+GUI deploy to jojo (no
+  protocol bump, so no version fight, but still the deploy rules).
 - The transport-independent *core* — client-keyed batches with Active-priority
   preemption — is pure logic that both shapes reuse and is what
   `AgentBatch::client_id` already seats. It is unit-testable with no daemon and no

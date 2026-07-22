@@ -9504,46 +9504,46 @@ fn expect_profile_write_lock(response: ServerResponse) -> Result<ProfileWriteLoc
 }
 
 /// Claim the single-writer lock over a web profile before opening a writable
-/// `WebContext` on it (slice 4.2). `client_id` names this client; the lock is
-/// tied to `pid` so a crash cannot wedge the profile forever.
+/// `WebContext` on it (slice 4.2). The lock is tied to `pid` so a crash cannot
+/// wedge the profile forever.
+///
+/// The holder's identity (client_id + role) is the calling PROCESS's slice-4.0
+/// identity via [`send_request`] — the one owner of client identity, set from
+/// `--client-role`/`--client-id`. This is what makes slice-4.1 Active-priority
+/// preemption work: the user's GUI sends `Active` (preempts a `Shadow` holder),
+/// a shadow view client sends `Shadow` (preemptible, never preempts). Hardcoding
+/// `Active` here — as the 4.2 build did before process identity existed — would
+/// make a shadow un-preemptible, defeating 4.1.
 ///
 /// **Lock ordering: acquire this BEFORE the slice-2b surface lease**, and do
 /// not take the surface lease if this is not `writable`.
 pub fn acquire_profile_write_lock(
     endpoint: &ServerEndpoint,
     profile: Option<&str>,
-    client_id: &str,
     pid: u32,
 ) -> Result<ProfileWriteLockStatus> {
-    expect_profile_write_lock(send_request_as(
+    expect_profile_write_lock(send_request(
         endpoint,
         &ServerRequest::AcquireProfileWriteLock {
             profile: profile.map(str::to_string),
             pid,
         },
-        &ClientIdentity {
-            role: ClientRole::Active,
-            client_id: Some(client_id.to_string()),
-        },
     )?)
 }
 
 /// Release a profile write-lock this client holds, freeing it for the next.
+/// Identity is the calling process's (see [`acquire_profile_write_lock`]), so a
+/// release can only free a lock this same client_id+pid holds.
 pub fn release_profile_write_lock(
     endpoint: &ServerEndpoint,
     profile: Option<&str>,
-    client_id: &str,
     pid: u32,
 ) -> Result<ProfileWriteLockStatus> {
-    expect_profile_write_lock(send_request_as(
+    expect_profile_write_lock(send_request(
         endpoint,
         &ServerRequest::ReleaseProfileWriteLock {
             profile: profile.map(str::to_string),
             pid,
-        },
-        &ClientIdentity {
-            role: ClientRole::Active,
-            client_id: Some(client_id.to_string()),
         },
     )?)
 }
