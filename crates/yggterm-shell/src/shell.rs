@@ -38756,6 +38756,17 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     last_render_health_checked_at_ms: mountedHost ? Number(mountedHost.lastRenderHealthCheckedAtMs || 0) : 0,
                     pending_render_health_recovery: mountedHost ? Boolean(mountedHost.pendingRenderHealthRecovery) : false,
                     render_health_ink_sample: mountedHost && mountedHost.renderHealthInkSample ? mountedHost.renderHealthInkSample : null,
+                    host_attachment_state: mountedHost && mountedHost.hostAttachmentState ? mountedHost.hostAttachmentState : null,
+                    term_element_connected: mountedHost && mountedHost.termElementConnected != null ? Boolean(mountedHost.termElementConnected) : null,
+                    host_contains_term_element: mountedHost && mountedHost.hostContainsTermElement != null ? Boolean(mountedHost.hostContainsTermElement) : null,
+                    term_element_detached_since_ms: mountedHost ? Number(mountedHost.termElementDetachedSinceMs || 0) : 0,
+                    term_element_detached_count: mountedHost ? Number(mountedHost.termElementDetachedCount || 0) : 0,
+                    last_visible_paint_term_element_attached: mountedHost && mountedHost.lastVisiblePaintTermElementAttached != null
+                        ? Boolean(mountedHost.lastVisiblePaintTermElementAttached)
+                        : null,
+                    last_visible_paint_was_husk: mountedHost ? Boolean(mountedHost.lastVisiblePaintWasHusk) : false,
+                    last_host_mutation: mountedHost && mountedHost.lastHostMutation ? mountedHost.lastHostMutation : null,
+                    host_mutation_count: mountedHost ? Number(mountedHost.hostMutationCount || 0) : 0,
                     skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
                     lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                     last_write_queued_at_ms: mountedHost ? Number(mountedHost.lastWriteQueuedAtMs || 0) : 0,
@@ -40450,6 +40461,17 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         last_render_health_checked_at_ms: mountedHost ? Number(mountedHost.lastRenderHealthCheckedAtMs || 0) : 0,
                         pending_render_health_recovery: mountedHost ? Boolean(mountedHost.pendingRenderHealthRecovery) : false,
                         render_health_ink_sample: mountedHost && mountedHost.renderHealthInkSample ? mountedHost.renderHealthInkSample : null,
+                        host_attachment_state: mountedHost && mountedHost.hostAttachmentState ? mountedHost.hostAttachmentState : null,
+                        term_element_connected: mountedHost && mountedHost.termElementConnected != null ? Boolean(mountedHost.termElementConnected) : null,
+                        host_contains_term_element: mountedHost && mountedHost.hostContainsTermElement != null ? Boolean(mountedHost.hostContainsTermElement) : null,
+                        term_element_detached_since_ms: mountedHost ? Number(mountedHost.termElementDetachedSinceMs || 0) : 0,
+                        term_element_detached_count: mountedHost ? Number(mountedHost.termElementDetachedCount || 0) : 0,
+                        last_visible_paint_term_element_attached: mountedHost && mountedHost.lastVisiblePaintTermElementAttached != null
+                            ? Boolean(mountedHost.lastVisiblePaintTermElementAttached)
+                            : null,
+                        last_visible_paint_was_husk: mountedHost ? Boolean(mountedHost.lastVisiblePaintWasHusk) : false,
+                        last_host_mutation: mountedHost && mountedHost.lastHostMutation ? mountedHost.lastHostMutation : null,
+                        host_mutation_count: mountedHost ? Number(mountedHost.hostMutationCount || 0) : 0,
                     skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
                     lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                         retained_write_paint_repair_count: mountedHost ? Number(mountedHost.retainedWritePaintRepairCount || 0) : 0,
@@ -76430,6 +76452,44 @@ fn terminal_eval_script_with_canvas_renderer(
             kind: "debug",
             message: `host_chain host=${{hostId}} ${{elementChainMetrics(host)}}`
         }});
+        // BLANK-VIEWPORT PROVENANCE PROBE (2026-07-22). A live blank viewport was
+        // root-caused to `term.element` sitting DETACHED while an empty husk
+        // (`div.terminal.xterm` holding only `.xterm-viewport`, no `.xterm-screen`)
+        // occupied the host. What could NOT be determined from the trace is WHICH
+        // wipe/open left that husk behind — the mount emits no event between the
+        // reveal-ghost attach and the (empty) first-paint samples. So every host
+        // wipe and every `term.open` now leaves a synchronous breadcrumb with a
+        // real stack; `syncHostAttachmentEntry` correlates the next detach against
+        // it. See docs/xterm-bugs.md#detached-term-element-blank-viewport.
+        window.__yggtermRecordHostMutation = window.__yggtermRecordHostMutation || function (record) {{
+            try {{
+                const log = window.__yggtermHostMutationLog = window.__yggtermHostMutationLog || [];
+                const entry = Object.assign({{ at_ms: Date.now() }}, record || {{}});
+                try {{
+                    entry.stack = String((new Error()).stack || '')
+                        .split('\n').slice(2, 7).join(' | ').slice(0, 600);
+                }} catch (_stackError) {{}}
+                log.push(entry);
+                while (log.length > 64) {{
+                    log.shift();
+                }}
+                const hostEntry = window.__yggtermXtermHosts && record && record.host_id
+                    ? window.__yggtermXtermHosts[record.host_id]
+                    : null;
+                if (hostEntry) {{
+                    hostEntry.lastHostMutation = entry;
+                    hostEntry.hostMutationCount = Number(hostEntry.hostMutationCount || 0) + 1;
+                }}
+                return entry;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
+        window.__yggtermRecordHostMutation({{
+            host_id: hostId,
+            site: 'mount_init_wipe',
+            child_count: Number(host.childElementCount || 0),
+        }});
         host.innerHTML = "";
         // BORING REVEAL ghost, attach half: same synchronous task as the wipe
         // above, so the cleared host never reaches the compositor — the ghost is
@@ -76797,6 +76857,14 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }};
         term.open(host);
+        window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+            host_id: hostId,
+            site: 'mount_term_open',
+            child_count: Number(host.childElementCount || 0),
+            term_element_inside_after: Boolean(term && term.element && host.contains(term.element)),
+            xterm_roots_in_host: Number(host.querySelectorAll('.xterm').length || 0),
+            screen_in_host: Boolean(host.querySelector('.xterm-screen')),
+        }});
         const suppressedOsc4Disposable = registerTerminalProtocolResponseSuppressor(4);
         const suppressedOsc10Disposable = registerTerminalProtocolResponseSuppressor(10);
         const suppressedOsc11Disposable = registerTerminalProtocolResponseSuppressor(11);
@@ -77515,6 +77583,113 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.sessionPath = host.getAttribute("data-terminal-session-path") || "";
             }} catch (_error) {{}}
         }};
+        let termElementDetachedSinceMs = 0;
+        let termElementDetachedCount = 0;
+        let lastTermElementDetachedReportAtMs = 0;
+        // DETACHED-TERM PROBE (2026-07-22). The blank-viewport class that every
+        // existing health field scored "healthy": `term.element` is out of the
+        // host, so nothing can paint, while the xterm OBJECT (buffer, cursor,
+        // text tail, write callbacks) stays perfectly intact and keeps reporting
+        // good news. The DOM is the only witness — so measure the DOM, and also
+        // record WHY the in-place repair declined (the three `rebindCurrentHost`
+        // reopen guards evaluated live), because a husk that matches `.xterm` but
+        // has no `.xterm-screen` makes all three read false.
+        const terminalHostAttachmentState = () => {{
+            const termElement = term && term.element ? term.element : null;
+            const liveHost = document.getElementById(hostId) || host;
+            const hostContainsTermElement = Boolean(termElement && liveHost.contains(termElement));
+            const xtermRoots = Array.from(liveHost.querySelectorAll('.xterm'));
+            const orphanRoots = xtermRoots.filter((root) => root !== termElement);
+            const screenInHost = Boolean(liveHost.querySelector('.xterm-screen'));
+            const rowsInHost = Boolean(liveHost.querySelector('.xterm-rows'));
+            const screenCanvasCount = Number(liveHost.querySelectorAll('.xterm-screen canvas').length || 0);
+            const termElementConnected = Boolean(termElement && termElement.isConnected);
+            const detached = Boolean(termElement) && !hostContainsTermElement;
+            // The exact predicates `rebindCurrentHost` uses to decide a reopen.
+            const guardHostMissingXtermRoot = xtermRoots.length === 0;
+            const guardHostMissingRenderableLayer = Boolean(screenInHost && !rowsInHost && screenCanvasCount === 0);
+            const guardStaleClause = Boolean(!termElementConnected && xtermRoots.length === 0);
+            const repairWouldReopen = guardHostMissingXtermRoot
+                || guardHostMissingRenderableLayer
+                || guardStaleClause;
+            return {{
+                term_element_present: Boolean(termElement),
+                term_element_connected: termElementConnected,
+                host_contains_term_element: hostContainsTermElement,
+                host_connected: Boolean(liveHost && liveHost.isConnected),
+                host_child_count: Number(liveHost.childElementCount || 0),
+                xterm_root_count: xtermRoots.length,
+                orphan_xterm_root_count: orphanRoots.length,
+                screen_in_host: screenInHost,
+                rows_in_host: rowsInHost,
+                screen_canvas_count: screenCanvasCount,
+                detached,
+                // The husk signature: an `.xterm` root the repair guards accept as
+                // proof of a mounted terminal, with no screen/rows/canvas under it.
+                orphan_root_without_screen: Boolean(orphanRoots.length > 0 && !screenInHost),
+                repair_guard_host_missing_xterm_root: guardHostMissingXtermRoot,
+                repair_guard_host_missing_renderable_layer: guardHostMissingRenderableLayer,
+                repair_guard_stale_clause: guardStaleClause,
+                repair_would_reopen: repairWouldReopen,
+                // Detached AND every repair guard declines = permanently blank
+                // until the session is remounted by hand. This is the alarm.
+                unrepairable_detached: Boolean(detached && !repairWouldReopen),
+            }};
+        }};
+        const syncHostAttachmentEntry = (reason) => {{
+            try {{
+                const state = terminalHostAttachmentState();
+                const now = Date.now();
+                if (state.detached) {{
+                    if (!termElementDetachedSinceMs) {{
+                        termElementDetachedSinceMs = now;
+                        termElementDetachedCount += 1;
+                    }}
+                }} else {{
+                    termElementDetachedSinceMs = 0;
+                }}
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (entry) {{
+                    entry.hostAttachmentState = state;
+                    entry.termElementConnected = state.term_element_connected;
+                    entry.hostContainsTermElement = state.host_contains_term_element;
+                    entry.termElementDetachedSinceMs = termElementDetachedSinceMs;
+                    entry.termElementDetachedCount = termElementDetachedCount;
+                }}
+                // Report each detach episode once, then at most every 30s while it
+                // persists — enough for the trace to show duration without flooding.
+                if (state.detached
+                    && (now - lastTermElementDetachedReportAtMs > 30000
+                        || lastTermElementDetachedReportAtMs === 0)) {{
+                    lastTermElementDetachedReportAtMs = now;
+                    const lastMutation = window.__yggtermHostMutationLog
+                        && window.__yggtermHostMutationLog.length
+                        ? window.__yggtermHostMutationLog[window.__yggtermHostMutationLog.length - 1]
+                        : null;
+                    sendTerminalEvent({{
+                        kind: "debug",
+                        message: `terminal_host_element_detached host=${{hostId}} reason=${{String(reason || '')}}`
+                            + ` detached_ms=${{Math.max(0, now - termElementDetachedSinceMs)}}`
+                            + ` episode=${{termElementDetachedCount}}`
+                            + ` unrepairable=${{state.unrepairable_detached}}`
+                            + ` orphan_root_without_screen=${{state.orphan_root_without_screen}}`
+                            + ` xterm_roots=${{state.xterm_root_count}}`
+                            + ` screen_in_host=${{state.screen_in_host}}`
+                            + ` rows_in_host=${{state.rows_in_host}}`
+                            + ` screen_canvases=${{state.screen_canvas_count}}`
+                            + ` repair_would_reopen=${{state.repair_would_reopen}}`
+                            + ` last_mutation_site=${{lastMutation ? String(lastMutation.site || '') : 'none'}}`
+                            + ` last_mutation_age_ms=${{lastMutation ? Math.max(0, now - Number(lastMutation.at_ms || now)) : -1}}`
+                            + ` last_mutation_stack=${{lastMutation ? String(lastMutation.stack || '') : ''}}`
+                    }});
+                }}
+                return state;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
         const terminalRendererSurfaceState = () => {{
             const screen = host.querySelector('.xterm-screen');
             const rowsLayer = host.querySelector('.xterm-rows');
@@ -77663,6 +77838,13 @@ fn terminal_eval_script_with_canvas_renderer(
                     }}
                 }} catch (_error) {{}}
                 host = liveHost;
+                window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+                    host_id: hostId,
+                    site: 'rebind_host_wipe',
+                    reason: String(reason || ''),
+                    child_count: Number(host.childElementCount || 0),
+                    term_element_was_inside: Boolean(termElement && host.contains(termElement)),
+                }});
                 host.innerHTML = "";
                 applyHostSurfaceContract();
                 host.style.cursor = inputEnabled ? 'text' : 'default';
@@ -79896,9 +80078,21 @@ fn terminal_eval_script_with_canvas_renderer(
                 || Boolean(rowsLayer);
             normalizeLowContrastGlyphs();
             applySoftwareCanvasLayerOptimization('paint');
+            // `visible` above is satisfied by ANY child in the host — including an
+            // empty `.xterm` husk left behind by a detached term. It reported
+            // `true` 43 times over a viewport that never painted a glyph. Record
+            // the truthful companion rather than changing this gate's semantics:
+            // `ensureVisibleHost` short-circuits on `visible`, so flipping it is a
+            // behavioural fix that belongs with the repair work, not the probe.
+            const paintAttachment = syncHostAttachmentEntry('emit_paint');
+            const paintedElementAttached = paintAttachment
+                ? Boolean(paintAttachment.host_contains_term_element)
+                : null;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].paintCount = paintCount + 1;
                 window.__yggtermXtermHosts[hostId].lastVisiblePaint = visible;
+                window.__yggtermXtermHosts[hostId].lastVisiblePaintTermElementAttached = paintedElementAttached;
+                window.__yggtermXtermHosts[hostId].lastVisiblePaintWasHusk = Boolean(visible && paintedElementAttached === false);
             }}
             const nextPaintKey = JSON.stringify([
                 host.childElementCount,
@@ -80948,13 +81142,25 @@ fn terminal_eval_script_with_canvas_renderer(
                     reason: 'frame_like_hot',
                 }}
                 : sampleCanvasInk();
+            // ZERO-SAMPLE HONESTY (2026-07-22): `sampled_pixels === 0` means the ink
+            // probe found nothing to measure, NOT that the surface is fine. A blank
+            // viewport once scored `healthy` off an all-zero sample for 16 minutes.
+            // Mark it so no reader (agent or human) can mistake "could not sample"
+            // for "sampled and it was good".
+            if (!skipInkSample && ink && Number(ink.canvas_count || 0) === 0 && Number(ink.sampled_pixels || 0) === 0) {{
+                ink.unsampleable = true;
+            }}
+            const attachment = syncHostAttachmentEntry(`render_health:${{String(reason || '')}}`);
+            // A detached `term.element` cannot paint by construction — no ink probe,
+            // buffer read, or cursor field can see it, so it must be its own verdict.
+            const unhealthyDetachedTermElement = Boolean(attachment && attachment.detached && hasBufferText);
             const unhealthyDomRenderer = hasBufferText && rendererLayerMissing;
             const unhealthyCanvas = !skipInkSample
                 && hasBufferText
                 && ink.canvas_count > 0
                 && ink.sampled_pixels > 0
                 && (ink.nontransparent_pixels === 0 || ink.alpha_sum <= 12);
-            const unhealthy = unhealthyDomRenderer || unhealthyCanvas;
+            const unhealthy = unhealthyDetachedTermElement || unhealthyDomRenderer || unhealthyCanvas;
             // Background hosts sample blank legitimately (a hidden WebGL canvas
             // holds no ink), so a recovery redraw can never turn them healthy —
             // firing it anyway formed an endless ~6s heavy-repaint loop per
@@ -80969,13 +81175,17 @@ fn terminal_eval_script_with_canvas_renderer(
                     && String(host.getAttribute('data-terminal-session-path') || '')
                         === String(window.__yggtermActiveTerminalSessionPath || ''));
             renderHealthStatus = unhealthy ? 'unhealthy' : 'healthy';
-            renderHealthReason = unhealthyDomRenderer
-                ? 'dom_renderer_missing_text_layer_with_buffer_text'
-                : (unhealthyCanvas
-                    ? (hostIsActive
-                        ? 'canvas_blank_with_buffer_text'
-                        : 'canvas_blank_with_buffer_text_background')
-                    : '');
+            renderHealthReason = unhealthyDetachedTermElement
+                ? (attachment && attachment.unrepairable_detached
+                    ? 'term_element_detached_from_host_unrepairable'
+                    : 'term_element_detached_from_host')
+                : (unhealthyDomRenderer
+                    ? 'dom_renderer_missing_text_layer_with_buffer_text'
+                    : (unhealthyCanvas
+                        ? (hostIsActive
+                            ? 'canvas_blank_with_buffer_text'
+                            : 'canvas_blank_with_buffer_text_background')
+                        : ''));
             // Partial-blank / glyph-drop scan: only worth running when the
             // aggregate sample looks healthy (a fully blank canvas is already
             // handled above) and only for the active host (background WebGL
@@ -81523,9 +81733,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 kind: "debug",
                 message: `rebuild_blank_host host=${{hostId}} reason=${{reason}} attempts=${{rebuildAttempts}}`
             }});
+            window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+                host_id: hostId,
+                site: 'rebuild_blank_host_wipe',
+                reason: String(reason || ''),
+                child_count: Number(host.childElementCount || 0),
+                term_element_was_inside: Boolean(term && term.element && host.contains(term.element)),
+            }});
             host.innerHTML = "";
             try {{
                 term.open(host);
+                window.__yggtermRecordHostMutation && window.__yggtermRecordHostMutation({{
+                    host_id: hostId,
+                    site: 'rebuild_blank_host_term_open',
+                    reason: String(reason || ''),
+                    term_element_inside_after: Boolean(term && term.element && host.contains(term.element)),
+                }});
             }} catch (_error) {{}}
             requestVisiblePaint();
         }};
@@ -83188,6 +83411,15 @@ fn terminal_eval_script_with_canvas_renderer(
             lastRenderHealthCheckedAtMs,
             pendingRenderHealthRecovery: false,
             renderHealthInkSample: null,
+            hostAttachmentState: null,
+            termElementConnected: null,
+            hostContainsTermElement: null,
+            termElementDetachedSinceMs: 0,
+            termElementDetachedCount: 0,
+            lastVisiblePaintTermElementAttached: null,
+            lastVisiblePaintWasHusk: false,
+            lastHostMutation: null,
+            hostMutationCount: 0,
             lowPowerTuiActive: false,
             lowPowerTuiFrameCount: 0,
             lastLowPowerTuiText: '',
@@ -99680,6 +99912,86 @@ mod tests {
     // (pointer-events none), self-releasing (settle timeout + first keystroke),
     // gated on a previously-painted SAME-hostId entry (cold mounts never ghost),
     // and kill-switchable.
+    #[test]
+    fn terminal_eval_script_probes_detached_term_element() {
+        // Regression guard for the blank-viewport class root-caused 2026-07-22:
+        // `term.element` detached from its host while every buffer-derived health
+        // field kept reporting healthy. See
+        // docs/xterm-bugs.md#detached-term-element-blank-viewport.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+
+        assert!(
+            script.contains("const terminalHostAttachmentState = () => {"),
+            "the DOM is the only witness to a detached term element"
+        );
+        assert!(
+            script.contains("unrepairable_detached:"),
+            "detached AND every repair guard declining is the alarm condition"
+        );
+        assert!(
+            script.contains("orphan_root_without_screen:"),
+            "the husk signature (.xterm root with no .xterm-screen) is what defeats the repair guards"
+        );
+        for guard in [
+            "repair_guard_host_missing_xterm_root:",
+            "repair_guard_host_missing_renderable_layer:",
+            "repair_guard_stale_clause:",
+            "repair_would_reopen:",
+        ] {
+            assert!(
+                script.contains(guard),
+                "telemetry must record WHY the in-place repair declined: {guard}"
+            );
+        }
+        assert!(
+            script.contains("terminal_host_element_detached host="),
+            "a detach episode must reach the event trace"
+        );
+        assert!(
+            script.contains("ink.unsampleable = true;"),
+            "sampled_pixels == 0 means 'could not sample', never 'sampled and healthy'"
+        );
+        assert!(
+            script.contains("const unhealthyDetachedTermElement ="),
+            "a detached element cannot paint, so it must be its own unhealthy verdict"
+        );
+        assert!(
+            script.contains("'term_element_detached_from_host_unrepairable'"),
+            "the unrepairable case needs its own reason string"
+        );
+        assert!(
+            script.contains("lastVisiblePaintWasHusk"),
+            "emitPaint's `visible` is satisfied by a husk; record the truthful companion"
+        );
+
+        // Provenance breadcrumbs: which wipe/open left the husk behind could NOT be
+        // determined from the trace, so every mutation site records a stack.
+        assert!(script.contains("window.__yggtermRecordHostMutation = window.__yggtermRecordHostMutation ||"));
+        for site in [
+            "site: 'mount_init_wipe'",
+            "site: 'rebind_host_wipe'",
+            "site: 'rebuild_blank_host_wipe'",
+            "site: 'rebuild_blank_host_term_open'",
+            "site: 'mount_term_open'",
+        ] {
+            assert!(
+                script.contains(site),
+                "every host wipe/open must leave a breadcrumb: {site}"
+            );
+        }
+        let record_ix = script
+            .find("window.__yggtermRecordHostMutation = window.__yggtermRecordHostMutation ||")
+            .expect("recorder defined");
+        let first_wipe_ix = script
+            .find("host.innerHTML = \"\";")
+            .expect("host wipe present");
+        assert!(
+            record_ix < first_wipe_ix,
+            "the recorder must be defined before the first wipe can call it"
+        );
+    }
+
     #[test]
     fn terminal_eval_script_reveal_ghost_covers_rebuild_churn() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
