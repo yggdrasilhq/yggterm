@@ -78154,6 +78154,12 @@ fn terminal_eval_script_with_canvas_renderer(
         let paintRateWindowCount = 0;
         let repaintStormSinceMs = 0;
         let lastRepaintStormReportAtMs = 0;
+        // Reopen circuit breaker (see rebindCurrentHost): a repair that never
+        // converges must be bounded, or it retries at PAINT RATE and takes the
+        // whole GUI down with it.
+        let sameHostReopenBurstCount = 0;
+        let sameHostReopenBurstStartMs = 0;
+        let sameHostReopenCooldownUntilMs = 0;
         // DETACHED-TERM PROBE (2026-07-22). The blank-viewport class that every
         // existing health field scored "healthy": `term.element` is out of the
         // host, so nothing can paint, while the xterm OBJECT (buffer, cursor,
@@ -78416,7 +78422,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 // on it. A future autopsy should be able to read "the element was
                 // outside, and we correctly did nothing because the host was parked".
                 const termElementOutsideHost = Boolean(termElement && !liveHost.contains(termElement));
-                const sameHostNeedsReopen =
+                const sameHostRepairWanted =
                     Boolean(
                         reopen
                         && sameHost
@@ -78428,6 +78434,65 @@ fn terminal_eval_script_with_canvas_renderer(
                             || (termElementDisconnected && !liveHost.querySelector('.xterm'))
                         )
                     );
+                // ⛔ CIRCUIT BREAKER (2026-07-22, user-reported). A repair that does
+                // not converge must not retry forever. On a genuinely poisoned host
+                // (`orphan_root_without_screen` — an `.xterm` root with no
+                // `.xterm-screen`, no rows, no canvases; the code already calls this
+                // `unrepairable=true`) the reopen "succeeds" and changes nothing, so
+                // the next emit_paint asks again: measured 5958 rebind_host events in
+                // 30 minutes, `reason=emit_paint reopened=true` at paint rate.
+                //
+                // Three symptoms, ONE cause — all three are this loop:
+                //   1. the viewport blinks (~2/s) as the host is wiped and rebuilt;
+                //   2. focus never settles on the xterm helper textarea, so the
+                //      session REFUSES KEYBOARD INPUT;
+                //   3. **the whole GUI goes unresponsive** — every attempt also
+                //      `dioxus.send`s a debug event, and that is the SAME channel the
+                //      web-surface geometry/cover eval uses. That eval is a
+                //      documented "starvable oracle (seconds, under output flood)"
+                //      and it is the INPUT-REGION authority, so starving it leaves a
+                //      stale GTK input region: clicks land nowhere and the session
+                //      appears to sit above everything else.
+                //
+                // So: allow a short burst of genuine repair attempts, then open the
+                // circuit and let the surface stay visibly broken (recoverable by a
+                // session switch) rather than melt the GUI trying to fix it.
+                const REOPEN_BURST_LIMIT = 3;
+                const REOPEN_BURST_WINDOW_MS = 2000;
+                const REOPEN_COOLDOWN_MS = 5000;
+                let sameHostNeedsReopen = sameHostRepairWanted;
+                let reopenCircuitOpen = false;
+                if (sameHostRepairWanted) {{
+                    const breakerNowMs = Date.now();
+                    if (breakerNowMs < sameHostReopenCooldownUntilMs) {{
+                        sameHostNeedsReopen = false;
+                        reopenCircuitOpen = true;
+                    }} else {{
+                        if (breakerNowMs - sameHostReopenBurstStartMs > REOPEN_BURST_WINDOW_MS) {{
+                            sameHostReopenBurstStartMs = breakerNowMs;
+                            sameHostReopenBurstCount = 0;
+                        }}
+                        sameHostReopenBurstCount += 1;
+                        if (sameHostReopenBurstCount > REOPEN_BURST_LIMIT) {{
+                            sameHostReopenCooldownUntilMs = breakerNowMs + REOPEN_COOLDOWN_MS;
+                            sameHostNeedsReopen = false;
+                            reopenCircuitOpen = true;
+                            // ONE event per cooldown, not one per paint.
+                            sendTerminalEvent({{
+                                kind: "debug",
+                                message: `terminal_host_reopen_circuit_open host=${{hostId}} reason=${{reason}}`
+                                    + ` attempts=${{sameHostReopenBurstCount}} cooldown_ms=${{REOPEN_COOLDOWN_MS}}`
+                                    + ` missing_root=${{hostMissingXtermRoot}} missing_layer=${{hostMissingRenderableLayer}}`
+                                    + ` term_outside=${{termElementOutsideHost}} term_disconnected=${{termElementDisconnected}}`,
+                            }});
+                        }}
+                    }}
+                }} else {{
+                    // The condition cleared on its own — the repair converged (or was
+                    // never needed). Forget the burst so a later genuine fault still
+                    // gets its full allowance.
+                    sameHostReopenBurstCount = 0;
+                }}
                 if (sameHost && !sameHostNeedsReopen) {{
                     repairMissingRendererSurface(reason);
                     return host;
@@ -78478,7 +78543,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 repairMissingRendererSurface(reason);
                 sendTerminalEvent({{
                     kind: "debug",
-                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_connected=${{hostConnected}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
+                    message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} term_outside_host=${{termElementOutsideHost}} host_connected=${{hostConnected}} circuit_open=${{reopenCircuitOpen}} host_missing_root=${{hostMissingXtermRoot}} host_missing_renderable_layer=${{hostMissingRenderableLayer}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
                 }});
             }} catch (_error) {{}}
             return host;
@@ -100667,6 +100732,28 @@ mod tests {
             script.contains("host_connected=${hostConnected}"),
             "the autopsy needs to see WHY an outside-host observation was declined"
         );
+        // The circuit breaker. On a genuinely poisoned host the reopen "succeeds"
+        // and changes nothing, so the next emit_paint asks again — 5958 rebind_host
+        // events in 30 minutes, at paint rate. That loop blinks the viewport, stops
+        // focus settling (no typing), AND floods the same dioxus.send channel the
+        // web-surface geometry/cover eval needs — and that eval is the INPUT-REGION
+        // authority, so starving it froze the WHOLE GUI.
+        assert!(
+            script.contains("const REOPEN_BURST_LIMIT ="),
+            "a repair that never converges must be bounded, not retried at paint rate"
+        );
+        assert!(
+            script.contains("sameHostReopenCooldownUntilMs = breakerNowMs + REOPEN_COOLDOWN_MS"),
+            "exceeding the burst must open the circuit for a cooldown"
+        );
+        assert!(
+            script.contains("terminal_host_reopen_circuit_open host="),
+            "the give-up must be visible in telemetry, ONCE per cooldown not per paint"
+        );
+        assert!(
+            script.contains("sameHostReopenBurstCount = 0;"),
+            "a converged repair must reset the allowance for a later genuine fault"
+        );
         // REPAINT-STORM PROBE (2026-07-22): the ~50Hz garbled-blink pathology is
         // invisible to paint-count health; the paint-RATE probe must ship so
         // telemetry catches a churning viewport instead of scoring it "healthy".
@@ -104003,9 +104090,17 @@ mod tests {
             script.contains("const termElementHost = termElement && termElement.closest"),
             "rebind helper should resolve the detached xterm element owner host"
         );
+        // The decision is now two-stage: the raw condition (`sameHostRepairWanted`)
+        // and the post-circuit-breaker verdict (`sameHostNeedsReopen`). Both must
+        // exist — the condition is what detects the fault, the verdict is what
+        // bounds the retry.
         assert!(
-            script.contains("const sameHostNeedsReopen ="),
+            script.contains("const sameHostRepairWanted ="),
             "rebind helper should reopen the same host when the xterm DOM detached"
+        );
+        assert!(
+            script.contains("let sameHostNeedsReopen = sameHostRepairWanted;"),
+            "the reopen verdict must derive from the condition, through the breaker"
         );
         assert!(
             script.contains("|| (termElementDisconnected && !liveHost.querySelector('.xterm'))"),
@@ -132945,3 +133040,4 @@ Updated at   Branch  Conversation\n\
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
 }
+
