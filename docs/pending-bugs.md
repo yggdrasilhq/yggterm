@@ -82,17 +82,42 @@ fix) once the fix is verified live on jojo.
   emits `terminal_mount_open_incomplete`; `attachTerminalSurfaceToHost` refuses
   to MOVE a husk and rebuilds it instead. Guarded by
   `terminal_eval_script_rebuilds_a_husk_instead_of_moving_it`.
-  **⚠ THERE ARE TWO HUSK SPECIES — the second is still open.** Species A
-  (partial open, guard unarmed) is repaired by the above. Species B is a
-  terminal that opened **completely** and lost its screen subtree afterwards:
-  its guard IS armed, so `open()` early-returns and the rebuild cannot take. The
-  new code detects this, reports `mode=rebuild_from_husk_failed`, and puts the
-  husk back so the surface is no worse than it was found. **Species B was
-  observed live within minutes of the fix deploying** (during the documented
-  post-deploy re-attach window; a subsequent remount cleared it and the visible
-  surface stayed healthy). **Next probe:** who removes `.xterm-screen` from an
-  already-opened terminal — `host.innerHTML=""` cannot, since removing a node
-  does not empty it. Only a remount helps species B today.
+  **✅ "SPECIES B" IS FIXED TOO (2026-07-22) — and it was never a second
+  species.** It was written up here as *"a terminal that opened completely and
+  lost its screen subtree afterwards"*, with the open question *"who removes
+  `.xterm-screen` from an already-opened terminal?"* **Nobody does. There was
+  never a completely-opened terminal.** `_coreBrowserService` — the second half
+  of `open()`'s early-return guard — is assigned in the **middle** of `open()`,
+  six services before `element.appendChild(fragment)` finally puts the screen
+  into the root. So the husk's birth window is not one window but two, split by
+  that single assignment:
+
+  | throw lands | root in host | guard | screen | |
+  |---|---|---|---|---|
+  | before `_coreBrowserService` | yes | unarmed | no | species A — `open()` rebuilds it |
+  | **after** `_coreBrowserService` | yes | **armed** | no | "species B" — `open()` is a no-op |
+
+  Same birth site, same mount, same millisecond; only the throw's position
+  differs. Measured element-by-element, first in jsdom against the shipped
+  bundle (`tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js`)
+  and then **in the live WebKit engine on jojo**, where the band is real and the
+  husk's DOM signature is identical to species A's.
+  **The fix follows from that:** the armed guard is *stale*, not authoritative —
+  it guards a terminal that never finished opening. So when the rebuild does not
+  take, the surface owner clears `term._core.element`, which disarms the guard,
+  and re-opens; `open()` then runs its whole body and builds a real surface.
+  Proven live in real WebKit: husk (no screen) → plain `open()` → still no
+  screen → disarm → screen present, `.xterm-rows` in the host, and
+  `term.write()` read back verbatim from the buffer. New mode
+  `rebuilt_from_husk_disarmed` distinguishes it in the mutation log.
+  ⚠ The private `_core` shape is **feature-detected**: an xterm bump that moves
+  it degrades to the old put-the-husk-back behaviour (`rebuild_from_husk_failed`,
+  remount required) rather than half-repairing silently.
+  ⚠ **`term.element` on the public `Terminal` is a delegating getter** — reading
+  or assigning `term._coreBrowserService` / `term.element` on the wrapper
+  silently does nothing. An earlier draft of the harness probed the wrapper and
+  concluded "the guard never arms", which was the instrument lying, not xterm.
+  Probe `term._core`.
 
 - **★ A GUI RESTART CAN LEAVE APP CONTROL PERMANENTLY UNREACHABLE — the client
   instance record vanishes after a SUCCESSFUL register (jojo, 2026-07-22).**

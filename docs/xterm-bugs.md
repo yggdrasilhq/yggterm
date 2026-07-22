@@ -50,7 +50,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
-| [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PARTIAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B OPEN — a fully-opened terminal that later loses its screen has an armed early-return guard, so only a remount helps (reported as `rebuild_from_husk_failed`) |
+| [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PARTIAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
 
 ---
@@ -1690,10 +1690,33 @@ Proven deterministically against the shipped bundle, not inferred:
    needing two live closures for one `hostId`.
    **Fixed** by `terminalSurfaceIsComplete` + a mount retry that discards the
    husk first, and by `attachTerminalSurfaceToHost` rebuilding rather than moving
-   a husk. **Species B remains open:** a terminal that opened completely and lost
-   its screen afterwards has an armed guard, so `open()` is a no-op and only a
-   remount helps; the code now reports that honestly as
-   `mode=rebuild_from_husk_failed` instead of claiming a repair.
+   a husk.
+   **✅ "Species B" is fixed too, and it was never a second species.** It was
+   described as *a terminal that opened completely and lost its screen
+   afterwards*, and the open question was *who removes `.xterm-screen` from an
+   already-opened terminal?* **Nobody. There was no completely-opened terminal.**
+   `_coreBrowserService` is assigned in the MIDDLE of `open()` — six services
+   before `element.appendChild(fragment)` delivers the screen — so the birth
+   window is split in two by that one statement: a throw before it leaves the
+   guard unarmed (species A, rebuildable), a throw after it leaves the guard
+   ARMED over a terminal with no screen ("species B"). Same birth site, same
+   mount, same millisecond. Measured element-by-element in
+   `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and
+   re-measured in the live WebKit engine, where the band is real and the DOM
+   signature is identical to species A's.
+   Because the armed guard is **stale rather than authoritative**, the surface
+   owner now clears `term._core.element` when a rebuild does not take — that
+   disarms the guard, and the following `open()` runs its whole body and builds a
+   real surface. Live proof in real WebKit: husk (no screen) → plain `open()` →
+   still no screen → disarm → screen present, `.xterm-rows` in the host, and
+   `term.write()` read back verbatim. Reported as `rebuilt_from_husk_disarmed`;
+   the private `_core` shape is feature-detected so an xterm bump degrades to the
+   old `rebuild_from_husk_failed` (remount required) instead of half-repairing.
+   ⚠ **`term.element` on the public `Terminal` is a delegating getter to
+   `_core.element`** — reading or assigning `term._coreBrowserService` /
+   `term.element` on the wrapper silently does nothing. An earlier harness draft
+   probed the wrapper and concluded "the guard never arms": the instrument lying,
+   not xterm. Probe `term._core`.
 2. **~~Was the reveal ghost involved?~~ NO — falsified 2026-07-22.** The
    `reveal_ghost_attached` ≫ `reveal_ghost_released` gap looked damning (27 vs 9
    in one generation) but is an accounting artefact: `releaseRevealGhost` is
