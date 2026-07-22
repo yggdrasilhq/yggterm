@@ -158,6 +158,19 @@ static REMOTE_YGGTERM_COMMAND_RESOLVE_LOCKS: OnceLock<
 > = OnceLock::new();
 static LOCAL_BUILD_ID_MEMO: OnceLock<Mutex<Option<LocalBuildIdMemo>>> = OnceLock::new();
 
+/// PROBE (2026-07-22, user-requested): total remote-yggterm command retries after
+/// a cache reset. A wedged remote target (the "cache reset" retry loop that left a
+/// session's viewport unable to reconnect) shows up as this counter CLIMBING fast
+/// — surfaced in `ServerRuntimeStatus` so telemetry catches the spin next time
+/// instead of only leaving scattered per-attempt errors in the trace.
+static REMOTE_YGGTERM_RETRY_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the running total of remote-yggterm command retries (see the static).
+pub fn remote_yggterm_retry_total() -> u64 {
+    REMOTE_YGGTERM_RETRY_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalBuildIdMemo {
     path: std::path::PathBuf,
@@ -12174,6 +12187,9 @@ fn run_remote_yggterm_command(
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.remove(&cache_key);
             }
+            // PROBE: count the retry. A single reset is normal; this counter
+            // CLIMBING fast is the wedged-target spin (surfaced in status).
+            REMOTE_YGGTERM_RETRY_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let retried = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
             run_remote_binary_command(ssh_target, exec_prefix, &retried.0, args, stdin_bytes)
                 .with_context(|| {
