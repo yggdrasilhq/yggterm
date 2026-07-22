@@ -30338,6 +30338,16 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
             // Descending into Settings OPENS the panel (never toggles it shut), so
             // the theme options are on screen to badge (spec §4).
             state.with_mut(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
+            // ...and focuses the head of its Tab chain, exactly as the Run arm in
+            // `execute_shell_command` does. `settings.toggle` DESCENDS (registry
+            // `descends_into: Some("settings")`), so ALT,G — the primary keyboard
+            // route — lands HERE and never in that arm: fixing only the Run arm
+            // would have left the real chord unfixed while the probe passed. Same
+            // two-dispatch-arm shape as the yedit declare/ping trap.
+            // Safe during a chord: the walker is a WINDOW-level keydown listener
+            // that claims chord keys "at any focus" and preventDefaults them while
+            // the overlay is open, so ALT,G,L still reaches the theme node.
+            focus_settings_field(state, SETTINGS_FIRST_FIELD_KEY);
         }
         // ALT,E — the row menu, on the "here" row. The menu is a positioned
         // surface, so it opens where a right-click on that row would have put it.
