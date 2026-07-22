@@ -30193,10 +30193,25 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             shell.clear_alt_overlay();
             shell.toggle_notifications_panel();
         }),
-        ShellCommand::ToggleSettings => state.with_mut(|shell| {
-            shell.clear_alt_overlay();
-            shell.toggle_settings_panel();
-        }),
+        ShellCommand::ToggleSettings => {
+            // Opening Settings from the keyboard (ALT,G) also moves focus into the
+            // panel, exactly as ToggleSidebar above focuses a row (§8). The panel's
+            // blanket `data-keytip-exempt="settings-panel"` is justified by calling
+            // it "a Tab-navigable configuration surface" — and its 25 controls ARE
+            // natively focusable with nothing intercepting Tab, but measuring it
+            // live on 2026-07-22 showed `activeElement` stuck on <body> with the
+            // panel open, so the Tab chain never began inside the panel and the
+            // user still had to reach for the mouse. Focusing the head of the chain
+            // is what makes that justification true.
+            let opened = state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.toggle_settings_panel();
+                shell.displayed_right_panel_mode() == RightPanelMode::Settings
+            });
+            if opened {
+                focus_settings_field(state, SETTINGS_FIRST_FIELD_KEY);
+            }
+        }
         ShellCommand::ToggleMetadata => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_metadata_panel();
@@ -76243,6 +76258,11 @@ fn reclaim_active_terminal_input_after_search_blur(mut state: Signal<ShellState>
         "#,
     ));
 }
+/// The first control in the Settings panel, and therefore the head of its native
+/// Tab chain — the focus target when the panel is opened from the keyboard.
+/// One owner: the renderer stamps this same constant as the row's
+/// `data-settings-field-key`, so the focus target cannot drift from the DOM.
+const SETTINGS_FIRST_FIELD_KEY: &str = "auto-hide-titlebar";
 fn focus_settings_field(mut state: Signal<ShellState>, field_key: &str) {
     let active_session_path = {
         let mut shell = state.write();
@@ -94221,7 +94241,7 @@ fn ChromeBehaviorSettingsSection(
             div {
                 style: settings_section_card_style(palette),
                 InlineSettingsToggleRow {
-                    field_key: "auto-hide-titlebar".to_string(),
+                    field_key: SETTINGS_FIRST_FIELD_KEY.to_string(),
                     label: "Auto-hide Titlebar".to_string(),
                     description: "Collapse the chrome to a top-edge hover strip and pin it while search or titlebar menus are active.".to_string(),
                     enabled: auto_hide_titlebar,
@@ -101273,6 +101293,19 @@ mod tests {
         assert!(script.contains("active.blur();"));
     }
 
+    #[test]
+    fn settings_keyboard_open_focus_target_is_the_head_of_the_panel_tab_chain() {
+        // The settings panel's blanket `data-keytip-exempt` is justified by calling
+        // it Tab-navigable, which only holds if opening it from the keyboard lands
+        // focus on the first control. One owner: the renderer stamps this same
+        // constant as that row's `data-settings-field-key`, and the focus script
+        // queries that attribute — so the focus target cannot drift from the DOM.
+        let script = focus_settings_field_by_key_script(SETTINGS_FIRST_FIELD_KEY);
+        assert!(
+            script.contains("document.querySelector('[data-settings-field-key=\"auto-hide-titlebar\"]')"),
+            "the keyboard-open focus script must target the panel's first control"
+        );
+    }
     #[test]
     fn settings_focus_script_claims_ui_focus_and_blurs_helper_before_refocus() {
         let script = focus_settings_field_by_key_script("interface-llm");
