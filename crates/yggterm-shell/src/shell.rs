@@ -78542,14 +78542,58 @@ fn terminal_eval_script_with_canvas_renderer(
                     existingIsHusk
                     && !terminalSurfaceIsComplete(term && term.element ? term.element : null)
                 ) {{
-                    // The rebuild did not take — this terminal got far enough to arm
-                    // the early-return guard, so `open()` was a no-op and only a
-                    // remount can help. Put the husk back so the surface is no worse
-                    // than we found it and the autopsy can still name the root.
-                    mode = 'rebuild_from_husk_failed';
-                    try {{
-                        targetHost.appendChild(existing);
-                    }} catch (_error) {{}}
+                    // The rebuild did not take: this terminal got far enough to arm
+                    // `open()`'s early-return guard
+                    //
+                    //     if (this.element?.ownerDocument.defaultView
+                    //         && this._coreBrowserService) return
+                    //
+                    // so the open above was a no-op. This used to be written up as a
+                    // second species — "a terminal that opened COMPLETELY and then
+                    // lost its screen" — and left for a remount. It is NOT that.
+                    // `_coreBrowserService` is assigned in the MIDDLE of open(), six
+                    // services before `element.appendChild(fragment)` puts the screen
+                    // in the root, so a throw in that band arms the guard over a
+                    // terminal that never finished opening. Same birth site as the
+                    // husk we already fix, two statements later. Measured element by
+                    // element in husk_species_b_is_a_late_partial_open.test.js.
+                    //
+                    // So the guard is stale, not authoritative, and clearing
+                    // `element` disarms it — open() then runs its whole body and
+                    // builds a real, writable surface. `element` is the terminal's
+                    // own first assignment inside open(), so nothing is destroyed
+                    // that open() would not overwrite anyway.
+                    //
+                    // The core holds that field, not the public wrapper (whose
+                    // `element` is a delegating getter — assigning it silently does
+                    // nothing). Feature-detect rather than assume: an xterm bump that
+                    // moves this shape must degrade to the old put-the-husk-back
+                    // behaviour, never to a silent half-repair.
+                    const disarmTarget = term && term._core && term._core.element
+                        ? term._core
+                        : null;
+                    if (disarmTarget) {{
+                        try {{
+                            disarmTarget.element = undefined;
+                            term.open(targetHost);
+                        }} catch (_error) {{}}
+                    }}
+                    if (terminalSurfaceIsComplete(term && term.element ? term.element : null)) {{
+                        mode = 'rebuilt_from_husk_disarmed';
+                        // The husk was already removed above; drop it for good so it
+                        // cannot linger as an orphan root beside the new surface.
+                        try {{
+                            existing.remove();
+                        }} catch (_error) {{}}
+                    }} else {{
+                        // Genuinely beyond repair here. Put the husk back so the
+                        // surface is no worse than we found it and the autopsy can
+                        // still name the root; a remount is the remaining cure.
+                        mode = 'rebuild_from_husk_failed';
+                        try {{
+                            targetHost.appendChild(existing);
+                        }} catch (_error) {{}}
+                    }}
                 }}
             }} else if (existing) {{
                 // Opening was forbidden by the caller, so the husk is all we have.
@@ -106098,11 +106142,33 @@ mod tests {
             "`term.open(host);` may appear exactly once — the mount, where term.element \
              does not exist yet. A second one is a no-op rebuild of a wiped host."
         );
+        // `term.open(targetHost);` appears twice — the rebuild, then the retry after
+        // the guard is disarmed — but BOTH must live inside attachTerminalSurfaceToHost.
+        // Assert the ownership directly rather than a count, which only ever stood in
+        // for it and would forbid a legitimate second attempt by the same owner.
+        let owner_start = script
+            .find("const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {")
+            .expect("the surface owner is present");
+        let owner_end = script
+            .find("const rebindCurrentHost = (reason, reopen) => {")
+            .expect("the owner's body ends before rebindCurrentHost");
+        assert!(owner_start < owner_end, "the owner precedes rebindCurrentHost");
+        let opens: Vec<usize> = script
+            .match_indices("term.open(targetHost);")
+            .map(|(at, _)| at)
+            .collect();
         assert_eq!(
-            script.matches("term.open(targetHost);").count(),
-            1,
-            "the never-opened fallback belongs to attachTerminalSurfaceToHost alone"
+            opens.len(),
+            2,
+            "exactly two opens: the rebuild, and the retry once the early-return \
+             guard has been disarmed"
         );
+        for at in opens {
+            assert!(
+                at > owner_start && at < owner_end,
+                "`term.open(targetHost);` belongs to attachTerminalSurfaceToHost alone"
+            );
+        }
     }
 
     #[test]
@@ -106139,6 +106205,38 @@ mod tests {
         assert!(
             script.contains("mode = 'rebuild_from_husk_failed';"),
             "a rebuild that did not take must be reported, not assumed"
+        );
+        // A no-op open() means the early-return guard is armed over a terminal that
+        // never finished opening (the guard is assigned mid-open, six services before
+        // the screen reaches the root — see
+        // tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js). Clearing
+        // `element` disarms it so the retry can actually build the surface.
+        for fragment in [
+            "const disarmTarget = term && term._core && term._core.element",
+            "disarmTarget.element = undefined;",
+            "mode = 'rebuilt_from_husk_disarmed';",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "a husk whose guard is armed must be repaired by disarming it, not \
+                 abandoned to a remount; missing: {fragment}"
+            );
+        }
+        assert!(
+            script.contains("term && term._core && term._core.element"),
+            "the private core shape must be feature-detected, so an xterm bump \
+             degrades to putting the husk back rather than half-repairing silently"
+        );
+        let disarm_at = script
+            .find("disarmTarget.element = undefined;")
+            .expect("the disarm is present");
+        let failure_report = script
+            .find("mode = 'rebuild_from_husk_failed';")
+            .expect("the give-up report is present");
+        assert!(
+            disarm_at < failure_report,
+            "reporting the failure before attempting the disarm would make the \
+             repair unreachable"
         );
         // Ordering: the husk has to leave the DOM before the open that replaces it.
         let husk_removed = script
