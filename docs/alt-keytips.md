@@ -408,6 +408,68 @@ it is the definition of done for Phase 1 — the same species of enforcement as 
 existing `assert_shell_namespace_clean` test, which is what has kept the namespace
 rule honest.
 
+### ⛔ 12.1 The audit number is CURRENTLY LYING — measured 2026-07-22
+
+`orphan_count: 0` on the live host, and **only 6 of 71 visible interactables are
+keyboard-reachable**:
+
+```
+visible: 71
+reachable_by_keyboard (data-keytip-node): 6
+no_hotkey, exempt on itself:             33
+no_hotkey, under an exempt SUBTREE:      32   { settings-panel: 25, list-item: 7 }
+orphan_audit_number:                      0
+```
+
+The audit counts `data-keytip-exempt` as *satisfied*, and whole subtrees are
+exempt — `settings-panel`, `notifications-panel`, `connect-form`,
+`daemon-control`, `active-session-menu`, `search`, `list-item`. So the metric
+measures **"declared or excused"**, not **"reachable"**, and it reads zero while
+92% of the visible UI has no keyboard route. This is exactly the user-reported
+symptom: *"the modal opens up which does not take keyboard commands so I have to
+use the mouse."*
+
+**Correction (user-directed 2026-07-22):** the audit must report
+`reachable / excused / orphan` as three separate numbers, and the definition of
+done becomes **`excused` is small and each entry is individually justified**, not
+`orphan == 0`. An exempt SUBTREE must be forbidden outright — exemption is
+per-element, with a reason string, or it is a hiding place.
+
+### 12.2 Component-level auto-assignment (user direction 2026-07-22)
+
+Declaring every affordance by hand does not scale and has already failed once (see
+12.1 — the pressure valve was bulk exemption). The direction is to **invert the
+default**: a yggui component emits its own KeyTip declaration, so *every* element
+gets a hotkey when the layer is open unless it opts out, and an explicit `keytip`
+is only needed to OVERRIDE the derived one.
+
+- Every interactive yggui component (button, toggle, tri-slider, menu item, list
+  row, input, select) declares itself. The letter is DERIVED from its label when
+  not specified — "intellisense" — through the same pure `assign_scope()` ladder
+  that already handles collisions, numbering, and pins (§5, §6), so derivation
+  cannot disagree with explicit assignment.
+- **Blocked on a real component layer.** Today most controls are rendered inline
+  in `shell.rs` rather than through `crates/yggui`, which is why there is no single
+  place to make this change. The component layer is the prerequisite, and it is the
+  bulk of the work — this is a structural inversion, not a feature.
+
+### 12.3 Modals must take the keyboard (user-reported, 2026-07-22)
+
+Concrete failing flow: `ALT,E,L` → `ALT,J,↑` → `ALT,E,X` opens a modal **which
+then accepts no keys**, forcing the mouse and breaking an otherwise
+keyboard-complete chain. A modal is a scope like any other (§4), but it also needs
+the conventional dialog keys, handled once at the modal boundary rather than per
+modal:
+
+| Key | Meaning |
+|---|---|
+| `Enter` | activate the default/primary action |
+| `Escape` | dismiss (already the overlay convention) |
+| `Backspace` | step back one scope — the parent menu, not the browser-back sense |
+
+These are dialog conventions, not KeyTips, so they must work whether or not the
+ALT overlay is open, and must not reach a PTY (§11.2 applies).
+
 ## 13. Invariants (each one testable)
 
 1. Assignment is a pure function of `(ordered declarations, keymap, pins)`.
@@ -415,7 +477,14 @@ rule honest.
 3. A pinned number never moves while its app stays installed.
 4. No shell top-level keytip lands on an Excel-reserved letter.
 5. The overlay never changes layout — zero reflow on ALT.
-6. Every visible interactable is declared or explicitly exempt (audit = 0).
+6. ~~Every visible interactable is declared or explicitly exempt (audit = 0).~~
+   **SUPERSEDED 2026-07-22 (§12.1) — this invariant was satisfiable by bulk
+   exemption and duly was: it read 0 while 6/71 affordances were reachable.**
+   Replacement: *every visible interactable is REACHABLE by keyboard, except a
+   small per-element exempt set each carrying a reason.* Subtree exemption is
+   forbidden.
+12. A modal accepts `Enter` / `Escape` / `Backspace` whether or not the ALT
+    overlay is open (§12.3).
 7. Held ALT+key in a focused terminal always reaches the PTY.
 8. No shell accelerator is a bare `Ctrl+<letter>` — the PTY keeps them (§11.2).
 9. No chord is hardcoded at a callsite; the registry owns every binding in both layers.
