@@ -678,13 +678,18 @@ Acceptance gate 12.
   `yggterm-headless`) and the `--help`; `server app clients` surfaces `client_id`
   so names are discoverable. Proven end-to-end through the real binary on a dev
   sandbox: `clients` lists the id; an unknown `--client` errors with the available
-  list; a known `--client` resolves to the pid and enqueues a *targeted* request
-  (a timeout against a non-worker stand-in, **not** a "no live client" error).
-  7 resolver unit tests + all touched crate tests green. **Still owed:** the live
-  demo of a real shadow GUI worker *claiming* a `--client`-targeted request — but
-  that is the pre-existing, unit-tested pid-routing path unchanged; only the
-  name→pid layer is new. This unblocks the LIVE proofs for gate 11 & gate 16
-  (they need a way to aim a verb at a specific view client).
+  list; a known `--client` resolves to the pid and enqueues a *targeted* request.
+  7 resolver unit tests + all touched crate tests green.
+  **✅ LIVE-PROVEN with a real shadow GUI (2026-07-22).** An isolated 2.12.1
+  sandbox daemon (`role_enforcement:true`) + a shadow launched via
+  `scripts/shadow-client.sh start --name shadow-demo` (headless sway; it survived
+  the fail-closed role gate = attached as Shadow). `server app clients` listed
+  `client_id=shadow-demo`; **`server app state --client shadow-demo` returned
+  `handled_by_pid` = the shadow's own pid with real state** — the verb *claimed*
+  by the named shadow, not the default worker; the negative control `--client
+  bogus-name` was refused (name-gated). A grim capture showed the shadow's own
+  full viewport. This is the recipe the gate-11 / gate-16 live proofs now build on
+  (both need to aim a verb at a specific view client).
 - Both clients read the **same daemon truth** (Phase-2 doctrine: daemon = truth,
   view client = disposable); the shadow adds a view, never a second source of
   state.
