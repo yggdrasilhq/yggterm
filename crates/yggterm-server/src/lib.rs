@@ -15778,6 +15778,14 @@ pub struct ClientInstanceRecord {
     /// stamped at registration.
     #[serde(default)]
     pub client_id: Option<String>,
+    /// The slice-4 client role ("active" | "shadow"), stamped at registration
+    /// from `current_client_identity().role`. `None` (legacy record) reads as
+    /// Active. Untargeted app-control verbs route to the Active client — a
+    /// live Shadow must never swallow the user's default routing (the
+    /// "newest wins" rule silently routed every untargeted verb to a
+    /// freshly-started shadow, live-caught 2026-07-23).
+    #[serde(default)]
+    pub client_role: Option<String>,
     #[serde(default)]
     pub linux_desktop_app_id: Option<String>,
     #[serde(default)]
@@ -16008,15 +16016,46 @@ fn choose_app_control_pid(
     match records {
         [] => Ok(None),
         [record] => Ok(Some(record.pid)),
-        many if require_explicit_target => anyhow::bail!(
-            "multiple live Yggterm GUI clients are registered; rerun with --pid <pid> / --client <name> or set YGGTERM_APP_CONTROL_PID. available: {}",
-            format_available_client_instances(many)
-        ),
-        many => Ok(many
-            .iter()
-            .max_by_key(|record| record.started_at_ms)
-            .map(|record| record.pid)),
+        many => {
+            // Untargeted routing prefers the ACTIVE-role client: shadows exist
+            // precisely so agent probes do not touch the user's GUI, and the
+            // symmetric guarantee is that the user's untargeted verbs (their
+            // own scripts, muscle-memory CLI) keep reaching THEIR client while
+            // a shadow runs. A legacy record with no role reads as Active.
+            let actives: Vec<&ClientInstanceRecord> = many
+                .iter()
+                .filter(|record| client_instance_record_is_active_role(record))
+                .collect();
+            match actives.as_slice() {
+                [one] => Ok(Some(one.pid)),
+                [] if require_explicit_target => anyhow::bail!(
+                    "only Shadow clients are live; a mutating app verb needs an explicit \
+                     --pid <pid> / --client <name>. available: {}",
+                    format_available_client_instances(many)
+                ),
+                [] => Ok(many
+                    .iter()
+                    .max_by_key(|record| record.started_at_ms)
+                    .map(|record| record.pid)),
+                _ if require_explicit_target => anyhow::bail!(
+                    "multiple live Active Yggterm GUI clients are registered; rerun with \
+                     --pid <pid> / --client <name> or set YGGTERM_APP_CONTROL_PID. available: {}",
+                    format_available_client_instances(many)
+                ),
+                several => Ok(several
+                    .iter()
+                    .max_by_key(|record| record.started_at_ms)
+                    .map(|record| record.pid)),
+            }
+        }
     }
+}
+
+/// A record's role, defaulting missing/unknown values to Active: legacy
+/// records predate the field, and the user's anonymous GUI must never lose
+/// default routing to a typo'd role string.
+fn client_instance_record_is_active_role(record: &ClientInstanceRecord) -> bool {
+    !matches!(record.client_role.as_deref(), Some("shadow"))
 }
 
 fn ensure_live_app_control_pid(
@@ -22762,6 +22801,7 @@ mod tests {
             pid: 123,
             started_at_ms: 456,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: None,
             executable_path: None,
@@ -33721,6 +33761,7 @@ terminal_window_id: None,
             pid,
             started_at_ms,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: None,
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -33739,6 +33780,53 @@ terminal_window_id: None,
         }
     }
 
+    fn shadow_client_record(pid: u32, started_at_ms: u128, client_id: &str) -> ClientInstanceRecord {
+        ClientInstanceRecord {
+            client_role: Some("shadow".to_string()),
+            ..named_client_record(pid, started_at_ms, client_id)
+        }
+    }
+
+    // The live-caught 2026-07-23 routing hole: with a shadow running, every
+    // untargeted verb routed to the NEWEST worker — the shadow — so the user's
+    // own untargeted reads observed the shadow's state and looked like the
+    // shadow had yanked their session. Untargeted verbs must prefer the
+    // Active-role client, reads and mutations alike.
+    #[test]
+    fn untargeted_verbs_prefer_the_active_client_over_a_newer_shadow() {
+        let records = vec![
+            client_record(100, 10, ":10"),
+            shadow_client_record(200, 20, "agent-1"),
+        ];
+        let read = choose_app_control_pid(&records, None, None, false).expect("read resolves");
+        assert_eq!(read, Some(100), "an untargeted read must reach the user's client");
+        let mutation = choose_app_control_pid(&records, None, None, true).expect("mutation resolves");
+        assert_eq!(
+            mutation,
+            Some(100),
+            "a sole Active among shadows takes untargeted mutations — the user's scripts keep working"
+        );
+    }
+
+    #[test]
+    fn untargeted_mutation_with_only_shadows_fails_loudly() {
+        let records = vec![
+            shadow_client_record(200, 20, "agent-1"),
+            shadow_client_record(300, 30, "agent-2"),
+        ];
+        let error = choose_app_control_pid(&records, None, None, true).expect_err("must refuse");
+        assert!(error.to_string().contains("only Shadow clients are live"));
+        // Reads still resolve (newest shadow) so observability never goes dark.
+        let read = choose_app_control_pid(&records, None, None, false).expect("read resolves");
+        assert_eq!(read, Some(300));
+    }
+
+    #[test]
+    fn legacy_records_without_role_stay_active_for_routing() {
+        assert!(super::client_instance_record_is_active_role(&client_record(1, 1, ":0")));
+        assert!(!super::client_instance_record_is_active_role(&shadow_client_record(2, 2, "s")));
+    }
+
     #[test]
     fn choose_app_control_pid_prefers_requested_pid() {
         let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
@@ -33754,7 +33842,7 @@ terminal_window_id: None,
         assert!(
             error
                 .to_string()
-                .contains("multiple live Yggterm GUI clients are registered")
+                .contains("multiple live Active Yggterm GUI clients are registered")
         );
     }
 
@@ -33832,6 +33920,7 @@ terminal_window_id: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -33872,6 +33961,7 @@ terminal_window_id: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
