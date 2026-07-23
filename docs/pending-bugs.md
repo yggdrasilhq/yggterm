@@ -6,6 +6,47 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ AGENT WEB-SURFACE AUTOMATION HARD-CRASHES THE GUI (WebKitGTK
+  segfault) — diagnosed 2026-07-24 on jojo, GUI recovered, FIX NOT BUILT.**
+  A `web_surface_do` synthetic click injected into a `local://<uuid>` web
+  surface segfaulted WebKitGTK and killed the entire GUI process. dmesg:
+  `yggterm[<pid>]: segfault at 48 ... error 4 in
+  libwebkit2gtk-4.1.so.0.21.8` — a null-pointer read (deref at struct
+  offset 0x48) inside WebKit. The GUI's last two trace events before death
+  were the trigger: a `web_surface_eval` DOM scrape
+  (`document.querySelectorAll("*")`) then a `web_surface_do` primary click
+  at (122, 514). **Not OOM** (no oom-kill at crash time, memory healthy);
+  **not a Rust panic** (`panic.log` untouched — a native C++ crash bypasses
+  the Rust panic hook, so the process just takes SIGSEGV). The GUI runs as
+  a one-shot transient systemd scope (`app-dev.yggterm.Yggterm@<uuid>`, no
+  `Restart=`), so once it died nothing relaunched the window. The daemon
+  (separate process) survived and kept owning every PTY, so all live agent
+  sessions were unaffected — the crash was cosmetic to the work, but the
+  user lost the window.
+  **Two failure layers, both need a fix:**
+  (1) *Crash surface:* a synthetic-click / DOM-eval into a WebKitGTK web
+  surface can null-deref inside WebKit. The injection path must be guarded
+  (validate the target surface/element is live before dispatch; catch/
+  isolate the webview call so a bad injection cannot take down the whole
+  GUI process — ideally the web surface is a child that can die alone).
+  (2) *Routing violation:* this web-surface automation was aimed at the
+  user's **active GUI** instead of a shadow view-client — exactly what the
+  SHADOW-PROBE LAW forbids (untargeted verbs route to the active client =
+  the user's GUI). `web do/eval/wait` verbs should refuse to drive the
+  active user GUI and require a shadow/backgrounded target, or spawn one.
+  **Broader pattern:** this is not a one-off — ~20 yggterm segfaults in a
+  single day's dmesg (webkit/glib/libc) and dozens of `failed`
+  `Yggterm@*.service` scopes; the web-surface automation path (landed
+  2026-07-23 in the agent-client no-activate + shadow-probe commits) is the
+  freshest suspect. **Recovery gotcha (found live):** a leftover shadow
+  view-client intercepts GUI relaunch — a plain `yggterm` launch and
+  `server app launch` both get handled by the registered shadow (it tries
+  to focus its own headless `wayland-1` window and fails) instead of
+  spawning the primary GUI. Tear the shadow down first
+  (`scripts/shadow-client.sh stop --name agent-1`), then launch the primary
+  GUI with the KDE `wayland-0` env — it re-attaches to the surviving daemon
+  with no re-resume (live-verified: 6 owned · 6 total · 0 preserved).
+
 - **★ AGENT SHADOW CLIENT FOR THE TERMINAL LANE — E2E LIVE ON JOJO
   (2026-07-23, user directive "complete the agent client system e2e"):**
   the slice-4.3 shadow view client now runs against the LIVE daemon
