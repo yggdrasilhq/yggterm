@@ -531,14 +531,18 @@ Examples:
 #### Document reading font (document surfaces, markdown reader)
 
 Rendered markdown documents (yedit and any future document surface) read like
-an article, not like chrome. This is the NYT-readability decision
-(user-directed 2026-07-18):
+an article, not like chrome. User-directed 2026-07-18 ("readability like The
+New York Times"), refined 2026-07-23: **sans-serif** — the user prefers a very
+legible sans over serif; the formatting/spacing system is what carries the
+article feel:
 
-- Body: serif reading stack `Georgia, 'Iowan Old Style', 'Palatino Linotype',
-  'Noto Serif', 'Times New Roman', serif`, 15.5px, line-height 1.75.
-- Headings: same serif, heavy weights (h1 800 → h4 720), negative letter
-  spacing on h1/h2, more air above than below. NO border/rule under headings —
-  no decoration the markdown didn't ask for.
+- Body: legible sans reading stack `'Inter', 'SF Pro Text', 'Segoe UI',
+  'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif`,
+  15px, line-height 1.7, letter-spacing 0.002em.
+- Headings: same sans, heavy weights (h1 800 → h4 720), negative letter
+  spacing on h1/h2, more air above than below (h1 26px above / 12px below,
+  scaling down). Paragraphs carry 14px bottom margin. NO border/rule under
+  headings — no decoration the markdown didn't ask for.
 - Links: accent color only, no underline (markdown has no underline syntax, so
   underlines are never ours to add).
 - Code (inline + blocks) stays monospace at a reduced em so it sits quietly
