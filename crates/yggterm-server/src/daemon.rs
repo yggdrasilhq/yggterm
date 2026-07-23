@@ -10909,6 +10909,30 @@ fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
     )
 }
 
+/// Is this reachable peer a genuine migration SUCCESSOR — a daemon running a
+/// strictly newer version than us? Handoff exists to converge ownership onto the
+/// newest build, so an older or same-version peer is not somewhere to converge
+/// to. An unparseable version is never a successor (fail closed: releasing a
+/// live PTY to a daemon we cannot identify strands the user's session).
+fn daemon_version_is_newer_successor(peer_version: &str) -> bool {
+    let Some(peer) = parse_daemon_version_triple(peer_version.trim()) else {
+        return false;
+    };
+    let Some(current) = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION) else {
+        return false;
+    };
+    peer > current
+}
+
+/// How many times one runtime key may be released for migration before we stop
+/// trying. A release is only progress if the successor ADOPTS it; if the client
+/// re-ensures the session on us instead, the key comes straight back and
+/// releasing it again is an infinite re-resume loop under the user's fingers
+/// (each cycle = fresh PTY + agent-CLI re-resume + a blank/blinking viewport).
+/// Two attempts is enough for a successor that is merely slow; a third means the
+/// handoff is not converging and lingering is strictly better than churning.
+const MAX_MIGRATION_RELEASES_PER_KEY: u32 = 2;
+
 /// One owned session's migration inputs for a single tick.
 struct MigrationCandidateRow {
     runtime_key: String,
@@ -10944,6 +10968,9 @@ fn spawn_progressive_session_migration(
     std::thread::spawn(move || {
         // Paced cadence: one release per tick, oldest-idle first.
         const POLL_INTERVAL_MS: u64 = 5_000;
+        // Releases attempted per runtime key. A key that keeps coming back is a
+        // handoff that is NOT converging — see MAX_MIGRATION_RELEASES_PER_KEY.
+        let mut release_attempts = HashMap::<String, u32>::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             let owned = {
@@ -10971,12 +10998,35 @@ fn spawn_progressive_session_migration(
                 let _ = shutdown(&endpoint);
                 break;
             }
-            // Never release the only live owner: require a reachable successor
+            // Never release the only live owner: require a reachable SUCCESSOR
             // to adopt the released session, or we would strand it.
-            let successor_reachable = !reachable_versioned_daemon_statuses_excluding_endpoint(
+            //
+            // ⛔ "Any other reachable daemon" is NOT a successor, and reading it
+            // that way cost the user a live-session churn loop (jojo 2026-07-23).
+            // jojo had three daemons: 2.12.3 (live, GUI attached, owner of every
+            // session) plus abandoned 2.11.4 and 2.11.5 lingerers from earlier
+            // deploys. The 2.12.3 daemon saw two OLDER daemons, read "successor
+            // reachable", and began releasing its OWN live agent PTYs one per
+            // tick — to daemons that were older and would never adopt them. The
+            // client re-ensured each released session on the SAME daemon, which
+            // re-spawned the PTY and RE-RESUMED the agent CLI, so the user got a
+            // viewport that blinked and swallowed keystrokes for ~3s roughly
+            // every 50 seconds, forever. Measured in the daemon trace: a
+            // `progressive_migration_session_released {runtime_removed: true}`
+            // for the active remote-cc row, then `terminal_runtime spawn` +
+            // `first_bytes` for the SAME runtime key 14.5s later — repeating
+            // across every idle agent session, and the same key released seven
+            // times in twenty minutes without ever converging.
+            //
+            // A successor is a daemon running a STRICTLY NEWER version — that is
+            // the whole point of the handoff (converge ownership onto the newest
+            // build). An older or same-version peer means there is nobody to
+            // converge onto, and lingering harmlessly is the correct outcome.
+            let successor_reachable = reachable_versioned_daemon_statuses_excluding_endpoint(
                 &home_dir, &endpoint,
             )
-            .is_empty();
+            .into_iter()
+            .any(|(_endpoint, status)| daemon_version_is_newer_successor(&status.server_version));
             if !successor_reachable {
                 continue;
             }
@@ -10984,6 +11034,10 @@ fn spawn_progressive_session_migration(
                 let rt = lock_daemon_runtime(&runtime, "progressive_migration_select");
                 let rows = owned
                     .iter()
+                    .filter(|key| {
+                        release_attempts.get(key.as_str()).copied().unwrap_or(0)
+                            < MAX_MIGRATION_RELEASES_PER_KEY
+                    })
                     .map(|key| MigrationCandidateRow {
                         runtime_key: key.clone(),
                         re_resumable: rt
@@ -11001,6 +11055,28 @@ fn spawn_progressive_session_migration(
                 // Nothing safe to migrate this tick; keep lingering and re-check.
                 continue;
             };
+            let attempts = release_attempts
+                .entry(runtime_key.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            if *attempts > 1 {
+                // Loud, not silent: a key we already released is back in our
+                // hands, so the successor did not adopt it. Say so — a churn
+                // loop that leaves no trace reads as "healthy" while the user
+                // watches their session re-resume.
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "progressive_migration_session_returned",
+                    serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "release_attempt": *attempts,
+                        "max_attempts": MAX_MIGRATION_RELEASES_PER_KEY,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+            }
             let mut rt = lock_daemon_runtime(&runtime, "progressive_migration_release");
             rt.release_session_for_migration(&home_dir, &runtime_key);
         }
@@ -13415,6 +13491,86 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(key, value) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    /// REGRESSION LOCK for the jojo 2026-07-23 live-session churn loop. The
+    /// migration loop asked only "is any other daemon reachable" before
+    /// releasing a live agent PTY. jojo ran three daemons — the live 2.12.3 the
+    /// GUI was attached to, plus abandoned 2.11.4 and 2.11.5 lingerers — so the
+    /// NEWEST daemon read two OLDER peers as its successor and released its own
+    /// sessions to them forever. Each release re-spawned the PTY and re-resumed
+    /// the agent CLI under the user's fingers (~3s of blinking, no keystrokes,
+    /// every ~50s). Only a strictly NEWER peer is somewhere to converge onto.
+    #[test]
+    fn only_a_strictly_newer_daemon_counts_as_a_migration_successor() {
+        use super::daemon_version_is_newer_successor as newer;
+        let current = super::SERVER_PROTOCOL_VERSION;
+        let triple = super::parse_daemon_version_triple(current)
+            .expect("our own version parses");
+
+        assert!(
+            !newer(current),
+            "a SAME-version peer is not a successor — there is nothing to converge onto"
+        );
+        assert!(
+            !newer("2.11.4") && !newer("2.11.5"),
+            "the two abandoned jojo lingerers must never read as successors"
+        );
+        assert!(
+            !newer("0.0.1"),
+            "an ancient peer is not a successor"
+        );
+        for junk in ["", "dev", "2.x.3", "not-a-version"] {
+            assert!(
+                !newer(junk),
+                "{junk:?} must fail CLOSED — releasing a live PTY to an \
+                 unidentifiable daemon strands the user's session"
+            );
+        }
+        let newer_patch = format!("{}.{}.{}", triple.0, triple.1, triple.2 + 1);
+        let newer_minor = format!("{}.{}.0", triple.0, triple.1 + 1);
+        assert!(newer(&newer_patch), "{newer_patch} is a successor");
+        assert!(newer(&newer_minor), "{newer_minor} is a successor");
+    }
+
+    /// A release is only progress if the successor ADOPTS the session. If the
+    /// client re-ensures it on us instead, the key returns and releasing it
+    /// again is an infinite re-resume loop, so the candidate filter must drop a
+    /// key that has already been released its allowance of times.
+    #[test]
+    fn a_returning_runtime_key_stops_being_a_migration_candidate() {
+        use std::collections::HashMap;
+        let key = "remote-cc://dev/session";
+        let mut attempts = HashMap::<String, u32>::new();
+        let candidate_survives = |attempts: &HashMap<String, u32>| {
+            let rows = [key]
+                .iter()
+                .filter(|k| {
+                    attempts.get(**k).copied().unwrap_or(0)
+                        < super::MAX_MIGRATION_RELEASES_PER_KEY
+                })
+                .map(|k| MigrationCandidateRow {
+                    runtime_key: (*k).to_string(),
+                    re_resumable: true,
+                    migratable: true,
+                    idle_ms: 60_000,
+                })
+                .collect::<Vec<_>>();
+            super::select_next_migration_candidate(&rows).is_some()
+        };
+
+        assert!(candidate_survives(&attempts), "first release is allowed");
+        attempts.insert(key.to_string(), 1);
+        assert!(
+            candidate_survives(&attempts),
+            "a second attempt is allowed for a merely slow successor"
+        );
+        attempts.insert(key.to_string(), super::MAX_MIGRATION_RELEASES_PER_KEY);
+        assert!(
+            !candidate_survives(&attempts),
+            "a key that keeps coming back must stop being released — lingering \
+             beats churning the user's live session"
+        );
     }
 
     use super::{

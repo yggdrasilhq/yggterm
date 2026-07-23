@@ -6,6 +6,54 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★★ ROOT-CAUSED + FIXED 2026-07-23 — "the viewport blinks and stops taking
+  keystrokes for a few seconds" was PROGRESSIVE MIGRATION EATING ITS OWN LIVE
+  SESSIONS.** Reported as "I cannot type in the current session if I switch to
+  another window, say chromium, and come back"; refined live by the user to
+  "fast blinks, no input, settled within 3 sec".
+  **Cause.** `spawn_progressive_session_migration` (daemon.rs) is the retiring-
+  predecessor handoff: each tick it releases the oldest-idle agent session so a
+  newer successor can adopt it. Its guard asked only *"is any other daemon
+  reachable"* — not *"is it a SUCCESSOR"*. jojo ran three daemons: the live
+  2.12.3 the GUI was attached to (owner of every session) plus abandoned 2.11.4
+  and 2.11.5 lingerers from earlier deploys. The newest daemon read two OLDER
+  peers as its successor and began releasing its own live agent PTYs, one per
+  5 s tick. Nothing adopted them, so the client re-ensured each released session
+  on the SAME daemon → `terminal_runtime spawn` → agent-CLI **re-resume** →
+  blank/blinking viewport that swallows keystrokes for ~3 s, roughly once a
+  minute, forever. Trace signature: `progressive_migration_session_released
+  {runtime_removed:true}` followed ~15 s later by `terminal_runtime spawn` +
+  `first_bytes` for the same runtime key; **the same key was released seven
+  times in twenty minutes and never converged.**
+  **Why the window-switch framing was a red herring:** the trigger is the idle
+  timer (`idle_ms` 45–50 s every time), and being away in another window is just
+  the most common way to be idle. A genuine compositor focus-out/focus-in cycle
+  reproduced nothing (clean recovery at 6 s and at 118 s away).
+  **Fixes (2.12.4):** only a strictly NEWER peer counts as a migration successor
+  (unparseable versions fail closed); and a runtime key that comes back into our
+  hands is released at most `MAX_MIGRATION_RELEASES_PER_KEY` times, with a loud
+  `progressive_migration_session_returned` trace — lingering beats churning.
+  Regression locks: `only_a_strictly_newer_daemon_counts_as_a_migration_successor`,
+  `a_returning_runtime_key_stops_being_a_migration_candidate`.
+  **Second contributing defect FIXED:** a freshly created agent session was NOT
+  keep-alive, and `keep_alive` is the only input to `restart_protected_runtime`
+  in `terminal_reuse_needs_restart` — so an unprotected agent row also had its
+  PTY re-spawned on any transient stale/blank remote-attach reading. Agent CLI
+  kinds are now born keep-alive (`session_kind_persists_by_default`); restore
+  stays authoritative so an explicit opt-out and the update-restore distinction
+  both survive.
+  **Probes shipped alongside** (keep them; they are how the next one is decided
+  in a single command): `ui/window_focus/transition`, `ui/input_policy/applied`,
+  and `app state` → `input_dead_ms` / `passive_focus_recovery_state` /
+  `input_dead_active_element`. Also fixed: the passive focus watchdog bailed on
+  `document.hasFocus()`, a measured Wayland false negative for a foreground
+  window and redundant with `inputEnabled`.
+  ⚠ **KNOWN GAP:** `PersistedLiveSession.keep_alive` is a bool, so "user turned
+  keep-alive OFF for an agent session" and "born before 2.12.4" are
+  indistinguishable across a restart. Pre-2.12.4 agent rows stay blue until
+  marked once. A tri-state (unset/on/off) is the real fix if that ever matters.
+  Full entry: [`docs/xterm-bugs.md#input-dead-after-window-refocus`](xterm-bugs.md#input-dead-after-window-refocus).
+
 - **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
