@@ -3144,6 +3144,31 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    // The session-identity handshake must survive a MANUAL `ssh <host>` hop:
+    // stock OpenSSH forwards LC_* (SendEnv/AcceptEnv defaults), so the LC_
+    // mirror is what lets a libyggterm app on the far side detect the surface
+    // (user report 2026-07-23: yedit said "not inside yggterm" after ssh).
+    // Both names carry the SAME key — a divergence would be two identities.
+    #[test]
+    fn session_identity_env_exports_the_lc_mirror_for_ssh_hops() {
+        let mut command = CommandBuilder::new("true");
+        apply_session_identity_env(&mut command, Some("local://abc"));
+        assert_eq!(
+            command.get_env("YGGTERM_SESSION_ID").and_then(|v| v.to_str()),
+            Some("local://abc")
+        );
+        assert_eq!(
+            command
+                .get_env("LC_YGGTERM_SESSION_ID")
+                .and_then(|v| v.to_str()),
+            Some("local://abc"),
+            "the LC_ mirror is the only identity that survives a user-typed ssh hop"
+        );
+        let mut absent = CommandBuilder::new("true");
+        apply_session_identity_env(&mut absent, None);
+        assert!(absent.get_env("LC_YGGTERM_SESSION_ID").is_none());
+    }
+
     #[test]
     fn daemon_vt100_preserves_composer_bg_across_column_resize() {
         // Regression lock + FALSIFICATION of the long-standing "reflow drops cell
