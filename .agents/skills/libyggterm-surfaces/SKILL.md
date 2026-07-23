@@ -153,6 +153,16 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
   Vocabulary: `section`, `label`, `search-box`, `text-input`, `number-input`,
   `toggle`, `button`, `list-row` (with action buttons), `tabs`. An unknown
   `kind` fails the pane rather than rendering a hole.
+  - **Status footer (2026-07-23, yedit wc bar was the forcing consumer):** a
+    schema may also carry a top-level `footer: [widgets…]` list — yggterm pins
+    it at the rail BOTTOM, under the scroll area, behind a separator. Subset
+    vocabulary only: `label`, `toggle`, `button` (grow it when a consumer
+    needs more). Use it for status-bar data (counts, modes) — not for content.
+  - **`text-input` editor fields (document surface):** `line_numbers: true`
+    draws the gutter; `word_wrap` (DEFAULT TRUE — user spec) soft-wraps the
+    editor. While wrap is on the gutter is SUPPRESSED (logical line numbers
+    desync against wrapped visual rows — the wc footer carries the count) and
+    the textarea owns its own scroll instead of growing by logical rows.
 - **Act**: a click `POST`s `{pane, action, values}` to `<control>/action`; the
   app performs it on its own host and returns `{schema?, toast?, eval?}` — a
   fresh schema to re-render, a message to toast, and/or a script for the GUI to

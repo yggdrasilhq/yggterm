@@ -24,6 +24,28 @@ fix) once the fix is verified live on jojo.
   and a detected ring gap reconciles — the remaining swap-window paint
   transient is the attach-seed seam the harness spec owns.
 
+- **libyggterm apps over a MANUAL ssh hop say "not inside yggterm"
+  (user-confirmed 2026-07-23).** Spawn a local yggterm terminal, `ssh <host>`,
+  run `yedit` there → detection fails because `YGGTERM_SESSION_ID` does not
+  cross a user-typed ssh hop. TWO halves:
+  1. **Detection — SHIPPED in code:** the daemon now also exports
+     `LC_YGGTERM_SESSION_ID` at PTY spawn (the iTerm2 `LC_TERMINAL` trick —
+     stock OpenSSH forwards `LC_*` both ways by default), and yedit falls back
+     to it. ⚠ The daemon export is DORMANT until the next daemon bump (the
+     2.12.7 daemon on jojo predates it; GUI-only deploys don't activate it).
+  2. **Control-channel attribution — DESIGNED, NOT BUILT:** even with
+     detection, the app's declared control endpoint is loopback on the REMOTE
+     host, and the GUI resolves forwards from the SESSION's `ssh_target` —
+     which is local for a manual hop, so the fetch dials the wrong machine and
+     the surface dies as "not responding". Design: the declare payload carries
+     the app host's identity (`gethostname()`); the GUI maps it to a known
+     remote machine (requires a hostname↔machine mapping the remote-machine
+     registry does not hold yet — `RemoteMachineSnapshot` has `ssh_target` and
+     `label` only, and oc's hostname ≠ its alias) and spawns the `ssh -L`
+     against that machine. Until built, the honest state is: detection works
+     (post-bump), surface takeover over a manual hop does not; running the app
+     in a session yggterm itself opened on that host works fully.
+
 - **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
@@ -174,6 +196,36 @@ fix) once the fix is verified live on jojo.
   newer-build-on-disk flag, and the daemon's own deferral reason, plus a manual
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
+
+- **Rendering stability: user RE-REPORTED blinking + blank-on-switch 2026-07-23
+  ("blinking and waiting on blank sessions only fixed by switching again and in
+  session blinking") — a THIRD defect found + fixed same day: the render-health
+  ink probe was blind and its recovery loop WAS the in-session blink.**
+  `sampleCanvasInk` judged "canvas blank" from ANY canvas in the host (reveal
+  ghost, overlays) while the canvas that actually paints text was either absent
+  (DOM renderer) or unreadable (WebGL — `getContext('2d')` returns null on a
+  GPU-context canvas). Measured in the hour before the fix: **110 false
+  `terminal_render_health_unhealthy` edges and 47 `render_health` repaints**,
+  each repaint = atlas clear + full refresh + forced host rebind (a visible
+  blink), and each rebind's wipe window produced fresh `term_element_detached`
+  readings that scheduled the NEXT repaint — self-sustaining. Backgrounded
+  hosts accumulated the same false "unhealthy", which the reveal path consumes
+  to force a repaint at switch-in (the switch-in blink/blank). The 2026-07-20
+  fix attempt (ba2fe8c, drawImage readback) had corrupted the glyph atlas and
+  was reverted; the diagnosis was right, the readback was the poison.
+  **Fix (2026-07-23, GUI-only):** ink sampled ONLY from `.xterm-screen` render
+  canvases; an unreadable (GPU-context) layer marks the sample `unsampleable`
+  and FORBIDS the canvas-blank verdict (no GPU touch, no readback); a detach
+  verdict must persist ≥900 ms (the racing `detached_ms=0` reads 28–642 ms
+  after `rebind_host_attach` no longer count); the attachment-state mirror
+  gained the missing `termElementOutsideHost` guard so `unrepairable` stops
+  false-alarming. **Live: 3 min post-swap under heavy streaming = 0 unhealthy
+  edges, 0 repaints, 0 rebinds** (was ~5/2/several per 3 min), and the active
+  host's ink reads `unreadable_layers:1, unsampleable:true, status:healthy` —
+  the exact state that previously fired the loop. Locks:
+  `unreadable_layers` + `detachedPersistedMs` + guard asserts in the eval-script
+  test. **Remove this paragraph once the user confirms switching no longer
+  blinks and no blank-on-switch recurs across a few days.**
 
 - **Cross-pathway blink (local-cc → remote-cc switch) — BOTH DEFECTS FIXED in
   2.12.7 (2026-07-23), user gesture-confirmation pending.** The trace signature
