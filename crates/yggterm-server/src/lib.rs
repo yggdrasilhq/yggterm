@@ -1,5 +1,6 @@
 mod app_control;
 mod attach;
+mod clipboard_sweep;
 mod codex_cli;
 mod daemon;
 pub mod grid_overlay;

@@ -11666,12 +11666,36 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         }
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
+        let chore_home_dir = home_dir.clone();
         std::thread::spawn(move || {
             let mut sleep_ms = BACKGROUND_COPY_CHORE_MS;
             let mut remote_cc_confirmed: HashSet<String> = HashSet::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
+                // Clipboard staging autoclean (docs/pending-bugs.md design):
+                // interval-gated inside, no runtime lock, per-host dir only.
+                let user_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                if let Some(outcome) = crate::clipboard_sweep::run_clipboard_sweep_if_due(
+                    &chore_home_dir,
+                    user_home.as_deref(),
+                    crate::current_millis_u64(),
+                ) && outcome.did_anything()
+                {
+                    append_trace_event(
+                        &chore_home_dir,
+                        "daemon",
+                        "chore",
+                        "clipboard_sweep",
+                        serde_json::json!({
+                            "trashed": outcome.trashed,
+                            "deleted": outcome.deleted,
+                            "kept_referenced": outcome.kept_referenced,
+                            "live_bytes_after": outcome.live_bytes_after,
+                            "degraded": outcome.degraded,
+                        }),
+                    );
+                }
                 match run_background_copy_chore(
                     &runtime,
                     generation_enabled,
