@@ -3614,6 +3614,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "paper-renderer"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6967,6 +6974,7 @@ dependencies = [
  "objc2-foundation",
  "once_cell",
  "p256",
+ "paper-renderer",
  "png 0.18.1",
  "pulldown-cmark",
  "rand 0.8.6",
