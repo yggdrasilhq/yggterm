@@ -1625,6 +1625,42 @@ pub struct ServerRuntimeStatus {
     /// `role_enforcement` (D7).
     #[serde(default)]
     pub advertises_stored_session_keys: bool,
+    /// B4 LIVE-row prevention, the twin of `stored_terminal_sessions`.
+    ///
+    /// When a successor boots beside a live predecessor,
+    /// `may_cold_restore_live_sessions` refuses and `saved.live_sessions.clear()`
+    /// wipes EVERY persisted live row — correctly, because the file is not the
+    /// truth while a predecessor is alive (retaining it re-opens the 2026-07-09
+    /// incident where 19 CLOSED sessions were resurrected from a stale
+    /// `server-state.json`). But the refusal is all-or-nothing, and the two
+    /// existing recovery passes can only re-adopt a row some reachable daemon
+    /// ACTIVELY HOLDS: `recover_missing_preserved_owner_live_sessions_from_reachable_daemons`
+    /// needs a live runtime, `adopt_missing_dormant_sessions_from_reachable_daemons`
+    /// needs the row in the predecessor's `stored_terminal_sessions`. A live-listed
+    /// row owned by NO daemon — the normal state for an agent-CLI row whose PTY
+    /// has exited but which is still attachable — matches neither, so it goes
+    /// invisible. Measured on the 2.12.2 → 2.12.3 swap: 25 rows → 12, and exactly
+    /// the predecessor's 6 owned keys survived.
+    ///
+    /// So the LIVE predecessor advertises its live rows here, and the successor
+    /// adopts the ones it lacks. The refusal stays all-or-nothing; the rows come
+    /// from a running daemon rather than from the file.
+    ///
+    /// Sourced from `persisted_state().live_sessions` — the SAME value the file
+    /// would receive — so persistence and the wire cannot diverge. Carried on
+    /// status rather than the snapshot because the reconcile already fetches
+    /// status, and `ServerRuntimeStatus` is not part of `ServerRequest`/
+    /// `ServerResponse`, so adding fields does not trip the protocol shape stamp
+    /// (precedent: `remote_yggterm_retry_total`, `stored_terminal_sessions`).
+    #[serde(default)]
+    pub live_terminal_sessions: Vec<PersistedLiveSession>,
+    /// True on any daemon that populates `live_terminal_sessions`. A pre-B4
+    /// daemon lacks the field and deserializes `false`, so a successor can tell
+    /// "this predecessor has no live rows" from "this predecessor cannot tell me
+    /// about its live rows" and never reads an old daemon's silence as an empty
+    /// set. Same fail-safe encoding as `advertises_stored_session_keys`.
+    #[serde(default)]
+    pub advertises_live_session_rows: bool,
     /// PROBE (2026-07-22): running total of remote-yggterm command retries after a
     /// cache reset. A wedged remote target (the "cache reset" spin that stranded a
     /// session's viewport) shows as this CLIMBING fast between polls. `#[serde(default)]`
@@ -2800,6 +2836,11 @@ impl DaemonRuntime {
             .collect::<Vec<_>>();
         stored_terminal_session_keys.sort();
         stored_terminal_session_keys.dedup();
+        // B4: the LIVE rows, from the exact value persistence would write, so a
+        // successor that had to clear its own file can adopt them from us rather
+        // than from the file. No mirrored filter — `persisted_state()` IS the
+        // filter, so the wire and the file cannot drift apart.
+        let live_terminal_sessions = self.server.persisted_state().live_sessions;
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
@@ -2836,6 +2877,8 @@ impl DaemonRuntime {
             stored_terminal_session_keys,
             stored_terminal_sessions,
             advertises_stored_session_keys: true,
+            live_terminal_sessions,
+            advertises_live_session_rows: true,
             remote_yggterm_retry_total: crate::remote_yggterm_retry_total(),
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
@@ -3542,6 +3585,7 @@ impl DaemonRuntime {
         self.restore_missing_preserved_owner_live_sessions(reason);
         self.recover_missing_preserved_owner_live_sessions_from_reachable_daemons(reason);
         self.adopt_missing_dormant_sessions_from_reachable_daemons(reason);
+        self.adopt_missing_live_session_rows_from_reachable_daemons(reason);
         append_trace_event(
             self.store.home_dir(),
             "daemon",
@@ -3591,6 +3635,70 @@ impl DaemonRuntime {
                         "owner_endpoint": owner_endpoint_label(&owner_endpoint),
                         "owner_server_version": owner_status.server_version,
                         "owner_server_pid": owner_status.server_pid,
+                        "adopted_row_keys": adopted,
+                    }),
+                );
+            }
+        }
+    }
+
+    /// B4 LIVE-row prevention — the third and last reconcile pass, and the one
+    /// that finally covers a row owned by NOBODY.
+    ///
+    /// The two passes above can only re-adopt a row some reachable daemon
+    /// ACTIVELY HOLDS. A live-listed row whose PTY has exited but which is still
+    /// attachable (the normal resting state of an agent-CLI row) is held by no
+    /// daemon, so neither pass can see it, and after
+    /// `may_cold_restore_live_sessions` refuses and clears our own file it is
+    /// simply gone. That is the whole of B4: measured 25 rows → 12 on the
+    /// 2.12.2 → 2.12.3 swap, with exactly the predecessor's 6 owned keys
+    /// surviving.
+    ///
+    /// A live PREDECESSOR still has those rows in memory and now advertises them
+    /// (`live_terminal_sessions`). Adopt the ones we lack.
+    ///
+    /// Three properties this must keep:
+    /// * **Only ADDS.** A row we already have is left exactly as it is — we never
+    ///   overwrite our own live state with a peer's view of it.
+    /// * **Never resurrects from the file.** The source is a RUNNING daemon's
+    ///   memory. That is precisely why the all-or-nothing refusal can stay: the
+    ///   file is still not trusted, the live predecessor is.
+    /// * **Fail-safe against old daemons.** `advertises_live_session_rows` is
+    ///   false on a pre-B4 predecessor, whose silence must not be read as "it has
+    ///   no live rows" — we skip it rather than conclude anything.
+    fn adopt_missing_live_session_rows_from_reachable_daemons(&mut self, reason: &'static str) {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        for (owner_endpoint, owner_status) in reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        ) {
+            if !owner_status.advertises_live_session_rows {
+                // Pre-B4 predecessor: it cannot tell us, so we know nothing about
+                // its live rows. Silence is not an empty set.
+                continue;
+            }
+            let mut adopted = Vec::new();
+            for live in &owner_status.live_terminal_sessions {
+                if self.server.live_session_row_exists(&live.key) {
+                    continue;
+                }
+                self.server.restore_live_session(live.clone());
+                if self.server.live_session_row_exists(&live.key) {
+                    adopted.push(live.key.clone());
+                }
+            }
+            if !adopted.is_empty() {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "preserved_owner_live_session_rows_adopted",
+                    serde_json::json!({
+                        "reason": reason,
+                        "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                        "owner_server_version": owner_status.server_version,
+                        "owner_server_pid": owner_status.server_pid,
+                        "advertised_row_count": owner_status.live_terminal_sessions.len(),
                         "adopted_row_keys": adopted,
                     }),
                 );
@@ -13536,6 +13644,42 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(key, value) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    /// B4 FAIL-SAFE LOCK. A pre-B4 predecessor does not carry
+    /// `live_terminal_sessions` at all, so it deserializes as an EMPTY vec — and
+    /// an empty vec from a daemon that cannot speak about its live rows must not
+    /// be read as "it has no live rows". `advertises_live_session_rows` is the
+    /// discriminator, and it must default to false, exactly like
+    /// `advertises_stored_session_keys`. If this ever defaults true, a successor
+    /// would conclude an old predecessor holds nothing and adopt nothing — B4
+    /// again, silently.
+    #[test]
+    fn a_pre_b4_daemon_status_does_not_claim_to_advertise_live_rows() {
+        let legacy = serde_json::json!({
+            "server_version": "2.11.5",
+            "server_build_id": 0,
+            "server_pid": 1234,
+            "host_kind": "test",
+            "host_detail": "",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "restored_from_persisted_state": true,
+        });
+        let status: super::ServerRuntimeStatus =
+            serde_json::from_value(legacy).expect("a pre-B4 status still deserializes");
+        assert!(
+            !status.advertises_live_session_rows,
+            "silence from an old daemon must not read as 'I have no live rows'"
+        );
+        assert!(
+            status.live_terminal_sessions.is_empty(),
+            "the field is absent on an old daemon, so it must deserialize empty"
+        );
+        assert!(
+            !status.advertises_stored_session_keys,
+            "the dormant twin must keep the same fail-safe encoding"
+        );
     }
 
     /// REGRESSION LOCK for the jojo 2026-07-23 live-session churn loop. The
