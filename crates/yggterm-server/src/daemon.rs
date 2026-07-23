@@ -13548,6 +13548,76 @@ mod tests {
         hot_restart_block_reason_summary,
     };
 
+    // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
+
+    #[test]
+    fn scheme_registry_lock_uses_runtime_owned_terminal_path() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality};
+        let name = "uses_runtime_owned_terminal_path";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            s.agent && !s.legacy && s.locality == SchemeLocality::Remote
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let covered = super::uses_runtime_owned_terminal_path(scheme.example);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} ignores {} and no hole is recorded — fix it or record it",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
+    // The write strategy is the §7.2 predicate round 8 already FIXED (the
+    // post-swap un-inputable remote-cc window). This lock pins the fix: every
+    // current remote agent ROW scheme falls to RemoteDirectFallback when no
+    // local runtime is running, with NO recorded holes.
+    #[test]
+    fn scheme_registry_lock_terminal_write_strategy_for_path() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality, SchemeRole};
+        let name = "terminal_write_strategy_for_path";
+        assert_eq!(
+            agent_scheme::predicate_holes_for(name).count(),
+            0,
+            "this predicate is fixed; a new hole row would be a regression"
+        );
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| {
+            s.agent
+                && !s.legacy
+                && s.locality == SchemeLocality::Remote
+                && matches!(s.role, SchemeRole::RowIdentity)
+        }) {
+            assert!(
+                matches!(
+                    super::terminal_write_strategy_for_path(scheme.example, false),
+                    super::TerminalWriteStrategy::RemoteDirectFallback
+                ),
+                "{} must write remote-direct when the local bridge runtime is down",
+                scheme.prefix
+            );
+        }
+        assert!(
+            matches!(
+                super::terminal_write_strategy_for_path(
+                    "local://00000000-0000-4000-8000-000000000001",
+                    false
+                ),
+                super::TerminalWriteStrategy::LocalRuntimeFallback
+            ),
+            "a local row never takes the remote-direct path"
+        );
+    }
+
     fn blocker(key: &str, kind: &str, idle_ms: Option<u64>) -> HotRestartBlocker {
         HotRestartBlocker {
             session_key: key.to_string(),
