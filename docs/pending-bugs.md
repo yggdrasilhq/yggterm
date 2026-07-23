@@ -54,22 +54,34 @@ fix) once the fix is verified live on jojo.
   marked once. A tri-state (unset/on/off) is the real fix if that ever matters.
   Full entry: [`docs/xterm-bugs.md#input-dead-after-window-refocus`](xterm-bugs.md#input-dead-after-window-refocus).
 
-- **★ NEW 2026-07-23: an agent row born through `open_or_focus_session` is NOT
-  keep-alive — the born-green rule has a second birth site it never covered.**
-  Live-caught during the 2.12.5 deploy recovery: all 13 `remote-cc://dev/*` rows
-  reconnected via `yggterm server connect` came back `keep_alive: false` (each
-  had been `true` before the swap), under a 2.12.5 daemon that carries the
-  born-keep-alive fix. Cause: `server connect` → `ServerRequest::OpenStoredSession`
-  → `open_or_focus_session` → `build_session` — a SECOND live-row birth
-  constructor, and only `insert_live_session_with_launch` applies
-  `session_kind_persists_by_default`. Consequence is not cosmetic (same family as
-  the round-7 second fix): `keep_alive` is the only input to
-  `restart_protected_runtime`, so every connect-birthed agent row is eligible for
-  a PTY re-spawn/re-resume on any transient stale-attach reading. Fix direction:
-  apply the born-green default at the `build_session`-birth site too (only when
-  the row is newly created — an existing row's flag must never be overwritten),
-  or better, collapse the two birth sites into one owner. Recovery meanwhile:
-  `server app terminal keep <path>` per row (verified working).
+- **★ NEW 2026-07-23, user-confirmed: the ACTIVE remote-cc session is
+  un-inputable for ~3–5 minutes after a daemon swap, while its runtime is owned
+  by the retiring predecessor.** User (live, during the 2.12.5→2.12.6 swap):
+  stale frame → window-swap → "almost perfect frame but not inputable" →
+  input only after ~5 min. Trace (seconds after the swap): +17 mount +
+  `ensure_begin`; +23 `ensure_attempt_outcome` **timed out after 5000ms**, then
+  `daemon_ensure_begin`→`end` took **69 s**; +93 `attach_ready` against the OLD
+  owner's runtime (cursor 27434 — the stale frame); +133
+  `read_error_after_attach {"error":"reading daemon response",
+  "remote_resume_session": false}`; +138 second ensure timeout, second
+  daemon_ensure 56 s; **+194 the NEW daemon abandoned bridging and spawned a
+  fresh runtime (re-resume) — input recovered here**, not from the user's
+  window-swap gesture; +336 one more mount cycle with the mount generation
+  running BACKWARD (3→1, the cross-pathway double-construct signature).
+  **Two suspects, in order:** (1) `terminal_write_strategy_for_path`
+  (daemon.rs) returns `RemoteDirectFallback` ONLY for `remote-session://` —
+  a `remote-cc://` session whose local runtime is not running falls to
+  `LocalRuntimeFallback`, i.e. keystrokes are aimed at a runtime that does not
+  exist. One more member of the `cc-runtime://`/remote-cc hole class
+  (docs/spec-agent-cli-harness.md §7.2). (2) whatever `daemon_ensure` blocks
+  on for 56–69 s during the drain window — that latency IS the un-inputable
+  window's floor. Note `remote_resume_session: false` on a remote-cc session
+  throughout: the codex-only readiness family (§7.3) live on the wire.
+  Fix belongs to the spec's phase 0/3 (scheme registry + attach single-writer),
+  acceptance case A2's sibling: "a daemon swap must return input to the ACTIVE
+  session in seconds, not minutes."
+
+- **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
   `term.element` is out of the DOM (`isConnected:false`, rect 0×0) while an
@@ -268,78 +280,6 @@ fix) once the fix is verified live on jojo.
   (shell.rs) — reveal-in-place vs cold-remount. Both are now acceptance case A2
   of `docs/spec-agent-cli-harness.md`; fix them there, not piecemeal.
 
-- **B4 ROOT CAUSE FOUND (jojo, 2026-07-22): the cold-restore refusal is
-  ALL-OR-NOTHING, and rows owned by NOBODY have no recovery source.** Measured
-  end-to-end on the live 2.12.2 → 2.12.3 swap: the sidebar went **25 rows → 12**,
-  losing 13 `remote-cc://dev/*` rows. This is NOT the dormant-adoption gap that
-  `ad4a595` closed — that fix is present and ran.
-  **Mechanism, with the trace evidence:**
-  1. The successor boots, sees other live daemons, and
-     `may_cold_restore_live_sessions` refuses → `daemon.rs` runs
-     `saved.live_sessions.clear()`, wiping **all 19** persisted live rows
-     (`cold_restore_of_live_sessions_refused {skipped_live_sessions: 19}`).
-  2. The deep reconcile then runs and can only re-adopt a row that some
-     **reachable daemon actively holds**:
-     `recover_missing_preserved_owner_live_sessions_from_reachable_daemons` needs
-     a live runtime, `adopt_missing_dormant_sessions_from_reachable_daemons` needs
-     the row in the predecessor's `stored_terminal_sessions`.
-     Trace: `preserved_owner_deep_reconcile_ran {before: 7, after: 7}` — adopted
-     nothing.
-  3. **Exactly the predecessor's 6 `terminal_session_keys` survived.** The other
-     13 were live-listed but owned by no daemon (the normal state for an agent-CLI
-     row whose PTY has exited but which is still attachable), so no adoption path
-     could see them and they went invisible.
-  **Why the obvious one-line fix is WRONG:** simply retaining unowned rows from
-  the file re-opens the 2026-07-09 incident the refusal exists to prevent (19
-  *closed* sessions resurrected from a stale `server-state.json`) — see
-  `cold_restore_of_live_sessions_is_refused_beside_a_live_owner`. The file is not
-  the truth while a predecessor is alive.
-  **★ FIXED 2026-07-23 (`287d6e8`, shipped in 2.12.5) exactly as designed below — the
-  live predecessor now advertises `live_terminal_sessions` +
-  `advertises_live_session_rows` on `ServerRuntimeStatus` (sourced from
-  `persisted_state().live_sessions`, so wire and file cannot drift), and a THIRD
-  reconcile pass `adopt_missing_live_session_rows_from_reachable_daemons` adopts
-  the rows this daemon lacks. Add-only, gated on the new `live_session_row_exists`;
-  a pre-B4 predecessor's silence is skipped rather than read as an empty set.
-  Locks: `a_pre_b4_daemon_status_does_not_claim_to_advertise_live_rows`,
-  `adopting_a_live_row_that_already_exists_is_a_no_op`.**
-  **★★ TWO-DAEMON SANDBOX PROOF DONE 2026-07-23 (real daemons, real sockets, real
-  PTY, isolated `YGGTERM_HOME`):** predecessor 2.12.5 with 3 unowned agent rows +
-  1 owned pin-shell PTY; successor 2.12.6 booted beside it → trace shows
-  `cold_restore_of_live_sessions_refused {skipped_live_sessions: 4}` followed by
-  `preserved_owner_live_session_rows_adopted {adopted_row_keys: [all 3 agent
-  rows]}`; successor ended with 4/4 rows and keep-alive flags byte-preserved
-  (pre-fix behaviour on the same scenario: 1/4). Sandbox trap for reruns: the
-  pinned shell must have a stdin that never closes — an EOF exits the shell, the
-  predecessor then owns nothing, and the refusal (correctly) never fires.
-  **The fail-safe arm is LIVE-PROVEN on the 2.12.4→2.12.5 jojo swap:** the
-  successor logged the refusal (skipped 20, predecessor owning 7) and adopted
-  NOTHING from the non-advertising 2.12.4 predecessor — silence skipped, not
-  misread; the expected one-last-time drop (20→7) was recovered by the connect
-  loop. **The adoption arm still needs its live proof on the next real swap
-  (2.12.5→newer, both sides advertising); expect ZERO row loss there, then
-  delete this entry.**
-  Original design note follows.
-  **Correct fix (designed, NOW BUILT):** mirror what `stored_terminal_sessions`
-  already does for dormant rows — have the predecessor **advertise its live rows
-  on `ServerRuntimeStatus`** (`live_terminal_sessions: Vec<PersistedLiveSession>` +
-  an `advertises_live_session_rows` fail-safe flag, both `#[serde(default)]`, which
-  does NOT trip the protocol shape stamp since `ServerRuntimeStatus` is not part of
-  `ServerRequest`/`ServerResponse` — precedent: `remote_yggterm_retry_total`), and
-  add a third reconcile pass that adopts the live rows this daemon lacks. Source
-  the field from `persisted_state().live_sessions` so persistence and the wire
-  cannot diverge (no mirrored filter). Then the refusal can stay all-or-nothing:
-  the live predecessor, not the file, supplies the rows.
-  **Recovery until then** (works, verified this run): capture
-  `server app rows` **BEFORE** any deploy, diff after, then
-  `yggterm server connect '<path>'` each missing row — ⚠ `connect` is on the
-  `yggterm` binary, not `yggterm-headless`, and ⚠ use `ssh -n` in the loop or ssh
-  eats the loop's stdin and you silently reconnect only the first row. Rows return
-  in 5–10 s. Note `yggterm server reorder` only reorders rows with a **live
-  runtime** (`replace_live_session_order` filters on
-  `managed_session_is_live_runtime_session`), so it cannot restore the order of
-  reconnected dormant rows — cosmetic, but do not expect byte-identical order.
-
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
   holes (`t ik` for `think`, including the user's own composer echo), merged
@@ -531,30 +471,6 @@ fix) once the fix is verified live on jojo.
   local root while a local CC session works — the row must show the blinking
   working dot (`server app rows` → the `local` group row reports
   `busy: true, busy_reason: group_descendant_working`).
-
-- **Clipboard-staging dir grows forever — no autoclean anywhere (user-confirmed
-  2026-07-16).** `stage_local_clipboard_png` (shell.rs) and
-  `stage_remote_clipboard_png` (yggterm-server lib.rs, incl. the python ssh
-  fallback) write every image paste to `~/.yggterm/clipboard/` and nothing ever
-  prunes it: pi is at 204 files / 182 MB since April, files up to 15 MB each.
-  Left alone this fills the drive.
-  **The careful part — these files are NOT free to delete.** The staged PATH is
-  what gets pasted into agent CLIs (codex / Claude Code image attach), so agent
-  session transcripts reference these paths; resuming a 15-day-old session and
-  re-reading its image must not hit file-not-found. Design constraints for the
-  fix (deterministic, explicit thresholds, per the no-non-determinism rule):
-  1. Two-stage TTL, sweep in each host daemon's chore tick, oldest-first by
-     filename (names embed epoch millis, so name order = age order):
-     age > 45 days → move to `~/.yggterm/clipboard/.trash/`; trash age >
-     45 more days → delete. A "something not found" event then has a 90-day
-     recovery window and the trash hop is itself reversible.
-  2. Before trashing, reference-check the (unique) filename against that
-     host's agent transcript stores (`~/.codex/sessions`, `~/.claude/projects`
-     JSONLs); referenced files get their clock reset, never silently dropped.
-  3. Size backstop: if the live dir exceeds 1 GB, evict oldest-to-trash down
-     to the cap (same reference check applies).
-  4. Local and remote hosts each sweep their OWN dir (the daemon is per-host);
-     no cross-host deletion.
 
 ## Diagnostics available
 
