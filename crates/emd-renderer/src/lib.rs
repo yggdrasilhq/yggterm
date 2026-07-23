@@ -1,6 +1,6 @@
-//! paper-renderer — the markdown-superset DOCUMENT MODEL and parser.
+//! emd-renderer — the markdown-superset DOCUMENT MODEL and parser.
 //!
-//! Spec: `docs/spec-paper-renderer.md` (yggterm repo). One sentence: source
+//! Spec: `docs/spec-emd-renderer.md` (yggterm repo). One sentence: source
 //! markdown parses into ONE typed block tree; every consumer (yedit's
 //! document surface today; paper, the notion-class app, and ztlkn, the
 //! zettelkasten app, next) renders and edits THAT tree, and edits splice
