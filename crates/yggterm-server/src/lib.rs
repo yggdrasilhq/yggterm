@@ -451,6 +451,20 @@ fn session_keep_alive(session: &ManagedSessionView) -> bool {
         .is_some_and(|entry| entry.value == RUNTIME_PERSISTENCE_KEEP_ALIVE)
 }
 
+/// Does this session kind persist by default — i.e. is it born keep-alive?
+///
+/// CLAUDE.md's first-class/second-class split, expressed as one predicate:
+/// agent CLI sessions (Codex, Codex-LiteLLM, Claude Code) are first-class and
+/// "persist by default"; plain shells (local and ssh) are second-class and
+/// survive a GUI close only when the user explicitly marks them keep-alive.
+/// Remote agent rows resolve to the same agent kinds, so they are covered too.
+fn session_kind_persists_by_default(kind: SessionKind) -> bool {
+    match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => true,
+        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => false,
+    }
+}
+
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
     if keep_alive {
         upsert_session_metadata(
@@ -6569,9 +6583,15 @@ impl YggtermServer {
                         &self.remote_machines,
                     );
                 }
-                if keep_alive {
-                    set_session_keep_alive_metadata(&mut session, true);
-                }
+                // RESTORE IS AUTHORITATIVE, birth only supplies a DEFAULT.
+                // `insert_live_session_with_launch` marks agent CLI kinds
+                // keep-alive at birth (CLAUDE.md first-class contract), so this
+                // must SET the persisted value, not merely add it — otherwise a
+                // row the user deliberately turned keep-alive OFF would come
+                // back on, and an "unkept" agent row protected as a temporary
+                // update-restore would be silently promoted to Keep Alive
+                // (a distinction daemon.rs deliberately maintains).
+                set_session_keep_alive_metadata(&mut session, keep_alive);
                 if temporary_update_restore {
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -6652,9 +6672,15 @@ impl YggtermServer {
                         self.theme,
                     );
                 }
-                if keep_alive {
-                    set_session_keep_alive_metadata(session, true);
-                }
+                // RESTORE IS AUTHORITATIVE, birth only supplies a DEFAULT.
+                // `insert_live_session_with_launch` marks agent CLI kinds
+                // keep-alive at birth (CLAUDE.md first-class contract), so this
+                // must SET the persisted value, not merely add it — otherwise a
+                // row the user deliberately turned keep-alive OFF would come
+                // back on, and an "unkept" agent row protected as a temporary
+                // update-restore would be silently promoted to Keep Alive
+                // (a distinction daemon.rs deliberately maintains).
+                set_session_keep_alive_metadata(session, keep_alive);
                 if has_saved_codex_identity {
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -6763,9 +6789,8 @@ impl YggtermServer {
                     user_visible_launch_command(&session.launch_command),
                 );
             }
-            if keep_alive {
-                set_session_keep_alive_metadata(session, true);
-            }
+            // Restore is authoritative — see the note at the sibling site above.
+            set_session_keep_alive_metadata(session, keep_alive);
             if temporary_update_restore {
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -7516,6 +7541,20 @@ impl YggtermServer {
             session.title = title_override;
         }
         session.session_path = key.to_string();
+        // AGENT CLI SESSIONS ARE KEEP-ALIVE AT BIRTH (user decision 2026-07-23).
+        // CLAUDE.md's contract: agent CLI sessions are FIRST-CLASS and "persist
+        // by default"; a plain shell is second-class and survives only if the
+        // user marks it. Nothing used to set keep-alive at birth, so a freshly
+        // created Codex/Claude Code session was the one row in the sidebar
+        // wearing the blue "closes with the app" dot while every older agent row
+        // was green — and the gap was not cosmetic. `keep_alive` is also the ONLY
+        // thing that sets `restart_protected_runtime` in
+        // `terminal_reuse_needs_restart`, so an unprotected agent session had its
+        // PTY re-spawned (and its CLI re-resumed) on any transient
+        // stale/blank-remote-attach reading. Born-green closes both.
+        if session_kind_persists_by_default(kind) {
+            set_session_keep_alive_metadata(&mut session, true);
+        }
         // Creation hook (phantom-spawn investigation, TODO-2/Bug-3 family):
         // every live-session birth through this chokepoint is traced with the
         // prior active pointer so a phantom UUIDv4 spawn (user clicked an
@@ -23341,6 +23380,7 @@ mod tests {
             hot_restart_block_reason: None,
             hot_restart_blockers: Vec::new(),
             role_enforcement: true,
+            remote_yggterm_retry_total: 0,
             server_version: server_version.to_string(),
             server_build_id: 0,
             server_pid: 0,
@@ -29798,6 +29838,38 @@ terminal_window_id: None,
         assert!(!shell.keep_alive);
     }
 
+    /// CLAUDE.md's first-class/second-class contract, pinned at the birth site.
+    /// Until 2026-07-23 NOTHING set keep-alive at birth, so a freshly created
+    /// Claude Code session wore the blue "closes with the app" dot next to a
+    /// sidebar full of green agent rows — and because keep-alive is the only
+    /// input to `restart_protected_runtime`, that session's PTY was also the one
+    /// eligible for a re-spawn (and an agent-CLI re-resume) on any transient
+    /// stale/blank remote-attach reading.
+    #[test]
+    fn agent_cli_sessions_are_born_keep_alive_and_plain_shells_are_not() {
+        use super::session_kind_persists_by_default as persists;
+        for agent in [
+            SessionKind::Codex,
+            SessionKind::CodexLiteLlm,
+            SessionKind::ClaudeCode,
+        ] {
+            assert!(
+                persists(agent),
+                "{agent:?} is a FIRST-CLASS agent CLI session — CLAUDE.md says it persists by default"
+            );
+        }
+        for second_class in [
+            SessionKind::Shell,
+            SessionKind::SshShell,
+            SessionKind::Document,
+        ] {
+            assert!(
+                !persists(second_class),
+                "{second_class:?} is second-class — keep-alive stays an explicit user choice"
+            );
+        }
+    }
+
     #[test]
     fn restore_persisted_state_preserves_active_keep_alive_remote_over_update_restart_local() {
         let tree = SessionNode {
@@ -33610,6 +33682,7 @@ terminal_window_id: None,
             hot_restart_block_reason: None,
             hot_restart_blockers: Vec::new(),
             role_enforcement: true,
+            remote_yggterm_retry_total: 0,
             server_version: "2.1.41".to_string(),
             server_build_id: 41,
             server_pid: 0,

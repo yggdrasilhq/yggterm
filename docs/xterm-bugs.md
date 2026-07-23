@@ -51,6 +51,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PARTIAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
+| [input-dead-after-window-refocus](#input-dead-after-window-refocus) | Viewport blinks and swallows keystrokes for ~3s, repeatedly; first reported as "cannot type after coming back from another window" | ROOT-CAUSED + FIXED 2026-07-23 (2.12.4) — progressive migration treated ANY reachable daemon as a successor and released the live daemon's own agent PTYs once a tick, re-resuming the CLI under the user's fingers. Successor now means strictly-newer + a returning key stops being released. Contributing: agent sessions born non-keep-alive (hence restart-unprotected), and the passive focus watchdog gated on the Wayland-lying `document.hasFocus()`. Probes kept: `ui/window_focus/transition`, `ui/input_policy/applied`, `input_dead_ms`, `passive_focus_recovery_state` |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
 
 ---
@@ -1802,6 +1803,125 @@ site carries a breadcrumb defined before the first wipe.
 
 `[[campaign-telemetry-infinite]]`, `[[feedback-verify-visual-with-faithful-pixel]]`,
 `[[xterm-host-registry-leak]]` (same registry, different failure).
+
+---
+
+## input-dead-after-window-refocus
+
+**STATUS:** ROOT-CAUSED + FIXED 2026-07-23 (2.12.4). The cause was NOT in the
+focus path at all — full write-up in `docs/pending-bugs.md`. The daemon's
+retiring-predecessor handoff was releasing the LIVE daemon's own agent sessions
+because it treated any reachable peer as a successor; each release re-spawned
+the PTY and re-resumed the agent CLI, which is the blink + dead keystrokes the
+user saw. The focus-path findings below stand as a contributing defect and as
+the probe set to reach for next time.
+
+### Symptom
+
+User (2026-07-23): "I cannot type in the current session if I switch to another
+window, say chromium, and come back to yggterm. Rendering is fine, but the
+viewport will not take any inputs." Workaround the user found: switch to another
+session and back, after which input works again.
+
+Rendering staying correct is the diagnostic centre of gravity: the write path
+(daemon → write bridge → xterm) is entirely independent of the input path
+(keyboard → helper textarea → PTY), so a viewport that keeps painting while
+swallowing keys means the *input* half is gated off, not that the session died.
+
+### Reproduction
+
+Not yet captured deterministically. On jojo the obvious route does NOT
+reproduce: driving a genuine compositor focus-out/focus-in cycle (a `kdialog`
+window steals focus, then is destroyed) recovers cleanly every time, at 6s and at
+118s away — the poller recorded `inputEnabled` going back to `true` and DOM focus
+returning to `.xterm-helper-textarea` within one sample. The untested variant is
+focus returning by ACTIVATION while the competing window stays alive (a real
+Alt+Tab or a click on the yggterm window); that could not be synthesised because
+KWin force-activate is refused on this host (`kwin_active=false`, the same
+refusal `screenshot --backend os` reports).
+
+Two candidate mechanisms remain, and the probes below were built to tell them
+apart on the next occurrence:
+
+1. **Rust gate stuck closed.** A trailing/spurious tao `WindowEvent::Focused(false)`
+   after the return leaves `shell.window_focused == false`, so
+   `terminal_runtime_input_policy` keeps `allow_input=false` and xterm keeps
+   `disableStdin=true`. Switching sessions repairs it because
+   `schedule_terminal_focus_after_activation` sets `terminal_input_override_active`,
+   which is the documented bypass for a lagging focus observer.
+   → `ui/window_focus/transition` + `ui/input_policy/applied` decide this one.
+2. **DOM focus drift.** Input is re-enabled but `document.activeElement` stays on
+   `<body>`, so keys go nowhere. → `passive_focus_recovery_state` +
+   `input_dead_ms` decide this one.
+
+### Root cause
+
+Not yet established. One CONTRIBUTING defect is root-caused and fixed: the
+passive focus watchdog — the only thing in the app that repairs "the terminal is
+live but `<body>` holds focus" — bailed out whenever `document.hasFocus()` was
+false. On KDE/Wayland that is a measured false negative for a visibly foreground
+window (`[[finding-wayland-focus-gate-squished-viewport]]`; the same substitution
+was already made for the active write-frame budget and for the grid fit). It was
+also redundant: rust only opens `inputEnabled` when
+`(window_focused || terminal_input_override_active) && !app_control_backgrounded`,
+so `!inputEnabled` already enforces the window-focus condition one line above.
+
+The precondition was measured live on jojo 2026-07-23: on the return leg of a
+focus cycle the poller caught `document.hasFocus()===false` while rust had
+already re-opened the input gate (`inputEnabled=true`, `policyReason=changed`).
+For those ~2.5s the passive repair was switched off — the exact window in which
+focus drift after a refocus would be unrecoverable.
+
+### Workaround / fix
+
+- Removed the `document.hasFocus()` gate from the passive focus watchdog; the
+  classifier now returns a named state instead of a bare bool.
+- Focusing an element in an unfocused document does not raise or activate the
+  window, so removing the gate cannot steal OS focus from another app.
+- User-facing workaround until the root cause is closed: switch session and back
+  (sets the input override), or click in the viewport (`onmousedown` →
+  `reclaim_active_terminal_input_from_viewport_click`, plus the pointer-release
+  focus ladder).
+
+### Code locations
+
+- `crates/yggterm-shell/src/shell.rs` — `passiveFocusRecoveryState` /
+  `recordPassiveFocusRecoveryState` / `inputDriftWatchdog` (webview classifier +
+  probe), `set_window_focused` (focus-transition trace),
+  `trace_active_terminal_input_policy` (policy trace),
+  `terminal_runtime_input_policy` (the gate itself).
+
+### Tests
+
+`terminal_eval_script_declares_sync_focus_before_stretch_root_uses_it` asserts
+the ABSENCE of the `document.hasFocus()` gate (a reversed regression lock — it
+used to assert its presence), the presence of the classifier, of the
+`rust_gate_closed_while_window_focused` verdict, and of the `inputDeadMs` probe.
+
+### Telemetry
+
+- `ui/window_focus/transition` — one line per real focus change, with
+  `focused`, `was_focused`, `app_control_backgrounded`,
+  `terminal_input_override_active`, `active_session_path`. A missing `focused:true`
+  after a return, or a spurious trailing `focused:false`, is mechanism 1.
+- `ui/input_policy/applied` — deduped on the decision: `allow_input`,
+  `focus_input` plus every gate that produced them.
+- `app state` → `active_terminal_hosts[].passive_focus_recovery_state` — one of
+  `focused`, `recoverable`, `ui_focus_claim`, `foreign_active_element`,
+  `host_not_input_owner`, `input_disabled`,
+  `rust_gate_closed_while_window_focused`.
+- `app state` → `input_dead_ms` / `input_dead_since_ms` /
+  `input_dead_active_element` — how long the live terminal has been unable to
+  receive keystrokes. **This is the field to read first on the next report**;
+  `helper_textarea_focused:false` alone never distinguished "not clicked in yet"
+  from "keys have gone nowhere for a minute".
+- `input_dead host=… state=… dead_ms=…` debug line in the trace after two
+  watchdog ticks in the dead state, rate-limited to one per 30s per host.
+
+### Related memory
+
+`[[finding-wayland-focus-gate-squished-viewport]]` (same instrument, two earlier
+sites), `[[spec-xterm-gating-ux]]`.
 
 ---
 
