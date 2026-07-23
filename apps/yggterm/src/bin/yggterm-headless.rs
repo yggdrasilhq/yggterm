@@ -2158,11 +2158,13 @@ fn main() -> Result<()> {
                                 None
                             }
                         });
+                        let activate = !args.iter().any(|arg| arg == "--no-activate");
                         run_app_control_create_terminal(
                             machine_key,
                             cwd,
                             title_hint,
                             kind,
+                            activate,
                             timeout_ms,
                         )
                     }

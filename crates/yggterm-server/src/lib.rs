@@ -2631,6 +2631,18 @@ impl YggtermServer {
         Ok(())
     }
 
+    /// Restore the active session/view after a no-activate (agent-driven)
+    /// session creation: the interactive snapshot from a create marks the NEW
+    /// session active, and the agent must hand the view straight back — both
+    /// mutations land before the next render, so the user never sees a flash.
+    /// No-op when the previous path no longer resolves.
+    pub fn restore_active_session(&mut self, path: &str, view_mode: WorkspaceViewMode) {
+        if self.resolve_session_storage_key(path).is_some() || self.sessions.contains_key(path) {
+            self.active_session_path = Some(path.to_string());
+            self.active_view_mode = view_mode;
+        }
+    }
+
     pub fn request_terminal_launch_for_path(&mut self, path: &str) {
         let resolved_key = self.resolve_session_storage_key(path).map(str::to_string);
         if let Ok(home) = resolve_yggterm_home() {
@@ -18130,6 +18142,7 @@ pub fn run_app_control_create_terminal(
     cwd: Option<&str>,
     title_hint: Option<&str>,
     kind: Option<&str>,
+    activate: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -18140,6 +18153,7 @@ pub fn run_app_control_create_terminal(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             session_kind: kind.map(parse_app_control_session_kind).transpose()?,
+            activate: Some(activate),
         },
         timeout_ms,
     )?;
@@ -19386,6 +19400,24 @@ pub fn run_app_control_web_surface_do(
 /// Claim a session's web surface so the background reaper leaves it alone while
 /// unattended agent work runs (agent control plane `lease`, slice 2b). The lease
 /// only ever EXTENDS the background hold; `ttl_secs: 0` releases it.
+pub fn run_app_control_ensure_web_surface(
+    session_path: &str,
+    ttl_secs: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::EnsureWebSurface {
+            session_path: session_path.to_string(),
+            ttl_secs,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_web_surface_lease(
     session_path: Option<&str>,
     ttl_secs: u64,

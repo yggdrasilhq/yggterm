@@ -39,7 +39,16 @@ Any probe that changes what the viewport shows — `app open`, view switches,
 search, session inspection — MUST run against a **shadow view client**, not the
 user's GUI. The user reported the foreground-driving probes directly ("can't
 you use the agent control client mode — we built it for exactly this") and the
-answer is yes, it works end-to-end:
+answer is yes, it works end-to-end.
+
+**The shadow is a FIRST-CLASS tool (user ruling 2026-07-23):**
+pixels-of-a-non-active-view is the most load-bearing bug-bash instrument that
+does not disturb the user — don't treat it as a last resort. ⚠ Platform note
+(same ruling): the `--client`/role model is platform-neutral; sway+grim is
+only the LINUX backend of the shadow-view concept. yggterm is heading to
+Windows/macOS (and Android/iOS in a private repo), so never let core-plane
+code grow a compositor dependency — new shadow work goes behind a
+per-platform backend seam.
 
 ```bash
 # One-time per work session (idempotent; reuses a running shadow):
@@ -75,6 +84,36 @@ ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh stop --name agen
   start-page observation and for parking view switches; read terminal
   CONTENT via `terminal read-buffer <session>` or `server snapshot`
   (read-only, safe untargeted — they never move the user's view).
+
+### Background work WITHOUT the shadow (the verbs plane — prefer these for ACTION)
+
+The settled model ([[spec-agent-shadow-client-control]]): agents ACT on the
+user's own GUI against backgrounded sessions; the user can switch in anytime
+and watch (agent-presence cursor). The enabling verbs:
+
+```bash
+# Spawn a session WITHOUT switching the user's view (agent probe/work spawns):
+yggterm server app terminal new --kind shell --no-activate
+# Materialize a BACKGROUNDED session's declared web surfaces into the soft
+# stash (created + demoted + leased, never revealed) so web do/read/wait
+# verbs can drive them immediately:
+yggterm server app web ensure --session <path> [--ttl <secs>]
+# Then automate invisibly:
+yggterm server app web do click --selector "#submit" --session <path>
+yggterm server app web read --as readable --session <path>
+yggterm server app web wait --until load:finished --session <path>
+```
+
+Recipe for invisible ychrome automation on a live session: `terminal new
+--no-activate` (or target an existing session) → `terminal send <session>`
+to run `ychrome <url>` there → `web ensure --session <session>` →
+`do/read/wait`. Pass `--agent <id>` so the user sees your cursor if they
+switch in. ⚠ One seam (Dream §2, open): a NEVER-revealed session's FIRST
+declare needs one brief reveal+restore (~5s) — the OSC declare is parsed by
+the client-side terminal script, which a never-revealed session doesn't
+have. After that first declare, `web ensure` re-materializes headless
+forever (live-proven: background read + per-surface screenshot with the
+user's view untouched).
 
 ## Screenshot
 
