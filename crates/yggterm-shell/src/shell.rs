@@ -1597,6 +1597,14 @@ const DOCUMENT_PANE_DEFAULT_VIEW: &str = "";
 struct DocumentPaneChannel {
     schema: Option<AppPaneSchemaState>,
     values: HashMap<String, String>,
+    /// The last values the GUI POSTed up to the app (a draft sync or an
+    /// action). A schema whose declared value merely ECHOES one of these is
+    /// the app repeating back the user's own draft — it must NOT remount the
+    /// field (which would yank focus and reset the caret mid-type), even when
+    /// the live draft has since run ahead of it. Only a declared value that is
+    /// neither the live draft NOR an echo of what we sent is genuine new
+    /// content (a note switch, a reload-from-disk) worth adopting.
+    last_sent: HashMap<String, String>,
     error: Option<String>,
     request_seq: u64,
 }
@@ -1927,6 +1935,14 @@ enum AppPaneWidget {
         row_action: String,
         #[serde(default)]
         actions: Vec<AppPaneRowAction>,
+        /// Right-click context-menu items for this row (yggterm draws the
+        /// floating menu at the cursor; a click POSTs the item's action with
+        /// this row's id as its value, exactly like `actions`). Empty = the
+        /// row has no context menu, and a right-click falls through to the
+        /// platform default. The app owns what the menu offers (yedit's
+        /// Rename / Close); yggterm owns only how it is drawn and dismissed.
+        #[serde(default)]
+        menu: Vec<AppPaneRowAction>,
     },
     /// A compact horizontal row of icon buttons — the quick-actions strip
     /// (MS-Office quick access shape) at the top of an app's sidebar.
@@ -1973,6 +1989,19 @@ struct AppPaneRowAction {
     label: String,
     #[serde(default)]
     title: String,
+}
+
+/// An open right-click menu over a contributed rail row. yggterm owns the
+/// floating draw + dismissal; the app owns the items (declared on the row) and
+/// performs the chosen action. Keyed by the pane + row it was opened on so the
+/// click POSTs back to the right app with the right row id.
+#[derive(Debug, Clone, PartialEq)]
+struct AppPaneContextMenu {
+    pane_id: String,
+    row_id: String,
+    items: Vec<AppPaneRowAction>,
+    /// Client coordinates of the right-click, where the menu's top-left anchors.
+    position: (f64, f64),
 }
 
 /// What an action POST returns: any of a fresh schema to re-render, a message
@@ -5088,6 +5117,9 @@ struct ShellState {
     /// Bumped on every pane open / action so a late reply from a superseded
     /// fetch cannot overwrite a newer schema.
     app_pane_request_seq: u64,
+    /// The open right-click menu over a contributed rail row, if any. yggterm
+    /// draws + dismisses it; the app owns the items and the action.
+    app_pane_context_menu: Option<AppPaneContextMenu>,
     /// The DOCUMENT channels — one per (session, view context), Phase 3's
     /// keyed generalization of the old single slot. Deliberately separate
     /// from the rail's `app_pane_schema`: both can be open at once, and a
@@ -5650,6 +5682,12 @@ struct RenderSnapshot {
     /// The mode a hidden rail reveals/docks to — the last one it actually showed.
     /// SSOT for reveal content AND the resize-grip un-hide, so they agree.
     right_panel_restore_mode: RightPanelMode,
+    /// What a HIDDEN rail's hover-reveal actually renders: the remembered mode
+    /// resolved through the same tenancy/liveness rules the docked rail gets,
+    /// so a dead `WebTabs` never reveals as an empty "No web surface" rail and
+    /// a document app's own sidebar reveals instead. Computed once per frame by
+    /// `revealed_right_panel_mode`.
+    right_panel_reveal_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
     selected_row: Option<BrowserRow>,
@@ -5688,6 +5726,8 @@ struct RenderSnapshot {
     /// error from fetching it.
     app_pane_schema: Option<AppPaneSchemaState>,
     app_pane_error: Option<String>,
+    /// The open right-click menu over a contributed rail row, if any.
+    app_pane_context_menu: Option<AppPaneContextMenu>,
     /// DOCUMENT SURFACES by session, one per CO-VISIBLE session (the active
     /// session + the active split group's members) that declares a
     /// viewport-placement pane. Values carry the live editor draft — the
@@ -6945,6 +6985,7 @@ impl ShellState {
             right_panel_mode_before_web_tabs: None,
             app_pane_error: None,
             app_pane_request_seq: 0,
+            app_pane_context_menu: None,
             document_panes: HashMap::new(),
             document_draft_sync: HashMap::new(),
             document_surface_hidden: HashSet::new(),
@@ -7681,6 +7722,7 @@ impl ShellState {
             // renders and what a titlebar button acts on cannot disagree.
             right_panel_mode: self.displayed_right_panel_mode(),
             right_panel_restore_mode: self.right_panel_restore_mode.clone(),
+            right_panel_reveal_mode: self.revealed_right_panel_mode(current_millis()),
             rows,
             selected_path,
             selected_row,
@@ -7738,6 +7780,7 @@ impl ShellState {
             apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
+            app_pane_context_menu: self.app_pane_context_menu.clone(),
             // Document surfaces for every CO-VISIBLE session: the active
             // session plus the active split group's members ([[campaign-
             // libyggterm]] Phase 3 — a doc pane beside a terminal pane).
@@ -10176,7 +10219,10 @@ impl ShellState {
         // resizes — exactly as the left tree's grip re-opens the tree. So the
         // rail is draggable in hidden mode too, at parity with the left sidebar.
         if self.right_panel_mode == RightPanelMode::Hidden {
-            self.set_right_panel_mode(self.right_panel_restore_mode.clone());
+            // Dock to the SAME resolved mode the hover-reveal shows, so the
+            // grip can never dock a dead WebTabs rail while the reveal shows
+            // the app's sidebar (or vice versa).
+            self.set_right_panel_mode(self.revealed_right_panel_mode(current_millis()));
         }
         self.rail_resize_drag = Some(SidebarResizeDrag {
             origin_client_x: client_x,
@@ -10505,6 +10551,70 @@ impl ShellState {
                     .any(|pane| pane.id == pane_id)
             })
     }
+    /// What a HIDDEN right rail reveals (or un-hides) to. The docked rail is
+    /// resolved through `effective_right_panel_mode` so it can never show a
+    /// dead tenant — a `WebTabs` rail with no live web surface, or an app pane
+    /// the active session no longer offers. The hover-reveal and the resize-
+    /// grip un-hide MUST use the same resolution, or the reveal surfaces the
+    /// near-blank "No web surface is open" rail on a session that never had a
+    /// surface (the yedit-hidden-sidebar bug). One owner for "what the rail
+    /// shows", docked or revealed.
+    ///
+    /// Seeded from `right_panel_restore_mode` (the last mode the rail actually
+    /// showed) rather than the current mode (which is Hidden). A remembered
+    /// mode that resolves to nothing valid falls back to the active session's
+    /// own contributed rail pane when it has one — a document app's sidebar is
+    /// intrinsic to using it — and to Metadata otherwise (a rail that always
+    /// has content), never a blank WebTabs. Takes `now_ms` so contribution
+    /// liveness is resolved against the same clock as the rest of the frame.
+    fn revealed_right_panel_mode(&self, now_ms: u64) -> RightPanelMode {
+        // The active session's live rail panes (a document app's intrinsic
+        // sidebar — yedit's notes tabs), resolved at this frame's clock.
+        let active_rail_panes: Vec<String> = self
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .map(|path| {
+                self.active_sidebar_panes(&path, now_ms)
+                    .into_iter()
+                    .map(|pane| pane.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let offers = |pane_id: &str| active_rail_panes.iter().any(|id| id == pane_id);
+        // Walk the same tenancy fallback the docked rail uses, seeded with the
+        // remembered mode instead of the (Hidden) current one. Each dead tenant
+        // stands down by its own rule, re-checked per encountered pane.
+        let mut mode = self.right_panel_restore_mode.clone();
+        let settled = 'resolve: {
+            for _ in 0..2 {
+                mode = match &mode {
+                    RightPanelMode::AppPane(pane_id) if !offers(pane_id) => self
+                        .right_panel_mode_before_app_pane
+                        .clone()
+                        .unwrap_or(RightPanelMode::Hidden),
+                    RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms) => self
+                        .right_panel_mode_before_web_tabs
+                        .clone()
+                        .unwrap_or(RightPanelMode::Hidden),
+                    other => break 'resolve other.clone(),
+                };
+            }
+            mode.clone()
+        };
+        let dead = matches!(&settled, RightPanelMode::AppPane(pane_id) if !offers(pane_id))
+            || matches!(&settled, RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms))
+            || settled == RightPanelMode::Hidden;
+        if dead {
+            // A document app's rail is what the user means by "reveal my
+            // sidebar"; fall to it before any generic rail.
+            if let Some(pane_id) = active_rail_panes.first() {
+                return RightPanelMode::AppPane(pane_id.clone());
+            }
+            return RightPanelMode::Metadata;
+        }
+        settled
+    }
     /// Draft input values never survive a pane switch: a search term or an
     /// add-form password belongs to the pane the user was looking at.
     fn clear_app_pane_draft(&mut self) {
@@ -10512,6 +10622,8 @@ impl ShellState {
         self.app_pane_values.clear();
         self.app_pane_error = None;
         self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
+        // A row menu belongs to the pane it was opened over; a pane hop retires it.
+        self.app_pane_context_menu = None;
     }
     /// Claim the next request sequence. A reply carrying a stale sequence is
     /// dropped, so a slow schema fetch cannot overwrite the newer schema an
@@ -10582,6 +10694,29 @@ impl ShellState {
     fn set_app_pane_value(&mut self, widget_id: &str, value: String) {
         self.app_pane_values.insert(widget_id.to_string(), value);
     }
+    /// Open the right-click menu for a contributed rail row. Empty items = no
+    /// menu (a right-click on a menu-less row is a no-op, leaving the platform
+    /// default). One menu at a time — a new right-click replaces any open one.
+    fn open_app_pane_context_menu(
+        &mut self,
+        pane_id: String,
+        row_id: String,
+        items: Vec<AppPaneRowAction>,
+        position: (f64, f64),
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        self.app_pane_context_menu = Some(AppPaneContextMenu {
+            pane_id,
+            row_id,
+            items,
+            position,
+        });
+    }
+    fn close_app_pane_context_menu(&mut self) {
+        self.app_pane_context_menu = None;
+    }
     // ===== the DOCUMENT SURFACE's schema channel =====
     // A viewport-placement pane rendered as shell DOM in the main viewport.
     // Same contract as the rail channel (the app owns every value, epochs
@@ -10632,22 +10767,48 @@ impl ShellState {
             .unwrap_or_default();
         let mut value_epochs: HashMap<String, u64> = HashMap::new();
         let mut values: HashMap<String, String> = HashMap::new();
+        let mut last_sent: HashMap<String, String> = HashMap::new();
         for widget in &schema.widgets {
             let Some((id, declared)) = widget.declared_value() else {
                 continue;
             };
             let epoch = previous_epochs.get(id).copied().unwrap_or(0);
-            let unchanged = channel
+            // The field is undisturbed when the app declares the value it is
+            // already showing, OR when it merely echoes a draft the GUI sent up
+            // — the search box echoes on Enter, and a multiline editor's draft
+            // sync echoes the buffer WHILE the user keeps typing past it. In
+            // both cases the live draft is the truth: keep it, and do NOT bump
+            // the epoch (which keys — and so would remount — the uncontrolled
+            // input, stealing focus and the caret). Only a declared value that
+            // is neither the live draft nor an echo of our own POST is genuine
+            // new content (a note switch, a reload) the field must adopt.
+            let matches_live_draft = channel
                 .values
                 .get(id)
                 .is_some_and(|shown| *shown == declared);
+            let is_echo_of_sent = channel
+                .last_sent
+                .get(id)
+                .is_some_and(|sent| *sent == declared);
+            let undisturbed = matches_live_draft || is_echo_of_sent;
             value_epochs.insert(
                 id.to_string(),
-                if unchanged { epoch } else { epoch.wrapping_add(1) },
+                if undisturbed { epoch } else { epoch.wrapping_add(1) },
             );
-            values.insert(id.to_string(), declared);
+            // Keep the user's live draft when the app is only echoing; adopt the
+            // declared value when it is genuinely new content.
+            let kept = if undisturbed {
+                channel.values.get(id).cloned().unwrap_or_else(|| declared.clone())
+            } else {
+                declared.clone()
+            };
+            values.insert(id.to_string(), kept);
+            // The app now knows this declared value; it becomes the settled
+            // baseline for the next echo comparison.
+            last_sent.insert(id.to_string(), declared);
         }
         channel.values = values;
+        channel.last_sent = last_sent;
         channel.error = None;
         channel.schema = Some(AppPaneSchemaState {
             pane_id: pane_id.to_string(),
@@ -10685,6 +10846,19 @@ impl ShellState {
             .or_default()
             .values
             .insert(widget_id.to_string(), value);
+    }
+    /// Record the draft we are about to POST to the app as the settled
+    /// baseline. When the app echoes any of these values back in its next
+    /// schema, the echo must not remount the field (see `last_sent` on
+    /// [`DocumentPaneChannel`]). Called the instant before every document
+    /// action/draft POST leaves the GUI.
+    fn document_pane_mark_sent(&mut self, session_path: &str) {
+        if let Some(channel) = self
+            .document_panes
+            .get_mut(&Self::document_pane_key(session_path))
+        {
+            channel.last_sent = channel.values.clone();
+        }
     }
     /// The debounced GUI→app draft sync's decision fn, run once per poll
     /// tick per co-visible session. Returns the pane to POST `draft` to iff:
@@ -44674,7 +44848,13 @@ async fn document_pane_run_action(
     if let (Some(value), Some(map)) = (value, values.as_object_mut()) {
         map.insert("value".to_string(), serde_json::Value::String(value));
     }
-    let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
+    // The draft we are sending becomes the echo baseline: the reply (or a later
+    // stamp-driven refetch) will re-declare these very values, and that echo
+    // must not remount the editor out from under a still-typing user.
+    let seq = state.with_mut(|shell| {
+        shell.document_pane_mark_sent(&session_path);
+        shell.document_pane_next_request(&session_path)
+    });
     let url = app_pane_action_url(&control_url);
     let body = json!({ "pane": pane_id, "action": action, "values": values });
     let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
@@ -56974,6 +57154,25 @@ fn app() -> Element {
                 // default path pays nothing.
                 if !snapshot.agent_cursors.is_empty() {
                     AgentCursorOverlay { cursors: snapshot.agent_cursors.clone() }
+                }
+                // A contributed rail row's right-click menu (yedit's Rename /
+                // Close). GUI-owned floating draw; the item POSTs its action to
+                // the app with the row id.
+                if let Some(menu) = snapshot.app_pane_context_menu.clone() {
+                    AppPaneContextMenuOverlay {
+                        menu,
+                        palette: snapshot.palette,
+                        on_app_pane_action: {
+                            let desktop = desktop.clone();
+                            move |(pane_id, action, value): (String, String, Option<String>)| {
+                                let desktop = desktop.clone();
+                                spawn(app_pane_run_action(state, desktop, pane_id, action, value));
+                            }
+                        },
+                        on_close: move |_| {
+                            state.with_mut(|shell| shell.close_app_pane_context_menu());
+                        },
+                    }
                 }
                 if let Some(row) = context_menu_overlay.clone() {
                     ContextMenuOverlay {
@@ -90304,12 +90503,16 @@ fn RightRail(
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode.clone();
     // The mode a HIDDEN rail reveals to is the shell's authoritative
-    // `right_panel_restore_mode` (the last mode it actually showed) — the SAME
-    // value the resize-grip un-hides to, so hover-reveal and drag-dock can never
-    // disagree. Replaces a component-local `retained_mode` signal that lagged and
-    // showed Metadata even after the user had switched to Settings (the
-    // "hardlocked to session metadata" report, 2026-07-21).
-    let restore_mode = snapshot.right_panel_restore_mode.clone();
+    // `right_panel_reveal_mode` — `right_panel_restore_mode` (the last mode it
+    // actually showed) RESOLVED through the same tenancy/liveness rules the
+    // docked rail gets, so the reveal can never surface a dead `WebTabs` rail
+    // ("No web surface is open") on a session that never had a surface, and a
+    // document app's own sidebar reveals instead (the yedit hidden-sidebar
+    // bug). The resize-grip un-hide uses the SAME value, so hover-reveal and
+    // drag-dock can never disagree. Replaces a component-local `retained_mode`
+    // signal that lagged and showed Metadata even after the user had switched
+    // to Settings (the "hardlocked to session metadata" report, 2026-07-21).
+    let restore_mode = snapshot.right_panel_reveal_mode.clone();
     // A contributed pane lives and dies with its declaration: when the app stops
     // declaring (exited, session switched, contribution swept) the pane
     // collapses, and it re-reveals when the app is back.
@@ -90434,6 +90637,7 @@ fn RightRail(
                     pane_id: rendered_app_pane_id.clone().unwrap_or_default(),
                     on_app_pane_action,
                     on_app_pane_value,
+                    state,
                 }
             }
             }
@@ -92076,12 +92280,73 @@ fn DocumentSurfaceBody(
     }
 }
 
+/// The floating right-click menu over a contributed rail row (yedit's Rename /
+/// Close). yggterm owns the draw + dismissal; the app owns the items. A click
+/// anywhere (or another right-click) dismisses; an item POSTs its action with
+/// the row id, then closes. Anchored with its RIGHT edge at the cursor so a
+/// right-side rail's menu opens leftward and stays on-screen.
+#[component]
+fn AppPaneContextMenuOverlay(
+    menu: AppPaneContextMenu,
+    palette: Palette,
+    on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let (x, y) = menu.position;
+    let placement = format!(
+        "right:calc(100vw - {:.0}px); top:min({:.0}px, calc(100vh - 220px));",
+        x.max(0.0),
+        y.max(8.0),
+    );
+    let surface = context_menu_surface_style(palette, &placement, "blur(18px)");
+    rsx! {
+        div {
+            style: "position:fixed; inset:0; z-index:2147483000;",
+            onclick: move |_| on_close.call(()),
+            oncontextmenu: move |evt: MouseEvent| {
+                evt.prevent_default();
+                on_close.call(());
+            },
+            div {
+                "data-app-pane-context-menu": "{menu.pane_id}",
+                style: "{surface}",
+                onclick: move |evt: MouseEvent| evt.stop_propagation(),
+                for item in menu.items.iter().cloned() {
+                    button {
+                        key: "{item.action}",
+                        "data-app-pane-menu-item": "{item.action}",
+                        style: context_menu_action_style(palette, false),
+                        title: "{item.title}",
+                        onclick: {
+                            let (pane_id, action, row_id) =
+                                (menu.pane_id.clone(), item.action.clone(), menu.row_id.clone());
+                            move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                on_app_pane_action.call((
+                                    pane_id.clone(),
+                                    action.clone(),
+                                    Some(row_id.clone()),
+                                ));
+                                on_close.call(());
+                            }
+                        },
+                        "{item.label}"
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
     pane_id: String,
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     on_app_pane_value: EventHandler<(String, String)>,
+    /// A row's right-click opens its context menu on the shell state directly —
+    /// a GUI-owned floating overlay, not an app schema.
+    state: Signal<ShellState>,
 ) -> Element {
     let palette = snapshot.palette;
     let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
@@ -92379,16 +92644,39 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions } => {
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu } => {
                                 // The SHARED row engine (Phase 1): same anatomy
                                 // and metrics as the cwdtree rows and WebTabs
                                 // rail — whole-row clickable, selected tinted,
                                 // tiny trailing actions.
                                 let clickable = !row_action.is_empty();
+                                let has_menu = !menu.is_empty();
                                 rsx! {
                                     div {
                                         key: "{widget_key}",
                                         style: if follows_row { "margin-top:-8px;" } else { "" },
+                                        // Right-click opens the app-declared row
+                                        // menu as a GUI-owned floating overlay.
+                                        oncontextmenu: {
+                                            let (pane_id, row_id, menu) =
+                                                (pane_id.clone(), id.clone(), menu.clone());
+                                            let mut state = state;
+                                            move |evt: MouseEvent| {
+                                                if !has_menu {
+                                                    return;
+                                                }
+                                                evt.prevent_default();
+                                                let pos = evt.client_coordinates();
+                                                state.with_mut(|shell| {
+                                                    shell.open_app_pane_context_menu(
+                                                        pane_id.clone(),
+                                                        row_id.clone(),
+                                                        menu.clone(),
+                                                        (pos.x, pos.y),
+                                                    );
+                                                });
+                                            }
+                                        },
                                     SessionStyleRow {
                                         "data-app-pane-row": "{id}",
                                         density: SessionRowDensity::Rail,
@@ -99583,6 +99871,44 @@ mod tests {
         );
     }
 
+    // The yedit hidden-sidebar bug: a HIDDEN rail's hover-reveal (and resize-
+    // grip un-hide) must resolve the remembered mode through the same
+    // tenancy/liveness rules the docked rail gets, so it can never surface the
+    // empty "No web surface is open" WebTabs rail on a document session that
+    // never had a surface — it reveals the document app's own sidebar instead.
+    #[test]
+    fn a_hidden_rail_reveals_the_apps_sidebar_not_a_dead_web_tabs_rail() {
+        // yedit is active and offers a "notes" rail; the remembered mode is a
+        // stale WebTabs left by an earlier browser session, and this session
+        // has no web surface.
+        let mut shell = shell_with_rail_pane("local://yedit", "notes", 1_000);
+        shell.right_panel_mode = RightPanelMode::Hidden;
+        shell.right_panel_restore_mode = RightPanelMode::WebTabs;
+        shell.right_panel_mode_before_web_tabs = None;
+        assert_eq!(
+            shell.revealed_right_panel_mode(1_000),
+            RightPanelMode::AppPane("notes".to_string()),
+            "the reveal shows the active app's sidebar, never a dead WebTabs rail"
+        );
+
+        // With no app sidebar to fall to, a dead WebTabs still never reveals —
+        // it resolves to Metadata (a rail that always has content).
+        let bootstrap = test_shell_bootstrap_with_active_session("local://plain");
+        let mut plain = ShellState::new(bootstrap);
+        plain.right_panel_mode = RightPanelMode::Hidden;
+        plain.right_panel_restore_mode = RightPanelMode::WebTabs;
+        plain.right_panel_mode_before_web_tabs = None;
+        assert_eq!(
+            plain.revealed_right_panel_mode(1_000),
+            RightPanelMode::Metadata,
+            "a dead WebTabs reveal falls back to Metadata, never the empty tab rail"
+        );
+
+        // A remembered Metadata rail is a valid user choice and is preserved.
+        plain.right_panel_restore_mode = RightPanelMode::Metadata;
+        assert_eq!(plain.revealed_right_panel_mode(1_000), RightPanelMode::Metadata);
+    }
+
     // The rail stack, mutation half: changing the rail while the pane is
     // DISPLACED (its session not active) edits the BASE — the pane's tenancy
     // survives and returning to its session restores it. On the pane's own
@@ -99689,6 +100015,74 @@ mod tests {
             "replies never create a channel"
         );
         assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
+    }
+
+    // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
+    // a bumped epoch remounts the node and yanks focus + caret. A draft sync
+    // POSTs the buffer for crash safety, the app echoes it back, and the user
+    // keeps typing PAST the echo — so the echo must not be mistaken for new
+    // content and remount the field mid-type (the "focus stolen, spam-click to
+    // write" bug). Genuinely new content the GUI never typed still remounts.
+    #[test]
+    fn a_draft_echo_never_remounts_the_editor_but_new_content_does() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let editor = |value: &str| AppPaneSchema {
+            title: "Doc".to_string(),
+            widgets: vec![AppPaneWidget::TextInput {
+                id: "editor".into(),
+                label: String::new(),
+                placeholder: String::new(),
+                value: value.to_string(),
+                action: String::new(),
+                secret: false,
+                multiline: true,
+                rows: 0,
+                line_numbers: true,
+                word_wrap: true,
+            }],
+            footer: Vec::new(),
+        };
+        let epoch = |shell: &ShellState| {
+            shell
+                .document_pane_channel("local://a")
+                .and_then(|c| c.schema.as_ref())
+                .and_then(|s| s.value_epochs.get("editor").copied())
+                .expect("the editor has a value epoch")
+        };
+
+        // The editor mounts with "hello".
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", editor("hello"));
+        let mounted = epoch(&shell);
+
+        // The user types past the buffer; the draft syncs (mark_sent); the user
+        // keeps typing, so the live draft now runs AHEAD of what we sent.
+        shell.set_document_pane_value("local://a", "editor", "hello world".into());
+        shell.document_pane_mark_sent("local://a");
+        shell.set_document_pane_value("local://a", "editor", "hello world!!".into());
+
+        // The app echoes the synced draft: no remount, and the newer live draft
+        // survives untouched.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", editor("hello world"));
+        assert_eq!(epoch(&shell), mounted, "a draft echo must not remount the editor");
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!("hello world!!"),
+            "the live draft survives the echo"
+        );
+
+        // Genuine new content (a note switch / reload the GUI never typed) DOES
+        // remount, and the field adopts the app's value.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", editor("# a different note"));
+        assert_ne!(epoch(&shell), mounted, "new content the user never typed remounts");
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!("# a different note"),
+            "the editor adopts genuinely new content"
+        );
     }
 
     // Endpoint-ping liveness (Phase 2): a ping reply is the PTY declare's
@@ -106700,6 +107094,7 @@ mod tests {
             title: String::new(),
             subtitle: String::new(),
             actions: Vec::new(),
+            menu: Vec::new(),
         };
         assert_eq!(row("a").key(0, &epochs), row("a").key(7, &epochs));
         assert_ne!(row("a").key(0, &epochs), row("b").key(0, &epochs));
@@ -126454,6 +126849,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -126479,6 +126875,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -127098,6 +127495,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -127123,6 +127521,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -127277,6 +127676,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -127302,6 +127702,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -127456,6 +127857,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -127481,6 +127883,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -127638,6 +128041,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -127663,6 +128067,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -127824,6 +128229,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -127849,6 +128255,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -128002,6 +128409,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -128027,6 +128435,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -128180,6 +128589,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -128205,6 +128615,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -128392,6 +128803,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -128417,6 +128829,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(active_session.session_path.clone()),
             selected_row: Some(row.clone()),
@@ -128573,6 +128986,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -128598,6 +129012,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
             selected_row: Some(row.clone()),
@@ -128786,6 +129201,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -128811,6 +129227,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
             selected_row: Some(row.clone()),
@@ -129176,6 +129593,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
+            app_pane_context_menu: None,
             document_surfaces: HashMap::new(),
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
@@ -129201,6 +129619,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             rail_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             right_panel_restore_mode: RightPanelMode::Notifications,
+            right_panel_reveal_mode: RightPanelMode::Notifications,
             rows: Vec::new(),
             selected_path: None,
             selected_row: None,
