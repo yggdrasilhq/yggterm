@@ -5398,6 +5398,11 @@ struct ClientInstanceRecord {
     /// resolve NAME → this worker's pid. `None` = the user's anonymous GUI.
     #[serde(default)]
     client_id: Option<String>,
+    /// Slice-4 client role ("active" | "shadow"); `None` (legacy) = Active.
+    /// Untargeted app-control verbs prefer the Active client (the resolver in
+    /// yggterm-server reads this field from the same JSON).
+    #[serde(default)]
+    client_role: Option<String>,
     #[serde(default)]
     linux_desktop_app_id: Option<String>,
     #[serde(default)]
@@ -52271,10 +52276,18 @@ fn register_client_instance(
     let pid = std::process::id();
     let started_at_ms = current_millis();
     let path = dir.join(format!("{pid}-{started_at_ms}.json"));
+    let identity = yggterm_server::current_client_identity();
     let record = ClientInstanceRecord {
         pid,
         started_at_ms,
-        client_id: yggterm_server::current_client_identity().client_id,
+        client_id: identity.client_id,
+        client_role: Some(
+            match identity.role {
+                yggterm_server::ClientRole::Shadow => "shadow",
+                _ => "active",
+            }
+            .to_string(),
+        ),
         linux_desktop_app_id: linux_desktop_app_id.map(str::to_string),
         process_start_ticks: process_start_ticks(pid),
         executable_path: current_client_executable_path(),
@@ -110172,6 +110185,7 @@ mod tests {
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
@@ -110275,6 +110289,7 @@ mod tests {
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,
+            client_role: None,
             linux_desktop_app_id: Some(YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-old".to_string()),

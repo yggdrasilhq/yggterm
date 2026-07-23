@@ -33,6 +33,49 @@ Read it:
 LIVE_HOST=$(cat .agents/config/live-host)
 ```
 
+## ⛔ THE SHADOW-PROBE LAW (user-directed 2026-07-23) — probe through the shadow client, never the user's GUI
+
+Any probe that changes what the viewport shows — `app open`, view switches,
+search, session inspection — MUST run against a **shadow view client**, not the
+user's GUI. The user reported the foreground-driving probes directly ("can't
+you use the agent control client mode — we built it for exactly this") and the
+answer is yes, it works end-to-end:
+
+```bash
+# One-time per work session (idempotent; reuses a running shadow):
+ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh start --name agent-1'
+
+# Then aim every viewport-changing verb at it:
+ssh "$LIVE_HOST" '~/.local/bin/yggterm server app open <session-path> --client agent-1'
+ssh "$LIVE_HOST" '~/.local/bin/yggterm server app state --client agent-1'
+ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh capture /tmp/shadow.png --name agent-1'
+
+# Tear down at session end (the ritual's dangling-process duty):
+ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh stop --name agent-1'
+```
+
+- The shadow has its OWN active session and viewport — live-proven 2026-07-23:
+  `open --client agent-1` switched the shadow while the user's worker stayed on
+  their session (verify with pid-targeted `state --pid <user-gui-pid>`).
+- **Untargeted verbs route to the ACTIVE client** (the user's GUI) even while
+  shadows run — never rely on "newest wins," and never read the user's state
+  through an untargeted verb *assuming* it's theirs on an older build: on
+  pre-fix builds an untargeted read answers from the newest worker (the
+  shadow), which looks exactly like the shadow yanking the user's session
+  (instrument-lie, live-caught 2026-07-23).
+- A Shadow is read-only for geometry/ownership by daemon role gate: it cannot
+  `terminal new`/resize/focus. For SPAWNING probe sessions, use the user's
+  worker but restore their active session immediately after, or spawn via
+  `terminal new` and `app open` their session back — the no-activate spawn is
+  a recorded follow-up.
+- The shadow's screenshots come from `shadow-client.sh capture` (grim on its
+  own compositor) or `app screenshot --client agent-1`.
+- ⚠ The shadow's TERMINAL viewport renders BLANK — the role gate denies it
+  the PTY attach (D8, correct). Use the shadow for tree/session/metadata/
+  start-page observation and for parking view switches; read terminal
+  CONTENT via `terminal read-buffer <session>` or `server snapshot`
+  (read-only, safe untargeted — they never move the user's view).
+
 ## Screenshot
 
 ```bash
