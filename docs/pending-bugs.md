@@ -6,6 +6,24 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
+  still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
+  plain text, duplicated turns, no codex TUI chrome, on a cold launch. This is
+  the motivating repro of `docs/spec-agent-cli-harness.md` (§7.6: the attach
+  seed has TWO WRITERS by construction — daemon seed + client reveal replay),
+  and its structural fix is the spec's phase 0/3. The spec build is gated on
+  the user's explicit go; when given, the acceptance test is: a cold-launched
+  codex session must be pixel-indistinguishable from a manual
+  `ssh -t <machine> codex resume <UUID>`.
+  **Same report, swap-window frames:** two clipboard frames captured at 13:41
+  (broken bottom-line interleave, then a blank viewport) fall inside the
+  GUI-swap settling window ~1–3 min after the 2.12.7 GUI relaunch; the surface
+  settled clean by 13:47 (faithful screenshot, bottom intact) and mount churn
+  stopped. Deploy-window transients are a documented class (field guide §4.4);
+  what changed in 2.12.7 is that input returns in seconds, births mount once,
+  and a detected ring gap reconciles — the remaining swap-window paint
+  transient is the attach-seed seam the harness spec owns.
+
 - **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
