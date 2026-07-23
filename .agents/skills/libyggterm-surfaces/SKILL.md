@@ -163,6 +163,26 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     editor. While wrap is on the gutter is SUPPRESSED (logical line numbers
     desync against wrapped visual rows — the wc footer carries the count) and
     the textarea owns its own scroll instead of growing by logical rows.
+  - **`list-row` right-click menu (2026-07-24, yedit Rename was the forcing
+    consumer):** a `list-row` may carry a `menu: [{action, label, title?}]`.
+    yggterm draws it as a GUI-owned floating menu at the cursor on right-click
+    (anchored so a right-side rail opens leftward, dismissed by any click or a
+    second right-click); an item POSTs `{action, values:{value: <row id>}}` just
+    like a row's `actions[]`, then closes. The app owns the items and performs
+    them; yggterm owns only the draw + dismissal. Empty/absent `menu` = the row
+    has no context menu (platform default falls through). This is how yedit
+    exposes Rename (the only way to name an in-DB note): the row menu's Rename
+    sets a per-note rename field in the app's next schema.
+  - **Editor draft stability (2026-07-24):** the document channel keeps the
+    user's LIVE draft as the source of truth while they type. A schema whose
+    declared value merely ECHOES a draft the GUI already sent up (the ~2.5s
+    draft-sync round-trip, or a stamp-driven refetch) does NOT remount the
+    uncontrolled editor — only a value that is neither the live draft nor an
+    echo of what the GUI sent (a note switch, a reload-from-disk) is adopted.
+    Before this, a draft echo landing while the user typed past it remounted
+    the textarea and stole focus (the "spam-click to type" bug). An app need do
+    nothing to benefit; do NOT try to "help" by suppressing the editor value in
+    a draft reply — the GUI handles it.
 - **Act**: a click `POST`s `{pane, action, values}` to `<control>/action`; the
   app performs it on its own host and returns `{schema?, toast?, eval?}` — a
   fresh schema to re-render, a message to toast, and/or a script for the GUI to
