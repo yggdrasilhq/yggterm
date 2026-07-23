@@ -2524,6 +2524,17 @@ fn apply_session_identity_env(command: &mut CommandBuilder, session_key: Option<
         return;
     };
     command.env("YGGTERM_SESSION_ID", session_key);
+    // The iTerm2 `LC_TERMINAL` trick: a user-typed `ssh <host>` strips the
+    // environment, but stock OpenSSH forwards `LC_*` (client `SendEnv LANG
+    // LC_*`, server `AcceptEnv LANG LC_*` — the Debian defaults), so a
+    // libyggterm app on the far side of a MANUAL ssh hop can still detect it
+    // is inside a yggterm surface (user report 2026-07-23: yedit said "not
+    // inside yggterm" after `ssh` from a local yggterm terminal). Apps check
+    // `YGGTERM_SESSION_ID` first, then this mirror. NOTE: detection is only
+    // half the remote story — the GUI still needs a route to the app's
+    // loopback control endpoint (see docs/pending-bugs.md, manual-ssh
+    // control-channel attribution).
+    command.env("LC_YGGTERM_SESSION_ID", session_key);
     if let Ok(exe) = std::env::current_exe() {
         command.env("YGGTERM_BIN", exe.as_os_str());
     }

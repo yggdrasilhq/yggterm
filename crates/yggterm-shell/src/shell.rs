@@ -1415,6 +1415,14 @@ struct SidebarContributionState {
     /// GUI-reachable control endpoint. For a remote session this is the LOCAL
     /// end of an `ssh -L` forward, not the app's own loopback address.
     control_url: String,
+    /// The control URL exactly as the app DECLARED it (pre-resolve). This is
+    /// the identity a later declare is compared against: a declare carrying a
+    /// DIFFERENT url means the app moved (new daemon, new port) and the stored
+    /// endpoint is dead — re-declare idempotence only holds for an UNCHANGED
+    /// url. Live incident 2026-07-23: a retained-scrollback replay re-delivered
+    /// a stale declare first, and the fresh declare's new port was then ignored
+    /// forever ("Connection refused" against the dead port).
+    declared_control_url: String,
     /// Holds the `ssh -L` forward open for the contribution's lifetime; killed
     /// when the contribution expires or closes. `Arc<Mutex<_>>` because
     /// `ShellState` is `Clone` and a `Child` is not — the same shape the web
@@ -1736,6 +1744,18 @@ struct AppPaneSchema {
     title: String,
     #[serde(default)]
     widgets: Vec<AppPaneWidget>,
+    /// Status-bar region pinned at the rail BOTTOM, under the scroll area and
+    /// a separator — for "status-bar'y" data (yedit's wc + wrap toggle was the
+    /// forcing consumer, 2026-07-23). Deliberately a SUBSET vocabulary today:
+    /// `label`, `toggle`, `button` (grow it when a consumer needs more — the
+    /// extraction-not-construction corollary). Unknown kinds still fail the
+    /// pane exactly like `widgets`.
+    #[serde(default)]
+    footer: Vec<AppPaneWidget>,
+}
+
+fn app_pane_text_input_word_wrap_default() -> bool {
+    true
 }
 
 impl AppPaneWidget {
@@ -1853,8 +1873,16 @@ enum AppPaneWidget {
         rows: u32,
         /// Document-surface editors only: draw a line-number gutter beside the
         /// textarea. The gutter tracks the LIVE draft's line count.
+        /// Suppressed while `word_wrap` is on — logical line numbers against
+        /// wrapped visual rows desync, so the wc status footer carries the
+        /// line count instead (product call, 2026-07-23).
         #[serde(default)]
         line_numbers: bool,
+        /// Document-surface editors: soft-wrap long lines instead of scrolling
+        /// horizontally. ON by default (user spec 2026-07-18: "word-wrap ON
+        /// default"); the app may declare it off or toggle it per action.
+        #[serde(default = "app_pane_text_input_word_wrap_default")]
+        word_wrap: bool,
     },
     NumberInput {
         id: String,
@@ -8216,7 +8244,10 @@ impl ShellState {
         document_version: Option<String>,
         env_id: Option<String>,
         now_ms: u64,
+        // (declared url, GUI-reachable resolved url, forward child). Only
+        // supplied when this declare CREATES the contribution.
         resolved: Option<(
+            String,
             String,
             Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
         )>,
@@ -8303,13 +8334,14 @@ impl ShellState {
                 document_rail: document_version_changed,
             };
         }
-        let Some((control_url, forward_child)) = resolved else {
+        let Some((declared_control_url, control_url, forward_child)) = resolved else {
             return SidebarRefetch::default();
         };
         self.sidebar_contributions.insert(
             session_path.to_string(),
             SidebarContributionState {
                 control_url,
+                declared_control_url,
                 forward_child,
                 panes,
                 policy_version: policy_version.clone(),
@@ -8771,6 +8803,26 @@ impl ShellState {
             }
             None if contribution.policy_version.is_empty() => SurfacePolicyGate::Absent,
             None => SurfacePolicyGate::Pending,
+        }
+    }
+    /// Whether a declare for `session_path` matches the STORED contribution —
+    /// i.e. it is a liveness heartbeat for the same endpoint. `false` when the
+    /// declared control url MOVED (the app's daemon restarted on a fresh port,
+    /// or a retained-scrollback replay delivered a stale declare before the
+    /// fresh one): the stored endpoint is dead and the caller must tear the
+    /// contribution down and let the declare re-create it. A declare carrying
+    /// no url cannot contradict the stored one.
+    fn sidebar_contribution_matches_declare(
+        &self,
+        session_path: &str,
+        declared: Option<&str>,
+    ) -> bool {
+        let Some(existing) = self.sidebar_contributions.get(session_path) else {
+            return false;
+        };
+        match declared {
+            None => true,
+            Some(url) => existing.declared_control_url == url,
         }
     }
     fn close_sidebar_contribution(&mut self, session_path: &str) {
@@ -66896,11 +66948,48 @@ fn TerminalCanvas(
                                         // re-resolve — resolving spawns an
                                         // `ssh -L`, and once per heartbeat would
                                         // leak one ssh every few seconds.
+                                        // ⚠ Idempotence holds for an UNCHANGED
+                                        // url only. A declare carrying a NEW
+                                        // control url means the app moved (its
+                                        // daemon restarted on a fresh port) —
+                                        // or a retained-scrollback replay
+                                        // re-delivered a STALE declare before
+                                        // the fresh one (live 2026-07-23: the
+                                        // GUI pinned yedit to a dead port and
+                                        // every fetch read "Connection
+                                        // refused" forever). The stale entry
+                                        // is torn down (its forward killed)
+                                        // and the declare re-creates it.
                                         let (known, mut refetch) = state.with_mut(|shell| {
                                             shell.sweep_stale_sidebar_contributions(now_ms);
-                                            let known = shell
+                                            let mut known = shell
                                                 .sidebar_contributions
                                                 .contains_key(&contribution_session_path);
+                                            if known
+                                                && !shell.sidebar_contribution_matches_declare(
+                                                    &contribution_session_path,
+                                                    control.as_deref(),
+                                                )
+                                            {
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "sidebar_contribution",
+                                                    "control_url_moved",
+                                                    json!({
+                                                        "session_path": contribution_session_path,
+                                                        "stored": shell
+                                                            .sidebar_contributions
+                                                            .get(&contribution_session_path)
+                                                            .map(|c| c.declared_control_url.clone()),
+                                                        "declared": control.clone(),
+                                                    }),
+                                                );
+                                                shell.close_sidebar_contribution(
+                                                    &contribution_session_path,
+                                                );
+                                                known = false;
+                                            }
                                             let refetch = if known {
                                                 shell.upsert_sidebar_contribution(
                                                     &contribution_session_path,
@@ -66951,7 +67040,11 @@ fn TerminalCanvas(
                                                     document_version.clone(),
                                                     env_id.clone(),
                                                     now_ms,
-                                                    Some((effective_control.clone(), forward_child)),
+                                                    Some((
+                                                        control_url.clone(),
+                                                        effective_control.clone(),
+                                                        forward_child,
+                                                    )),
                                                 )
                                             });
                                             append_trace_event(
@@ -78628,9 +78721,18 @@ fn terminal_eval_script_with_canvas_renderer(
             const guardHostMissingXtermRoot = xtermRoots.length === 0;
             const guardHostMissingRenderableLayer = Boolean(screenInHost && !rowsInHost && screenCanvasCount === 0);
             const guardStaleClause = Boolean(!termElementConnected && xtermRoots.length === 0);
+            // 2026-07-23: rebindCurrentHost also repairs `termElementOutsideHost`
+            // on a CONNECTED host (the 2026-07-22 husk fix). This mirror had not
+            // been updated, so a plainly repairable detach was alarmed as
+            // `unrepairable` (guihost trace: every detach episode carried
+            // unrepairable=true while the very next repaint reattached it).
+            const guardTermElementOutsideConnectedHost = Boolean(
+                detached && liveHost && liveHost.isConnected
+            );
             const repairWouldReopen = guardHostMissingXtermRoot
                 || guardHostMissingRenderableLayer
-                || guardStaleClause;
+                || guardStaleClause
+                || guardTermElementOutsideConnectedHost;
             return {{
                 term_element_present: Boolean(termElement),
                 term_element_connected: termElementConnected,
@@ -78684,6 +78786,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 repair_guard_host_missing_xterm_root: guardHostMissingXtermRoot,
                 repair_guard_host_missing_renderable_layer: guardHostMissingRenderableLayer,
                 repair_guard_stale_clause: guardStaleClause,
+                repair_guard_term_element_outside_connected_host: guardTermElementOutsideConnectedHost,
                 repair_would_reopen: repairWouldReopen,
                 // Detached AND every repair guard declines = permanently blank
                 // until the session is remounted by hand. This is the alarm.
@@ -82294,18 +82397,34 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const forceTerminalRepaint = (reason) => redrawTerminal(reason || 'forced_repaint');
         const sampleCanvasInk = () => {{
-            const canvases = Array.from(host.querySelectorAll('canvas'))
+            // Ink may only be judged from canvases that are actual RENDER layers
+            // (inside `.xterm-screen`). The host also carries non-render canvases —
+            // the reveal ghost, focus overlays — that legitimately sample
+            // transparent; sampling them as a proxy for "the terminal painted
+            // nothing" convicted healthy sessions (guihost 2026-07-23: 110 false
+            // unhealthy edges/hour driving an atlas-clearing redraw loop = the
+            // user's in-session blink). A canvas that already holds a GPU context
+            // (the WebGL renderer's text layer) returns null from getContext('2d');
+            // that is UNREADABLE, not blank — counted separately so the verdict can
+            // refuse to judge instead of judging blind. Reading it via drawImage
+            // was tried (ba2fe8c) and REVERTED: per-check GPU readback of the live
+            // canvas corrupts the WebKitGTK glyph atlas. Do not reintroduce it.
+            const canvases = Array.from(host.querySelectorAll('.xterm-screen canvas'))
                 .filter((canvas) => Number(canvas.width || 0) > 0 && Number(canvas.height || 0) > 0)
                 .slice(-4);
             let sampledPixels = 0;
             let nontransparentPixels = 0;
             let alphaSum = 0;
+            let readableLayers = 0;
+            let unreadableLayers = 0;
             for (const canvas of canvases) {{
                 try {{
                     const context = canvas.getContext('2d', {{ willReadFrequently: true }});
                     if (!context) {{
+                        unreadableLayers += 1;
                         continue;
                     }}
+                    readableLayers += 1;
                     const width = Math.max(1, Number(canvas.width || 0));
                     const height = Math.max(1, Number(canvas.height || 0));
                     const stepX = Math.max(1, Math.floor(width / 12));
@@ -82324,6 +82443,8 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             return {{
                 canvas_count: canvases.length,
+                readable_layers: readableLayers,
+                unreadable_layers: unreadableLayers,
                 sampled_pixels: sampledPixels,
                 nontransparent_pixels: nontransparentPixels,
                 alpha_sum: alphaSum,
@@ -82473,15 +82594,38 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!skipInkSample && ink && Number(ink.canvas_count || 0) === 0 && Number(ink.sampled_pixels || 0) === 0) {{
                 ink.unsampleable = true;
             }}
+            // UNREADABLE-LAYER HONESTY (2026-07-23): a render canvas holding a GPU
+            // context cannot be read without touching the live canvas (the ba2fe8c
+            // regression), so a sample taken beside one is INCOMPLETE — the very
+            // layer that paints the text is the one missing from it. Refusing to
+            // judge is the only honest verdict.
+            if (!skipInkSample && ink && Number(ink.unreadable_layers || 0) > 0) {{
+                ink.unsampleable = true;
+            }}
             const attachment = syncHostAttachmentEntry(`render_health:${{String(reason || '')}}`);
             // A detached `term.element` cannot paint by construction — no ink probe,
             // buffer read, or cursor field can see it, so it must be its own verdict.
-            const unhealthyDetachedTermElement = Boolean(attachment && attachment.detached && hasBufferText);
+            // PERSISTENCE GATE (2026-07-23): a detach reading younger than ~1s is
+            // routinely the health check racing a repair mid-flight (trace showed
+            // `detached_ms=0` episodes 28–642ms after `rebind_host_attach`), and
+            // each such reading scheduled a redraw whose own wipe window produced
+            // the NEXT detach reading — the repair manufacturing its fault signal.
+            // A real detach persists; only judge one that has.
+            const detachedPersistedMs = termElementDetachedSinceMs > 0
+                ? Math.max(0, now - termElementDetachedSinceMs)
+                : 0;
+            const unhealthyDetachedTermElement = Boolean(
+                attachment
+                && attachment.detached
+                && hasBufferText
+                && detachedPersistedMs >= 900
+            );
             const unhealthyDomRenderer = hasBufferText && rendererLayerMissing;
             const unhealthyCanvas = !skipInkSample
                 && hasBufferText
                 && ink.canvas_count > 0
                 && ink.sampled_pixels > 0
+                && Number(ink.unreadable_layers || 0) === 0
                 && (ink.nontransparent_pixels === 0 || ink.alpha_sum <= 12);
             const unhealthy = unhealthyDetachedTermElement || unhealthyDomRenderer || unhealthyCanvas;
             // Background hosts sample blank legitimately (a hidden WebGL canvas
@@ -90714,14 +90858,27 @@ fn top_level_block_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
+/// The document reading typography (user spec 2026-07-18: "readability like
+/// The New York Times" — serif body, generous leading, no decoration the
+/// markdown didn't ask for). ONE owner: the markdown reader root and the
+/// block click-to-edit reader both use exactly this string. The serif stack
+/// is the DESIGN.md "document reading font" entry — change it there first.
+fn document_reading_typography() -> &'static str {
+    "font-size:15.5px; line-height:1.75; \
+     font-family:Georgia, 'Iowan Old Style', 'Palatino Linotype', 'Noto Serif', \
+     'Times New Roman', serif; text-rendering:optimizeLegibility;"
+}
+
 fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
     let code_style = format!(
         "background:{}; border:1px solid {}; \
          border-radius:4px; padding:1px 5px; font-family:ui-monospace, monospace; \
-         font-size:0.88em; color:{};",
+         font-size:0.82em; color:{};",
         palette.chrome, palette.border, palette.fg
     );
-    let link_style = format!("color:{}; text-decoration:underline;", palette.accent);
+    // No underline unless the markdown itself asks for one (user spec): a link
+    // is distinguished by the accent color alone, the NYT body-link idiom.
+    let link_style = format!("color:{}; text-decoration:none;", palette.accent);
     rsx! {
         for (index, item) in items.iter().enumerate() {
             match item {
@@ -90750,29 +90907,26 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
     let border = palette.border.as_str();
     match block {
         MdBlock::Heading { level, children } => {
-            let (size, weight, margin) = match level {
-                1 => ("1.55em", "800", "18px 0 10px 0"),
-                2 => ("1.32em", "750", "16px 0 8px 0"),
-                3 => ("1.16em", "700", "14px 0 6px 0"),
-                _ => ("1.02em", "700", "12px 0 4px 0"),
+            // NYT-style headlines: heavier weight, more air above than below,
+            // and NO rule/underline — decoration the markdown didn't ask for
+            // (user spec 2026-07-18; the old h1/h2 border-bottom is gone).
+            let (size, weight, margin, spacing) = match level {
+                1 => ("1.8em", "800", "26px 0 12px 0", "-0.015em"),
+                2 => ("1.42em", "780", "24px 0 10px 0", "-0.01em"),
+                3 => ("1.18em", "740", "20px 0 8px 0", "0"),
+                _ => ("1.04em", "720", "16px 0 6px 0", "0"),
             };
             let style = format!(
-                "font-size:{size}; font-weight:{weight}; margin:{margin}; color:{}; \
-                 border-bottom:{}; padding-bottom:{};",
+                "font-size:{size}; font-weight:{weight}; margin:{margin}; \
+                 letter-spacing:{spacing}; line-height:1.25; color:{};",
                 palette.fg,
-                if *level <= 2 {
-                    format!("1px solid {border}")
-                } else {
-                    "none".to_string()
-                },
-                if *level <= 2 { "4px" } else { "0" },
             );
             rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes(children, palette)} } }
         }
         MdBlock::Paragraph(children) => rsx! {
             p {
                 key: "p{index}",
-                style: format!("margin:7px 0; line-height:1.6; color:{};", palette.fg),
+                style: format!("margin:0 0 14px 0; color:{};", palette.fg),
                 {md_inline_nodes(children, palette)}
             }
         },
@@ -90781,8 +90935,8 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                 key: "pre{index}",
                 style: format!(
                     "background:{}; border:1px solid {border}; \
-                     border-radius:7px; padding:10px 14px; overflow-x:auto; margin:10px 0; \
-                     font-family:ui-monospace, monospace; font-size:0.88em; line-height:1.5; color:{};",
+                     border-radius:8px; padding:12px 16px; overflow-x:auto; margin:14px 0; \
+                     font-family:ui-monospace, monospace; font-size:0.8em; line-height:1.55; color:{};",
                     palette.chrome, palette.fg
                 ),
                 "{code}"
@@ -90792,7 +90946,8 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
             div {
                 key: "q{index}",
                 style: format!(
-                    "border-left:3px solid {}; margin:8px 0; padding:2px 0 2px 14px; color:{};",
+                    "border-left:3px solid {}; margin:14px 0; padding:2px 0 2px 16px; \
+                     font-style:italic; color:{};",
                     palette.accent, palette.muted
                 ),
                 for (child_index, child) in body.iter().enumerate() {
@@ -90805,7 +90960,7 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                 for (item_index, item) in items.iter().enumerate() {
                     li {
                         key: "li{item_index}",
-                        style: "margin:3px 0; line-height:1.55;",
+                        style: "margin:5px 0;",
                         for (child_index, child) in item.iter().enumerate() {
                             {md_block_node(child, palette, child_index)}
                         }
@@ -90813,15 +90968,15 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                 }
             };
             if *ordered {
-                rsx! { ol { key: "ol{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.fg), {list_body} } }
+                rsx! { ol { key: "ol{index}", style: format!("margin:0 0 14px 0; padding-left:28px; color:{};", palette.fg), {list_body} } }
             } else {
-                rsx! { ul { key: "ul{index}", style: format!("margin:7px 0; padding-left:26px; color:{};", palette.fg), {list_body} } }
+                rsx! { ul { key: "ul{index}", style: format!("margin:0 0 14px 0; padding-left:28px; color:{};", palette.fg), {list_body} } }
             }
         }
         MdBlock::Table { header, rows } => {
             let cell_style = format!(
-                "border:1px solid {border}; padding:5px 10px; text-align:left; \
-                 vertical-align:top; line-height:1.45; color:{};",
+                "border:1px solid {border}; padding:7px 12px; text-align:left; \
+                 vertical-align:top; line-height:1.5; color:{};",
                 palette.fg
             );
             let head_style = format!("{cell_style} background:{}; font-weight:700;", palette.chrome);
@@ -90830,9 +90985,9 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                 // never scrolls horizontally (the triage-board acceptance rule).
                 div {
                     key: "tw{index}",
-                    style: "overflow-x:auto; margin:10px 0;",
+                    style: "overflow-x:auto; margin:14px 0;",
                     table {
-                        style: "border-collapse:collapse; font-size:0.94em;",
+                        style: "border-collapse:collapse; font-size:0.88em;",
                         if !header.is_empty() {
                             thead {
                                 tr {
@@ -90857,17 +91012,25 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
             }
         }
         MdBlock::Rule => rsx! {
-            div { key: "hr{index}", style: format!("border-top:1px solid {border}; margin:14px 0;") }
+            div { key: "hr{index}", style: format!("border-top:1px solid {border}; margin:20px 0;") }
         },
     }
 }
 
-/// The `markdown` widget's body: parse + render, document typography.
-fn markdown_widget_body(source: &str, palette: &DocTheme) -> Element {
+/// The `markdown` widget's body: parse + render. `compact` keeps the caller's
+/// interface typography (the 300px rail pane, which sizes its own wrapper —
+/// the old always-on inner font-size silently overrode it); the default is the
+/// serif document reading typography (one owner, [`document_reading_typography`]).
+fn markdown_widget_body(source: &str, palette: &DocTheme, compact: bool) -> Element {
     let blocks = parse_markdown_blocks(source);
+    let root_style = if compact {
+        "font-size:inherit; line-height:1.55;"
+    } else {
+        document_reading_typography()
+    };
     rsx! {
         div {
-            style: "font-size:13.5px;",
+            style: "{root_style}",
             for (index, block) in blocks.iter().enumerate() {
                 {md_block_node(block, palette, index)}
             }
@@ -90938,7 +91101,7 @@ fn EditableMarkdownBody(
     rsx! {
         style { "{block_hover_css}" }
         div {
-            style: "font-size:13.5px;",
+            style: document_reading_typography(),
             for (index, block) in blocks.iter().enumerate() {
                 if editable && *editing.read() == Some(index) {
                     {
@@ -91364,12 +91527,12 @@ fn DocumentSurfaceBody(
                                         // in the editor, not here.
                                         {
                                             let live = document_values.get(live_from).cloned();
-                                            markdown_widget_body(live.as_deref().unwrap_or(source), &doc)
+                                            markdown_widget_body(live.as_deref().unwrap_or(source), &doc, false)
                                         }
                                     }
                                 }
                             },
-                            AppPaneWidget::TextInput { id, value, line_numbers, .. } => {
+                            AppPaneWidget::TextInput { id, value, line_numbers, word_wrap, .. } => {
                                 // The gutter tracks the LIVE draft, not the last
                                 // declared value, so typing a newline never
                                 // desyncs the numbers.
@@ -91379,11 +91542,22 @@ fn DocumentSurfaceBody(
                                     .unwrap_or_else(|| value.clone());
                                 let line_count = live.split('\n').count().max(1);
                                 let editor_font = "font-family:ui-monospace, monospace; font-size:12.5px; line-height:1.55;";
+                                // Wrap mode: the gutter is SUPPRESSED (logical
+                                // line numbers desync against wrapped visual
+                                // rows — the wc footer carries the count) and
+                                // the textarea owns its own scroll instead of
+                                // growing by logical rows (a wrapped line's
+                                // visual height is unknowable from here).
+                                let wrapped = *word_wrap;
                                 rsx! {
                                     div {
                                         key: "{widget_key}",
-                                        style: "display:flex; align-items:flex-start; min-height:100%;",
-                                        if *line_numbers {
+                                        style: if wrapped {
+                                            "display:flex; align-items:stretch; min-height:100%; height:100%;"
+                                        } else {
+                                            "display:flex; align-items:flex-start; min-height:100%;"
+                                        },
+                                        if *line_numbers && !wrapped {
                                             div {
                                                 "data-document-gutter": "{id}",
                                                 style: format!(
@@ -91397,16 +91571,26 @@ fn DocumentSurfaceBody(
                                         }
                                         textarea {
                                             "data-document-editor": "{id}",
-                                            style: format!(
-                                                "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
-                                                 background:transparent; color:{}; caret-color:{}; \
-                                                 padding:14px 20px 40px 14px; white-space:pre; overflow-x:auto; \
-                                                 overflow-y:hidden; tab-size:4; {editor_font}",
-                                                doc.fg, doc.accent
-                                            ),
+                                            style: if wrapped {
+                                                format!(
+                                                    "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
+                                                     background:transparent; color:{}; caret-color:{}; \
+                                                     padding:14px 20px 40px 20px; white-space:pre-wrap; overflow-wrap:anywhere; \
+                                                     overflow-x:hidden; overflow-y:auto; tab-size:4; {editor_font}",
+                                                    doc.fg, doc.accent
+                                                )
+                                            } else {
+                                                format!(
+                                                    "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
+                                                     background:transparent; color:{}; caret-color:{}; \
+                                                     padding:14px 20px 40px 14px; white-space:pre; overflow-x:auto; \
+                                                     overflow-y:hidden; tab-size:4; {editor_font}",
+                                                    doc.fg, doc.accent
+                                                )
+                                            },
                                             spellcheck: "false",
-                                            wrap: "off",
-                                            rows: "{line_count + 1}",
+                                            wrap: if wrapped { "soft" } else { "off" },
+                                            rows: if wrapped { "2".to_string() } else { format!("{}", line_count + 1) },
                                             initial_value: "{value}",
                                             oninput: {
                                                 let mut state = state;
@@ -91567,6 +91751,10 @@ fn AppPaneRailBody(
         .map(|schema| schema.title.clone())
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| pane_id.clone());
+    let footer_widgets: Vec<AppPaneWidget> = schema
+        .as_ref()
+        .map(|schema| schema.footer.clone())
+        .unwrap_or_default();
 
     rsx! {
         RailHeader { title: title, color: palette.text.to_string() }
@@ -91891,7 +92079,7 @@ fn AppPaneRailBody(
                                     key: "{widget_key}",
                                     "data-app-pane-markdown": "{id}",
                                     style: "font-size:11px; min-width:0; overflow-wrap:anywhere;",
-                                    {markdown_widget_body(&source, &DocTheme::from_terminal(&snapshot.terminal_palette))}
+                                    {markdown_widget_body(&source, &DocTheme::from_terminal(&snapshot.terminal_palette), true)}
                                 }
                             },
                         }
@@ -91901,6 +92089,81 @@ fn AppPaneRailBody(
                     div { style: "{muted_style}", "Loading…" }
                 }
             }
+            }
+        }
+        // The rail STATUS FOOTER: pinned under the scroll area, separated, for
+        // the app's status-bar data (schema `footer`). Subset vocabulary —
+        // label / toggle / button — documented in the libyggterm-surfaces skill.
+        if !footer_widgets.is_empty() {
+            div {
+                "data-app-pane-footer": "{pane_id}",
+                style: format!(
+                    "flex:0 0 auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap; \
+                     padding:8px 16px 10px 16px; border-top:1px solid rgba(127,127,127,0.25); \
+                     font-size:10px; color:{};",
+                    palette.muted
+                ),
+                for (index, widget) in footer_widgets.iter().cloned().enumerate() {
+                    {
+                    let widget_key = widget.key(index, &value_epochs);
+                    match widget {
+                        AppPaneWidget::Label { text, .. } => rsx! {
+                            span {
+                                key: "{widget_key}",
+                                style: format!("color:{}; white-space:nowrap;", palette.muted),
+                                "{text}"
+                            }
+                        },
+                        AppPaneWidget::Toggle { id, label, action, value } => rsx! {
+                            button {
+                                key: "{widget_key}",
+                                "data-app-pane-footer-toggle": "{id}",
+                                style: if value {
+                                    format!(
+                                        "margin-left:auto; padding:3px 9px; border:0; border-radius:7px; \
+                                         background:{}; color:#fff; font-size:10px; font-weight:700; cursor:pointer;",
+                                        palette.accent
+                                    )
+                                } else {
+                                    format!(
+                                        "margin-left:auto; padding:3px 9px; border:1px solid rgba(127,127,127,0.35); \
+                                         border-radius:7px; background:transparent; color:{}; font-size:10px; \
+                                         font-weight:600; cursor:pointer;",
+                                        palette.text
+                                    )
+                                },
+                                onclick: {
+                                    let action = action.clone();
+                                    let next = (!value).to_string();
+                                    let pane_id = pane_id.clone();
+                                    move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), Some(next.clone())))
+                                },
+                                "{label}"
+                            }
+                        },
+                        AppPaneWidget::Button { id, label, action, .. } => rsx! {
+                            button {
+                                key: "{widget_key}",
+                                "data-app-pane-footer-button": "{id}",
+                                style: format!(
+                                    "padding:3px 9px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
+                                     background:transparent; color:{}; font-size:10px; font-weight:600; cursor:pointer;",
+                                    palette.text
+                                ),
+                                onclick: {
+                                    let action = action.clone();
+                                    let pane_id = pane_id.clone();
+                                    move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
+                                },
+                                "{label}"
+                            }
+                        },
+                        // Anything else in a footer is a schema mistake; render
+                        // nothing rather than a hole the app can't see.
+                        _ => rsx! {},
+                    }
+                    }
+                }
             }
         }
     }
@@ -98414,6 +98677,34 @@ mod tests {
         assert_eq!(plan.land_on, None, "a fresh start lands on the app tab");
     }
 
+    // A re-declare is idempotent for an UNCHANGED control url only. When the
+    // declared url MOVES (the app's daemon restarted on a new port — or a
+    // retained-scrollback replay delivered a STALE declare before the fresh
+    // one, live incident 2026-07-23), the stored endpoint is dead: the declare
+    // arm must tear the contribution down and re-create it, never keep
+    // fetching the dead port forever.
+    #[test]
+    fn a_declare_with_a_moved_control_url_does_not_match_the_stored_contribution() {
+        let shell = shell_with_contribution("local://s", 1_000);
+        assert!(
+            shell.sidebar_contribution_matches_declare("local://s", Some("http://127.0.0.1:1/")),
+            "the same declared url is the liveness heartbeat"
+        );
+        assert!(
+            shell.sidebar_contribution_matches_declare("local://s", None),
+            "a declare without a url cannot contradict the stored one"
+        );
+        assert!(
+            !shell
+                .sidebar_contribution_matches_declare("local://s", Some("http://127.0.0.1:2/")),
+            "a MOVED url means the stored endpoint is dead — the caller must re-create"
+        );
+        assert!(
+            !shell.sidebar_contribution_matches_declare("local://other", Some("http://127.0.0.1:1/")),
+            "no stored contribution can never match"
+        );
+    }
+
     /// Build a shell with an active-visible terminal session that owns a
     /// sidebar contribution declared at `declared_ms` — the zombie-surface
     /// sweep fixture ([[campaign-libyggterm]] Phase 0.2).
@@ -98431,7 +98722,11 @@ mod tests {
             None,
             None,
             declared_ms,
-            Some(("http://127.0.0.1:1/".to_string(), None)),
+            Some((
+                "http://127.0.0.1:1/".to_string(),
+                "http://127.0.0.1:1/".to_string(),
+                None,
+            )),
         );
         shell
     }
@@ -98815,7 +99110,11 @@ mod tests {
             None,
             None,
             now_ms,
-            Some(("http://127.0.0.1:1/".to_string(), None)),
+            Some((
+                "http://127.0.0.1:1/".to_string(),
+                "http://127.0.0.1:1/".to_string(),
+                None,
+            )),
         );
         shell
     }
@@ -98955,6 +99254,7 @@ mod tests {
         let schema = AppPaneSchema {
             title: "Doc".to_string(),
             widgets: Vec::new(),
+            footer: Vec::new(),
         };
 
         let seq_a = shell.document_pane_next_request("local://a");
@@ -101392,6 +101692,7 @@ mod tests {
             "repair_guard_host_missing_xterm_root:",
             "repair_guard_host_missing_renderable_layer:",
             "repair_guard_stale_clause:",
+            "repair_guard_term_element_outside_connected_host:",
             "repair_would_reopen:",
         ] {
             assert!(
@@ -101399,6 +101700,15 @@ mod tests {
                 "telemetry must record WHY the in-place repair declined: {guard}"
             );
         }
+        // 2026-07-23: the attachment-state mirror of rebindCurrentHost's guards
+        // was missing the termElementOutsideHost trigger, so every plainly
+        // repairable detach was alarmed `unrepairable=true` while the very next
+        // repaint reattached it. The mirror must carry all FOUR guards.
+        assert!(
+            script.contains("|| guardTermElementOutsideConnectedHost"),
+            "a detach on a CONNECTED host is repairable (rebindCurrentHost reopens on \
+             termElementOutsideHost), so the unrepairable alarm must not fire for it"
+        );
         assert!(
             script.contains("terminal_host_element_detached host="),
             "a detach episode must reach the event trace"
@@ -101407,9 +101717,34 @@ mod tests {
             script.contains("ink.unsampleable = true;"),
             "sampled_pixels == 0 means 'could not sample', never 'sampled and healthy'"
         );
+        // 2026-07-23: the ink sampler judged ANY canvas in the host (reveal
+        // ghost, focus overlays) as a proxy for the terminal's paint, convicting
+        // healthy DOM-renderer sessions of `canvas_blank_with_buffer_text` and
+        // driving an atlas-clearing redraw loop (the user's in-session blink).
+        // Ink may only come from render layers, and a GPU-context layer that
+        // getContext('2d') cannot read makes the sample unjudgeable — reading it
+        // via drawImage was ba2fe8c, reverted for corrupting the glyph atlas.
+        assert!(
+            script.contains("unreadable_layers: unreadableLayers,"),
+            "the sampler must report layers it could NOT read, so a blind sample \
+             can never pass for a healthy one"
+        );
+        assert!(
+            script.contains("&& Number(ink.unreadable_layers || 0) === 0"),
+            "the canvas-blank verdict is forbidden while any render layer is \
+             unreadable — the unreadable layer is the one that paints the text"
+        );
         assert!(
             script.contains("const unhealthyDetachedTermElement ="),
             "a detached element cannot paint, so it must be its own unhealthy verdict"
+        );
+        // 2026-07-23: `detached_ms=0` readings taken 28-642ms after
+        // `rebind_host_attach` were the health check racing its own repair; each
+        // scheduled a redraw whose wipe window produced the next detach reading.
+        assert!(
+            script.contains("&& detachedPersistedMs >= 900"),
+            "a detach verdict must have PERSISTED — a fresh reading is routinely \
+             the health check racing a repair mid-flight"
         );
         assert!(
             script.contains("'term_element_detached_from_host_unrepairable'"),
@@ -105896,6 +106231,7 @@ mod tests {
         // rebuilds the node whose DOM value is otherwise uncontrolled.
         let field = AppPaneWidget::TextInput {
             line_numbers: false,
+            word_wrap: true,
             id: "password".into(),
             label: String::new(),
             placeholder: String::new(),
@@ -105943,6 +106279,41 @@ mod tests {
         assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { action, .. } if action.is_empty()));
         assert!(matches!(&schema.widgets[6], AppPaneWidget::TextInput { action, secret: true, .. } if action == "unlock"));
         assert!(matches!(&schema.widgets[10], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
+        // Word wrap is ON unless the app declares it off (user spec 2026-07-18:
+        // "word-wrap ON default") — an app that never heard of the field gets
+        // the wrapping editor.
+        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { word_wrap: true, .. }));
+        // A schema with no footer is the common case and must parse to empty.
+        assert!(schema.footer.is_empty());
+    }
+
+    // The rail status footer (yedit wc + wrap toggle was the forcing consumer):
+    // schema-level `footer` widgets parse with the same vocabulary rules as
+    // `widgets`, and `word_wrap: false` round-trips for the app that turns the
+    // wrapping editor off.
+    #[test]
+    fn app_pane_schema_parses_a_status_footer_and_wrap_opt_out() {
+        let schema: AppPaneSchema = serde_json::from_value(json!({
+            "widgets": [
+                {"kind": "text-input", "id": "editor", "multiline": true,
+                 "line_numbers": true, "word_wrap": false},
+            ],
+            "footer": [
+                {"kind": "label", "text": "412 words · 87 lines · 2,301 chars"},
+                {"kind": "toggle", "id": "wrap", "label": "Wrap",
+                 "action": "toggle_wrap", "value": true},
+            ],
+        }))
+        .expect("schema parses");
+        assert!(matches!(
+            &schema.widgets[0],
+            AppPaneWidget::TextInput { word_wrap: false, line_numbers: true, .. }
+        ));
+        assert_eq!(schema.footer.len(), 2);
+        assert!(matches!(&schema.footer[0], AppPaneWidget::Label { .. }));
+        assert!(
+            matches!(&schema.footer[1], AppPaneWidget::Toggle { action, value: true, .. } if action == "toggle_wrap")
+        );
     }
 
     // An unknown widget kind must fail the pane, not silently render a hole:
@@ -106054,7 +106425,11 @@ mod tests {
             None,
             None,
             now_ms,
-            Some(("http://127.0.0.1:1".to_string(), None)),
+            Some((
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )),
         );
     }
 
@@ -106090,7 +106465,11 @@ mod tests {
             Some(document_version.to_string()),
             None,
             now_ms,
-            Some(("http://127.0.0.1:1".to_string(), None)),
+            Some((
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )),
         )
     }
 
@@ -106205,7 +106584,11 @@ mod tests {
                 None,
                 None,
                 now_ms,
-                Some(("http://127.0.0.1:1".to_string(), None)),
+                Some((
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )),
             )
             .policy
     }

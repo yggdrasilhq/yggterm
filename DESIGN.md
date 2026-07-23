@@ -528,6 +528,27 @@ Examples:
 - map label font
 - monospace editor font
 
+#### Document reading font (document surfaces, markdown reader)
+
+Rendered markdown documents (yedit and any future document surface) read like
+an article, not like chrome. This is the NYT-readability decision
+(user-directed 2026-07-18):
+
+- Body: serif reading stack `Georgia, 'Iowan Old Style', 'Palatino Linotype',
+  'Noto Serif', 'Times New Roman', serif`, 15.5px, line-height 1.75.
+- Headings: same serif, heavy weights (h1 800 → h4 720), negative letter
+  spacing on h1/h2, more air above than below. NO border/rule under headings —
+  no decoration the markdown didn't ask for.
+- Links: accent color only, no underline (markdown has no underline syntax, so
+  underlines are never ours to add).
+- Code (inline + blocks) stays monospace at a reduced em so it sits quietly
+  inside serif body text.
+- The compact rail-pane markdown widget keeps the interface font and the rail's
+  own size — reading typography applies to document-scale surfaces only.
+
+One code owner: `document_reading_typography()` in `yggterm-shell/src/shell.rs`.
+Change the stack here first, then there.
+
 ## Project Overlay: Yggterm
 
 This section is intentionally project-specific.
