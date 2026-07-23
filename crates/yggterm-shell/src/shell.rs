@@ -2483,6 +2483,17 @@ fn web_profile_write_locks_to_release(
 /// The agent lease on one (session, tab), read from the desired-state owner
 /// (`ShellState`) — the reconciler's `applied` map is a MIRROR, so the lease
 /// must not live there or it would be a second copy that can diverge.
+/// Canonical geometry for a headless-created surface: real enough for layout
+/// (media queries, responsive breakpoints) while never shown.
+const WEB_SURFACE_HEADLESS_CREATE_RECT: (i32, i32, i32, i32) = (0, 0, 1280, 800);
+
+/// Whether an agent's EnsureWebSurface request is still standing. Pure so the
+/// TTL edge is testable; an expired request simply stops materializing — the
+/// already-created surface lives on under its own hold/lease clock.
+fn web_surface_headless_create_due(wanted_until_ms: Option<u64>, now_ms: u64) -> bool {
+    wanted_until_ms.is_some_and(|until| now_ms < until)
+}
+
 fn web_surface_lease_until_ms(
     state: &Signal<ShellState>,
     session_path: &str,
@@ -4102,9 +4113,32 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_zoom(entry.native_id, want_zoom);
                         entry.zoom_factor = want_zoom;
                     }
-                } else if want_visible
-                    && let Some(rect) = place_rect
-                {
+                } else {
+                    // Headless materialization (agent control plane slice 2):
+                    // an agent asked for this BACKGROUNDED session's surfaces
+                    // to exist now (EnsureWebSurface) — create the webview at
+                    // a canonical offscreen rect and stash it in the same
+                    // tick: never revealed, no page hole, reaped on the
+                    // normal hold/lease clock.
+                    let headless_wanted = !want_visible
+                        && web_surface_headless_create_due(
+                            state
+                                .peek()
+                                .web_surface_headless_wanted
+                                .get(session_path.as_str())
+                                .copied(),
+                            current_millis(),
+                        );
+                    let create_rect = if want_visible {
+                        place_rect
+                    } else if headless_wanted {
+                        Some(WEB_SURFACE_HEADLESS_CREATE_RECT)
+                    } else {
+                        None
+                    };
+                    let Some(rect) = create_rect else {
+                        continue;
+                    };
                     // The app's policy has not landed yet. Userscripts only
                     // inject at document-start, so a surface created now would
                     // run without them for its whole life. Skip the pass: the
@@ -4249,12 +4283,32 @@ async fn web_surface_native_reconcile_loop(
                             // A surface is born mid-navigation: light the tab's
                             // loading dot now. Written ONCE, here — the poll below
                             // only writes state on a CHANGE, so the light cannot
-                            // become a per-tick re-render.
-                            {
+                            // become a per-tick re-render. A headless create skips
+                            // it: a stashed surface is never polled, so the light
+                            // would stick ON (the stash path's own rule).
+                            if want_visible {
                                 let mut writable = state;
                                 writable.with_mut(|shell| {
                                     shell.set_web_tab_loading(&key.0, key.1, true);
                                 });
+                            }
+                            if !want_visible {
+                                // Headless create: demote below the glass in the
+                                // SAME tick it was born — the page loads and the
+                                // agent verbs reach it, but no pixel and no input
+                                // hole ever appear over the user's view.
+                                let _ = desktop.demote_web_surface(native_id);
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "web_surface",
+                                    "native_open_headless",
+                                    json!({
+                                        "session_path": session_path,
+                                        "tab_id": tab_id,
+                                        "native_id": native_id,
+                                    }),
+                                );
                             }
                             applied.insert(
                                 key,
@@ -4262,17 +4316,18 @@ async fn web_surface_native_reconcile_loop(
                                     native_id,
                                     url: effective_url.clone(),
                                     bounds: rect,
-                                    visible: true,
+                                    visible: want_visible,
                                     reload_nonce,
                                     socks_port,
                                     profile,
                                     zoom_factor: open_zoom,
-                                    stashed_at_ms: None,
+                                    stashed_at_ms: (!want_visible).then(current_millis),
                                     // A surface is created BY a navigation, so it
                                     // is loading from its first frame — start the
                                     // light on rather than waiting a tick to
-                                    // discover it.
-                                    loading: true,
+                                    // discover it. (Headless: stashed surfaces are
+                                    // not polled, so the light stays off.)
+                                    loading: want_visible,
                                     page_url: effective_url,
                                     page_title: String::new(),
                                     generation: next_web_surface_generation(),
@@ -4988,6 +5043,10 @@ struct ShellState {
     // ychrome pilot). SSOT for the viewport web overlay; entries expire when
     // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
     web_surfaces: HashMap<String, WebSurfaceUiState>,
+    /// Agent-requested headless materialization (EnsureWebSurface): session ->
+    /// wanted-until epoch ms. The reconciler creates the session's surfaces
+    /// straight into the soft stash while a request is standing.
+    web_surface_headless_wanted: HashMap<String, u64>,
     /// Session paths this GUI DELIBERATELY closed (✕ / suspend / the app's own
     /// close OSC), with the time it happened. The heartbeat guard consults this
     /// so a racing heartbeat right after a close cannot resurrect a ghost
@@ -6877,6 +6936,7 @@ impl ShellState {
             session_working_prev: HashMap::new(),
             session_working_confirm_streak: HashMap::new(),
             web_surfaces: HashMap::new(),
+            web_surface_headless_wanted: HashMap::new(),
             web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
             app_pane_schema: None,
@@ -50093,9 +50153,23 @@ async fn process_pending_app_control_requests(
             cwd,
             title_hint,
             session_kind,
+            activate,
         } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let requested_kind = session_kind.unwrap_or(SessionKind::Shell);
+            // `--no-activate` (agent-driven spawns): remember the user's view
+            // BEFORE the create; the snapshot apply below will mark the new
+            // session active and we hand the view straight back — both
+            // mutations land before the next render, so nothing flashes.
+            let preserved_view = (activate == Some(false))
+                .then(|| {
+                    let shell = state.read();
+                    shell
+                        .server
+                        .active_session_path()
+                        .map(|path| (path.to_string(), shell.server.active_view_mode()))
+                })
+                .flatten();
             let terminal_appearance =
                 state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
             match machine_key.clone().map(|key| {
@@ -50180,6 +50254,9 @@ async fn process_pending_app_control_requests(
                                     snapshot,
                                     message.clone(),
                                 )));
+                                if let Some((prev_path, prev_view)) = preserved_view.clone() {
+                                    shell.server.restore_active_session(&prev_path, prev_view);
+                                }
                             });
                             if let Some(created_path) = created_path.clone()
                                 && created_remote_terminal_should_prewarm(&created_path)
@@ -50201,7 +50278,12 @@ async fn process_pending_app_control_requests(
                                     "cwd": cwd,
                                     "title_hint": title_hint,
                                     "session_kind": requested_kind,
-                                    "active_session_path": created_path,
+                                    "activated": activate != Some(false),
+                                    "active_session_path": if activate == Some(false) {
+                                        preserved_view.as_ref().map(|(p, _)| json!(p)).unwrap_or(Value::Null)
+                                    } else {
+                                        json!(created_path)
+                                    },
                                     "session_path": created_path,
                                     "message": message,
                                 })),
@@ -50246,6 +50328,9 @@ async fn process_pending_app_control_requests(
                                     snapshot,
                                     message.clone(),
                                 )));
+                                if let Some((prev_path, prev_view)) = preserved_view.clone() {
+                                    shell.server.restore_active_session(&prev_path, prev_view);
+                                }
                             });
                             AppControlResponse {
                                 request_id: request.request_id.clone(),
@@ -50258,7 +50343,12 @@ async fn process_pending_app_control_requests(
                                     "cwd": cwd,
                                     "title_hint": title_hint,
                                     "session_kind": requested_kind,
-                                    "active_session_path": created_path,
+                                    "activated": activate != Some(false),
+                                    "active_session_path": if activate == Some(false) {
+                                        preserved_view.as_ref().map(|(p, _)| json!(p)).unwrap_or(Value::Null)
+                                    } else {
+                                        json!(created_path)
+                                    },
                                     "session_path": created_path,
                                     "message": message,
                                 })),
@@ -51064,6 +51154,44 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::EnsureWebSurface {
+            session_path,
+            ttl_secs,
+        } => {
+            let ttl = ttl_secs.unwrap_or(600).clamp(30, 3600);
+            let until = current_millis() + ttl * 1000;
+            let tabs = state.with_mut(|shell| {
+                let tabs = shell
+                    .web_surfaces
+                    .get(&session_path)
+                    .map(|surface| surface.tabs.len())
+                    .unwrap_or(0);
+                if tabs > 0 {
+                    shell
+                        .web_surface_headless_wanted
+                        .insert(session_path.clone(), until);
+                }
+                tabs
+            });
+            let lease = (tabs > 0)
+                .then(|| web_surface_lease_for(&mut state, Some(session_path.as_str()), ttl));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (tabs == 0)
+                    .then(|| format!("no declared web surface for {session_path}")),
+                data: Some(json!({
+                    "accepted": tabs > 0,
+                    "session_path": session_path,
+                    "tabs": tabs,
+                    "wanted_until_ms": until,
+                    "ttl_secs": ttl,
+                    "lease": lease,
+                })),
             }
         }
         AppControlCommand::WebSurfaceLease {
@@ -104691,6 +104819,18 @@ mod tests {
     // the RETAINED closure's own registry functions (a superseded closure's
     // entry was already replaced last-writer-wins, so the nudge can never wake
     // a stood-down closure) — resize refit first, then the content redraw.
+    // Headless surface-create (slice 2): the materialization request is a TTL
+    // edge — standing requests create, expired ones stop creating, absence
+    // never creates. The created surface's LIFETIME is the normal hold/lease
+    // clock, deliberately not this TTL.
+    #[test]
+    fn headless_create_fires_only_while_the_request_stands() {
+        assert!(web_surface_headless_create_due(Some(1_000), 999));
+        assert!(!web_surface_headless_create_due(Some(1_000), 1_000));
+        assert!(!web_surface_headless_create_due(Some(1_000), 2_000));
+        assert!(!web_surface_headless_create_due(None, 0));
+    }
+
     #[test]
     fn stable_epoch_reveal_nudge_script_drives_the_retained_closure() {
         let script = terminal_stable_epoch_reveal_nudge_script("yggterm-terminal-test");
