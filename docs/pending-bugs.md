@@ -229,6 +229,24 @@ fix) once the fix is verified live on jojo.
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
 
+- **★ NEW 2026-07-23, NOT ROOT-CAUSED: the blink is on a CROSS-PATHWAY session
+  switch.** User: *"I switched it from a local-cc session to this remote-cc.
+  Switching out to a remote-cc to this remote-cc solved it. The local-cc also had
+  a blinking issue when closing."* So **local-cc → remote-cc blinks; remote-cc →
+  remote-cc does not** — same-pathway switches are fine. Trace for the episode:
+  **11 mounts in 15 minutes** for the one session, the mount generation going
+  BACKWARD (`m3` → `m1`), **each reveal CONSTRUCTING TWICE ~0.5 s apart**,
+  `terminal_render_health_unhealthy` at construction, and
+  `remote_pty_resize_failed {error: "…terminal session not found:
+  cc-runtime://<id>"}` right after each mount (5 in 10 min; `remote_yggterm_retry_total`
+  held steady at 17, so this is NOT the runaway cache-reset spin).
+  Two things to chase, in order: (1) **one reveal should mount once** — the double
+  construct is the blink; (2) why the remote daemon does not recognise the
+  `cc-runtime://` key after a local→remote switch. This is the user-visible face
+  of the pathway drift recorded as spec work in the campaign
+  (`{remote,local}×{cc,codex}` unification) — make "switch local-cc → remote-cc"
+  a first-class acceptance case there.
+
 - **B4 ROOT CAUSE FOUND (jojo, 2026-07-22): the cold-restore refusal is
   ALL-OR-NOTHING, and rows owned by NOBODY have no recovery source.** Measured
   end-to-end on the live 2.12.2 → 2.12.3 swap: the sidebar went **25 rows → 12**,
@@ -255,7 +273,18 @@ fix) once the fix is verified live on jojo.
   *closed* sessions resurrected from a stale `server-state.json`) — see
   `cold_restore_of_live_sessions_is_refused_beside_a_live_owner`. The file is not
   the truth while a predecessor is alive.
-  **Correct fix (designed, NOT built):** mirror what `stored_terminal_sessions`
+  **★ FIXED 2026-07-23 (`287d6e8`, 2.12.5-to-be) exactly as designed below — the
+  live predecessor now advertises `live_terminal_sessions` +
+  `advertises_live_session_rows` on `ServerRuntimeStatus` (sourced from
+  `persisted_state().live_sessions`, so wire and file cannot drift), and a THIRD
+  reconcile pass `adopt_missing_live_session_rows_from_reachable_daemons` adopts
+  the rows this daemon lacks. Add-only, gated on the new `live_session_row_exists`;
+  a pre-B4 predecessor's silence is skipped rather than read as an empty set.
+  Locks: `a_pre_b4_daemon_status_does_not_claim_to_advertise_live_rows`,
+  `adopting_a_live_row_that_already_exists_is_a_no_op`. NOT YET LIVE-PROVEN across
+  a real two-daemon swap — do that before deleting this entry.**
+  Original design note follows.
+  **Correct fix (designed, NOW BUILT):** mirror what `stored_terminal_sessions`
   already does for dormant rows — have the predecessor **advertise its live rows
   on `ServerRuntimeStatus`** (`live_terminal_sessions: Vec<PersistedLiveSession>` +
   an `advertises_live_session_rows` fail-safe flag, both `#[serde(default)]`, which
