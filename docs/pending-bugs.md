@@ -6,22 +6,28 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
-- **★ USER CALL 2026-07-23: agent probes must stop driving the user's
-  foreground GUI — build the missing shadow/headless layer for the
-  terminal lane.** The agent-control plane's `do/read/wait/lease` verbs and
-  agent-presence cursor cover WEB surfaces, but `app open`,
-  `terminal new`, and `search set` steal the user's active view — exactly
-  the "headless surface-create blocks undisturbed co-browse" gap in
-  `docs/agent-control-plane.md` §Field-findings. The user asked directly:
-  "can't you use the agent control client mode instead — we built it for
-  exactly this type of work, or is there some missing layer?" Answer: the
-  layer is missing for terminal work. Direction: an agent-scoped client
-  context (per-agent active-session + soft-stashed surface set) so
-  agent-driven opens/spawns/probes never touch the user's
-  `active_session_path`, plus a `--shadow`/`--agent` flag on the session
-  verbs routing into it. Until built, probe etiquette stands: capture and
-  restore the active path, batch activations, never drive the search bar
-  while the user is present.
+- **★ AGENT SHADOW CLIENT FOR THE TERMINAL LANE — E2E LIVE ON JOJO
+  (2026-07-23, user directive "complete the agent client system e2e"):**
+  the slice-4.3 shadow view client now runs against the LIVE daemon
+  (sway+grim installed on jojo; `scripts/shadow-client.sh start --name
+  agent-1` attaches as Shadow through the role gate), and probes drive it
+  with `--client agent-1` — live-proven that `app open --client agent-1`
+  switches ONLY the shadow's active session while the user's worker stays
+  put (pid-targeted state on both workers). **Routing hole found + fixed
+  the same night:** untargeted app-control verbs resolved to the NEWEST
+  worker, so a running shadow silently captured every untargeted verb —
+  which reads exactly like the shadow yanking the user's session (it was
+  an instrument lie, not propagation). `ClientInstanceRecord` now carries
+  `client_role`; untargeted verbs prefer the sole ACTIVE client for reads
+  AND mutations (user scripts keep working while shadows run);
+  only-shadows-alive mutations fail loudly; legacy records read Active.
+  The probe workflow is codified in
+  `.agents/skills/yggui-app-control/SKILL.md` §THE SHADOW-PROBE LAW.
+  **Remaining (recorded, not blocking):** a `--no-activate` spawn path so
+  probe-session creation on the user's worker doesn't switch their view
+  (Shadow role rightly cannot ensure/spawn — D8); on-demand shadow
+  lifecycle (auto-spawn + idle reap, eng-review D6) — the script's
+  start/stop is manual today.
 
 - **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
   still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
