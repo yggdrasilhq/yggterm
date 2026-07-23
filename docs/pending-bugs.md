@@ -197,6 +197,38 @@ fix) once the fix is verified live on jojo.
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
 
+- **★★ THE CLICK RENDER STORM — root-caused live 2026-07-23 (user repro:
+  "clicking anywhere in the claude TUI produces the blink … UI gets laggy and
+  fans spin"), fix = single-live-owner stand-down, felt-confirmation pending.**
+  Mechanism, proven with a tagged-node MutationObserver on the live host: a
+  click-driven re-open re-dispatches the terminal eval script for a hostId
+  whose PREVIOUS closure is still alive (`constructed …-m1` fired 3× for one
+  hostId: GUI start + both click episodes — the mount-epoch reuse keeps the
+  LABEL but not the closure). Both closures then FIGHT for the host: each
+  one's placement repair sees the other's element and evicts it — measured
+  ONE click → **560 host childList mutations in 3 s**, two roots (the WebGL
+  original vs a `xterm-dom-renderer-owner-N` twin) alternating at 25–50 ms,
+  each wipe re-firing the other closure's ResizeObserver. The storm is also
+  the DOM-event flood that starves the GTK input region (laggy UI) and burns
+  CPU (fans). It settles only when one side's circuit breaker loses.
+  **Fix (GUI-only): ownership tokens.** Registration into
+  `__yggtermXtermHosts[hostId]` is last-writer-wins and now stamps an
+  `ownerToken`; a closure that finds a newer token STANDS DOWN completely
+  (rebind/redraw/render-health refuse, ResizeObserver disconnects, traced
+  `superseded_closure_stand_down`) instead of competing. Locks: the
+  ownership/gate asserts in the eval-script test.
+  **Also fixed:** SGR mouse-report bursts (a click on a mouse-tracking TUI =
+  `\x1b[<b;x;yM` ≈ 12–14 bytes on onData) were classified as pastes — 226
+  bogus `xterm_paste_event`/hour measured.
+  **STILL OPEN under this entry:** WHY a viewport click fires
+  `request_terminal_launch_for_active` and re-dispatches the mount script at
+  all (the stand-down makes it harmless but each re-dispatch still costs a
+  full Terminal construct + snapshot restore ≈ the user's post-switch
+  "papers-checking" seconds. That trigger path is harness-spec §7.10/phase 3
+  material — find the click→open-request edge and the re-dispatch condition
+  before coding). Remove this entry once the user confirms clicking and
+  switching no longer blink.
+
 - **Rendering stability: user RE-REPORTED blinking + blank-on-switch 2026-07-23
   ("blinking and waiting on blank sessions only fixed by switching again and in
   session blinking") — a THIRD defect found + fixed same day: the render-health
