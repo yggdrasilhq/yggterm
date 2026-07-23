@@ -50,6 +50,7 @@ pub enum ShellCommand {
     NextSession,
     PrevSession,
     OpenKeymapEditor,
+    FocusSearch,
 }
 
 /// Static metadata for one command.
@@ -164,6 +165,17 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Edit ALT+ keys",
         parent: None,
         default_keytip: Some('k'),
+        descends_into: None,
+    },
+    CommandSpec {
+        // Replaces the bare "/" hotkey (user call 2026-07-23): a plain
+        // printable key stole real typing whenever focus judgment misfired;
+        // search focus belongs in the ALT+ layer like every other affordance.
+        command: ShellCommand::FocusSearch,
+        id: "search.focus",
+        title: "Search",
+        parent: None,
+        default_keytip: Some('s'),
         descends_into: None,
     },
     CommandSpec {

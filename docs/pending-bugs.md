@@ -6,6 +6,23 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★ USER CALL 2026-07-23: agent probes must stop driving the user's
+  foreground GUI — build the missing shadow/headless layer for the
+  terminal lane.** The agent-control plane's `do/read/wait/lease` verbs and
+  agent-presence cursor cover WEB surfaces, but `app open`,
+  `terminal new`, and `search set` steal the user's active view — exactly
+  the "headless surface-create blocks undisturbed co-browse" gap in
+  `docs/agent-control-plane.md` §Field-findings. The user asked directly:
+  "can't you use the agent control client mode instead — we built it for
+  exactly this type of work, or is there some missing layer?" Answer: the
+  layer is missing for terminal work. Direction: an agent-scoped client
+  context (per-agent active-session + soft-stashed surface set) so
+  agent-driven opens/spawns/probes never touch the user's
+  `active_session_path`, plus a `--shadow`/`--agent` flag on the session
+  verbs routing into it. Until built, probe etiquette stands: capture and
+  restore the active path, batch activations, never drive the search bar
+  while the user is present.
+
 - **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
   still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
   plain text, duplicated turns, no codex TUI chrome, on a cold launch. This is
