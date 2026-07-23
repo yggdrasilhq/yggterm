@@ -78648,6 +78648,56 @@ fn terminal_eval_script_with_canvas_renderer(
         let detachHostInteractions = (_targetHost) => {{}};
         let handleTerminalContextMenu = (_event) => {{}};
         let handleTerminalSecondaryButton = (_event) => false;
+        // ── SINGLE LIVE OWNER PER HOST (2026-07-23, user-reported render
+        // storm). A click-driven re-open can re-dispatch this whole script for
+        // a hostId whose previous closure is still alive: two closures then
+        // FIGHT for the host — each one's repair sees the other's element and
+        // evicts it (measured live: ONE click → 560 childList mutations in 3s,
+        // two roots alternating at 25-50ms, UI lag + fans — the user's "render
+        // storm"). The registry write below is last-writer-wins, so the entry's
+        // ownerToken names the ONE legitimate owner; a closure that finds a
+        // NEWER token must stand down COMPLETELY — no repairs, no observers,
+        // no redraws — instead of competing. Registration flips ownRegistered,
+        // so the pre-registration window never misreads the predecessor's
+        // token as "we were superseded".
+        window.__yggtermXtermOwnerTokens = (window.__yggtermXtermOwnerTokens || 0) + 1;
+        const closureOwnerToken = window.__yggtermXtermOwnerTokens;
+        let closureOwnRegistered = false;
+        let closureRetired = false;
+        const closureSuperseded = () => {{
+            if (closureRetired) {{
+                return true;
+            }}
+            if (!closureOwnRegistered) {{
+                return false;
+            }}
+            const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+            return Boolean(
+                entry && entry.ownerToken !== undefined && entry.ownerToken !== closureOwnerToken
+            );
+        }};
+        const standDownIfSuperseded = (site) => {{
+            if (!closureSuperseded()) {{
+                return false;
+            }}
+            if (!closureRetired) {{
+                closureRetired = true;
+                try {{
+                    if (resizeObserver) {{
+                        resizeObserver.disconnect();
+                    }}
+                }} catch (_error) {{}}
+                try {{
+                    detachHostInteractions(host);
+                }} catch (_error) {{}}
+                sendTerminalEvent({{
+                    kind: "debug",
+                    message: `superseded_closure_stand_down host=${{hostId}} site=${{String(site || '')}}`
+                        + ` token=${{closureOwnerToken}}`,
+                }});
+            }}
+            return true;
+        }};
         const applyHostSurfaceContract = () => {{
             host.tabIndex = 0;
             host.style.pointerEvents = 'auto';
@@ -79088,6 +79138,11 @@ fn terminal_eval_script_with_canvas_renderer(
             return mode;
         }};
         const rebindCurrentHost = (reason, reopen) => {{
+            // A superseded closure must never repair: its "repair" evicts the
+            // live owner's element (the two-owner fight, above).
+            if (standDownIfSuperseded(`rebind:${{String(reason || '')}}`)) {{
+                return host;
+            }}
             try {{
                 const liveHost = document.getElementById(hostId);
                 if (!liveHost) {{
@@ -82294,6 +82349,9 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }};
         const redrawTerminal = (reason = 'manual') => {{
+            if (standDownIfSuperseded(`redraw:${{String(reason || '')}}`)) {{
+                return;
+            }}
             manualRedrawCount += 1;
             const redrawStartedAtMs = Date.now();
             // Fail-pattern detection: a burst of repaints with NO session
@@ -82569,6 +82627,10 @@ fn terminal_eval_script_with_canvas_renderer(
             }};
         }};
         const updateRenderHealth = (reason, cursorLineText = '', textTail = '', options = {{}}) => {{
+            if (standDownIfSuperseded(`render_health:${{String(reason || '')}}`)) {{
+                return {{ status: 'superseded', reason: 'closure_stood_down', ink: null,
+                    recovery_count: 0, recovery_pending: false }};
+            }}
             const now = Date.now();
             lastRenderHealthCheckedAtMs = now;
             const skipInkSample = Boolean(options && options.skip_ink_sample);
@@ -84835,6 +84897,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{
+            ownerToken: closureOwnerToken,
             host,
             term,
             fitAddon,
@@ -85061,6 +85124,10 @@ fn terminal_eval_script_with_canvas_renderer(
             lastViewportForceReason: '',
             lastViewportForceAtMs: 0,
         }};
+        // Registration is the ownership claim: from here on, a NEWER closure
+        // overwriting this entry (its ownerToken replaces ours) supersedes us
+        // and every gated site above stands us down.
+        closureOwnRegistered = true;
         // FIX A (content-scoop on remount): fit the term to its container
         // BEFORE the snapshot restore writes content. A fresh/remounted xterm
         // is 80x24 until the first fit; restoring the retained snapshot (the
@@ -85147,7 +85214,14 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}, delayMs);
             }});
         }};
-        resizeObserver = new ResizeObserver(() => scheduleEmitResize());
+        resizeObserver = new ResizeObserver(() => {{
+            // The ghost's observer re-fires on the live owner's every DOM
+            // change — this gate is what actually ends the A-B eviction fight.
+            if (standDownIfSuperseded('resize_observer')) {{
+                return;
+            }}
+            scheduleEmitResize();
+        }});
         resizeObserver.observe(host);
         const readTerminalBufferSample = () => {{
             try {{
@@ -86663,9 +86737,17 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 if (typeof data === 'string' && data.length >= 4) {{
                     const dt = lastPasteEventAtMs ? Date.now() - lastPasteEventAtMs : -1;
+                    // A mouse-tracking TUI (CC, codex pagers) turns every click
+                    // and wheel tick into an SGR mouse-report burst on onData
+                    // (\x1b[<b;x;yM / m, 12-14 bytes) — input, not a paste.
+                    // Before this guard a single click on a mouse-enabled
+                    // session logged a bogus paste event (226/hour measured
+                    // live, 2026-07-23).
+                    const mouseReportBurst = /^(?:\\u001b\[<\d+;\d+;\d+[Mm])+$/.test(data);
                     // If we just emitted a paste event from our own path,
                     // skip the onData echo (term.paste internally feeds onData).
-                    if (!(dt >= 0 && dt < 60 && lastPasteEventTrigger === 'middle_click_yggterm')) {{
+                    if (!mouseReportBurst
+                        && !(dt >= 0 && dt < 60 && lastPasteEventTrigger === 'middle_click_yggterm')) {{
                         recordPasteEvent('unknown', 'on_data_burst', data.length, null);
                     }}
                 }}
@@ -90865,7 +90947,7 @@ fn top_level_block_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
 /// block click-to-edit reader both use exactly this string. The stack is the
 /// DESIGN.md "document reading font" entry — change it there first.
 fn document_reading_typography() -> &'static str {
-    "font-size:15px; line-height:1.7; \
+    "font-size:16px; line-height:1.7; \
      font-family:'Inter', 'SF Pro Text', 'Segoe UI', 'Noto Sans', \
      'Liberation Sans', 'Helvetica Neue', Arial, sans-serif; \
      letter-spacing:0.002em; text-rendering:optimizeLegibility;"
@@ -90947,9 +91029,11 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
         MdBlock::BlockQuote(body) => rsx! {
             div {
                 key: "q{index}",
+                // Obsidian-style: the accent bar carries the quote; the text
+                // stays upright (italic-everything read as decoration).
                 style: format!(
                     "border-left:3px solid {}; margin:14px 0; padding:2px 0 2px 16px; \
-                     font-style:italic; color:{};",
+                     color:{};",
                     palette.accent, palette.muted
                 ),
                 for (child_index, child) in body.iter().enumerate() {
@@ -90962,7 +91046,7 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                 for (item_index, item) in items.iter().enumerate() {
                     li {
                         key: "li{item_index}",
-                        style: "margin:5px 0;",
+                        style: "margin:6px 0;",
                         for (child_index, child) in item.iter().enumerate() {
                             {md_block_node(child, palette, child_index)}
                         }
@@ -90976,12 +91060,20 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
             }
         }
         MdBlock::Table { header, rows } => {
+            // Obsidian-style table: horizontal separators only — no vertical
+            // grid, no header fill. The full cell grid read as a spreadsheet;
+            // an article's table is rows of text with quiet rules.
             let cell_style = format!(
-                "border:1px solid {border}; padding:7px 12px; text-align:left; \
-                 vertical-align:top; line-height:1.5; color:{};",
+                "border:0; border-bottom:1px solid {border}; padding:8px 14px 8px 0; \
+                 text-align:left; vertical-align:top; line-height:1.55; color:{};",
                 palette.fg
             );
-            let head_style = format!("{cell_style} background:{}; font-weight:700;", palette.chrome);
+            let head_style = format!(
+                "border:0; border-bottom:2px solid {border}; padding:8px 14px 8px 0; \
+                 text-align:left; vertical-align:top; line-height:1.55; \
+                 font-weight:700; color:{};",
+                palette.fg
+            );
             rsx! {
                 // Wide tables scroll inside their own container; the document
                 // never scrolls horizontally (the triage-board acceptance rule).
@@ -91112,12 +91204,17 @@ fn EditableMarkdownBody(
                     textarea {
                         key: "md-edit-{index}",
                         "data-md-block-editor": "{index}",
+                        // In-place feel (user, 2026-07-23, the obsidian
+                        // reference): the editor keeps the READING typography
+                        // and shows no box — only a thin accent bar marks the
+                        // active block, so block → editor is a reveal of the
+                        // source text, not a mode jolt into a bordered form.
                         style: format!(
-                            "display:block; width:100%; min-height:64px; box-sizing:border-box; margin:6px 0; \
-                             padding:10px 12px; border:1px solid {}; border-radius:8px; background:{}; \
-                             color:{}; caret-color:{}; font-family:ui-monospace, monospace; font-size:12.5px; \
-                             line-height:1.55; resize:vertical; outline:none;",
-                            doc.accent, doc.chrome, doc.fg, doc.accent
+                            "display:block; width:100%; min-height:48px; box-sizing:border-box; margin:0 0 14px 0; \
+                             padding:0 0 0 12px; border:0; border-left:2px solid {}; border-radius:0; \
+                             background:transparent; color:{}; caret-color:{}; \
+                             {} resize:vertical; outline:none; white-space:pre-wrap; overflow-wrap:anywhere;",
+                            doc.accent, doc.fg, doc.accent, document_reading_typography()
                         ),
                         rows: "{edit_rows}",
                         autofocus: true,
@@ -106185,9 +106282,41 @@ mod tests {
         );
         assert!(
             script.contains("const scheduleEmitResize = () => {")
-                && script
-                    .contains("resizeObserver = new ResizeObserver(() => scheduleEmitResize());"),
+                && script.contains("resizeObserver = new ResizeObserver(() => {"),
             "resize observer bursts should be collapsed to one fit per animation frame"
+        );
+        // ── SINGLE LIVE OWNER PER HOST (2026-07-23, the click render storm).
+        // A re-dispatched script for a hostId whose previous closure is alive
+        // produced TWO closures fighting for the host: each one's repair
+        // evicted the other's element (measured live: one click → 560 host
+        // childList mutations in 3s, two roots alternating at 25-50ms). The
+        // registry entry's ownerToken names the ONE owner; every repair-capable
+        // site must stand a superseded closure down rather than let it compete.
+        assert!(
+            script.contains("ownerToken: closureOwnerToken,"),
+            "registration must claim ownership — last writer wins"
+        );
+        for gate in [
+            "if (standDownIfSuperseded(`rebind:${String(reason || '')}`)) {",
+            "if (standDownIfSuperseded(`redraw:${String(reason || '')}`)) {",
+            "if (standDownIfSuperseded(`render_health:${String(reason || '')}`)) {",
+            "if (standDownIfSuperseded('resize_observer')) {",
+        ] {
+            assert!(
+                script.contains(gate),
+                "a superseded closure must stand down at every repair-capable site: {gate}"
+            );
+        }
+        assert!(
+            script.contains("closureOwnRegistered = true;"),
+            "the supersession check must not fire before this closure has registered — \
+             the pre-registration window would misread the predecessor's token"
+        );
+        // A mouse-tracking TUI turns every click/wheel into an SGR report burst
+        // on onData — input, not a paste (226 bogus paste events/hour measured).
+        assert!(
+            script.contains("const mouseReportBurst = "),
+            "SGR mouse-report bursts must never be classified as pastes"
         );
         assert!(
             script.contains("const fitChanged = fitTerminalToHost('resize');")
