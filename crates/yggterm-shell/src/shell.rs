@@ -77522,6 +77522,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     host.style.position = 'relative';
                 }}
                 host.appendChild(revealGhostFrame);
+                const ghostAttachedAtMs = Date.now();
                 const releaseRevealGhost = () => {{
                     try {{
                         if (revealGhostFrame.isConnected) {{
@@ -77534,7 +77535,22 @@ fn terminal_eval_script_with_canvas_renderer(
                     }} catch (_error) {{}}
                 }};
                 window.setTimeout(releaseRevealGhost, 2400);
-                window.addEventListener('keydown', releaseRevealGhost, {{ once: true, capture: true }});
+                // First keystroke releases the cover (input echo must not be
+                // hidden) — UNLESS the ghost is younger than the keystroke's
+                // own remount: when a keydown (prompt submit) is what caused
+                // this re-dispatch, that same keydown used to rip the cover
+                // off and expose the fresh construct's fit+restore for a
+                // frame (user 2026-07-23: "after passing a prompt … zoomed a
+                // little; blinked once and fixed"). A minimum cover age keeps
+                // the transition invisible; real typing lands >250ms later.
+                const releaseOnKeydown = () => {{
+                    if (Date.now() - ghostAttachedAtMs < 250) {{
+                        window.addEventListener('keydown', releaseOnKeydown, {{ once: true, capture: true }});
+                        return;
+                    }}
+                    releaseRevealGhost();
+                }};
+                window.addEventListener('keydown', releaseOnKeydown, {{ once: true, capture: true }});
                 sendTerminalEvent({{
                     kind: "debug",
                     message: `reveal_ghost_attached host=${{hostId}} w=${{revealGhostFrame.width}} h=${{revealGhostFrame.height}}`
@@ -90995,10 +91011,10 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
             // and NO rule/underline — decoration the markdown didn't ask for
             // (user spec 2026-07-18; the old h1/h2 border-bottom is gone).
             let (size, weight, margin, spacing) = match level {
-                1 => ("1.8em", "800", "26px 0 12px 0", "-0.015em"),
-                2 => ("1.42em", "780", "24px 0 10px 0", "-0.01em"),
-                3 => ("1.18em", "740", "20px 0 8px 0", "0"),
-                _ => ("1.04em", "720", "16px 0 6px 0", "0"),
+                1 => ("1.8em", "800", "34px 0 16px 0", "-0.015em"),
+                2 => ("1.42em", "780", "30px 0 14px 0", "-0.01em"),
+                3 => ("1.18em", "740", "26px 0 12px 0", "0"),
+                _ => ("1.04em", "720", "20px 0 10px 0", "0"),
             };
             let style = format!(
                 "font-size:{size}; font-weight:{weight}; margin:{margin}; \
@@ -91206,13 +91222,17 @@ fn EditableMarkdownBody(
                         "data-md-block-editor": "{index}",
                         // In-place feel (user, 2026-07-23, the obsidian
                         // reference): the editor keeps the READING typography
-                        // and shows no box — only a thin accent bar marks the
-                        // active block, so block → editor is a reveal of the
-                        // source text, not a mode jolt into a bordered form.
+                        // and shows no box — a faint accent-tinted background
+                        // marks the active block, so block → editor is a
+                        // reveal of the source text, not a mode jolt.
+                        // ⚠ NOT a left bar: an accent left bar is the
+                        // BLOCKQUOTE vocabulary (user caught the collision —
+                        // "that blue line does not denote editability; on the
+                        // obsidian screenshot that was a quote").
                         style: format!(
                             "display:block; width:100%; min-height:48px; box-sizing:border-box; margin:0 0 14px 0; \
-                             padding:0 0 0 12px; border:0; border-left:2px solid {}; border-radius:0; \
-                             background:transparent; color:{}; caret-color:{}; \
+                             padding:6px 10px; border:0; border-radius:8px; \
+                             background:color-mix(in srgb, {} 9%, transparent); color:{}; caret-color:{}; \
                              {} resize:vertical; outline:none; white-space:pre-wrap; overflow-wrap:anywhere;",
                             doc.accent, doc.fg, doc.accent, document_reading_typography()
                         ),
@@ -102027,8 +102047,17 @@ mod tests {
         );
         assert!(
             script
-                .contains("window.addEventListener('keydown', releaseRevealGhost, { once: true, capture: true });"),
+                .contains("window.addEventListener('keydown', releaseOnKeydown, { once: true, capture: true });"),
             "the first keystroke must reveal reality (input echo never hidden)"
+        );
+        // …but NOT the keystroke that caused the remount itself: a prompt
+        // submit used to rip the cover off in the same instant it triggered
+        // the re-dispatch, exposing the fresh construct's fit+restore for a
+        // frame (user 2026-07-23: "zoomed a little; blinked once and fixed").
+        assert!(
+            script.contains("if (Date.now() - ghostAttachedAtMs < 250) {"),
+            "the cover must survive the keystroke that caused the remount — \
+             a minimum ghost age keeps the transition invisible"
         );
         // Capture BEFORE the prior entry's cleanup (which disposes the canvases),
         // attach AFTER (and in the same task as) the host wipe.
