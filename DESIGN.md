@@ -546,9 +546,13 @@ article feel:
 - Blockquotes: accent left bar, upright text (never italicize the whole
   quote).
 - Block click-to-edit: the in-place editor keeps the READING typography with
-  no box — transparent background, no border, a thin accent bar on the left
-  marks the active block. Entering edit is a reveal of the source text, not a
-  mode jolt into a form (the obsidian in-place feel, at block granularity).
+  no box — a faint accent-tinted background (color-mix ~9%) marks the active
+  block. Entering edit is a reveal of the source text, not a mode jolt into a
+  form (the obsidian in-place feel, at block granularity).
+- ⚠ An accent LEFT BAR is the BLOCKQUOTE vocabulary — never reuse it for
+  editability or selection in a document surface (user caught the collision
+  2026-07-23: "that blue line does not denote editability; on the obsidian
+  screenshot that was a quote"). One visual token, one meaning.
 - Headings: same sans, heavy weights (h1 800 → h4 720), negative letter
   spacing on h1/h2, more air above than below (h1 26px above / 12px below,
   scaling down). Paragraphs carry 14px bottom margin. NO border/rule under
