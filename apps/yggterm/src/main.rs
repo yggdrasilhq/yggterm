@@ -29,6 +29,7 @@ use yggterm_server::{
     resolve_client_daemon_endpoint,
     run_app_control_background_window, run_app_control_close_window,
     run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
+    run_app_control_ensure_web_surface,
     run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
@@ -2640,11 +2641,13 @@ fn main() -> Result<()> {
                                 None
                             }
                         });
+                        let activate = !args.iter().any(|arg| arg == "--no-activate");
                         run_app_control_create_terminal(
                             machine_key,
                             cwd,
                             title_hint,
                             kind,
+                            activate,
                             timeout_ms,
                         )
                     }
@@ -2969,6 +2972,18 @@ fn main() -> Result<()> {
                             generation,
                             timeout_ms,
                         )
+                    }
+                    "ensure" => {
+                        // Headless surface-create: materialize a BACKGROUNDED
+                        // session's declared web surfaces into the soft stash
+                        // (never revealed) so agent verbs can drive them:
+                        //   web ensure --session <path> [--ttl <secs>]
+                        let ttl_secs = cli_flag_value(&args, "--ttl")
+                            .map(|raw| raw.parse::<u64>().context("--ttl needs a number"))
+                            .transpose()?;
+                        let session = session_path
+                            .context("web ensure needs --session <path> (a backgrounded surface has no active default)")?;
+                        run_app_control_ensure_web_surface(session, ttl_secs, timeout_ms)
                     }
                     "lease" => {
                         // Claim the surface so the background reaper leaves it

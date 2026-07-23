@@ -467,6 +467,11 @@ pub enum AppControlCommand {
         title_hint: Option<String>,
         #[serde(default)]
         session_kind: Option<SessionKind>,
+        /// `Some(false)` = create WITHOUT switching the user's active view
+        /// (agent-driven probe/background spawns). `None`/`Some(true)` = the
+        /// existing activate-on-create behavior.
+        #[serde(default)]
+        activate: Option<bool>,
     },
     SendTerminalInput {
         session_path: String,
@@ -725,6 +730,16 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         ttl_secs: u64,
     },
+    /// Headless surface-create (agent control plane slice 2): materialize a
+    /// BACKGROUNDED session's declared web surfaces now — created straight
+    /// into the soft stash (demoted, never revealed, no page hole) and leased
+    /// for `ttl_secs`, so an agent can drive them without the user's view
+    /// ever changing.
+    EnsureWebSurface {
+        session_path: String,
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -841,6 +856,7 @@ impl AppControlCommand {
             Self::WebSurfaceRead { .. } => "web_surface_read",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",
+            Self::EnsureWebSurface { .. } => "ensure_web_surface",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",

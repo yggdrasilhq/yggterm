@@ -334,11 +334,19 @@ presence dialog.
   surface (read/do interleave; the human always preempts). A lease taken while
   the surface is still foreground survives the later foreground→stash transition
   (it is written to the entry, not to the stash timer).
-- **Headless surface-create.** `open --session <path> --url … --headless` mounts
-  a surface that is created but never revealed — the reconciler places it
-  demoted with a lease and no page hole. Dream §2: OSC surface-create must not
-  defer while the window is backgrounded. On the farm plane this is just
-  `/open`.
+- **Headless surface-create — ✅ BUILT 2026-07-23.** `server app web ensure
+  --session <path> [--ttl <secs>]` (`EnsureWebSurface`) marks the session
+  headless-wanted; the reconciler's lazy-create branch then materializes its
+  declared surfaces at a canonical offscreen rect (1280×800) and demotes them
+  in the SAME tick — created straight into the soft stash, never revealed, no
+  page hole, tab lease set from the same ttl. The materialization request is a
+  TTL edge (`web_surface_headless_create_due`); the created surface's lifetime
+  is the normal hold/lease clock. Paired with `terminal new --no-activate`
+  (create a session without switching the user's view — the snapshot apply's
+  activation is handed straight back before the next render), a full ychrome
+  automation run touches the user's viewport zero times. Dream §2 (OSC
+  surface-create must not defer while the WINDOW is backgrounded) is the
+  remaining sibling; on the farm plane this is just `/open`.
 
 ## Action & lifecycle correctness (slice 2b — normative, F3)
 

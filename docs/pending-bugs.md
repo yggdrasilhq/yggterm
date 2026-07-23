@@ -23,11 +23,26 @@ fix) once the fix is verified live on jojo.
   only-shadows-alive mutations fail loudly; legacy records read Active.
   The probe workflow is codified in
   `.agents/skills/yggui-app-control/SKILL.md` §THE SHADOW-PROBE LAW.
-  **Remaining (recorded, not blocking):** a `--no-activate` spawn path so
-  probe-session creation on the user's worker doesn't switch their view
-  (Shadow role rightly cannot ensure/spawn — D8); on-demand shadow
-  lifecycle (auto-spawn + idle reap, eng-review D6) — the script's
-  start/stop is manual today.
+  **COMPLETED same night (user: "finish the remaining gaps"):**
+  `terminal new --no-activate` (create without switching the user's view;
+  activation handed back before the next render, so nothing flashes) and
+  **headless surface-create** (`web ensure --session <path>` — see
+  docs/agent-control-plane.md, "✅ BUILT 2026-07-23"). The user ruled the
+  shadow client FIRST-CLASS (bug-bash pixels of a non-active view), with
+  the platform caution: sway+grim is the Linux backend only — yggterm goes
+  Windows/macOS (+ mobile in a private repo), so shadow-view work stays
+  behind a per-platform backend seam and the core plane must never grow a
+  compositor dependency. **Still recorded:** ★ Dream §2 — daemon-side OSC
+  declare ingestion: the web-surface declare is parsed by the CLIENT-side
+  terminal eval script, so a never-revealed session's FIRST declare needs
+  one brief reveal+restore (~5s); after it, `web ensure` re-materializes
+  headless forever (live-proven: background `web read` + per-surface
+  screenshot with the user's view untouched). The fix is parsing/
+  registering declares daemon-side (or a bounded GUI-side chunk scan on
+  `ensure`) so even the first declare is invisible. Also: terminal-lane
+  agent PRESENCE (a badge when an agent drives a session's terminal —
+  pointer verbs have the cursor, `terminal send` shows nothing); on-demand
+  shadow lifecycle (auto-spawn + idle reap, D6).
 
 - **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
   still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
