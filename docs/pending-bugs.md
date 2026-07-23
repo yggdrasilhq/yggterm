@@ -6,51 +6,6 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
-- **★ SIDEBAR CWD-TREE, three user-reported bugs (2026-07-23) — ALL THREE
-  FIXED + LIVE-VERIFIED same day, user felt-confirmation pending.**
-  1. **Scroll clamp on collapse — FIXED.** Root cause: the
-     `sidebar_scroll_bounds_repair_script` `use_effect` computed its key in
-     the render body and read no tracked signal inside its closure, so
-     Dioxus subscribed it only to its own dedup signal — it fired once at
-     GUI start and went inert; WebKitGTK does not self-clamp `scrollTop`
-     when content shrinks, so a collapse stranded the viewport. Fix: the
-     repair is folded into the adjacent autoscroll effect, which reads
-     state inside the closure (the key includes `rows.len()`, which is what
-     a collapse changes). Live proof: scrolled the sidebar to max
-     (top 4250 = 5410-1160), shrank rows via search filter (same
-     `rows.len()` shrink as collapse) → scrollTop clamped to 0, sidebar
-     scrollable. Remove after the user confirms the literal collapse
-     gesture no longer wedges the sidebar.
-  2. **Local cwd-tree folders now own a REAL directory path (the remote
-     model), so launches land in them and rows merge with scan nodes.**
-     Was: creation birthed a virtual `/workspace/folder-<nanos>` group,
-     rename only re-titled it, launches fell back to `$HOME`, and the user
-     got duplicate rows (their `gh/yggterm` twins) — the
-     [[spec-unify-local-remote]] divergence. Now: creation on the local
-     machine roots at real `$HOME`; a rename MOVES the group to the real
-     target path (`local_workspace_rename_target`, sharing
-     `join_remote_cwd`'s segment rules) and materializes the directory
-     (`materialize_local_folder_rename` — a generated `folder-<nanos>` dir
-     is moved, any other real dir is never touched); legacy `/workspace/…`
-     rows re-root under `$HOME` on their next rename. The tree builder
-     needed NO change — real-path groups already nest and structurally
-     merge with scan-derived nodes (`insert_workspace_group_path` /
-     `insert_codex_browser_path` share the segment-keyed children map).
-     Live proof on jojo: the user's one real legacy local folder healed
-     from `~/git/folder-1783…` to its real titled path (dir verified);
-     subfolder creation based at the real path.
-  3. **Slash decomposition — works via the same move.** Live proof: rename
-     to `sub/deep-proof` produced the nested group AND the nested real
-     directories. Remote folders additionally gained the missing
-     `mkdir -p` on rename (`ensure_remote_workspace_dir` over ssh,
-     best-effort) — live-proven jojo→dev. Also swept 20 empty legacy
-     `~/folder-<nanos>` litter dirs on jojo (one non-empty survivor left:
-     `~/folder-1783652039123392249` — has content, user's call).
-  ⚠ Known edge kept deliberately: renaming to a title equal to the row's
-  label is a no-op (existing early return), and a rename whose target path
-  already exists as a group errors instead of merging — non-destructive,
-  revisit only if the user hits it.
-
 - **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
   still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
   plain text, duplicated turns, no codex TUI chrome, on a cold launch. This is
@@ -285,18 +240,37 @@ fix) once the fix is verified live on jojo.
   it deliberately never fires on request bumps while the host is on screen.
   **Live proof: 3-minute quiet window on the actively-streaming remote-cc
   session = 0 bootstrap events (pre-swap same session: 4–5 per 10 min).**
-  **STILL OPEN — the SWITCH-reveal re-bootstrap is a DIFFERENT layer and
-  survives:** trace shows every switch recreates the terminal COMPONENT
-  INSTANCE (fresh `last_bootstrap_identity` ⇒ `bootstrap_reset` fires with
-  `mount_epoch_reused` on the same render — for remote-CODEX too), so the
-  activation-epoch pin never gets a say. Switch-zoom needs the component to
-  survive backgrounding (premount/keep-set mount retention — harness §7.10
-  / phase-3 material). The nudge infrastructure shipped here is the reveal
-  half that work will need. Also still open: the residual "slight zoom, no
-  blink" ghost-geometry mismatch on covered switches (pixel-diff the ghost
-  frame vs first settled frame on New Yedit).
-  Remove the in-session paragraph once the user confirms output-boundary
-  moments no longer zoom; keep the switch-reveal item until §7.10 lands.
+  **STILL OPEN — the SWITCH-reveal re-bootstrap, now DESIGN-COMPLETE
+  (sharpened 2026-07-23 late, do NOT re-diagnose):** every switch recreates
+  the terminal COMPONENT INSTANCE (fresh `last_bootstrap_identity` ⇒
+  `bootstrap_reset` fires WITH `mount_epoch_reused` on the same render —
+  for remote-CODEX too), so no activation-epoch pin can help. The premount
+  keep-set (HOT-tier, cap 8) retains the EPOCH and the JS closure — the
+  xterm closure genuinely survives in `__yggtermXtermHosts` with its
+  painted buffer, and the saved-cursor `ResumeAppend` read plan already
+  makes the re-read delta-only — but the single-live-owner stand-down
+  (the click-storm fix) GUARANTEES the fresh dispatch's new closure
+  supersedes the survivor and rebuilds from scratch. **The fix is an
+  ADOPTION path in the mount script:** before constructing, if the registry
+  holds a live entry for this hostId with a COMPLETE surface
+  (`terminalSurfaceIsComplete`), call a new closure-exposed
+  `adoptHost(newHostElement)` on the survivor — it re-points the closure's
+  `host` binding, moves `term.element` in via `attachTerminalSurfaceToHost`
+  (refuses husks by construction), re-attaches host interactions +
+  ResizeObserver + surface contract — and the new script EXITS WITHOUT
+  REGISTERING (so the survivor's ownerToken stays newest; no stand-down
+  fires). ⚠ The hard part is the RUST bootstrap contract: the dispatching
+  bootstrap task must treat "adopted" as constructed+painted (emit a
+  compatible event or a dedicated `adopted` signal) or it will stall into
+  timeout recovery — the snapshot-poison minefield. Skip the snapshot seed
+  on adoption (the buffer is live); the reveal nudge shipped this round is
+  the repaint half. Prove on {local,remote}×{cc,codex}×{idle,streaming}:
+  second reveals must show ZERO `bootstrap_reset` and no construct, with
+  scrollback intact. Also still open: the residual "slight zoom, no blink"
+  ghost-geometry mismatch on covered switches (pixel-diff ghost frame vs
+  first settled frame on New Yedit).
+  The in-session arm is user-confirmed fixed (2026-07-23 "all good");
+  keep this entry until the adoption path lands.
 
 - **Rendering stability: user RE-REPORTED blinking + blank-on-switch 2026-07-23
   ("blinking and waiting on blank sessions only fixed by switching again and in
