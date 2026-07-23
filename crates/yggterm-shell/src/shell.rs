@@ -663,6 +663,12 @@ const RETAINED_REHYDRATE_DAEMON_READY_WATCH_GRACE_MS: u64 = 1_000;
 const TERMINAL_LOCAL_ENSURE_ATTEMPT_TIMEOUT_MS: u64 = 5_000;
 const TERMINAL_REMOTE_ENSURE_ATTEMPT_TIMEOUT_MS: u64 = 30_000;
 const TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS: u64 = 3;
+const TERMINAL_DAEMON_ENSURE_DETOUR_TIMEOUT_MS: u64 = 10_000;
+/// Stale-attach lease reclaim: past this age, an attach whose open attempt
+/// never reached ready no longer blocks a new bootstrap owner. Generous
+/// against the slowest healthy remote resume (~30s ensure budget), far below
+/// the many-minute wedges it exists to break.
+const TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS: u64 = 45_000;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 const TERMINAL_REMOTE_RESUME_READ_POLL_MS: u64 = 45;
 const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
@@ -12955,6 +12961,35 @@ impl ShellState {
             self.terminal_cold_remount_since_ms.remove(session_path);
             return (self.retain_terminal_session_path(session_path), true, false);
         }
+        // A mount whose attach is STILL SETTLING is not a cold-remount
+        // candidate. The re-assert that lands right after an open request
+        // completes (the `latest_open_request_id` bump re-runs the mount-key
+        // effect) used to fall through here — the reveal path above requires
+        // `was_ever_ready`, which a session being born cannot satisfy — and
+        // tear down the in-flight mount ~0.6s after it was constructed:
+        // measured as epoch N then N+1 on virtually every session birth and
+        // cross-pathway switch (the "each reveal constructs twice" blink).
+        // Genuine fault recovery bumps the epoch directly, never through this
+        // resolver, so reusing the settling host here cannot mask a fault; a
+        // hung attach ages past its recovery budget and the next re-assert
+        // cold-remounts normally.
+        if already_mounted
+            && self.terminal_attach_in_flight.contains(session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_some_and(|attempt| {
+                    attempt.latched_failure_reason.is_none()
+                        && matches!(
+                            attempt.state,
+                            TerminalOpenAttemptState::Pending
+                                | TerminalOpenAttemptState::Recovering
+                        )
+                        && now_ms.saturating_sub(attempt.started_at_ms)
+                            < retained_fault_recovery_rearm_after_ms(attempt)
+                })
+        {
+            return (self.retain_terminal_session_path(session_path), true, false);
+        }
         let count = self
             .terminal_cold_remount_count
             .get(session_path)
@@ -13776,6 +13811,47 @@ impl ShellState {
                         )
                 });
         if recovery_already_in_flight {
+            return false;
+        }
+        // A YOUNG in-flight attempt is not a fault. The empty-surface signal
+        // fires the moment the host mounts — before the ensure/attach has
+        // delivered a single byte — so without this gate a user open was
+        // invalidated ~0.7s in and cold-remounted, on virtually every reveal
+        // (the "each reveal constructs twice" cross-pathway blink: measured
+        // epoch N then N+1 within 0.3–2.2s on almost every mount pair).
+        // While the latest attempt is still pending inside the SAME budget
+        // the recovery watchdog itself grants a recovery attempt, the attempt
+        // machinery owns the outcome; a genuinely hung attempt ages past the
+        // budget and recovery proceeds on the next fault signal.
+        let attempt_still_settling = self.terminal_attach_in_flight.contains(session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_some_and(|attempt| {
+                    attempt.latched_failure_reason.is_none()
+                        && matches!(
+                            attempt.state,
+                            TerminalOpenAttemptState::Pending
+                                | TerminalOpenAttemptState::Recovering
+                        )
+                        && current_millis().saturating_sub(attempt.started_at_ms)
+                            < retained_fault_recovery_rearm_after_ms(attempt)
+                });
+        if attempt_still_settling {
+            let suppression_key = format!("{session_path}:attempt_settling");
+            if self
+                .last_retained_fault_invalidation_suppression_key
+                .as_deref()
+                != Some(suppression_key.as_str())
+            {
+                self.last_retained_fault_invalidation_suppression_key = Some(suppression_key);
+                self.record_terminal_contract_telemetry(
+                    "retained_fault_recovery_suppressed_attempt_settling",
+                    "info",
+                    session_path,
+                    fault_reason.unwrap_or("fault while open attempt still settling"),
+                    json!({}),
+                );
+            }
             return false;
         }
         // Per [[spec-xterm-gating-ux]]: stop the recovery loop when the gate
@@ -51870,6 +51946,46 @@ fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) ->
     }
     process_has_gui_client_argv(record.pid)
 }
+/// The staging subdirectory for atomic client-instance record writes. Records
+/// are fully written here, then renamed into the scan directory, so a
+/// concurrent cleanup pass can never observe a half-written record.
+const CLIENT_INSTANCE_STAGING_DIR: &str = "tmp";
+
+fn client_instance_trace_home_from_dir(dir: &Path) -> PathBuf {
+    // <home>/client-instances/<endpoint-scope> — two ancestors up is home.
+    dir.ancestors()
+        .nth(2)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Every record removal is traced with the removing pid, the removed record's
+/// pid, and the predicate that rejected it. The 2026-07-22 incident — a
+/// freshly registered record vanishing seconds after a SUCCESSFUL register,
+/// taking the whole app-control plane down invisibly — was undiagnosable
+/// precisely because these removals were silent.
+fn remove_stale_client_instance_record(
+    dir: &Path,
+    path: &Path,
+    removed_pid: Option<u32>,
+    predicate: &'static str,
+) {
+    let removed = fs::remove_file(path).is_ok();
+    append_trace_event(
+        &client_instance_trace_home_from_dir(dir),
+        "client",
+        "gui",
+        "client_instance_record_removed",
+        json!({
+            "removing_pid": std::process::id(),
+            "removed_path": path.display().to_string(),
+            "removed_pid": removed_pid,
+            "predicate": predicate,
+            "removed": removed,
+        }),
+    );
+}
+
 fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut active = Vec::new();
@@ -51878,30 +51994,35 @@ fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Resul
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
+        // The atomic-write staging dir (and anything else that is not a
+        // plain file) is never a record.
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
         if keep_path.is_some_and(|keep| keep == path.as_path()) {
             active.push(path);
             continue;
         }
         let Some(pid) = parse_client_instance_pid(&path) else {
-            let _ = fs::remove_file(&path);
+            remove_stale_client_instance_record(dir, &path, None, "unparseable_filename");
             continue;
         };
         let Ok(bytes) = fs::read(&path) else {
-            let _ = fs::remove_file(&path);
+            remove_stale_client_instance_record(dir, &path, Some(pid), "unreadable");
             continue;
         };
         let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
-            let _ = fs::remove_file(&path);
+            remove_stale_client_instance_record(dir, &path, Some(pid), "undeserializable");
             continue;
         };
         if record.pid != pid {
-            let _ = fs::remove_file(&path);
+            remove_stale_client_instance_record(dir, &path, Some(pid), "filename_pid_mismatch");
             continue;
         }
         if client_instance_record_matches_live_process(&record) {
             active.push(path);
         } else {
-            let _ = fs::remove_file(&path);
+            remove_stale_client_instance_record(dir, &path, Some(pid), "no_matching_live_process");
         }
     }
     active.sort();
@@ -51942,14 +52063,34 @@ fn register_client_instance(
         xdg_runtime_dir: env_var("XDG_RUNTIME_DIR"),
         xauthority: env_var("XAUTHORITY"),
     };
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("creating client instance {}", path.display()))?;
+    // ATOMIC write, or the register can silently un-register itself
+    // (2026-07-22 incident): create_new + write_all exposed an EMPTY file
+    // between the create and the write, and any concurrent cleanup pass
+    // (every `server app …` CLI probe runs one) read it as undeserializable
+    // and deleted it. write_all then succeeded on the unlinked inode, so the
+    // register traced ok:true while the record was already gone — the whole
+    // app-control plane down with a clean-looking trace. Stage the full
+    // payload in a subdirectory the cleanup pass skips, then rename.
+    let staging_dir = dir.join(CLIENT_INSTANCE_STAGING_DIR);
+    fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
+    if let Ok(stale) = fs::read_dir(&staging_dir) {
+        for entry in stale.flatten() {
+            let stale_path = entry.path();
+            match parse_client_instance_pid(&stale_path) {
+                Some(stale_pid) if process_is_alive(stale_pid) => {}
+                _ => {
+                    let _ = fs::remove_file(&stale_path);
+                }
+            }
+        }
+    }
+    let staging_path = staging_dir.join(format!("{pid}-{started_at_ms}.json"));
     let payload = serde_json::to_vec(&record)?;
-    file.write_all(&payload)
-        .with_context(|| format!("writing client instance {}", path.display()))?;
+    fs::write(&staging_path, &payload)
+        .with_context(|| format!("staging client instance {}", staging_path.display()))?;
+    fs::rename(&staging_path, &path)
+        .with_context(|| format!("publishing client instance {}", path.display()))?;
     append_trace_event(
         &perf_home_dir(settings_path),
         "client",
@@ -62496,18 +62637,50 @@ fn acquire_terminal_bootstrap_lease(
                 .map(String::as_str)
                 == Some(owner_id);
             let attach_in_flight = shell.terminal_attach_in_flight.contains(session_path);
-            if owner_matches {
+            // Stale-attach reclaim (resume-cc deadlock, dev 2026-07-20): an
+            // attach whose open attempt NEVER reached ready and has aged far
+            // past any healthy resume is wedged (e.g. the remote wrapper
+            // bridging a runtime that never spawned its CLI). Deferring to it
+            // forever made every re-click log
+            // `terminal_bootstrap_existing_lease_skip` and change nothing —
+            // the only recovery was a manual pkill on the remote host. A new
+            // owner may take such a lease over; the wedged task's own
+            // lease/owner checks then see it lost ownership and stand down.
+            let stale_never_ready_attach = attach_in_flight
+                && shell
+                    .latest_terminal_open_attempt_for_path(session_path)
+                    .is_some_and(|attempt| {
+                        attempt.ready_at_ms.is_none()
+                            && current_millis().saturating_sub(attempt.started_at_ms)
+                                >= TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS
+                    });
+            if owner_matches && !stale_never_ready_attach {
                 false
-            } else if attach_in_flight && same_lease {
+            } else if attach_in_flight && same_lease && !stale_never_ready_attach {
                 false
             } else {
+                if stale_never_ready_attach {
+                    shell.terminal_attach_in_flight.remove(session_path);
+                    shell.record_terminal_io_telemetry(
+                        "terminal_bootstrap_lease_reclaimed_stale_attach",
+                        "warn",
+                        session_path,
+                        "bootstrap lease reclaimed: attach in flight never reached ready",
+                        json!({
+                            "session_path": session_path,
+                            "lease": lease_id,
+                            "owner": owner_id,
+                            "reclaim_after_ms": TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS,
+                        }),
+                    );
+                }
                 shell
                     .terminal_bootstrap_lease_by_session
                     .insert(session_path.to_string(), lease_id.to_string());
                 shell
                     .terminal_bootstrap_owner_by_session
                     .insert(session_path.to_string(), owner_id.to_string());
-                !same_lease || !owner_matches
+                stale_never_ready_attach || !same_lease || !owner_matches
             }
         }
         None => {
@@ -73828,7 +74001,14 @@ fn app_control_terminal_input_write_path(shell: &ShellState, session_path: &str)
     )
 }
 fn terminal_input_write_path_for_runtime(session_path: &str, runtime_path: String) -> String {
-    if session_path.trim_start().starts_with("remote-session://") {
+    // BOTH remote agent schemes, not just codex: the daemon re-resolves the
+    // runtime key itself, but only the SESSION path carries the machine key
+    // its remote direct-write fallback needs. Sending the bare runtime key for
+    // a `remote-cc://` session classified every post-swap keystroke as local,
+    // which is half of the "active remote-cc un-inputable for minutes after a
+    // daemon swap" window.
+    let trimmed = session_path.trim_start();
+    if trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://") {
         session_path.to_string()
     } else {
         runtime_path
@@ -73854,15 +74034,25 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
         || text.contains("parsing daemon response: \"\"")
         || text.contains("timed out")
 }
+/// A `remote-cc://` session is a REMOTE session: its ensure crosses SSH just
+/// like `remote-session://`, so it gets the remote attempt budget. It used to
+/// fall into the local arm (5s timeout, 3 attempts), which is how a post-swap
+/// mount of the active remote-cc session burned its whole budget against a
+/// draining predecessor daemon.
+fn terminal_ensure_session_is_remote(session_path: &str) -> bool {
+    session_path.starts_with("remote-session://")
+        || session_path.starts_with("remote-cc://")
+        || session_path.starts_with("ssh://")
+}
 fn terminal_ensure_attempt_timeout_ms(session_path: &str) -> u64 {
-    if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+    if terminal_ensure_session_is_remote(session_path) {
         TERMINAL_REMOTE_ENSURE_ATTEMPT_TIMEOUT_MS
     } else {
         TERMINAL_LOCAL_ENSURE_ATTEMPT_TIMEOUT_MS
     }
 }
 fn terminal_ensure_max_attempts(session_path: &str) -> u64 {
-    if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+    if terminal_ensure_session_is_remote(session_path) {
         8
     } else {
         TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS
@@ -73973,15 +74163,40 @@ async fn terminal_ensure_with_retry_async(
                             "attempt": attempts,
                         }),
                     );
+                    // Bounded detour. During a daemon swap several callers
+                    // (startup warm, reuse, this mount) serialize on the
+                    // process-local ensure guard and each pass probes the
+                    // draining predecessor slowly — measured 69s/56s total
+                    // while the ensure retry itself then succeeded in 56ms.
+                    // The detour is a side-quest; past the bound we proceed
+                    // with retries and let the detached pass finish in the
+                    // background (spawn_blocking — dropping the await does
+                    // not cancel the work or leak the guard).
                     let daemon_result = {
                         let endpoint = endpoint.clone();
-                        run_dedicated_terminal_io("daemon_ensure", trace_home, move || {
-                            ensure_daemon_running(&endpoint)
-                        })
+                        tokio::time::timeout(
+                            Duration::from_millis(TERMINAL_DAEMON_ENSURE_DETOUR_TIMEOUT_MS),
+                            run_dedicated_terminal_io("daemon_ensure", trace_home, move || {
+                                ensure_daemon_running(&endpoint)
+                            }),
+                        )
                         .await
                     };
                     match daemon_result {
-                        Ok(()) => {
+                        Err(_elapsed) => {
+                            append_trace_event(
+                                trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "daemon_ensure_timeout_proceeding",
+                                json!({
+                                    "session_path": session_path,
+                                    "attempt": attempts,
+                                    "timeout_ms": TERMINAL_DAEMON_ENSURE_DETOUR_TIMEOUT_MS,
+                                }),
+                            );
+                        }
+                        Ok(Ok(())) => {
                             append_trace_event(
                                 trace_home,
                                 "ui",
@@ -73993,7 +74208,7 @@ async fn terminal_ensure_with_retry_async(
                                 }),
                             );
                         }
-                        Err(daemon_error) => {
+                        Ok(Err(daemon_error)) => {
                             append_trace_event(
                                 trace_home,
                                 "ui",
@@ -109343,6 +109558,55 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
     #[test]
+    fn cleanup_stale_client_instances_skips_the_atomic_write_staging_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-client-instances-staging-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let staging_dir = dir.join(CLIENT_INSTANCE_STAGING_DIR);
+        fs::create_dir_all(&staging_dir).expect("create staging dir");
+        // A half-written record mid-stage: cleanup must neither read nor
+        // delete it — the 2026-07-22 vanish was exactly a concurrent cleanup
+        // deleting a record whose JSON had not landed yet.
+        let staged = staging_dir.join(format!("{}-1.json", std::process::id()));
+        fs::write(&staged, b"").expect("write staged record");
+        let active = cleanup_stale_client_instances(&dir, None).expect("cleanup instances");
+        assert!(active.is_empty());
+        assert!(staging_dir.is_dir(), "staging dir must survive cleanup");
+        assert!(staged.exists(), "staged record must survive cleanup");
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn register_client_instance_publishes_a_complete_record_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-client-instance-register-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let settings_path = root.join("settings.json");
+        fs::create_dir_all(&root).expect("create temp home");
+        let endpoint = ServerEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 7101,
+        };
+        let registration = register_client_instance(&settings_path, &endpoint, None)
+            .expect("register client instance");
+        let bytes = fs::read(&registration.path).expect("read published record");
+        let record: ClientInstanceRecord =
+            serde_json::from_slice(&bytes).expect("published record must be complete JSON");
+        assert_eq!(record.pid, std::process::id());
+        // Nothing may be left mid-stage after a successful publish.
+        let staging_dir = client_instances_dir(&settings_path, &endpoint)
+            .join(CLIENT_INSTANCE_STAGING_DIR);
+        let staged: Vec<_> = fs::read_dir(&staging_dir)
+            .expect("staging dir exists")
+            .flatten()
+            .collect();
+        assert!(staged.is_empty(), "staging dir must be empty after publish");
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
     fn client_instances_dir_is_scoped_by_endpoint() {
         let settings_path = PathBuf::from("/tmp/yggterm/settings.json");
         #[cfg(unix)]
@@ -119063,6 +119327,45 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
     #[test]
+    fn open_reassert_reuses_the_host_while_its_first_attach_is_settling() {
+        // Regression for the "each reveal constructs twice" blink: the
+        // re-assert that lands right after an open request completes (the
+        // latest_open_request_id bump re-runs the mount-key effect) must
+        // REVEAL the just-mounted host, not cold-remount it — the reveal
+        // path requires was_ever_ready, which a session being born cannot
+        // satisfy, so this used to bump epoch N to N+1 ~0.6s after every
+        // first mount and tear down the in-flight attach.
+        let active_session_path = "remote-cc://dev/settling-birth";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let (first_epoch, reused_first, _) =
+            shell.resolve_active_open_mount_epoch(active_session_path, 1_000);
+        assert!(!reused_first, "a genuine first mount must cold-mount");
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-birth", 1, "open_path");
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = 1_000;
+        }
+        // The re-assert 600ms later, attach still in flight: reuse, no bump.
+        let (epoch, reused, settled) =
+            shell.resolve_active_open_mount_epoch(active_session_path, 1_600);
+        assert!(reused, "a settling first attach must be revealed, not remounted");
+        assert!(!settled);
+        assert_eq!(epoch, first_epoch, "no epoch bump while the attach settles");
+        // Once the attempt ages past its recovery budget without ready, a
+        // re-assert may cold-remount again (the hung-attach escape hatch).
+        let stale_now = 1_000 + STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1_000;
+        let (stale_epoch, stale_reused, _) =
+            shell.resolve_active_open_mount_epoch(active_session_path, stale_now);
+        assert!(!stale_reused, "a hung attach must not pin the host forever");
+        assert!(stale_epoch > first_epoch);
+    }
+    #[test]
     fn futile_cold_remounts_settle_instead_of_looping_forever() {
         // Regression for the idle "blink" loop
         // ([[finding-cc-blink-dead-session-remount-loop]]): a live session whose
@@ -122608,6 +122911,58 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &shell,
             active_session_path,
             "lease-b"
+        ));
+    }
+    #[test]
+    fn terminal_bootstrap_lease_reclaims_stale_never_ready_attach() {
+        let active_session_path = "remote-cc://dev/test-stale";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        assert!(acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "lease-a",
+            "owner-a"
+        ));
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-stale", 1, "app_control");
+        // A FRESH in-flight attach still defends its lease against a rival
+        // owner on the same mount identity.
+        assert!(!acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "lease-a",
+            "owner-b"
+        ));
+        // Age the attempt past the reclaim budget without it ever reaching
+        // ready: the wedged-resume shape (dev 2026-07-20) where re-clicks
+        // logged existing_lease_skip forever.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = current_millis()
+                .saturating_sub(TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS + 1_000);
+            assert!(attempt.ready_at_ms.is_none());
+        } else {
+            panic!("attempt not recorded");
+        }
+        assert!(acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "lease-a",
+            "owner-b"
+        ));
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path),
+            "stale attach flag must be cleared on reclaim"
+        );
+        assert!(terminal_bootstrap_owner_is_current(
+            &shell,
+            active_session_path,
+            "owner-b"
         ));
     }
     #[test]
@@ -130270,6 +130625,33 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "local-runtime::abc123".to_string()
             ),
             "local-runtime::abc123"
+        );
+        // remote-cc must keep its session path too — the bare cc-runtime://
+        // key strips the machine key the daemon's remote write fallback needs.
+        let remote_cc_path = "remote-cc://dev/abc123";
+        assert_eq!(
+            terminal_input_write_path_for_runtime(
+                remote_cc_path,
+                "cc-runtime://abc123".to_string()
+            ),
+            remote_cc_path
+        );
+    }
+
+    #[test]
+    fn remote_cc_terminal_ensure_gets_the_remote_attempt_budget() {
+        assert_eq!(
+            terminal_ensure_attempt_timeout_ms("remote-cc://dev/abc123"),
+            TERMINAL_REMOTE_ENSURE_ATTEMPT_TIMEOUT_MS
+        );
+        assert_eq!(terminal_ensure_max_attempts("remote-cc://dev/abc123"), 8);
+        assert_eq!(
+            terminal_ensure_attempt_timeout_ms("local://abc123"),
+            TERMINAL_LOCAL_ENSURE_ATTEMPT_TIMEOUT_MS
+        );
+        assert_eq!(
+            terminal_ensure_max_attempts("local://abc123"),
+            TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS
         );
     }
 
