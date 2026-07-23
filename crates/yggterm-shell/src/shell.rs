@@ -45726,9 +45726,51 @@ async fn web_surface_do_for(
     let result = match action {
         WebSurfaceDoAction::Click { x, y, button } => {
             match doc_to_viewport(desktop, native_id, *x, *y).await {
-                Ok((vx, vy)) => desktop
-                    .inject_web_surface_click(native_id, vx, vy, web_do_gdk_button(*button))
-                    .map(|()| json!({ "verb": "click", "x": vx, "y": vy })),
+                Ok((vx, vy)) => {
+                    // Crash-safety (WebKitGTK null-deref on a blind coordinate
+                    // click — pending-bugs 2026-07-24, GUI hard-crash): a native
+                    // GDK button event synthesized at a point that hits no live
+                    // element, or lands in a page mid-teardown/mid-navigation,
+                    // segfaults WebKit inside the UI process and takes the whole
+                    // GUI down. So hit-test FIRST, exactly like ClickSelector: the
+                    // `elementFromPoint` eval both confirms the point hits a real
+                    // element AND round-trips through the web content process, so a
+                    // document that cannot lay out fails HERE (refused) instead of
+                    // receiving a synthetic click into a dying frame. Prefer
+                    // `do click --selector`; this makes the raw-coordinate path as
+                    // safe as the selector path when coordinates are unavoidable.
+                    let hit = web_do_eval(
+                        desktop,
+                        native_id,
+                        &format!(
+                            "(function(){{var e=document.elementFromPoint({vx},{vy});\
+                             return e?{{ok:true,tag:e.tagName}}:{{ok:false}};}})()"
+                        ),
+                    )
+                    .await;
+                    match hit {
+                        Ok(info)
+                            if info.get("ok").and_then(Value::as_bool).unwrap_or(false) =>
+                        {
+                            desktop
+                                .inject_web_surface_click(
+                                    native_id,
+                                    vx,
+                                    vy,
+                                    web_do_gdk_button(*button),
+                                )
+                                .map(|()| json!({ "verb": "click", "x": vx, "y": vy }))
+                        }
+                        Ok(_) => Err(format!(
+                            "no live element at viewport ({vx:.0}, {vy:.0}) — refusing a blind \
+                             native click (would risk a WebKit crash); use do click --selector"
+                        )),
+                        Err(reason) => Err(format!(
+                            "hit-test failed before click ({reason}) — page not laid out; \
+                             refusing native injection to avoid a WebKit crash"
+                        )),
+                    }
+                }
                 Err(reason) => Err(reason),
             }
         }
