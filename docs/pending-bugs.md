@@ -54,7 +54,22 @@ fix) once the fix is verified live on jojo.
   marked once. A tri-state (unset/on/off) is the real fix if that ever matters.
   Full entry: [`docs/xterm-bugs.md#input-dead-after-window-refocus`](xterm-bugs.md#input-dead-after-window-refocus).
 
-- **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
+- **★ NEW 2026-07-23: an agent row born through `open_or_focus_session` is NOT
+  keep-alive — the born-green rule has a second birth site it never covered.**
+  Live-caught during the 2.12.5 deploy recovery: all 13 `remote-cc://dev/*` rows
+  reconnected via `yggterm server connect` came back `keep_alive: false` (each
+  had been `true` before the swap), under a 2.12.5 daemon that carries the
+  born-keep-alive fix. Cause: `server connect` → `ServerRequest::OpenStoredSession`
+  → `open_or_focus_session` → `build_session` — a SECOND live-row birth
+  constructor, and only `insert_live_session_with_launch` applies
+  `session_kind_persists_by_default`. Consequence is not cosmetic (same family as
+  the round-7 second fix): `keep_alive` is the only input to
+  `restart_protected_runtime`, so every connect-birthed agent row is eligible for
+  a PTY re-spawn/re-resume on any transient stale-attach reading. Fix direction:
+  apply the born-green default at the `build_session`-birth site too (only when
+  the row is newly created — an existing row's flag must never be overwritten),
+  or better, collapse the two birth sites into one owner. Recovery meanwhile:
+  `server app terminal keep <path>` per row (verified working).
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
   `term.element` is out of the DOM (`isConnected:false`, rect 0×0) while an
@@ -273,7 +288,7 @@ fix) once the fix is verified live on jojo.
   *closed* sessions resurrected from a stale `server-state.json`) — see
   `cold_restore_of_live_sessions_is_refused_beside_a_live_owner`. The file is not
   the truth while a predecessor is alive.
-  **★ FIXED 2026-07-23 (`287d6e8`, 2.12.5-to-be) exactly as designed below — the
+  **★ FIXED 2026-07-23 (`287d6e8`, shipped in 2.12.5) exactly as designed below — the
   live predecessor now advertises `live_terminal_sessions` +
   `advertises_live_session_rows` on `ServerRuntimeStatus` (sourced from
   `persisted_state().live_sessions`, so wire and file cannot drift), and a THIRD
@@ -281,8 +296,23 @@ fix) once the fix is verified live on jojo.
   the rows this daemon lacks. Add-only, gated on the new `live_session_row_exists`;
   a pre-B4 predecessor's silence is skipped rather than read as an empty set.
   Locks: `a_pre_b4_daemon_status_does_not_claim_to_advertise_live_rows`,
-  `adopting_a_live_row_that_already_exists_is_a_no_op`. NOT YET LIVE-PROVEN across
-  a real two-daemon swap — do that before deleting this entry.**
+  `adopting_a_live_row_that_already_exists_is_a_no_op`.**
+  **★★ TWO-DAEMON SANDBOX PROOF DONE 2026-07-23 (real daemons, real sockets, real
+  PTY, isolated `YGGTERM_HOME`):** predecessor 2.12.5 with 3 unowned agent rows +
+  1 owned pin-shell PTY; successor 2.12.6 booted beside it → trace shows
+  `cold_restore_of_live_sessions_refused {skipped_live_sessions: 4}` followed by
+  `preserved_owner_live_session_rows_adopted {adopted_row_keys: [all 3 agent
+  rows]}`; successor ended with 4/4 rows and keep-alive flags byte-preserved
+  (pre-fix behaviour on the same scenario: 1/4). Sandbox trap for reruns: the
+  pinned shell must have a stdin that never closes — an EOF exits the shell, the
+  predecessor then owns nothing, and the refusal (correctly) never fires.
+  **The fail-safe arm is LIVE-PROVEN on the 2.12.4→2.12.5 jojo swap:** the
+  successor logged the refusal (skipped 20, predecessor owning 7) and adopted
+  NOTHING from the non-advertising 2.12.4 predecessor — silence skipped, not
+  misread; the expected one-last-time drop (20→7) was recovered by the connect
+  loop. **The adoption arm still needs its live proof on the next real swap
+  (2.12.5→newer, both sides advertising); expect ZERO row loss there, then
+  delete this entry.**
   Original design note follows.
   **Correct fix (designed, NOW BUILT):** mirror what `stored_terminal_sessions`
   already does for dormant rows — have the predecessor **advertise its live rows
