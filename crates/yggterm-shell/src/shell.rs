@@ -3256,6 +3256,14 @@ fn web_surface_tab_place_rect(
 /// background; legacy/demoted, the stamp is "0" and the layer sits invisibly
 /// beneath the frame's identical paint.
 const WEB_UNDER_GLASS_CSS: &str = r#"
+/* A DOCUMENT surface owns the viewport: the xterm host sits directly beneath it
+   at nearly identical geometry, still visible and still taking pointer input.
+   A click meant for the editor therefore also reaches xterm underneath, and
+   xterm focuses its own helper textarea a frame later, yanking the caret back
+   out of the editor. That is the "focus is stolen, spam-click to type" bug, and
+   it is NOT the focus-reclaim allowlist (which correctly stands down): it is a
+   plain hit-testing overlap. The host is already marked; make the mark bite. */
+[data-document-surface-owns-viewport="true"] { pointer-events: none; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .yggterm-reveal-ghost { visibility: hidden; }
@@ -73025,6 +73033,17 @@ fn TerminalCanvas(
         terminal_overlay_dismissed(),
         resume_overlay_effective_failed,
     );
+    // A DOCUMENT surface covers the viewport at nearly the host's own geometry.
+    // The host stays mounted and visible underneath, so a click meant for the
+    // editor ALSO lands on xterm, which focuses its helper textarea a frame
+    // later and yanks the caret back out — the "focus stolen, spam-click to
+    // type" bug. Stop the host taking pointer input while it is covered. Both
+    // branches emit the same property key (Dioxus never clears a dropped one).
+    let terminal_host_pointer_events = if document_surface_owns_viewport {
+        "none"
+    } else {
+        "auto"
+    };
     let terminal_host_font_weight = terminal_font_weight(&theme);
     let terminal_host_font_weight_bold = terminal_font_weight_bold(&theme);
     let terminal_host_line_height = terminal_font_line_height(&theme);
@@ -73196,13 +73215,14 @@ fn TerminalCanvas(
                     "data-terminal-resume-overlay-phase": "hidden",
                     "data-terminal-resume-overlay-effective-failed": "false",
                     style: format!(
-                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; position:relative; {}; {}; \
+                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; position:relative; pointer-events:{}; {}; {}; \
                          --yggterm-term-font-family:{}; --yggterm-term-font-weight:{}; --yggterm-term-font-weight-bold:{}; \
                          --yggterm-term-line-height:{}; --yggterm-term-letter-spacing:0px; --yggterm-term-foreground:{}; \
                          --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-muted:{}; --yggterm-term-cursor-text:{}; \
                          --yggterm-term-font-smoothing:{}; --yggterm-term-moz-font-smoothing:{};",
                         terminal_shell_padding,
                         web_frame_bg,
+                        terminal_host_pointer_events,
                         terminal_host_visibility,
                         terminal_host_chrome,
                         TERMINAL_FONT_FAMILY,
@@ -88258,9 +88278,26 @@ fn terminal_set_input_enabled_script_for_session(
           const entries = Object.values(registry)
             .filter((entry) => entry && entry.sessionPath === sessionPath && typeof entry.setInputEnabled === "function")
             .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+          // NEVER pull focus into a terminal that a DOCUMENT SURFACE is covering.
+          // This is the path that actually stole the caret out of yedit's editor:
+          // `refocus_terminal_session_input` fires from ~10 call sites and asked
+          // for focus unconditionally, with none of the uiOwnsFocus arbitration
+          // the reclaim script does. Enabling input stays correct (the session is
+          // live either way); only the FOCUS grab stands down while covered.
+          let coveredByDocument = false;
+          try {{
+            const hostEl = Array.from(
+              document.querySelectorAll('[data-terminal-session-path]')
+            ).find((el) => String(el.getAttribute('data-terminal-session-path') || '') === sessionPath);
+            coveredByDocument = !!(
+              hostEl
+              && String(hostEl.getAttribute('data-document-surface-owns-viewport') || '') === 'true'
+            );
+          }} catch (_error) {{}}
+          const wantFocus = {focus} && !coveredByDocument;
           for (const entry of entries) {{
             try {{
-              entry.setInputEnabled({enabled}, {focus}, true, 'rust_policy');
+              entry.setInputEnabled({enabled}, wantFocus, true, 'rust_policy');
             }} catch (_error) {{}}
           }}
         }})();
