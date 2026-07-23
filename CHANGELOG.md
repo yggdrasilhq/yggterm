@@ -2,6 +2,25 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.9
+
+- **Fixed: moving a Claude Code session with `/cd` now moves it in the cwd tree,
+  on remote machines too.** Sessions on your own machine already followed a
+  `/cd`; sessions on a remote machine kept sitting in the folder they were
+  started in, forever. The remote scan read only the beginning of each
+  transcript and took the first folder it saw there — but a `/cd` is recorded at
+  the *end*, often megabytes later. It now reads both ends of the transcript and
+  trusts where Claude Code itself filed the session.
+- **Fixed: a renamed session on a remote machine kept showing its old name.**
+  Same cause — a rename is appended at the end of the transcript, past the point
+  the scan stopped reading. On one machine that was 130 of 175 sessions.
+- **Fixed: you can type in a yedit editor again.** Clicking into the editor put
+  the cursor there and then lost it again about a tenth of a second later, so
+  writing anything meant clicking between every few keystrokes. A click anywhere
+  in the window hands the keyboard back to the terminal, and that handler had
+  never been told that an editor covering the terminal owns the keyboard — it
+  already knew about web pages, just not documents.
+
 ## 2.12.4
 
 - **Fixed: a live agent session would blink and stop taking keystrokes for a few
