@@ -4196,6 +4196,7 @@ impl DaemonRuntime {
             .name("yggterm-remote-pty-resize".to_string())
             .spawn(move || {
                 let path = worker_path;
+                let mut not_found_retries = 0u32;
                 loop {
                     let next = {
                         let mut pending = pending
@@ -4248,6 +4249,25 @@ impl DaemonRuntime {
                     // TUI painting for a screen that no longer exists while the
                     // telemetry reports a healthy session. Make the failure loud.
                     if let Err(error) = result {
+                        // Mid-switch ordering: "terminal session not found"
+                        // usually means the remote daemon does not OWN the
+                        // runtime key YET (its ensure/resume is still in
+                        // flight during a session switch), not that the
+                        // session is gone. Re-queue the grid a few times
+                        // instead of dropping it — a newer client grid that
+                        // arrives meanwhile wins via or_insert.
+                        let error_text = error.to_string();
+                        let will_retry = error_text.contains("terminal session not found")
+                            && not_found_retries < REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES;
+                        if will_retry {
+                            not_found_retries += 1;
+                            let mut pending = pending
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            pending
+                                .entry(path.clone())
+                                .or_insert((machine, session_id, kind, cols, rows));
+                        }
                         append_trace_event(
                             &home,
                             "daemon",
@@ -4258,9 +4278,16 @@ impl DaemonRuntime {
                                 "kind": kind,
                                 "cols": cols,
                                 "rows": rows,
-                                "error": error.to_string(),
+                                "error": error_text,
+                                "will_retry": will_retry,
+                                "not_found_retries": not_found_retries,
                             }),
                         );
+                        if will_retry {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS,
+                            ));
+                        }
                     }
                 }
             });
@@ -13480,6 +13507,12 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
     }
 }
 
+/// Bounded mid-switch retry for the remote PTY resize forward: the remote
+/// daemon may not own the runtime key yet while its ensure/resume is in
+/// flight, so "not found" is retried a few times rather than dropped.
+const REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES: u32 = 5;
+const REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS: u64 = 2_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalWriteStrategy {
     LocalRuntime,
@@ -13491,9 +13524,17 @@ fn terminal_write_strategy_for_path(
     path: &str,
     local_runtime_running: bool,
 ) -> TerminalWriteStrategy {
+    // BOTH remote agent schemes, not just codex. This predicate used to match
+    // `remote-session://` only, so a `remote-cc://` session whose local bridge
+    // runtime was not running fell to LocalRuntimeFallback — keystrokes aimed
+    // at a runtime that does not exist, which then triggered the relaunch
+    // recovery (ensure) instead of delivering the byte to the remote host.
+    // That is the post-daemon-swap "active remote-cc un-inputable for minutes"
+    // window while the retiring predecessor still owns the runtime.
+    let trimmed = path.trim_start();
     if local_runtime_running {
         TerminalWriteStrategy::LocalRuntime
-    } else if path.trim_start().starts_with("remote-session://") {
+    } else if trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://") {
         TerminalWriteStrategy::RemoteDirectFallback
     } else {
         TerminalWriteStrategy::LocalRuntimeFallback
@@ -16426,6 +16467,23 @@ mod tests {
         assert_eq!(
             super::terminal_write_strategy_for_path("ssh://dev/home/pi/gh/yggterm", false),
             super::TerminalWriteStrategy::LocalRuntimeFallback
+        );
+        // remote-cc is a remote agent session exactly like remote-session:
+        // with no local bridge runtime, a keystroke must go to the remote
+        // host directly, never into the local relaunch-recovery path.
+        assert_eq!(
+            super::terminal_write_strategy_for_path(
+                "remote-cc://dev/d98bc22f-91e4-4332-8696-122cca33c71c",
+                false
+            ),
+            super::TerminalWriteStrategy::RemoteDirectFallback
+        );
+        assert_eq!(
+            super::terminal_write_strategy_for_path(
+                "remote-cc://dev/d98bc22f-91e4-4332-8696-122cca33c71c",
+                true
+            ),
+            super::TerminalWriteStrategy::LocalRuntime
         );
         assert_eq!(
             super::terminal_write_strategy_for_path("local://shell", true),

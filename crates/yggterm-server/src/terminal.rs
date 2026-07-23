@@ -1954,6 +1954,35 @@ impl PtySessionRuntime {
                 data: ATTACH_READY_MARKER.to_string(),
             });
         }
+        // Mid-stream gap resync (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-
+        // stream, the live-path variant of the 2.10.4 attach-seed fix): the
+        // ring trimmed the contiguous middle, so the tail above replays
+        // against a base the CLI never painted for THIS client — every cell a
+        // subsequent diff frame skips (CUF / relative moves) then keeps stale
+        // content, permanently. That is the busiest-CC character-interleave
+        // corruption: the daemon vt100 stays clean (it consumed every byte),
+        // the GUI forwards faithfully, and only the client base is wrong.
+        // Anchor the client by appending the viewport reconcile AFTER the
+        // tail: the tail still populates scrollback, and the final
+        // clear+repaint pins viewport+cursor to daemon truth. Viewport-only
+        // on purpose — normal-buffer history must never be injected under an
+        // alternate-screen TUI (the reverted history+screen gap resync). The
+        // attach-seed codex staleness exclusion does not apply here: on the
+        // live path the vt100 state has consumed every ring byte, so it is
+        // never staler than the tail it reconciles.
+        if resync_required && let Some(reconcile_chunk) = self.screen_reconcile_chunk(next_cursor) {
+            trace_terminal_event(
+                "mid_stream_gap_reconciled",
+                serde_json::json!({
+                    "path": self.key,
+                    "cursor": effective_cursor,
+                    "oldest_surviving_seq": retained_chunks.front().map(|chunk| chunk.seq),
+                    "next_cursor": next_cursor,
+                    "tail_chunks": chunks.len(),
+                }),
+            );
+            chunks.push(reconcile_chunk);
+        }
         TerminalReadResult {
             cursor: next_cursor,
             chunks,
@@ -3868,6 +3897,66 @@ PY"#,
                 chunk.seq
             );
         }
+    }
+
+    // Live-path variant of the 2.10.4 attach-seed fix: when the ring trims
+    // the contiguous middle past a resuming client's cursor, the read must
+    // end with the viewport reconcile so the client base is re-anchored to
+    // daemon truth — returning the bare discontiguous tail is what left the
+    // permanent character-interleave corruption on busy CC sessions.
+    #[test]
+    fn pty_read_with_trimmed_middle_appends_viewport_reconcile_after_tail() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://gap-resync-test",
+            "bash -lc 'printf base-frame; sleep 2'",
+            None,
+            None,
+        )
+        .expect("spawn gap resync test runtime");
+        let mut first_cursor = 0_u64;
+        for _ in 0..80 {
+            let read = runtime.read(0);
+            first_cursor = read.cursor;
+            if read
+                .chunks
+                .iter()
+                .any(|chunk| chunk.data.contains("base-frame"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(first_cursor > 0, "runtime produced no output");
+        // Simulate the high-throughput ring trim: drop everything the client
+        // has not consumed yet and append a tail chunk far past its cursor.
+        let tail_seq = first_cursor + 50;
+        {
+            let mut chunks = runtime.chunks.lock().expect("chunk lock");
+            chunks.clear();
+            chunks.push_back(TerminalChunk {
+                seq: tail_seq,
+                data: "\r\x1b[2Btail-after-gap\x1b[K".to_string(),
+            });
+        }
+        runtime.seq.store(tail_seq, Ordering::SeqCst);
+        let read = runtime.read(first_cursor);
+        runtime.shutdown(None).expect("shutdown test runtime");
+        assert!(
+            read.resync_required,
+            "a trimmed contiguous middle must signal resync"
+        );
+        let last = read.chunks.last().expect("chunks must not be empty");
+        assert!(
+            last.data.starts_with("\x1b[?25l\x1b[2J\x1b[H"),
+            "the read must END with the viewport reconcile payload, got {:?}",
+            last.data
+        );
+        assert!(
+            read.chunks
+                .iter()
+                .any(|chunk| chunk.data.contains("tail-after-gap")),
+            "the surviving tail must still be delivered for scrollback"
+        );
     }
 
     #[test]

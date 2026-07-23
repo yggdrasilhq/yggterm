@@ -47,7 +47,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [surface-recovery-false-positive-on-transient](#surface-recovery-false-positive-on-transient) | "Shadow" blank flash + multi-second re-gate, and (worse) input-disable → re-resume → exhaust → session yanked closed, all triggered by a TUI's normal clear+redraw transient misread as a broken/empty/non-prompt surface | FIXED 2026-06-03 (settle-gates) — empty-surface 2.8.11, non-prompt 4-point fix |
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
-| [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
+| [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 2b SHIPPED 2026-07-23 (read() appends the viewport reconcile after the tail on a detected gap — the busiest-CC interleave-corruption fix; layers 1/2a 2026-06-04) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PARTIAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
@@ -1239,15 +1239,29 @@ the preserved-owner path); `terminal_read` / `terminal_read_with_local_daemon_re
 loop binds it and emits a `terminal_stream_resync_required` trace event when a gap
 fires. So we can now OBSERVE real-world gaps (event-trace) without changing behavior.
 
-### Fix — layer 2b PENDING: client re-attach action (the live-risky part)
-The only remaining step: in the GUI read-bridge, when `resync_required` is set, trigger
-a clean re-attach (read from cursor 0 / fresh screen snapshot) to recover the trimmed
-middle from the vt100 scrollback, instead of appending the discontiguous tail. This
-changes runtime behavior and must be live-verified against the real repro (a
-BACKGROUNDED session streaming past the ring cap, then switch-back) before shipping —
-do NOT rush it (the in-band-replay variants of this were the 2.8.12/14 TRAP). Longer
-term this folds into real-scrollback retention (`[[spec-tmux-parity-and-beyond]]`) so
-the ring/idle-trim never evicts live content a connected client still needs.
+### Fix — layer 2b SHIPPED (2026-07-23): in-stream viewport reconcile, NOT a re-attach
+`read(cursor)` with `resync_required` now appends `screen_reconcile_chunk` (the
+`\x1b[?25l\x1b[2J\x1b[H` + vt100 `state_formatted` payload) AFTER the surviving
+tail — the live-path twin of the 2.10.4 attach-seed reconcile. The tail still
+populates scrollback; the final clear+repaint pins the client viewport, cursor
+AND modes to daemon truth, so every subsequent CUF/relative-move diff frame
+anchors against a base the CLI actually authored. This is what closes the
+"busiest-CC permanent character-interleave corruption" (2026-07-20): the gap
+left the client base wrong, and every diff frame that skipped unchanged cells
+preserved stale content forever.
+Why this does NOT re-open the 2.8.12/14 TRAP, point by point: (1) no history
+injection — the reconcile is viewport-only, safe under an alternate-screen TUI;
+(2) no `\x1b[3J` — normal-buffer scrollback is never cleared; (3) fires only on
+a genuine detected gap, not during recovery churn, and the payload shape has
+shipped safely in the attach-seed path since 2.10.4. The attach-seed codex
+staleness exclusion deliberately does not apply: on the live path the vt100
+state has consumed every ring byte, so it is never staler than the tail.
+Daemon trace `mid_stream_gap_reconciled` fires per reconcile. Regression lock:
+`pty_read_with_trimmed_middle_appends_viewport_reconcile_after_tail`.
+Longer term this still folds into real-scrollback retention
+(`[[spec-tmux-parity-and-beyond]]`) so the ring/idle-trim never evicts live
+content a connected client still needs (the trimmed middle stays lost to
+client scrollback; only the viewport is made true).
 
 ### Code locations
 `crates/yggterm-server/src/terminal.rs`: `PtySessionRuntime::read` (gap detection +

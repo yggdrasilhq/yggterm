@@ -3161,12 +3161,12 @@ impl YggtermServer {
         if data.is_empty() {
             return Ok(false);
         }
-        let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+        let Some((raw_machine_key, runtime_key)) = remote_direct_write_target_for_path(path)
+        else {
             return Ok(false);
         };
         let machine_key = normalize_machine_key(raw_machine_key);
         let target = self.remote_target_for_machine_key(&machine_key)?;
-        let runtime_key = remote_runtime_codex_session_key(session_id);
         let write_data = normalize_remote_terminal_write_data(data);
         let debug_binary_override = std::env::var("YGGTERM_REMOTE_YGGTERM_BINARY_EXPR")
             .ok()
@@ -8163,6 +8163,21 @@ fn parse_remote_runtime_cc_session_key(path: &str) -> Option<&str> {
     path.strip_prefix("cc-runtime://")
 }
 
+/// Machine key + per-kind daemon runtime key for the direct remote write
+/// fallback. BOTH remote agent schemes, not just codex (the same hole
+/// `forward_remote_pty_resize` had): a `remote-cc://` path used to parse to
+/// None in `remote_terminal_write_for_path`, so the direct-write fallback
+/// silently declined and the caller fell through to the local PTY — a runtime
+/// that does not exist for a remote session. That is the post-daemon-swap
+/// "active remote-cc un-inputable for minutes" window.
+fn remote_direct_write_target_for_path(path: &str) -> Option<(&str, String)> {
+    if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
+        return Some((machine_key, remote_runtime_codex_session_key(session_id)));
+    }
+    let (machine_key, session_id) = parse_remote_cc_session_path(path)?;
+    Some((machine_key, remote_runtime_cc_session_key(session_id)))
+}
+
 /// Per-kind table for the daemon-owned agent-runtime lane
 /// ([[spec-unify-local-remote]]: codex and Claude Code share ONE code path,
 /// parameterized — never forked). Returns None for kinds that have no
@@ -8321,6 +8336,44 @@ mod remote_terminal_write_data_tests {
             "/status\r\n"
         );
         assert_eq!(normalize_remote_terminal_write_data("plain\n"), "plain\n");
+    }
+}
+
+#[cfg(test)]
+mod remote_direct_write_target_tests {
+    use super::remote_direct_write_target_for_path;
+
+    #[test]
+    fn direct_write_targets_both_remote_agent_schemes_keyed_per_kind() {
+        assert_eq!(
+            remote_direct_write_target_for_path(
+                "remote-session://dev/8931728b-30a7-428a-8b8e-35bee0480444"
+            ),
+            Some((
+                "dev",
+                "codex-runtime://8931728b-30a7-428a-8b8e-35bee0480444".to_string()
+            ))
+        );
+        // remote-cc must resolve to the CC runtime key, never the codex one —
+        // and never None, which silently dropped the write into the local
+        // PTY fallback.
+        assert_eq!(
+            remote_direct_write_target_for_path(
+                "remote-cc://dev/d98bc22f-91e4-4332-8696-122cca33c71c"
+            ),
+            Some((
+                "dev",
+                "cc-runtime://d98bc22f-91e4-4332-8696-122cca33c71c".to_string()
+            ))
+        );
+        assert_eq!(
+            remote_direct_write_target_for_path("local://shell"),
+            None
+        );
+        assert_eq!(
+            remote_direct_write_target_for_path("ssh://dev/home/pi/gh/yggterm"),
+            None
+        );
     }
 }
 
@@ -14945,6 +14998,11 @@ fn terminal_write_with_local_daemon_recovery(
         .unwrap_or_else(|| anyhow::anyhow!("terminal write failed after daemon recovery")))
 }
 
+/// See the wedge-deadline comment in [`bridge_remote_runtime_session_stdio`]:
+/// generous enough for a cold CLI resume's first paint, far below the
+/// many-minute wedges observed live.
+const BRIDGE_RUNNING_NO_OUTPUT_DEADLINE_MS: u64 = 120_000;
+
 fn bridge_remote_runtime_session_stdio(
     endpoint: &ServerEndpoint,
     path: &str,
@@ -15181,6 +15239,33 @@ fn bridge_remote_runtime_session_stdio(
         if !running && !runtime_output_seen && start.elapsed() >= Duration::from_secs(2) {
             anyhow::bail!(
                 "yggterm: daemon-owned runtime for {session_id} exited before becoming interactive"
+            );
+        }
+        // Wedge deadline (resume-cc deadlock, dev 2026-07-20): a daemon can
+        // claim a runtime is `running` that never produces a single byte —
+        // the wrapper then bridged nothing forever, the viewport stayed
+        // honestly blank, and re-clicks deferred to the wedged attach. Any
+        // real agent CLI paints within seconds of spawn; a runtime with ZERO
+        // output ever after this long is wedged, and exiting lets the next
+        // open spawn a fresh wrapper (the recovery that was previously a
+        // manual `pkill`). Idle-but-healthy sessions are unaffected:
+        // `runtime_output_seen` is the daemon's has-ever-produced-output
+        // flag, not a this-read flag.
+        if running
+            && !runtime_output_seen
+            && start.elapsed() >= Duration::from_millis(BRIDGE_RUNNING_NO_OUTPUT_DEADLINE_MS)
+        {
+            trace_remote_bridge_event(
+                "bridge_running_no_output_deadline",
+                json!({
+                    "path": path,
+                    "session_id": session_id,
+                    "elapsed_ms": start.elapsed().as_millis(),
+                }),
+            );
+            anyhow::bail!(
+                "yggterm: daemon-owned runtime for {session_id} claims running but produced no \
+                 output within {BRIDGE_RUNNING_NO_OUTPUT_DEADLINE_MS}ms — presumed wedged"
             );
         }
         std::thread::sleep(Duration::from_millis(30));

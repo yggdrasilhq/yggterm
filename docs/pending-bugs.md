@@ -6,81 +6,6 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
-- **★★★ ROOT-CAUSED + FIXED 2026-07-23 — "the viewport blinks and stops taking
-  keystrokes for a few seconds" was PROGRESSIVE MIGRATION EATING ITS OWN LIVE
-  SESSIONS.** Reported as "I cannot type in the current session if I switch to
-  another window, say chromium, and come back"; refined live by the user to
-  "fast blinks, no input, settled within 3 sec".
-  **Cause.** `spawn_progressive_session_migration` (daemon.rs) is the retiring-
-  predecessor handoff: each tick it releases the oldest-idle agent session so a
-  newer successor can adopt it. Its guard asked only *"is any other daemon
-  reachable"* — not *"is it a SUCCESSOR"*. jojo ran three daemons: the live
-  2.12.3 the GUI was attached to (owner of every session) plus abandoned 2.11.4
-  and 2.11.5 lingerers from earlier deploys. The newest daemon read two OLDER
-  peers as its successor and began releasing its own live agent PTYs, one per
-  5 s tick. Nothing adopted them, so the client re-ensured each released session
-  on the SAME daemon → `terminal_runtime spawn` → agent-CLI **re-resume** →
-  blank/blinking viewport that swallows keystrokes for ~3 s, roughly once a
-  minute, forever. Trace signature: `progressive_migration_session_released
-  {runtime_removed:true}` followed ~15 s later by `terminal_runtime spawn` +
-  `first_bytes` for the same runtime key; **the same key was released seven
-  times in twenty minutes and never converged.**
-  **Why the window-switch framing was a red herring:** the trigger is the idle
-  timer (`idle_ms` 45–50 s every time), and being away in another window is just
-  the most common way to be idle. A genuine compositor focus-out/focus-in cycle
-  reproduced nothing (clean recovery at 6 s and at 118 s away).
-  **Fixes (2.12.4):** only a strictly NEWER peer counts as a migration successor
-  (unparseable versions fail closed); and a runtime key that comes back into our
-  hands is released at most `MAX_MIGRATION_RELEASES_PER_KEY` times, with a loud
-  `progressive_migration_session_returned` trace — lingering beats churning.
-  Regression locks: `only_a_strictly_newer_daemon_counts_as_a_migration_successor`,
-  `a_returning_runtime_key_stops_being_a_migration_candidate`.
-  **Second contributing defect FIXED:** a freshly created agent session was NOT
-  keep-alive, and `keep_alive` is the only input to `restart_protected_runtime`
-  in `terminal_reuse_needs_restart` — so an unprotected agent row also had its
-  PTY re-spawned on any transient stale/blank remote-attach reading. Agent CLI
-  kinds are now born keep-alive (`session_kind_persists_by_default`); restore
-  stays authoritative so an explicit opt-out and the update-restore distinction
-  both survive.
-  **Probes shipped alongside** (keep them; they are how the next one is decided
-  in a single command): `ui/window_focus/transition`, `ui/input_policy/applied`,
-  and `app state` → `input_dead_ms` / `passive_focus_recovery_state` /
-  `input_dead_active_element`. Also fixed: the passive focus watchdog bailed on
-  `document.hasFocus()`, a measured Wayland false negative for a foreground
-  window and redundant with `inputEnabled`.
-  ⚠ **KNOWN GAP:** `PersistedLiveSession.keep_alive` is a bool, so "user turned
-  keep-alive OFF for an agent session" and "born before 2.12.4" are
-  indistinguishable across a restart. Pre-2.12.4 agent rows stay blue until
-  marked once. A tri-state (unset/on/off) is the real fix if that ever matters.
-  Full entry: [`docs/xterm-bugs.md#input-dead-after-window-refocus`](xterm-bugs.md#input-dead-after-window-refocus).
-
-- **★ NEW 2026-07-23, user-confirmed: the ACTIVE remote-cc session is
-  un-inputable for ~3–5 minutes after a daemon swap, while its runtime is owned
-  by the retiring predecessor.** User (live, during the 2.12.5→2.12.6 swap):
-  stale frame → window-swap → "almost perfect frame but not inputable" →
-  input only after ~5 min. Trace (seconds after the swap): +17 mount +
-  `ensure_begin`; +23 `ensure_attempt_outcome` **timed out after 5000ms**, then
-  `daemon_ensure_begin`→`end` took **69 s**; +93 `attach_ready` against the OLD
-  owner's runtime (cursor 27434 — the stale frame); +133
-  `read_error_after_attach {"error":"reading daemon response",
-  "remote_resume_session": false}`; +138 second ensure timeout, second
-  daemon_ensure 56 s; **+194 the NEW daemon abandoned bridging and spawned a
-  fresh runtime (re-resume) — input recovered here**, not from the user's
-  window-swap gesture; +336 one more mount cycle with the mount generation
-  running BACKWARD (3→1, the cross-pathway double-construct signature).
-  **Two suspects, in order:** (1) `terminal_write_strategy_for_path`
-  (daemon.rs) returns `RemoteDirectFallback` ONLY for `remote-session://` —
-  a `remote-cc://` session whose local runtime is not running falls to
-  `LocalRuntimeFallback`, i.e. keystrokes are aimed at a runtime that does not
-  exist. One more member of the `cc-runtime://`/remote-cc hole class
-  (docs/spec-agent-cli-harness.md §7.2). (2) whatever `daemon_ensure` blocks
-  on for 56–69 s during the drain window — that latency IS the un-inputable
-  window's floor. Note `remote_resume_session: false` on a remote-cc session
-  throughout: the codex-only readiness family (§7.3) live on the wire.
-  Fix belongs to the spec's phase 0/3 (scheme registry + attach single-writer),
-  acceptance case A2's sibling: "a daemon swap must return input to the ACTIVE
-  session in seconds, not minutes."
-
 - **Blank viewport from a DETACHED `term.element` (jojo, 2026-07-22).** The
   viewport paints nothing — background only — while the session is alive, the
   daemon screen is correct, and **every health field reports healthy**. Cause:
@@ -194,50 +119,26 @@ fix) once the fix is verified live on jojo.
   concluded "the guard never arms", which was the instrument lying, not xterm.
   Probe `term._core`.
 
-- **★ A GUI RESTART CAN LEAVE APP CONTROL PERMANENTLY UNREACHABLE — the client
-  instance record vanishes after a SUCCESSFUL register (jojo, 2026-07-22).**
-  After a routine GUI-only swap the GUI was alive, visible, and usable by the
-  user, but every `server app …` verb failed with **"no live Yggterm GUI client
-  is registered for app control"** — i.e. the entire agent control plane was
-  down, with no symptom the user would ever notice. The whole yggui workflow
-  (screenshot, state, dom-eval, probes) is dead in this state.
-  **Evidence, not inference.** The trace shows a normal, successful
-  registration: `launch_shell_register_begin` → `register` (with the exact
-  record path under `client-instances/unix--home-pi--yggterm-server-2-12-3-sock/`)
-  → `launch_shell_register_end {ok: true}` → `duplicate_app_instance_suppressed`
-  — a sequence **byte-identical to the two prior GUIs that registered fine**.
-  Yet the directory was empty afterwards, with an mtime in the same second as
-  the register. So the record was written and then deleted, while its process
-  stayed alive.
-  **Falsified, so don't re-derive:** the scan predicate is fine — a
-  hand-reconstructed record with the live pid and correct `process_start_ticks`
-  **survives** repeated `active_client_instance_paths_for_scan` passes, so
-  `client_instance_record_matches_live_process` is not the deleter. Nor is
-  `terminate_superseded_client_instances`: it skips its own record explicitly
-  (`linux_client_record_requires_app_id_isolation` returns false when
-  `record_pid == current_pid`). **The deleter is unidentified — do not guess it,
-  instrument it:** the cheap next step is a trace event at every
-  `fs::remove_file` in `cleanup_stale_client_instances` carrying the removing
-  pid, the removed pid, and which predicate rejected it.
-  **★ RECOVERY WITHOUT ANOTHER RESTART (verified — this is the valuable half).**
-  `CLIENT_INSTANCE` is a `OnceCell`, so the GUI never re-registers; but the
-  record is just a file, and recreating it restores control immediately. With
-  the live GUI pid:
-  ```bash
-  D=~/.yggterm/client-instances/unix--home-pi--yggterm-server-<VER>-sock
-  TICKS=$(awk '{print $22}' /proc/<GUIPID>/stat)   # field 22 = starttime
-  printf '{"pid":<GUIPID>,"started_at_ms":<MS>,"client_id":null,
-  "linux_desktop_app_id":"dev.yggterm.Yggterm","process_start_ticks":'$TICKS',
-  "executable_path":"/home/pi/.local/bin/yggterm","display":":1",
-  "wayland_display":"wayland-0","xdg_session_id":"","xdg_runtime_dir":"/run/user/1000",
-  "xauthority":""}' > $D/<GUIPID>-<MS>.json
-  ```
-  The filename **must** be `<pid>-<started_at_ms>.json` (the pid is parsed back
-  out of it and must match the record) and `<MS>` should be the `started_at_ms`
-  from the `register` trace event. Confirm with `server app clients`.
-  ⚠ **Check `server app clients` after every GUI restart** — a restart that
-  looks clean can silently take the control plane down, and the failure is
-  invisible until an agent tries to use it.
+- **★ ROOT-CAUSED + FIXED 2026-07-23 (2.12.7): the vanishing client-instance
+  record was a TOCTOU in the register itself.** `register_client_instance`
+  wrote non-atomically — `create_new` produced an EMPTY file, the JSON landed
+  in a later `write_all` — and every `server app …` CLI probe runs
+  `cleanup_stale_client_instances`, whose "undeserializable → delete"
+  predicate ate any record read in that window. The register then wrote to
+  the unlinked inode successfully and traced `ok:true`, which is why the
+  2026-07-22 incident showed a byte-identical-to-healthy register with an
+  empty directory one second later, and why both previously-suspected
+  deleters were correctly falsified. **Fix:** the record is staged in a
+  `tmp/` subdirectory the cleanup pass skips, then renamed into place
+  (atomic); every removal is now traced
+  (`client_instance_record_removed` with removing pid, removed pid, and the
+  rejecting predicate) so any residual deleter convicts itself. Locks:
+  `register_client_instance_publishes_a_complete_record_atomically`,
+  `cleanup_stale_client_instances_skips_the_atomic_write_staging_dir`.
+  Live: `server app clients` returned exactly 1 after BOTH 2.12.7 swaps.
+  The manual record-reconstruction recovery recipe lives in git history of
+  this file (pre-2026-07-23) if ever needed. Remove this entry after a few
+  more clean GUI restarts.
 
 - **THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
   A deploy that lands new binaries does NOT mean the new code is running. The
@@ -256,29 +157,30 @@ fix) once the fix is verified live on jojo.
   hot-restart button — so this is visible in the product rather than only to an
   agent who thinks to look.
 
-- **★ NEW 2026-07-23, NOT ROOT-CAUSED: the blink is on a CROSS-PATHWAY session
-  switch.** User: *"I switched it from a local-cc session to this remote-cc.
-  Switching out to a remote-cc to this remote-cc solved it. The local-cc also had
-  a blinking issue when closing."* So **local-cc → remote-cc blinks; remote-cc →
-  remote-cc does not** — same-pathway switches are fine. Trace for the episode:
-  **11 mounts in 15 minutes** for the one session, the mount generation going
-  BACKWARD (`m3` → `m1`), **each reveal CONSTRUCTING TWICE ~0.5 s apart**,
-  `terminal_render_health_unhealthy` at construction, and
-  `remote_pty_resize_failed {error: "…terminal session not found:
-  cc-runtime://<id>"}` right after each mount (5 in 10 min; `remote_yggterm_retry_total`
-  held steady at 17, so this is NOT the runaway cache-reset spin).
-  Two things to chase, in order: (1) **one reveal should mount once** — the double
-  construct is the blink; (2) why the remote daemon does not recognise the
-  `cc-runtime://` key after a local→remote switch. This is the user-visible face
-  of the pathway drift recorded as spec work in the campaign
-  (`{remote,local}×{cc,codex}` unification) — make "switch local-cc → remote-cc"
-  a first-class acceptance case there.
-  **UPDATE 2026-07-23 (spec survey):** (2) is an ORDERING bug, not a naming bug —
-  `resize_remote_agent_session_pty` keys per kind correctly (cc-runtime for CC);
-  the failure fires because the remote daemon does not yet OWN the key when the
-  resize lands mid-switch. (1)'s machinery is `resolve_active_open_mount_epoch`
-  (shell.rs) — reveal-in-place vs cold-remount. Both are now acceptance case A2
-  of `docs/spec-agent-cli-harness.md`; fix them there, not piecemeal.
+- **Cross-pathway blink (local-cc → remote-cc switch) — BOTH DEFECTS FIXED in
+  2.12.7 (2026-07-23), user gesture-confirmation pending.** The trace signature
+  was "each reveal CONSTRUCTS TWICE ~0.5 s apart" + `remote_pty_resize_failed
+  {terminal session not found: cc-runtime://<id>}` mid-switch.
+  **Root cause of the double construct — TWO writers, one shape:** the reveal
+  guard in `resolve_active_open_mount_epoch` requires `!attach_in_flight` AND
+  `was_ever_ready`, so the re-assert that lands right after any open request
+  completes (the `latest_open_request_id` bump re-runs the mount-key effect)
+  cold-remounted a session being born ~0.6 s into its FIRST attach; and
+  `invalidate_retained_remote_non_prompt_surface` treated the benign
+  "host exists but xterm surface is empty" reading of a 0.7 s-old settling
+  attempt as a fault (attempt 13 `source: retained_fault_recovery` in the
+  trace) and bumped the epoch directly. Both now reuse the settling host
+  while the latest attempt is inside its own recovery budget; a hung attach
+  ages out and remounts normally. **Live-proven on the 2.12.7 GUI swap: one
+  `bootstrap_spawn_scheduled` then `mount_epoch_reused` — previously every
+  birth was a pair.** Locks:
+  `open_reassert_reuses_the_host_while_its_first_attach_is_settling`,
+  the `attempt_settling` suppression in the invalidation path.
+  **The resize ordering half:** the remote daemon does not own the
+  `cc-runtime://` key yet while its ensure/resume is in flight mid-switch;
+  the resize worker now re-queues a not-found grid up to 5× (2 s apart,
+  newer client grid wins) instead of dropping it. Remove this entry once the
+  user confirms a local-cc → remote-cc switch no longer blinks.
 
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
@@ -405,6 +307,22 @@ fix) once the fix is verified live on jojo.
   model. Settle that first — it discriminates between "client base is wrong"
   and "CLI model is wrong".
 
+  **FIX SHIPPED 2026-07-23 (2.12.7): the seam is the chunk-ring mid-stream
+  gap, and `read()` now appends the viewport reconcile after the surviving
+  tail whenever `resync_required` fires** — the live-path twin of the 2.10.4
+  attach-seed reconcile (viewport-only, alt-screen-safe, no history
+  injection, so it does not re-open the 2.8.12/14 trap). Daemon trace
+  `mid_stream_gap_reconciled` fires per reconcile; lock:
+  `pty_read_with_trimmed_middle_appends_viewport_reconcile_after_tail`. Full
+  design + trap analysis:
+  [`docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream`](xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+  **Remove this entry once re-measured under a busy streaming session**
+  (read-buffer vs daemon-screen diff staying clean while
+  `mid_stream_gap_reconciled` fires; the SIGWINCH question is answered by the
+  mechanism — CC's repaint is diff-based against its own model, so only
+  re-anchoring the client base can help, which is exactly what the reconcile
+  does).
+
 - **Remote CC session stays permanently blank: `resume-cc` deadlocks before it
   launches the CLI (dev, 2026-07-20).** User-reported as "it never renders", and
   it is NOT a render bug — the xterm buffer is genuinely empty (0 non-whitespace
@@ -437,6 +355,19 @@ fix) once the fix is verified live on jojo.
   reclaim a lease whose attach never reached ready, instead of deferring to it
   forever.
 
+  **FIXES SHIPPED 2026-07-23 (2.12.7, both halves of the recorded direction):**
+  (2) the wrapper bridge now bails after 120 s if the daemon claims `running`
+  but the runtime has produced ZERO output ever
+  (`bridge_running_no_output_deadline` trace; idle-but-healthy sessions are
+  unaffected — the flag is has-ever-produced-output), so the next open spawns
+  a fresh wrapper instead of requiring a manual pkill; deployed to dev's
+  `~/.yggterm/bin` where the wrapper runs. (3) a re-click now RECLAIMS a
+  bootstrap lease whose attach never reached ready after 45 s
+  (`terminal_bootstrap_lease_reclaimed_stale_attach`; lock:
+  `terminal_bootstrap_lease_reclaims_stale_never_ready_attach`). (1) dev
+  daemon consolidation stays parked with B1 (user call: investigate-only).
+  Remove this entry once a wedged resume recovers without manual intervention.
+
 ## Deployed live on jojo, faithful-gesture confirmation pending
 
 - **Middle-click a link in a web surface → new tab (2.10.15, c6542edc).** Root
@@ -455,22 +386,6 @@ fix) once the fix is verified live on jojo.
   gesture), and jojo's Wayland input injection is unreliable (ydotoold). Ask the
   user to middle-click a link in a ychrome surface; confirm via the
   `web_surface / new_tab_from_link` trace event.
-
-## Fixed in 2.10.2 — confirm live, then delete this section
-
-- **Working-dot lag (10–45 s after the agent finished).** Root cause: the
-  focused-terminal defer suspended ALL background snapshot applies, and
-  snapshots were the only carrier of `working` flags. Fixed with the
-  lightweight `WorkingFlags` daemon poll (2.5 s, defer-exempt) + in-place
-  patching. Verify: watch `working_edge` events (source
-  `working_flags_poll`) in `~/.yggterm/ui-telemetry.jsonl` while a background
-  agent finishes; the dot should clear within ~3 s.
-- **Collapsed local machine row never blinked.** Root cause: local agent
-  sessions carry the loopback `ssh_target: "localhost"` for restore, which the
-  local root's `ssh_target.is_none()` check excluded. Verify: collapse the
-  local root while a local CC session works — the row must show the blinking
-  working dot (`server app rows` → the `local` group row reports
-  `busy: true, busy_reason: group_descendant_working`).
 
 ## Diagnostics available
 
