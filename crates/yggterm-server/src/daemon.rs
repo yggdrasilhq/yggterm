@@ -5544,8 +5544,47 @@ impl DaemonRuntime {
                         owned_terminal_session_keys.clone(),
                         existing_entries,
                     )?;
-                    let spawn_result =
-                        spawn_hot_restart_daemon_process(&daemon_executable, &owner_endpoint);
+                    // ⛔ A SUCCESSOR MAY ALREADY BE RUNNING, and spawning another
+                    // one is not merely redundant — it is why an old daemon can
+                    // sit at its old version forever.
+                    //
+                    // The successor binds a socket named for its own version. If
+                    // a daemon of the target version is already up (the normal
+                    // case when the machine was updated by launching the new
+                    // daemon rather than through this RPC), the child we spawn
+                    // finds that socket taken and exits 0 — correct single-
+                    // instance behaviour. But `spawn_result` is Ok (the *spawn*
+                    // worked), so we record `spawn_ok: true`, return "handoff
+                    // started", and linger as the preserved PTY owner waiting for
+                    // an adopter that was never created. Nothing drains us, so we
+                    // never retire.
+                    //
+                    // Measured on jojo 2026-07-23: two abandoned lingerers each
+                    // logged `hot_update_handoff_prepared {spawn_ok: true}`
+                    // followed ~10s later by `spawned_daemon_exit {code: 0,
+                    // success: true}`, and both were still on their old versions
+                    // afterwards. That is what "the hot update is blocked" looked
+                    // like from the outside: a success message and no change.
+                    //
+                    // A live daemon at or above the target version IS the
+                    // successor. Register the handoff against it and skip the
+                    // doomed spawn.
+                    let live_successor_version = expected_version.as_deref().and_then(|target| {
+                        let want = parse_daemon_version_triple(target)?;
+                        reachable_versioned_daemon_statuses_excluding_endpoint(
+                            self.store.home_dir(),
+                            &owner_endpoint,
+                        )
+                        .into_iter()
+                        .find_map(|(_peer_endpoint, status)| {
+                            let peer = parse_daemon_version_triple(status.server_version.trim())?;
+                            (peer >= want).then(|| status.server_version.clone())
+                        })
+                    });
+                    let spawn_result = match live_successor_version.as_deref() {
+                        Some(_) => Ok(()),
+                        None => spawn_hot_restart_daemon_process(&daemon_executable, &owner_endpoint),
+                    };
                     append_trace_event(
                         self.store.home_dir(),
                         "daemon",
@@ -5569,6 +5608,12 @@ impl DaemonRuntime {
                             "handoff_runtime_keys": registry.keys(),
                             "spawn_ok": spawn_result.is_ok(),
                             "spawn_error": spawn_result.as_ref().err().map(|error| error.to_string()),
+                            // Which of the two shapes this was. `spawn_skipped`
+                            // means we handed off to a daemon that was ALREADY
+                            // live; a spawn that "succeeds" and then exits 0 is
+                            // the failure this distinguishes it from.
+                            "successor_already_live": live_successor_version.is_some(),
+                            "successor_live_version": live_successor_version,
                             "update_priority": "handoff_preserve_sessions",
                         }),
                     );
