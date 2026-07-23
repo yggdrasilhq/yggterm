@@ -1067,6 +1067,60 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
     Ok(summary)
 }
 
+/// Name a piece of text in a few words — the generic twin of the session-title
+/// generator, for a contributed pane's in-place rename (yedit naming an
+/// untitled note from its own body).
+///
+/// The GUI owns this, not the app: the endpoint, key and model live in
+/// yggterm's settings, and a second app reaching for its own LLM config would
+/// be exactly the duplicate-source-of-truth this codebase forbids. The app
+/// declares only WHAT to name.
+///
+/// Rate limiting propagates (never silently substitutes a heuristic name): a
+/// rename is an explicit gesture, so an empty field the user can retry beats a
+/// junk name they have to notice and undo.
+pub fn request_generated_short_name(settings: &AppSettings, text: &str) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!("nothing to name");
+    }
+    if !settings_ready(settings) {
+        anyhow::bail!("no LiteLLM endpoint configured");
+    }
+    let context: String = text.chars().take(6000).collect();
+    let url = completions_url(&settings.litellm_endpoint);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build LiteLLM client")?;
+    let body = serde_json::json!({
+        "model": settings.interface_llm_model,
+        "temperature": 0.2,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Name a document from its contents. Answer with a short specific noun phrase of 2 to 5 words that says what the document IS about. No quotes, no markdown, no file extension, no trailing punctuation. Never answer with a question or an instruction. Good: 'Quarterly Tax Notice', 'Xterm Focus Investigation', 'Kitchen Renovation Quotes'. Bad: 'Untitled', 'Document', 'Notes', 'A file about some things'."
+            },
+            {
+                "role": "user",
+                "content": format!("Name this document. Return the name only.\n\n{context}")
+            }
+        ]
+    });
+    let response = client
+        .post(url)
+        .bearer_auth(settings.litellm_api_key.trim())
+        .json(&body)
+        .send()
+        .context("LiteLLM request failed")?
+        .error_for_status()
+        .context("LiteLLM returned an error status")?;
+    let value: Value = response.json().context("failed to parse LiteLLM response")?;
+    let raw = extract_completion_text(&value).context("LiteLLM returned no completion text")?;
+    sanitize_generated_title(&raw).context("LiteLLM returned an unusable name")
+}
+
 fn completions_url(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {

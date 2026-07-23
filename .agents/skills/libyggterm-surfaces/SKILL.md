@@ -172,7 +172,29 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     them; yggterm owns only the draw + dismissal. Empty/absent `menu` = the row
     has no context menu (platform default falls through). This is how yedit
     exposes Rename (the only way to name an in-DB note): the row menu's Rename
-    sets a per-note rename field in the app's next schema.
+    marks that note as renaming in the app's next schema, which the row then
+    declares via `rename` (below).
+  - **`list-row` IN-PLACE RENAME (2026-07-24, user-specified):** a `list-row`
+    may carry
+    `rename: {value, action, cancel_action?, ai_source?, placeholder?}`.
+    Present ⇒ that row's BODY is replaced by a prefilled text field — the same
+    shape as the cwd tree's "Rename session", which is the product's rename
+    vocabulary; a rename field floating above the list is not. Enter (and blur)
+    POSTs `action`, Escape and the ✕ button POST `cancel_action`, both with the
+    row id as the value.
+    - The draft rides back under the widget id **`rename:<row id>`**, not the
+      row id — yggterm namespaces it so it can never collide with a widget the
+      app declared. Read `values["rename:<id>"]` in the action handler.
+    - `ai_source` is the TEXT an AI-generated name should be derived from (for
+      yedit, the note's body). Non-empty ⇒ the row shows the ✨ button; clicking
+      it fills the field. **yggterm generates, not the app** — the LiteLLM
+      endpoint, key and model are yggterm settings, and an app carrying its own
+      copy of them is a duplicate source of truth. The app says only WHAT to
+      name; there is no round trip and no action to handle.
+    - A rate-limited or unreachable model surfaces a warning notification and
+      leaves the field alone. It never substitutes a heuristic name — a rename
+      is an explicit gesture, and a junk name the user must notice and undo is
+      worse than an unchanged field they can retry.
   - **Editor draft stability (2026-07-24):** the document channel keeps the
     user's LIVE draft as the source of truth while they type. A schema whose
     declared value merely ECHOES a draft the GUI already sent up (the ~2.5s
