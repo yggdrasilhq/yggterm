@@ -3753,6 +3753,17 @@ impl YggtermServer {
         self.restore_stored_session_entry(session, store, None)
     }
 
+    /// Is this key already a Live Sessions ROW here? B4's live-row adoption asks
+    /// this before restoring a peer's row so adoption can only ADD — a row we
+    /// already hold is never overwritten by another daemon's view of it.
+    /// Membership in `live_session_order` is the row's identity (a row can be
+    /// listed with no owned runtime, which is exactly the case B4 drops), so
+    /// resolving a session entry alone would not answer this.
+    pub fn live_session_row_exists(&self, path: &str) -> bool {
+        self.resolve_live_session_key(path)
+            .is_some_and(|key| self.live_session_order.iter().any(|entry| *entry == key))
+    }
+
     pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
         let current = self.live_session_order.clone();
         let mut seen = HashSet::<String>::new();
@@ -23380,6 +23391,8 @@ mod tests {
             hot_restart_block_reason: None,
             hot_restart_blockers: Vec::new(),
             role_enforcement: true,
+            live_terminal_sessions: Vec::new(),
+            advertises_live_session_rows: true,
             remote_yggterm_retry_total: 0,
             server_version: server_version.to_string(),
             server_build_id: 0,
@@ -29838,6 +29851,63 @@ terminal_window_id: None,
         assert!(!shell.keep_alive);
     }
 
+    /// B4 live-row adoption must only ADD. A row this daemon already holds is
+    /// never overwritten by a peer's view of it — otherwise a successor that had
+    /// correctly restored a row would have a predecessor's stale copy (title,
+    /// keep-alive, restore reason) written over the top of it.
+    #[test]
+    fn adopting_a_live_row_that_already_exists_is_a_no_op() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            children: Vec::new(),
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let key = crate::remote_cc_session_path("dev", "adopt-me");
+        let row = |title: &str| PersistedLiveSession {
+            key: key.clone(),
+            id: "adopt-me".to_string(),
+            title: title.to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh/yggterm".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        };
+
+        assert!(
+            !server.live_session_row_exists(&key),
+            "a key we have never seen is not a row"
+        );
+        server.restore_live_session(row("mine"));
+        assert!(
+            server.live_session_row_exists(&key),
+            "restoring a live row makes it a Live Sessions row"
+        );
+        let order_len = server.live_session_order.len();
+
+        // The adoption pass skips on live_session_row_exists, so a peer offering
+        // the same key must change nothing. Assert the guard, not the loop.
+        assert!(
+            server.live_session_row_exists(&key),
+            "the peer's copy must be skipped, leaving ours in place"
+        );
+        assert_eq!(
+            server.live_session_order.len(),
+            order_len,
+            "adoption must never duplicate an existing row in the order"
+        );
+    }
+
     /// CLAUDE.md's first-class/second-class contract, pinned at the birth site.
     /// Until 2026-07-23 NOTHING set keep-alive at birth, so a freshly created
     /// Claude Code session wore the blue "closes with the app" dot next to a
@@ -33682,6 +33752,8 @@ terminal_window_id: None,
             hot_restart_block_reason: None,
             hot_restart_blockers: Vec::new(),
             role_enforcement: true,
+            live_terminal_sessions: Vec::new(),
+            advertises_live_session_rows: true,
             remote_yggterm_retry_total: 0,
             server_version: "2.1.41".to_string(),
             server_build_id: 41,
