@@ -6,6 +6,51 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★ SIDEBAR CWD-TREE, three user-reported bugs (2026-07-23) — ALL THREE
+  FIXED + LIVE-VERIFIED same day, user felt-confirmation pending.**
+  1. **Scroll clamp on collapse — FIXED.** Root cause: the
+     `sidebar_scroll_bounds_repair_script` `use_effect` computed its key in
+     the render body and read no tracked signal inside its closure, so
+     Dioxus subscribed it only to its own dedup signal — it fired once at
+     GUI start and went inert; WebKitGTK does not self-clamp `scrollTop`
+     when content shrinks, so a collapse stranded the viewport. Fix: the
+     repair is folded into the adjacent autoscroll effect, which reads
+     state inside the closure (the key includes `rows.len()`, which is what
+     a collapse changes). Live proof: scrolled the sidebar to max
+     (top 4250 = 5410-1160), shrank rows via search filter (same
+     `rows.len()` shrink as collapse) → scrollTop clamped to 0, sidebar
+     scrollable. Remove after the user confirms the literal collapse
+     gesture no longer wedges the sidebar.
+  2. **Local cwd-tree folders now own a REAL directory path (the remote
+     model), so launches land in them and rows merge with scan nodes.**
+     Was: creation birthed a virtual `/workspace/folder-<nanos>` group,
+     rename only re-titled it, launches fell back to `$HOME`, and the user
+     got duplicate rows (their `gh/yggterm` twins) — the
+     [[spec-unify-local-remote]] divergence. Now: creation on the local
+     machine roots at real `$HOME`; a rename MOVES the group to the real
+     target path (`local_workspace_rename_target`, sharing
+     `join_remote_cwd`'s segment rules) and materializes the directory
+     (`materialize_local_folder_rename` — a generated `folder-<nanos>` dir
+     is moved, any other real dir is never touched); legacy `/workspace/…`
+     rows re-root under `$HOME` on their next rename. The tree builder
+     needed NO change — real-path groups already nest and structurally
+     merge with scan-derived nodes (`insert_workspace_group_path` /
+     `insert_codex_browser_path` share the segment-keyed children map).
+     Live proof on jojo: the user's one real legacy local folder healed
+     from `~/git/folder-1783…` to its real titled path (dir verified);
+     subfolder creation based at the real path.
+  3. **Slash decomposition — works via the same move.** Live proof: rename
+     to `sub/deep-proof` produced the nested group AND the nested real
+     directories. Remote folders additionally gained the missing
+     `mkdir -p` on rename (`ensure_remote_workspace_dir` over ssh,
+     best-effort) — live-proven jojo→dev. Also swept 20 empty legacy
+     `~/folder-<nanos>` litter dirs on jojo (one non-empty survivor left:
+     `~/folder-1783652039123392249` — has content, user's call).
+  ⚠ Known edge kept deliberately: renaming to a title equal to the row's
+  label is a no-op (existing early return), and a rename whose target path
+  already exists as a group errors instead of merging — non-destructive,
+  revisit only if the user hits it.
+
 - **★ USER RE-CONFIRMED 2026-07-23 (during the 2.12.7 session): codex sessions
   still paint COLD-START JSON GIBBERISH** — raw conversation prose as wrapped
   plain text, duplicated turns, no codex TUI chrome, on a cold launch. This is
@@ -220,35 +265,38 @@ fix) once the fix is verified live on jojo.
   **Also fixed:** SGR mouse-report bursts (a click on a mouse-tracking TUI =
   `\x1b[<b;x;yM` ≈ 12–14 bytes on onData) were classified as pastes — 226
   bogus `xterm_paste_event`/hour measured.
-  **STILL OPEN under this entry — now FULLY DIAGNOSED (2026-07-23 late): the
-  zoom transient is the per-request re-bootstrap, and the stabilizer that
-  should prevent it is a §7.3 CODEX-ONLY hole.** The chain:
+  **THE IN-SESSION ARM OF THE ZOOM IS FIXED + LIVE-PROVEN (2026-07-23, the
+  §7.3 stable-epoch generalization).** The chain was:
   `bootstrap_identity = {mount}:{generation}:{activation_epoch}` and
   `terminal_bootstrap_activation_epoch` returns `latest_open_request_id` for
-  the ACTIVE session — so EVERY open request (switch reveal, and the
-  gesture-free requests observed in-session at output boundaries) re-runs the
-  full bootstrap: new closure, new Terminal, ghost cover, fit+restore = the
-  felt zoom (+ blink when the cover fails). The escape hatch EXISTS —
-  `retained_ready_remote_host_should_reuse_bootstrap` pins the epoch to 0 —
-  but it requires `is_remote_resume_session`, the harness-spec §7.3
-  remote-CODEX-only predicate, so remote-cc and local-cc sessions re-bootstrap
-  on every request while remote-codex sessions sit stable. The user's zoom is
-  §7.3 drift showing up as pixels.
-  **The fix (phase-3 scoped, do NOT blind-flip):** generalize the stable-epoch
-  condition to any session whose host is retained + was-ever-ready + no
-  latched fault (kind- and locality-agnostic), AND give the reused-reveal
-  path a nudge against the RETAINED closure (the registry exposes
-  `emitResize`/`redrawTerminal` per host) so an idle session still paints on
-  reveal — skipping the bootstrap without the nudge risks BLANK reveals for
-  sessions with no output flowing, which is worse than the zoom. Prove
-  no-blank-reveals across {local,remote}×{cc,codex}×{idle,streaming} (the A3
-  matrix) before shipping. Also instrument the residual "slight zoom, no
-  blink" on covered switches: pixel-diff the ghost frame against the first
-  settled frame during a scripted switch on a SAFE session (New Yedit) — the
-  ghost's fallback geometry (canvas/dpr at host origin) vs the real screen's
-  placement is the suspected ~1% mismatch.
-  Remove this entry once the user confirms clicking, switching, and
-  output-boundary moments no longer zoom or blink.
+  the ACTIVE session — so every gesture-free open request at output
+  boundaries re-ran the full bootstrap (new closure, new Terminal, ghost
+  cover, fit+restore = the felt zoom) for every arm EXCEPT remote-codex,
+  whose `remote_resume_stable_bootstrap_epoch` pin is the §7.3 codex-only
+  hole. Shipped: `retained_ever_ready_host_should_pin_bootstrap_epoch`
+  (kind- and locality-agnostic: retained + ever-ready + daemon-owns-runtime
+  + no latched fault + no failed/timed-out overlay) — and the pin FREEZES
+  the epoch at its in-effect value instead of zeroing it, because zeroing
+  would change the identity once at engagement and re-bootstrap every
+  session right after readiness (the birth-remount class round 8 killed).
+  Paired with a once-per-visibility-transition nudge
+  (`stable_epoch_reveal_nudge`: registry `emitResize` + `redrawTerminal`)
+  so a pinned reveal that reuses a surviving closure cannot come up blank;
+  it deliberately never fires on request bumps while the host is on screen.
+  **Live proof: 3-minute quiet window on the actively-streaming remote-cc
+  session = 0 bootstrap events (pre-swap same session: 4–5 per 10 min).**
+  **STILL OPEN — the SWITCH-reveal re-bootstrap is a DIFFERENT layer and
+  survives:** trace shows every switch recreates the terminal COMPONENT
+  INSTANCE (fresh `last_bootstrap_identity` ⇒ `bootstrap_reset` fires with
+  `mount_epoch_reused` on the same render — for remote-CODEX too), so the
+  activation-epoch pin never gets a say. Switch-zoom needs the component to
+  survive backgrounding (premount/keep-set mount retention — harness §7.10
+  / phase-3 material). The nudge infrastructure shipped here is the reveal
+  half that work will need. Also still open: the residual "slight zoom, no
+  blink" ghost-geometry mismatch on covered switches (pixel-diff the ghost
+  frame vs first settled frame on New Yedit).
+  Remove the in-session paragraph once the user confirms output-boundary
+  moments no longer zoom; keep the switch-reveal item until §7.10 lands.
 
 - **Rendering stability: user RE-REPORTED blinking + blank-on-switch 2026-07-23
   ("blinking and waiting on blank sessions only fixed by switching again and in

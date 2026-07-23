@@ -15554,6 +15554,20 @@ fn refresh_remote_managed_cli(
 /// the CC JSONL on the machine that owns it. Reuses the SSOT remote-yggterm
 /// invoker (binary resolution + quoting). See memory
 /// finding-cc-title-storage-custom-title.
+/// Create a workspace directory on a remote machine, for cwd-tree folder
+/// renames: the folder row's identity is the real directory path, so the
+/// directory must exist for `cd <cwd>` launches to land in it (a missing dir
+/// silently dropped the session into $HOME). `mkdir -p` is idempotent and the
+/// path is single-quoted by the command builder.
+pub fn ensure_remote_workspace_dir(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    cwd: &str,
+) -> anyhow::Result<()> {
+    run_remote_binary_command(ssh_target, exec_prefix, "mkdir", &["-p", cwd], None)?;
+    Ok(())
+}
+
 pub fn rename_remote_cc_session(
     ssh_target: &str,
     exec_prefix: Option<&str>,

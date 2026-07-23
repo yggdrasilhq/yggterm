@@ -154,6 +154,50 @@ pub(crate) fn retained_ready_remote_host_should_reuse_bootstrap(
     is_remote_resume_session && retained && resume_ready && host_id_present
 }
 
+/// The §7.3 stable-epoch generalization (harness spec phase-3 scope; the
+/// user-felt "zoom" in docs/pending-bugs.md): `bootstrap_activation_epoch`
+/// returns `latest_open_request_id` for the active session, so EVERY open
+/// request — switch reveal or the gesture-free requests observed at output
+/// boundaries — re-ran the full bootstrap (new closure, new Terminal, ghost
+/// cover, fit + restore = the felt zoom). The pre-existing pins
+/// (`retained_ready_remote_host_should_reuse_bootstrap`,
+/// `remote_resume_stable_bootstrap_epoch`) require `is_remote_resume_session`
+/// — remote-CODEX-only — so cc and local sessions reconstructed per request
+/// while remote-codex sat stable.
+///
+/// This predicate pins the epoch for ANY session — kind- and
+/// locality-agnostic — whose host is retained, reached ready at least once,
+/// and shows no fault:
+/// - `daemon_owns_runtime` mirrors the reveal-reuse predicate
+///   (`terminal_session_host_reusable_for_reveal`): a runtime the daemon lost
+///   needs a real re-bootstrap, not a reveal.
+/// - a latched fault or a failed/timed-out resume overlay unpins, so every
+///   existing failure path re-bootstraps exactly as before.
+/// - genuine fault recovery bumps the MOUNT epoch directly (never through the
+///   activation epoch), so pinning here can never mask a remount.
+///
+/// The caller pairs the pin with a reveal NUDGE against the retained closure
+/// (`emitResize` + `redrawTerminal`) — skipping the bootstrap without the
+/// nudge risks a BLANK reveal for an idle session whose parked canvas lost
+/// its backing store, which is worse than the zoom.
+pub(crate) fn retained_ever_ready_host_should_pin_bootstrap_epoch(
+    retained: bool,
+    was_ever_ready: bool,
+    daemon_owns_runtime: bool,
+    latched_fault: bool,
+    host_id_present: bool,
+    resume_overlay_failed: bool,
+    resume_overlay_timed_out: bool,
+) -> bool {
+    retained
+        && was_ever_ready
+        && daemon_owns_runtime
+        && !latched_fault
+        && host_id_present
+        && !resume_overlay_failed
+        && !resume_overlay_timed_out
+}
+
 pub(crate) fn retained_remote_host_should_rehydrate(
     is_remote_resume_session: bool,
     retained: bool,
@@ -459,6 +503,45 @@ mod tests {
         ));
         assert!(!retained_ready_remote_host_should_reuse_bootstrap(
             true, true, true, false
+        ));
+    }
+
+    // §7.3 generalization: a retained, ever-ready, daemon-owned, fault-free
+    // host pins the bootstrap epoch REGARDLESS of kind or locality — this is
+    // the predicate that stops cc/local sessions re-bootstrapping (the felt
+    // zoom) on every open request while remote-codex sat stable.
+    #[test]
+    fn retained_ever_ready_host_pins_epoch_kind_and_locality_agnostic() {
+        assert!(retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, true, false, true, false, false
+        ));
+    }
+
+    // Every unpin direction re-bootstraps exactly as before: not retained, never
+    // ready (a session being born must keep the per-request epoch), a runtime the
+    // daemon lost, a latched fault, no host, and a failed/timed-out resume overlay.
+    #[test]
+    fn stable_epoch_pin_releases_on_every_fault_direction() {
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            false, true, true, false, true, false, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, false, true, false, true, false, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, false, false, true, false, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, true, true, true, false, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, true, false, false, false, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, true, false, true, true, false
+        ));
+        assert!(!retained_ever_ready_host_should_pin_bootstrap_epoch(
+            true, true, true, false, true, false, true
         ));
     }
 
