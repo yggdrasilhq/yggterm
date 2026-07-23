@@ -299,6 +299,7 @@ usually not `remote-cc://`):
 | `terminal_line_internal_transport_error_index` | shell.rs:73310 | a real `…not found: cc-runtime://…` transport error is NOT excised |
 | `terminal_line_is_internal_transport_error` (SSOT twin) | terminal_observe.rs:3702 | same hole, second copy |
 | `is_hot_terminal_sidebar_path` | shell.rs:25820 | includes remote-cc but not cc-runtime |
+| `terminal_write_strategy_for_path` | daemon.rs (below the io-timeout table) | `RemoteDirectFallback` only for `remote-session://`; a remote-cc session with no local runtime gets `LocalRuntimeFallback` — keystrokes aimed at a nonexistent runtime. **Bit the user live 2026-07-23** (docs/pending-bugs.md, post-swap un-inputable window) |
 
 This table is the registry lock's (§2.3, A5) initial work-list.
 
