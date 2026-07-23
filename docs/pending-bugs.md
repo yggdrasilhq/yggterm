@@ -7,7 +7,25 @@ fix) once the fix is verified live on jojo.
 ## Standing traps / other open bugs
 
 - **★★ AGENT WEB-SURFACE AUTOMATION HARD-CRASHES THE GUI (WebKitGTK
-  segfault) — diagnosed 2026-07-24 on jojo, GUI recovered, FIX NOT BUILT.**
+  segfault) — diagnosed 2026-07-24 on jojo; LAYER 1 (crash surface) FIXED +
+  LIVE-VERIFIED at 2.12.8 (`c3c7086`), LAYER 2 (routing/isolation) OPEN.**
+  **UPDATE 2026-07-24 (dev agent):** the raw-coordinate `do click` path was the
+  culprit — it synthesized a native GDK button event with NO hit-test, unlike
+  `ClickSelector`. Fixed in `web_surface_do_for`: the `Click{x,y}` arm now evals
+  `document.elementFromPoint(vx,vy)` FIRST and refuses (never injecting) if it
+  returns null or the eval fails — which both confirms a live element is present
+  AND round-trips through the web content process, so a page that cannot lay out
+  fails there instead of taking a synthetic click into a dying frame. Live-proven
+  on the fixed GUI (jojo pid 3290202, GUI-only swap, daemon + all 6 sessions
+  preserved): a blind click at (5000,5000) into a MAPPED 1mg surface is refused
+  with "no live element … refusing a blind native click"; a valid `--selector`
+  click succeeds; the GUI survives every blind click that previously segfaulted
+  it. Prefer `do click --selector`. **STILL OPEN (layer 2):** a WebKit-internal
+  race on a *valid* element is not fully preventable from the UI process — the
+  ultimate belt is process isolation (run agent web surfaces in a shadow/child
+  process that can die alone) or GUI auto-restart (the transient scope has no
+  `Restart=`), plus the SHADOW-PROBE routing so agent web verbs never drive the
+  user's foreground surface. Those are the remaining fixes.
   A `web_surface_do` synthetic click injected into a `local://<uuid>` web
   surface segfaulted WebKitGTK and killed the entire GUI process. dmesg:
   `yggterm[<pid>]: segfault at 48 ... error 4 in
