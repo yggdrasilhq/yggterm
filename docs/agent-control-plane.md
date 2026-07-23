@@ -1267,3 +1267,83 @@ surface must be revealed once; (b) `--session` on a backgrounded surface is
 bounded by the ~600s reap hold unless a `lease` extends it — the single `not live`
 seen this run is consistent with hold-expiry, not a missing feature. Lesson for
 the file: never conclude "not deployed" from a usage string.
+
+## Field findings — invisible co-browse maiden run (2026-07-23)
+
+The FIRST real research task run entirely through the invisible path: spawn a
+`terminal new --no-activate` work session, `web ensure --session` a headless
+surface, and drive it by `--session` while the user's Claude session stayed on
+screen. Read/navigate/wait across three sites (protocol.bryanjohnson.com,
+janaushadhi.gov.in, davaindia.com, 1mg.com) worked cleanly and invisibly — the
+`read`/`eval`/`wait`/lease primitives are solid headless. The gaps below are all
+in the *lifecycle and routing* around that read path, and two of them broke
+recovery outright. Ranked by how badly they bit.
+
+1. **`terminal new` (and `session remove`) route to the shadow and fail
+   `shadow_cannot_own` — the headline gap.** With a shadow client (`agent-1`)
+   registered and the real primary GUI **not enumerable** in `server app clients`
+   (only the shadow appeared), an untargeted `terminal new` lands on the shadow
+   and errors; `--pid <real-gui>` fails with "no live GUI client with pid" because
+   the primary isn't a registered client at all. Result: once a shadow is present,
+   an agent **cannot create a fresh work session** via app-control, and cannot tear
+   one down (`session remove` → `accepted:false`; the session had to be SIGKILLed
+   by shell PID, leaving a dead row until reconcile). Round-10 made untargeted
+   READ/DRIVE verbs skip shadows, but **ownership verbs were not covered.** → (a)
+   role-aware routing must extend to ownership verbs: never route
+   `terminal new`/`session remove` to a shadow, always to the real primary; (b) the
+   real primary GUI MUST always be listed/targetable in `server app clients` (today
+   it can vanish from the roster while still handling `open`/`screenshot`). Note the
+   asymmetry that hid this: the same run's `open`/`state`/`screenshot`/first
+   `web ensure` all routed to the real GUI fine — only ownership verbs fell to the
+   shadow, which reads as nondeterministic routing.
+
+2. **The OSC declare does NOT survive a surface reap — sharper than the recorded
+   "first declare needs a reveal" seam.** After the leased surface was reaped,
+   `web ensure --session` returned `tabs:0` and could **not** re-materialize it;
+   relaunching ychrome in the work session + a brief reveal also failed to re-seed
+   it. The declare is parsed client-side and not retained daemon-side, so once the
+   surface is gone there is nothing to rebuild from. This is the severe form of
+   Dream §2: not just "first declare needs one reveal" but "a reaped surface is
+   unrecoverable headless." → **Daemon-side declare ingestion (Dream §2)** so
+   `web ensure` rebuilds a reaped surface with no reveal, ever. Until then, a leased
+   surface that reaps mid-task ends the invisible run.
+
+3. **A blind `web do click` at guessed coordinates on an unrevealed surface
+   triggered the reap.** One `--x/--y` click navigated the page (hit a link) and
+   the surface was reaped moments later. → Prefer `web do click --selector`; treat
+   coordinate clicks on a headless surface as needing a confirm/guard; and a leased
+   surface should be protected from reap by an in-page navigation it initiated (the
+   lease is the "keep this alive" contract).
+
+4. **Per-surface `web screenshot` fails on a never-revealed (soft-stashed)
+   surface.** Returned "error creating the snapshot" / `capture_faithful:null` — a
+   headless surface has no compositor to composite. So faithful-pixel PROOF of an
+   invisible surface is currently impossible without a reveal, even though the
+   read/eval path is fully functional headless. → An offscreen/render-buffer capture
+   path independent of the compositor, or an explicit "pixel proof needs a brief
+   reveal" documented limitation. (This run leaned on structured `read`/`eval` as
+   proof instead, which is honest but not a pixel.)
+
+5. **`terminal read-buffer` can't read a `--no-activate` session
+   (`terminal_host_missing`).** A never-revealed session has no mounted client-side
+   xterm host, so an agent cannot observe its OWN work session's terminal output
+   without revealing it — exactly when it most wants to (diagnosing why a launch
+   didn't declare). The daemon owns the PTY vt100 screen (already the content SSOT
+   per the repo's self-verification rules). → `read-buffer` should fall back to the
+   daemon screen when no client host is mounted, giving a client-independent read of
+   a headless work session.
+
+6. **Auto title/summary ran on the invisible work session, creating a visible
+   Live-Sessions row.** The daemon generated a title ("YChrome Protocol Research")
+   and a rich working-summary for a session the user never opened — a minor
+   invisibility leak (a "work session" appears in the user's sidebar and consumes a
+   title/summary LLM generation). → An agent-owned/`--no-activate` session class
+   that is excluded from the user's row set and skips title/summary generation.
+
+**What this run proves for the escalation ladder.** The invisible read path
+(spawn → ensure → `--session` read/eval/wait → restore) is real and was
+demonstrated end-to-end across four sites. The plane's weakness is not observation;
+it is **lifecycle under a shadow and under reap** — session ownership routing (#1)
+and declare persistence (#2) are the two that must land before an agent can run an
+invisible task that survives a reap or coexists with a standing shadow. Findings #1
+and #2 are the current ceiling on "undisturbed, unattended co-browse."
