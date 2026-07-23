@@ -261,6 +261,12 @@ fix) once the fix is verified live on jojo.
   of the pathway drift recorded as spec work in the campaign
   (`{remote,local}×{cc,codex}` unification) — make "switch local-cc → remote-cc"
   a first-class acceptance case there.
+  **UPDATE 2026-07-23 (spec survey):** (2) is an ORDERING bug, not a naming bug —
+  `resize_remote_agent_session_pty` keys per kind correctly (cc-runtime for CC);
+  the failure fires because the remote daemon does not yet OWN the key when the
+  resize lands mid-switch. (1)'s machinery is `resolve_active_open_mount_epoch`
+  (shell.rs) — reveal-in-place vs cold-remount. Both are now acceptance case A2
+  of `docs/spec-agent-cli-harness.md`; fix them there, not piecemeal.
 
 - **B4 ROOT CAUSE FOUND (jojo, 2026-07-22): the cold-restore refusal is
   ALL-OR-NOTHING, and rows owned by NOBODY have no recovery source.** Measured
