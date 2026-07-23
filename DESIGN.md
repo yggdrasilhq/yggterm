@@ -538,7 +538,17 @@ article feel:
 
 - Body: legible sans reading stack `'Inter', 'SF Pro Text', 'Segoe UI',
   'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif`,
-  15px, line-height 1.7, letter-spacing 0.002em.
+  16px, line-height 1.7, letter-spacing 0.002em (obsidian-reference pass,
+  2026-07-23).
+- Tables: horizontal separators ONLY — no vertical grid, no header fill;
+  header carries a 2px bottom rule, rows 1px. A full cell grid reads as a
+  spreadsheet; an article's table is rows of text with quiet rules.
+- Blockquotes: accent left bar, upright text (never italicize the whole
+  quote).
+- Block click-to-edit: the in-place editor keeps the READING typography with
+  no box — transparent background, no border, a thin accent bar on the left
+  marks the active block. Entering edit is a reveal of the source text, not a
+  mode jolt into a form (the obsidian in-place feel, at block granularity).
 - Headings: same sans, heavy weights (h1 800 → h4 720), negative letter
   spacing on h1/h2, more air above than below (h1 26px above / 12px below,
   scaling down). Paragraphs carry 14px bottom margin. NO border/rule under
