@@ -3805,6 +3805,46 @@ fn terminal_chunk_printable_signal_count(data: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // ── Scheme-registry predicate lock (harness spec §2.3/§8 phase 0) ───────
+    // The SSOT twin of shell.rs's transport-error index — same expected
+    // scheme set, same burn-down table in yggterm-core::agent_scheme.
+    #[test]
+    fn scheme_registry_lock_terminal_line_is_internal_transport_error() {
+        use yggterm_core::agent_scheme::{self, SchemeRole};
+        let name = "terminal_line_is_internal_transport_error";
+        // Any scheme that can key a terminal session can appear in a daemon
+        // "terminal session not found: <key>" error line.
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            !s.legacy
+                && s.agent
+                && matches!(
+                    s.role,
+                    SchemeRole::RowIdentity
+                        | SchemeRole::RuntimeKey
+                        | SchemeRole::RowAndRuntimeKey
+                )
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let line = format!("Error: terminal session not found: {}", scheme.example);
+            let covered = super::terminal_line_is_internal_transport_error(&line);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} does not excise `{line}` and no hole is recorded — fix it or record it"
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
     use super::{
         MemoryPressureSnapshot, RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
         WorkspaceViewMode, parse_meminfo,

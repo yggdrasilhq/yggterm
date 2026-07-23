@@ -98069,6 +98069,73 @@ mod tests {
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
 
+    // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
+
+    #[test]
+    fn scheme_registry_lock_terminal_line_internal_transport_error_index() {
+        use yggterm_core::agent_scheme::{self, SchemeRole};
+        let name = "terminal_line_internal_transport_error_index";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            !s.legacy
+                && s.agent
+                && matches!(
+                    s.role,
+                    SchemeRole::RowIdentity
+                        | SchemeRole::RuntimeKey
+                        | SchemeRole::RowAndRuntimeKey
+                )
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let line = format!("Error: terminal session not found: {}", scheme.example);
+            let covered = terminal_line_internal_transport_error_index(&line).is_some();
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} does not excise `{line}` and no hole is recorded — fix it or record it"
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
+    #[test]
+    fn scheme_registry_lock_is_hot_terminal_sidebar_path() {
+        use yggterm_core::agent_scheme::{self};
+        let name = "is_hot_terminal_sidebar_path";
+        // Every current scheme that can name a LIVE session (agent rows,
+        // agent runtime keys, shell rows) must promote into the hot sidebar.
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            !s.legacy && (s.agent || matches!(s.kind, Some(SessionKind::Shell | SessionKind::SshShell)))
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let covered = is_hot_terminal_sidebar_path(scheme.example);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} ignores {} and no hole is recorded — fix it or record it",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
     #[test]
     fn parse_pty_size_cells_reads_the_grid_string() {
         assert_eq!(parse_pty_size_cells("167 × 81 cells"), Some((167, 81)));
