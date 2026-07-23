@@ -4928,6 +4928,9 @@ struct ShellState {
     server: YggtermServer,
     settings: AppSettings,
     search_query: String,
+    /// Bumped on every EXTERNAL search-value change (never on typing); rides
+    /// the titlebar input's Dioxus key so the uncontrolled input rebuilds.
+    search_value_epoch: u64,
     search_focused: bool,
     window_focused: bool,
     // Monitoring override (app-control `force-foreground`): when true the GUI
@@ -5560,6 +5563,7 @@ struct DocumentSurfaceSnapshot {
 struct RenderSnapshot {
     palette: Palette,
     search_query: String,
+    search_value_epoch: u64,
     search_active: bool,
     command_mode_active: bool,
     search_focused: bool,
@@ -6837,6 +6841,7 @@ impl ShellState {
             browser,
             server,
             search_query: String::new(),
+            search_value_epoch: 0,
             search_focused: false,
             window_focused: true,
             app_control_force_foreground: false,
@@ -7581,6 +7586,7 @@ impl ShellState {
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
+            search_value_epoch: self.search_value_epoch,
             search_active,
             command_mode_active,
             search_focused: self.search_focused,
@@ -7807,7 +7813,19 @@ impl ShellState {
             shell_material_blur_px: material_blur_radius_px(&active_theme_spec),
         }
     }
+    /// EXTERNAL search set (app-control, Escape, the clear button, ALT layer):
+    /// bumps `search_value_epoch` so the titlebar input — whose DOM value is
+    /// deliberately UNCONTROLLED — is rebuilt with the new `initial_value`.
+    /// Typing goes through `set_search_from_input`, which never bumps: a
+    /// controlled `value:` rewrite raced the per-keystroke tree rebuild and
+    /// ate/reordered characters mid-composition (user report 2026-07-23,
+    /// "typing and backspacing acts weird"). Same pattern as the app-pane
+    /// widgets' value epochs.
     fn set_search(&mut self, query: String) {
+        self.search_value_epoch = self.search_value_epoch.wrapping_add(1);
+        self.set_search_from_input(query);
+    }
+    fn set_search_from_input(&mut self, query: String) {
         self.search_query = query;
         self.search_sidebar_match_index = None;
         self.search_content_match_index = None;
@@ -30339,6 +30357,13 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             if let Some(path) = focus_path {
                 scroll_sidebar_row_into_view(&path);
             }
+        }
+        ShellCommand::FocusSearch => {
+            state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.set_search_focus(true);
+            });
+            focus_search_input(true);
         }
         ShellCommand::ViewWeb => {
             state.with_mut(|shell| shell.clear_alt_overlay());
@@ -53786,6 +53811,7 @@ fn app() -> Element {
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool, bool)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let mut last_sidebar_bounds_repair_key = use_signal(|| None::<String>);
+    let mut last_search_value_epoch_sync = use_signal(|| None::<u64>);
     let mut last_tree_rename_focus_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
     // Count forced wakes ALWAYS, not only under the render trace. A storm is
@@ -54949,6 +54975,36 @@ fn app() -> Element {
     // behavior-equivalent and removes a whole row-clone pass per render.
     // See [[finding-gui-latency-render-path-campaign]].
     let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
+    // External search-value sync: the titlebar input is UNCONTROLLED (typing
+    // never re-renders its value — the controlled rewrite raced the
+    // per-keystroke tree rebuild and ate characters), so external writers
+    // (Escape, the clear chip, app-control `search set`) bump
+    // `search_value_epoch` and this effect pushes the value into the DOM.
+    // An epoch-keyed node rebuild was tried first and does NOT fire: Dioxus
+    // keys drive list diffing, not single static children. Reads state
+    // inside the closure — an effect subscribes only to signals read during
+    // its last run (the sidebar bounds-repair lesson, same day).
+    use_effect(move || {
+        let (epoch, query) = {
+            let shell = state.read();
+            (shell.search_value_epoch, shell.search_query.clone())
+        };
+        if *last_search_value_epoch_sync.read() == Some(epoch) {
+            return;
+        }
+        last_search_value_epoch_sync.set(Some(epoch));
+        let Ok(query_literal) = serde_json::to_string(&query) else {
+            return;
+        };
+        let _ = document::eval(&format!(
+            "(function() {{
+                const input = document.getElementById({SEARCH_INPUT_ID:?});
+                if (input && input.value !== {query_literal}) {{
+                    input.value = {query_literal};
+                }}
+            }})();"
+        ));
+    });
     use_effect(move || {
         let (scroll_path, show_loading_tree, suppress_autoscroll, bounds_repair_key) = {
             let shell = state.read();
@@ -55510,20 +55566,10 @@ fn app() -> Element {
                     focus_search_input(true);
                     return;
                 }
-                let should_focus_search_on_slash = {
-                    let shell = state.read();
-                    !shell.search_focused && !shell.active_terminal_prefers_text_input()
-                };
-                if should_focus_search_on_slash
-                    && !is_accel
-                    && !evt.modifiers().contains(Modifiers::SHIFT)
-                    && matches!(evt.key(), Key::Character(ref key) if key == "/")
-                {
-                    evt.prevent_default();
-                    state.with_mut(|shell| shell.set_search_focus(true));
-                    focus_search_input(true);
-                    return;
-                }
+                // The bare "/" search hotkey is GONE (user call 2026-07-23): a
+                // plain printable key stole real typing whenever the
+                // focus-judgment predicate misfired. Search focus lives in the
+                // ALT+ layer (`search.focus`, ALT,S) and Ctrl+Shift+P.
                 let preview_navigation_enabled = {
                     let shell = state.read();
                     shell.server.active_view_mode() == WorkspaceViewMode::Rendered && !shell.search_focused
@@ -56078,7 +56124,19 @@ fn app() -> Element {
                                 snapshot: titlebar_snapshot,
                                 hovered: hovered,
                                 on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
-                                on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                                on_search: move |value: String| state.with_mut(|shell| shell.set_search_from_input(value)),
+                                on_clear_search: move |_| {
+                                    state.with_mut(|shell| {
+                                        shell.set_search(String::new());
+                                        shell.set_search_focus(false);
+                                    });
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                            if (input && input.blur) input.blur();
+                                        }})();"
+                                    ));
+                                },
                                 on_execute_search_command: move |command: String| execute_search_command(state, command),
                                 on_set_search_focus: move |focused: bool| {
                                     state.with_mut(|shell| shell.set_search_focus(focused));
@@ -56893,6 +56951,7 @@ fn Titlebar(
     hovered: Signal<Option<HoveredControl>>,
     on_toggle_sidebar: EventHandler<()>,
     on_search: EventHandler<String>,
+    on_clear_search: EventHandler<()>,
     on_execute_search_command: EventHandler<String>,
     on_set_search_focus: EventHandler<bool>,
     on_prev_search_content: EventHandler<()>,
@@ -57543,7 +57602,9 @@ fn Titlebar(
                                     key: "titlebar-search-activator",
                                     "data-titlebar-search-activator": "1",
                                     // The invisible click target that focuses the
-                                    // search field; shares the input's exemption (§12).
+                                    // search field; also anchors the ALT,S badge
+                                    // (`search.focus` replaced the bare "/").
+                                    "data-keytip-node": keytip_node_id("search.focus"),
                                     "data-keytip-exempt": "search",
                                     style: format!(
                                         "position:absolute; inset:0; z-index:2; border:none; background:transparent; cursor:text; padding:0; margin:0; \
@@ -57568,14 +57629,22 @@ fn Titlebar(
                                     key: "titlebar-search-field-row",
                                     style: "display:flex; align-items:center; gap:8px; width:100%; min-width:0;",
                                     input {
-                                        key: "titlebar-search-input",
+                                        // UNCONTROLLED on purpose: a controlled
+                                        // `value:` rewrite raced the per-keystroke
+                                        // tree rebuild and ate/reordered characters
+                                        // mid-composition. External sets (Escape,
+                                        // clear, app-control) bump the epoch, which
+                                        // rebuilds this node with the new
+                                        // initial_value — the app-pane widget
+                                        // pattern.
+                                        key: "titlebar-search-input-{snapshot.search_value_epoch}",
                                         id: SEARCH_INPUT_ID,
-                                        // Focus-search is reachable by `/` and the
-                                        // planned Ctrl+Shift+F accelerator, so the
-                                        // input needs no ALT badge (§12 exempt).
+                                        // Focus-search is ALT,S (`search.focus`) and
+                                        // Ctrl+Shift+P; the input itself needs no
+                                        // ALT badge (§12 exempt).
                                         "data-keytip-exempt": "search",
                                         r#type: "text",
-                                        value: "{snapshot.search_query}",
+                                        initial_value: "{snapshot.search_query}",
                                         placeholder: "{search_placeholder}",
                                         style: "{search_field_style}",
                                         onmousedown: move |evt| {
@@ -57597,6 +57666,31 @@ fn Titlebar(
                                                 on_execute_search_command.call(search_query.clone());
                                             }
                                         },
+                                    }
+                                    // The exit affordance the search never had
+                                    // (user call 2026-07-23): clears the query
+                                    // AND releases focus — same action as
+                                    // Escape, reachable by mouse.
+                                    if !snapshot.search_query.is_empty() {
+                                        button {
+                                            "data-titlebar-search-clear": "1",
+                                            "data-keytip-exempt": "search",
+                                            title: "Clear search (Esc)",
+                                            style: format!(
+                                                "z-index:3; border:none; background:transparent; cursor:pointer; \
+                                                 padding:0 6px; font-size:13px; line-height:1; color:{};",
+                                                snapshot.palette.muted
+                                            ),
+                                            onmousedown: |evt| {
+                                                evt.prevent_default();
+                                                evt.stop_propagation();
+                                            },
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                on_clear_search.call(());
+                                            },
+                                            "✕"
+                                        }
                                     }
                                     if snapshot.search_active
                                         && matches!(
@@ -126167,6 +126261,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -126810,6 +126905,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -126988,6 +127084,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -127166,6 +127263,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -127347,6 +127445,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -127532,6 +127631,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -127709,6 +127809,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -127886,6 +127987,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -128097,6 +128199,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -128277,6 +128380,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -128489,6 +128593,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
@@ -128878,6 +128983,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_palette: Default::default(),
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
+            search_value_epoch: 0,
             search_active: false,
             command_mode_active: false,
             search_focused: false,
