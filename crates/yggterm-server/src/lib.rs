@@ -2464,6 +2464,18 @@ impl YggtermServer {
         });
         entry.kind = kind;
         entry.backend = self.backend;
+        // AGENT CLI SESSIONS ARE KEEP-ALIVE AT BIRTH — at THIS birth site too.
+        // This is the constructor behind `open_or_focus_session` (a click on a
+        // scanned/stored row, `server connect`), a SECOND birth site beside
+        // `insert_live_session_with_launch`; only the latter applied the
+        // born-green rule, so every agent row adopted through click=resume or
+        // connect was born restart-unprotected (live-caught 2026-07-23: all 13
+        // rows reconnected after the 2.12.5 swap came back blue). Birth-only:
+        // an existing row's flag is the user's (or restore's) and is never
+        // touched here.
+        if was_missing && session_kind_persists_by_default(kind) {
+            set_session_keep_alive_metadata(entry, true);
+        }
         if let Some(session_id) = session_id {
             entry.id = session_id.to_string();
         }
@@ -29938,6 +29950,73 @@ terminal_window_id: None,
                 "{second_class:?} is second-class — keep-alive stays an explicit user choice"
             );
         }
+    }
+
+    /// The born-green rule holds at BOTH birth sites. `open_or_focus_session`
+    /// (click on a scanned/stored row, `server connect`) births through
+    /// `build_session`, not `insert_live_session_with_launch` — and until
+    /// 2026-07-23 only the latter applied the rule, so every agent row adopted
+    /// through click=resume was born restart-unprotected. Birth-only: a row
+    /// whose flag an authoritative restore (or the user) set to OFF must
+    /// survive a re-open untouched.
+    #[test]
+    fn open_or_focus_session_births_agent_rows_keep_alive_but_never_flips_existing() {
+        use super::session_keep_alive;
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            children: Vec::new(),
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let key = crate::remote_cc_session_path("dev", "born-green");
+        server.open_or_focus_session(
+            SessionKind::ClaudeCode,
+            &key,
+            Some("born-green"),
+            Some("/tmp"),
+            None,
+            None,
+        );
+        let session = server.sessions.get(&key).expect("open births the row");
+        assert!(
+            session_keep_alive(session),
+            "an agent row born through open_or_focus_session is keep-alive"
+        );
+
+        // An unkept row stays unkept across a re-open (restore/user authority).
+        let unkept = crate::remote_cc_session_path("dev", "user-unkept");
+        server.restore_live_session(PersistedLiveSession {
+            key: unkept.clone(),
+            id: "user-unkept".to_string(),
+            title: "unkept".to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: false,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/tmp".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        });
+        server.open_or_focus_session(
+            SessionKind::ClaudeCode,
+            &unkept,
+            Some("user-unkept"),
+            Some("/tmp"),
+            None,
+            None,
+        );
+        let session = server.sessions.get(&unkept).expect("row still present");
+        assert!(
+            !session_keep_alive(session),
+            "re-opening an existing row must not overwrite its keep-alive choice"
+        );
     }
 
     #[test]
