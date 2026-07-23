@@ -53,8 +53,8 @@ use crate::terminal_retained_replay_policy::{
     RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
     blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
     daemon_retained_snapshot_replay_should_start, retained_ready_remote_host_rehydrate_mode,
-    retained_rehydrate_allow_screen_fallback, retained_rehydrate_identity_key,
-    retained_remote_host_should_rehydrate,
+    retained_ever_ready_host_should_pin_bootstrap_epoch, retained_rehydrate_allow_screen_fallback,
+    retained_rehydrate_identity_key, retained_remote_host_should_rehydrate,
 };
 use crate::terminal_themes::{
     default_terminal_theme_name, terminal_theme_by_name, terminal_theme_names_for_mode,
@@ -33909,7 +33909,12 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
             task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_group_virtual_path_for_row(&row_for_task);
-                let _ = ensure_home_scoped_workspace_dir(&virtual_path)?;
+                // Deliberately NO directory creation here: the path still ends
+                // in a generated `folder-<nanos>` leaf, and materializing that
+                // litters the filesystem (reported 2026-07-09). The rename —
+                // the moment the folder gets its real name — moves the group
+                // to the real path AND creates/renames the real directory
+                // (`materialize_local_folder_rename`).
                 store.save_group_with_kind(
                     &virtual_path,
                     Some("New Folder"),
@@ -34143,10 +34148,26 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
             None => None,
         }
     };
+    // A remote FOLDER rename moves the row to a real directory path on that
+    // machine; resolve the ssh route up front so the blocking task can
+    // `mkdir -p` it there (a missing remote dir made `cd <cwd>` fail and the
+    // launched session silently landed in $HOME).
+    let remote_folder_dir_ensure: Option<(String, Option<String>, String)> =
+        remote_workspace_rename_target(&row, &trimmed).and_then(|(target_path, _)| {
+            let (machine_key, cwd) = remote_folder_machine_and_cwd_from_path(&target_path)?;
+            let shell = state.read();
+            shell
+                .server
+                .remote_machines()
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+                .map(|machine| (machine.ssh_target.clone(), machine.prefix.clone(), cwd))
+        });
     spawn(async move {
         let row_for_task = row.clone();
         let trimmed_for_task = trimmed.clone();
         let remote_cc_rename_for_task = remote_cc_rename.clone();
+        let remote_folder_dir_ensure_for_task = remote_folder_dir_ensure.clone();
         let outcome = task::spawn_blocking(move || -> Result<(SessionNode, String)> {
             let store = SessionStore::open_or_init()?;
             let mut selected_path = row_for_task.full_path.clone();
@@ -34172,6 +34193,9 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     let kind = row_for_task
                         .group_kind
                         .unwrap_or(WorkspaceGroupKind::Folder);
+                    let local_home = std::env::var_os("HOME")
+                        .map(|home| home.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     if let Some((target_path, target_title)) =
                         remote_workspace_rename_target(&row_for_task, &trimmed_for_task)
                     {
@@ -34182,6 +34206,41 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                             Some(&target_title),
                             kind,
                         )?;
+                        // Best-effort: an offline machine must not fail a
+                        // rename whose group move already succeeded; the dir
+                        // is re-attempted implicitly on the next rename.
+                        if let Some((ssh_target, prefix, cwd)) =
+                            remote_folder_dir_ensure_for_task.as_ref()
+                        {
+                            let _ = yggterm_server::ensure_remote_workspace_dir(
+                                ssh_target,
+                                prefix.as_deref(),
+                                cwd,
+                            );
+                        }
+                    } else if let Some((target_path, target_title)) = (kind
+                        == WorkspaceGroupKind::Folder)
+                        .then(|| {
+                            local_workspace_rename_target(
+                                &row_for_task,
+                                &local_home,
+                                &trimmed_for_task,
+                            )
+                        })
+                        .flatten()
+                    {
+                        // Local folder rename = MOVE to the real directory path
+                        // (mirrors the remote arm), so the row merges with the
+                        // scan-derived cwd node and launches land in the real
+                        // dir. See docs/pending-bugs.md sidebar entry 2026-07-23.
+                        let moved = store.move_group(&row_for_task.full_path, &target_path)?;
+                        selected_path = moved.virtual_path.clone();
+                        store.save_group_with_kind(
+                            &moved.virtual_path,
+                            Some(&target_title),
+                            kind,
+                        )?;
+                        materialize_local_folder_rename(&row_for_task.full_path, &target_path)?;
                     } else {
                         store.save_group_with_kind(
                             &row_for_task.full_path,
@@ -35314,9 +35373,21 @@ fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
     }
 }
 fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
+    // A folder on the LOCAL machine roots at the real $HOME path — the same
+    // model as remote folders (`__remote_folder__/<machine>/<real path>`):
+    // the folder's identity IS a directory path, so the tree builder nests it
+    // under the real cwd nodes and MERGES it with any scan-derived node at
+    // the same path. The old `/workspace` base put local folders outside the
+    // real path tree forever: launches fell back to $HOME and the user got a
+    // duplicate row beside the scan node (docs/pending-bugs.md 2026-07-23).
+    let local_machine_base = || {
+        std::env::var_os("HOME")
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/workspace".to_string())
+    };
     let base = match row.kind {
-        BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
-        BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
+        BrowserRowKind::Group if row.full_path == "local" => local_machine_base(),
+        BrowserRowKind::Group if row.full_path.starts_with("__live_") => local_machine_base(),
         BrowserRowKind::Group => row.full_path.clone(),
         BrowserRowKind::Separator => {
             document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
@@ -35963,6 +36034,79 @@ fn remote_workspace_rename_target(row: &BrowserRow, label: &str) -> Option<(Stri
         format!("/__remote_folder__/{machine}{}", target_cwd),
         target_label,
     ))
+}
+/// Local twin of `remote_workspace_rename_target`: renaming a LOCAL folder
+/// moves the group to the REAL directory path the new label names, instead of
+/// re-titling a synthetic identity. Shares `join_remote_cwd`'s segment rules,
+/// so a slash label ("gh/thunderbird-cli") decomposes into nesting and an
+/// absolute label re-roots exactly like the remote arm. Legacy `/workspace/…`
+/// folders (the pre-2026-07-23 virtual namespace) re-root under `home` on
+/// their next rename, migrating old rows without a bulk rewrite. Targets are
+/// refused outside `home` — a rename must never move a folder row onto system
+/// paths.
+fn local_workspace_rename_target(
+    row: &BrowserRow,
+    home: &str,
+    label: &str,
+) -> Option<(String, String)> {
+    if row.kind != BrowserRowKind::Group || row.group_kind != Some(WorkspaceGroupKind::Folder) {
+        return None;
+    }
+    let path = row.full_path.as_str();
+    let home = home.trim_end_matches('/');
+    if home.is_empty()
+        || path.trim_start_matches('/').starts_with("__")
+        || !path.starts_with('/')
+    {
+        return None;
+    }
+    let parent = if path == "/workspace" || path.starts_with("/workspace/") {
+        home.to_string()
+    } else {
+        workspace_parent_path(path)?
+    };
+    let target = join_remote_cwd(&parent, label)?;
+    if !std::path::Path::new(&target).starts_with(home) || target == path {
+        return None;
+    }
+    let title = workspace_leaf_name(&target)?;
+    Some((target, title))
+}
+/// The filesystem half of a local folder rename: the folder row's identity is
+/// now a real directory path, so the directory must exist for launches to land
+/// in it. A generated `folder-<nanos>` directory (yggterm-authored, from the
+/// pre-fix creation flow) is MOVED to the target so any content it gathered
+/// survives; any other source directory is left untouched — renaming a row
+/// must never rename a real directory the user's sessions live in.
+fn materialize_local_folder_rename(old_path: &str, target_path: &str) -> Result<()> {
+    let Some(target) = home_scoped_workspace_path(target_path) else {
+        return Ok(());
+    };
+    let generated_old_dir = home_scoped_workspace_path(old_path)
+        .filter(|_| workspace_cwd_uses_generated_leaf(old_path))
+        .filter(|dir| dir.is_dir());
+    if let Some(old_dir) = generated_old_dir {
+        if !target.exists() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create workspace parent {}", parent.display())
+                })?;
+            }
+            fs::rename(&old_dir, &target).with_context(|| {
+                format!(
+                    "failed to move workspace dir {} -> {}",
+                    old_dir.display(),
+                    target.display()
+                )
+            })?;
+            return Ok(());
+        }
+        // Target already real: drop the generated dir only if it is empty.
+        let _ = fs::remove_dir(&old_dir);
+    }
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create workspace cwd {}", target.display()))?;
+    Ok(())
 }
 fn home_scoped_workspace_path(path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
@@ -54805,22 +54949,8 @@ fn app() -> Element {
     // behavior-equivalent and removes a whole row-clone pass per render.
     // See [[finding-gui-latency-render-path-campaign]].
     let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
-    let sidebar_bounds_repair_key = format!(
-        "{}:{}:{}:{}",
-        snapshot.rows.len(),
-        snapshot.show_loading_tree,
-        snapshot.active_session_path.as_deref().unwrap_or("<none>"),
-        snapshot.selected_path.as_deref().unwrap_or("<none>")
-    );
     use_effect(move || {
-        if *last_sidebar_bounds_repair_key.read() == Some(sidebar_bounds_repair_key.clone()) {
-            return;
-        }
-        last_sidebar_bounds_repair_key.set(Some(sidebar_bounds_repair_key.clone()));
-        let _ = document::eval(sidebar_scroll_bounds_repair_script());
-    });
-    use_effect(move || {
-        let (scroll_path, show_loading_tree, suppress_autoscroll) = {
+        let (scroll_path, show_loading_tree, suppress_autoscroll, bounds_repair_key) = {
             let shell = state.read();
             let active_path = shell.server.active_session_path().map(ToOwned::to_owned);
             let snapshot = shell.snapshot();
@@ -54836,6 +54966,22 @@ fn app() -> Element {
                         .filter(|path| snapshot.rows.iter().any(|row| row.full_path == *path))
                         .map(ToOwned::to_owned)
                 });
+            // The bounds-repair key MUST be computed inside this effect: an
+            // effect only re-runs when a signal it read during its last run
+            // changes, so a key captured from the render body left the repair
+            // subscribed to nothing but its own dedup signal — it fired once
+            // at startup and never again. Collapsing a long subtree then
+            // stranded scrollTop past the shrunken scrollHeight (WebKitGTK
+            // does not self-clamp on content shrink) and the sidebar stopped
+            // scrolling with Live Sessions clipped until the user re-expanded
+            // something tall. `rows.len()` is what a collapse changes.
+            let bounds_repair_key = format!(
+                "{}:{}:{}:{}",
+                snapshot.rows.len(),
+                snapshot.show_loading_tree,
+                active_path.as_deref().unwrap_or("<none>"),
+                snapshot.selected_path.as_deref().unwrap_or("<none>")
+            );
             let active_visible_path =
                 active_path.filter(|path| snapshot.rows.iter().any(|row| row.full_path == *path));
             let suppress_autoscroll = shell.tree_rename_path.is_some()
@@ -54844,8 +54990,13 @@ fn app() -> Element {
                 selected_path.or(active_visible_path),
                 snapshot.show_loading_tree,
                 suppress_autoscroll,
+                bounds_repair_key,
             )
         };
+        if *last_sidebar_bounds_repair_key.read() != Some(bounds_repair_key.clone()) {
+            last_sidebar_bounds_repair_key.set(Some(bounds_repair_key));
+            let _ = document::eval(sidebar_scroll_bounds_repair_script());
+        }
         if show_loading_tree {
             set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
@@ -63854,6 +64005,10 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let retained_recovery_watch_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let stable_reveal_nudge_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let pinned_bootstrap_activation_epoch =
+        use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0_u64))).clone();
     let resume_overlay_excerpt = terminal_resume_overlay_excerpt()
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
@@ -63961,16 +64116,45 @@ fn TerminalCanvas(
         resume_overlay_failed(),
         resume_overlay_timed_out(),
     );
+    // §7.3 generalization: the kind-/locality-agnostic pin, so cc and local
+    // sessions stop re-bootstrapping (the felt zoom) on every open request.
+    // Paired with the stable-epoch reveal nudge below the bootstrap dispatch.
+    let stable_retained_bootstrap_epoch = state.with(|shell| {
+        retained_ever_ready_host_should_pin_bootstrap_epoch(
+            shell
+                .retained_terminal_session_paths
+                .contains(&session_path),
+            shell.terminal_session_was_ever_ready(&session_path),
+            shell.daemon_owns_session_runtime(&session_path),
+            shell
+                .latest_terminal_open_attempt_for_path(&session_path)
+                .is_some_and(|attempt| attempt.latched_failure_reason.is_some()),
+            shell.terminal_session_host_id(&session_path).is_some(),
+            resume_overlay_failed(),
+            resume_overlay_timed_out(),
+        )
+    });
     let bootstrap_activation_epoch = if retained_ready_remote_host || stable_remote_bootstrap_epoch
     {
         0
+    } else if stable_retained_bootstrap_epoch {
+        // FREEZE, don't zero: the generalized pin engages only after the
+        // session reaches ready, by which point the epoch is already the
+        // birth request id — flipping it to 0 would change the bootstrap
+        // identity once at engagement and re-bootstrap every session right
+        // after readiness (the birth-remount class round 8 killed). Reusing
+        // the last unpinned value keeps engagement identity-neutral; later
+        // open requests then leave the identity untouched (the zoom fix).
+        pinned_bootstrap_activation_epoch.get()
     } else {
-        terminal_bootstrap_activation_epoch(
+        let epoch = terminal_bootstrap_activation_epoch(
             snapshot.active_view_mode,
             snapshot.active_session_path.as_deref(),
             &session_path,
             latest_open_request_id,
-        )
+        );
+        pinned_bootstrap_activation_epoch.set(epoch);
+        epoch
     };
     let bootstrap_identity =
         format!("{mount_identity}:{current_bootstrap_generation}:{bootstrap_activation_epoch}");
@@ -65549,6 +65733,47 @@ fn TerminalCanvas(
                     "context": lease_context,
                 }),
             );
+        }
+    }
+    // §7.3 stable-epoch reveal nudge: when the generalized pin suppressed a
+    // re-bootstrap for a reveal, the RETAINED closure must still repaint — a
+    // parked canvas can lose its backing store, so a pinned reveal of an idle
+    // session would otherwise stay blank (worse than the zoom this pin fixes).
+    // Fires ONCE per visibility transition, keyed on (host, selected): an
+    // open request that bumps `latest_open_request_id` while the host is
+    // already on screen must NOT repaint (output-boundary requests under
+    // streaming would turn the nudge into per-request flicker). The legacy
+    // remote-codex pins keep their own reveal reconcile machinery untouched.
+    let stable_reveal_nudge_key = format!("stable-reveal:{host_id}:{active_host_selected}");
+    if *stable_reveal_nudge_identity.borrow() != stable_reveal_nudge_key {
+        let previous_nudge_state = stable_reveal_nudge_identity.borrow().clone();
+        *stable_reveal_nudge_identity.borrow_mut() = stable_reveal_nudge_key;
+        let generalized_pin_only = stable_retained_bootstrap_epoch
+            && !retained_ready_remote_host
+            && !stable_remote_bootstrap_epoch;
+        if active_host_selected
+            && generalized_pin_only
+            && !bootstrap_identity_changed
+            && !previous_nudge_state.is_empty()
+        {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "stable_epoch_reveal_nudge",
+                json!({
+                    "session_path": session_path.clone(),
+                    "host_id": host_id.clone(),
+                    "mount_identity": mount_identity.clone(),
+                    "latest_open_request_id": latest_open_request_id,
+                }),
+            );
+            let host_id_for_nudge = host_id.clone();
+            spawn(async move {
+                let _ = document::eval(&terminal_stable_epoch_reveal_nudge_script(
+                    &host_id_for_nudge,
+                ));
+            });
         }
     }
     let terminal_context_row = BrowserRow {
@@ -87467,6 +87692,37 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         moz_font_smoothing = moz_font_smoothing,
     )
 }
+/// §7.3 stable-epoch reveal nudge: repaint a retained closure whose reveal
+/// skipped the bootstrap (pinned activation epoch). `emitResize` re-fits the
+/// grid after any parked-geometry drift; `redrawTerminal` rebuilds the canvas
+/// content in case the parked backing store was dropped. Both are the retained
+/// closure's OWN functions from the host registry — the same dispatch a live
+/// closure uses — so a superseded (stood-down) closure correctly refuses.
+fn terminal_stable_epoch_reveal_nudge_script(host_id: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+          const hostId = {host_id:?};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entry = registry[hostId];
+          if (!entry) {{
+            return;
+          }}
+          try {{
+            if (typeof entry.emitResize === "function") {{
+              entry.emitResize();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.redrawTerminal === "function") {{
+              entry.redrawTerminal('stable_epoch_reveal');
+            }}
+          }} catch (_error) {{}}
+        }})();
+        "#,
+        host_id = host_id,
+    )
+}
 fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) -> String {
     format!(
         r#"
@@ -104324,6 +104580,28 @@ mod tests {
         assert!(script.contains("entry.term.options.fontFamily"));
         assert!(script.contains("brightBlack"));
     }
+    // §7.3 stable-epoch reveal nudge: the pinned-reveal repaint must go through
+    // the RETAINED closure's own registry functions (a superseded closure's
+    // entry was already replaced last-writer-wins, so the nudge can never wake
+    // a stood-down closure) — resize refit first, then the content redraw.
+    #[test]
+    fn stable_epoch_reveal_nudge_script_drives_the_retained_closure() {
+        let script = terminal_stable_epoch_reveal_nudge_script("yggterm-terminal-test");
+        assert!(script.contains("__yggtermXtermHosts"));
+        assert!(script.contains("\"yggterm-terminal-test\""));
+        assert!(script.contains("entry.emitResize()"));
+        assert!(script.contains("entry.redrawTerminal('stable_epoch_reveal')"));
+        let resize_ix = script
+            .find("entry.emitResize()")
+            .expect("nudge refits the grid");
+        let redraw_ix = script
+            .find("entry.redrawTerminal")
+            .expect("nudge redraws content");
+        assert!(
+            resize_ix < redraw_ix,
+            "refit must precede the redraw so the repaint uses the settled grid"
+        );
+    }
     #[test]
     fn terminal_eval_script_rebuilds_blank_retained_host_when_reenabled() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -110253,6 +110531,109 @@ mod tests {
         let path = new_group_virtual_path_for_row(&folder);
         assert!(path.starts_with("__remote_folder__/practice/home/user/folder-"));
         assert!(!path.starts_with("/home/user/folder-"));
+    }
+    #[test]
+    fn new_group_virtual_path_for_local_machine_roots_at_real_home() {
+        let machine = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "local".to_string(),
+            label: "local".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 0,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        };
+        let home = std::env::var("HOME").expect("test env has HOME");
+        let path = new_group_virtual_path_for_row(&machine);
+        assert!(
+            path.starts_with(&format!("{}/folder-", home.trim_end_matches('/'))),
+            "local machine folder must root at the real $HOME (got {path})"
+        );
+        assert!(!path.starts_with("/workspace/"));
+    }
+    fn folder_row(full_path: &str) -> BrowserRow {
+        BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: full_path.to_string(),
+            label: workspace_leaf_name(full_path).unwrap_or_default(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 2,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+    // The local rename-as-move contract (mirrors remote_workspace_rename_target):
+    // a rename re-points the folder at the REAL directory the label names, with
+    // slash labels decomposing into nesting — this is what lets the row merge
+    // with the scan-derived cwd node and launches land in the right directory.
+    #[test]
+    fn local_folder_rename_moves_to_the_real_path_with_slash_decomposition() {
+        let row = folder_row("/home/user/folder-1783594131281231525");
+        assert_eq!(
+            local_workspace_rename_target(&row, "/home/user", "gh/thunderbird-cli"),
+            Some((
+                "/home/user/gh/thunderbird-cli".to_string(),
+                "thunderbird-cli".to_string()
+            ))
+        );
+        let nested = folder_row("/home/user/gh/folder-99");
+        assert_eq!(
+            local_workspace_rename_target(&nested, "/home/user", "thunderbird-cli"),
+            Some((
+                "/home/user/gh/thunderbird-cli".to_string(),
+                "thunderbird-cli".to_string()
+            ))
+        );
+        // An absolute label re-roots, exactly like the remote arm.
+        assert_eq!(
+            local_workspace_rename_target(&nested, "/home/user", "/home/user/notes"),
+            Some(("/home/user/notes".to_string(), "notes".to_string()))
+        );
+    }
+    // Legacy `/workspace/…` folders (the pre-fix virtual namespace) migrate
+    // under $HOME on their next rename — the user's existing rows heal without
+    // a bulk rewrite.
+    #[test]
+    fn local_folder_rename_migrates_legacy_workspace_rows_under_home() {
+        let legacy = folder_row("/workspace/folder-1234");
+        assert_eq!(
+            local_workspace_rename_target(&legacy, "/home/user", "gh/yggterm"),
+            Some(("/home/user/gh/yggterm".to_string(), "yggterm".to_string()))
+        );
+    }
+    #[test]
+    fn local_folder_rename_refuses_escapes_and_foreign_rows() {
+        let row = folder_row("/home/user/gh/folder-99");
+        // `..` and outside-home targets must never move a folder row.
+        assert_eq!(local_workspace_rename_target(&row, "/home/user", "../../etc"), None);
+        assert_eq!(local_workspace_rename_target(&row, "/home/user", "/etc/cron.d"), None);
+        // A no-op label (target == current path) falls back to title-only.
+        let named = folder_row("/home/user/gh/thunderbird-cli");
+        assert_eq!(
+            local_workspace_rename_target(&named, "/home/user", "thunderbird-cli"),
+            None
+        );
+        // Remote/synthetic namespaces belong to the remote arm.
+        let remote = folder_row("__remote_folder__/dev/home/user/gh");
+        assert_eq!(local_workspace_rename_target(&remote, "/home/user", "x"), None);
+        // Non-folder rows never move.
+        let mut separator = folder_row("/home/user/gh/folder-99");
+        separator.group_kind = Some(WorkspaceGroupKind::Separator);
+        assert_eq!(local_workspace_rename_target(&separator, "/home/user", "x"), None);
     }
     #[test]
     fn new_separator_virtual_path_sorts_after_regular_children() {
