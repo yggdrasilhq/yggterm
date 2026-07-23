@@ -1818,6 +1818,23 @@ pub fn append_cc_session_custom_title(
     Ok(())
 }
 
+/// Encode a cwd the way Claude Code names its project directories
+/// (`/home/pi/git/x.y` -> `-home-pi-git-x-y`): every character outside
+/// `[A-Za-z0-9-]` becomes `-`. Lossy by design — used only to VERIFY a
+/// candidate cwd against the dir CC itself filed the transcript under, never
+/// to decode a dir name back into a path.
+fn cc_project_dir_encoding(cwd: &str) -> String {
+    cwd.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, String)>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read cc session {}", path.display()))?;
@@ -1827,8 +1844,25 @@ pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, St
         .and_then(|stem| stem.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| String::from("unknown-session"));
+    // The session's cwd is NOT "the first user record's cwd": a `/cd` inside
+    // CC re-homes the session — CC moves the transcript into the project dir
+    // encoding the NEW cwd, and `claude --resume` only finds it from there.
+    // Live case (jojo 2026-07-23): a session launched in /home/pi (the old
+    // folder-cwd bug), /cd'd to its real project — 307 records say /home/pi,
+    // the last 4 say the real path, and the FILE lives under the real path's
+    // encoding. First-cwd bucketed it under /home/pi (invisible among 647
+    // rows) and would resume in the wrong dir. So: prefer the LATEST cwd
+    // whose encoding matches the parent project dir (CC's own placement is
+    // the authority), else the LAST cwd seen (append-only transcript = the
+    // session's current home), else None as before.
+    let parent_dir_name = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
     let mut session_id: Option<String> = None;
-    let mut cwd: Option<String> = None;
+    let mut last_cwd: Option<String> = None;
+    let mut last_placement_confirmed_cwd: Option<String> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -1841,18 +1875,23 @@ pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, St
                 .filter(|s| !s.trim().is_empty())
                 .map(ToOwned::to_owned);
         }
-        if cwd.is_none() && value.get("type").and_then(Value::as_str) == Some("user") {
-            cwd = value
+        if value.get("type").and_then(Value::as_str) == Some("user") {
+            if let Some(cwd) = value
                 .get("cwd")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
-                .map(ToOwned::to_owned);
-        }
-        if session_id.is_some() && cwd.is_some() {
-            break;
+            {
+                if parent_dir_name
+                    .as_deref()
+                    .is_some_and(|dir| cc_project_dir_encoding(cwd) == dir)
+                {
+                    last_placement_confirmed_cwd = Some(cwd.to_owned());
+                }
+                last_cwd = Some(cwd.to_owned());
+            }
         }
     }
-    let cwd = match cwd {
+    let cwd = match last_placement_confirmed_cwd.or(last_cwd) {
         Some(c) => normalize_codex_cwd(c),
         None => return Ok(None),
     };
@@ -2425,6 +2464,81 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `/cd` inside CC re-homes the session: CC moves the transcript into
+    /// the project dir encoding the NEW cwd, so the FIRST user-record cwd is
+    /// the wrong answer for both grouping and resume. Live case (jojo
+    /// 2026-07-23): a session launched in /home/pi (the old folder-cwd bug),
+    /// /cd'd to its real project — 307 records said /home/pi, the last 4 said
+    /// the real path, and the file lived under the real path's encoding; the
+    /// session bucketed under /home/pi, invisible among 647 rows, and its
+    /// healed folder read "0 conversations".
+    #[test]
+    fn cc_session_cwd_follows_cd_rehoming_not_the_first_record() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-cc-cd-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let projects = root.join("projects");
+        let project = projects.join("-home-pi-git-gmat-learning-with-claude");
+        fs::create_dir_all(&project).expect("create project dir");
+        let session_id = "217cb4a6-0000-4000-8000-000000000001";
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        let record = |cwd: &str| {
+            serde_json::json!({
+                "type": "user",
+                "sessionId": session_id,
+                "cwd": cwd,
+            })
+            .to_string()
+        };
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n",
+                record("/home/pi"),
+                record("/home/pi"),
+                record("/home/pi/git/gmat-learning-with-claude"),
+            ),
+        )
+        .expect("write transcript");
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, session_id).as_deref(),
+            Some("/home/pi/git/gmat-learning-with-claude"),
+            "the placement-confirmed (and last) cwd wins over the launch cwd"
+        );
+
+        // Even if records AFTER the /cd carry stray cwds (subagents, hooks),
+        // the cwd whose encoding matches CC's own file placement is the
+        // authority.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n",
+                record("/home/pi"),
+                record("/home/pi/git/gmat-learning-with-claude"),
+                record("/tmp/somewhere-else"),
+            ),
+        )
+        .expect("rewrite transcript");
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, session_id).as_deref(),
+            Some("/home/pi/git/gmat-learning-with-claude"),
+            "placement confirmation outranks recency"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cc_project_dir_encoding_matches_cc_naming() {
+        assert_eq!(
+            cc_project_dir_encoding("/home/pi/git/gmat-learning-with-claude"),
+            "-home-pi-git-gmat-learning-with-claude"
+        );
+        assert_eq!(cc_project_dir_encoding("/home/pi/gh/x.y_z"), "-home-pi-gh-x-y-z");
     }
 
     // The settings file has a hand-written writer AND a hand-written parser, so a
