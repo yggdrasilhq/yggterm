@@ -2,6 +2,32 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.4
+
+- **Fixed: a live agent session would blink and stop taking keystrokes for a few
+  seconds, over and over.** A background handoff meant for retiring an old
+  background service was releasing this machine's *own* live sessions, because it
+  treated any other service it could see as a newer replacement to hand them to.
+  On a machine with leftover services from earlier updates that meant your oldest
+  idle Codex/Claude Code session had its terminal torn down and re-resumed roughly
+  once a minute — you saw a burst of flicker and a few seconds where typing did
+  nothing. Only a genuinely newer service now counts as a replacement, and a
+  session that comes straight back is no longer handed over again in a loop.
+- **New Codex and Claude Code sessions now keep themselves alive by default.**
+  They used to be created as "closes with the app" (the blue dot) while every
+  other agent session in your list was green, so a session you had just started
+  was the one most likely to be interrupted. Plain shell terminals are unchanged —
+  they still keep alive only if you ask them to.
+- **The terminal is better at taking your keystrokes back after you leave the
+  window.** The safety net that re-arms the terminal when keyboard focus has
+  drifted away used to switch itself off whenever the browser engine claimed the
+  window was not focused — which on this desktop it wrongly does for a window you
+  are looking straight at. It no longer asks that question.
+- **The app now records why you can or cannot type.** `server app state` reports
+  how long input has been dead and which gate is holding it, and the trace keeps a
+  line for every window focus change and every input-policy decision. Diagnostics
+  only.
+
 ## 2.12.3
 
 - **Better self-diagnosis for two rendering/connection glitches.** Added telemetry

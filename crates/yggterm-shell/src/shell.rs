@@ -932,6 +932,14 @@ const APP_CONTROL_IDLE_POLL_MS: u64 = 1_000;
 const APP_CONTROL_WATCHDOG_IDLE_POLL_MS: u64 = 15_000;
 const APP_CONTROL_DRAIN_STUCK_MS: u64 = 2_500;
 const TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS: u64 = 3_000;
+/// How long the active terminal may sit input-enabled WITHOUT holding keyboard
+/// focus before the webview writes an `input_dead` line to the disk trace. Two
+/// watchdog ticks: one tick is an ordinary focus handoff, two means the passive
+/// repair has already run and failed, which is the user-visible "I cannot type".
+const TERMINAL_INPUT_DEAD_TRACE_MS: u64 = 2 * TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS;
+/// Floor between two `input_dead` trace lines for the same host, so a session
+/// parked in the dead state costs a handful of lines an hour, not one per tick.
+const TERMINAL_INPUT_DEAD_TRACE_INTERVAL_MS: u64 = 30_000;
 const BROWSER_TREE_REFRESH_WAIT_POLL_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_WAIT_POLL_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_WAIT_MIN_MS: u64 = 250;
@@ -9829,6 +9837,33 @@ impl ShellState {
         // background-mode debounce.
         if focused && !was_focused {
             self.next_hot_warm_check_at_ms = 0;
+        }
+        // ALWAYS-ON focus probe. `window_focused` is the root gate on terminal
+        // input: `terminal_runtime_input_policy` refuses `allow_input` unless
+        // (window_focused || terminal_input_override_active), so if the tao
+        // `WindowEvent::Focused(true)` that lands here ever goes missing on the
+        // way back from another window, the terminal renders perfectly and
+        // silently swallows every keystroke. Until this probe existed the app
+        // recorded NOTHING about focus transitions, so "I alt-tabbed back and
+        // could not type" was undecidable after the fact — the whole reason this
+        // is on disk and not behind a debug flag. One append per real transition.
+        if focused != was_focused {
+            let trace_home = perf_home_dir(&self.bootstrap.settings_path);
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "window_focus",
+                "transition",
+                json!({
+                    "focused": focused,
+                    "was_focused": was_focused,
+                    "app_control_backgrounded": self.app_control_backgrounded,
+                    "app_control_force_foreground": self.app_control_force_foreground,
+                    "terminal_input_override_active": self.terminal_input_override_active,
+                    "active_view_mode": format!("{:?}", self.server.active_view_mode()),
+                    "active_session_path": self.server.active_session_path(),
+                }),
+            );
         }
     }
     fn mark_app_control_backgrounded(&mut self) {
@@ -41924,6 +41959,20 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         raw_input_enabled: inputEnabled,
                         effective_input_focus: effectiveInputFocus,
                         raw_effective_input_focus: effectiveInputFocus,
+                        // XTERM-BUG: input-dead-after-window-refocus — the
+                        // duration is the signal. `helper_textarea_focused:false`
+                        // alone never distinguished "the user has not clicked in
+                        // yet" from "keystrokes have been going nowhere for a
+                        // minute"; `input_dead_ms` does, and
+                        // `passive_focus_recovery_state` names the gate.
+                        passive_focus_recovery_state: mountedHost ? String(mountedHost.passiveFocusRecoveryState || '') : '',
+                        input_dead_ms: mountedHost ? Number(mountedHost.inputDeadMs || 0) : 0,
+                        input_dead_since_ms: mountedHost ? Number(mountedHost.inputDeadSinceMs || 0) : 0,
+                        input_dead_active_element: mountedHost ? String(mountedHost.inputDeadActiveElement || '') : '',
+                        passive_focus_recovery_count: mountedHost ? Number(mountedHost.passiveFocusRecoveryCount || 0) : 0,
+                        last_passive_focus_recovery_at_ms: mountedHost ? Number(mountedHost.lastPassiveFocusRecoveryAtMs || 0) : 0,
+                        document_has_focus_at_last_watchdog: mountedHost ? Boolean(mountedHost.documentHasFocusAtLastWatchdog) : null,
+                        window_focused_at_last_watchdog: mountedHost ? Boolean(mountedHost.windowFocusedAtLastWatchdog) : null,
                         mounted_entry_host_connected: Boolean(mountedHost && mountedHost.host && mountedHost.host.isConnected),
                         canvas_count: canvasCount,
                         visible_canvas_layer_count: canvasCount,
@@ -54414,9 +54463,12 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
-        let policy_signature = {
+        let (policy_signature, trace_home) = {
             let shell = state.read();
-            active_terminal_input_policy_signature(&shell)
+            (
+                active_terminal_input_policy_signature(&shell),
+                perf_home_dir(&shell.bootstrap.settings_path),
+            )
         };
         let previous_policy = last_active_terminal_input_policy.read().clone();
         if previous_policy.as_ref() == Some(&policy_signature) {
@@ -54429,7 +54481,7 @@ fn app() -> Element {
             .as_ref()
             .is_some_and(|prev| !prev.window_focused && policy_signature.window_focused);
         last_active_terminal_input_policy.set(Some(policy_signature.clone()));
-        apply_active_terminal_input_policy(&policy_signature, foreground_regained);
+        apply_active_terminal_input_policy(&policy_signature, foreground_regained, &trace_home);
     });
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
@@ -76021,9 +76073,67 @@ fn active_terminal_input_policy_signature(
         web_surface_active,
     }
 }
+/// Last `(allow_input, focus_input, gates…)` tuple written to the trace, so the
+/// probe below appends only on a real change. Zero means "nothing traced yet".
+static LAST_TRACED_INPUT_POLICY: AtomicU64 = AtomicU64::new(0);
+/// ALWAYS-ON probe for "why can/can't the user type right now". Everything that
+/// gates terminal input converges on this one decision, and until this existed
+/// the decision left no trace at all: an `allow_input=false` computed from a
+/// stale `window_focused` looked identical, in every log the app kept, to a
+/// terminal that simply had not been clicked. Deduped on the decision itself so
+/// idle resyncs (titlebar dismiss, re-render) cost nothing.
+fn trace_active_terminal_input_policy(
+    trace_home: &std::path::Path,
+    signature: &ActiveTerminalInputPolicySignature,
+    session_path: &str,
+    allow_input: bool,
+    focus_input: bool,
+    foreground_regained: bool,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        allow_input,
+        focus_input,
+        signature.window_focused,
+        signature.terminal_input_override_active,
+        signature.app_control_backgrounded,
+        signature.remote_resume_input_ready,
+        signature.web_surface_active,
+        signature.search_focused,
+        session_path,
+    )
+        .hash(&mut hasher);
+    // Never collide with the "nothing traced yet" sentinel.
+    let fingerprint = hasher.finish() | 1;
+    if LAST_TRACED_INPUT_POLICY.swap(fingerprint, Ordering::Relaxed) == fingerprint {
+        return;
+    }
+    append_trace_event(
+        trace_home,
+        "ui",
+        "input_policy",
+        "applied",
+        json!({
+            "session_path": session_path,
+            "allow_input": allow_input,
+            "focus_input": focus_input,
+            "foreground_regained": foreground_regained,
+            "window_focused": signature.window_focused,
+            "terminal_input_override_active": signature.terminal_input_override_active,
+            "app_control_backgrounded": signature.app_control_backgrounded,
+            "remote_resume_input_ready": signature.remote_resume_input_ready,
+            "web_surface_active": signature.web_surface_active,
+            "search_focused": signature.search_focused,
+            "right_panel_mode": format!("{:?}", signature.right_panel_mode),
+            "tree_rename_active": signature.tree_rename_active,
+        }),
+    );
+}
 fn apply_active_terminal_input_policy(
     signature: &ActiveTerminalInputPolicySignature,
     foreground_regained: bool,
+    trace_home: &std::path::Path,
 ) {
     if signature.active_view_mode != WorkspaceViewMode::Terminal {
         let _ = document::eval(&terminal_clear_input_policy_script());
@@ -76059,6 +76169,14 @@ fn apply_active_terminal_input_policy(
         allow_input = false;
         focus_input = false;
     }
+    trace_active_terminal_input_policy(
+        trace_home,
+        signature,
+        session_path,
+        allow_input,
+        focus_input,
+        foreground_regained,
+    );
     let _ = document::eval(&terminal_set_input_policy_script_for_active_session(
         session_path,
         allow_input,
@@ -76071,13 +76189,18 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
     // (schedule_terminal_focus_after_activation) that can re-enter while a
     // write borrow is live — a raw read here panicked the GUI with
     // AlreadyBorrowed (panic.log 2026-06-22 / 2026-07-07).
-    let Some(signature) = safe_shell_read(state, "sync_active_terminal_input_policy", |shell| {
-        active_terminal_input_policy_signature(shell)
-    }) else {
+    let Some((signature, trace_home)) =
+        safe_shell_read(state, "sync_active_terminal_input_policy", |shell| {
+            (
+                active_terminal_input_policy_signature(shell),
+                perf_home_dir(&shell.bootstrap.settings_path),
+            )
+        })
+    else {
         return;
     };
     // Manual resync (titlebar dismiss, etc.) is not a foreground transition.
-    apply_active_terminal_input_policy(&signature, false);
+    apply_active_terminal_input_policy(&signature, false, &trace_home);
 }
 fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
@@ -76661,6 +76784,8 @@ fn terminal_eval_script_with_canvas_renderer(
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
         .expect("serialize terminal moz font smoothing");
     let terminal_passive_focus_watchdog_ms = TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS;
+    let terminal_input_dead_trace_ms = TERMINAL_INPUT_DEAD_TRACE_MS;
+    let terminal_input_dead_trace_interval_ms = TERMINAL_INPUT_DEAD_TRACE_INTERVAL_MS;
     let constructed_debug = if cfg!(debug_assertions) {
         "sendTerminalEvent({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -82949,37 +83074,137 @@ fn terminal_eval_script_with_canvas_renderer(
                 return false;
             }}
         }};
-        const terminalNeedsPassiveFocusRecovery = () => {{
+        // XTERM-BUG: input-dead-after-window-refocus
+        // See docs/xterm-bugs.md#input-dead-after-window-refocus.
+        //
+        // This classifier is the single decision "may the passive watchdog put
+        // focus back on the helper textarea", and it now NAMES its verdict
+        // instead of returning a bare bool. When the user says "I came back from
+        // another window and cannot type", the state snapshot has to be able to
+        // answer *which gate refused* — before this, every one of the five exits
+        // below was the same indistinguishable `false`.
+        //
+        // ⛔ REMOVED GATE — `document.hasFocus()`. It used to bail out here, and
+        // it was both WRONG and REDUNDANT:
+        //   * wrong: on KDE/Wayland `document.hasFocus()` is a measured false
+        //     negative for a visibly foreground window
+        //     ([[finding-wayland-focus-gate-squished-viewport]]; the same
+        //     substitution was already made for the active write-frame budget and
+        //     for the grid fit). Live on guihost 2026-07-23 the poller caught
+        //     `document.hasFocus()===false` while rust had ALREADY re-opened the
+        //     input gate on refocus — precisely the window in which focus drift is
+        //     most likely, and precisely when this gate switched the only passive
+        //     repair off.
+        //   * redundant: rust owns `inputEnabled` and only opens it when
+        //     `(window_focused || terminal_input_override_active) &&
+        //     !app_control_backgrounded`, so the "is the window focused" condition
+        //     is already enforced by `!inputEnabled` one line above. A gate that
+        //     can only ever be wrong is pure loss.
+        // Focusing an element in an unfocused document does not raise or activate
+        // the window, so nothing here can steal focus from another app.
+        const passiveFocusRecoveryState = () => {{
             if (!inputEnabled) {{
-                return false;
+                // Rust refused input while it believes the window IS focused: the
+                // webview cannot repair this one, only the rust policy can, and
+                // naming it separately is what makes that distinction readable.
+                const hostIsActiveSession = (() => {{
+                    try {{
+                        return host.getAttribute('data-active-session-host') === 'true';
+                    }} catch (_error) {{
+                        return false;
+                    }}
+                }})();
+                return hostIsActiveSession && terminalWindowFocused()
+                    ? 'rust_gate_closed_while_window_focused'
+                    : 'input_disabled';
             }}
-            try {{
-                if (typeof document.hasFocus === 'function' && !document.hasFocus()) {{
-                    return false;
-                }}
-            }} catch (_error) {{}}
             if (!hostOwnsActiveTerminalInput()) {{
-                return false;
-            }}
-            if (activeElementBlocksTerminalAutofocus()) {{
-                return false;
+                return 'host_not_input_owner';
             }}
             const active = document.activeElement;
             const helperTextarea = host.querySelector('.xterm-helper-textarea');
             if (helperTextarea && active === helperTextarea) {{
-                return false;
+                return 'focused';
             }}
-            return (
+            if (activeElementBlocksTerminalAutofocus()) {{
+                return 'ui_focus_claim';
+            }}
+            const bodyOwnsFocus = (
                 !active
                 || active === document.body
                 || active === document.documentElement
                 || active === host
             );
+            return bodyOwnsFocus ? 'recoverable' : 'foreign_active_element';
+        }};
+        const terminalNeedsPassiveFocusRecovery = () =>
+            passiveFocusRecoveryState() === 'recoverable';
+        let passiveFocusRecoveryCount = 0;
+        let lastPassiveFocusRecoveryAtMs = 0;
+        let inputDeadSinceMs = 0;
+        let lastInputDeadTraceAtMs = 0;
+        // "Input dead" = rust has opened the input gate for this session but the
+        // keystroke sink (the xterm helper textarea) does NOT hold DOM focus, so
+        // every key the user presses is dropped while the viewport keeps painting
+        // normally. That is the exact shape of the 2026-07-23 report, and the app
+        // recorded nothing about it: `helper_textarea_focused:false` was already in
+        // the snapshot but carried no duration, so it was indistinguishable from a
+        // terminal the user had simply not clicked yet. The DURATION is the signal.
+        const recordPassiveFocusRecoveryState = (state) => {{
+            try {{
+                const now = Date.now();
+                const dead = state === 'recoverable'
+                    || state === 'foreign_active_element'
+                    || state === 'rust_gate_closed_while_window_focused';
+                if (dead) {{
+                    if (inputDeadSinceMs === 0) {{
+                        inputDeadSinceMs = now;
+                    }}
+                }} else {{
+                    inputDeadSinceMs = 0;
+                }}
+                const deadMs = inputDeadSinceMs ? Math.max(0, now - inputDeadSinceMs) : 0;
+                const active = document.activeElement;
+                const activeDescription = active
+                    ? `${{String(active.tagName || '')}}.${{String(active.className || '').split(/\s+/)[0] || ''}}#${{String(active.id || '')}}`
+                    : 'null';
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (entry) {{
+                    entry.passiveFocusRecoveryState = state;
+                    entry.passiveFocusRecoveryCount = passiveFocusRecoveryCount;
+                    entry.lastPassiveFocusRecoveryAtMs = lastPassiveFocusRecoveryAtMs;
+                    entry.inputDeadSinceMs = inputDeadSinceMs;
+                    entry.inputDeadMs = deadMs;
+                    entry.inputDeadActiveElement = deadMs > 0 ? activeDescription : '';
+                    entry.documentHasFocusAtLastWatchdog = terminalDocumentHasFocus();
+                    entry.windowFocusedAtLastWatchdog = terminalWindowFocused();
+                }}
+                if (
+                    deadMs >= {terminal_input_dead_trace_ms}
+                    && now - lastInputDeadTraceAtMs >= {terminal_input_dead_trace_interval_ms}
+                ) {{
+                    lastInputDeadTraceAtMs = now;
+                    sendTerminalEvent({{
+                        kind: "debug",
+                        message: `input_dead host=${{hostId}} state=${{state}} dead_ms=${{deadMs}}`
+                            + ` active=${{activeDescription}} doc_focus=${{terminalDocumentHasFocus()}}`
+                            + ` window_focused=${{terminalWindowFocused()}}`
+                            + ` ui_claim=${{Date.now() < Number(window.__yggtermUiFocusClaimUntilMs || 0)}}`
+                            + ` sidebar_owner=${{Boolean(window.__yggtermSidebarKeyboardOwner)}}`
+                    }});
+                }}
+            }} catch (_error) {{}}
         }};
         const inputDriftWatchdog = window.setInterval(() => {{
-            if (!terminalNeedsPassiveFocusRecovery()) {{
+            const recoveryState = passiveFocusRecoveryState();
+            recordPassiveFocusRecoveryState(recoveryState);
+            if (recoveryState !== 'recoverable') {{
                 return;
             }}
+            passiveFocusRecoveryCount += 1;
+            lastPassiveFocusRecoveryAtMs = Date.now();
             focusTerminal();
         }}, {terminal_passive_focus_watchdog_ms});
         // Screen-restore (vacuum fix): periodically persist the rendered transcript
@@ -103587,10 +103812,36 @@ mod tests {
             script.contains("scheduleInputDriftRecovery();"),
             "helper textarea blur and non-focused reenables should schedule drift recovery"
         );
+        // REVERSED LOCK (2026-07-23). This used to assert the OPPOSITE: that
+        // passive focus recovery bailed out on `!document.hasFocus()`. That gate
+        // was removed — on KDE/Wayland `document.hasFocus()` false-negatives on a
+        // visibly foreground window, so it could switch off the only passive
+        // repair for "focus drifted to <body> while the terminal is live", which
+        // is exactly the state a return from another window lands in. The
+        // window-focus condition it was standing in for is already enforced by
+        // `!inputEnabled` (rust only opens that gate for a focused window), so the
+        // check was redundant in the good case and wrong in the bad one. Lock the
+        // absence so it cannot creep back.
         assert!(
-            script.contains("typeof document.hasFocus === 'function' && !document.hasFocus()")
+            !script.contains("typeof document.hasFocus === 'function' && !document.hasFocus()"),
+            "passive focus recovery must NOT gate on document.hasFocus() — it is a Wayland \
+             false negative for a foreground window and redundant with inputEnabled"
+        );
+        assert!(
+            script.contains("const passiveFocusRecoveryState = () => {")
+                && script.contains("return bodyOwnsFocus ? 'recoverable' : 'foreign_active_element';")
                 && script.contains("}, 3000);"),
-            "passive focus recovery should back off in idle windows and avoid reclaiming focus while the document is unfocused"
+            "passive focus recovery should classify (and report) its verdict on a 3s watchdog"
+        );
+        assert!(
+            script.contains("? 'rust_gate_closed_while_window_focused'"),
+            "the classifier must separate 'rust refused input while the window is focused' from \
+             an ordinary disabled host — only the rust policy can repair that one"
+        );
+        assert!(
+            script.contains("entry.inputDeadMs = deadMs;"),
+            "the webview must record how long the live terminal has been unable to receive \
+             keystrokes; a bare helper_textarea_focused:false carries no duration"
         );
         assert!(
             script.contains("const hostPointerRelease ="),
