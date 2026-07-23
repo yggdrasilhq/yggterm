@@ -1787,7 +1787,12 @@ impl AppPaneWidget {
             AppPaneWidget::NumberInput { id, .. } => format!("number-{id}-{}", epoch(id)),
             AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
             AppPaneWidget::Button { id, .. } => format!("button-{id}"),
-            AppPaneWidget::ListRow { id, .. } => format!("row-{id}"),
+            // A renaming row holds an uncontrolled field, so it carries the
+            // epoch too — that is how a generated name reaches the DOM.
+            AppPaneWidget::ListRow { id, rename, .. } => match rename {
+                Some(_) => format!("row-{id}-{}", epoch(&app_pane_row_rename_value_id(id))),
+                None => format!("row-{id}"),
+            },
             AppPaneWidget::Toolbar { id, .. } => format!("toolbar-{id}"),
             AppPaneWidget::Markdown { id, .. } => format!("markdown-{id}"),
         }
@@ -1798,13 +1803,20 @@ impl AppPaneWidget {
     /// The APP owns these: a schema declares what every field holds, and the
     /// GUI's copy is only the user's edits since that schema arrived. Widgets
     /// with nothing to echo (a button, a section) answer `None`.
-    fn declared_value(&self) -> Option<(&str, String)> {
+    fn declared_value(&self) -> Option<(String, String)> {
         match self {
-            AppPaneWidget::Tabs { id, active, .. } => Some((id, active.clone())),
-            AppPaneWidget::SearchBox { id, value, .. } => Some((id, value.clone())),
-            AppPaneWidget::TextInput { id, value, .. } => Some((id, value.clone())),
-            AppPaneWidget::NumberInput { id, value, .. } => Some((id, value.to_string())),
-            AppPaneWidget::Toggle { id, value, .. } => Some((id, value.to_string())),
+            AppPaneWidget::Tabs { id, active, .. } => Some((id.clone(), active.clone())),
+            AppPaneWidget::SearchBox { id, value, .. } => Some((id.clone(), value.clone())),
+            AppPaneWidget::TextInput { id, value, .. } => Some((id.clone(), value.clone())),
+            AppPaneWidget::NumberInput { id, value, .. } => Some((id.clone(), value.to_string())),
+            AppPaneWidget::Toggle { id, value, .. } => Some((id.clone(), value.to_string())),
+            // A renaming row's field is a value like any other, under a
+            // namespaced id so it can never collide with an app's own widget.
+            AppPaneWidget::ListRow {
+                id,
+                rename: Some(rename),
+                ..
+            } => Some((app_pane_row_rename_value_id(id), rename.value.clone())),
             AppPaneWidget::Section { .. }
             | AppPaneWidget::Label { .. }
             | AppPaneWidget::Button { .. }
@@ -1813,6 +1825,12 @@ impl AppPaneWidget {
             | AppPaneWidget::Markdown { .. } => None,
         }
     }
+}
+
+/// The widget id a renaming row's field holds its draft under. One owner, so
+/// the renderer, the value map and the epoch map cannot spell it differently.
+fn app_pane_row_rename_value_id(row_id: &str) -> String {
+    format!("rename:{row_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -1943,6 +1961,13 @@ enum AppPaneWidget {
         /// Rename / Close); yggterm owns only how it is drawn and dismissed.
         #[serde(default)]
         menu: Vec<AppPaneRowAction>,
+        /// Present ⇒ THIS row is being renamed, and its body is replaced by an
+        /// in-place text field — the same shape as the cwd tree's "Rename
+        /// session", which is what the user asked contributed rows to match
+        /// (a rename field floating above the list is not the product's
+        /// vocabulary). See [`AppPaneRowRename`].
+        #[serde(default)]
+        rename: Option<AppPaneRowRename>,
     },
     /// A compact horizontal row of icon buttons — the quick-actions strip
     /// (MS-Office quick access shape) at the top of an app's sidebar.
@@ -1989,6 +2014,41 @@ struct AppPaneRowAction {
     label: String,
     #[serde(default)]
     title: String,
+}
+
+/// An in-place rename on a contributed `list-row`, modelled on the cwd tree's
+/// own rename (`tree_rename_*`): the row body becomes a prefilled text field,
+/// Enter commits, Escape cancels, and a ✕ gives the cancel an affordance the
+/// keyboard-only version never had. `ai_action`, when set, adds the same
+/// sparkle button the tree's session rename uses — the app owns what a
+/// generated name means, so the button just POSTs the action and re-reads the
+/// schema the app returns.
+///
+/// The field's value is the app's; the GUI holds the draft under the widget id
+/// `rename:<row id>` so the value-epoch remount rule works unchanged.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneRowRename {
+    /// Prefilled draft — the row's current name.
+    #[serde(default)]
+    value: String,
+    /// Fired on Enter (and on blur) with the edited text as its value.
+    action: String,
+    /// Fired by Escape and by the ✕ button. Empty ⇒ no cancel affordance, and
+    /// Escape just drops the draft locally.
+    #[serde(default)]
+    cancel_action: String,
+    /// The text an AI-generated name should be derived from — the note's body
+    /// for yedit. Non-empty ⇒ the row shows the same ✨ button the tree's
+    /// session rename has, and clicking it fills the field.
+    ///
+    /// The GUI generates, not the app: the LiteLLM endpoint, key and model are
+    /// yggterm settings, and a second app carrying its own copy of them is the
+    /// duplicate source of truth this codebase forbids. The app says only WHAT
+    /// to name.
+    #[serde(default)]
+    ai_source: String,
+    #[serde(default)]
+    placeholder: String,
 }
 
 /// An open right-click menu over a contributed rail row. yggterm owns the
@@ -3255,15 +3315,27 @@ fn web_surface_tab_place_rect(
 /// glass the frame + root paints clear and the holed layer is the app
 /// background; legacy/demoted, the stamp is "0" and the layer sits invisibly
 /// beneath the frame's identical paint.
-const WEB_UNDER_GLASS_CSS: &str = r#"
-/* A DOCUMENT surface owns the viewport: the xterm host sits directly beneath it
-   at nearly identical geometry, still visible and still taking pointer input.
-   A click meant for the editor therefore also reaches xterm underneath, and
-   xterm focuses its own helper textarea a frame later, yanking the caret back
-   out of the editor. That is the "focus is stolen, spam-click to type" bug, and
-   it is NOT the focus-reclaim allowlist (which correctly stands down): it is a
-   plain hit-testing overlap. The host is already marked; make the mark bite. */
+/// A DOCUMENT surface owns the viewport: the xterm host sits directly beneath it
+/// at nearly identical geometry, still visible and still taking pointer input, so
+/// a click meant for the editor also reaches xterm underneath. Standing the host
+/// down closes that hit-testing overlap.
+///
+/// ⚠ It is NOT the "focus is stolen, spam-click to type" bug, which this rule
+/// originally claimed to be. That was measured after this shipped — the host read
+/// `pointer-events: none` and the steal still happened — and the real cause turned
+/// out to be a scripted focus call from the shell root's click handler
+/// ([`root_click_terminal_focus_script`]). Keep this: an unclickable covered host
+/// is right on its own merits.
+///
+/// It lives apart from [`WEB_UNDER_GLASS_CSS`] because that constant holds one
+/// invariant — every rule keyed on the `:root[data-under-glass="1"]` stamp, so a
+/// runtime probe demotion restores all of it with no re-render — and this rule is
+/// not keyed on it and must apply whether or not the shell is under glass.
+const DOCUMENT_SURFACE_STANDDOWN_CSS: &str = r#"
 [data-document-surface-owns-viewport="true"] { pointer-events: none; }
+"#;
+
+const WEB_UNDER_GLASS_CSS: &str = r#"
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] { background: transparent !important; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .xterm { visibility: hidden; }
 :root[data-under-glass="1"] [data-web-surface-owns-viewport="true"] .yggterm-reveal-ghost { visibility: hidden; }
@@ -10684,17 +10756,17 @@ impl ShellState {
             let Some((id, declared)) = widget.declared_value() else {
                 continue;
             };
-            let epoch = previous_epochs.get(id).copied().unwrap_or(0);
+            let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
             // Bump ONLY when the app pushes a value the field is not already
             // showing. An app that merely echoes back what the user typed (the
             // search box does exactly this) must not rebuild the node, or the
             // caret jumps out from under them mid-search.
-            let unchanged = self.app_pane_values.get(id).is_some_and(|shown| *shown == declared);
+            let unchanged = self.app_pane_values.get(&id).is_some_and(|shown| *shown == declared);
             value_epochs.insert(
-                id.to_string(),
+                id.clone(),
                 if unchanged { epoch } else { epoch.wrapping_add(1) },
             );
-            values.insert(id.to_string(), declared);
+            values.insert(id, declared);
         }
         self.app_pane_values = values;
         self.app_pane_error = None;
@@ -10722,6 +10794,46 @@ impl ShellState {
     }
     fn set_app_pane_value(&mut self, widget_id: &str, value: String) {
         self.app_pane_values.insert(widget_id.to_string(), value);
+    }
+    /// Put a generated name into a renaming row's field.
+    ///
+    /// The field is uncontrolled (`initial_value`), so writing the draft alone
+    /// would never reach the DOM — the row's key carries the value epoch, and
+    /// bumping it is what remounts the field showing the new text. Same rule the
+    /// app-pushed values use; this is just the GUI pushing one.
+    fn set_app_pane_row_rename_value(&mut self, pane_id: &str, row_id: &str, value: String) {
+        let Some(state) = self
+            .app_pane_schema
+            .as_mut()
+            .filter(|state| state.pane_id == pane_id)
+        else {
+            return;
+        };
+        let mut found = false;
+        for widget in state.schema.widgets.iter_mut() {
+            if let AppPaneWidget::ListRow {
+                id,
+                rename: Some(rename),
+                ..
+            } = widget
+                && id == row_id
+            {
+                rename.value = value.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // The rename was cancelled (or the row went away) while the name
+            // was being generated. Dropping it is right: the user moved on.
+            return;
+        }
+        let value_id = app_pane_row_rename_value_id(row_id);
+        let epoch = state.value_epochs.get(&value_id).copied().unwrap_or(0);
+        state
+            .value_epochs
+            .insert(value_id.clone(), epoch.wrapping_add(1));
+        self.app_pane_values.insert(value_id, value);
     }
     /// Open the right-click menu for a contributed rail row. Empty items = no
     /// menu (a right-click on a menu-less row is a no-op, leaving the platform
@@ -10803,7 +10915,7 @@ impl ShellState {
             let Some((id, declared)) = widget.declared_value() else {
                 continue;
             };
-            let epoch = previous_epochs.get(id).copied().unwrap_or(0);
+            let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
             // The field is undisturbed when the app declares the value it is
             // already showing, OR when it merely echoes a draft the GUI sent up
             // — the search box echoes on Enter, and a multiline editor's draft
@@ -10815,28 +10927,28 @@ impl ShellState {
             // new content (a note switch, a reload) the field must adopt.
             let matches_live_draft = channel
                 .values
-                .get(id)
+                .get(&id)
                 .is_some_and(|shown| *shown == declared);
             let is_echo_of_sent = channel
                 .last_sent
-                .get(id)
+                .get(&id)
                 .is_some_and(|sent| *sent == declared);
             let undisturbed = matches_live_draft || is_echo_of_sent;
             value_epochs.insert(
-                id.to_string(),
+                id.clone(),
                 if undisturbed { epoch } else { epoch.wrapping_add(1) },
             );
             // Keep the user's live draft when the app is only echoing; adopt the
             // declared value when it is genuinely new content.
             let kept = if undisturbed {
-                channel.values.get(id).cloned().unwrap_or_else(|| declared.clone())
+                channel.values.get(&id).cloned().unwrap_or_else(|| declared.clone())
             } else {
                 declared.clone()
             };
-            values.insert(id.to_string(), kept);
+            values.insert(id.clone(), kept);
             // The app now knows this declared value; it becomes the settled
             // baseline for the next echo comparison.
-            last_sent.insert(id.to_string(), declared);
+            last_sent.insert(id, declared);
         }
         channel.values = values;
         channel.last_sent = last_sent;
@@ -10915,7 +11027,7 @@ impl ShellState {
             let Some((id, declared)) = widget.declared_value() else {
                 continue;
             };
-            if channel.values.get(id).is_some_and(|shown| *shown != declared) {
+            if channel.values.get(&id).is_some_and(|shown| *shown != declared) {
                 dirty = true;
             }
         }
@@ -18309,6 +18421,57 @@ fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: boo
 fn spawn_deferred_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     spawn(async move {
         queue_title_generation(state, row, force, force);
+    });
+}
+/// Fill a contributed row's rename field with an AI-generated name.
+///
+/// The app declared the source text (`rename.ai_source`); yggterm owns the
+/// model call, because the endpoint/key/model are yggterm settings and a second
+/// copy of them inside every app is the duplicate source of truth the working
+/// rules forbid.
+fn queue_app_pane_row_rename_ai_name(
+    mut state: Signal<ShellState>,
+    pane_id: String,
+    row_id: String,
+    source: String,
+) {
+    let settings = safe_shell_read(state, "app_pane_rename_ai_settings", |shell| {
+        shell.settings.clone()
+    });
+    let Some(settings) = settings else {
+        return;
+    };
+    spawn(async move {
+        let generated = tokio::task::spawn_blocking(move || {
+            yggterm_core::request_generated_short_name(&settings, &source)
+        })
+        .await;
+        match generated {
+            Ok(Ok(name)) => {
+                state.with_mut(|shell| {
+                    shell.set_app_pane_row_rename_value(&pane_id, &row_id, name);
+                    shell.last_action = "generated a name".to_string();
+                });
+            }
+            Ok(Err(error)) => {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Name Generation Failed",
+                        error.to_string(),
+                    );
+                });
+            }
+            Err(error) => {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Name Generation Failed",
+                        format!("name generation task failed: {error}"),
+                    );
+                });
+            }
+        }
     });
 }
 fn queue_rename_field_ai_title_generation(mut state: Signal<ShellState>, row: BrowserRow) {
@@ -55857,16 +56020,25 @@ fn app() -> Element {
                         .server
                         .active_session()
                         .map(|session| session.session_path.clone())?;
-                    // A live web surface (profile picker or ychrome page) overlays
-                    // the viewport and OWNS the keyboard. This root-level onclick
-                    // fires for EVERY click in the window — including clicks on the
-                    // picker's own inputs, which bubble up here — so reclaiming
-                    // terminal focus would yank focus straight out of the input the
-                    // user just clicked (the "click the new-profile field and it
-                    // loses focus immediately" bug). Same rule the input policy uses
-                    // (apply_active_terminal_input_policy): overlay present => the
-                    // terminal does not get focus.
-                    if shell.has_live_web_surface(&path, current_millis()) {
+                    // A surface covering the viewport OWNS the keyboard. This
+                    // root-level onclick fires for EVERY click in the window —
+                    // including clicks on the covering surface's own inputs, which
+                    // bubble up here — so reclaiming terminal focus would yank focus
+                    // straight out of the field the user just clicked.
+                    //
+                    // A live WEB surface was taught this (the "click the new-profile
+                    // field and it loses focus immediately" bug). The DOCUMENT
+                    // surface — yedit's editor — was not, and that is THE
+                    // "focus is stolen, spam-click to type" bug: this handler is the
+                    // fourth focus path, the one the reclaim/input-policy/allowlist
+                    // hardenings all missed because it is not a focus-arbitration
+                    // script at all, just a click handler that refocuses.
+                    // Same rule the input policy uses
+                    // (apply_active_terminal_input_policy): a surface covers the
+                    // viewport => the terminal does not get focus.
+                    if shell.has_live_web_surface(&path, current_millis())
+                        || shell.document_surface_visible_for(&path)
+                    {
                         None
                     } else {
                         Some(path)
@@ -55875,35 +56047,8 @@ fn app() -> Element {
                 dismiss_titlebar_transients_and_resync_active_terminal(state);
                 if let Some(session_path) = active_terminal_session {
                     if let Ok(session_path_literal) = serde_json::to_string(&session_path) {
-                        let _ = document::eval(&format!(
-                            "(function() {{
-                                const sessionPath = {session_path_literal};
-                                const registry = window.__yggtermXtermHosts || {{}};
-                                const entries = Object.values(registry)
-                                    .filter((entry) => entry && entry.sessionPath === sessionPath)
-                                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
-                                const visible = entries.find((entry) => {{
-                                    const host = entry && entry.hostId ? document.getElementById(entry.hostId) : null;
-                                    if (!host) {{
-                                        return false;
-                                    }}
-                                    const rect = host.getBoundingClientRect();
-                                    const style = window.getComputedStyle(host);
-                                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                                }}) || entries[0] || null;
-                                if (!visible || !visible.hostId) {{
-                                    return;
-                                }}
-                                const host = document.getElementById(visible.hostId);
-                                const helperTextarea = host ? host.querySelector('.xterm-helper-textarea') : null;
-                                try {{
-                                    if (helperTextarea && helperTextarea.focus) {{
-                                        helperTextarea.focus({{ preventScroll: true }});
-                                    }} else if (host && host.focus) {{
-                                        host.focus({{ preventScroll: true }});
-                                    }}
-                                }} catch (_error) {{}}
-                            }})();"
+                        let _ = document::eval(&root_click_terminal_focus_script(
+                            &session_path_literal,
                         ));
                     }
                 }
@@ -56112,6 +56257,7 @@ fn app() -> Element {
                 evt.stop_propagation();
             },
             style { "{TOAST_CSS}" }
+            style { "{DOCUMENT_SURFACE_STANDDOWN_CSS}" }
             style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
             style { "{WEB_SURFACE_VTAB_CSS}" }
@@ -89380,6 +89526,63 @@ fn ui_focus_owner_selectors_js() -> String {
     format!("[{}]", items.join(","))
 }
 
+/// The shell root's click handler refocuses the active terminal so a click on
+/// dead chrome puts the keyboard back where the user expects it.
+///
+/// It is a focus-arbitration script like the reclaim and the host guard, and it
+/// must honour the same [`UI_FOCUS_OWNER_SELECTORS`] — for a long time it did
+/// not, and because it is a plain click handler rather than something named
+/// "focus", it survived three rounds of fixes aimed at the other paths. Live
+/// trace that convicted it (guihost, 2026-07-24): a real pointer click into yedit's
+/// editor moved focus there, and ~93 ms later the helper textarea took it back
+/// from a top-level eval with an empty call stack — no registry closure on it,
+/// which is exactly this `document::eval`.
+///
+/// The Rust caller already declines for a covering surface; this guard is the
+/// belt, and it covers the rest of the chrome too (a click landing in the
+/// sidebar, the theme editor or a settings field used to be yanked away here as
+/// well).
+fn root_click_terminal_focus_script(session_path_literal: &str) -> String {
+    let ui_focus_owners = ui_focus_owner_selectors_js();
+    format!(
+        "(function() {{
+            const active = document.activeElement;
+            if (active && active.closest && {ui_focus_owners}.some((sel) => active.closest(sel))) {{
+                return;
+            }}
+            const sessionPath = {session_path_literal};
+            const registry = window.__yggtermXtermHosts || {{}};
+            const entries = Object.values(registry)
+                .filter((entry) => entry && entry.sessionPath === sessionPath)
+                .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+            const visible = entries.find((entry) => {{
+                const host = entry && entry.hostId ? document.getElementById(entry.hostId) : null;
+                if (!host) {{
+                    return false;
+                }}
+                const rect = host.getBoundingClientRect();
+                const style = window.getComputedStyle(host);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            }}) || entries[0] || null;
+            if (!visible || !visible.hostId) {{
+                return;
+            }}
+            const host = document.getElementById(visible.hostId);
+            if (host && String(host.getAttribute('data-document-surface-owns-viewport') || '').trim() === 'true') {{
+                return;
+            }}
+            const helperTextarea = host ? host.querySelector('.xterm-helper-textarea') : null;
+            try {{
+                if (helperTextarea && helperTextarea.focus) {{
+                    helperTextarea.focus({{ preventScroll: true }});
+                }} else if (host && host.focus) {{
+                    host.focus({{ preventScroll: true }});
+                }}
+            }} catch (_error) {{}}
+        }})();"
+    )
+}
+
 fn terminal_reclaim_focus_script_for_session(session_path: &str) -> String {
     let ui_focus_owners = ui_focus_owner_selectors_js();
     format!(
@@ -92677,13 +92880,148 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu } => {
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu, rename } => {
                                 // The SHARED row engine (Phase 1): same anatomy
                                 // and metrics as the cwdtree rows and WebTabs
                                 // rail — whole-row clickable, selected tinted,
                                 // tiny trailing actions.
                                 let clickable = !row_action.is_empty();
                                 let has_menu = !menu.is_empty();
+                                // Renaming replaces the row BODY in place — the
+                                // cwd tree's "Rename session" shape, which is
+                                // what the user asked contributed rows to match.
+                                // The draft lives under `rename:<row id>` so a
+                                // switch of which row is being renamed remounts
+                                // the field with the new name (value epochs).
+                                if let Some(rename) = rename {
+                                    let draft_id = format!("rename:{id}");
+                                    return rsx! {
+                                        div {
+                                            key: "{widget_key}",
+                                            "data-app-pane-row-rename": "{id}",
+                                            style: format!(
+                                                "{}display:flex; align-items:center; gap:6px; padding:2px 0;",
+                                                if follows_row { "margin-top:-8px; " } else { "" },
+                                            ),
+                                            input {
+                                                "data-app-pane-input": "{draft_id}",
+                                                style: format!(
+                                                    "flex:1; min-width:0; height:29px; border:none; border-radius:10px; \
+                                                     background:rgba(255,255,255,0.92); color:{}; font-size:12px; \
+                                                     font-weight:600; padding:0 10px; \
+                                                     box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                                    palette.text
+                                                ),
+                                                r#type: "text",
+                                                placeholder: "{rename.placeholder}",
+                                                initial_value: "{rename.value}",
+                                                onmounted: move |evt| async move {
+                                                    let _ = evt.set_focus(true).await;
+                                                },
+                                                oninput: {
+                                                    let (draft_id, on_app_pane_value) =
+                                                        (draft_id.clone(), on_app_pane_value.clone());
+                                                    move |evt: FormEvent| {
+                                                        on_app_pane_value.call((draft_id.clone(), evt.value()))
+                                                    }
+                                                },
+                                                onkeydown: {
+                                                    let (pane_id, apply, cancel, row_id) = (
+                                                        pane_id.clone(),
+                                                        rename.action.clone(),
+                                                        rename.cancel_action.clone(),
+                                                        id.clone(),
+                                                    );
+                                                    let on_app_pane_action = on_app_pane_action.clone();
+                                                    move |evt: KeyboardEvent| {
+                                                        evt.stop_propagation();
+                                                        match evt.key() {
+                                                            Key::Enter if !apply.is_empty() => {
+                                                                evt.prevent_default();
+                                                                on_app_pane_action.call((
+                                                                    pane_id.clone(),
+                                                                    apply.clone(),
+                                                                    Some(row_id.clone()),
+                                                                ));
+                                                            }
+                                                            Key::Escape if !cancel.is_empty() => {
+                                                                evt.prevent_default();
+                                                                on_app_pane_action.call((
+                                                                    pane_id.clone(),
+                                                                    cancel.clone(),
+                                                                    Some(row_id.clone()),
+                                                                ));
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                },
+                                                onclick: |evt: MouseEvent| evt.stop_propagation(),
+                                            }
+                                            if !rename.ai_source.is_empty() {
+                                                button {
+                                                    "data-app-pane-row-rename-ai": "{id}",
+                                                    title: "Use an AI-generated name",
+                                                    style: rename_ai_action_button_style(palette),
+                                                    // mousedown default would blur the
+                                                    // field before the click lands.
+                                                    onmousedown: |evt: MouseEvent| {
+                                                        evt.prevent_default();
+                                                        evt.stop_propagation();
+                                                    },
+                                                    onclick: {
+                                                        let (pane_id, source, row_id) = (
+                                                            pane_id.clone(),
+                                                            rename.ai_source.clone(),
+                                                            id.clone(),
+                                                        );
+                                                        move |evt: MouseEvent| {
+                                                            evt.stop_propagation();
+                                                            queue_app_pane_row_rename_ai_name(
+                                                                state,
+                                                                pane_id.clone(),
+                                                                row_id.clone(),
+                                                                source.clone(),
+                                                            );
+                                                        }
+                                                    },
+                                                    AiSparkleIcon { size: 12 }
+                                                }
+                                            }
+                                            // The visible way out. Escape alone was
+                                            // the only cancel, which is not an
+                                            // affordance (user, 2026-07-24).
+                                            if !rename.cancel_action.is_empty() {
+                                                button {
+                                                    "data-app-pane-row-rename-cancel": "{id}",
+                                                    title: "Cancel rename",
+                                                    style: session_row_action_button_style(palette.muted),
+                                                    onmousedown: |evt: MouseEvent| {
+                                                        evt.prevent_default();
+                                                        evt.stop_propagation();
+                                                    },
+                                                    onclick: {
+                                                        let (pane_id, action, row_id) = (
+                                                            pane_id.clone(),
+                                                            rename.cancel_action.clone(),
+                                                            id.clone(),
+                                                        );
+                                                        let on_app_pane_action = on_app_pane_action.clone();
+                                                        move |evt: MouseEvent| {
+                                                            evt.stop_propagation();
+                                                            on_app_pane_action.call((
+                                                                pane_id.clone(),
+                                                                action.clone(),
+                                                                Some(row_id.clone()),
+                                                            ));
+                                                        }
+                                                    },
+                                                    "✕"
+                                                }
+                                            }
+                                        }
+                                    };
+                                }
                                 rsx! {
                                     div {
                                         key: "{widget_key}",
@@ -100083,7 +100421,15 @@ mod tests {
             host.contains("data-document-surface"),
             "the host input guard must honour the same focus owners"
         );
-        // Both embed the SAME list, so neither can drift from the other. Match
+        // Script 3: the shell root's click handler. It is not NAMED like a focus
+        // path, which is exactly how it survived three rounds of fixes aimed at
+        // scripts 1 and 2 while the user still could not type in yedit.
+        let root_click = root_click_terminal_focus_script("\"local://x\"");
+        assert!(
+            root_click.contains("data-document-surface"),
+            "the root click handler must not steal focus from a document editor"
+        );
+        // All three embed the SAME list, so none can drift from the others. Match
         // on the attribute/id token: the JS literal escapes the inner quotes of
         // `[data-x="1"]`, so the raw selector never appears verbatim.
         for selector in UI_FOCUS_OWNER_SELECTORS {
@@ -100094,7 +100440,69 @@ mod tests {
                 .trim_start_matches('[');
             assert!(reclaim.contains(needle), "reclaim lost {selector}");
             assert!(host.contains(needle), "host guard lost {selector}");
+            assert!(root_click.contains(needle), "root click lost {selector}");
         }
+    }
+
+    /// The structural half: enumerating focus-arbitration scripts BY HAND is how
+    /// script 3 stayed invisible while three fixes shipped. This scans the source
+    /// itself, so a fourth script that focuses an xterm helper textarea has to
+    /// either carry the shared owner list or be recorded here as a deliberate
+    /// agent-driven probe.
+    #[test]
+    fn every_helper_textarea_focus_site_is_guarded_or_a_recorded_probe() {
+        // Agent-driven probes (yggui `terminal send` / scroll). These are
+        // explicit automation, not a reaction to a user gesture, so they are
+        // allowed to focus the terminal unconditionally.
+        const RECORDED_PROBES: &[&str] = &[
+            "terminal_probe_input_script",
+            "probe_terminal_viewport_scroll_for",
+        ];
+        let source = include_str!("shell.rs");
+        let mut fn_name = "<top level>";
+        let mut unguarded: Vec<(&str, usize)> = Vec::new();
+        // Track the enclosing `fn` and whether its body has taken the guard by
+        // the time a focus call shows up. The guard reads either as the shared
+        // list interpolated into the script (`{ui_focus_owners}` / the helper
+        // that builds it, or the `uiOwnsFocus()` predicate it feeds), or as the
+        // covering-surface attribute checked directly.
+        let mut fn_start = 0usize;
+        for (index, line) in source.lines().enumerate() {
+            let mut trimmed = line.trim_start();
+            for prefix in ["pub(crate) ", "pub ", "async ", "unsafe "] {
+                trimmed = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
+            }
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
+                fn_name = rest.split(['(', '<', ' ']).next().unwrap_or("<unknown>");
+                fn_start = index;
+            }
+            if !line.contains("helperTextarea.focus(") {
+                continue;
+            }
+            if RECORDED_PROBES.contains(&fn_name) {
+                continue;
+            }
+            let body: String = source
+                .lines()
+                .skip(fn_start)
+                .take(index - fn_start + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let guarded = body.contains("ui_focus_owner_selectors_js()")
+                || body.contains("{ui_focus_owners}")
+                || body.contains("uiOwnsFocus()")
+                || body.contains("data-document-surface");
+            if !guarded {
+                unguarded.push((fn_name, index + 1));
+            }
+        }
+        assert!(
+            unguarded.is_empty(),
+            "these focus an xterm helper textarea without the shared focus-owner \
+             guard — add {} to the script, or record the fn in RECORDED_PROBES if \
+             it is deliberate automation: {unguarded:?}",
+            "ui_focus_owner_selectors_js()"
+        );
     }
 
     // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
@@ -103490,6 +103898,19 @@ mod tests {
                 "under-glass rule not keyed on the root stamp: {line}"
             );
         }
+        // The covered-host pointer stand-down is NOT under-glass business and is
+        // not keyed on the stamp, so it lives in its own sheet — putting it here
+        // is what broke the invariant above.
+        assert!(
+            DOCUMENT_SURFACE_STANDDOWN_CSS.contains(
+                "[data-document-surface-owns-viewport=\"true\"] { pointer-events: none; }"
+            ),
+            "a document surface covering the host must make the host unclickable"
+        );
+        assert!(
+            !css.contains("data-document-surface-owns-viewport"),
+            "document-surface rules do not belong in the under-glass sheet"
+        );
     }
 
     // Under glass the backgrounding stash is SOFT: the webview stays
@@ -105231,8 +105652,19 @@ mod tests {
             ),
             "terminal reclaim should honor durable sidebar keyboard ownership instead of relying only on transient timers"
         );
+        // The per-selector `active.closest('[data-theme-editor-overlay="1"]')`
+        // this used to assert is gone: every focus-owning region now comes from
+        // the one UI_FOCUS_OWNER_SELECTORS list, checked in a single `.some(...)`
+        // pass. Asserting the old hand-rolled literal left main red while the
+        // behaviour was correct — so assert the mechanism, and let
+        // `every_focus_arbitration_script_treats_the_document_surface_as_a_focus_owner`
+        // pin the list's contents.
         assert!(
-            script.contains("active.closest('[data-theme-editor-overlay=\"1\"]')"),
+            script.contains(".some((sel) => active.closest(sel))"),
+            "delayed terminal autofocus reclaim must consult the shared focus-owner list"
+        );
+        assert!(
+            script.contains("data-theme-editor-overlay"),
             "theme editor overlay should block delayed terminal autofocus reclaim"
         );
         assert!(
@@ -107175,9 +107607,46 @@ mod tests {
             subtitle: String::new(),
             actions: Vec::new(),
             menu: Vec::new(),
+            rename: None,
         };
         assert_eq!(row("a").key(0, &epochs), row("a").key(7, &epochs));
         assert_ne!(row("a").key(0, &epochs), row("b").key(0, &epochs));
+
+        // A RENAMING row holds an uncontrolled field, so its key carries the
+        // epoch too — that is the only way a generated name reaches the DOM.
+        let renaming = |id: &str, value: &str| AppPaneWidget::ListRow {
+            icon: String::new(),
+            selected: false,
+            row_action: String::new(),
+            id: id.to_string(),
+            title: String::new(),
+            subtitle: String::new(),
+            actions: Vec::new(),
+            menu: Vec::new(),
+            rename: Some(AppPaneRowRename {
+                value: value.to_string(),
+                action: "rename_apply".into(),
+                cancel_action: "rename_cancel".into(),
+                ai_source: "some note body".into(),
+                placeholder: String::new(),
+            }),
+        };
+        let renamed_epoch = HashMap::from([("rename:a".to_string(), 1u64)]);
+        assert_ne!(
+            renaming("a", "x").key(0, &epochs),
+            renaming("a", "x").key(0, &renamed_epoch),
+            "a bumped rename epoch must remount the field"
+        );
+        assert_eq!(
+            renaming("a", "x").declared_value(),
+            Some(("rename:a".to_string(), "x".to_string())),
+            "the rename draft is namespaced so it cannot collide with an app's own widget id"
+        );
+        assert_eq!(
+            row("a").declared_value(),
+            None,
+            "a row that is not being renamed declares no value"
+        );
 
         // An input's key carries its value epoch, so an app pushing a new value
         // rebuilds the node whose DOM value is otherwise uncontrolled.
