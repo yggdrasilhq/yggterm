@@ -6,6 +6,35 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
+  before ever "fixing" a focus steal again.** The user could not type in yedit;
+  three previous fixes all missed, because every one of them hardened something
+  NAMED like a focus path (the reclaim script, the input-policy script, the
+  `uiOwnsFocus` allowlist, the covered-host `pointer-events:none`). The actual
+  thief is the shell root's **`onclick` handler** in `fn app()`: it fires for
+  every click anywhere in the window and `document::eval`s a script that
+  refocuses the active terminal's helper textarea. It bailed out for a live WEB
+  surface — the same bug was found and fixed there once ("click the new-profile
+  field and it loses focus immediately") — but nobody taught it about the
+  DOCUMENT surface, which did not exist yet when that bail was written.
+  **How it was finally caught** (the method matters more than the fix): patch
+  `HTMLElement.prototype.focus` on the live GUI to log any call landing on an
+  `.xterm-helper-textarea`, AND wrap the registry's `focusTerminal` /
+  `setInputEnabled` / `term.focus` so a hit says WHICH closure ran; then drive a
+  REAL `server app pointer click` into the editor. The log read: click lands in
+  the editor, ~93 ms later `helper.focus()` fires with an EMPTY marks list and a
+  `global code@dioxus://index.html` stack — i.e. a freshly-eval'd script, not
+  any registry closure. That empty marks list is what convicted the click
+  handler. ⚠ A JS `el.focus()` probe passes while the bug is live; only a real
+  pointer click reproduces it, because the thief is a DOM click handler.
+  **Fixes:** the Rust bail now includes `document_surface_visible_for`, the
+  script is extracted as `root_click_terminal_focus_script` carrying the shared
+  `UI_FOCUS_OWNER_SELECTORS` guard (so it also stops yanking focus out of the
+  sidebar, the theme editor and settings fields), and
+  `every_helper_textarea_focus_site_is_guarded_or_a_recorded_probe` scans the
+  source so a FIFTH script cannot hide the same way — enumerating these by hand
+  is exactly what let this one survive three rounds.
+
 - **★★ AGENT WEB-SURFACE AUTOMATION HARD-CRASHES THE GUI (WebKitGTK
   segfault) — diagnosed 2026-07-24 on jojo; LAYER 1 (crash surface) FIXED +
   LIVE-VERIFIED at 2.12.8 (`c3c7086`), LAYER 2 (routing/isolation) OPEN.**

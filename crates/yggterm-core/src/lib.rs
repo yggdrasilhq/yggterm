@@ -67,7 +67,7 @@ pub use titles::{
     SessionSummaryTimelineEntry, SessionTitleStore, best_effort_context_from_session_path,
     best_effort_precis_from_context, best_effort_summary_from_context,
     best_effort_title_from_context, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy,
+    looks_like_low_signal_generated_copy, request_generated_short_name,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
