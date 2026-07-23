@@ -220,14 +220,35 @@ fix) once the fix is verified live on jojo.
   **Also fixed:** SGR mouse-report bursts (a click on a mouse-tracking TUI =
   `\x1b[<b;x;yM` ≈ 12–14 bytes on onData) were classified as pastes — 226
   bogus `xterm_paste_event`/hour measured.
-  **STILL OPEN under this entry:** WHY a viewport click fires
-  `request_terminal_launch_for_active` and re-dispatches the mount script at
-  all (the stand-down makes it harmless but each re-dispatch still costs a
-  full Terminal construct + snapshot restore ≈ the user's post-switch
-  "papers-checking" seconds. That trigger path is harness-spec §7.10/phase 3
-  material — find the click→open-request edge and the re-dispatch condition
-  before coding). Remove this entry once the user confirms clicking and
-  switching no longer blink.
+  **STILL OPEN under this entry — now FULLY DIAGNOSED (2026-07-23 late): the
+  zoom transient is the per-request re-bootstrap, and the stabilizer that
+  should prevent it is a §7.3 CODEX-ONLY hole.** The chain:
+  `bootstrap_identity = {mount}:{generation}:{activation_epoch}` and
+  `terminal_bootstrap_activation_epoch` returns `latest_open_request_id` for
+  the ACTIVE session — so EVERY open request (switch reveal, and the
+  gesture-free requests observed in-session at output boundaries) re-runs the
+  full bootstrap: new closure, new Terminal, ghost cover, fit+restore = the
+  felt zoom (+ blink when the cover fails). The escape hatch EXISTS —
+  `retained_ready_remote_host_should_reuse_bootstrap` pins the epoch to 0 —
+  but it requires `is_remote_resume_session`, the harness-spec §7.3
+  remote-CODEX-only predicate, so remote-cc and local-cc sessions re-bootstrap
+  on every request while remote-codex sessions sit stable. The user's zoom is
+  §7.3 drift showing up as pixels.
+  **The fix (phase-3 scoped, do NOT blind-flip):** generalize the stable-epoch
+  condition to any session whose host is retained + was-ever-ready + no
+  latched fault (kind- and locality-agnostic), AND give the reused-reveal
+  path a nudge against the RETAINED closure (the registry exposes
+  `emitResize`/`redrawTerminal` per host) so an idle session still paints on
+  reveal — skipping the bootstrap without the nudge risks BLANK reveals for
+  sessions with no output flowing, which is worse than the zoom. Prove
+  no-blank-reveals across {local,remote}×{cc,codex}×{idle,streaming} (the A3
+  matrix) before shipping. Also instrument the residual "slight zoom, no
+  blink" on covered switches: pixel-diff the ghost frame against the first
+  settled frame during a scripted switch on a SAFE session (New Yedit) — the
+  ghost's fallback geometry (canvas/dpr at host origin) vs the real screen's
+  placement is the suspected ~1% mismatch.
+  Remove this entry once the user confirms clicking, switching, and
+  output-boundary moments no longer zoom or blink.
 
 - **Rendering stability: user RE-REPORTED blinking + blank-on-switch 2026-07-23
   ("blinking and waiting on blank sessions only fixed by switching again and in

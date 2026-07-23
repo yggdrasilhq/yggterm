@@ -1,0 +1,9 @@
+[package]
+name = "paper-renderer"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The markdown-superset document model and parser shared by yggterm document surfaces (yedit today; paper and ztlkn next). Spec: docs/spec-paper-renderer.md in the yggterm repo."
+
+[dependencies]
+pulldown-cmark = { version = "0.12", default-features = false }
