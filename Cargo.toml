@@ -9,7 +9,7 @@ members = [
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",
-  "crates/paper-renderer",
+  "crates/emd-renderer",
 ]
 resolver = "2"
 
