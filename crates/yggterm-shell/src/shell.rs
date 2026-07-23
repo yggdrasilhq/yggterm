@@ -91458,10 +91458,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
 // render as their alt text + a link (asset transport is a follow-up; the GUI
 // cannot assume a note's relative path is fetchable from its own host).
 
-use paper_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ranges};
+use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ranges};
 
-// The typed markdown model + parser live in the `paper-renderer` crate now
-// (docs/spec-paper-renderer.md — the markdown-superset engine that yedit,
+// The typed markdown model + parser live in the `emd-renderer` crate now
+// (docs/spec-emd-renderer.md — the markdown-superset engine that yedit,
 // paper and ztlkn share). This file keeps only the Dioxus RENDER of those
 // blocks; extracting the render is the spec's next seam.
 
