@@ -1,6 +1,6 @@
 # Spec: the agent-CLI harness contract — one pathway, N CLIs
 
-**Status:** DESIGN COMPLETE 2026-07-23 · implementation not started (user-gated)
+**Status:** DESIGN COMPLETE 2026-07-23 · **USER GO GIVEN 2026-07-23 — implementation started; phase 0 (scheme registry + predicate locks) first**
 **Directive:** user, 2026-07-23 — *"line up {remote,local}×{cc,codex} code pathways
 and optimize them … as the number of CLI harnesses increases they can share a
 shared code pathway like codex and claude code."* Planned CLIs 3–5: **kimi**,
