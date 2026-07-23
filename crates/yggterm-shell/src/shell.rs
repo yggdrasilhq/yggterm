@@ -90858,15 +90858,17 @@ fn top_level_block_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
-/// The document reading typography (user spec 2026-07-18: "readability like
-/// The New York Times" — serif body, generous leading, no decoration the
+/// The document reading typography (user spec 2026-07-18 "readability like
+/// The New York Times", REFINED 2026-07-23: **sans-serif**, very legible,
+/// generous spacing between paragraphs and around headings, no decoration the
 /// markdown didn't ask for). ONE owner: the markdown reader root and the
-/// block click-to-edit reader both use exactly this string. The serif stack
-/// is the DESIGN.md "document reading font" entry — change it there first.
+/// block click-to-edit reader both use exactly this string. The stack is the
+/// DESIGN.md "document reading font" entry — change it there first.
 fn document_reading_typography() -> &'static str {
-    "font-size:15.5px; line-height:1.75; \
-     font-family:Georgia, 'Iowan Old Style', 'Palatino Linotype', 'Noto Serif', \
-     'Times New Roman', serif; text-rendering:optimizeLegibility;"
+    "font-size:15px; line-height:1.7; \
+     font-family:'Inter', 'SF Pro Text', 'Segoe UI', 'Noto Sans', \
+     'Liberation Sans', 'Helvetica Neue', Arial, sans-serif; \
+     letter-spacing:0.002em; text-rendering:optimizeLegibility;"
 }
 
 fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
