@@ -12984,101 +12984,188 @@ print(path)
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The remote twin of `yggterm_core::read_cc_session_identity_fields` +
+/// `read_cc_session_title` + `read_cc_session_context`. It exists because a
+/// remote machine's `~/.claude/projects` can only be read over ssh, and not
+/// every fleet machine's yggterm binary is current.
+///
+/// ⚠ **It must agree with the Rust owner, record for record.** Both encodings
+/// are pinned together by
+/// `the_remote_cc_scan_script_agrees_with_the_rust_owner` — that test runs THIS
+/// script under `python3` against the same fixtures the Rust helpers read and
+/// asserts identical `cwd`/`title`/`context`. Change one side without the
+/// other and the test fails.
+///
+/// It diverged once, and the user paid for it: the Rust side learned that a
+/// `/cd` re-homes a Claude Code session (CC moves the transcript into the
+/// project dir encoding the NEW cwd), while this script still took the FIRST
+/// cwd it saw and read only the first 512 KB — so on a remote machine a
+/// `/cd`-moved session kept showing under its birth folder in the cwd tree
+/// forever. Live case, dev 2026-07-24: session `4a0a61e0` `/cd`'d from
+/// `/home/pi/gh/yggterm` to `/home/pi/data/callgraph`, and the record proving
+/// it sits at byte 942_954 of a 943_711-byte transcript — past the old head-only
+/// cap, so no latest-wins rule alone would have caught it either.
 const REMOTE_CC_SCAN_SCRIPT: &str = r#"
 import json, os, sys
 from pathlib import Path
 
-# Read at most 512 KB per file to avoid hanging on huge active sessions.
-MAX_BYTES_PER_FILE = 512 * 1024
+# One sampled read per transcript, split HEAD + TAIL (same total budget the
+# old head-only cap used). The TAIL half is what makes late-appended records
+# visible: both a `/cd` re-home and a `custom-title` rename land at the END of
+# a multi-megabyte transcript. 130 of 175 transcripts on the dev fleet machine
+# are larger than the old 512 KB head cap, so their renames were invisible too.
+HEAD_BYTES = 256 * 1024
+TAIL_BYTES = 256 * 1024
+
+
+def project_dir_encoding(cwd):
+    # Mirrors yggterm_core::cc_project_dir_encoding: every character outside
+    # [A-Za-z0-9-] becomes '-'. Lossy by design — only ever used to VERIFY a
+    # candidate cwd against the dir CC itself filed the transcript under.
+    out = []
+    for ch in cwd:
+        if ch == '-' or (ch.isascii() and ch.isalnum()):
+            out.append(ch)
+        else:
+            out.append('-')
+    return ''.join(out)
+
+
+def normalize_cwd(raw):
+    # Mirrors yggterm_core::normalize_codex_cwd.
+    trimmed = raw.strip()
+    if not trimmed or trimmed == '/':
+        return '/'
+    if trimmed.startswith('/'):
+        return ('/' + trimmed.lstrip('/')).rstrip('/') or '/'
+    return '/' + trimmed.strip('/')
+
+
+def sampled_lines(path, size):
+    # Whole file when it fits the budget (exact parity with the Rust owner,
+    # which always reads everything); otherwise head + tail, dropping the one
+    # partial line at each cut so a half-record never parses as a whole one.
+    with open(path, 'rb') as f:
+        if size <= HEAD_BYTES + TAIL_BYTES:
+            for line in f.read().split(b'\n'):
+                yield line
+            return
+        head = f.read(HEAD_BYTES)
+        cut = head.rfind(b'\n')
+        if cut >= 0:
+            head = head[:cut]
+        for line in head.split(b'\n'):
+            yield line
+        f.seek(size - TAIL_BYTES)
+        tail = f.read()
+        cut = tail.find(b'\n')
+        tail = tail[cut + 1:] if cut >= 0 else b''
+        for line in tail.split(b'\n'):
+            yield line
+
 
 def scan_cc_session(jsonl_path):
     # Use the filename stem as the canonical session_id fallback (mirrors Rust behavior).
+    jsonl_path = str(jsonl_path)
     fallback_id = Path(jsonl_path).stem
+    # CC's own placement is the authority on where a session lives, so a cwd
+    # whose encoding matches the parent project dir outranks the merely-latest
+    # one (a Bash `cd` inside the session moves `cwd` transiently too).
+    parent_dir_name = Path(jsonl_path).parent.name
     session_id = None
-    cwd = None
+    last_cwd = None
+    last_placement_confirmed_cwd = None
+    last_any_cwd = None
+    last_any_placement_confirmed_cwd = None
     ai_title = None
     custom_title = None
     first_human_text = None
     context_parts = []
     try:
-        with open(jsonl_path, encoding='utf-8', errors='ignore') as f:
-            bytes_read = 0
-            for line in f:
-                bytes_read += len(line.encode('utf-8', errors='ignore'))
-                if bytes_read > MAX_BYTES_PER_FILE:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                t = r.get('type', '')
-                # sessionId can appear on any record; prefer permissionMode/permission-mode
-                # but fall through to any record that carries it.
-                if session_id is None:
-                    sid = r.get('sessionId') or r.get('session_id')
-                    if sid and sid.strip():
-                        session_id = sid.strip()
-                if t == 'ai-title' and ai_title is None:
-                    ai_title = (r.get('aiTitle') or '').strip() or None
-                # custom-title is the user rename (/rename or picker Ctrl+R); it
-                # wins over ai-title and is latest-wins (a re-rename appends again).
-                if t == 'custom-title':
-                    ct = (r.get('customTitle') or '').strip()
-                    if ct:
-                        custom_title = ct
+        size = os.path.getsize(jsonl_path)
+        for raw_line in sampled_lines(jsonl_path, size):
+            line = raw_line.decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            t = r.get('type', '')
+            # sessionId can appear on any record; take the first one that carries it.
+            if session_id is None:
+                sid = r.get('sessionId') or r.get('session_id')
+                if sid and sid.strip():
+                    session_id = sid.strip()
+            # ai-title is latest-wins, like custom-title (CC re-titles as the
+            # conversation moves on).
+            if t == 'ai-title':
+                at = (r.get('aiTitle') or '').strip()
+                if at:
+                    ai_title = at
+            # custom-title is the user rename (/rename or picker Ctrl+R); it
+            # wins over ai-title and is latest-wins (a re-rename appends again).
+            if t == 'custom-title':
+                ct = (r.get('customTitle') or '').strip()
+                if ct:
+                    custom_title = ct
+            raw_cwd = r.get('cwd')
+            if raw_cwd and raw_cwd.strip():
+                candidate = raw_cwd.strip()
+                confirmed = project_dir_encoding(candidate) == parent_dir_name
                 if t == 'user':
-                    # cwd lives in user records alongside the message content
-                    if cwd is None:
-                        raw_cwd = r.get('cwd')
-                        if raw_cwd and raw_cwd.strip():
-                            cwd = raw_cwd.strip()
-                    msg = r.get('message', {})
-                    if msg.get('role') == 'user':
-                        content = msg.get('content', '')
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            text = ' '.join(p.get('text', '') for p in content if p.get('type') == 'text')
-                        else:
-                            continue
-                        tag = '</local-command-caveat>'
-                        pos = text.find(tag)
-                        if pos >= 0:
-                            text = text[pos + len(tag):]
-                        text = text.strip()
-                        if not text or text.startswith('<'):
-                            continue
-                        if first_human_text is None:
-                            first_human_text = text[:80]
-                        if len(context_parts) < 3:
-                            context_parts.append(text[:120])
-                # cwd fallback: any record that carries a top-level cwd field
-                if cwd is None and r.get('cwd') and r['cwd'].strip():
-                    cwd = r['cwd'].strip()
-                # NOTE: do NOT early-break once ai-title/human/cwd are known — a
-                # `custom-title` (user rename) is appended later in the log and
-                # must win. Scanning continues to the MAX_BYTES cap.
+                    if confirmed:
+                        last_placement_confirmed_cwd = candidate
+                    last_cwd = candidate
+                else:
+                    if confirmed:
+                        last_any_placement_confirmed_cwd = candidate
+                    last_any_cwd = candidate
+            if t == 'user':
+                msg = r.get('message', {})
+                if msg.get('role') == 'user':
+                    content = msg.get('content', '')
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = ' '.join(p.get('text', '') for p in content if p.get('type') == 'text')
+                    else:
+                        continue
+                    tag = '</local-command-caveat>'
+                    pos = text.find(tag)
+                    if pos >= 0:
+                        text = text[pos + len(tag):]
+                    text = text.strip()
+                    if not text or text.startswith('<'):
+                        continue
+                    if first_human_text is None:
+                        first_human_text = text[:80] + ('…' if len(text) > 80 else '')
+                    if len(context_parts) < 3:
+                        context_parts.append(text[:120])
     except Exception:
         return None
     # Use filename stem as session_id if no explicit sessionId was found in the file.
     resolved_id = session_id or fallback_id
     if not resolved_id:
         return None
+    cwd = (last_placement_confirmed_cwd or last_cwd
+           or last_any_placement_confirmed_cwd or last_any_cwd)
     # cwd may be empty for sessions that haven't set it; that is valid.
     try:
-        mtime = int(os.path.getmtime(str(jsonl_path)))
+        mtime = int(os.path.getmtime(jsonl_path))
     except Exception:
         mtime = 0
     return {
         'session_id': resolved_id,
-        'cwd': cwd or '',
-        'title': custom_title or ai_title or first_human_text or resolved_id[:8],
+        'cwd': normalize_cwd(cwd) if cwd else '',
+        # Empty when the transcript names itself nowhere. The CALLER owns what a
+        # titleless session is labelled (`short_session_id`), exactly like the
+        # codex scan arm — duplicating that fallback here is what made the same
+        # session read `session-` remotely and `Q<last7>` locally.
+        'title': custom_title or ai_title or first_human_text or '',
         'context': ' · '.join(context_parts),
         'mtime': mtime,
-        'path': str(jsonl_path),
+        'path': jsonl_path,
     }
 
 projects_dir = Path(os.path.expanduser('~/.claude/projects'))
@@ -13093,7 +13180,7 @@ for project_dir in projects_dir.iterdir():
             print(json.dumps(data, ensure_ascii=False))
 "#;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteCcSummaryLine {
     session_id: String,
     cwd: String,
@@ -13232,6 +13319,13 @@ fn scan_remote_machine_sessions(
                         }
                         cc_sessions.push(RemoteScannedSession {
                             session_path: remote_cc_session_path(&machine_key, &summary.session_id),
+                            title_hint: if summary.title.trim().is_empty() {
+                                // One owner for "what a titleless session is
+                                // called", shared with the codex arm above.
+                                short_session_id(&summary.session_id)
+                            } else {
+                                summary.title
+                            },
                             session_id: summary.session_id,
                             cwd: summary.cwd,
                             started_at: String::new(),
@@ -13239,13 +13333,13 @@ fn scan_remote_machine_sessions(
                             event_count: 0,
                             user_message_count: 0,
                             assistant_message_count: 0,
-                            title_hint: summary.title,
                             recent_context: summary.context,
                             cached_precis: None,
                             cached_summary: None,
                             live_runtime: false,
                             storage_path: summary.path,
                         });
+
                     }
                 }
             }
@@ -34215,5 +34309,188 @@ terminal_window_id: None,
         assert!(!local_daemon_connect_error_is_transient(&anyhow::anyhow!(
             "terminal session not found: codex-runtime://missing"
         )));
+    }
+
+    // ── The remote CC scan script vs the Rust owner ─────────────────────────
+    // `REMOTE_CC_SCAN_SCRIPT` is a second encoding of
+    // `read_cc_session_identity_fields` / `read_cc_session_title` /
+    // `read_cc_session_context` — unavoidable, because a remote machine's
+    // `~/.claude/projects` is only reachable over ssh. This test denies it the
+    // chance to diverge silently: it runs the REAL script under python3 over
+    // fixtures and asserts field-for-field agreement with the Rust owner.
+    // It also pins the values themselves, so the two cannot agree on a wrong
+    // answer.
+
+    fn cc_jsonl(records: &[serde_json::Value]) -> String {
+        records
+            .iter()
+            .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn the_remote_cc_scan_script_agrees_with_the_rust_owner() {
+        use std::io::Write as _;
+        use super::short_session_id;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-cc-scan-parity-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let projects = root.join(".claude").join("projects");
+
+        // (A) The user's bug: `/cd` re-homes the session. CC moved the
+        //     transcript into the dir encoding the NEW cwd, so that cwd — not
+        //     the birth cwd of record 1 — is where the session lives.
+        let a_dir = projects.join("-home-pi-data-callgraph");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::write(
+            a_dir.join("aaaaaaaa-0000-0000-0000-000000000001.jsonl"),
+            cc_jsonl(&[
+                serde_json::json!({"type":"user","sessionId":"session-a","cwd":"/home/pi/gh/yggterm",
+                    "message":{"role":"user","content":"continue the callgraph campaign"}}),
+                serde_json::json!({"type":"assistant","cwd":"/home/pi/gh/yggterm"}),
+                serde_json::json!({"type":"user","cwd":"/home/pi/data/callgraph",
+                    "message":{"role":"user","content":"now build the graph"}}),
+            ]),
+        )
+        .unwrap();
+
+        // (B) A Bash `cd` inside the session also moves the recorded cwd, so
+        //     "latest" alone is wrong — CC's own placement is the authority.
+        let b_dir = projects.join("-home-pi-gh-yggterm");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(
+            b_dir.join("bbbbbbbb-0000-0000-0000-000000000002.jsonl"),
+            cc_jsonl(&[
+                serde_json::json!({"type":"user","sessionId":"session-b","cwd":"/home/pi/gh/yggterm",
+                    "message":{"role":"user","content":"fix the shell"}}),
+                serde_json::json!({"type":"user","cwd":"/home/pi/gh/yggterm/crates/yggterm-shell/src",
+                    "message":{"role":"user","content":"grep in here"}}),
+            ]),
+        )
+        .unwrap();
+
+        // (C) A transcript past the sampling budget whose deciding records —
+        //     the `/cd` and the rename — are BOTH appended at the very end.
+        //     This is the case a head-only read can never see; on the dev
+        //     fleet machine 130 of 175 transcripts are this shape.
+        let c_dir = projects.join("-home-pi-git-formulations");
+        std::fs::create_dir_all(&c_dir).unwrap();
+        let mut c = cc_jsonl(&[
+            serde_json::json!({"type":"user","sessionId":"session-c","cwd":"/home/pi/gh/elsewhere",
+                "message":{"role":"user","content":"first human turn"}}),
+            serde_json::json!({"type":"user","cwd":"/home/pi/gh/elsewhere",
+                "message":{"role":"user","content":"second human turn"}}),
+            serde_json::json!({"type":"user","cwd":"/home/pi/gh/elsewhere",
+                "message":{"role":"user","content":"third human turn"}}),
+            serde_json::json!({"type":"ai-title","aiTitle":"An Early Auto Title"}),
+        ]);
+        let filler = cc_jsonl(&[serde_json::json!({
+            "type":"assistant","cwd":"/home/pi/gh/elsewhere",
+            "message":{"role":"assistant","content":"x".repeat(4096)}
+        })]);
+        while c.len() < 700 * 1024 {
+            c.push_str(&filler);
+        }
+        c.push_str(&cc_jsonl(&[
+            serde_json::json!({"type":"ai-title","aiTitle":"A Later Auto Title"}),
+            serde_json::json!({"type":"user","cwd":"/home/pi/git/formulations",
+                "message":{"role":"user","content":"moved here"}}),
+            serde_json::json!({"type":"custom-title","customTitle":"Renamed Late"}),
+        ]));
+        std::fs::write(
+            c_dir.join("cccccccc-0000-0000-0000-000000000003.jsonl"),
+            &c,
+        )
+        .unwrap();
+
+        // (D) Some transcripts carry `cwd` only on non-`user` records. Dropping
+        //     them from the tree entirely is worse than filing them where every
+        //     record agrees they belong.
+        let d_dir = projects.join("-home-pi-git-jyas");
+        std::fs::create_dir_all(&d_dir).unwrap();
+        std::fs::write(
+            d_dir.join("dddddddd-0000-0000-0000-000000000004.jsonl"),
+            cc_jsonl(&[
+                serde_json::json!({"type":"assistant","sessionId":"session-d","cwd":"/home/pi/git/jyas"}),
+                serde_json::json!({"type":"summary","summary":"a compacted session"}),
+            ]),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new("python3")
+            .arg("-")
+            .env("HOME", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn python3");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(super::REMOTE_CC_SCAN_SCRIPT.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "remote cc scan script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let scanned: Vec<super::RemoteCcSummaryLine> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("script emits RemoteCcSummaryLine json"))
+            .collect();
+
+        // Pin the values, so agreement on a wrong answer still fails.
+        let by_id = |id: &str| -> super::RemoteCcSummaryLine {
+            scanned
+                .iter()
+                .find(|s| s.session_id == id)
+                .unwrap_or_else(|| panic!("script dropped {id}; emitted {} rows", scanned.len()))
+                .clone()
+        };
+        assert_eq!(by_id("session-a").cwd, "/home/pi/data/callgraph");
+        assert_eq!(by_id("session-b").cwd, "/home/pi/gh/yggterm");
+        assert_eq!(by_id("session-c").cwd, "/home/pi/git/formulations");
+        assert_eq!(by_id("session-c").title, "Renamed Late");
+        assert_eq!(by_id("session-d").cwd, "/home/pi/git/jyas");
+
+        // …and pin them to the Rust owner, field for field.
+        for summary in &scanned {
+            let path = std::path::Path::new(&summary.path);
+            let (rust_id, rust_cwd) = yggterm_core::read_cc_session_identity_fields(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("rust owner dropped {}", summary.path));
+            // The titleless fallback belongs to the CALLER, not the scan — so
+            // here both sides must agree on "no title at all".
+            let rust_title = yggterm_core::read_cc_session_title(path)
+                .unwrap()
+                .unwrap_or_default();
+            let rust_context = yggterm_core::read_cc_session_context(path).unwrap();
+            assert_eq!(summary.session_id, rust_id, "session_id for {}", summary.path);
+            assert_eq!(summary.cwd, rust_cwd, "cwd for {}", summary.path);
+            assert_eq!(summary.title, rust_title, "title for {}", summary.path);
+            assert_eq!(
+                summary.context, rust_context,
+                "context for {}",
+                summary.path
+            );
+        }
+        assert_eq!(scanned.len(), 4, "every fixture must be emitted");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

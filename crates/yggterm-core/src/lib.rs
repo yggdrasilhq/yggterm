@@ -1863,6 +1863,12 @@ pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, St
     let mut session_id: Option<String> = None;
     let mut last_cwd: Option<String> = None;
     let mut last_placement_confirmed_cwd: Option<String> = None;
+    // Last resort: a handful of transcripts carry `cwd` only on non-`user`
+    // records (3/163 on the dev fleet machine, 2026-07-24). Without this the
+    // whole session is dropped from the cwd tree, which is strictly worse than
+    // filing it under a cwd every record agrees on.
+    let mut last_any_cwd: Option<String> = None;
+    let mut last_any_placement_confirmed_cwd: Option<String> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -1875,23 +1881,33 @@ pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, St
                 .filter(|s| !s.trim().is_empty())
                 .map(ToOwned::to_owned);
         }
+        let Some(cwd) = value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let placement_confirmed = parent_dir_name
+            .as_deref()
+            .is_some_and(|dir| cc_project_dir_encoding(cwd) == dir);
         if value.get("type").and_then(Value::as_str) == Some("user") {
-            if let Some(cwd) = value
-                .get("cwd")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-            {
-                if parent_dir_name
-                    .as_deref()
-                    .is_some_and(|dir| cc_project_dir_encoding(cwd) == dir)
-                {
-                    last_placement_confirmed_cwd = Some(cwd.to_owned());
-                }
-                last_cwd = Some(cwd.to_owned());
+            if placement_confirmed {
+                last_placement_confirmed_cwd = Some(cwd.to_owned());
             }
+            last_cwd = Some(cwd.to_owned());
+        } else {
+            if placement_confirmed {
+                last_any_placement_confirmed_cwd = Some(cwd.to_owned());
+            }
+            last_any_cwd = Some(cwd.to_owned());
         }
     }
-    let cwd = match last_placement_confirmed_cwd.or(last_cwd) {
+    let cwd = match last_placement_confirmed_cwd
+        .or(last_cwd)
+        .or(last_any_placement_confirmed_cwd)
+        .or(last_any_cwd)
+    {
         Some(c) => normalize_codex_cwd(c),
         None => return Ok(None),
     };
@@ -2527,6 +2543,56 @@ mod tests {
             local_cc_session_cwd_in(&projects, session_id).as_deref(),
             Some("/home/pi/git/gmat-learning-with-claude"),
             "placement confirmation outranks recency"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A few transcripts carry `cwd` only on non-`user` records (3 of 163 on
+    /// the dev fleet machine, 2026-07-24). Requiring a `user` record dropped
+    /// them from the cwd tree entirely — strictly worse than filing them where
+    /// every record agrees they belong. A `user` cwd still outranks them, so
+    /// the /cd rule above is untouched.
+    #[test]
+    fn cc_session_cwd_falls_back_to_a_non_user_record_rather_than_vanishing() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-cc-nonuser-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let projects = root.join("projects");
+        let project = projects.join("-home-pi-git-jyas");
+        fs::create_dir_all(&project).expect("create project dir");
+        let session_id = "1611ca42-0000-4000-8000-000000000001";
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"assistant","sessionId":session_id,"cwd":"/home/pi/git/jyas"}),
+                serde_json::json!({"type":"summary","summary":"a compacted session"}),
+            ),
+        )
+        .expect("write transcript");
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, session_id).as_deref(),
+            Some("/home/pi/git/jyas"),
+            "a session whose cwd never lands on a user record must still be placed"
+        );
+
+        // …but a user record still wins when there is one.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"assistant","sessionId":session_id,"cwd":"/tmp/stray"}),
+                serde_json::json!({"type":"user","cwd":"/home/pi/git/jyas"}),
+            ),
+        )
+        .expect("rewrite transcript");
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, session_id).as_deref(),
+            Some("/home/pi/git/jyas")
         );
 
         fs::remove_dir_all(&root).ok();
