@@ -449,6 +449,18 @@ these already cover all four pathways correctly.
 
 0. **Scheme registry + predicate locks** (pure addition, no behavior change;
    immediately catches the sanitizer's missing `cc-runtime://`).
+   ✅ **SHIPPED 2026-07-23**: `yggterm_core::agent_scheme` — every scheme
+   declared once (role, locality, kind, legacy, synthetic example key), plus
+   `KNOWN_PREDICATE_HOLES`, the dated burn-down table (13 rows, each
+   re-verified against main this day; `terminal_write_strategy_for_path` and
+   most of `is_hot_terminal_sidebar_path` were already fixed piecemeal in
+   round 8 and are pinned at zero/one hole). TEN lock tests across
+   yggterm-server (lib/daemon/terminal) and yggterm-shell
+   (shell/terminal_observe) enforce BOTH directions: a predicate missing a
+   registered scheme fails unless its hole is recorded, and a recorded hole
+   that stops reproducing fails until its row is deleted — the table can
+   never go stale-green. Later phases burn the table down to empty; A5 is
+   met when it is.
 1. **Descriptor extraction**: introduce `AgentCliDescriptor` for codex + CC;
    port `resume_argv`/`launch_argv` construction and the store scanners onto
    it; delete the per-arm builders as each caller moves. No wire changes.

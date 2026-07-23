@@ -3144,6 +3144,109 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
+
+    #[test]
+    fn scheme_registry_lock_terminal_key_prefers_initial_screen_snapshot() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality};
+        let name = "terminal_key_prefers_initial_screen_snapshot";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            s.agent && !s.legacy && s.locality == SchemeLocality::Remote
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let covered = terminal_key_prefers_initial_screen_snapshot(scheme.example, "");
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} ignores {} and no hole is recorded — fix it or record it",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
+    // The remote-resume-attach recognizer must know every agent kind's resume
+    // AND start subcommand (the kind table in lib.rs is the SSOT it should
+    // derive from — §7.4). The lock keys holes on the kind's remote ROW
+    // scheme, since the subcommand itself is not a scheme.
+    #[test]
+    fn scheme_registry_lock_launch_command_looks_like_remote_resume_attach() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality, SchemeRole};
+        let name = "launch_command_looks_like_remote_resume_attach";
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| {
+            s.agent
+                && !s.legacy
+                && s.locality == SchemeLocality::Remote
+                && matches!(s.role, SchemeRole::RowIdentity)
+        }) {
+            let kind = scheme.kind.expect("remote agent row schemes are kind-specific");
+            for subcommand in [
+                crate::remote_agent_resume_subcommand(kind),
+                crate::remote_agent_start_subcommand(kind),
+            ] {
+                let launch_command = format!(
+                    "ssh -tt devhost -- sh -lc 'exec \"$HOME\"/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''{subcommand}'\\'' …'"
+                );
+                let covered = launch_command_looks_like_remote_resume_attach(&launch_command);
+                let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+                assert!(
+                    covered || hole,
+                    "{name} does not recognize `{subcommand}` and no hole is recorded for {}",
+                    scheme.prefix
+                );
+                assert!(
+                    !(covered && hole),
+                    "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                    scheme.prefix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheme_registry_lock_initial_remote_attach_should_preserve_retained_chunks() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality, SchemeRole};
+        let name = "initial_remote_attach_should_preserve_retained_chunks";
+        // A chunk that clears the scrollback-text bar (DEFAULT_ROWS+4
+        // non-empty lines), so the key arm is the only variable under test.
+        let scrollback: String = (0..usize::from(DEFAULT_ROWS) + 5)
+            .map(|n| format!("scrollback line {n} with real words\r\n"))
+            .collect();
+        let chunks = vec![TerminalChunk {
+            seq: 1,
+            data: scrollback,
+        }];
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| {
+            s.agent
+                && !s.legacy
+                && s.locality == SchemeLocality::Remote
+                && matches!(s.role, SchemeRole::RowIdentity)
+        }) {
+            let covered =
+                initial_remote_attach_should_preserve_retained_chunks(scheme.example, "", &chunks);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} ignores {} and no hole is recorded — fix it or record it",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+    }
+
     // The session-identity handshake must survive a MANUAL `ssh <host>` hop:
     // stock OpenSSH forwards LC_* (SendEnv/AcceptEnv defaults), so the LC_
     // mirror is what lets a libyggterm app on the far side detect the surface

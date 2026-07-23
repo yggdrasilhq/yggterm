@@ -1,4 +1,5 @@
 pub mod agent_presence;
+pub mod agent_scheme;
 pub mod app_registry;
 mod browser;
 pub mod click_grid;

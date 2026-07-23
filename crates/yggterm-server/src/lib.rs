@@ -22310,6 +22310,79 @@ mod tests {
         select_claude_code_storage_candidate,
     };
 
+    // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
+    // Both directions: a scheme the registry expects that the predicate does
+    // not cover fails UNLESS recorded in KNOWN_PREDICATE_HOLES; a recorded
+    // hole that no longer reproduces fails until its row is deleted. The
+    // burn-down list lives in yggterm-core::agent_scheme.
+
+    #[test]
+    fn scheme_registry_lock_local_runtime_id_from_key() {
+        use yggterm_core::agent_scheme::{self, SchemeRole};
+        let name = "local_runtime_id_from_key";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            s.agent
+                && matches!(
+                    s.role,
+                    SchemeRole::RuntimeKey | SchemeRole::RowAndRuntimeKey
+                )
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let covered = super::local_runtime_id_from_key(scheme.example).is_some();
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} does not parse {} and no hole is recorded — fix it or record it",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} now parses — delete the KNOWN_PREDICATE_HOLES row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(
+                in_scope(scheme),
+                "{name}'s hole row {} is outside the predicate's scope — typo?",
+                hole.scheme
+            );
+        }
+    }
+
+    #[test]
+    fn scheme_registry_lock_bridge_initial_snapshot_should_use_raw_stream() {
+        use yggterm_core::agent_scheme::{self, SchemeLocality, SchemeRole};
+        let name = "bridge_initial_snapshot_should_use_raw_stream";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            s.agent
+                && !s.legacy
+                && s.locality == SchemeLocality::Remote
+                && matches!(s.role, SchemeRole::RuntimeKey)
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            let covered = super::bridge_initial_snapshot_should_use_raw_stream(scheme.example);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                covered || hole,
+                "{name} ignores {} and no hole is recorded",
+                scheme.prefix
+            );
+            assert!(
+                !(covered && hole),
+                "STALE HOLE: {name}×{} — delete the row",
+                scheme.prefix
+            );
+        }
+        for hole in agent_scheme::predicate_holes_for(name) {
+            let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
+                .expect("hole names a registered scheme");
+            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+        }
+    }
+
     // Remote protocol compatibility keys off `build_id` (a hash of the shipped
     // binary, stable across release-version bumps), NOT the release version
     // string. A GUI-only deploy makes the checking process a newer version while
