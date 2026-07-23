@@ -1999,9 +1999,30 @@ struct AppPaneRowAction {
 struct AppPaneContextMenu {
     pane_id: String,
     row_id: String,
+    /// The row's label, shown as the menu heading (the cwd-tree menu's shape).
+    title: String,
     items: Vec<AppPaneRowAction>,
-    /// Client coordinates of the right-click, where the menu's top-left anchors.
+    /// Client coordinates of the right-click, where the menu anchors.
     position: (f64, f64),
+}
+
+impl AppPaneContextMenu {
+    /// The app's row actions as the SHARED menu vocabulary. yggterm draws
+    /// contributed menus with the very same [`ContextMenuOverlay`] the cwd tree
+    /// uses — one menu component, one look, one keyboard story.
+    fn menu_items(&self) -> Vec<RowMenuItem> {
+        self.items
+            .iter()
+            .map(|action| RowMenuItem {
+                id: action.action.clone(),
+                label: action.label.clone(),
+                hint: None,
+                destructive: false,
+                emphasized: false,
+                separator: false,
+            })
+            .collect()
+    }
 }
 
 /// What an action POST returns: any of a fresh schema to re-render, a message
@@ -10701,6 +10722,7 @@ impl ShellState {
         &mut self,
         pane_id: String,
         row_id: String,
+        title: String,
         items: Vec<AppPaneRowAction>,
         position: (f64, f64),
     ) {
@@ -10710,6 +10732,7 @@ impl ShellState {
         self.app_pane_context_menu = Some(AppPaneContextMenu {
             pane_id,
             row_id,
+            title,
             items,
             position,
         });
@@ -57156,27 +57179,40 @@ fn app() -> Element {
                     AgentCursorOverlay { cursors: snapshot.agent_cursors.clone() }
                 }
                 // A contributed rail row's right-click menu (yedit's Rename /
-                // Close). GUI-owned floating draw; the item POSTs its action to
-                // the app with the row id.
+                // Close). Drawn by the SAME ContextMenuOverlay the cwd tree
+                // uses — one menu component for every right-click in the app.
                 if let Some(menu) = snapshot.app_pane_context_menu.clone() {
-                    AppPaneContextMenuOverlay {
-                        menu,
+                    ContextMenuOverlay {
+                        position: menu.position,
+                        window_size: context_menu_window_size,
                         palette: snapshot.palette,
-                        on_app_pane_action: {
-                            let desktop = desktop.clone();
-                            move |(pane_id, action, value): (String, String, Option<String>)| {
-                                let desktop = desktop.clone();
-                                spawn(app_pane_run_action(state, desktop, pane_id, action, value));
-                            }
-                        },
+                        items: menu.menu_items(),
+                        menu_title: menu.title.clone(),
+                        keytip_tree: snapshot.keytip_tree.clone(),
+                        alt_overlay_active: false,
+                        alt_overlay_sequence: String::new(),
                         on_close: move |_| {
                             state.with_mut(|shell| shell.close_app_pane_context_menu());
+                        },
+                        on_action: {
+                            let desktop = desktop.clone();
+                            let (pane_id, row_id) = (menu.pane_id.clone(), menu.row_id.clone());
+                            move |action: String| {
+                                let desktop = desktop.clone();
+                                state.with_mut(|shell| shell.close_app_pane_context_menu());
+                                spawn(app_pane_run_action(
+                                    state,
+                                    desktop,
+                                    pane_id.clone(),
+                                    action,
+                                    Some(row_id.clone()),
+                                ));
+                            }
                         },
                     }
                 }
                 if let Some(row) = context_menu_overlay.clone() {
                     ContextMenuOverlay {
-                        row: row.clone(),
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
                         window_size: context_menu_window_size,
                         palette: snapshot.palette,
@@ -77710,6 +77746,8 @@ fn terminal_eval_script_with_canvas_renderer(
     canvas_renderer_enabled: bool,
     renderer_policy_reason: &str,
 ) -> String {
+    // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
+    let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
@@ -80666,22 +80704,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (active.id === {SEARCH_INPUT_ID:?}) {{
                     return true;
                 }}
-                if (active.closest && active.closest('[data-yggterm-titlebar-search="1"]')) {{
-                    return true;
-                }}
                 if (
                     active.closest
-                    && (
-                        active.closest('[data-theme-editor-overlay="1"]')
-                        || active.closest('[data-theme-editor-shell="1"]')
-                    )
+                    && {ui_focus_owners}.some((sel) => active.closest(sel))
                 ) {{
-                    return true;
-                }}
-                if (active.closest && active.closest('[data-yggui-side-rail="1"]')) {{
-                    return true;
-                }}
-                if (active.closest && active.closest('#yggterm-sidebar')) {{
                     return true;
                 }}
                 const settingsFieldKey = active.getAttribute
@@ -89285,7 +89311,40 @@ fn terminal_clear_input_policy_script() -> String {
     "#
     .to_string()
 }
+/// The chrome regions that OWN keyboard focus while the user is inside them.
+/// Whenever the active element is within one of these, the terminal must NOT
+/// reclaim focus.
+///
+/// ONE list, shared by every focus-arbitration script. There used to be two
+/// hand-rolled copies that had already drifted (one lacked the web picker), and
+/// NEITHER knew about the document surface — so a terminal focus-reclaim yanked
+/// focus straight out of a yedit editor mid-keystroke, which is the
+/// "focus is stolen, spam-click to type" bug. A second copy of this list is a
+/// bug waiting to happen; add regions here, never at a call site.
+const UI_FOCUS_OWNER_SELECTORS: &[&str] = &[
+    "[data-yggterm-titlebar-search=\"1\"]",
+    "[data-yggui-side-rail=\"1\"]",
+    "[data-theme-editor-overlay=\"1\"]",
+    "[data-theme-editor-shell=\"1\"]",
+    "[data-yggterm-web-picker=\"1\"]",
+    "#yggterm-sidebar",
+    // A document surface (yedit's editor) owns the viewport, and with it the
+    // keyboard: the terminal is not even on screen behind it.
+    "[data-document-surface]",
+];
+
+/// [`UI_FOCUS_OWNER_SELECTORS`] as a JS array literal, for embedding in a
+/// focus-arbitration script.
+fn ui_focus_owner_selectors_js() -> String {
+    let items: Vec<String> = UI_FOCUS_OWNER_SELECTORS
+        .iter()
+        .map(|selector| format!("{selector:?}"))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 fn terminal_reclaim_focus_script_for_session(session_path: &str) -> String {
+    let ui_focus_owners = ui_focus_owner_selectors_js();
     format!(
         r#"
         (() => {{
@@ -89313,12 +89372,7 @@ fn terminal_reclaim_focus_script_for_session(session_path: &str) -> String {
                 return true;
               }}
               if (
-                (active.closest && active.closest('[data-yggterm-titlebar-search="1"]'))
-                || (active.closest && active.closest('[data-yggui-side-rail="1"]'))
-                || (active.closest && active.closest('[data-theme-editor-overlay="1"]'))
-                || (active.closest && active.closest('[data-theme-editor-shell="1"]'))
-                || (active.closest && active.closest('[data-yggterm-web-picker="1"]'))
-                || (active.closest && active.closest('#yggterm-sidebar'))
+                (active.closest && {ui_focus_owners}.some((sel) => active.closest(sel)))
                 || Boolean(settingsFieldKey)
               ) {{
                 return true;
@@ -92280,64 +92334,6 @@ fn DocumentSurfaceBody(
     }
 }
 
-/// The floating right-click menu over a contributed rail row (yedit's Rename /
-/// Close). yggterm owns the draw + dismissal; the app owns the items. A click
-/// anywhere (or another right-click) dismisses; an item POSTs its action with
-/// the row id, then closes. Anchored with its RIGHT edge at the cursor so a
-/// right-side rail's menu opens leftward and stays on-screen.
-#[component]
-fn AppPaneContextMenuOverlay(
-    menu: AppPaneContextMenu,
-    palette: Palette,
-    on_app_pane_action: EventHandler<(String, String, Option<String>)>,
-    on_close: EventHandler<()>,
-) -> Element {
-    let (x, y) = menu.position;
-    let placement = format!(
-        "right:calc(100vw - {:.0}px); top:min({:.0}px, calc(100vh - 220px));",
-        x.max(0.0),
-        y.max(8.0),
-    );
-    let surface = context_menu_surface_style(palette, &placement, "blur(18px)");
-    rsx! {
-        div {
-            style: "position:fixed; inset:0; z-index:2147483000;",
-            onclick: move |_| on_close.call(()),
-            oncontextmenu: move |evt: MouseEvent| {
-                evt.prevent_default();
-                on_close.call(());
-            },
-            div {
-                "data-app-pane-context-menu": "{menu.pane_id}",
-                style: "{surface}",
-                onclick: move |evt: MouseEvent| evt.stop_propagation(),
-                for item in menu.items.iter().cloned() {
-                    button {
-                        key: "{item.action}",
-                        "data-app-pane-menu-item": "{item.action}",
-                        style: context_menu_action_style(palette, false),
-                        title: "{item.title}",
-                        onclick: {
-                            let (pane_id, action, row_id) =
-                                (menu.pane_id.clone(), item.action.clone(), menu.row_id.clone());
-                            move |evt: MouseEvent| {
-                                evt.stop_propagation();
-                                on_app_pane_action.call((
-                                    pane_id.clone(),
-                                    action.clone(),
-                                    Some(row_id.clone()),
-                                ));
-                                on_close.call(());
-                            }
-                        },
-                        "{item.label}"
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[component]
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
@@ -92658,8 +92654,8 @@ fn AppPaneRailBody(
                                         // Right-click opens the app-declared row
                                         // menu as a GUI-owned floating overlay.
                                         oncontextmenu: {
-                                            let (pane_id, row_id, menu) =
-                                                (pane_id.clone(), id.clone(), menu.clone());
+                                            let (pane_id, row_id, row_title, menu) =
+                                                (pane_id.clone(), id.clone(), title.clone(), menu.clone());
                                             let mut state = state;
                                             move |evt: MouseEvent| {
                                                 if !has_menu {
@@ -92671,6 +92667,7 @@ fn AppPaneRailBody(
                                                     shell.open_app_pane_context_menu(
                                                         pane_id.clone(),
                                                         row_id.clone(),
+                                                        row_title.clone(),
                                                         menu.clone(),
                                                         (pos.x, pos.y),
                                                     );
@@ -94344,8 +94341,6 @@ fn AgentCursorOverlay(cursors: Vec<AgentPointer>) -> Element {
 
 #[component]
 fn ContextMenuOverlay(
-    /// The row the menu acts on.
-    row: BrowserRow,
     position: (f64, f64),
     window_size: (f64, f64),
     palette: Palette,
@@ -100015,6 +100010,54 @@ mod tests {
             "replies never create a channel"
         );
         assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
+    }
+
+    // The REAL "focus stolen, spam-click to type" bug: a terminal focus-reclaim
+    // yanked focus out of yedit's editor because the document surface was
+    // missing from the UI-focus-owner allowlist — and there were TWO hand-rolled
+    // copies of that allowlist which had already drifted. One list now feeds
+    // every focus-arbitration script; this test fails if a script stops using it
+    // or the surface drops out.
+    #[test]
+    fn every_focus_arbitration_script_treats_the_document_surface_as_a_focus_owner() {
+        assert!(
+            UI_FOCUS_OWNER_SELECTORS.contains(&"[data-document-surface]"),
+            "a document surface owns the keyboard while it owns the viewport"
+        );
+        let owners = ui_focus_owner_selectors_js();
+        assert!(owners.starts_with('[') && owners.ends_with(']'), "a JS array literal");
+        assert!(owners.contains("data-document-surface"));
+
+        // Script 1: the reclaim fired on activation — the one that stole focus.
+        let reclaim = terminal_reclaim_focus_script_for_session("local://x");
+        assert!(
+            reclaim.contains("data-document-surface"),
+            "the reclaim script must not steal focus from a document editor"
+        );
+        // Script 2: the xterm host's own input-ownership guard.
+        let host = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-x",
+            &terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 14.0, ""),
+            true,
+            true,
+            "test",
+        );
+        assert!(
+            host.contains("data-document-surface"),
+            "the host input guard must honour the same focus owners"
+        );
+        // Both embed the SAME list, so neither can drift from the other. Match
+        // on the attribute/id token: the JS literal escapes the inner quotes of
+        // `[data-x="1"]`, so the raw selector never appears verbatim.
+        for selector in UI_FOCUS_OWNER_SELECTORS {
+            let needle = selector
+                .split('=')
+                .next()
+                .unwrap_or(selector)
+                .trim_start_matches('[');
+            assert!(reclaim.contains(needle), "reclaim lost {selector}");
+            assert!(host.contains(needle), "host guard lost {selector}");
+        }
     }
 
     // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
