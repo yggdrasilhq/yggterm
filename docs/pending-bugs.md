@@ -28,11 +28,13 @@ fix) once the fix is verified live on jojo.
   (user-confirmed 2026-07-23).** Spawn a local yggterm terminal, `ssh <host>`,
   run `yedit` there → detection fails because `YGGTERM_SESSION_ID` does not
   cross a user-typed ssh hop. TWO halves:
-  1. **Detection — SHIPPED in code:** the daemon now also exports
-     `LC_YGGTERM_SESSION_ID` at PTY spawn (the iTerm2 `LC_TERMINAL` trick —
-     stock OpenSSH forwards `LC_*` both ways by default), and yedit falls back
-     to it. ⚠ The daemon export is DORMANT until the next daemon bump (the
-     2.12.7 daemon on jojo predates it; GUI-only deploys don't activate it).
+  1. **Detection — ACTIVE on jojo-local (2026-07-23, 2.12.8 daemon swap):**
+     the daemon exports `LC_YGGTERM_SESSION_ID` at PTY spawn (the iTerm2
+     `LC_TERMINAL` trick — stock OpenSSH forwards `LC_*` both ways by
+     default), and yedit falls back to it. Live-proven: a fresh jojo PTY
+     echoes the session key from `$LC_YGGTERM_SESSION_ID`. ⚠ PTYs owned by
+     REMOTE machines' daemons (dev/oc fleet, B1-parked) still predate the
+     export until those daemons bump.
   2. **Control-channel attribution — DESIGNED, NOT BUILT:** even with
      detection, the app's declared control endpoint is loopback on the REMOTE
      host, and the GUI resolves forwards from the SESSION's `ssh_target` —
