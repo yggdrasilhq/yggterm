@@ -1407,3 +1407,53 @@ unattended invisible run are (a) no pixel proof of a headless surface (#4), and
 (b) nothing yet re-materializes a surface *automatically* — `web ensure` is the
 explicit request that rebuilds one, which is deliberate (a heartbeat must never
 resurrect a surface the app or user closed).
+
+## Field findings — income-tax portal run (2026-07-24)
+
+An OTP-gated government portal, driven invisibly end to end (spawn `--no-activate`
+→ `web ensure` → `--session` verbs → teardown), with the login OTP read off the
+user's phone over KDE Connect. Two of these were hard blockers; both are FIXED in
+this commit. The user's view was never touched — `rebuilt_from_daemon_declare:
+true` on every ensure, so the round-12b declare ingestion removed the last reveal.
+
+1. **★★ A page JS dialog wedged a headless surface PERMANENTLY — fixed.** WebKit
+   blocks the whole web process until a script dialog is answered, and one web
+   process serves every surface on a profile. An invisible surface has nowhere to
+   show a dialog and nobody to answer it, so a single `alert()` killed the
+   surface *and every sibling on that profile*: process idle in `S`, every
+   eval/read/screenshot timing out, unrecoverable without killing the process.
+   Found because the AIS portal raised one; then reproduced deliberately with a
+   one-line `alert()` on a throwaway surface (the decisive experiment — before
+   it, "the page is busy" and "the page is blocked" looked identical, and
+   `ps` %CPU is a lifetime average that reads ~17% on a process doing nothing;
+   the honest instrument is a `/proc/<pid>/stat` delta, which read 4 ticks/5s).
+   Fix: `connect_script_dialog_guard` answers every dialog deterministically and
+   records it (traced as `web_surface.script_dialog_answered`).
+2. **★★ The answer to `beforeunload` decides whether a surface can ever leave its
+   page.** The first cut of the guard answered *every* confirm-shaped dialog with
+   "cancel", which is right for `confirm()` and catastrophic for
+   `beforeunload`: the income-tax portal arms one, so every SSO hand-off out of
+   it silently did nothing — indistinguishable from a navigation that never
+   commits, and it cost a full deploy cycle to see. `beforeunload` must answer
+   LEAVE; the navigation was already asked for.
+3. **Cross-origin SSO hand-offs are a first-class agentic-browsing case, and
+   `window.open` being a no-op is not enough.** The portal hands off to the
+   Compliance Portal by POSTing a one-shot token to another domain with
+   `target="_blank"`. Patching `HTMLFormElement.prototype.submit` to force
+   `_self` works, but only from the originating page: replaying the same token
+   from a local `http://127.0.0.1` page reaches the server and is refused
+   (`Access Denied !!`), and `fetch()` cannot do it at all (no CORS, by design).
+   Worth considering: a `web` verb that opens a declared surface *as the target
+   of a form POST*, so an agent does not have to monkey-patch the page.
+4. **Coordinate clicks are only as fresh as the layout.** A rect measured seconds
+   earlier landed on the button BELOW the intended one (the page has a
+   height-changing news ticker), and the wrong button navigated away — which read
+   as "the site rejected our login". `web do click --selector` resolves at click
+   time and is the safer verb; a coordinate click should be paired with a
+   same-instant measurement. (Also: `web eval` takes a BARE EXPRESSION —
+   `dom-eval` is the one that needs `return`.)
+5. **A stale cookie is a lying instrument.** Reading a probe's result out of a
+   cookie the *previous* probe wrote produced a confident, wholly wrong
+   conclusion ("the click lands 59px high"). Version every probe payload, or
+   clear it before the run — the same discipline the field guide already demands
+   of screenshots.

@@ -457,6 +457,108 @@ pub fn forget_seat_input(surface_id: u64) {
     });
 }
 
+// ===========================================================================
+// JS dialog guard.
+//
+// WebKit BLOCKS the page's whole web process until a script dialog is answered,
+// and one web process serves EVERY surface sharing a profile. Our surfaces are
+// routinely invisible — soft-stashed, or created headless for an agent — and an
+// invisible surface has nowhere to show a dialog and nobody to click it. So an
+// unanswered `alert()` wedges that surface and every sibling on its profile,
+// permanently: the process sits idle in `S`, and every eval/read/screenshot
+// times out. Measured live (2026-07-24) on the income-tax AIS portal, then
+// reproduced deliberately with a one-line `alert()` on a throwaway surface.
+//
+// The shell therefore answers every dialog itself, deterministically:
+//   alert        -> OK (nothing else to say)
+//   confirm      -> CANCEL — never confirm on behalf of a human who was never
+//                   shown the question; cancel is the answer that changes least
+//   beforeunload -> LEAVE. This one is the opposite call on purpose: the
+//                   navigation was already asked for (by the page, the user, or
+//                   an agent verb), and answering "stay" would PIN the surface
+//                   on its current page forever. Measured: the income-tax
+//                   portal arms `beforeunload`, so a "stay" answer silently
+//                   killed every SSO hand-off out of it — the failure looked
+//                   exactly like a navigation that never committed.
+//   prompt       -> cancel with empty text
+// The message is not lost: it is recorded per surface so the shell can trace it
+// and an agent can read what the page asked.
+// ===========================================================================
+
+/// One JS dialog a page raised and the shell answered for it.
+#[derive(Clone, Debug)]
+pub struct ScriptDialogRecord {
+    pub surface_id: u64,
+    /// `alert` | `confirm` | `prompt` | `beforeunload` | `unknown`
+    pub kind: &'static str,
+    pub message: String,
+    pub uri: String,
+    /// The answer the shell gave the page.
+    pub answered: &'static str,
+}
+
+thread_local! {
+    /// Dialogs answered but not yet consumed by the shell.
+    static SCRIPT_DIALOGS: RefCell<Vec<ScriptDialogRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Consume the dialogs answered since the last call. The shell polls this so a
+/// page's question reaches a human (or an agent's log) instead of vanishing.
+pub fn take_script_dialogs() -> Vec<ScriptDialogRecord> {
+    SCRIPT_DIALOGS.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Answer JS dialogs on this surface instead of letting WebKit block on one.
+/// See the section comment above — this is what keeps an invisible surface from
+/// becoming permanently unresponsive.
+fn connect_script_dialog_guard(webkit: &webkit2gtk::WebView, surface_id: u64) {
+    use webkit2gtk::{ScriptDialogType, WebViewExt as _};
+    webkit.connect_script_dialog(move |view, dialog| {
+        let (kind, answered) = match dialog.dialog_type() {
+            ScriptDialogType::Alert => ("alert", "ok"),
+            ScriptDialogType::Confirm => {
+                dialog.confirm_set_confirmed(false);
+                ("confirm", "cancel")
+            }
+            ScriptDialogType::BeforeUnloadConfirm => {
+                // TRUE = leave the page. See the section comment: answering
+                // "stay" pins the surface on its current page for good.
+                dialog.confirm_set_confirmed(true);
+                ("beforeunload", "leave")
+            }
+            ScriptDialogType::Prompt => {
+                dialog.prompt_set_text("");
+                ("prompt", "cancel")
+            }
+            _ => ("unknown", "ok"),
+        };
+        let message = dialog.message().map(|m| m.to_string()).unwrap_or_default();
+        let uri = view.uri().map(|u| u.to_string()).unwrap_or_default();
+        tracing::warn!(
+            surface_id,
+            kind,
+            answered,
+            %uri,
+            "web surface: answered a page JS dialog ({message})"
+        );
+        SCRIPT_DIALOGS.with(|log| {
+            let mut log = log.borrow_mut();
+            // A page in a dialog loop must not grow this without bound.
+            if log.len() < 64 {
+                log.push(ScriptDialogRecord {
+                    surface_id,
+                    kind,
+                    message,
+                    uri,
+                    answered,
+                });
+            }
+        });
+        // TRUE = handled here; WebKit resumes the page as soon as we return.
+        true
+    });
+}
+
 /// Observe real seat input on a webview: button presses, key presses, scrolls
 /// and touch — the gestures that mean "the human took this surface back".
 ///
@@ -835,6 +937,9 @@ fn build_popup_webview(
     // Gate 9: notice when the HUMAN takes this popup, so a queued agent batch
     // stops instead of landing behind them.
     connect_seat_input_observer(&webview.webview(), popup_id);
+    // Same dialog guard as a page surface: a popup is just as invisible when the
+    // surface it covers is stashed.
+    connect_script_dialog_guard(&webview.webview(), popup_id);
     // `window.close()`: the page's own report (the engine will not tell us), plus
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
@@ -1249,6 +1354,10 @@ impl WebSurfaceHost {
             // layer can tell the agent's own injection from the human (the
             // injected events are deliberately indistinguishable to the page).
             connect_seat_input_observer(&webview.webview(), id);
+            // A page dialog must never be able to wedge this surface (and every
+            // sibling on its profile) just because nothing is on screen to
+            // answer it.
+            connect_script_dialog_guard(&webview.webview(), id);
         }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
