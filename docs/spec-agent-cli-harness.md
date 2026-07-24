@@ -103,9 +103,17 @@ pub struct AgentCliDescriptor {
     pub display_name: &'static str,
     /// Where this CLI persists its own sessions on a host, relative to $HOME
     /// (globs). This is the CLI's OWN store — yggterm never writes into it.
+    /// SHIPPED 1b. `**` = any number of segments, `*` = within one segment.
+    /// The store ROOT is the glob's literal prefix — derived, never declared
+    /// twice. Two companions fell out of the port and are shipped beside it:
+    /// `store_excluded_name_fragments` (a glob cannot say "not containing", and
+    /// codex writes `.bak.` copies beside real transcripts) and
+    /// `store_home_env_override` (the CLI home a var may relocate).
     pub session_store_globs: &'static [&'static str],
     /// Extract (session_id, cwd, modified_epoch_ms, title_material) from one
     /// store file. Feeds the cwd tree scanner AND identity rebinding.
+    /// SHIPPED 1b. `title` is material the CLI recorded ITSELF: `None` for
+    /// codex is normal, not a failure — the generated-copy store answers there.
     pub read_store_entry: fn(&Path) -> Option<AgentStoreEntry>,
     /// Build the resume argv for an EXISTING session id in a cwd.
     /// The harness — not the descriptor — wraps this for transport
@@ -445,6 +453,14 @@ recognizers (shell.rs:87143/87236); the top-level persistence gates
 `session_path_is_remote_agent`, `persisted_live_session_is_recoverable`) —
 these already cover all four pathways correctly.
 
+**Added by phase 1b (2026-07-25):** the STORE is now such an island.
+`yggterm_core::agent_cli` answers where every CLI keeps its sessions and which
+files those are, for local scanners, remote scan scripts (via argv), fd-based
+identity rebinding, the clipboard sweep and the cwd-tree predicates alike.
+Build on `store_path_is_under_root` / `store_path_is_session_file` /
+`store_roots_absolute` / `CODEX_FAMILY` rather than writing a path fragment —
+a source-scan lock in each crate now fails the build if you do.
+
 ## 8. Migration order (each phase shippable alone, oldest debt first)
 
 0. **Scheme registry + predicate locks** (pure addition, no behavior change;
@@ -481,10 +497,44 @@ these already cover all four pathways correctly.
    Whether that was intent or oversight is unverified; phase 2's four-arm matrix
    settles it. Flipping it inside a "no wire changes" phase would be exactly the
    silent behavior change this phase exists to avoid.
-   **REMAINING (1b, next):** `session_store_globs` + `read_store_entry` — the
-   store scanners are spread across all three crates (`local_cc_*` in core, the
-   remote scanners in server, `CODEX_SESSIONS` in shell) and porting them is the
-   larger half. Do it as its own slice with fresh context.
+   ✅ **1b SHIPPED 2026-07-25 (store half)**: `session_store_globs`
+   (`$HOME`-relative, `**`/`*`, with `store_excluded_name_fragments` for codex's
+   `.bak.` copies and `store_home_env_override` for `YGGTERM_CODEX_HOME`) +
+   `read_store_entry -> Option<AgentStoreEntry>`. The store ROOT is *derived*
+   from each glob's literal prefix, so nothing declares it twice. Registry
+   helpers — `store_path_is_under_root`, `store_path_is_session_file`,
+   `store_file_name_is_session`, `store_home_prefix_of`, `store_roots_absolute`,
+   `home_relative_path`, `CODEX_FAMILY` + `store_path_is_under_any` /
+   `store_home_dir_name_is_any` — replaced the store layout at **twenty-three**
+   call sites across all three crates: core's two scanners, `is_codex_session_file`,
+   `local_cc_projects_dir` and `selected_path_should_expand_ancestors`; the
+   server's fd-rebinding predicates, `proc_fd_path_is_codex_sqlite`,
+   `resolve_remote_codex_home`, `remote_saved_cc_session_exists`, its own
+   `scan_local_claude_code_sessions`, `local_cc_current_session_id`,
+   `local_cc_session_registry_dir` and the clipboard sweep's root list; and the
+   shell's four path predicates plus `codex_storage_root_for_path`. **Both
+   embedded remote python scripts now take the store globs as ARGV** from the
+   descriptor (`remote_cc_scan_args`) instead of spelling `~/.claude/projects`
+   themselves — one declaration now drives both sides of the transport seam, and
+   the CC scan script has no default, so it cannot silently fall back to a second
+   encoding.
+   **Locks:** byte-for-byte glob/root locks per CLI; classification locks
+   (including the `.bak.` exclusion and CC's exactly-one-project-level depth);
+   store roots proven mutually exclusive; and a SOURCE SCAN in each crate
+   (`unregistered_store_literals`) that fails when product code re-encodes a
+   store path, with a `RecordedStoreLiteral` exception list — **all four lists
+   are EMPTY**, i.e. no product site outside the registry spells a store path
+   today. The scanner is itself tested to FIRE (a lock that can only pass is
+   worth nothing) and reports `store_literal_scan_coverage`, asserted against a
+   floor per file — because a first cut brace-counted the test-module skip, was
+   fooled by the braces in `shell.rs`'s embedded JS/CSS, and passed green while
+   seeing only a third of the file.
+   ⚠ **Recorded, not fixed:** `selected_path_should_expand_ancestors` covers the
+   codex stores but not CC's (`KNOWN_STORE_PREDICATE_HOLES`, the store-keyed twin
+   of phase 0's table, same both-directions burn-down contract); and the codex
+   home env var forks by locality — `YGGTERM_CODEX_HOME` locally vs the CLI's own
+   `CODEX_HOME` on the remote scan path. Both change what a user sees, so they
+   belong to a phase that can prove the change live.
 2. **Four-arm test matrix**: the A3 harness (jsdom/PTY-level where possible)
    so later phases can't regress one arm silently.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a

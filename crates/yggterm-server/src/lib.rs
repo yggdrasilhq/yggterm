@@ -547,12 +547,19 @@ fn passive_title_hint_can_update(current_title: &str, title_hint: &str, was_miss
         )
 }
 
+/// Whether `path` is a Claude Code transcript in CC's own store.
+///
+/// Where that store is, and which files in it are sessions, are the
+/// descriptor's answers — the same glob the local and remote scanners read, so
+/// a change to CC's layout lands in one place instead of diverging between
+/// "what we scan" and "what we recognize on an fd".
 fn is_local_claude_code_storage_session_path(path: &str) -> bool {
-    path.contains("/.claude/projects/") && path.ends_with(".jsonl")
+    yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)
+        .is_some_and(|descriptor| descriptor.store_path_is_session_file(path))
 }
 
 fn is_local_codex_storage_session_path(path: &str) -> bool {
-    path.contains("/.codex/sessions/") || path.contains("/.codex-litellm/sessions/")
+    yggterm_core::store_path_is_under_any(yggterm_core::CODEX_FAMILY, path)
 }
 
 fn normalize_proc_fd_target_path(path: &Path) -> Option<PathBuf> {
@@ -613,7 +620,7 @@ fn proc_fd_path_is_codex_sqlite(path: &Path, prefix: &str) -> bool {
     else {
         return false;
     };
-    if !matches!(parent_name, ".codex" | ".codex-litellm") {
+    if !yggterm_core::store_home_dir_name_is_any(yggterm_core::CODEX_FAMILY, parent_name) {
         return false;
     }
     path.file_name()
@@ -1220,7 +1227,18 @@ fn select_claude_code_storage_candidate(mut candidates: Vec<PathBuf>) -> Option<
 /// only sees a transcript while a write happens to be in flight, and can see
 /// a FOREIGN transcript the process opened to read history).
 fn local_cc_session_registry_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude").join("sessions"))
+    // Beside CC's transcript store, not inside it — but under the same CLI
+    // home, which the descriptor declares once.
+    yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)?
+        .home_relative_path(&dirs::home_dir()?, "sessions")
+}
+
+/// Claude Code's transcript store on THIS machine, from the descriptor.
+fn local_cc_projects_dir() -> Option<PathBuf> {
+    yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)?
+        .store_roots_absolute(&dirs::home_dir()?)
+        .into_iter()
+        .next()
 }
 
 /// `local_cc_registry_session_id_in` against an explicit registry dir (test seam).
@@ -7078,8 +7096,8 @@ impl YggtermServer {
                 return;
             }
         }
-        // Local Claude Code session — JSONL file under ~/.claude/projects/
-        if path.contains("/.claude/projects/") && path.ends_with(".jsonl") {
+        // Local Claude Code session — a transcript in CC's own store.
+        if is_local_claude_code_storage_session_path(&path) {
             self.open_local_cc_session(&path);
             return;
         }
@@ -8674,6 +8692,18 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance(
     )
 }
 
+/// Codex's home directory NAME (`.codex`), from the descriptor.
+///
+/// ⚠ The env var above it is a recorded fork (`store_home_env_override`): local
+/// resolution honours `YGGTERM_CODEX_HOME`, this remote path honours the CLI's
+/// own `CODEX_HOME`. Unifying them changes which sessions a host finds, so it
+/// belongs to phase 2's matrix, not to this refactor.
+fn codex_home_dir_name() -> &'static str {
+    yggterm_core::agent_cli_descriptor(SessionKind::Codex)
+        .and_then(|descriptor| descriptor.store_home_dir_names().first().copied())
+        .unwrap_or(".codex")
+}
+
 fn resolve_remote_codex_home() -> std::path::PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
@@ -8681,9 +8711,9 @@ fn resolve_remote_codex_home() -> std::path::PathBuf {
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
-                .map(|home| home.join(".codex"))
+                .map(|home| home.join(codex_home_dir_name()))
         })
-        .unwrap_or_else(|| std::path::PathBuf::from(".codex"))
+        .unwrap_or_else(|| std::path::PathBuf::from(codex_home_dir_name()))
 }
 
 fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
@@ -8703,10 +8733,9 @@ fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
 /// transcripts as `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, so
 /// the basename IS the session identity — no per-file identity parse needed.
 fn remote_saved_cc_session_exists(session_id: &str) -> anyhow::Result<bool> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(projects_dir) = local_cc_projects_dir() else {
         return Ok(false);
     };
-    let projects_dir = home.join(".claude").join("projects");
     let Ok(project_entries) = fs::read_dir(&projects_dir) else {
         return Ok(false);
     };
@@ -13170,17 +13199,41 @@ def scan_cc_session(jsonl_path):
         'path': jsonl_path,
     }
 
-projects_dir = Path(os.path.expanduser('~/.claude/projects'))
-if not projects_dir.exists():
-    sys.exit(0)
-for project_dir in projects_dir.iterdir():
-    if not project_dir.is_dir():
-        continue
-    for jsonl_path in project_dir.glob('*.jsonl'):
+# WHERE to look is NOT this script's decision: the caller passes CC's store
+# globs, $HOME-relative, straight from AgentCliDescriptor.session_store_globs
+# (docs/spec-agent-cli-harness.md §3). Python's `Path.glob` gives `**` and `*`
+# the same meaning the Rust matcher does, so one declaration drives both sides
+# of the transport seam. No argv ⇒ nothing to scan, deliberately: a default
+# here would be a second encoding of the store layout, which is the exact class
+# of drift this script's pinning test exists to prevent.
+home = Path(os.path.expanduser('~'))
+seen = set()
+for pattern in [a for a in sys.argv[1:] if a.strip()]:
+    for jsonl_path in home.glob(pattern):
+        key = str(jsonl_path)
+        if key in seen:
+            continue
+        seen.add(key)
         data = scan_cc_session(jsonl_path)
         if data:
             print(json.dumps(data, ensure_ascii=False))
 "#;
+
+/// The argv `REMOTE_CC_SCAN_SCRIPT` needs: CC's store globs, `$HOME`-relative,
+/// from the descriptor. The script has no default, so this is the ONLY place
+/// that decides where a remote CC scan looks — and the same value the local
+/// scanner uses.
+pub(crate) fn remote_cc_scan_args() -> Vec<String> {
+    yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)
+        .map(|descriptor| {
+            descriptor
+                .session_store_globs
+                .iter()
+                .map(|glob| (*glob).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteCcSummaryLine {
@@ -13219,7 +13272,10 @@ fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
     let machine_key = machine_key_from_ssh_target(&target.ssh_target);
-    let python_args = [String::from("~/.codex")];
+    // The CLI home to scan, from the registry — not a literal repeated here and
+    // in the scanner.
+    let codex_home_arg = format!("~/{}", codex_home_dir_name());
+    let python_args = [codex_home_arg.clone()];
 
     // Step 1: Codex/yggterm session scan. May fail if a scan is already in progress on
     // the remote (lock busy). Capture the error rather than returning early so the CC
@@ -13227,7 +13283,7 @@ fn scan_remote_machine_sessions(
     let (yggterm_lines, deferred_error) = match run_remote_yggterm_command(
         &target.ssh_target,
         target.prefix.as_deref(),
-        &["server", "remote", "scan", "~/.codex"],
+        &["server", "remote", "scan", codex_home_arg.as_str()],
         None,
     ) {
         Ok(output) => (output.lines().map(str::to_string).collect::<Vec<_>>(), None),
@@ -13286,7 +13342,7 @@ fn scan_remote_machine_sessions(
         &target.ssh_target,
         target.prefix.as_deref(),
         REMOTE_CC_SCAN_SCRIPT,
-        &[],
+        &remote_cc_scan_args(),
     ) {
         Err(ref cc_err) => {
             if let Ok(home) = resolve_yggterm_home() {
@@ -13412,9 +13468,8 @@ pub(crate) fn poll_remote_local_codex_identities(
 }
 
 pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
-    let projects_dir = match dirs::home_dir() {
-        Some(home) => home.join(".claude").join("projects"),
-        None => return Vec::new(),
+    let Some(projects_dir) = local_cc_projects_dir() else {
+        return Vec::new();
     };
     let Ok(project_entries) = fs::read_dir(&projects_dir) else {
         return Vec::new();
@@ -13430,7 +13485,7 @@ pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
         };
         for session_entry in session_entries.flatten() {
             let file_path = session_entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            if !is_local_claude_code_storage_session_path(&file_path.display().to_string()) {
                 continue;
             }
             let Some(file_path_str) = file_path.to_str().map(ToOwned::to_owned) else {
@@ -19939,7 +19994,7 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
             std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".codex")
+                .join(codex_home_dir_name())
         });
     let scan_roots = remote_scan_roots(&requested_home, codex_home);
     let yggterm_home = resolve_yggterm_home()?;
@@ -22115,7 +22170,7 @@ fn local_cc_resume_cwd(session_id: &str) -> Option<String> {
 /// avoids ever picking a foreign session just because it was used more
 /// recently (which would collide with that still-live session).
 fn local_cc_current_session_id(candidates: &[&str]) -> String {
-    match dirs::home_dir().map(|home| home.join(".claude").join("projects")) {
+    match local_cc_projects_dir() {
         Some(projects_dir) => local_cc_current_session_id_in(&projects_dir, candidates),
         None => candidates[0].to_string(),
     }
@@ -22583,6 +22638,43 @@ mod tests {
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
         select_claude_code_storage_candidate,
     };
+
+    // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
+
+    /// Sites in this crate still allowed to spell a store path by hand. The
+    /// list should only ever shrink — each entry is a place a fourth agent CLI
+    /// would have to be remembered.
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[];
+
+    #[test]
+    fn no_store_path_literal_outside_the_agent_cli_registry() {
+        let source = include_str!("lib.rs");
+        // The scanner must actually SEE this file — it went blind once.
+        let (scanned, _skipped) = yggterm_core::store_literal_scan_coverage(source);
+        assert!(
+            scanned > 20000,
+            "the store-literal scan covered only {scanned} lines of lib.rs — its \
+             test-module skip is swallowing product code"
+        );
+        let findings = yggterm_core::unregistered_store_literals(source, RECORDED_STORE_LITERALS);
+        assert!(
+            findings.is_empty(),
+            "these re-encode an agent CLI's store layout — ask the descriptor \
+             (yggterm_core::agent_cli_descriptor) instead, or record the site in \
+             RECORDED_STORE_LITERALS with a reason: {findings:?}"
+        );
+    }
+
+    /// The remote CC scan is driven by the descriptor's globs, so the script
+    /// and the local scanner cannot look in different places. Pins the argv the
+    /// production call site builds.
+    #[test]
+    fn remote_cc_scan_args_come_from_the_descriptor() {
+        assert_eq!(
+            super::remote_cc_scan_args(),
+            vec![".claude/projects/*/*.jsonl"]
+        );
+    }
 
     // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
     // Both directions: a scheme the registry expects that the predicate does
@@ -34608,8 +34700,12 @@ terminal_window_id: None,
         )
         .unwrap();
 
+        // Same argv the production call site passes — the descriptor's globs.
+        // Running the script any other way would test a scan the product never
+        // performs.
         let mut child = std::process::Command::new("python3")
             .arg("-")
+            .args(super::remote_cc_scan_args())
             .env("HOME", &root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

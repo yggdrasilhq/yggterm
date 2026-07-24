@@ -28,6 +28,13 @@ use time::OffsetDateTime;
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 pub use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
 
+pub use agent_cli::{
+    AGENT_CLIS, AgentCliDescriptor, AgentStoreEntry, CODEX_FAMILY, RecordedStoreLiteral,
+    ResumeSelector, agent_cli_descriptor, agent_cli_for_store_path,
+    agent_cli_for_store_session_file, all_agent_cli_store_path_fragments,
+    store_home_dir_name_is_any, store_literal_scan_coverage, store_path_is_under_any,
+    unregistered_store_literals,
+};
 pub use app_registry::{
     APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
     write_app_manifest,
@@ -1464,14 +1471,19 @@ fn session_node_name(path: &Path, include_codex_files: bool) -> String {
         .unwrap_or_else(|| String::from("sessions"))
 }
 
+/// Whether `path` names a codex session transcript.
+///
+/// NAME-level on purpose: the codex tree walk runs against
+/// `resolve_codex_home()`, which `YGGTERM_CODEX_HOME` can point anywhere, so a
+/// root-containment test would silently stop finding sessions on a relocated
+/// store. The pattern itself comes from the descriptor — one place declares
+/// what a codex transcript is called.
 fn is_codex_session_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-
-    file_name.starts_with("rollout-")
-        && file_name.ends_with(".jsonl")
-        && !file_name.contains(".bak.")
+    agent_cli_descriptor(SessionKind::Codex)
+        .is_some_and(|descriptor| descriptor.store_file_name_is_session(file_name))
 }
 
 fn codex_leaf_label(path: &Path) -> String {
@@ -1639,55 +1651,63 @@ pub fn scan_local_codex_sessions(
 /// `scan_local_codex_sessions` so both flow through the same tree builder.
 /// Per [[spec-cwd-tree-agent-cli-unified]] this replaces the prior
 /// post-hoc `inject_file_backed_cc_session_rows` injection path.
+/// Where CC keeps its sessions, and which files are sessions, are the
+/// descriptor's answers (harness spec §3) — not this function's.
 pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    let projects_dir = home.join(".claude").join("projects");
-    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+    let Some(descriptor) = agent_cli_descriptor(SessionKind::ClaudeCode) else {
         return Vec::new();
     };
     let mut sessions = Vec::new();
-    for project_entry in project_entries.flatten() {
-        let project_path = project_entry.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Ok(session_entries) = fs::read_dir(&project_path) else {
+    for projects_dir in descriptor.store_roots_absolute(&home) {
+        let Ok(project_entries) = fs::read_dir(&projects_dir) else {
             continue;
         };
-        for session_entry in session_entries.flatten() {
-            let file_path = session_entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        for project_entry in project_entries.flatten() {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
                 continue;
             }
-            let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&file_path) else {
+            let Ok(session_entries) = fs::read_dir(&project_path) else {
                 continue;
             };
-            let title = read_cc_session_title(&file_path).ok().flatten();
-            let detail = read_cc_session_context(&file_path)
-                .ok()
-                .filter(|s| !s.trim().is_empty());
-            let modified_epoch_ms = fs::metadata(&file_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or_default();
-            sessions.push(LocalAgentSessionSummary {
-                kind: SessionKind::ClaudeCode,
-                file_path,
-                session_id,
-                cwd,
-                title,
-                detail,
-                modified_epoch_ms,
-            });
+            for session_entry in session_entries.flatten() {
+                let file_path = session_entry.path();
+                if !descriptor.store_path_is_session_file(&file_path.display().to_string()) {
+                    continue;
+                }
+                let Some(entry) = (descriptor.read_store_entry)(&file_path) else {
+                    continue;
+                };
+                sessions.push(LocalAgentSessionSummary {
+                    kind: SessionKind::ClaudeCode,
+                    file_path,
+                    session_id: entry.session_id,
+                    cwd: entry.cwd,
+                    title: entry.title,
+                    detail: entry.detail,
+                    modified_epoch_ms: entry.modified_epoch_ms,
+                });
+            }
         }
     }
     sessions
 }
 
+/// The codex arm of the store read.
+///
+/// It deliberately calls the FALLIBLE identity reader rather than the
+/// descriptor's `read_store_entry`: an `Option` erases *why* a read failed, and
+/// this scanner's caller propagates an unreadable transcript instead of
+/// silently dropping it. Both wrap one implementation
+/// (`read_codex_session_identity`), so the two arities cannot diverge —
+/// changing what a codex session file contains still means changing one place.
+///
+/// Codex records no title in its own transcript, so the generated-copy store
+/// answers here: the descriptor supplies material, generation stays one shared
+/// chore (spec §3).
 fn read_local_codex_session_summary(
     path: &Path,
     title_resolver: Option<&SessionTitleResolver>,
@@ -1732,7 +1752,10 @@ pub fn local_cc_session_jsonl_path(session_id: &str) -> Option<PathBuf> {
 }
 
 fn local_cc_projects_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude").join("projects"))
+    agent_cli_descriptor(SessionKind::ClaudeCode)?
+        .store_roots_absolute(&dirs::home_dir()?)
+        .into_iter()
+        .next()
 }
 
 /// `local_cc_session_jsonl_path` against an explicit projects dir — the seam the
@@ -2433,6 +2456,29 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No hand-written store path may survive in this crate outside the
+    /// registry. The structural half of phase 1b: eleven copies of
+    /// `"/.codex/sessions/"` accumulated because every author added theirs by
+    /// hand and nothing objected.
+    #[test]
+    fn no_store_path_literal_outside_the_agent_cli_registry() {
+        let source = include_str!("lib.rs");
+        // The scanner must actually SEE this file — it went blind once.
+        let (scanned, _skipped) = agent_cli::store_literal_scan_coverage(source);
+        assert!(
+            scanned > 2000,
+            "the store-literal scan covered only {scanned} lines of lib.rs — its \
+             test-module skip is swallowing product code"
+        );
+        let findings = agent_cli::unregistered_store_literals(source, &[]);
+        assert!(
+            findings.is_empty(),
+            "these re-encode an agent CLI's store layout — ask the descriptor \
+             (yggterm_core::agent_cli) instead, or record the site with a reason: \
+             {findings:?}"
+        );
+    }
 
     /// A local CC session's cwd comes from its TRANSCRIPT, not from the row.
     ///
