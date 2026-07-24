@@ -464,6 +464,27 @@ these already cover all four pathways correctly.
 1. **Descriptor extraction**: introduce `AgentCliDescriptor` for codex + CC;
    port `resume_argv`/`launch_argv` construction and the store scanners onto
    it; delete the per-arm builders as each caller moves. No wire changes.
+   ✅ **1a SHIPPED 2026-07-24 (invocation half)**: `yggterm_core::agent_cli` —
+   `AgentCliDescriptor` + `AGENT_CLIS` for all three shipped kinds, carrying
+   `binary_name`, `resume_selector` (`Flag("--resume")` vs
+   `Subcommand("resume")`), `resume_re_roots_with_cwd` and
+   `content_rederives_on_resume`. **`SessionKind::is_agent()` is now DERIVED
+   from the registry**, so a CLI without a descriptor is impossible by
+   construction. The launch-command builder's `is_claude` / `matches!(kind,
+   Codex) && has_cwd` branch pair is GONE — it asks the descriptor for tokens.
+   Locks: descriptor-presence ≡ `is_agent()`, one descriptor per kind,
+   `ManagedCliTool::binary_name()` ≡ `descriptor.binary_name` (provisioning and
+   invocation must name one executable), and a byte-for-byte lock on the four
+   shipped invocation strings so a refactor cannot smuggle a behavior change.
+   ⚠ **Recorded, not fixed:** `CodexLiteLlm` does NOT re-root with `-C "$PWD"`,
+   because the pre-descriptor builder gated that on `SessionKind::Codex` alone.
+   Whether that was intent or oversight is unverified; phase 2's four-arm matrix
+   settles it. Flipping it inside a "no wire changes" phase would be exactly the
+   silent behavior change this phase exists to avoid.
+   **REMAINING (1b, next):** `session_store_globs` + `read_store_entry` — the
+   store scanners are spread across all three crates (`local_cc_*` in core, the
+   remote scanners in server, `CODEX_SESSIONS` in shell) and porting them is the
+   larger half. Do it as its own slice with fresh context.
 2. **Four-arm test matrix**: the A3 harness (jsdom/PTY-level where possible)
    so later phases can't regress one arm silently.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a

@@ -1219,6 +1219,67 @@ mod tests {
     // with claude's own conventions: `--resume <id>` flag, not the codex
     // `resume` subcommand. A wrong shape here silently breaks every CC
     // launch/resume once the managed lane takes over from the legacy builder.
+    // Two tables now name the same executable: `ManagedCliTool` (provisioning
+    // owns install/version) and the harness descriptor (invocation shape). They
+    // must agree, or a CLI is provisioned under one name and invoked under
+    // another — silent until a session refuses to launch.
+    #[test]
+    fn managed_cli_tool_and_descriptor_agree_on_every_binary_name() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let tool = ManagedCliTool::from_session_kind(descriptor.kind).unwrap_or_else(|| {
+                panic!("{:?} has a descriptor but no managed tool", descriptor.kind)
+            });
+            assert_eq!(
+                tool.binary_name(),
+                descriptor.binary_name,
+                "{:?}: provisioning and invocation must name one binary",
+                descriptor.kind
+            );
+        }
+    }
+
+    // Byte-for-byte lock on the invocations the descriptor now builds. These
+    // strings are what actually reaches the PTY, and phase 1 is a REFACTOR —
+    // any change here is a behavior change wearing a refactor's clothes.
+    #[test]
+    fn descriptor_built_invocations_match_the_shipped_strings() {
+        let quoted = shell_single_quote("019d-abc");
+        let codex = yggterm_core::agent_cli::agent_cli_descriptor(SessionKind::Codex).unwrap();
+        assert_eq!(
+            format!(
+                "codex{}",
+                join_invocation_tokens(&codex.resume_tokens(&quoted, true))
+            ),
+            "codex resume -C \"$PWD\" '019d-abc'"
+        );
+        assert_eq!(
+            format!(
+                "codex{}",
+                join_invocation_tokens(&codex.resume_tokens(&quoted, false))
+            ),
+            "codex resume '019d-abc'"
+        );
+        let claude =
+            yggterm_core::agent_cli::agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        assert_eq!(
+            format!(
+                "claude{}",
+                join_invocation_tokens(&claude.resume_tokens(&quoted, true))
+            ),
+            "claude --resume '019d-abc'"
+        );
+        assert_eq!(
+            format!(
+                "claude{}",
+                join_invocation_tokens(&claude.resume_picker_tokens())
+            ),
+            "claude --resume"
+        );
+        // A plain launch carries no tokens at all — byte-identical to the
+        // pre-descriptor `format!("{bin}{extra}")`.
+        assert_eq!(join_invocation_tokens(&[]), "");
+    }
+
     #[test]
     fn managed_cli_supports_claude_code() {
         assert_eq!(
@@ -1544,57 +1605,64 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
     }
     parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
     let extra_args = configured_cli_extra_args(kind);
-    // Claude resumes via `--resume <id>` (flag), the codex CLIs via the
-    // `resume` subcommand — same conventions the legacy launch builder uses.
-    let is_claude = tool == ManagedCliTool::ClaudeCode;
+    // Invocation SHAPE is descriptor data now (harness spec §3, phase 1): which
+    // CLI takes `--resume <id>` vs `resume <id>`, and which re-roots with
+    // `-C "$PWD"`, is answered once in `yggterm_core::agent_cli` instead of by
+    // an `is_claude` branch here — the fork class §7 inventories. The binary
+    // name still comes from `ManagedCliTool` because provisioning owns it; the
+    // descriptor and the tool are locked to the same string by
+    // `managed_cli_tool_and_descriptor_agree_on_every_binary_name`.
+    //
+    // Per [[project-purpose]] wrapper-vs-manual parity rule the tokens carry
+    // ONLY what the manual `ssh -t <machine> codex resume <UUID>` path uses:
+    // the manual case produces correct scrollback without `--no-alt-screen`,
+    // and adding it here was a wrong-headed guess. The real wrapper-vs-manual
+    // divergence lives in yggterm's PTY/preservation path, not in CLI flags.
+    let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kind);
     let invocation = match action {
         ManagedCliAction::Launch => format!("{}{}", tool.binary_name(), extra_args),
         ManagedCliAction::ResumePicker { persistent } => {
             let prefix = if persistent { "exec " } else { "" };
-            if is_claude {
-                format!("{prefix}{}{} --resume", tool.binary_name(), extra_args)
-            } else {
-                format!("{prefix}{}{} resume", tool.binary_name(), extra_args)
-            }
+            let tokens = descriptor
+                .map(|descriptor| descriptor.resume_picker_tokens())
+                .unwrap_or_default();
+            format!(
+                "{prefix}{}{}{}",
+                tool.binary_name(),
+                extra_args,
+                join_invocation_tokens(&tokens)
+            )
         }
         ManagedCliAction::Resume {
             session_id,
             persistent,
         } => {
-            // Per [[project-purpose]] wrapper-vs-manual parity rule: add
-            // ONLY flags the manual `ssh -t <machine> codex resume <UUID>`
-            // path uses. The manual case produces correct scrollback
-            // without `--no-alt-screen`; adding it here was a wrong-headed
-            // guess that didn't match the manual baseline. The real
-            // wrapper-vs-manual divergence is in yggterm's PTY/preservation
-            // path, not in codex flags.
             let prefix = if persistent { "exec " } else { "" };
-            if is_claude {
-                format!(
-                    "{prefix}{}{} --resume {}",
-                    tool.binary_name(),
-                    extra_args,
-                    shell_single_quote(session_id)
-                )
-            } else if matches!(kind, SessionKind::Codex) && has_cwd {
-                format!(
-                    "{prefix}{}{} resume -C \"$PWD\" {}",
-                    tool.binary_name(),
-                    extra_args,
-                    shell_single_quote(session_id)
-                )
-            } else {
-                format!(
-                    "{prefix}{}{} resume {}",
-                    tool.binary_name(),
-                    extra_args,
-                    shell_single_quote(session_id)
-                )
-            }
+            let quoted = shell_single_quote(session_id);
+            let tokens = descriptor
+                .map(|descriptor| descriptor.resume_tokens(&quoted, has_cwd))
+                .unwrap_or_else(|| vec![quoted.clone()]);
+            format!(
+                "{prefix}{}{}{}",
+                tool.binary_name(),
+                extra_args,
+                join_invocation_tokens(&tokens)
+            )
         }
     };
     parts.push(invocation);
     Ok(parts.join(" && "))
+}
+
+/// Join descriptor invocation tokens onto a command, each space-prefixed.
+///
+/// Empty tokens ⇒ empty string, so a plain launch stays byte-identical to the
+/// pre-descriptor `format!("{bin}{extra}")`.
+fn join_invocation_tokens(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| format!(" {token}"))
+        .collect::<String>()
 }
 
 fn configured_cli_extra_args(kind: SessionKind) -> String {
