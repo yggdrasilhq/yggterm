@@ -127095,15 +127095,27 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!provider.can_edit);
     }
 
+    /// A plain shell has NO conversation — this test used to assert the
+    /// opposite, pinning the very behaviour the user reported: opening a yedit
+    /// session (a shell hosting a document app) showed a "Terminal transcript /
+    /// Saved terminal output" reader captioned "web view", a surface that
+    /// session was never meant to have. The routing now keeps a shell out of
+    /// `Rendered` entirely (`row_offers_rendered_view`); this asserts the
+    /// renderer would show nothing rather than invent a conversation even if it
+    /// were reached.
     #[test]
-    fn terminal_conversation_provider_is_read_only_terminal_transcript() {
-        let session = test_managed_conversation_session(SessionKind::SshShell);
-
-        let provider = conversation_provider_model_for_session(&session);
-
-        assert_eq!(provider.kind, "terminal-transcript");
-        assert!(provider.read_only);
-        assert!(!provider.can_send);
+    fn a_plain_shell_has_no_conversation_to_render() {
+        for kind in [SessionKind::Shell, SessionKind::SshShell] {
+            let session = test_managed_conversation_session(kind);
+            let provider = conversation_provider_model_for_session(&session);
+            assert_eq!(provider.kind, "none", "{kind:?} must not invent a transcript");
+            assert!(provider.read_only);
+            assert!(!provider.can_send);
+            assert!(
+                !kind.offers_rendered_view(),
+                "{kind:?} must not be routed into the rendered view in the first place"
+            );
+        }
     }
 
     #[test]
