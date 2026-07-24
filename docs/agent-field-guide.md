@@ -167,6 +167,13 @@ The live host runs the daemon from `~/.local/bin/`, but remote wrappers invoke
 `cp -a` each to `*.rollback` first, then **`mv` the new binary in — never `cp`**
 (cp over a running binary is `ETXTBSY`).
 
+⚠ **Cap the rollbacks — they are ~48 MB each and pile up fast.** A single
+`*.rollback` per dir would be overwritten each swap, but a dated/named rollback
+(`.rollback-<fix>`) accumulates: a day of swaps left 26 of them (~1.2 GB) on a
+host already thrashing swap. After staging the new binary, prune to the two
+newest per dir: `ls -t "$dir"/yggterm.rollback* | tail -n +3 | xargs -r rm -f`.
+The junk that makes the fan angry is often our own deploy residue.
+
 ### 4.3 The recipe that works (cross-version, no fight)
 
 ```bash
