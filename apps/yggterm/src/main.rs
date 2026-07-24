@@ -908,6 +908,7 @@ fn print_server_help() {
   yggterm server shutdown
   yggterm server terminal write <session> (--data <data>|--stdin)
   yggterm server terminal screen <session> [--retained] [--raw] [--history]
+  yggterm server terminal app-declares <session>
   yggterm server terminal resize <session> --cols <n> --rows <n>
   yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
@@ -1695,6 +1696,27 @@ fn main() -> Result<()> {
                 "history_row_count": rows.len(),
                 "nonblank_row_count": nonblank,
                 "rows": rows,
+            }))?
+        );
+        return Ok(());
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"
+    {
+        // Read-only: what the daemon retained off this session's OSC 7717
+        // channel (the app's latest web-surface / sidebar payload). This is
+        // what `web ensure` rebuilds a never-revealed or reaped surface from,
+        // so it is also the first thing to look at when a rebuild answers
+        // "no declared web surface". Connect directly like the other read-only
+        // diagnostics — no version gate, no daemon spawn.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let (records, running) = yggterm_server::terminal_app_declares(&endpoint, &args[3])?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_path": args[3],
+                "running": running,
+                "declare_count": records.len(),
+                "declares": records,
             }))?
         );
         return Ok(());
