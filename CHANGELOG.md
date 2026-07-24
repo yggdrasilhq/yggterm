@@ -2,6 +2,25 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.10
+
+- **Fixed: an app's page can be brought back without putting it on your screen.**
+  A program running in a session tells yggterm about its page over the terminal
+  stream, and until now only the on-screen terminal was listening. So a page that
+  had been put away (or one belonging to a session you had never opened) could
+  not be brought back at all — the message that would have rebuilt it had been
+  read by something that no longer existed. yggterm now also listens where the
+  session actually lives, and keeps each app's latest message, so the page can be
+  rebuilt on request. Nothing that needs your presence is kept or replayed.
+- **Fixed: reading a session's screen no longer requires opening it.** Asking for
+  the contents of a session you have never opened used to answer "no terminal",
+  which is when you most want to look. It now answers from the session's own
+  screen and says where the answer came from.
+- **Fixed: yggterm re-announces itself if its registration goes missing.** The
+  window registered itself once at startup; if that registration was lost, the
+  window kept working while becoming invisible to everything that looks up "which
+  window do I talk to". It now notices and re-registers.
+
 ## 2.12.9
 
 - **Fixed: moving a Claude Code session with `/cd` now moves it in the cwd tree,
