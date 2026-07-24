@@ -579,6 +579,33 @@ impl DesktopService {
         }
     }
 
+    /// Throttle/unthrottle a soft-stashed surface's CPU by hiding/showing its
+    /// inner webview (WebKitGTK page-visibility). See `WebSurfaceHost::set_throttled`.
+    pub fn throttle_web_surface(&self, id: u64, throttled: bool) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.set_throttled(id, throttled),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, throttled);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Re-attach a stashed web surface at the given bounds and show it.
     pub fn unstash_web_surface(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
         #[cfg(not(any(

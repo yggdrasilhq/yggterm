@@ -3901,6 +3901,18 @@ async fn web_surface_native_reconcile_loop(
                         // reveal is "cut the hole" over live pixels), demoted
                         // so it can never occlude the active page's hole.
                         let _ = desktop.demote_web_surface(entry.native_id);
+                        // ...but a demoted-yet-mapped WebKitGTK view keeps its
+                        // rAF/timers/compositor paint at full CPU — an animating
+                        // background page burns a whole core (the "angry fan").
+                        // Hide the inner webview so the page throttles
+                        // (document.hidden) while the container stays attached
+                        // for an instant raise-reveal. A LEASED surface is an
+                        // agent co-browsing in the background: leave it live.
+                        let leased = web_surface_lease_until_ms(&state, &key.0, key.1)
+                            .is_some_and(|until| until > now_ms);
+                        if !leased {
+                            let _ = desktop.throttle_web_surface(entry.native_id, true);
+                        }
                     }
                     entry.stashed_at_ms = Some(now_ms);
                     entry.visible = false;
@@ -4955,6 +4967,15 @@ fn resolve_web_surface_effective_url(
     }
     (url.to_string(), None, None)
 }
+/// How stale a retained declare may be and still rebuild a surface.
+///
+/// A live libyggterm app re-emits its full payload every ~4s, so a record this
+/// old means the app is gone — and an app that is gone has no control endpoint
+/// to answer the surface it would get. Same spirit as the GUI's own 15s
+/// heartbeat expiry: a `close` clears the record, and silence eventually means
+/// the same thing.
+const WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS: u64 = 30_000;
+
 /// The `open` a retained `web-surface` declare stands for.
 struct DeclaredWebSurfaceOpen {
     url: String,
@@ -5015,12 +5036,30 @@ async fn rebuild_web_surface_from_daemon_declare(
         .await
         .map(|(records, _running)| records)
         .unwrap_or_default();
+    let now_ms = current_millis();
     let Some((record, open)) = declares
         .into_iter()
         .find(|record| record.verb == "web-surface")
+        .filter(|record| {
+            let age_ms = now_ms.saturating_sub(record.at_ms);
+            if age_ms > WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "daemon_declare_too_stale",
+                    json!({
+                        "session_path": session_path,
+                        "age_ms": age_ms,
+                        "max_age_ms": WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS,
+                    }),
+                );
+                return false;
+            }
+            true
+        })
         .and_then(|record| {
-            declared_web_surface_open_from_payload(&record.payload)
-                .map(|open| (record, open))
+            declared_web_surface_open_from_payload(&record.payload).map(|open| (record, open))
         })
     else {
         return false;
@@ -5057,7 +5096,7 @@ async fn rebuild_web_surface_from_daemon_declare(
         ssh_target,
         "daemon_declare_rebuild",
         claimed_session.as_deref(),
-        current_millis(),
+        now_ms,
     )
     .await
 }
@@ -51774,10 +51813,13 @@ async fn process_pending_app_control_requests(
             // or whose surface the reaper collected has nothing in
             // `web_surfaces` — but the daemon kept the app's declare. Rebuild
             // from it BEFORE answering, so `ensure` means ensure.
-            let rebuilt_from_daemon_declare = state
-                .with(|shell| !shell.web_surfaces.contains_key(&session_path))
-                && rebuild_web_surface_from_daemon_declare(state, home.clone(), &session_path)
-                    .await;
+            let rebuilt_from_daemon_declare = state.with(|shell| {
+                shell
+                    .web_surfaces
+                    .get(&session_path)
+                    .map(|surface| surface.tabs.is_empty())
+                    .unwrap_or(true)
+            }) && rebuild_web_surface_from_daemon_declare(state, home.clone(), &session_path).await;
             let tabs = state.with_mut(|shell| {
                 let tabs = shell
                     .web_surfaces
