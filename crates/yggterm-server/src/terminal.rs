@@ -1,3 +1,4 @@
+use crate::app_declare::{AppDeclareLog, AppDeclareRecord, AppDeclareScanner};
 use crate::codex_cli::{
     TerminalIdentityColorProfile, normalize_terminal_identity_color,
     terminal_identity_appearance_from_environment,
@@ -140,6 +141,24 @@ struct TerminalProtocolProfile {
 
 impl TerminalProtocolProfile {
     fn from_launch_command(launch_command: &str) -> Self {
+        Self::from_launch_command_with_host_profile(
+            launch_command,
+            terminal_identity_color_profile_from_environment(),
+        )
+    }
+
+    /// The host's ambient color profile is an INPUT, not an ambient read.
+    ///
+    /// It used to be read inside this function, which made every test of the
+    /// launch-command path depend on the environment the suite happened to run
+    /// in — and the suite is usually run from a terminal INSIDE yggterm, whose
+    /// PTY carries `YGGTERM_TERMINAL_COLOR_*`. Three colour tests failed only
+    /// there, which is the worst kind of failure: it looks like the change under
+    /// test broke something.
+    fn from_launch_command_with_host_profile(
+        launch_command: &str,
+        host_profile: Option<TerminalIdentityColorProfile>,
+    ) -> Self {
         let appearance = infer_terminal_appearance_from_launch_command(launch_command)
             .or_else(
                 || match terminal_identity_appearance_from_environment().as_str() {
@@ -164,7 +183,7 @@ impl TerminalProtocolProfile {
             },
         };
         terminal_identity_color_profile_from_launch_command(launch_command)
-            .or_else(terminal_identity_color_profile_from_environment)
+            .or(host_profile)
             .and_then(|profile| base.with_color_profile(&profile))
             .unwrap_or(base)
     }
@@ -700,6 +719,13 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.history_rows())
     }
 
+    /// The libyggterm declares the daemon has retained for this session (the
+    /// app's latest `web-surface` / `sidebar` payloads). Empty for a plain
+    /// shell, and empty again once the app emits its `close`.
+    pub fn session_app_declares(&self, key: &str) -> Option<Vec<AppDeclareRecord>> {
+        self.sessions.get(key).map(|session| session.app_declares())
+    }
+
     pub fn session_keys(&self) -> Vec<String> {
         let mut keys = self
             .sessions
@@ -1080,6 +1106,12 @@ struct PtySessionRuntime {
     current_cols: Arc<AtomicU16>,
     current_rows: Arc<AtomicU16>,
     screen_state: Arc<Mutex<TerminalScreenState>>,
+    /// The latest libyggterm OSC 7717 declare per verb, lifted off this
+    /// session's stream by the daemon itself. The GUI's xterm parser reads the
+    /// same bytes, but only while a client host is mounted — this copy is what
+    /// lets a never-revealed session's surfaces be materialized, and a reaped
+    /// one be rebuilt, with no reveal. See [`crate::app_declare`].
+    app_declares: Arc<Mutex<AppDeclareLog>>,
     launch_command: String,
     cwd: Option<String>,
 }
@@ -1466,6 +1498,8 @@ impl PtySessionRuntime {
         let reader_eof_without_output = Arc::clone(&eof_without_output);
         let reader_attach_ready_seen = Arc::clone(&attach_ready_seen);
         let reader_screen_state = Arc::clone(&screen_state);
+        let app_declares = Arc::new(Mutex::new(AppDeclareLog::new()));
+        let reader_app_declares = Arc::clone(&app_declares);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
         let terminal_protocol_profile =
@@ -1486,6 +1520,7 @@ impl PtySessionRuntime {
                 let mut pending_utf8 = Vec::<u8>::new();
                 let mut protocol_filter = TerminalProtocolFilter::default();
                 let mut agent_error_scanner = AgentSessionErrorScanner::default();
+                let mut app_declare_scanner = AppDeclareScanner::new();
                 let mut saw_any_output = false;
                 loop {
                     match reader.read(&mut buffer) {
@@ -1587,6 +1622,12 @@ impl PtySessionRuntime {
                             if let Ok(mut screen_state) = reader_screen_state.lock() {
                                 screen_state.process(data.as_bytes());
                             }
+                            ingest_app_declares(
+                                &mut app_declare_scanner,
+                                &reader_app_declares,
+                                &key_label,
+                                &data,
+                            );
                             for hit in agent_error_scanner
                                 .scan(&strip_terminal_control_sequences(&data), now_millis())
                             {
@@ -1677,9 +1718,18 @@ impl PtySessionRuntime {
             current_cols,
             current_rows,
             screen_state,
+            app_declares,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
+    }
+
+    /// The declares this session's app currently stands behind.
+    fn app_declares(&self) -> Vec<AppDeclareRecord> {
+        self.app_declares
+            .lock()
+            .map(|log| log.records())
+            .unwrap_or_default()
     }
 
     fn matches_spec(&self, launch_command: &str, cwd: Option<&str>) -> bool {
@@ -2486,6 +2536,60 @@ fn find_uuid_in_text(text: &str) -> Option<String> {
     None
 }
 
+/// Lift libyggterm declares out of a chunk and retain the latest per verb.
+///
+/// Runs on every PTY chunk, so the scanner's no-escape fast path matters: the
+/// cost on ordinary output is one `contains('\x1b')`. Only a state CHANGE is
+/// traced — an app heartbeats its full payload every ~4s, and tracing each one
+/// would bury the trace in noise for zero diagnostic value.
+fn ingest_app_declares(
+    scanner: &mut AppDeclareScanner,
+    log: &Arc<Mutex<AppDeclareLog>>,
+    path: &str,
+    data: &str,
+) {
+    let messages = scanner.scan(data);
+    if messages.is_empty() {
+        return;
+    }
+    let now_ms = now_millis();
+    // Identity of the retained STATE, ignoring the timestamp and seq a
+    // heartbeat refreshes — otherwise every heartbeat looks like a change.
+    let state_of = |records: &[AppDeclareRecord]| {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.verb.clone(),
+                    record.action.clone(),
+                    record.payload.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for message in messages {
+        let Ok(mut log) = log.lock() else {
+            return;
+        };
+        let before = state_of(&log.records());
+        let verb = message.verb.clone();
+        let action = message.action.clone();
+        log.ingest(message, now_ms);
+        let after = log.records();
+        if before != state_of(&after) {
+            trace_terminal_event(
+                "app_declare_ingested",
+                serde_json::json!({
+                    "path": path,
+                    "verb": verb,
+                    "action": action,
+                    "retained_verbs": after.iter().map(|record| record.verb.clone()).collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+}
+
 fn record_agent_session_error(path: &str, launch_command: &str, hit: &AgentSessionErrorHit) {
     let payload = serde_json::json!({
         "path": path,
@@ -3144,6 +3248,42 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    /// A child that asks the terminal for its foreground colour and reports
+    /// whether the answer matched `YGG_EXPECT_FG_HEX` (hex so no escape
+    /// sequence has to survive shell quoting).
+    const OSC_COLOR_QUERY_CHILD: &str = r#"python3 - <<'PY'
+import os
+import select
+import sys
+import termios
+import tty
+
+fd = os.open('/dev/tty', os.O_RDWR | getattr(os, 'O_NOCTTY', 0))
+old = termios.tcgetattr(fd)
+data = b''
+try:
+    tty.setraw(fd)
+    os.write(fd, b'\x1b]10;?\x1b\\')
+    ready, _, _ = select.select([fd], [], [], 2.0)
+    if ready:
+        data = os.read(fd, 64)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    os.close(fd)
+
+expected = bytes.fromhex(os.environ['YGG_EXPECT_FG_HEX'])
+sys.stdout.write('COLOR_OK\n' if data == expected else f'COLOR_BAD:{data!r} want {expected!r}\n')
+PY"#;
+
+    /// The protocol profile for a launch command, with NO host colour profile.
+    ///
+    /// The suite is normally run from a terminal inside yggterm, whose PTY
+    /// carries `YGGTERM_TERMINAL_COLOR_*`; reading those made three colour
+    /// assertions fail there and nowhere else. Tests state their own input.
+    fn test_protocol_profile(launch_command: &str) -> TerminalProtocolProfile {
+        TerminalProtocolProfile::from_launch_command_with_host_profile(launch_command, None)
+    }
+
     // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
 
     #[test]
@@ -3267,9 +3407,22 @@ mod tests {
             Some("local://abc"),
             "the LC_ mirror is the only identity that survives a user-typed ssh hop"
         );
+        // "Sets nothing" — asserted as a DIFF, not as absence: a CommandBuilder
+        // inherits this process' environment, and this suite is usually run
+        // from a terminal inside yggterm, which exports the very variable the
+        // old `is_none()` demanded be missing.
         let mut absent = CommandBuilder::new("true");
+        let inherited = absent
+            .get_env("LC_YGGTERM_SESSION_ID")
+            .map(ToOwned::to_owned);
         apply_session_identity_env(&mut absent, None);
-        assert!(absent.get_env("LC_YGGTERM_SESSION_ID").is_none());
+        assert_eq!(
+            absent
+                .get_env("LC_YGGTERM_SESSION_ID")
+                .map(ToOwned::to_owned),
+            inherited,
+            "a session-less launch must not ADD an identity of its own"
+        );
     }
 
     #[test]
@@ -3475,7 +3628,7 @@ line-two on the real screen\r\n\
 
     #[test]
     fn terminal_protocol_filter_answers_default_color_queries() {
-        let profile = TerminalProtocolProfile::from_launch_command(
+        let profile = test_protocol_profile(
             "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
         );
         let mut filter = TerminalProtocolFilter::default();
@@ -3503,7 +3656,7 @@ line-two on the real screen\r\n\
     #[test]
     fn terminal_protocol_filter_holds_split_color_query() {
         let profile =
-            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+            test_protocol_profile("export COLORFGBG='15;0'; codex");
         let mut filter = TerminalProtocolFilter::default();
 
         let first = filter.process("left\u{1b}]11;?", profile);
@@ -3520,7 +3673,7 @@ line-two on the real screen\r\n\
 
     #[test]
     fn terminal_protocol_filter_answers_palette_queries_without_visible_leak() {
-        let profile = TerminalProtocolProfile::from_launch_command(
+        let profile = test_protocol_profile(
             "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
         );
         let mut filter = TerminalProtocolFilter::default();
@@ -3567,7 +3720,7 @@ line-two on the real screen\r\n\
             export YGGTERM_TERMINAL_COLOR_13='#eeeeee'; \
             export YGGTERM_TERMINAL_COLOR_14='#ababab'; \
             export YGGTERM_TERMINAL_COLOR_15='#fefefe'; edit";
-        let profile = TerminalProtocolProfile::from_launch_command(launch_command);
+        let profile = test_protocol_profile(launch_command);
         let mut filter = TerminalProtocolFilter::default();
 
         let result = filter.process("\u{1b}]11;?\u{1b}\\\u{1b}]4;0;?;15;?\u{1b}\\", profile);
@@ -3585,7 +3738,7 @@ line-two on the real screen\r\n\
     #[test]
     fn terminal_protocol_filter_holds_split_palette_query() {
         let profile =
-            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+            test_protocol_profile("export COLORFGBG='15;0'; codex");
         let mut filter = TerminalProtocolFilter::default();
 
         let first = filter.process("left\u{1b}]4;0;?;1;?", profile);
@@ -3615,7 +3768,7 @@ line-two on the real screen\r\n\
     #[test]
     fn terminal_protocol_filter_preserves_palette_set_sequences_for_xterm() {
         let profile =
-            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+            test_protocol_profile("export COLORFGBG='15;0'; codex");
         let mut filter = TerminalProtocolFilter::default();
         let payload = "pre\u{1b}]4;1;rgb:1111/2222/3333\u{1b}\\post";
 
@@ -3629,7 +3782,7 @@ line-two on the real screen\r\n\
     #[test]
     fn terminal_protocol_filter_keeps_cat_crlf_after_palette_query() {
         let profile =
-            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+            test_protocol_profile("export COLORFGBG='15;0'; codex");
         let mut filter = TerminalProtocolFilter::default();
 
         let result = filter.process(
@@ -3651,31 +3804,26 @@ line-two on the real screen\r\n\
 
     #[test]
     fn pty_runtime_answers_default_color_query_to_child() {
+        // The daemon answers with ITS profile, and that profile legitimately
+        // picks up the host's YGGTERM_TERMINAL_COLOR_* when the launch command
+        // carries none — which this suite does whenever it is run from a
+        // terminal inside yggterm. So derive the expectation from the same
+        // profile the runtime will use: hardcoding the built-in dark grey made
+        // this test fail in-session only, which reads as "your change broke it".
+        let appearance_export = "export YGGTERM_TERMINAL_APPEARANCE=dark; ";
+        let (r, g, b) = TerminalProtocolProfile::from_launch_command(appearance_export).foreground;
+        let expected_response =
+            format!("\u{1b}]10;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\u{1b}\\");
+        let expected_hex: String = expected_response
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let launch_command = format!(
+            "{appearance_export}export YGG_EXPECT_FG_HEX={expected_hex}; {OSC_COLOR_QUERY_CHILD}"
+        );
         let runtime = PtySessionRuntime::spawn(
             "local://osc-color-query",
-            r#"export YGGTERM_TERMINAL_APPEARANCE=dark; python3 - <<'PY'
-import os
-import select
-import sys
-import termios
-import tty
-
-fd = os.open('/dev/tty', os.O_RDWR | getattr(os, 'O_NOCTTY', 0))
-old = termios.tcgetattr(fd)
-data = b''
-try:
-    tty.setraw(fd)
-    os.write(fd, b'\x1b]10;?\x1b\\')
-    ready, _, _ = select.select([fd], [], [], 2.0)
-    if ready:
-        data = os.read(fd, 64)
-finally:
-    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    os.close(fd)
-
-expected = b'\x1b]10;rgb:cccc/cccc/cccc\x1b\\'
-sys.stdout.write('COLOR_OK\n' if data == expected else f'COLOR_BAD:{data!r}\n')
-PY"#,
+            &launch_command,
             None,
             None,
         )

@@ -2050,6 +2050,13 @@ pub enum ServerRequest {
     TerminalHistory {
         path: String,
     },
+    /// The libyggterm declares (OSC 7717) the daemon retained off this
+    /// session's stream. Read-only, and the ONLY way to learn what an app
+    /// declared on a session whose client host was never mounted or has since
+    /// been torn down. See [`crate::app_declare`].
+    TerminalAppDeclares {
+        path: String,
+    },
     TerminalWrite {
         path: String,
         data: String,
@@ -2142,6 +2149,11 @@ pub enum ServerResponse {
     TerminalHistory {
         #[serde(default)]
         rows: Vec<String>,
+        running: bool,
+    },
+    TerminalAppDeclares {
+        #[serde(default)]
+        records: Vec<crate::app_declare::AppDeclareRecord>,
         running: bool,
     },
     Ack {
@@ -2317,7 +2329,8 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::TerminalRead { .. }
         | ServerRequest::TerminalSnapshot { .. }
         | ServerRequest::TerminalRetainedSnapshot { .. }
-        | ServerRequest::TerminalHistory { .. } => ShadowAccess::Allow,
+        | ServerRequest::TerminalHistory { .. }
+        | ServerRequest::TerminalAppDeclares { .. } => ShadowAccess::Allow,
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
@@ -6926,6 +6939,36 @@ impl DaemonRuntime {
                     running: self.terminals.session_is_running(&runtime_path),
                 }
             }
+            ServerRequest::TerminalAppDeclares { path } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                // A preserved-owner session's bytes are read by the daemon that
+                // owns its PTY, so its declares live there too — ask the owner
+                // rather than answering "none" from an empty local log.
+                if let Some(owner_endpoint) =
+                    self.preserved_owner_endpoint_for_request(&runtime_path)
+                {
+                    match terminal_app_declares(&owner_endpoint, &runtime_path) {
+                        Ok((records, running)) => {
+                            return Ok(ServerResponse::TerminalAppDeclares { records, running });
+                        }
+                        Err(error) => {
+                            self.handle_preserved_owner_request_error(
+                                &runtime_path,
+                                &owner_endpoint,
+                                &error,
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                ServerResponse::TerminalAppDeclares {
+                    records: self
+                        .terminals
+                        .session_app_declares(&runtime_path)
+                        .unwrap_or_default(),
+                    running: self.terminals.session_is_running(&runtime_path),
+                }
+            }
             ServerRequest::TerminalWrite { path, data } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 if let Some(owner_endpoint) =
@@ -8694,6 +8737,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::TerminalSnapshot { .. } => "terminal_snapshot",
         ServerRequest::TerminalRetainedSnapshot { .. } => "terminal_retained_snapshot",
         ServerRequest::TerminalHistory { .. } => "terminal_history",
+        ServerRequest::TerminalAppDeclares { .. } => "terminal_app_declares",
         ServerRequest::TerminalWrite { .. } => "terminal_write",
         ServerRequest::TerminalResize { .. } => "terminal_resize",
         ServerRequest::TerminalRestart { .. } => "terminal_restart",
@@ -10156,6 +10200,23 @@ pub fn terminal_history(endpoint: &ServerEndpoint, path: &str) -> Result<(Vec<St
         ServerResponse::TerminalHistory { rows, running } => Ok((rows, running)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal history response: {:?}", other),
+    }
+}
+
+/// The declares the daemon retained for a session's app (OSC 7717).
+pub fn terminal_app_declares(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<(Vec<crate::app_declare::AppDeclareRecord>, bool)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalAppDeclares {
+            path: path.to_string(),
+        },
+    )? {
+        ServerResponse::TerminalAppDeclares { records, running } => Ok((records, running)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal app declares response: {:?}", other),
     }
 }
 
@@ -19142,11 +19203,12 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for slice 4.2: `ServerRequest` gained the profile
-        // write-lock acquire/release/report variants and `ServerResponse` gained
-        // `ProfileWriteLock` (agent control plane, docs/agent-control-plane.md).
-        const STAMPED_AT_VERSION: &str = "2.12.0";
-        const STAMPED_SHAPE_HASH: u64 = 0xb82a2ebb9ed1b9d4;
+        // Re-stamped for 2.12.10: `ServerRequest`/`ServerResponse` gained
+        // `TerminalAppDeclares` — daemon-side ingestion of the OSC 7717 declare
+        // channel, so a never-revealed or reaped web surface can be rebuilt
+        // with no client parser (agent-control-plane finding #2).
+        const STAMPED_AT_VERSION: &str = "2.12.10";
+        const STAMPED_SHAPE_HASH: u64 = 0x14d7960b806d144d;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
