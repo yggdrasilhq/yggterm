@@ -56622,9 +56622,25 @@ fn app() -> Element {
                     });
                 }
             },
-            oncontextmenu: |evt| {
-                evt.prevent_default();
-                evt.stop_propagation();
+            // The shell root suppresses the platform's own right-click menu so a
+            // stray right-click on CHROME does not surface a webview menu over the
+            // app. But a DOCUMENT (yedit) or WEB (ychrome) surface renders real
+            // WebKit content whose native menu (Copy/Cut/Paste/Select-All) is the
+            // right menu there — and this blanket preventDefault was killing it,
+            // which is why yedit had no right-click copy at all. Stand down for
+            // those surfaces and let the engine's menu through.
+            //
+            // ⚠ Third handler in this family to need the same lesson (after the
+            // root ONCLICK focus-steal and the terminal secondary-button funnel):
+            // a root-level handler that acts on every event must ask WHO owns the
+            // area under the pointer. `DOCUMENT_SURFACE_MENU_OWNER_SELECTORS` is
+            // the one list; add a surface there, never a fourth hand-rolled copy.
+            // NOTE: the blanket `evt.prevent_default()` that used to live here is
+            // gone — see context_menu_policy_script(). Rust cannot ask "what is under
+            // the pointer" synchronously (document::eval is async), so the policy
+            // has to be decided in JS, where the target element is in hand.
+            onmounted: move |_evt| async move {
+                let _ = document::eval(&context_menu_policy_script());
             },
             style { "{TOAST_CSS}" }
             style { "{DOCUMENT_SURFACE_STANDDOWN_CSS}" }
@@ -85690,10 +85706,45 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             return false;
         }};
+        // A DOCUMENT (yedit) or WEB (ychrome) surface covering this terminal owns
+        // the right-click: its content is WebKit-rendered DOM whose OWN context
+        // menu offers Copy/Cut/Paste. This guard is why a right-click in yedit
+        // reaches that native menu instead of the terminal's.
+        //
+        // ⚠ It must live HERE, at the funnel, not at the DOM entry points. The
+        // thief was `handleDocumentPointerCapture` — a DOCUMENT-level capture
+        // listener that routes a right-click to the terminal whenever it falls
+        // GEOMETRICALLY inside the host rect (`pointerEventFallsWithinHost`).
+        // A covering document surface occupies that exact rect, so every yedit
+        // right-click looked like a terminal one, was preventDefault'ed, and
+        // opened the terminal menu — the Rust-side viewport guard never saw the
+        // event because the document surface is a SIBLING of the host, not a
+        // child. Same shape as the fourth-focus-path bug: a host-wide handler
+        // that never learned the document surface exists.
+        const terminalSecondaryIsCoveredBySurface = (event) => {{
+            try {{
+                if (
+                    String(host.getAttribute('data-document-surface-owns-viewport') || '') === 'true'
+                    || String(host.getAttribute('data-web-surface-owns-viewport') || '') === 'true'
+                ) {{
+                    return true;
+                }}
+                const target = event && event.target;
+                if (target && target.closest && target.closest('[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker]')) {{
+                    return true;
+                }}
+            }} catch (_error) {{}}
+            return false;
+        }};
         handleTerminalSecondaryButton = (event) => {{
             try {{
                 const eventType = String(event && event.type || '');
                 if (eventType !== 'contextmenu' && Number(event && event.button) !== 2) {{
+                    return false;
+                }}
+                // Stand down entirely: no preventDefault, no menu — the covering
+                // surface's native menu comes through.
+                if (terminalSecondaryIsCoveredBySurface(event)) {{
                     return false;
                 }}
                 return openTerminalContextMenuFromEvent(event, `secondary_${{eventType || 'event'}}`);
@@ -88725,6 +88776,188 @@ fn terminal_stable_epoch_reveal_nudge_script(host_id: &str) -> String {
         host_id = host_id,
     )
 }
+/// Selectors for content that owns its OWN (native WebKit) context menu.
+///
+/// ONE list, like `UI_FOCUS_OWNER_SELECTORS`. A right-click inside any of these
+/// is the engine's to handle — it renders real DOM/page content and its native
+/// menu (Copy / Cut / Paste / Select All) is the correct menu there. Everything
+/// else is yggterm chrome, where the platform menu is noise and stays suppressed.
+const NATIVE_CONTEXT_MENU_OWNER_SELECTORS: &str =
+    "[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker], [data-document-editor]";
+
+/// App-wide right-click policy: suppress the platform menu over yggterm chrome,
+/// ALLOW it over content that owns its own menu.
+///
+/// This replaced a blanket `evt.prevent_default()` on the shell root, which
+/// killed the native menu everywhere — the reason yedit had no right-click copy.
+/// It must be JS: the decision needs the event's target element, and Rust's only
+/// route to the DOM (`document::eval`) is async, so a Rust handler cannot decide
+/// in time to not-cancel the event.
+///
+/// Capture phase at the document, installed once and idempotent.
+fn context_menu_policy_script() -> String {
+    format!(
+        r#"
+(() => {{
+  if (window.__yggtermContextMenuPolicy) return;
+  const OWNERS = {NATIVE_CONTEXT_MENU_OWNER_SELECTORS:?};
+  const ownsNativeMenu = (target) => {{
+    try {{
+      return !!(target && target.closest && target.closest(OWNERS));
+    }} catch (_e) {{ return false; }}
+  }};
+  const policy = (event) => {{
+    try {{
+      if (ownsNativeMenu(event.target)) return; // the engine's menu wins here
+      event.preventDefault();
+    }} catch (_e) {{}}
+  }};
+  document.addEventListener("contextmenu", policy, false);
+  window.__yggtermContextMenuPolicy = policy;
+}})();
+"#
+    )
+}
+
+
+/// Kate-style wrap-aware line-number gutter for the document editor.
+///
+/// A textarea does not expose where its soft-wrap breaks each logical line, so a
+/// static `1\n2\n3` gutter desyncs the moment a line wraps — which is why the
+/// gutter used to be suppressed in wrap mode. This installs a JS maintainer that
+/// measures each logical line's visual-row count in a hidden mirror div (same
+/// content width, font, padding and wrap rules as the textarea, so it wraps
+/// identically), then renders the gutter one entry PER VISUAL ROW: the line
+/// number on a line's first row, a continuation arrow (↪) on each wrapped row —
+/// exactly like KDE Kate. The gutter's inner block is translated by the
+/// textarea's scrollTop so it tracks the text as it scrolls.
+///
+/// Idempotent and self-reinstalling: the mount hook re-runs `syncAll()`, hooks
+/// each textarea once (input/scroll/resize), and rebuilds on every change.
+const DOCUMENT_WRAP_GUTTER_SCRIPT: &str = r#"
+(() => {
+  const ARROW = "↪";
+  const MAX_LINES = 6000; // beyond this, fall back to plain numbers (no per-line measure)
+  function lineH(ta) {
+    const lh = parseFloat(getComputedStyle(ta).lineHeight);
+    return (isFinite(lh) && lh > 0) ? lh : 18;
+  }
+  function mirrorFor(ta) {
+    let m = ta.__yggMirror;
+    if (m && m.isConnected) return m;
+    m = document.createElement("div");
+    m.setAttribute("aria-hidden", "true");
+    m.style.cssText = "position:absolute; top:0; left:-99999px; visibility:hidden; pointer-events:none; margin:0; border:0;";
+    document.body.appendChild(m);
+    ta.__yggMirror = m;
+    return m;
+  }
+  function visualRows(ta) {
+    const cs = getComputedStyle(ta);
+    const contentWidth = ta.clientWidth - parseFloat(cs.paddingLeft || "0") - parseFloat(cs.paddingRight || "0");
+    if (!(contentWidth > 0)) return null;
+    const lines = ta.value.split("\n");
+    if (lines.length > MAX_LINES) return lines.map(() => 1);
+    const m = mirrorFor(ta);
+    m.style.width = contentWidth + "px";
+    m.style.fontFamily = cs.fontFamily;
+    m.style.fontSize = cs.fontSize;
+    m.style.lineHeight = cs.lineHeight;
+    m.style.letterSpacing = cs.letterSpacing;
+    m.style.tabSize = cs.tabSize;
+    m.style.whiteSpace = "pre-wrap";
+    m.style.overflowWrap = "anywhere";
+    m.style.wordBreak = cs.wordBreak;
+    m.textContent = "";
+    const kids = [];
+    for (const line of lines) {
+      const d = document.createElement("div");
+      d.style.whiteSpace = "pre-wrap";
+      d.style.overflowWrap = "anywhere";
+      // an empty logical line still occupies one visual row
+      d.textContent = line.length ? line : " ";
+      m.appendChild(d);
+      kids.push(d);
+    }
+    const lh = lineH(ta);
+    return kids.map((d) => Math.max(1, Math.round(d.offsetHeight / lh)));
+  }
+  function gutterFor(ta) {
+    const parent = ta.parentElement;
+    if (!parent) return null;
+    return parent.querySelector("[data-document-wrap-gutter]");
+  }
+  function rebuild(ta) {
+    const gutter = gutterFor(ta);
+    if (!gutter) return;
+    // An invisible editor has no layout to measure — its mirror reads 0 width.
+    if (ta.offsetParent === null && ta.clientWidth === 0) return;
+    // Skip when nothing that affects wrapping changed (value or width). The
+    // body MutationObserver fires on unrelated churn — terminal streaming — so
+    // this guard is what keeps that from re-measuring a large doc every tick.
+    const sig = ta.value.length + ":" + ta.value + ":" + ta.clientWidth;
+    if (sig === ta.__yggGutterSig) return;
+    const rows = visualRows(ta);
+    if (!rows) return;
+    ta.__yggGutterSig = sig;
+    const lh = lineH(ta);
+    let html = "";
+    for (let i = 0; i < rows.length; i++) {
+      html += '<div style="height:' + lh + 'px;line-height:' + lh + 'px;">' + (i + 1) + "</div>";
+      for (let k = 1; k < rows[i]; k++) {
+        html += '<div style="height:' + lh + 'px;line-height:' + lh + 'px;opacity:0.45;">' + ARROW + "</div>";
+      }
+    }
+    let inner = gutter.firstElementChild;
+    if (!inner) { inner = document.createElement("div"); gutter.appendChild(inner); }
+    inner.innerHTML = html;
+    inner.style.transform = "translateY(" + (-ta.scrollTop) + "px)";
+  }
+  function syncScroll(ta) {
+    const gutter = gutterFor(ta);
+    const inner = gutter && gutter.firstElementChild;
+    if (inner) inner.style.transform = "translateY(" + (-ta.scrollTop) + "px)";
+  }
+  window.__yggtermDocGutter = {
+    syncAll() {
+      const editors = document.querySelectorAll("textarea[data-document-wrap-editor]");
+      editors.forEach((ta) => {
+        if (!ta.__yggGutterHooked) {
+          ta.__yggGutterHooked = true;
+          ta.addEventListener("input", () => rebuild(ta));
+          ta.addEventListener("scroll", () => syncScroll(ta));
+          try {
+            const ro = new ResizeObserver(() => rebuild(ta));
+            ro.observe(ta);
+          } catch (_e) {}
+        }
+        rebuild(ta);
+      });
+    }
+  };
+  window.__yggtermDocGutter.syncAll();
+  // Dioxus re-renders the editor subtree on a wrap toggle WITHOUT necessarily
+  // re-firing onmounted, so a body observer re-installs the hooks. Debounced and
+  // guarded by the value/width signature in rebuild(), so unrelated churn (a
+  // streaming terminal repainting) costs one timer, not a re-measure.
+  if (!window.__yggtermDocGutterObserver) {
+    let pending = 0;
+    const kick = () => {
+      if (pending) return;
+      pending = setTimeout(() => {
+        pending = 0;
+        try { window.__yggtermDocGutter.syncAll(); } catch (_e) {}
+      }, 120);
+    };
+    try {
+      const obs = new MutationObserver(kick);
+      obs.observe(document.body, { childList: true, subtree: true });
+      window.__yggtermDocGutterObserver = obs;
+    } catch (_e) {}
+  }
+})();
+"#;
+
 fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) -> String {
     format!(
         r#"
@@ -92526,6 +92759,38 @@ fn DocumentSurfaceBody(
         div {
             "data-document-surface": "{pane_id}",
             style: "{layer_style}",
+            // Each viewport type owns its context menu (user call 2026-07-24).
+            // A document surface gets the EDITOR menu — Copy/Cut/Paste/Select All
+            // — not the Live Session row menu that used to appear over every
+            // viewport, and not a native menu we cannot verify raises here.
+            oncontextmenu: {
+                let mut state = state;
+                move |evt: MouseEvent| {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    let coords = evt.client_coordinates();
+                    // The overlay needs an anchor row; the surface's own items are
+                    // what render, so any row for the active session serves.
+                    let row = state.with(|shell| {
+                        let active = shell.server.active_session_path().map(str::to_string)?;
+                        shell
+                            .snapshot()
+                            .rows
+                            .iter()
+                            .find(|row| row.full_path == active)
+                            .cloned()
+                    });
+                    if let Some(row) = row {
+                        state.with_mut(|shell| {
+                            shell.open_viewport_context_menu(
+                                ViewportMenuKind::Document,
+                                row,
+                                (coords.x, coords.y),
+                            );
+                        });
+                    }
+                }
+            },
             if has_bar {
                 div {
                     style: "{bar_style}",
@@ -92743,14 +93008,25 @@ fn DocumentSurfaceBody(
                                     .cloned()
                                     .unwrap_or_else(|| value.clone());
                                 let line_count = live.split('\n').count().max(1);
-                                let editor_font = "font-family:ui-monospace, monospace; font-size:12.5px; line-height:1.55;";
-                                // Wrap mode: the gutter is SUPPRESSED (logical
-                                // line numbers desync against wrapped visual
-                                // rows — the wc footer carries the count) and
-                                // the textarea owns its own scroll instead of
-                                // growing by logical rows (a wrapped line's
-                                // visual height is unknowable from here).
+                                // Text-mode editor is one point larger than the
+                                // 12.5px chrome baseline (user call 2026-07-24):
+                                // source editing wants a touch more air than a
+                                // dense sidebar row. The gutter shares it so the
+                                // numbers sit on the same baseline as the text.
+                                let editor_font = "font-family:ui-monospace, monospace; font-size:13.5px; line-height:1.55;";
+                                // Wrap mode keeps its line numbers now: a hidden
+                                // mirror measures each logical line's visual-row
+                                // count, and the gutter draws the number on a
+                                // line's first row + a continuation arrow (↪) on
+                                // each wrapped row, KDE-Kate style (see
+                                // DOCUMENT_WRAP_GUTTER_SCRIPT). The textarea owns
+                                // its own scroll; the gutter's inner block tracks
+                                // its scrollTop.
                                 let wrapped = *word_wrap;
+                                let show_gutter = *line_numbers;
+                                // The wrap gutter's JS pairs textarea↔gutter by this
+                                // marker; absent (None) in non-wrap mode.
+                                let wrap_editor_marker = wrapped.then(|| id.clone());
                                 rsx! {
                                     div {
                                         key: "{widget_key}",
@@ -92759,7 +93035,7 @@ fn DocumentSurfaceBody(
                                         } else {
                                             "display:flex; align-items:flex-start; min-height:100%;"
                                         },
-                                        if *line_numbers && !wrapped {
+                                        if show_gutter && !wrapped {
                                             div {
                                                 "data-document-gutter": "{id}",
                                                 style: format!(
@@ -92771,8 +93047,25 @@ fn DocumentSurfaceBody(
                                                 {(1..=line_count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n")}
                                             }
                                         }
+                                        if show_gutter && wrapped {
+                                            // JS-maintained gutter: overflow-hidden
+                                            // frame, inner block translated by the
+                                            // textarea's scrollTop. Padding-top
+                                            // matches the textarea so line 1 aligns.
+                                            div {
+                                                "data-document-wrap-gutter": "{id}",
+                                                style: format!(
+                                                    "flex:0 0 auto; overflow:hidden; text-align:right; \
+                                                     padding:14px 10px 40px 16px; color:{}; border-right:1px solid {}; \
+                                                     user-select:none; -webkit-user-select:none; white-space:pre; {editor_font}",
+                                                    doc.muted, doc.border
+                                                ),
+                                                div {}
+                                            }
+                                        }
                                         textarea {
                                             "data-document-editor": "{id}",
+                                            "data-document-wrap-editor": wrap_editor_marker,
                                             style: if wrapped {
                                                 format!(
                                                     "flex:1 1 auto; min-width:0; border:0; outline:none; resize:none; \
@@ -92794,6 +93087,13 @@ fn DocumentSurfaceBody(
                                             wrap: if wrapped { "soft" } else { "off" },
                                             rows: if wrapped { "2".to_string() } else { format!("{}", line_count + 1) },
                                             initial_value: "{value}",
+                                            onmounted: move |_evt| async move {
+                                                // Install/refresh the wrap gutter maintainer
+                                                // once the textarea is in the DOM. Idempotent.
+                                                if wrapped {
+                                                    let _ = document::eval(DOCUMENT_WRAP_GUTTER_SCRIPT);
+                                                }
+                                            },
                                             oninput: {
                                                 let mut state = state;
                                                 let id = id.clone();
@@ -94443,6 +94743,13 @@ fn row_menu_node_key(id: &str) -> String {
 #[serde(rename_all = "snake_case")]
 enum ViewportMenuKind {
     Terminal,
+    /// A document surface (yedit). Gets a real yggterm-drawn Copy/Cut/Paste/
+    /// Select-All menu rather than relying on WebKitGTK's native one: the native
+    /// menu could not be verified to fire here (a GTK popup is a separate window,
+    /// invisible to the webview screenshot, and a synthetic DOM event cannot
+    /// raise it), and "the user can right-click copy" is not something to ship on
+    /// an unverified assumption.
+    Document,
 }
 
 /// The menu for a viewport surface. Ids share the `viewport-` prefix so
@@ -94455,13 +94762,56 @@ fn viewport_menu_items(kind: ViewportMenuKind) -> Vec<RowMenuItem> {
             RowMenuItem::divider(),
             RowMenuItem::new("viewport-select-all", "Select All", 'A'),
         ],
+        // An editor edits, so Cut belongs here and not in the read-only terminal.
+        ViewportMenuKind::Document => vec![
+            RowMenuItem::new("viewport-copy", "Copy", 'C'),
+            RowMenuItem::new("viewport-cut", "Cut", 'X'),
+            RowMenuItem::new("viewport-paste", "Paste", 'P'),
+            RowMenuItem::divider(),
+            RowMenuItem::new("viewport-select-all", "Select All", 'A'),
+        ],
     }
 }
 
 fn viewport_menu_title(kind: ViewportMenuKind) -> String {
     match kind {
         ViewportMenuKind::Terminal => "Terminal".to_string(),
+        ViewportMenuKind::Document => "Editor".to_string(),
     }
+}
+
+/// Run a document-surface edit action on the focused editor.
+///
+/// `execCommand` is the only route that edits a textarea *through the undo
+/// stack* — a manual `value` splice would make Ctrl+Z jump over the edit. Copy
+/// and cut also make yggterm's own WebKit the clipboard owner, which is exactly
+/// the case the paste deadlock fix made safe.
+fn document_surface_edit_script(action: &str) -> String {
+    let command = match action {
+        "copy" => "copy",
+        "cut" => "cut",
+        "select-all" => "selectAll",
+        _ => "paste",
+    };
+    format!(
+        r#"
+        (() => {{
+          try {{
+            const editors = Array.from(document.querySelectorAll("textarea[data-document-editor]"));
+            const active = document.activeElement;
+            const ta = (active && active.matches && active.matches("textarea[data-document-editor]"))
+              ? active
+              : editors[0];
+            if (!ta) return "no_editor";
+            ta.focus();
+            if ({select_all}) {{ ta.select(); return "selected"; }}
+            return document.execCommand({command:?}) ? "ok" : "refused";
+          }} catch (_e) {{ return "error"; }}
+        }})();
+        "#,
+        select_all = if command == "selectAll" { "true" } else { "false" },
+        command = command,
+    )
 }
 /// Build the row menu for `row`. Pure: same inputs, same menu, in a stable order
 /// — which is what makes the KeyTip letters stable too (invariant 1).
@@ -94769,6 +95119,44 @@ fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) 
         shell.close_context_menu();
         (surface, session, trace)
     });
+    // A document surface edits its own DOM: route to execCommand so the edit
+    // joins the editor's undo stack. `paste` goes through the off-main clipboard
+    // read + an insert, because execCommand('paste') is refused by WebKit.
+    if surface == Some(ViewportMenuKind::Document) {
+        if action == "paste" {
+            spawn(async move {
+                let Ok(text) = read_native_clipboard_text_off_main().await else {
+                    return;
+                };
+                let literal = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+                let _ = document::eval(&format!(
+                    r#"
+                    (() => {{
+                      try {{
+                        const editors = Array.from(document.querySelectorAll("textarea[data-document-editor]"));
+                        const active = document.activeElement;
+                        const ta = (active && active.matches && active.matches("textarea[data-document-editor]"))
+                          ? active : editors[0];
+                        if (!ta) return;
+                        ta.focus();
+                        // insertText keeps the undo stack and fires `input`, so the
+                        // document channel sees the change like any keystroke.
+                        if (!document.execCommand("insertText", false, {literal})) {{
+                          const s = ta.selectionStart, e = ta.selectionEnd;
+                          ta.value = ta.value.slice(0, s) + {literal} + ta.value.slice(e);
+                          ta.selectionStart = ta.selectionEnd = s + {literal}.length;
+                          ta.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                        }}
+                      }} catch (_e) {{}}
+                    }})();
+                    "#
+                ));
+            });
+            return;
+        }
+        let _ = document::eval(&document_surface_edit_script(&action));
+        return;
+    }
     if surface != Some(ViewportMenuKind::Terminal) {
         return;
     }
@@ -101820,6 +102208,30 @@ mod tests {
                 .any(|item| item.id == "rename-session" || item.id.starts_with("close")),
             "a viewport menu must never carry session-row actions"
         );
+
+        // The document surface (yedit) owns an EDITOR menu — Cut belongs to an
+        // editor and not to the read-only terminal. This is the fix for "no
+        // right-click copy in yedit", so Copy must be present by contract.
+        let doc = viewport_menu_items(ViewportMenuKind::Document);
+        let doc_ids: Vec<&str> = doc
+            .iter()
+            .filter(|item| !item.separator)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(
+            doc_ids,
+            vec![
+                "viewport-copy",
+                "viewport-cut",
+                "viewport-paste",
+                "viewport-select-all"
+            ]
+        );
+        assert!(
+            !ids.contains(&"viewport-cut"),
+            "the terminal is read-only — Cut is an editor action"
+        );
+        assert!(doc.iter().all(|item| item.separator || item.id.starts_with("viewport-")));
     }
 
     // tests below, which are handed their rows. Caught on the live host.
@@ -109605,6 +110017,78 @@ mod tests {
         assert!(script.contains("nativeClipboardPasteRequestDedupedCount"));
         assert!(!script.contains("navigator.clipboard.readText()"));
         assert!(!script.contains("navigator.clipboard.writeText("));
+    }
+
+    // A document/web surface covering the terminal owns the right-click, and the
+    // guard must sit at the SHARED funnel — `handleDocumentPointerCapture` routes
+    // by GEOMETRY (`pointerEventFallsWithinHost`), so a covering surface's clicks
+    // land there without ever touching the host element. Live-caught 2026-07-24:
+    // yedit right-clicks were preventDefault'ed and opened the terminal menu.
+    // The shell root used to preventDefault EVERY right-click, which is why
+    // yedit had no native Copy/Paste menu at all. The policy must exempt exactly
+    // the surfaces that render real WebKit content, from ONE selector list — the
+    // same drift-proofing UI_FOCUS_OWNER_SELECTORS got after a hand-rolled copy
+    // let the fourth focus path hide for three rounds.
+    #[test]
+    fn context_menu_policy_exempts_native_menu_owners_from_one_list() {
+        let script = context_menu_policy_script();
+        for selector in [
+            "[data-document-surface]",
+            "[data-ws-overlay]",
+            "[data-yggterm-web-picker]",
+            "[data-document-editor]",
+        ] {
+            assert!(
+                NATIVE_CONTEXT_MENU_OWNER_SELECTORS.contains(selector),
+                "{selector} must be a native-menu owner"
+            );
+            assert!(
+                script.contains(selector),
+                "the policy script must embed {selector} — no second hand-rolled list"
+            );
+        }
+        // The exemption must come BEFORE the suppression, or the native menu is
+        // cancelled before anyone asks who owns the area.
+        let exempt_at = script.find("ownsNativeMenu(event.target)").expect("exemption");
+        let suppress_at = script.find("event.preventDefault()").expect("suppression");
+        assert!(exempt_at < suppress_at);
+        assert!(
+            script.contains("window.__yggtermContextMenuPolicy"),
+            "install must be idempotent — the root remounts"
+        );
+    }
+
+    #[test]
+    fn terminal_secondary_button_stands_down_under_a_covering_surface() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const terminalSecondaryIsCoveredBySurface = (event) => {"),
+            "the covering-surface guard must exist"
+        );
+        assert!(script.contains("data-document-surface-owns-viewport"));
+        assert!(script.contains("data-web-surface-owns-viewport"));
+        assert!(
+            script.contains("[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker]"),
+            "the target-side check must cover document, web overlay and picker"
+        );
+        // The guard has to run INSIDE the shared funnel, before the opener — both
+        // the host listener and the document-level capture listener pass through
+        // handleTerminalSecondaryButton, and only one of them touches the host.
+        let funnel = script
+            .split("handleTerminalSecondaryButton = (event) => {")
+            .nth(1)
+            .expect("the secondary-button funnel exists");
+        let guard_at = funnel
+            .find("terminalSecondaryIsCoveredBySurface(event)")
+            .expect("the funnel must consult the guard");
+        let open_at = funnel
+            .find("openTerminalContextMenuFromEvent(event")
+            .expect("the funnel opens the menu");
+        assert!(
+            guard_at < open_at,
+            "the covering-surface guard must run BEFORE the menu opens"
+        );
     }
 
     #[test]
