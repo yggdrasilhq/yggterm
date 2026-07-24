@@ -6208,6 +6208,10 @@ struct RenderSnapshot {
     selected_path: Option<String>,
     selected_row: Option<BrowserRow>,
     active_session: Option<ManagedSessionView>,
+    /// The active session's kind, resolved from the sidebar row. Survives the
+    /// window where `active_session` has not been populated yet — see
+    /// [`active_session_offers_view_toggle`].
+    active_session_kind: Option<SessionKind>,
     active_session_path: Option<String>,
     /// The active session's live web-surface profile (app tab), if it has a
     /// surface.
@@ -6963,15 +6967,23 @@ fn active_viewport_shows_terminal_theme(snapshot: &RenderSnapshot) -> bool {
 /// session. It is a libyggterm-spec affordance shown ONLY when a session truly has
 /// BOTH surfaces: an agent CLI (Codex / Claude Code) renders its JSONL transcript
 /// as the Web View and its PTY as the Terminal, so it gets the toggle. A plain
-/// shell has only a terminal. A libyggterm app (ychrome et al.) runs inside a
-/// shell session and OWNS its own surface — no generic toggle — until an app opts
-/// in through the spec (future: an app-declared flag over OSC 7717). So the gate
-/// is simply "is the active session an agent CLI".
+/// shell has only a terminal.
+///
+/// ⚠ It used to read `snapshot.active_session`, a struct that is `None` whenever
+/// the live-session list has not caught up with `active_session_path` — so the
+/// toggle VANISHED on a session that plainly had both surfaces (live-caught on a
+/// Claude Code session, 2026-07-25: `visibility:hidden` while the viewport was
+/// showing that very session). The kind carried on the snapshot's active row is
+/// the same answer without the second lookup that can lag.
 fn active_session_offers_view_toggle(snapshot: &RenderSnapshot) -> bool {
+    if let Some(session) = snapshot.active_session.as_ref() {
+        return session.kind.offers_rendered_view();
+    }
+    // No live-session record yet: fall back to the kind the active ROW carries,
+    // which the sidebar already resolved.
     snapshot
-        .active_session
-        .as_ref()
-        .is_some_and(|session| session.kind.is_agent())
+        .active_session_kind
+        .is_some_and(SessionKind::offers_rendered_view)
 }
 fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
     if session.kind == SessionKind::Document {
@@ -7261,11 +7273,17 @@ fn conversation_provider_model_for_session(
             "Claude Code transcript",
             "Claude conversation",
         ),
-        SessionKind::Shell | SessionKind::SshShell => ConversationProviderModel::read_only(
-            "terminal-transcript",
-            "Terminal transcript",
-            "Saved terminal output",
-        ),
+        // A plain shell has NO conversation. It used to get a "Terminal
+        // transcript / Saved terminal output" reader, which is how opening a
+        // yedit session (a shell hosting a document app) showed a terminal
+        // transcript captioned "web view" — a surface the product never meant
+        // that session to have (user report, 2026-07-25). The routing now keeps
+        // a shell out of `Rendered` entirely (`row_offers_rendered_view`); this
+        // arm remains only so a shell that somehow reaches the renderer shows
+        // nothing rather than inventing a conversation.
+        SessionKind::Shell | SessionKind::SshShell => {
+            ConversationProviderModel::read_only("none", "", "")
+        }
         SessionKind::Document => {
             ConversationProviderModel::read_only("document", "Document", "Yggterm document")
         }
@@ -8221,6 +8239,18 @@ impl ShellState {
             build_keytip_tree(&self.keytip_config, self.server.apps(), &row_menu_items);
         RenderSnapshot {
             palette: palette,
+            // Kind from the ROW the sidebar already resolved — available in the
+            // window where the live-session record is not populated yet.
+            active_session_kind: self
+                .server
+                .active_session_path()
+                .and_then(|path| {
+                    self.browser
+                        .rows()
+                        .iter()
+                        .find(|row| row.full_path == path)
+                        .and_then(|row| row.session_kind)
+                }),
             search_query: self.search_query.clone(),
             search_value_epoch: self.search_value_epoch,
             search_active,
@@ -24748,8 +24778,47 @@ fn preferred_open_mode_for_row(shell: &ShellState, row: &BrowserRow) -> Workspac
     match row.kind {
         BrowserRowKind::Document => WorkspaceViewMode::Rendered,
         BrowserRowKind::Session if row_supports_terminal(shell, row) => WorkspaceViewMode::Terminal,
+        // A row with no rendered view of its own must never inherit `Rendered`
+        // from whatever the last session happened to be showing. That is how a
+        // plain shell landed on the terminal-transcript reader.
+        _ if !row_offers_rendered_view(shell, row) => WorkspaceViewMode::Terminal,
         _ => shell.server.active_view_mode(),
     }
+}
+
+/// Whether `row`'s session has a non-terminal surface to show.
+///
+/// Kind answers for agent CLIs and documents; for a shell it depends on whether
+/// a libyggterm app has DECLARED a viewport pane for it (yedit's paper,
+/// ychrome's page). One predicate, so the titlebar toggle, the open routing and
+/// the view-mode setter cannot disagree about whether a surface exists — they
+/// did, and the disagreement was user-visible.
+fn row_offers_rendered_view(shell: &ShellState, row: &BrowserRow) -> bool {
+    if row.kind == BrowserRowKind::Document {
+        return true;
+    }
+    session_path_offers_rendered_view(shell, &row.full_path, row.session_kind)
+}
+
+fn session_path_offers_rendered_view(
+    shell: &ShellState,
+    session_path: &str,
+    hint: Option<SessionKind>,
+) -> bool {
+    let kind = hint.or_else(|| {
+        shell
+            .server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == session_path)
+            .map(|session| session.kind)
+    });
+    if kind.is_some_and(SessionKind::offers_rendered_view) {
+        return true;
+    }
+    // The shell-hosts-an-app case: the app owns the surface, so its declaration
+    // is the authority, not the session's kind.
+    shell.viewport_pane_for_session(session_path).is_some()
 }
 
 fn remote_live_focus_error_should_retry_via_open(row: &BrowserRow, error_text: &str) -> bool {
@@ -129021,6 +129090,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129670,6 +129740,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129854,6 +129925,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130038,6 +130110,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130225,6 +130298,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130416,6 +130490,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130599,6 +130674,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130782,6 +130858,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130999,6 +131076,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -131185,6 +131263,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -131403,6 +131482,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -131798,6 +131878,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
+            active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
