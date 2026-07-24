@@ -5532,9 +5532,17 @@ struct ShellState {
     /// per-session split flag exists anywhere else.
     split_groups: Vec<SplitGroup>,
     selection_anchor: Option<String>,
+    // ViewportMenuKind is defined near the context-menu helpers below.
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
+    /// When the open context menu belongs to a VIEWPORT surface rather than a
+    /// sidebar row, which surface — so the menu shows Copy/Paste for that
+    /// surface instead of the session's Rename/Close/Keep-Alive. `None` for a
+    /// sidebar-row menu. Document and web surfaces are never listed here: they
+    /// get WebKitGTK's own context menu (Copy/Cut/Paste), so the shell opens no
+    /// menu at all over them.
+    context_menu_surface: Option<ViewportMenuKind>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     server_daemon_detail: String,
@@ -6136,6 +6144,9 @@ struct RenderSnapshot {
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
+    /// The viewport surface the open menu belongs to (terminal), or `None` for
+    /// a sidebar-row menu. Drives the dispatch's row-vs-surface routing.
+    context_menu_surface: Option<ViewportMenuKind>,
     /// Agent pointers to draw over the CURRENT viewport (cursor v1). Already
     /// filtered to agents working the session the user is viewing, and to
     /// pointers inside their TTL, so the overlay just draws what it is given.
@@ -7354,6 +7365,7 @@ impl ShellState {
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: !has_initial_server_snapshot,
             server_daemon_detail: String::new(),
@@ -7971,8 +7983,14 @@ impl ShellState {
         // and the KeyTip tree's `rowmenu` scope declares it, so the mouse menu and
         // the ALT layer cannot disagree about what the menu holds.
         let selected_tree_paths: Vec<String> = self.selected_tree_paths.iter().cloned().collect();
-        let (row_menu_items, row_menu_title) = match self.context_menu_row.as_ref() {
-            Some(row) => {
+        let (row_menu_items, row_menu_title) = match (
+            self.context_menu_surface,
+            self.context_menu_row.as_ref(),
+        ) {
+            // A viewport surface's menu (terminal Copy/Paste) — its items are
+            // surface-scoped, not the row's session actions.
+            (Some(kind), Some(_)) => (viewport_menu_items(kind), viewport_menu_title(kind)),
+            (_, Some(row)) => {
                 let drag_paths = if selected_tree_paths.is_empty() {
                     selected_row
                         .as_ref()
@@ -8005,7 +8023,7 @@ impl ShellState {
                 };
                 (items, title)
             }
-            None => (Vec::new(), String::new()),
+            (_, None) => (Vec::new(), String::new()),
         };
         // The "here" row's path — what `ALT,E` acts on, so the row menu's KeyTip
         // badge can be painted ON that row instead of on some proxy in the chrome.
@@ -8202,6 +8220,7 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
+            context_menu_surface: self.context_menu_surface,
             agent_cursors: self
                 .agent_presence
                 .visible_for(self.server.active_session_path(), current_millis()),
@@ -16183,6 +16202,9 @@ impl ShellState {
         };
     }
     fn open_context_menu(&mut self, row: BrowserRow, position: (f64, f64)) {
+        // A sidebar-row menu, never a viewport menu — clear any surface tag so a
+        // stale one from a prior viewport right-click can't relabel the items.
+        self.context_menu_surface = None;
         let context_row = resolve_creation_context_row(self.browser.rows(), &row);
         self.context_menu_row = Some(row);
         self.context_menu_context_row = Some(context_row);
@@ -16197,6 +16219,20 @@ impl ShellState {
             }),
         );
         self.refresh_tree_debug("open_context_menu");
+    }
+    /// Open a menu for a VIEWPORT surface (the terminal) rather than a sidebar
+    /// row. Reuses the row-menu overlay/positioning; the surface tag makes the
+    /// builder emit Copy/Paste/Select-All instead of the session actions. The
+    /// row is still carried so the overlay has an anchor, but its own actions
+    /// are not shown.
+    fn open_viewport_context_menu(
+        &mut self,
+        kind: ViewportMenuKind,
+        row: BrowserRow,
+        position: (f64, f64),
+    ) {
+        self.open_context_menu(row, position);
+        self.context_menu_surface = Some(kind);
     }
     /// The keep-alive item's target set: every SELECTED live session when the
     /// right-clicked row is part of the selection (the same rule that titles
@@ -16218,6 +16254,7 @@ impl ShellState {
         self.context_menu_row = None;
         self.context_menu_context_row = None;
         self.context_menu_position = None;
+        self.context_menu_surface = None;
         self.refresh_tree_debug("close_context_menu");
     }
     fn all_sidebar_rows_for_selection(&self) -> Vec<BrowserRow> {
@@ -70218,7 +70255,11 @@ fn TerminalCanvas(
                                 let y = if client_y.is_finite() { client_y } else { 60.0 };
                                 let row = terminal_context_row.clone();
                                 let _ = safe_shell_mut(state, "terminal_context_menu", |shell| {
-                                    shell.open_context_menu(row, (x, y));
+                                    shell.open_viewport_context_menu(
+                                        ViewportMenuKind::Terminal,
+                                        row,
+                                        (x, y),
+                                    );
                                 });
                                 append_trace_event(
                                     &trace_home,
@@ -73659,12 +73700,24 @@ fn TerminalCanvas(
                     },
                     oncontextmenu: {
                         let context_row = context_row.clone();
-                        move |evt| {
+                        move |evt: MouseEvent| {
+                            // A document (yedit) or web (ychrome) surface fills the
+                            // viewport with WebKit-rendered content whose OWN context
+                            // menu already offers Copy/Cut/Paste/Select-All. Let it
+                            // through: do NOT preventDefault and do NOT open the
+                            // session row menu, which belongs to the sidebar rows.
+                            if document_surface_owns_viewport || web_surface_owns_viewport_host {
+                                return;
+                            }
+                            // A terminal is a canvas with no native menu — give it a
+                            // surface menu (Copy/Paste/Select-All), not the session's
+                            // Rename/Close/Keep-Alive.
                             evt.prevent_default();
                             evt.stop_propagation();
                             let coords = evt.client_coordinates();
                             state.with_mut(|shell| {
-                                shell.open_context_menu(
+                                shell.open_viewport_context_menu(
+                                    ViewportMenuKind::Terminal,
                                     context_row.clone(),
                                     (coords.x, coords.y),
                                 );
@@ -94378,6 +94431,38 @@ impl RowMenuItem {
 fn row_menu_node_key(id: &str) -> String {
     format!("rowmenu:{id}")
 }
+
+/// Which viewport surface a right-click landed on — selects the context menu.
+///
+/// Only the TERMINAL is here. A document (yedit) or web (ychrome) surface is a
+/// WebKit-rendered DOM/page whose OWN context menu already offers
+/// Copy/Cut/Paste/Select-All, so the shell opens no menu over those at all (it
+/// lets the native one through). The terminal is a canvas with no native menu,
+/// so it needs this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ViewportMenuKind {
+    Terminal,
+}
+
+/// The menu for a viewport surface. Ids share the `viewport-` prefix so
+/// [`dispatch_row_menu_action`] routes them to the surface, never to the row.
+fn viewport_menu_items(kind: ViewportMenuKind) -> Vec<RowMenuItem> {
+    match kind {
+        ViewportMenuKind::Terminal => vec![
+            RowMenuItem::new("viewport-copy", "Copy", 'C'),
+            RowMenuItem::new("viewport-paste", "Paste", 'P'),
+            RowMenuItem::divider(),
+            RowMenuItem::new("viewport-select-all", "Select All", 'A'),
+        ],
+    }
+}
+
+fn viewport_menu_title(kind: ViewportMenuKind) -> String {
+    match kind {
+        ViewportMenuKind::Terminal => "Terminal".to_string(),
+    }
+}
 /// Build the row menu for `row`. Pure: same inputs, same menu, in a stable order
 /// — which is what makes the KeyTip letters stable too (invariant 1).
 fn row_menu_items(
@@ -94627,7 +94712,116 @@ fn split_candidate_paths_for(
 /// Run one row-menu item against `row`. THE terminus for the row menu: a click on
 /// the item and its ALT chord (`ALT,E,<letter>`) both arrive here with the same
 /// id, so the keyboard can never reach an action the mouse cannot, or vice versa.
+/// Select the visible terminal host for `session_path` and highlight all of it.
+fn terminal_viewport_select_all_script(session_path: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+          try {{
+            const sessionPath = {session_path:?};
+            const registry = window.__yggtermXtermHosts || {{}};
+            const entry = Object.values(registry)
+              .filter((e) => e && e.term && e.sessionPath === sessionPath)
+              .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0))[0];
+            if (entry && entry.term && typeof entry.term.selectAll === "function") {{
+              try {{ entry.term.focus && entry.term.focus(); }} catch (_f) {{}}
+              entry.term.selectAll();
+            }}
+          }} catch (_e) {{}}
+        }})();
+        "#
+    )
+}
+
+/// Send back the visible terminal host's current selection text (empty if none).
+fn terminal_viewport_get_selection_script(session_path: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+          try {{
+            const sessionPath = {session_path:?};
+            const registry = window.__yggtermXtermHosts || {{}};
+            const entry = Object.values(registry)
+              .filter((e) => e && e.term && e.sessionPath === sessionPath)
+              .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0))[0];
+            const text = entry && entry.term && entry.term.getSelection
+              ? String(entry.term.getSelection() || "")
+              : "";
+            dioxus.send(text);
+          }} catch (_e) {{ dioxus.send(""); }}
+        }})();
+        "#
+    )
+}
+
+/// Run a viewport (terminal) context-menu action against the active session.
+///
+/// Copy reads the xterm selection and routes it through the SAME clipboard
+/// owner path as Ctrl+Shift+C (off-main owner + a "Copied N" notification —
+/// which is what a document/web surface's native menu gives for free, and what
+/// the terminal menu owes to match). Paste reuses the terminal paste; Select
+/// All highlights the buffer.
+fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) {
+    let (surface, session_path, trace_home) = state.with_mut(|shell| {
+        let surface = shell.context_menu_surface;
+        let session = shell.server.active_session_path().map(str::to_string);
+        let trace = perf_home_dir(&shell.bootstrap.settings_path);
+        shell.close_context_menu();
+        (surface, session, trace)
+    });
+    if surface != Some(ViewportMenuKind::Terminal) {
+        return;
+    }
+    let Some(session_path) = session_path else {
+        return;
+    };
+    match action.as_str() {
+        "paste" => {
+            spawn(async move {
+                let _ = paste_terminal_native_clipboard(state, &session_path).await;
+            });
+        }
+        "select-all" => {
+            let _ = document::eval(&terminal_viewport_select_all_script(&session_path));
+        }
+        "copy" => {
+            spawn(async move {
+                let mut eval =
+                    document::eval(&terminal_viewport_get_selection_script(&session_path));
+                let text = eval.recv::<String>().await.unwrap_or_default();
+                if text.is_empty() {
+                    safe_push_notification(
+                        state,
+                        NotificationTone::Info,
+                        "Nothing to Copy",
+                        "Select terminal text first.".to_string(),
+                    );
+                    return;
+                }
+                let chars = text.chars().count();
+                if copy_terminal_selection_to_clipboard(&session_path, "copy", text, trace_home)
+                    .is_ok()
+                {
+                    safe_push_notification(
+                        state,
+                        NotificationTone::Success,
+                        "Copied to Clipboard",
+                        format!("Copied {chars} character(s) from the terminal selection."),
+                    );
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
 fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: String) {
+    // A viewport-surface menu item (terminal Copy/Paste/Select-All) — routed by
+    // its `viewport-` prefix to the surface, never to the row's session actions.
+    if let Some(action) = id.strip_prefix("viewport-") {
+        dispatch_viewport_menu_action(state, action.to_string());
+        return;
+    }
     // The creation-context row (a folder for a paper, a session's own cwd) — the
     // same row `open_context_menu` resolved when the menu opened.
     let context_row = state.with(|shell| {
@@ -101606,6 +101800,28 @@ mod tests {
     // region), not from `browser.rows()`. Live sessions live only in the merged
     // list, so sourcing the cwd tree yielded `paths: []` and the menu rendered a
     // bare "Keep Alive" that wrote to nothing — invisible to the pure-function
+    // The terminal viewport menu is Copy/Paste/Select-All — a canvas has no
+    // native menu, so it needs one — and NEVER the session row's
+    // Rename/Close/Keep-Alive, which is what leaked into every viewport before.
+    // The `viewport-` prefix is the routing contract dispatch depends on.
+    #[test]
+    fn terminal_viewport_menu_is_copy_paste_not_session_actions() {
+        let items = viewport_menu_items(ViewportMenuKind::Terminal);
+        let ids: Vec<&str> = items
+            .iter()
+            .filter(|item| !item.separator)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["viewport-copy", "viewport-paste", "viewport-select-all"]);
+        assert!(ids.iter().all(|id| id.starts_with("viewport-")));
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.id == "rename-session" || item.id.starts_with("close")),
+            "a viewport menu must never carry session-row actions"
+        );
+    }
+
     // tests below, which are handed their rows. Caught on the live host.
     #[test]
     fn context_menu_keep_alive_plan_sees_live_region_rows() {
@@ -127811,6 +128027,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -128457,6 +128674,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -128638,6 +128856,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -128819,6 +129038,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129003,6 +129223,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129191,6 +129412,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129371,6 +129593,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129551,6 +129774,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129765,6 +129989,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -129948,6 +130173,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -130163,6 +130389,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
@@ -130555,6 +130782,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            context_menu_surface: None,
             keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
