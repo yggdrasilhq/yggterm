@@ -26611,16 +26611,28 @@ fn spawn_start_claude_code_session_for_row(
 ) {
     spawn_start_session_for_row(state, SessionKind::ClaudeCode, explicit_row);
 }
+/// Whether `path` is inside a given CLI's OWN session store.
+///
+/// The store layout is descriptor data (docs/spec-agent-cli-harness.md §3), so
+/// these three predicates no longer each spell a path fragment by hand — the
+/// same declaration drives the scanners, the sweeper and the fd-rebinding
+/// predicates in the other two crates.
+fn path_is_in_store_of(kind: SessionKind, path: &str) -> bool {
+    yggterm_core::agent_cli_descriptor(kind)
+        .is_some_and(|descriptor| descriptor.store_path_is_under_root(path))
+}
+
 fn is_codex_storage_session_path(path: &str) -> bool {
-    path.contains("/.codex/sessions/")
+    path_is_in_store_of(SessionKind::Codex, path)
 }
 
 fn is_codex_litellm_storage_session_path(path: &str) -> bool {
-    path.contains("/.codex-litellm/sessions/")
+    path_is_in_store_of(SessionKind::CodexLiteLlm, path)
 }
 
 fn is_claude_code_session_path(path: &str) -> bool {
-    (path.contains("/.claude/projects/") && path.ends_with(".jsonl"))
+    yggterm_core::agent_cli_descriptor(SessionKind::ClaudeCode)
+        .is_some_and(|descriptor| descriptor.store_path_is_session_file(path))
         || path.starts_with("remote-cc://")
 }
 
@@ -29745,7 +29757,7 @@ fn sidebar_search_context_for_path(path: &str) -> Option<String> {
         .and_then(|store| store.get(path).cloned())
 }
 fn local_transcript_search_context(path: &str) -> Option<String> {
-    if !(path.contains("/.codex/sessions/") || path.contains("/.codex-litellm/sessions/")) {
+    if !is_local_codex_history_session_path(path) {
         return None;
     }
     if let Ok(store) = local_transcript_search_context_store().lock()
@@ -33059,15 +33071,14 @@ fn stored_codex_transcript_row_is_visible(
     }
     expanded_paths.contains(root)
 }
+/// The codex home directory a storage path sits under (`/home/user/.codex`),
+/// for either fork. The store layout that makes this derivable is descriptor
+/// data — see [`path_is_in_store_of`].
 fn codex_storage_root_for_path(path: &str) -> Option<&str> {
-    const CODEX_SESSIONS: &str = "/.codex/sessions/";
-    const LITELLM_SESSIONS: &str = "/.codex-litellm/sessions/";
-    for marker in [CODEX_SESSIONS, LITELLM_SESSIONS] {
-        if let Some(ix) = path.find(marker) {
-            return path.get(..ix + marker.len() - "/sessions/".len());
-        }
-    }
-    None
+    yggterm_core::AGENT_CLIS
+        .iter()
+        .filter(|descriptor| yggterm_core::CODEX_FAMILY.contains(&descriptor.kind))
+        .find_map(|descriptor| descriptor.store_home_prefix_of(path))
 }
 #[derive(Default)]
 struct RemoteSessionIndex {
@@ -99979,6 +99990,61 @@ mod tests {
     use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
+
+    /// Sites in this crate still allowed to spell a store path by hand. The
+    /// list should only ever shrink — each entry is a place a fourth agent CLI
+    /// would have to be remembered.
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[];
+
+    #[test]
+    fn no_store_path_literal_outside_the_agent_cli_registry() {
+        let source = include_str!("shell.rs");
+        // The scanner must actually SEE this file — it went blind once.
+        let (scanned, _skipped) = yggterm_core::store_literal_scan_coverage(source);
+        assert!(
+            scanned > 90000,
+            "the store-literal scan covered only {scanned} lines of shell.rs — its \
+             test-module skip is swallowing product code"
+        );
+        let findings = yggterm_core::unregistered_store_literals(source, RECORDED_STORE_LITERALS);
+        assert!(
+            findings.is_empty(),
+            "these re-encode an agent CLI's store layout — ask the descriptor \
+             (yggterm_core::agent_cli_descriptor) instead, or record the site in \
+             RECORDED_STORE_LITERALS with a reason: {findings:?}"
+        );
+    }
+
+    /// The shipped classification, through the registry. `codex_storage_root_for_path`
+    /// is what the cwd-tree expansion keys on, so a wrong answer here hides rows.
+    #[test]
+    fn store_predicates_classify_each_shipped_layout() {
+        assert!(is_codex_storage_session_path(
+            "/home/user/.codex/sessions/2026/07/25/rollout-a.jsonl"
+        ));
+        assert!(!is_codex_storage_session_path(
+            "/home/user/.codex-litellm/sessions/2026/07/25/rollout-a.jsonl"
+        ));
+        assert!(is_codex_litellm_storage_session_path(
+            "/home/user/.codex-litellm/sessions/2026/07/25/rollout-a.jsonl"
+        ));
+        assert!(is_claude_code_session_path(
+            "/home/user/.claude/projects/-home-user-gh-yggterm/abc.jsonl"
+        ));
+        assert!(is_claude_code_session_path("remote-cc://dev/abc"));
+        assert!(!is_claude_code_session_path("/home/user/gh/yggterm/notes.jsonl"));
+        assert_eq!(
+            codex_storage_root_for_path("/home/user/.codex/sessions/2026/rollout-a.jsonl"),
+            Some("/home/user/.codex")
+        );
+        assert_eq!(
+            codex_storage_root_for_path("/home/user/.codex-litellm/sessions/2026/rollout-a.jsonl"),
+            Some("/home/user/.codex-litellm")
+        );
+        assert_eq!(codex_storage_root_for_path("/home/user/gh/yggterm"), None);
+    }
 
     // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
 

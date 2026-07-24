@@ -76,14 +76,15 @@ fn trashed_epoch_ms(file_name: &str) -> Option<u64> {
 }
 
 /// The transcript stores whose JSONLs may reference staged paths, per CLI.
-/// Grows with the agent-CLI roster (docs/spec-agent-cli-harness.md §3 makes
-/// this descriptor data once the registry lands).
+///
+/// Registry-derived (docs/spec-agent-cli-harness.md §3), so the roster grows
+/// with `AGENT_CLIS` and never independently: a new CLI that this list forgot
+/// would make the sweep delete staged files its transcripts still point at.
 fn transcript_store_roots(user_home: &Path) -> Vec<PathBuf> {
-    vec![
-        user_home.join(".codex/sessions"),
-        user_home.join(".codex-litellm/sessions"),
-        user_home.join(".claude/projects"),
-    ]
+    yggterm_core::AGENT_CLIS
+        .iter()
+        .flat_map(|descriptor| descriptor.store_roots_absolute(user_home))
+        .collect()
 }
 
 /// Which of `candidates` (file basenames) appear anywhere in the transcript
