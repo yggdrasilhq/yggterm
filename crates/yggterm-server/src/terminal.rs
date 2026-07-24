@@ -3244,6 +3244,7 @@ fn strip_terminal_control_sequences(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
@@ -3799,6 +3800,46 @@ line-two on the real screen\r\n\
                 .map(|query| query.label())
                 .collect::<Vec<_>>(),
             vec!["4:0".to_string(), "4:1".to_string()]
+        );
+    }
+
+    // End-to-end through a REAL pty: an app writes its OSC 7717 declare to its
+    // own stdout, and the daemon — with no GUI, no xterm, no client of any kind
+    // in the picture — retains it. That is the whole point: this is the state a
+    // never-revealed session is in, and it is what `web ensure` rebuilds from.
+    #[test]
+    fn pty_runtime_retains_an_app_declare_with_no_client_attached() {
+        let payload = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!({"session": "probe", "url": "https://example.test/ingested"})
+                .to_string()
+                .as_bytes(),
+        );
+        let runtime = PtySessionRuntime::spawn(
+            "local://declare-ingest",
+            &format!("printf '\\033]7717;web-surface;open;{payload}\\007'; sleep 5"),
+            None,
+            None,
+        )
+        .expect("spawn declare test runtime");
+
+        let mut records = Vec::new();
+        for _ in 0..80 {
+            records = runtime.app_declares();
+            if !records.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let screen = runtime.screen_snapshot();
+        runtime.shutdown(None).expect("shutdown test runtime");
+
+        assert_eq!(records.len(), 1, "expected one retained declare");
+        assert_eq!(records[0].verb, "web-surface");
+        assert_eq!(records[0].action, "open");
+        assert_eq!(records[0].payload["url"], "https://example.test/ingested");
+        assert!(
+            !screen.contains("7717"),
+            "the OSC must stay invisible on the screen: {screen:?}"
         );
     }
 

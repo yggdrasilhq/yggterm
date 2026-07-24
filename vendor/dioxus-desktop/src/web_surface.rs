@@ -1397,6 +1397,29 @@ impl WebSurfaceHost {
         Ok(())
     }
 
+    /// Throttle a soft-stashed surface's CPU WITHOUT detaching it. Hiding the
+    /// inner webview widget unmaps it, so WebKitGTK marks the page hidden
+    /// (`document.visibilityState === 'hidden'`) and stops driving it at the
+    /// compositor frame rate: `requestAnimationFrame` pauses and background
+    /// timers throttle. That is the difference between a demoted-but-live page
+    /// burning a whole core on an animation and the same page sitting idle
+    /// (measured author-note: ">1 core while invisible").
+    ///
+    /// The CONTAINER stays attached and demoted below the glass, so this is NOT
+    /// the detach stash: reveal is still a raise + `set_visible(true)` (see
+    /// `unstash`), not an overlay re-add and WebKit re-composite. Page STATE
+    /// (DOM, scroll, JS heap) is untouched — only rendering pauses — and
+    /// explicit JS eval still runs on a hidden view, so agent read/eval/wait
+    /// keep working. The stale-pixel hazard that makes a plain hidden webview
+    /// unsafe over a revealed session does not apply here: the surface is
+    /// demoted beneath the opaque glass, so nobody ever sees those pixels.
+    pub fn set_throttled(&self, id: u64, throttled: bool) -> Result<(), String> {
+        let surfaces = self.surfaces.borrow();
+        let s = surfaces.get(&id).ok_or("no such surface")?;
+        let _ = s.webview.set_visible(!throttled);
+        Ok(())
+    }
+
     pub fn is_open(&self, id: u64) -> bool {
         self.surfaces.borrow().contains_key(&id)
     }
