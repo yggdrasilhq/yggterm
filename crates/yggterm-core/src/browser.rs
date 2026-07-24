@@ -365,11 +365,25 @@ impl SessionBrowserState {
     }
 }
 
+/// Whether selecting `path` should expand its ancestor folders.
+///
+/// A path inside a CLI's OWN store is a transcript, not a tree folder: its
+/// ancestors are the CLI's storage dirs (codex's `2026/07/25`, CC's encoded
+/// project dir), which are not nodes the user navigates.
+///
+/// ⚠ Covers the codex stores only. Claude Code's store is a RECORDED HOLE
+/// (`KNOWN_STORE_PREDICATE_HOLES`) — a CC leaf's `path` is its real
+/// `~/.claude/projects/…jsonl` file, so it takes the folder branch today.
+/// Closing it changes what the tree expands on a CC click, which is a
+/// user-visible change and belongs to a phase that can prove it live, not to
+/// this refactor.
 fn selected_path_should_expand_ancestors(path: &str) -> bool {
-    !path.contains("://")
-        && !path.starts_with("__")
-        && !path.contains("/.codex/sessions/")
-        && !path.contains("/.codex-litellm/sessions/")
+    !path.contains("://") && !path.starts_with("__") && !codex_family_store_path(path)
+}
+
+/// True when `path` is inside either codex fork's store.
+fn codex_family_store_path(path: &str) -> bool {
+    crate::agent_cli::store_path_is_under_any(crate::agent_cli::CODEX_FAMILY, path)
 }
 
 fn default_level_one_expanded_paths(root: &SessionNode) -> HashSet<String> {
@@ -733,9 +747,39 @@ fn session_id_suffix(id: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserRowKind, SessionBrowserState, unique_session_short_ids_for_pairs};
+    use super::{
+        BrowserRowKind, SessionBrowserState, selected_path_should_expand_ancestors,
+        unique_session_short_ids_for_pairs,
+    };
     use crate::{SessionKind, SessionNode, SessionNodeKind, WorkspaceGroupKind};
     use std::path::PathBuf;
+
+    // The store-keyed twin of phase 0's scheme locks: this predicate must
+    // answer for every registered CLI store or record why it doesn't, and a
+    // hole that stops reproducing fails until its table row is deleted.
+    #[test]
+    fn selected_path_expansion_covers_every_agent_cli_store_or_records_the_hole() {
+        crate::agent_cli::assert_store_predicate_coverage(
+            "selected_path_should_expand_ancestors",
+            |path| !selected_path_should_expand_ancestors(path),
+        );
+    }
+
+    // The shipped behavior the lock above is calibrated against — kept explicit
+    // so the hole is legible without running the generic lock.
+    #[test]
+    fn codex_transcripts_do_not_expand_ancestors_but_cc_ones_still_do() {
+        assert!(!selected_path_should_expand_ancestors(
+            "/home/user/.codex/sessions/2026/07/25/rollout-abc.jsonl"
+        ));
+        assert!(!selected_path_should_expand_ancestors(
+            "/home/user/.codex-litellm/sessions/2026/07/25/rollout-abc.jsonl"
+        ));
+        assert!(selected_path_should_expand_ancestors(
+            "/home/user/.claude/projects/-home-user-gh-yggterm/abc.jsonl"
+        ));
+        assert!(selected_path_should_expand_ancestors("/home/user/gh/yggterm"));
+    }
 
     #[test]
     fn unique_session_short_ids_widen_only_colliding_suffixes() {

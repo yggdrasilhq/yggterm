@@ -7852,19 +7852,22 @@ def titles_from_lines(lines):
                 ai = at
     return custom, ai
 
-ids = [i for i in sys.argv[1:] if i.strip()]
-projects = Path(os.path.expanduser('~/.claude/projects'))
-if not projects.exists() or not ids:
+# argv[1] is CC's store glob ($HOME-relative), from
+# AgentCliDescriptor.session_store_globs — the same declaration the scanners
+# use. argv[2:] are the session ids to read. Where the store lives is NOT this
+# script's decision to re-encode (docs/spec-agent-cli-harness.md §3).
+store_glob = sys.argv[1] if len(sys.argv) > 1 else ''
+ids = [i for i in sys.argv[2:] if i.strip()]
+home = Path(os.path.expanduser('~'))
+if not store_glob or not ids:
     sys.exit(0)
+# The glob names FILES; a session's transcript is `<id>.jsonl` under it, so
+# match on the stem rather than re-deriving CC's project-dir encoding.
+by_id = {}
+for candidate in home.glob(store_glob):
+    by_id.setdefault(candidate.stem, candidate)
 for sid in ids:
-    found = None
-    for project_dir in projects.iterdir():
-        if not project_dir.is_dir():
-            continue
-        candidate = project_dir / (sid + '.jsonl')
-        if candidate.is_file():
-            found = candidate
-            break
+    found = by_id.get(sid)
     if found is None:
         continue
     try:
@@ -7951,12 +7954,14 @@ fn collect_remote_cc_title_syncs(
         else {
             continue;
         };
-        let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        // The store glob leads, the ids follow — see the script's argv contract.
+        let mut args = crate::remote_cc_scan_args();
+        args.extend(rows.iter().map(|(id, _)| id.clone()));
         let lines = match crate::run_remote_python_lines(
             &target.ssh_target,
             target.prefix.as_deref(),
             REMOTE_CC_TITLE_SCRIPT,
-            &ids,
+            &args,
         ) {
             Ok(lines) => lines,
             // ssh failed: leave the rows unconfirmed so the next tick retries
@@ -13608,6 +13613,29 @@ mod tests {
         HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker,
         hot_restart_block_reason_summary,
     };
+
+    /// Sites in this file still allowed to spell a store path by hand.
+    /// Should only ever shrink (harness spec §3 / §8 phase 1b).
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[];
+
+    #[test]
+    fn no_store_path_literal_outside_the_agent_cli_registry() {
+        let source = include_str!("daemon.rs");
+        // The scanner must actually SEE this file — it went blind once.
+        let (scanned, _skipped) = yggterm_core::store_literal_scan_coverage(source);
+        assert!(
+            scanned > 12000,
+            "the store-literal scan covered only {scanned} lines of daemon.rs — its \
+             test-module skip is swallowing product code"
+        );
+        let findings = yggterm_core::unregistered_store_literals(source, RECORDED_STORE_LITERALS);
+        assert!(
+            findings.is_empty(),
+            "these re-encode an agent CLI's store layout — ask the descriptor \
+             (yggterm_core::agent_cli_descriptor) instead, or record the site in \
+             RECORDED_STORE_LITERALS with a reason: {findings:?}"
+        );
+    }
 
     // ── Scheme-registry predicate locks (harness spec §2.3/§8 phase 0) ──────
 
