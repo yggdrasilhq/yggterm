@@ -10,6 +10,7 @@ mod profile_write_lock;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
+pub mod transcript_view;
 mod row_order_ledger;
 mod terminal;
 
