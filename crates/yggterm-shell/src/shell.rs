@@ -4955,6 +4955,198 @@ fn resolve_web_surface_effective_url(
     }
     (url.to_string(), None, None)
 }
+/// The `open` a retained `web-surface` declare stands for.
+struct DeclaredWebSurfaceOpen {
+    url: String,
+    title: Option<String>,
+    profile: Option<String>,
+    start_page: bool,
+    claimed_session: Option<String>,
+}
+
+/// Read a retained declare payload as an open, or refuse it.
+///
+/// The daemon retains whatever an app wrote to its own stdout, so this is a
+/// TRUST BOUNDARY as real as the client-side forwarder's: only an allowed URL
+/// scheme may be materialized (never `file:`/`javascript:`), and a payload
+/// without a url describes nothing to rebuild. Pure so the refusal is testable
+/// without a live surface.
+fn declared_web_surface_open_from_payload(payload: &Value) -> Option<DeclaredWebSurfaceOpen> {
+    let url = payload
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| web_surface_url_scheme_allowed(url))
+        .map(str::to_string)?;
+    Some(DeclaredWebSurfaceOpen {
+        url,
+        title: payload
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        profile: payload
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        start_page: payload.get("start_page") == Some(&Value::Bool(true)),
+        claimed_session: payload
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Rebuild a session's web surface from the declare the DAEMON retained.
+///
+/// The client-side OSC parser only exists while a terminal host is mounted, so
+/// a session spawned `--no-activate` never had one, and a surface the reaper
+/// collected cannot come back from a heartbeat (heartbeats are liveness, never
+/// intent). The daemon read the same bytes off the PTY and kept the app's
+/// latest payload, so `web ensure` — an explicit request, which is exactly the
+/// intent a heartbeat lacks — can materialize the surface with no reveal.
+/// Returns false when the app declared nothing (a plain shell, or an app that
+/// already emitted `close`).
+async fn rebuild_web_surface_from_daemon_declare(
+    state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: &str,
+) -> bool {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let declares = terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home)
+        .await
+        .map(|(records, _running)| records)
+        .unwrap_or_default();
+    let Some((record, open)) = declares
+        .into_iter()
+        .find(|record| record.verb == "web-surface")
+        .and_then(|record| {
+            declared_web_surface_open_from_payload(&record.payload)
+                .map(|open| (record, open))
+        })
+    else {
+        return false;
+    };
+    let DeclaredWebSurfaceOpen {
+        url,
+        title,
+        profile,
+        start_page,
+        claimed_session,
+    } = open;
+    let ssh_target = state.with(|shell| shell.web_surface_session_ssh_target(session_path));
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "web_surface",
+        "daemon_declare_rebuild",
+        json!({
+            "session_path": session_path,
+            "url": url,
+            "declared_at_ms": record.at_ms,
+            "declare_seq": record.seq,
+            "declare_action": record.action,
+        }),
+    );
+    materialize_declared_web_surface(
+        state,
+        trace_home,
+        session_path.to_string(),
+        url,
+        title,
+        profile.as_deref(),
+        start_page,
+        ssh_target,
+        "daemon_declare_rebuild",
+        claimed_session.as_deref(),
+        current_millis(),
+    )
+    .await
+}
+
+/// Turn an app's declared `open` payload into a live web surface.
+///
+/// ONE owner for "a declare becomes a surface". Two callers reach it: the OSC
+/// event arm (a declare read off a mounted client host) and the daemon-retained
+/// declare rebuild behind `web ensure` (a session whose host was never mounted,
+/// or whose surface the reaper collected — agent-control-plane finding #2). A
+/// rebuild that duplicated this would drift from a real declare the first time
+/// either changed; egress resolution alone is three fallbacks deep.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_declared_web_surface(
+    state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: String,
+    url: String,
+    title: Option<String>,
+    profile: Option<&str>,
+    start_page: bool,
+    ssh_target: Option<String>,
+    action: &str,
+    claimed_session: Option<&str>,
+    now_ms: u64,
+) -> bool {
+    // Session-side egress: remote sessions get an ssh -D SOCKS tunnel whose
+    // remote sshd originates every connection on the session's machine (ssh -L
+    // loopback rewrite as fallback). The bounded wait runs off the UI event
+    // loop.
+    let resolve_url = url.clone();
+    let resolve_target = ssh_target.clone();
+    let remote = resolve_target
+        .as_deref()
+        .is_some_and(|target| !ssh_target_host_is_loopback(target));
+    let (effective_url, forward_child, socks_port) = task::spawn_blocking(move || {
+        resolve_web_surface_effective_url(&resolve_url, resolve_target.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| (url.clone(), None, None));
+    let profile = normalize_web_surface_profile(profile);
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "web_surface",
+        "open",
+        json!({
+            "session_path": session_path,
+            "claimed_session": claimed_session,
+            "url": url,
+            "effective_url": effective_url,
+            "forwarded": forward_child.is_some(),
+            "socks_port": socks_port,
+            "egress_gap": remote && socks_port.is_none(),
+            "profile": profile,
+            "action": action,
+        }),
+    );
+    let mut state = state;
+    state.with_mut(|shell| {
+        shell.upsert_web_surface(
+            &session_path,
+            url,
+            title,
+            effective_url,
+            forward_child,
+            socks_port,
+            profile,
+            start_page,
+            now_ms,
+        );
+    });
+    // The tab the restore landed on may be one that has never been shown (the
+    // app tab having ADOPTED a saved URL, or a filed tab selected where it
+    // sits), and egress belongs to a run, so it is unresolved. Select it
+    // through the one door that resolves: otherwise the reconciler builds its
+    // webview against an empty URL and the restore comes back blank.
+    let landed = state.with(|shell| {
+        shell
+            .web_surfaces
+            .get(&session_path)
+            .map(|surface| surface.active_tab)
+    });
+    if let Some(tab_id) = landed {
+        select_web_surface_tab(state, session_path.clone(), tab_id);
+    }
+    landed.is_some()
+}
+
 /// Turn address-bar input into a navigable URL: pass http(s) URLs through,
 /// prefix bare hosts with a scheme (http for loopback dev servers, https
 /// otherwise), and send anything that doesn't look like a host to a web
@@ -51578,6 +51770,14 @@ async fn process_pending_app_control_requests(
         } => {
             let ttl = ttl_secs.unwrap_or(600).clamp(30, 3600);
             let until = current_millis() + ttl * 1000;
+            // A session whose host was never mounted (a `--no-activate` spawn)
+            // or whose surface the reaper collected has nothing in
+            // `web_surfaces` — but the daemon kept the app's declare. Rebuild
+            // from it BEFORE answering, so `ensure` means ensure.
+            let rebuilt_from_daemon_declare = state
+                .with(|shell| !shell.web_surfaces.contains_key(&session_path))
+                && rebuild_web_surface_from_daemon_declare(state, home.clone(), &session_path)
+                    .await;
             let tabs = state.with_mut(|shell| {
                 let tabs = shell
                     .web_surfaces
@@ -51607,6 +51807,7 @@ async fn process_pending_app_control_requests(
                     "wanted_until_ms": until,
                     "ttl_secs": ttl,
                     "lease": lease,
+                    "rebuilt_from_daemon_declare": rebuilt_from_daemon_declare,
                 })),
             }
         }
@@ -52810,18 +53011,71 @@ fn active_client_instance_paths_for_scan(
     active.dedup();
     Ok(active)
 }
-fn register_client_instance(
-    settings_path: &Path,
-    endpoint: &ServerEndpoint,
-    linux_desktop_app_id: Option<&str>,
-) -> Result<ClientInstanceRegistration> {
-    let dir = client_instances_dir(settings_path, endpoint);
-    let _ = cleanup_stale_client_instances(&dir, None);
+/// Re-publish this client's record if it has gone missing since startup.
+///
+/// Registration happens ONCE per process, so anything that removes the record
+/// afterwards leaves the GUI unregistered for the rest of its life while it
+/// keeps handling every other request — and an unenumerable primary is exactly
+/// how `terminal new` / `session remove` fell through to a standing shadow and
+/// failed `shadow_cannot_own` on the 2026-07-23 co-browse run (finding #1 in
+/// docs/agent-control-plane.md). The user's GUI must always be targetable, so
+/// the app-control watchdog re-asserts it rather than trusting one write made
+/// minutes or days ago. Re-publishing to the SAME path keeps the process-wide
+/// `CLIENT_INSTANCE` handle true (its path is what shutdown removes).
+fn reassert_client_instance_registration(settings_path: &Path) -> bool {
+    let Some(registration) = CLIENT_INSTANCE.get() else {
+        return false;
+    };
+    if registration.path.exists() {
+        return false;
+    }
+    let Some(dir) = registration.path.parent() else {
+        return false;
+    };
     let pid = std::process::id();
-    let started_at_ms = current_millis();
-    let path = dir.join(format!("{pid}-{started_at_ms}.json"));
+    let started_at_ms = client_instance_started_at_ms_from_path(&registration.path)
+        .unwrap_or_else(|| current_millis());
+    #[cfg(target_os = "linux")]
+    let linux_desktop_app_id_value = Some(linux_desktop_app_id());
+    #[cfg(not(target_os = "linux"))]
+    let linux_desktop_app_id_value: Option<String> = None;
+    let record = build_client_instance_record(
+        pid,
+        started_at_ms,
+        linux_desktop_app_id_value.as_deref(),
+    );
+    let republished =
+        publish_client_instance_record(dir, &registration.path, &record).is_ok();
+    append_trace_event(
+        &perf_home_dir(settings_path),
+        "client",
+        "gui",
+        "client_instance_record_reasserted",
+        json!({
+            "pid": pid,
+            "path": registration.path.display().to_string(),
+            "republished": republished,
+        }),
+    );
+    republished
+}
+
+/// The registration timestamp encoded in a record's `<pid>-<started_at_ms>.json`
+/// file name. Re-publishing keeps it so the record and its path never disagree.
+fn client_instance_started_at_ms_from_path(path: &Path) -> Option<u64> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.split_once('-'))
+        .and_then(|(_, started)| started.parse::<u64>().ok())
+}
+
+fn build_client_instance_record(
+    pid: u32,
+    started_at_ms: u64,
+    linux_desktop_app_id: Option<&str>,
+) -> ClientInstanceRecord {
     let identity = yggterm_server::current_client_identity();
-    let record = ClientInstanceRecord {
+    ClientInstanceRecord {
         pid,
         started_at_ms,
         client_id: identity.client_id,
@@ -52840,15 +53094,22 @@ fn register_client_instance(
         xdg_session_id: env_var("XDG_SESSION_ID"),
         xdg_runtime_dir: env_var("XDG_RUNTIME_DIR"),
         xauthority: env_var("XAUTHORITY"),
-    };
-    // ATOMIC write, or the register can silently un-register itself
-    // (2026-07-22 incident): create_new + write_all exposed an EMPTY file
-    // between the create and the write, and any concurrent cleanup pass
-    // (every `server app …` CLI probe runs one) read it as undeserializable
-    // and deleted it. write_all then succeeded on the unlinked inode, so the
-    // register traced ok:true while the record was already gone — the whole
-    // app-control plane down with a clean-looking trace. Stage the full
-    // payload in a subdirectory the cleanup pass skips, then rename.
+    }
+}
+
+/// ATOMIC write, or the register can silently un-register itself
+/// (2026-07-22 incident): create_new + write_all exposed an EMPTY file
+/// between the create and the write, and any concurrent cleanup pass
+/// (every `server app …` CLI probe runs one) read it as undeserializable
+/// and deleted it. write_all then succeeded on the unlinked inode, so the
+/// register traced ok:true while the record was already gone — the whole
+/// app-control plane down with a clean-looking trace. Stage the full
+/// payload in a subdirectory the cleanup pass skips, then rename.
+fn publish_client_instance_record(
+    dir: &Path,
+    path: &Path,
+    record: &ClientInstanceRecord,
+) -> Result<()> {
     let staging_dir = dir.join(CLIENT_INSTANCE_STAGING_DIR);
     fs::create_dir_all(&staging_dir)
         .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
@@ -52863,12 +53124,27 @@ fn register_client_instance(
             }
         }
     }
-    let staging_path = staging_dir.join(format!("{pid}-{started_at_ms}.json"));
-    let payload = serde_json::to_vec(&record)?;
+    let staging_path = staging_dir.join(format!("{}-{}.json", record.pid, record.started_at_ms));
+    let payload = serde_json::to_vec(record)?;
     fs::write(&staging_path, &payload)
         .with_context(|| format!("staging client instance {}", staging_path.display()))?;
-    fs::rename(&staging_path, &path)
+    fs::rename(&staging_path, path)
         .with_context(|| format!("publishing client instance {}", path.display()))?;
+    Ok(())
+}
+
+fn register_client_instance(
+    settings_path: &Path,
+    endpoint: &ServerEndpoint,
+    linux_desktop_app_id: Option<&str>,
+) -> Result<ClientInstanceRegistration> {
+    let dir = client_instances_dir(settings_path, endpoint);
+    let _ = cleanup_stale_client_instances(&dir, None);
+    let pid = std::process::id();
+    let started_at_ms = current_millis();
+    let path = dir.join(format!("{pid}-{started_at_ms}.json"));
+    let record = build_client_instance_record(pid, started_at_ms, linux_desktop_app_id);
+    publish_client_instance_record(&dir, &path, &record)?;
     append_trace_event(
         &perf_home_dir(settings_path),
         "client",
@@ -54795,6 +55071,11 @@ fn app() -> Element {
                     }),
                 );
                 loop {
+                    // The roster is only true if the primary keeps re-asserting
+                    // itself: a record removed after startup would otherwise hide
+                    // the user's GUI from every untargeted verb for the rest of
+                    // its life (agent-control-plane finding #1).
+                    reassert_client_instance_registration(&settings_path);
                     let pending_requests =
                         app_control_requests_pending_for_worker(&trace_home, std::process::id());
                     if app_control_drain_in_flight.load(Ordering::SeqCst) && pending_requests {
@@ -67716,82 +67997,20 @@ fn TerminalCanvas(
                                                     })
                                             });
                                         if let Some(url) = fresh_url {
-                                            // Session-side egress: remote sessions
-                                            // get an ssh -D SOCKS tunnel whose remote
-                                            // sshd originates every connection on the
-                                            // session's machine (ssh -L loopback
-                                            // rewrite as fallback). The bounded wait
-                                            // runs off the UI event loop.
-                                            let resolve_url = url.clone();
-                                            let resolve_target = web_surface_ssh_target.clone();
-                                            let remote = resolve_target
-                                                .as_deref()
-                                                .is_some_and(|t| !ssh_target_host_is_loopback(t));
-                                            let (effective_url, forward_child, socks_port) =
-                                                task::spawn_blocking(move || {
-                                                    resolve_web_surface_effective_url(
-                                                        &resolve_url,
-                                                        resolve_target.as_deref(),
-                                                    )
-                                                })
-                                                .await
-                                                .unwrap_or_else(|_| (url.clone(), None, None));
-                                            let profile = normalize_web_surface_profile(
+                                            materialize_declared_web_surface(
+                                                state,
+                                                trace_home.clone(),
+                                                surface_session_path.clone(),
+                                                url,
+                                                surface_title,
                                                 surface_profile.as_deref(),
-                                            );
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "web_surface",
-                                                "open",
-                                                json!({
-                                                    "session_path": surface_session_path,
-                                                    "claimed_session": claimed_session,
-                                                    "url": url,
-                                                    "effective_url": effective_url,
-                                                    "forwarded": forward_child.is_some(),
-                                                    "socks_port": socks_port,
-                                                    "egress_gap": remote && socks_port.is_none(),
-                                                    "profile": profile,
-                                                    "action": action,
-                                                }),
-                                            );
-                                            state.with_mut(|shell| {
-                                                shell.upsert_web_surface(
-                                                    &surface_session_path,
-                                                    url,
-                                                    surface_title,
-                                                    effective_url,
-                                                    forward_child,
-                                                    socks_port,
-                                                    profile,
-                                                    start_page,
-                                                    now_ms,
-                                                );
-                                            });
-                                            // The tab the restore landed on may be
-                                            // one that has never been shown (the app
-                                            // tab having ADOPTED a saved URL, or a
-                                            // filed tab selected where it sits), and
-                                            // egress belongs to a run, so it is
-                                            // unresolved. Select it through the one
-                                            // door that resolves: otherwise the
-                                            // reconciler builds its webview against
-                                            // an empty URL and the restore comes back
-                                            // blank.
-                                            let landed = state.with(|shell| {
-                                                shell
-                                                    .web_surfaces
-                                                    .get(&surface_session_path)
-                                                    .map(|surface| surface.active_tab)
-                                            });
-                                            if let Some(tab_id) = landed {
-                                                select_web_surface_tab(
-                                                    state,
-                                                    surface_session_path.clone(),
-                                                    tab_id,
-                                                );
-                                            }
+                                                start_page,
+                                                web_surface_ssh_target.clone(),
+                                                &action,
+                                                Some(claimed_session.as_str()),
+                                                now_ms,
+                                            )
+                                            .await;
                                         }
                                     }
                                     "close" => {
@@ -75925,6 +76144,16 @@ async fn terminal_snapshot_async(
 ) -> Result<(String, bool, bool, bool, u64, u64)> {
     run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
         terminal_snapshot(&endpoint, &session_path)
+    })
+    .await
+}
+async fn terminal_app_declares_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: &Path,
+) -> Result<(Vec<yggterm_server::app_declare::AppDeclareRecord>, bool)> {
+    run_dedicated_terminal_io("terminal_app_declares", trace_home, move || {
+        yggterm_server::terminal_app_declares(&endpoint, &session_path)
     })
     .await
 }
@@ -100239,6 +100468,47 @@ mod tests {
             shell.effective_right_panel_mode(false, 1_000),
             RightPanelMode::Hidden
         );
+    }
+
+    // A retained declare is bytes an app wrote to its own stdout, replayed by
+    // the daemon minutes later with no client parser in between — the same
+    // trust boundary the client-side forwarder has. Only http(s) may be
+    // materialized, and a payload with no url rebuilds nothing.
+    #[test]
+    fn a_retained_declare_only_rebuilds_an_http_surface() {
+        let good = declared_web_surface_open_from_payload(&json!({
+            "session": "s",
+            "url": "https://example.test/page",
+            "title": "Example",
+            "profile": "research",
+            "start_page": true,
+        }))
+        .expect("an http(s) declare rebuilds");
+        assert_eq!(good.url, "https://example.test/page");
+        assert_eq!(good.title.as_deref(), Some("Example"));
+        assert_eq!(good.profile.as_deref(), Some("research"));
+        assert!(good.start_page);
+        assert_eq!(good.claimed_session.as_deref(), Some("s"));
+
+        for hostile in [
+            json!({"session": "s", "url": "file:///etc/passwd"}),
+            json!({"session": "s", "url": "javascript:alert(1)"}),
+            json!({"session": "s", "title": "no url at all"}),
+            json!({"session": "s", "url": 42}),
+        ] {
+            assert!(
+                declared_web_surface_open_from_payload(&hostile).is_none(),
+                "must refuse to rebuild from {hostile}"
+            );
+        }
+
+        let plain = declared_web_surface_open_from_payload(&json!({
+            "session": "s",
+            "url": "http://127.0.0.1:8080/",
+        }))
+        .expect("loopback http is how every local app declares");
+        assert!(!plain.start_page, "start_page defaults off, not true");
+        assert!(plain.profile.is_none());
     }
 
     // The yedit hidden-sidebar bug: a HIDDEN rail's hover-reveal (and resize-
