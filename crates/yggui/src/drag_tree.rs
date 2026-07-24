@@ -264,9 +264,120 @@ pub fn build_tree_reorder_plan<K: Clone>(
     Some(plan)
 }
 
+/// Reorder a FLAT list: move `moved` to sit before/after `target`, returning the
+/// new order, or `None` when the drop is a no-op or names an id the list does
+/// not hold.
+///
+/// The tree engine above is path-and-parent shaped because the cwd tree nests.
+/// A contributed app rail does not: it is one flat sequence of row ids the app
+/// owns, and the whole reorder is "take this out, put it back there". Keeping
+/// that here rather than in the GUI means the meaning of a drop is unit-tested
+/// without a webview, and both the tree and the rail speak one
+/// [`DragDropPlacement`] vocabulary.
+///
+/// `Into` has no meaning in a flat list — nothing can be dropped *inside* a row
+/// — so it is treated as `After`, which is what the pointer bands either side of
+/// a row's midpoint already produce.
+pub fn reorder_flat_list(
+    order: &[String],
+    moved: &str,
+    target: &str,
+    placement: DragDropPlacement,
+) -> Option<Vec<String>> {
+    if moved == target || !order.iter().any(|id| id == moved) {
+        return None;
+    }
+    let mut remaining: Vec<String> = order.iter().filter(|id| *id != moved).cloned().collect();
+    let target_index = remaining.iter().position(|id| id == target)?;
+    let insert_at = match placement {
+        DragDropPlacement::Before => target_index,
+        DragDropPlacement::Into | DragDropPlacement::After => target_index + 1,
+    };
+    remaining.insert(insert_at.min(remaining.len()), moved.to_string());
+    (remaining != order).then_some(remaining)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn flat_reorder_moves_a_row_before_and_after_its_target() {
+        let order = ids(&["a", "b", "c", "d"]);
+        assert_eq!(
+            reorder_flat_list(&order, "d", "b", DragDropPlacement::Before),
+            Some(ids(&["a", "d", "b", "c"]))
+        );
+        assert_eq!(
+            reorder_flat_list(&order, "a", "c", DragDropPlacement::After),
+            Some(ids(&["b", "c", "a", "d"]))
+        );
+    }
+
+    // A flat list has no inside; the row bands either side of the midpoint are
+    // what the pointer actually produces, and `Into` must not silently drop the
+    // row on the floor.
+    #[test]
+    fn flat_reorder_treats_into_as_after() {
+        let order = ids(&["a", "b", "c"]);
+        assert_eq!(
+            reorder_flat_list(&order, "a", "b", DragDropPlacement::Into),
+            reorder_flat_list(&order, "a", "b", DragDropPlacement::After)
+        );
+    }
+
+    // No-ops must be `None`, not `Some(unchanged)`: the caller uses that to
+    // decide whether to POST at all, and a POST per settled drag would make the
+    // app rewrite its store on every mouse-up.
+    #[test]
+    fn flat_reorder_reports_no_op_drops_as_none() {
+        let order = ids(&["a", "b", "c"]);
+        assert_eq!(
+            reorder_flat_list(&order, "b", "b", DragDropPlacement::Before),
+            None,
+            "a row dropped on itself changes nothing"
+        );
+        assert_eq!(
+            reorder_flat_list(&order, "a", "b", DragDropPlacement::Before),
+            None,
+            "dropping before the row that already follows it changes nothing"
+        );
+        assert_eq!(
+            reorder_flat_list(&order, "c", "b", DragDropPlacement::After),
+            None,
+            "dropping after the row that already precedes it changes nothing"
+        );
+    }
+
+    #[test]
+    fn flat_reorder_rejects_ids_the_list_does_not_hold() {
+        let order = ids(&["a", "b"]);
+        assert_eq!(
+            reorder_flat_list(&order, "zz", "a", DragDropPlacement::Before),
+            None
+        );
+        assert_eq!(
+            reorder_flat_list(&order, "a", "zz", DragDropPlacement::Before),
+            None
+        );
+    }
+
+    #[test]
+    fn flat_reorder_can_move_a_row_to_either_end() {
+        let order = ids(&["a", "b", "c"]);
+        assert_eq!(
+            reorder_flat_list(&order, "c", "a", DragDropPlacement::Before),
+            Some(ids(&["c", "a", "b"]))
+        );
+        assert_eq!(
+            reorder_flat_list(&order, "a", "c", DragDropPlacement::After),
+            Some(ids(&["b", "c", "a"]))
+        );
+    }
 
     fn item(path: &str, parent_path: &str) -> TreeReorderItem<&'static str> {
         TreeReorderItem {

@@ -222,7 +222,8 @@ use yggui::{
     emphasized_enter_transition, emphasized_exit_transition, gradient_background_repeat_css,
     gradient_background_size_css, gradient_css, join_tree_child_path, live_blur_gradient_css,
     material_blur_radius_px, preview_surface_css,
-    resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
+    reorder_flat_list, resolve_drag_drop_target as resolve_tree_drag_drop_target,
+    resolve_tree_drop_placement,
     search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
@@ -1968,6 +1969,19 @@ enum AppPaneWidget {
         /// vocabulary). See [`AppPaneRowRename`].
         #[serde(default)]
         rename: Option<AppPaneRowRename>,
+        /// Non-empty ⇒ this row can be DRAGGED to reorder it among the other
+        /// reorderable rows of its pane, exactly as Live Sessions rows are.
+        /// On drop, yggterm fires this action with the moved row's id as its
+        /// value AND the pane's full new row order under `values["order"]`, so
+        /// an app can adopt the result wholesale instead of recomputing the
+        /// move from a pair of ids.
+        ///
+        /// The GUI never reorders anything itself: the rail is a projection of
+        /// the app's own list, so the app remains the single source of truth
+        /// for order. The rows re-arrange when the app says they did — which is
+        /// also why a no-op drop POSTs nothing.
+        #[serde(default)]
+        reorder_action: String,
     },
     /// A compact horizontal row of icon buttons — the quick-actions strip
     /// (MS-Office quick access shape) at the top of an app's sidebar.
@@ -2150,6 +2164,161 @@ struct WebSurfacePrefsPatch {
 /// the OSC so a 1100-row vault never rides the PTY.
 fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
     format!("{}/pane/{}", control_url.trim_end_matches('/'), pane_id)
+}
+
+#[cfg(test)]
+mod app_pane_reorder_tests {
+    use super::*;
+
+    fn shell() -> ShellState {
+        ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
+            "local://notes",
+        ))
+    }
+
+    // The gesture, end to end, on the state machine the render drives.
+    #[test]
+    fn a_rail_row_drag_reports_the_panes_new_order_on_drop() {
+        let rows = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut shell = shell();
+        shell.begin_app_pane_row_drag("notes".into(), "c".into());
+        shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::Before);
+        assert_eq!(
+            shell.app_pane_row_drop_edge("notes", "a"),
+            Some(DragDropPlacement::Before),
+            "the hovered row draws the drop line"
+        );
+        assert!(shell.app_pane_row_is_dragging("notes", "c"));
+        assert_eq!(
+            shell.take_app_pane_row_drop(&rows),
+            Some((
+                "notes".to_string(),
+                "c".to_string(),
+                vec!["c".to_string(), "a".to_string(), "b".to_string()]
+            ))
+        );
+        // Taking the drop ends the gesture — a second release cannot re-fire it.
+        assert_eq!(shell.take_app_pane_row_drop(&rows), None);
+    }
+
+    // A drop that changes nothing must POST nothing: otherwise every settled
+    // mouse-up rewrites the app's store.
+    #[test]
+    fn a_drop_that_changes_nothing_reports_no_reorder() {
+        let rows = vec!["a".to_string(), "b".to_string()];
+        let mut shell = shell();
+        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        shell.hover_app_pane_row_drop("notes", "b", DragDropPlacement::Before);
+        assert_eq!(
+            shell.take_app_pane_row_drop(&rows),
+            None,
+            "before the row that already follows it is the same order"
+        );
+    }
+
+    // Releasing without ever hovering a target is an abandoned drag, not a
+    // guess at where the row should go.
+    #[test]
+    fn a_drag_released_over_nothing_is_abandoned() {
+        let rows = vec!["a".to_string(), "b".to_string()];
+        let mut shell = shell();
+        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        assert_eq!(shell.take_app_pane_row_drop(&rows), None);
+        assert!(shell.app_pane_row_drag.is_none());
+    }
+
+    // Rails are per-app. A row must never be dropped into another pane's list —
+    // that would POST an order full of ids the receiving app never issued.
+    #[test]
+    fn a_hover_over_another_pane_is_not_a_drop_target() {
+        let rows = vec!["a".to_string(), "b".to_string()];
+        let mut shell = shell();
+        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        shell.hover_app_pane_row_drop("tabs", "b", DragDropPlacement::After);
+        assert_eq!(shell.app_pane_row_drop_edge("tabs", "b"), None);
+        assert_eq!(shell.take_app_pane_row_drop(&rows), None);
+    }
+
+    // Hovering the dragged row itself is not a target — that is what makes a
+    // click-without-moving stay a click.
+    #[test]
+    fn hovering_the_dragged_row_itself_is_not_a_target() {
+        let rows = vec!["a".to_string(), "b".to_string()];
+        let mut shell = shell();
+        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::After);
+        assert_eq!(shell.app_pane_row_drop_edge("notes", "a"), None);
+        assert_eq!(shell.take_app_pane_row_drop(&rows), None);
+    }
+
+    // A drag begins by dismissing any open row menu: a menu left standing over
+    // a moving row is the stale-overlay class.
+    #[test]
+    fn beginning_a_drag_dismisses_an_open_row_menu() {
+        let mut shell = shell();
+        shell.open_app_pane_context_menu(
+            "notes".into(),
+            "a".into(),
+            "A".into(),
+            vec![AppPaneRowAction {
+                action: "rename".into(),
+                label: "Rename".into(),
+                title: String::new(),
+            }],
+            (10.0, 10.0),
+        );
+        assert!(shell.app_pane_context_menu.is_some());
+        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        assert!(shell.app_pane_context_menu.is_none());
+    }
+
+    #[test]
+    fn the_drop_line_sits_on_the_edge_the_drop_would_land_on() {
+        let before = app_pane_row_drop_line_style(DragDropPlacement::Before, "#0af");
+        let after = app_pane_row_drop_line_style(DragDropPlacement::After, "#0af");
+        assert!(before.contains("inset 0 2px 0 0 #0af"), "{before}");
+        assert!(after.contains("inset 0 -2px 0 0 #0af"), "{after}");
+        assert_eq!(
+            app_pane_row_drop_line_style(DragDropPlacement::Into, "#0af"),
+            after,
+            "a flat list has no inside — Into draws as After, matching reorder_flat_list"
+        );
+    }
+}
+
+/// Half a rail row's height: above it a drop lands BEFORE the row, below it
+/// AFTER. The cwd tree uses 12px bands around a 36px row; a rail row is the
+/// compact `SessionRowDensity::Rail`, so its midpoint is lower.
+const APP_PANE_ROW_DROP_MIDPOINT_PX: f64 = 14.0;
+
+/// The reorderable rows of a pane, in draw order. A row opts in by declaring
+/// `reorder_action`; a row that does not is not a drag source AND not a drop
+/// target, so a fixed row (a header row, a "new note" row) cannot be shuffled
+/// into the middle of a list that does not own it.
+fn app_pane_reorderable_row_ids(widgets: &[AppPaneWidget]) -> Vec<String> {
+    widgets
+        .iter()
+        .filter_map(|widget| match widget {
+            AppPaneWidget::ListRow {
+                id, reorder_action, ..
+            } if !reorder_action.is_empty() => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The insertion line drawn on the edge a drop would land on. Same 2px accent
+/// rule the cwd tree's reorder uses, so one gesture reads the same everywhere.
+fn app_pane_row_drop_line_style(placement: DragDropPlacement, accent: &str) -> String {
+    let edge = match placement {
+        DragDropPlacement::Before => "top",
+        // A flat list has no inside; `Into` is `After` (see `reorder_flat_list`).
+        DragDropPlacement::Into | DragDropPlacement::After => "bottom",
+    };
+    format!("box-shadow: inset 0 {} 0 0 {accent};", match edge {
+        "top" => "2px",
+        _ => "-2px",
+    })
 }
 
 fn app_pane_action_url(control_url: &str) -> String {
@@ -5713,6 +5882,13 @@ struct ShellState {
     /// over nothing, which is a no-op on release.
     web_tab_drag: Option<u64>,
     web_tab_drop_target: Option<Option<String>>,
+    /// A contributed rail row being dragged to reorder: `(pane id, row id)`.
+    /// Only rows whose app declared `reorder_action` ever land here.
+    app_pane_row_drag: Option<(String, String)>,
+    /// Where that drag currently hovers: `(pane id, row id, placement)`. The
+    /// row draws the drop line; release commits. `None` over a non-reorderable
+    /// row, which makes the release a no-op rather than a guess.
+    app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
     /// The classic strip's overflow menu (the tabs that live in folders) is open.
     web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
@@ -6180,6 +6356,8 @@ struct RenderSnapshot {
     web_tab_folder_rename: Option<(String, String)>,
     web_tab_drag: Option<u64>,
     web_tab_drop_target: Option<Option<String>>,
+    app_pane_row_drag: Option<(String, String)>,
+    app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
     web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -7467,6 +7645,8 @@ impl ShellState {
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             tree_rename_path: None,
             tree_rename_depth: None,
@@ -8252,6 +8432,8 @@ impl ShellState {
             web_tab_folder_rename: self.web_tab_folder_rename.clone(),
             web_tab_drag: self.web_tab_drag,
             web_tab_drop_target: self.web_tab_drop_target.clone(),
+            app_pane_row_drag: self.app_pane_row_drag.clone(),
+            app_pane_row_drop_target: self.app_pane_row_drop_target.clone(),
             web_tab_overflow_open: self.web_tab_overflow_open,
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
@@ -11109,6 +11291,79 @@ impl ShellState {
     }
     fn close_app_pane_context_menu(&mut self) {
         self.app_pane_context_menu = None;
+    }
+
+    // ===== contributed rail row REORDER =====
+    // The Live-Sessions drag vocabulary, applied to an app's own rows. yggterm
+    // tracks the gesture; the APP owns the order — nothing here mutates the
+    // rail, it only computes what the drop meant and hands that to the app.
+
+    /// Begin dragging a reorderable rail row. Any open row menu is dismissed:
+    /// a menu left standing over a moving row is the stale-overlay bug class.
+    fn begin_app_pane_row_drag(&mut self, pane_id: String, row_id: String) {
+        self.close_app_pane_context_menu();
+        self.app_pane_row_drag = Some((pane_id, row_id));
+        self.app_pane_row_drop_target = None;
+    }
+
+    /// Hover `row_id` at `placement` while a drag is live. Ignored unless the
+    /// hovered row belongs to the SAME pane — a rail row cannot be dropped into
+    /// another app's list, and silently accepting that would POST an order
+    /// containing ids the app has never heard of.
+    fn hover_app_pane_row_drop(
+        &mut self,
+        pane_id: &str,
+        row_id: &str,
+        placement: DragDropPlacement,
+    ) {
+        let Some((drag_pane, drag_row)) = self.app_pane_row_drag.as_ref() else {
+            return;
+        };
+        if drag_pane != pane_id || drag_row == row_id {
+            // Over itself is not a target; leaving it `None` is what makes the
+            // release a no-op instead of a POST that changes nothing.
+            self.app_pane_row_drop_target = None;
+            return;
+        }
+        let next = Some((pane_id.to_string(), row_id.to_string(), placement));
+        if self.app_pane_row_drop_target != next {
+            self.app_pane_row_drop_target = next;
+        }
+    }
+
+    /// End the gesture and report what it meant: `(pane, moved row, new order)`,
+    /// or `None` for a drag that never found a target or that changed nothing.
+    /// `rows` is the pane's reorderable row ids in their CURRENT displayed order.
+    fn take_app_pane_row_drop(&mut self, rows: &[String]) -> Option<(String, String, Vec<String>)> {
+        let drag = self.app_pane_row_drag.take();
+        let target = self.app_pane_row_drop_target.take();
+        let (drag_pane, moved) = drag?;
+        let (target_pane, target_row, placement) = target?;
+        if target_pane != drag_pane {
+            return None;
+        }
+        let order = reorder_flat_list(rows, &moved, &target_row, placement)?;
+        Some((drag_pane, moved, order))
+    }
+
+    fn clear_app_pane_row_drag(&mut self) {
+        self.app_pane_row_drag = None;
+        self.app_pane_row_drop_target = None;
+    }
+
+    /// Is `row_id` the row the pointer would drop onto right now, and on which
+    /// side? Drives the drop line the row draws.
+    fn app_pane_row_drop_edge(&self, pane_id: &str, row_id: &str) -> Option<DragDropPlacement> {
+        self.app_pane_row_drop_target
+            .as_ref()
+            .filter(|(pane, row, _)| pane == pane_id && row == row_id)
+            .map(|(_, _, placement)| *placement)
+    }
+
+    fn app_pane_row_is_dragging(&self, pane_id: &str, row_id: &str) -> bool {
+        self.app_pane_row_drag
+            .as_ref()
+            .is_some_and(|(pane, row)| pane == pane_id && row == row_id)
     }
     // ===== the DOCUMENT SURFACE's schema channel =====
     // A viewport-placement pane rendered as shell DOM in the main viewport.
@@ -45611,12 +45866,44 @@ fn resolve_fido2_dialog(
 /// and an `eval` script to run in the session's web surface. `eval` is how a
 /// host-resident credential reaches a client-rendered page without the secret
 /// ever living in yggterm — the app computed it, the GUI only injects it.
+/// A rail row was dropped in a new slot: POST the app's `reorder_action` with
+/// the moved row as `value` and the pane's whole new order under `order`.
+///
+/// Both are sent on purpose. `value` keeps the row-action convention every other
+/// rail verb follows, and `order` is the complete answer — an app adopts it
+/// wholesale rather than re-deriving a move from a pair of ids and getting the
+/// off-by-one that "insert before vs after" always produces. The GUI does NOT
+/// reorder its own rows: the rail is a projection of the app's list, so the rows
+/// move when the app's next schema says they moved. That keeps one owner of
+/// order and makes a rejected reorder visibly a no-op instead of a lie.
+async fn app_pane_run_reorder(
+    state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    pane_id: String,
+    action: String,
+    moved: String,
+    order: Vec<String>,
+) {
+    app_pane_run_action_with_order(state, desktop, pane_id, action, Some(moved), Some(order)).await;
+}
+
 async fn app_pane_run_action(
+    state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    pane_id: String,
+    action: String,
+    value: Option<String>,
+) {
+    app_pane_run_action_with_order(state, desktop, pane_id, action, value, None).await;
+}
+
+async fn app_pane_run_action_with_order(
     mut state: Signal<ShellState>,
     desktop: dioxus::desktop::DesktopContext,
     pane_id: String,
     action: String,
     value: Option<String>,
+    order: Option<Vec<String>>,
 ) {
     let (control_url, mut values, host, live_zoom, secure, prefs) = {
         let shell = state.read();
@@ -45673,6 +45960,10 @@ async fn app_pane_run_action(
     if let Some(map) = values.as_object_mut() {
         map.insert("vertical_tabs".to_string(), serde_json::json!(prefs.0));
         map.insert("restore_tabs".to_string(), serde_json::json!(prefs.1));
+    }
+    // A reorder's payload: the pane's full new row order.
+    if let (Some(order), Some(map)) = (order, values.as_object_mut()) {
+        map.insert("order".to_string(), serde_json::json!(order));
     }
     // A widget that carries its own value (a tab id, a row's item id) passes it
     // alongside the pane's draft inputs rather than mutating them.
@@ -57737,6 +58028,17 @@ fn app() -> Element {
                                 move |(pane_id, action, value): (String, String, Option<String>)| {
                                     let desktop = desktop.clone();
                                     spawn(app_pane_run_action(state, desktop, pane_id, action, value));
+                                }
+                            },
+                            // A rail row was dragged to a new slot. Its own verb,
+                            // not an `on_app_pane_action` with a smuggled payload:
+                            // a reorder carries the pane's whole new order, which
+                            // no other action does.
+                            on_app_pane_reorder: {
+                                let desktop = desktop.clone();
+                                move |(pane_id, action, moved, order): (String, String, String, Vec<String>)| {
+                                    let desktop = desktop.clone();
+                                    spawn(app_pane_run_reorder(state, desktop, pane_id, action, moved, order));
                                 }
                             },
                             on_app_pane_value: move |(widget_id, value): (String, String)| {
@@ -91387,6 +91689,9 @@ fn RightRail(
     on_daemon_hot_restart: EventHandler<MouseEvent>,
     /// (pane_id, action, value) — fired by any widget in a contributed pane.
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    /// `(pane id, action, moved row id, the pane's new row order)` — fired
+    /// when a reorderable rail row is dropped somewhere that changes the order.
+    on_app_pane_reorder: EventHandler<(String, String, String, Vec<String>)>,
     /// (widget_id, value) — a draft input changed; stays in the GUI until an
     /// action carries it to the app.
     on_app_pane_value: EventHandler<(String, String)>,
@@ -91530,6 +91835,7 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     pane_id: rendered_app_pane_id.clone().unwrap_or_default(),
                     on_app_pane_action,
+                    on_app_pane_reorder,
                     on_app_pane_value,
                     state,
                 }
@@ -93246,6 +93552,9 @@ fn AppPaneRailBody(
     snapshot: SharedSnapshot,
     pane_id: String,
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    /// `(pane id, action, moved row id, the pane's new row order)` — fired
+    /// when a reorderable rail row is dropped somewhere that changes the order.
+    on_app_pane_reorder: EventHandler<(String, String, String, Vec<String>)>,
     on_app_pane_value: EventHandler<(String, String)>,
     /// A row's right-click opens its context menu on the shell state directly —
     /// a GUI-owned floating overlay, not an app schema.
@@ -93292,6 +93601,13 @@ fn AppPaneRailBody(
     let footer_widgets: Vec<AppPaneWidget> = schema
         .as_ref()
         .map(|schema| schema.footer.clone())
+        .unwrap_or_default();
+    // The pane's reorderable rows, in the order they are drawn — the list a
+    // drop permutes. Computed once per render, so every row's drop resolves
+    // against the same sequence the user is looking at.
+    let reorderable_row_ids: Vec<String> = schema
+        .as_ref()
+        .map(|schema| app_pane_reorderable_row_ids(&schema.widgets))
         .unwrap_or_default();
 
     rsx! {
@@ -93547,7 +93863,7 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu, rename } => {
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu, rename, reorder_action } => {
                                 // The SHARED row engine (Phase 1): same anatomy
                                 // and metrics as the cwdtree rows and WebTabs
                                 // rail — whole-row clickable, selected tinted,
@@ -93689,10 +94005,125 @@ fn AppPaneRailBody(
                                         }
                                     };
                                 }
+                                let reorderable = !reorder_action.is_empty();
+                                let (drop_edge, row_is_dragging) = if reorderable {
+                                    let shell = state.read();
+                                    (
+                                        shell.app_pane_row_drop_edge(&pane_id, &id),
+                                        shell.app_pane_row_is_dragging(&pane_id, &id),
+                                    )
+                                } else {
+                                    (None, false)
+                                };
                                 rsx! {
                                     div {
                                         key: "{widget_key}",
-                                        style: if follows_row { "margin-top:-8px;" } else { "" },
+                                        // Drag state is read here (not inside
+                                        // SessionStyleRow) so the drop line sits
+                                        // on the row's OUTER box — an inset shadow
+                                        // on the inner row would be clipped by its
+                                        // own border radius.
+                                        "data-app-pane-row-reorderable": if reorderable { "1" } else { "0" },
+                                        "data-app-pane-row-drop-edge": match drop_edge {
+                                            Some(DragDropPlacement::Before) => "before",
+                                            Some(_) => "after",
+                                            None => "",
+                                        },
+                                        "data-app-pane-row-dragging": if row_is_dragging { "1" } else { "0" },
+                                        style: format!(
+                                            "{}{}{}",
+                                            if follows_row { "margin-top:-8px;" } else { "" },
+                                            drop_edge
+                                                .map(|placement| app_pane_row_drop_line_style(
+                                                    placement,
+                                                    palette.accent,
+                                                ))
+                                                .unwrap_or_default(),
+                                            // The row being dragged dims, so the
+                                            // gesture has a subject on screen.
+                                            if row_is_dragging { " opacity:0.55;" } else { "" },
+                                        ),
+                                        // A reorder drag is a MOUSE gesture, like
+                                        // the cwd tree's: HTML5 dnd never fires
+                                        // reliably inside this webview, and the
+                                        // tree already proved the pointer path.
+                                        onmousedown: {
+                                            let (pane_id, row_id) = (pane_id.clone(), id.clone());
+                                            let mut state = state;
+                                            move |evt: MouseEvent| {
+                                                if !reorderable
+                                                    || evt.trigger_button() != Some(MouseButton::Primary)
+                                                {
+                                                    return;
+                                                }
+                                                state.with_mut(|shell| {
+                                                    shell.begin_app_pane_row_drag(
+                                                        pane_id.clone(),
+                                                        row_id.clone(),
+                                                    );
+                                                });
+                                            }
+                                        },
+                                        onmousemove: {
+                                            let (pane_id, row_id) = (pane_id.clone(), id.clone());
+                                            let mut state = state;
+                                            move |evt: MouseEvent| {
+                                                if !reorderable {
+                                                    return;
+                                                }
+                                                // Above/below the row's midpoint —
+                                                // a flat list has only two bands.
+                                                let y = evt.element_coordinates().y.max(0.0);
+                                                let placement = if y <= APP_PANE_ROW_DROP_MIDPOINT_PX {
+                                                    DragDropPlacement::Before
+                                                } else {
+                                                    DragDropPlacement::After
+                                                };
+                                                state.with_mut(|shell| {
+                                                    shell.hover_app_pane_row_drop(
+                                                        &pane_id,
+                                                        &row_id,
+                                                        placement,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                        onmouseup: {
+                                            let (pane_id, action, rows) = (
+                                                pane_id.clone(),
+                                                reorder_action.clone(),
+                                                reorderable_row_ids.clone(),
+                                            );
+                                            let on_app_pane_reorder = on_app_pane_reorder.clone();
+                                            let mut state = state;
+                                            move |_: MouseEvent| {
+                                                let dropped = state
+                                                    .with_mut(|shell| shell.take_app_pane_row_drop(&rows));
+                                                let Some((drop_pane, moved, order)) = dropped else {
+                                                    return;
+                                                };
+                                                if action.is_empty() || drop_pane != pane_id {
+                                                    return;
+                                                }
+                                                on_app_pane_reorder.call((
+                                                    pane_id.clone(),
+                                                    action.clone(),
+                                                    moved,
+                                                    order,
+                                                ));
+                                            }
+                                        },
+                                        // A drag that leaves the list entirely is
+                                        // abandoned, not applied to whatever row
+                                        // the pointer happens to return over.
+                                        onmouseleave: {
+                                            let mut state = state;
+                                            move |_: MouseEvent| {
+                                                state.with_mut(|shell| {
+                                                    shell.app_pane_row_drop_target = None;
+                                                });
+                                            }
+                                        },
                                         // Right-click opens the app-declared row
                                         // menu as a GUI-owned floating overlay.
                                         oncontextmenu: {
@@ -108646,6 +109077,7 @@ mod tests {
             actions: Vec::new(),
             menu: Vec::new(),
             rename: None,
+            reorder_action: String::new(),
         };
         assert_eq!(row("a").key(0, &epochs), row("a").key(7, &epochs));
         assert_ne!(row("a").key(0, &epochs), row("b").key(0, &epochs));
@@ -108668,7 +109100,41 @@ mod tests {
                 ai_source: "some note body".into(),
                 placeholder: String::new(),
             }),
+            reorder_action: String::new(),
         };
+        // Only a row that DECLARED `reorder_action` is a drag source or a drop
+        // target. A rail mixing fixed rows with reorderable ones must not let a
+        // drop land in a slot the app never offered.
+        let reorderable = |id: &str| AppPaneWidget::ListRow {
+            icon: String::new(),
+            selected: false,
+            row_action: String::new(),
+            id: id.to_string(),
+            title: String::new(),
+            subtitle: String::new(),
+            actions: Vec::new(),
+            menu: Vec::new(),
+            rename: None,
+            reorder_action: "reorder".into(),
+        };
+        let widgets = vec![
+            AppPaneWidget::Button {
+                id: "new".into(),
+                label: "New".into(),
+                action: "new".into(),
+                primary: false,
+            },
+            reorderable("a"),
+            row("fixed"),
+            reorderable("b"),
+        ];
+        assert_eq!(
+            app_pane_reorderable_row_ids(&widgets),
+            vec!["a".to_string(), "b".to_string()],
+            "only rows that declared reorder_action participate — a fixed row is \
+             neither a drag source nor a slot"
+        );
+
         let renamed_epoch = HashMap::from([("rename:a".to_string(), 1u64)]);
         assert_ne!(
             renaming("a", "x").key(0, &epochs),
@@ -126793,7 +127259,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         snapshot
     }
 
-    fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
+    pub(super) fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
         let active_tree = SessionNode {
             kind: SessionNodeKind::CodexSession,
             name: "test".to_string(),
@@ -128553,6 +129019,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129200,6 +129668,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129382,6 +129852,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129564,6 +130036,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129749,6 +130223,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -129938,6 +130414,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130119,6 +130597,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130300,6 +130780,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130515,6 +130997,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130699,6 +131183,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -130915,6 +131401,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
@@ -131308,6 +131796,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_tab_folder_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
+            app_pane_row_drag: None,
+            app_pane_row_drop_target: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
