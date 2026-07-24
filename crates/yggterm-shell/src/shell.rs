@@ -46282,6 +46282,28 @@ async fn web_surface_do_for(
         if desktop.take_web_surface_seat_input(handle.native_id) > 0 {
             note_human_input_on_web_surface(&session, handle.generation);
         }
+        // A page's JS dialog is answered for it at the webview layer (otherwise
+        // an invisible surface blocks its whole web process forever). The
+        // question itself would then be lost, so record it here — the agent
+        // driving this surface is exactly who needs to know the page asked.
+        for dialog in desktop.take_web_surface_script_dialogs() {
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "web_surface",
+                    "script_dialog_answered",
+                    json!({
+                        "session_path": session,
+                        "native_id": dialog.surface_id,
+                        "kind": dialog.kind,
+                        "answered": dialog.answered,
+                        "uri": dialog.uri,
+                        "message": dialog.message,
+                    }),
+                );
+            }
+        }
         let outcome = agent_input_arbiter_lock()
             .admit(&surface_key, &batch, handle.generation);
         if outcome == crate::agent_input_arbiter::AdmitOutcome::Preempted {
