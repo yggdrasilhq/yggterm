@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- Local render harness. NOT shipped: it is how we check the bundle paints a
+     real transcript without standing up yggterm. Open dist/../harness.html
+     after `npm run build`. -->
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>yggterm transcript — render harness</title>
+    <link rel="stylesheet" href="./dist/t3code-timeline.css" />
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #root { height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="./dist/transcript.js"></script>
+    <script>
+      const iso = (offsetSeconds) =>
+        new Date(Date.UTC(2026, 6, 25, 12, 0, offsetSeconds)).toISOString();
+
+      window.yggtermTranscript.mount(document.getElementById("root"), {
+        theme: "dark",
+        cwd: "/home/user/gh/yggterm",
+        working: false,
+        messages: [
+          {
+            id: "m1",
+            role: "user",
+            text: "Why is the rail rendering a terminal transcript for yedit?",
+            createdAt: iso(0),
+          },
+          {
+            id: "m2",
+            role: "assistant",
+            text: [
+              "Because the *rendered view* question had three different answers.",
+              "",
+              "| asker | asked |",
+              "| --- | --- |",
+              "| titlebar toggle | `kind.is_agent()` |",
+              "| open routing | nothing at all |",
+              "",
+              "```rust",
+              "pub fn offers_rendered_view(self) -> bool {",
+              "    self.is_agent() || matches!(self, SessionKind::Document)",
+              "}",
+              "```",
+              "",
+              "- a plain shell has a PTY and nothing else",
+              "- an app that declares a viewport pane is the caller's question",
+            ].join("\n"),
+            createdAt: iso(4),
+          },
+          {
+            id: "m3",
+            role: "user",
+            text: "Good. Now render this transcript the way T3 Code does.",
+            createdAt: iso(9),
+          },
+          {
+            id: "m4",
+            role: "assistant",
+            text: "Streaming this one, so the working indicator has something to show…",
+            createdAt: iso(11),
+            streaming: true,
+          },
+        ],
+      });
+    </script>
+  </body>
+</html>
