@@ -31953,20 +31953,6 @@ fn encode_rgba_png(width: usize, height: usize, rgba_bytes: &[u8]) -> Result<Vec
     Ok(png_bytes)
 }
 
-fn with_native_clipboard<R>(
-    mut state: Signal<ShellState>,
-    operation: impl FnOnce(&mut NativeClipboard) -> Result<R>,
-) -> Result<R> {
-    state.with_mut(|shell| {
-        if let Some(owner) = shell.native_clipboard_owner.as_mut() {
-            let mut owner = owner.borrow_mut();
-            return operation(&mut owner.clipboard);
-        }
-        let mut clipboard = create_native_clipboard()?;
-        operation(&mut clipboard)
-    })
-}
-
 fn with_owned_native_clipboard<R>(
     mut state: Signal<ShellState>,
     kind: NativeClipboardOwnerKind,
@@ -32107,40 +32093,64 @@ fn copy_terminal_selection_to_clipboard(
     Ok("native_owner_thread")
 }
 
-fn read_native_clipboard_png(state: Signal<ShellState>) -> Result<Vec<u8>> {
-    with_native_clipboard(state, |clipboard| {
-        #[cfg(target_os = "linux")]
-        let image = clipboard
-            .get()
-            .clipboard(LinuxClipboardKind::Clipboard)
-            .image()
-            .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
-        #[cfg(not(target_os = "linux"))]
-        let image = clipboard
-            .get_image()
-            .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
-        encode_rgba_png(image.width, image.height, image.bytes.as_ref())
-    })
+/// Read the clipboard on a BLOCKING thread with a FRESH connection — never on
+/// the GTK main thread, and never through the shared owner clipboard.
+///
+/// The paste path used to call arboard's synchronous `get()` directly in the
+/// async paste task, which runs on the GTK main thread. When the X11 selection
+/// owner is THIS process's own WebKit — a document surface (yedit) or web
+/// surface the user just copied from — that `get()` DEADLOCKS the whole GUI:
+/// the main thread blocks waiting for the selection contents, but WebKit needs
+/// that same main thread to answer the `SelectionRequest`, so neither ever
+/// completes and the window freezes hard (user had to kill it). Servicing the
+/// read on a separate OS thread keeps the main loop free to answer the
+/// request, so a same-process copy→paste completes. A fresh connection (not the
+/// shared `native_clipboard_owner`, which is `!Send`) is what makes the read
+/// movable to that thread.
+fn read_native_clipboard_png_fresh() -> Result<Vec<u8>> {
+    let mut clipboard = create_native_clipboard()?;
+    #[cfg(target_os = "linux")]
+    let image = clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Clipboard)
+        .image()
+        .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
+    #[cfg(not(target_os = "linux"))]
+    let image = clipboard
+        .get_image()
+        .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
+    encode_rgba_png(image.width, image.height, image.bytes.as_ref())
 }
 
-fn read_native_clipboard_text(state: Signal<ShellState>) -> Result<String> {
-    with_native_clipboard(state, |clipboard| {
-        #[cfg(target_os = "linux")]
-        let text = clipboard
-            .get()
-            .clipboard(LinuxClipboardKind::Clipboard)
-            .text()
-            .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
-        #[cfg(not(target_os = "linux"))]
-        let text = clipboard
-            .get_text()
-            .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
-        let text = text.trim_end_matches('\0').to_string();
-        if text.is_empty() {
-            return Err(anyhow!("clipboard does not currently contain text"));
-        }
-        Ok(text)
-    })
+fn read_native_clipboard_text_fresh() -> Result<String> {
+    let mut clipboard = create_native_clipboard()?;
+    #[cfg(target_os = "linux")]
+    let text = clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Clipboard)
+        .text()
+        .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
+    #[cfg(not(target_os = "linux"))]
+    let text = clipboard
+        .get_text()
+        .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
+    let text = text.trim_end_matches('\0').to_string();
+    if text.is_empty() {
+        return Err(anyhow!("clipboard does not currently contain text"));
+    }
+    Ok(text)
+}
+
+async fn read_native_clipboard_png_off_main() -> Result<Vec<u8>> {
+    task::spawn_blocking(read_native_clipboard_png_fresh)
+        .await
+        .map_err(|error| anyhow!("clipboard image read task failed: {error}"))?
+}
+
+async fn read_native_clipboard_text_off_main() -> Result<String> {
+    task::spawn_blocking(read_native_clipboard_text_fresh)
+        .await
+        .map_err(|error| anyhow!("clipboard text read task failed: {error}"))?
 }
 
 fn terminal_clipboard_png_fingerprint(png_bytes: &[u8]) -> u64 {
@@ -32311,7 +32321,7 @@ async fn stage_and_paste_terminal_clipboard_image(
             perf_home_dir(&shell.bootstrap.settings_path),
         )
     });
-    let png_bytes = read_native_clipboard_png(state)?;
+    let png_bytes = read_native_clipboard_png_off_main().await?;
     let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
     let claim = state.with_mut(|shell| {
         claim_terminal_image_paste(
@@ -32392,7 +32402,7 @@ async fn paste_terminal_native_clipboard(
             perf_home_dir(&shell.bootstrap.settings_path),
         )
     });
-    match read_native_clipboard_png(state) {
+    match read_native_clipboard_png_off_main().await {
         Ok(png_bytes) => {
             let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
             let claim = state.with_mut(|shell| {
@@ -32451,7 +32461,7 @@ async fn paste_terminal_native_clipboard(
             Ok(NativeClipboardPaste::Image { path })
         }
         Err(_png_error) => {
-            let text = read_native_clipboard_text(state)?;
+            let text = read_native_clipboard_text_off_main().await?;
             let chars = text.chars().count();
             let bytes = text.len();
             terminal_write_with_local_runtime_retry_async(
