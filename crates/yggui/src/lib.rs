@@ -15,8 +15,9 @@ pub use chrome::{
 pub use drag_tree::{
     DragDropPlacement, DragDropTarget, TreeDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     build_tree_reorder_plan, canonical_tree_leaf_name, join_tree_child_path,
-    ordered_tree_child_path, resolve_drag_drop_target, resolve_tree_drop_placement,
-    staging_tree_child_path, tree_parent_path, tree_path_contains, valid_drop_target,
+    ordered_tree_child_path, reorder_flat_list, resolve_drag_drop_target,
+    resolve_tree_drop_placement, staging_tree_child_path, tree_parent_path, tree_path_contains,
+    valid_drop_target,
 };
 pub use drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
 pub use motion::{
