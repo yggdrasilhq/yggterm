@@ -1,0 +1,35 @@
+{
+  "name": "@yggterm/t3code-timeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "yggterm's rendered-transcript view: T3 Code's timeline renderer (MIT) behind a mount() entry point.",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "//": "Versions track T3 Code's apps/web/package.json at the pinned UPSTREAM_COMMIT. Vendored components are written against these; drifting them independently is how a copied renderer starts rendering differently from the app it was copied from.",
+  "dependencies": {
+    "@base-ui/react": "^1.2.0",
+    "@pierre/diffs": "^1.1.0-beta.16",
+    "@tanstack/react-virtual": "^3.13.18",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "effect": "https://pkg.pr.new/Effect-TS/effect-smol/effect@8881a9b",
+    "lucide-react": "^0.564.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.0.0"
+  }
+}
