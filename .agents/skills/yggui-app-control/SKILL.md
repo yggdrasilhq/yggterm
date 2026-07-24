@@ -108,12 +108,13 @@ Recipe for invisible ychrome automation on a live session: `terminal new
 --no-activate` (or target an existing session) → `terminal send <session>`
 to run `ychrome <url>` there → `web ensure --session <session>` →
 `do/read/wait`. Pass `--agent <id>` so the user sees your cursor if they
-switch in. ⚠ One seam (Dream §2, open): a NEVER-revealed session's FIRST
-declare needs one brief reveal+restore (~5s) — the OSC declare is parsed by
-the client-side terminal script, which a never-revealed session doesn't
-have. After that first declare, `web ensure` re-materializes headless
-forever (live-proven: background read + per-surface screenshot with the
-user's view untouched).
+switch in. ✅ **The Dream §2 seam is CLOSED at 2.12.10: no reveal is needed,
+ever.** The daemon now reads the OSC declare off the PTY itself and keeps the
+app's latest payload, so `web ensure` materializes a NEVER-revealed session's
+surface — and rebuilds one the reaper collected — with the user's view
+untouched (`rebuilt_from_daemon_declare: true` in the response says that is
+what happened). It only rebuilds on an explicit `ensure`: a heartbeat must
+never resurrect a surface the app or the user closed.
 
 ## Screenshot
 
@@ -313,7 +314,11 @@ daemon requests as the GUI (one source of truth):
   appended after, so a partial list is safe.
 - Verify a reconnect with the session's `status_line`/`last_launch_error` from
   `server snapshot`, not `app terminal read-buffer` — the GUI may not have mounted
-  the xterm yet (`accepted:false`) even though the resume is healthy.
+  the xterm yet even though the resume is healthy. Since 2.12.10 `read-buffer`
+  answers from the DAEMON screen in that case (`source: "daemon_screen"`,
+  `client_host: "missing"`) instead of refusing, so a `--no-activate` work
+  session can be read without revealing it; `--mode cells` still needs a real
+  client host (attributes live only in xterm's buffer).
 
 ## Click Grid (agent pointer targeting — main webview AND ychrome pages)
 

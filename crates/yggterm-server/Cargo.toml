@@ -11,6 +11,7 @@ ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 dirs.workspace = true
 libc = "0.2"
 png = "0.18"

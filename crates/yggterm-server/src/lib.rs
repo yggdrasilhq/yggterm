@@ -1,4 +1,5 @@
 mod app_control;
+pub mod app_declare;
 mod attach;
 mod clipboard_sweep;
 mod codex_cli;
@@ -62,7 +63,8 @@ pub use daemon::{
     start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
     switch_agent_session_mode,
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
-    terminal_ensure, terminal_history, terminal_read, terminal_resize, terminal_restart,
+    terminal_app_declares, terminal_ensure, terminal_history, terminal_read, terminal_resize,
+    terminal_restart,
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
@@ -16121,6 +16123,20 @@ fn choose_app_control_pid(
     }
     match records {
         [] => Ok(None),
+        // A LONE shadow is the case the multi-record arm below never saw: with
+        // the user's GUI missing from the roster, an ownership verb routed to
+        // the shadow and came back `shadow_cannot_own` — which reads like a
+        // permission bug when it is really "the primary is not registered"
+        // (agent-control-plane finding #1). Say that instead.
+        [record] if require_explicit_target && !client_instance_record_is_active_role(record) => {
+            anyhow::bail!(
+                "the only registered Yggterm GUI client is a Shadow view client, which cannot own \
+                 sessions; a session-owning verb has to reach the user's primary GUI. Check that \
+                 the primary is running and registered (`server app clients`), or name a target \
+                 explicitly with --pid <pid> / --client <name>. available: {}",
+                format_available_client_instances(records)
+            )
+        }
         [record] => Ok(Some(record.pid)),
         many => {
             // Untargeted routing prefers the ACTIVE-role client: shadows exist
@@ -19364,8 +19380,87 @@ pub fn run_app_control_read_terminal_buffer(
         },
         timeout_ms,
     )?;
+    if read_terminal_buffer_response_needs_daemon_screen(response.data.as_ref(), mode) {
+        // A `--no-activate` (agent-spawned) session has never mounted a
+        // client-side xterm host, so there is no buffer to read — exactly when
+        // an agent most wants to observe its own work session. The daemon owns
+        // the PTY and its vt100 screen is the CONTENT source of truth, so fall
+        // back to it rather than making the agent reveal the session (which
+        // would defeat the invisible path). The answer is tagged
+        // `source: "daemon_screen"` so nobody mistakes it for a client read:
+        // it carries no scrollback geometry and no cell attributes.
+        let endpoint = resolve_client_daemon_endpoint(&home).endpoint;
+        let retained = mode == "full";
+        let screen = if retained {
+            crate::daemon::terminal_retained_snapshot(&endpoint, session_path)
+        } else {
+            crate::daemon::terminal_snapshot(&endpoint, session_path)
+        };
+        if let Ok((text, running, runtime_output_seen, _, _, _)) = screen {
+            let fallback = daemon_screen_read_terminal_buffer_payload(
+                session_path,
+                mode,
+                &text,
+                running,
+                runtime_output_seen,
+            );
+            write_stdout_payload(&serde_json::to_string_pretty(&fallback)?)?;
+            return Ok(());
+        }
+    }
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
+}
+
+/// Whether a `terminal read-buffer` answer should be re-asked of the daemon.
+///
+/// ONLY `terminal_host_missing` qualifies: that reason means the session is
+/// live but never mounted a client host (a `--no-activate` spawn, a reaped
+/// host). Every other refusal — an exception inside the read, a GUI that never
+/// answered — must stay visible instead of being papered over by a different
+/// source. `cells` mode is excluded because per-cell fg/bg attributes exist
+/// only in the client's xterm buffer; answering it from the daemon's plain
+/// text would silently change what the caller asked for.
+fn read_terminal_buffer_response_needs_daemon_screen(
+    data: Option<&serde_json::Value>,
+    mode: &str,
+) -> bool {
+    if mode == "cells" {
+        return false;
+    }
+    let Some(data) = data else {
+        return false;
+    };
+    if data.get("accepted").and_then(serde_json::Value::as_bool) != Some(false) {
+        return false;
+    }
+    data.get("reason").and_then(serde_json::Value::as_str) == Some("terminal_host_missing")
+}
+
+/// Shape the daemon-screen answer like the client read (same keys a caller
+/// already parses) minus the fields only a client buffer can honestly report.
+fn daemon_screen_read_terminal_buffer_payload(
+    session_path: &str,
+    mode: &str,
+    text: &str,
+    running: bool,
+    runtime_output_seen: bool,
+) -> serde_json::Value {
+    let lines: Vec<&str> = text.lines().collect();
+    let nonblank = lines.iter().filter(|line| !line.trim().is_empty()).count();
+    serde_json::json!({
+        "accepted": true,
+        "session_path": session_path,
+        "mode": if mode == "full" { "full" } else { "screen" },
+        "source": "daemon_screen",
+        "client_host": "missing",
+        "running": running,
+        "runtime_output_seen": runtime_output_seen,
+        "line_count": lines.len(),
+        "nonblank_line_count": nonblank,
+        "char_count": text.chars().count(),
+        "text": text,
+    })
 }
 
 pub fn run_app_control_web_surface_eval(
@@ -22676,6 +22771,8 @@ mod tests {
         apply_remote_preview_payload, apply_remote_preview_payload_for_path,
         apply_remote_scanned_session_preview, build_session, canonical_static_label,
         choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
+        daemon_screen_read_terminal_buffer_payload,
+        read_terminal_buffer_response_needs_daemon_screen,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, describe_status_line, describe_status_line_with_error,
@@ -33932,6 +34029,90 @@ terminal_window_id: None,
             Some(100),
             "a sole Active among shadows takes untargeted mutations — the user's scripts keep working"
         );
+    }
+
+    // The maiden-run failure (2026-07-23): the user's GUI was not enumerable, so
+    // the SOLE record was the shadow — and the sole-record arm handed it every
+    // verb, including `terminal new` / `session remove`, which the daemon then
+    // refused with `shadow_cannot_own`. A lone shadow must refuse ownership
+    // verbs by naming the real problem, while still serving reads.
+    #[test]
+    fn a_lone_shadow_refuses_ownership_verbs_and_names_the_missing_primary() {
+        let records = vec![shadow_client_record(200, 20, "agent-1")];
+        let error = choose_app_control_pid(&records, None, None, true)
+            .expect_err("a session-owning verb must not route to a lone shadow");
+        let message = error.to_string();
+        assert!(message.contains("Shadow view client"), "message: {message}");
+        assert!(message.contains("primary"), "message: {message}");
+        let read = choose_app_control_pid(&records, None, None, false).expect("reads resolve");
+        assert_eq!(
+            read,
+            Some(200),
+            "observation must keep working against a lone shadow"
+        );
+        let explicit = choose_app_control_pid(&records, Some(200), None, true)
+            .expect("an explicit --pid still names its own target");
+        assert_eq!(explicit, Some(200));
+    }
+
+    // `read-buffer` on a `--no-activate` session answers `terminal_host_missing`
+    // (no client host was ever mounted). The daemon owns the PTY screen, so the
+    // agent gets an answer instead of being forced to reveal the session — but
+    // ONLY for that reason, and never for `cells` (attributes live in xterm).
+    #[test]
+    fn read_buffer_falls_back_to_the_daemon_screen_only_for_a_missing_host() {
+        let missing = serde_json::json!({
+            "accepted": false,
+            "reason": "terminal_host_missing",
+            "session_path": "local://s",
+        });
+        assert!(read_terminal_buffer_response_needs_daemon_screen(
+            Some(&missing),
+            "screen"
+        ));
+        assert!(read_terminal_buffer_response_needs_daemon_screen(
+            Some(&missing),
+            "full"
+        ));
+        assert!(
+            !read_terminal_buffer_response_needs_daemon_screen(Some(&missing), "cells"),
+            "the daemon screen carries no cell attributes — answering `cells` from it would \
+             silently change what the caller asked for"
+        );
+        let other_failure = serde_json::json!({
+            "accepted": false,
+            "reason": "read_buffer_exception",
+            "message": "boom",
+        });
+        assert!(
+            !read_terminal_buffer_response_needs_daemon_screen(Some(&other_failure), "screen"),
+            "a real read failure must stay visible, not be papered over by another source"
+        );
+        let ok = serde_json::json!({ "accepted": true, "text": "hi" });
+        assert!(!read_terminal_buffer_response_needs_daemon_screen(
+            Some(&ok),
+            "screen"
+        ));
+        assert!(!read_terminal_buffer_response_needs_daemon_screen(
+            None, "screen"
+        ));
+    }
+
+    #[test]
+    fn daemon_screen_read_buffer_payload_is_tagged_and_counted() {
+        let payload = daemon_screen_read_terminal_buffer_payload(
+            "local://s",
+            "screen",
+            "one\n\nthree\n",
+            true,
+            true,
+        );
+        assert_eq!(payload["accepted"], serde_json::json!(true));
+        assert_eq!(payload["source"], serde_json::json!("daemon_screen"));
+        assert_eq!(payload["client_host"], serde_json::json!("missing"));
+        assert_eq!(payload["line_count"], serde_json::json!(3));
+        assert_eq!(payload["nonblank_line_count"], serde_json::json!(2));
+        assert_eq!(payload["mode"], serde_json::json!("screen"));
     }
 
     #[test]

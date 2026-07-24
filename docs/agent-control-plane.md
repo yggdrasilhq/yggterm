@@ -1279,6 +1279,10 @@ janaushadhi.gov.in, davaindia.com, 1mg.com) worked cleanly and invisibly — the
 in the *lifecycle and routing* around that read path, and two of them broke
 recovery outright. Ranked by how badly they bit.
 
+**Status 2026-07-24 (2.12.10): #1, #2 and #5 are FIXED; #3 was fixed at 2.12.8
+(the hit-test guard); #4 is deferred with a reason; #6 is REFUSED as written —
+see the per-finding notes below.**
+
 1. **`terminal new` (and `session remove`) route to the shadow and fail
    `shadow_cannot_own` — the headline gap.** With a shadow client (`agent-1`)
    registered and the real primary GUI **not enumerable** in `server app clients`
@@ -1296,6 +1300,17 @@ recovery outright. Ranked by how badly they bit.
    asymmetry that hid this: the same run's `open`/`state`/`screenshot`/first
    `web ensure` all routed to the real GUI fine — only ownership verbs fell to the
    shadow, which reads as nondeterministic routing.
+   **FIXED 2.12.10, both halves.** (a) Routing: `choose_app_control_pid`'s
+   sole-record arm now refuses an ownership verb when that one record is a
+   shadow, and says *why* ("the only registered client is a Shadow … the primary
+   is not registered") instead of letting the daemon answer `shadow_cannot_own`,
+   which reads like a permission bug. Reads still resolve against a lone shadow,
+   and an explicit `--pid`/`--client` still names its own target. (b) Roster: the
+   GUI registered itself exactly ONCE at startup, so any later loss of that
+   record unregistered the user's window for the rest of its life while it kept
+   serving every other request. The app-control watchdog now re-asserts the
+   record when it goes missing (`client_instance_record_reasserted`), which is
+   the durable half — routing can only prefer a primary that is enumerable.
 
 2. **The OSC declare does NOT survive a surface reap — sharper than the recorded
    "first declare needs a reveal" seam.** After the leased surface was reaped,
@@ -1307,6 +1322,21 @@ recovery outright. Ranked by how badly they bit.
    unrecoverable headless." → **Daemon-side declare ingestion (Dream §2)** so
    `web ensure` rebuilds a reaped surface with no reveal, ever. Until then, a leased
    surface that reaps mid-task ends the invisible run.
+   **FIXED 2.12.10 — the daemon now ingests the declare itself.**
+   `crates/yggterm-server/src/app_declare.rs` extracts
+   `ESC ] 7717 ; <verb> ; <action> ; <base64-json>` out of the PTY byte stream in
+   the daemon's reader thread (the same place the vt100 screen is fed), keeping
+   the LATEST payload per verb — `web-surface` and `sidebar` only, `close`
+   clears, and `fido2` is never retained because a presence ceremony must not be
+   replayable with nobody at the keyboard. `ServerRequest::TerminalAppDeclares`
+   serves it (read-only, shadow-allowed, forwarded to a preserved owner like the
+   other terminal reads). `web ensure` on a session with no surface now rebuilds
+   from that record before answering, through the SAME
+   `materialize_declared_web_surface` owner a live OSC `open` uses, and reports
+   `rebuilt_from_daemon_declare` in its response. This closes BOTH halves of the
+   seam: the never-revealed session's first declare (no reveal needed any more)
+   and the reaped surface (an explicit `ensure` is the intent a heartbeat lacks).
+   A retained payload is still a TRUST BOUNDARY — only http(s) URLs rebuild.
 
 3. **A blind `web do click` at guessed coordinates on an unrevealed surface
    triggered the reap.** One `--x/--y` click navigated the page (hit a link) and
@@ -1323,6 +1353,13 @@ recovery outright. Ranked by how badly they bit.
    path independent of the compositor, or an explicit "pixel proof needs a brief
    reveal" documented limitation. (This run leaned on structured `read`/`eval` as
    proof instead, which is honest but not a pixel.)
+   **DEFERRED 2.12.10, deliberately.** WebKitGTK's snapshot API needs a realized,
+   mapped view; there is no compositor-independent capture to reach for, so this
+   is not a guard to add but a rendering path to build (offscreen surface, or an
+   explicit brief reveal). Until it exists, treat structured `read`/`eval` as the
+   proof for a headless surface and say so — a `web screenshot` that silently
+   fell back to something else would be a `faithful:false` frame, which this repo
+   already treats as a lie.
 
 5. **`terminal read-buffer` can't read a `--no-activate` session
    (`terminal_host_missing`).** A never-revealed session has no mounted client-side
@@ -1332,6 +1369,13 @@ recovery outright. Ranked by how badly they bit.
    per the repo's self-verification rules). → `read-buffer` should fall back to the
    daemon screen when no client host is mounted, giving a client-independent read of
    a headless work session.
+   **FIXED 2.12.10.** `read-buffer` re-asks the daemon on
+   `terminal_host_missing` — and ONLY on that reason, so a genuine read failure
+   still surfaces instead of being papered over by a different source. The answer
+   is tagged `source: "daemon_screen"`, `client_host: "missing"`. `--mode cells`
+   is excluded on purpose: per-cell fg/bg attributes exist only in the client's
+   xterm buffer, and answering that from plain daemon text would silently change
+   what the caller asked for.
 
 6. **Auto title/summary ran on the invisible work session, creating a visible
    Live-Sessions row.** The daemon generated a title ("YChrome Protocol Research")
@@ -1339,6 +1383,16 @@ recovery outright. Ranked by how badly they bit.
    invisibility leak (a "work session" appears in the user's sidebar and consumes a
    title/summary LLM generation). → An agent-owned/`--no-activate` session class
    that is excluded from the user's row set and skips title/summary generation.
+   **REFUSED AS WRITTEN 2026-07-24 — the row is not a leak, it is the model.**
+   The settled spec (round 10, user's own correction) is that agents act on
+   BACKGROUNDED sessions of the user's GUI and the user switches in to WATCH.
+   A session they cannot see in their sidebar is a session they cannot switch
+   into or stop — hiding it would fight the spec, not serve it. What is left of
+   this finding is only the LLM spend (one title + one summary generation on a
+   session nobody asked to have named), and that is also what makes the row
+   legible when they do switch in. Not worth a session class. If it ever bites,
+   the narrow fix is a per-session "agent spawned this" marker that suppresses
+   the LLM call while KEEPING the row — never a hidden session.
 
 **What this run proves for the escalation ladder.** The invisible read path
 (spawn → ensure → `--session` read/eval/wait → restore) is real and was
@@ -1347,3 +1401,9 @@ it is **lifecycle under a shadow and under reap** — session ownership routing 
 and declare persistence (#2) are the two that must land before an agent can run an
 invisible task that survives a reap or coexists with a standing shadow. Findings #1
 and #2 are the current ceiling on "undisturbed, unattended co-browse."
+
+**Ceiling update 2.12.10:** #1 and #2 are shipped, so the remaining limits on an
+unattended invisible run are (a) no pixel proof of a headless surface (#4), and
+(b) nothing yet re-materializes a surface *automatically* — `web ensure` is the
+explicit request that rebuilds one, which is deliberate (a heartbeat must never
+resurrect a surface the app or user closed).
