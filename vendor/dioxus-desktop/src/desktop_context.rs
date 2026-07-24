@@ -789,6 +789,31 @@ impl DesktopService {
         }
     }
 
+    /// Consume the JS dialogs the shell has answered on behalf of pages since
+    /// the last call (see `web_surface::connect_script_dialog_guard`). The page
+    /// is never blocked waiting for one, so this is the only place its question
+    /// still exists — trace it rather than let it vanish.
+    pub fn take_web_surface_script_dialogs(&self) -> Vec<crate::web_surface::ScriptDialogRecord> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return crate::web_surface::take_script_dialogs();
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Inject a trusted pointer MOVE (real hover) into web surface `id`'s page.
     pub fn inject_web_surface_move(&self, id: u64, x: f64, y: f64) -> Result<(), String> {
         #[cfg(not(any(
