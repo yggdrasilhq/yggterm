@@ -621,6 +621,67 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The whole reason `PerfGuard` exists, measured rather than asserted in a
+    /// doc comment: on a path laced with `?`, an explicit `PerfSpan::finish` at
+    /// the bottom records NOTHING on the error branch — and a hot path that
+    /// failed after doing seconds of work is exactly the run worth a duration.
+    /// The RAII guard records either way.
+    #[test]
+    fn a_perf_guard_records_the_early_return_a_finish_at_the_bottom_loses() {
+        fn guarded(home: &Path, fail: bool) -> Result<(), String> {
+            let mut perf = PerfGuard::new(home, "test", "guard_early_return");
+            if fail {
+                Err("scan failed".to_string())?;
+            }
+            perf.annotate(json!({ "ok": true }));
+            Ok(())
+        }
+        fn spanned(home: &Path, fail: bool) -> Result<(), String> {
+            let perf = PerfSpan::start(home, "test", "span_early_return");
+            if fail {
+                Err("scan failed".to_string())?;
+            }
+            perf.finish(json!({ "ok": true }));
+            Ok(())
+        }
+
+        let dir = temp_test_dir("guard-early-return");
+        set_perf_profiling_enabled(true);
+        let path = perf_telemetry_path(&dir);
+
+        assert!(guarded(&dir, true).is_err());
+        assert!(spanned(&dir, true).is_err());
+        let after_failure = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            after_failure.contains("\"name\":\"guard_early_return\""),
+            "the guard must record the run that returned early: {after_failure}"
+        );
+        assert!(
+            !after_failure.contains("\"name\":\"span_early_return\""),
+            "control: an explicit finish at the bottom is skipped by `?`"
+        );
+
+        guarded(&dir, false).expect("guarded success");
+        spanned(&dir, false).expect("spanned success");
+        let after_success = fs::read_to_string(&path).expect("read perf telemetry");
+        assert_eq!(
+            after_success
+                .matches("\"name\":\"guard_early_return\"")
+                .count(),
+            2,
+            "the guard records once per call, error branch and success alike"
+        );
+        assert_eq!(
+            after_success
+                .matches("\"name\":\"span_early_return\"")
+                .count(),
+            1,
+            "the span records only the success"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn summarize_perf_telemetry_groups_and_ranks_by_total() {
         let dir = temp_test_dir("summary");
