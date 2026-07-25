@@ -962,6 +962,14 @@ fn run_app_launch_via_gui_companion(
     };
     let mut command = Command::new(&gui_exe);
     command.args(args);
+    // An agent-launched GUI must take the SAME GL path a desktop-launched one takes.
+    // This process inherits its parent's environment and hands it straight to the GUI,
+    // so a stale v3 launcher still on disk — or an operator's shell — could smuggle in
+    // WEBKIT_DISABLE_COMPOSITING_MODE and make `server app launch` land on software GL
+    // while the desktop entry probes its way to hardware. That is the same class as
+    // the inherited-canvas-flag bug (`linux_canvas_env_is_user_explicit`), where an
+    // agent-launched GUI was locked to the DOM renderer for months.
+    command.env_remove("WEBKIT_DISABLE_COMPOSITING_MODE");
     if let Some(root) = install_context.managed_root.as_ref() {
         command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
     }
