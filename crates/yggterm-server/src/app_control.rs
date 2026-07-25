@@ -523,7 +523,13 @@ pub enum AppControlCommand {
         grain: Option<f32>,
     },
     TriggerUpdateCheck,
-    RestartPendingUpdate,
+    /// Restart into a staged update.
+    ///
+    /// Refuses while an agent holds a live web-surface lease unless `force`.
+    RestartPendingUpdate {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
@@ -584,6 +590,12 @@ pub enum AppControlCommand {
     CloseWindowPreservingSessions {
         #[serde(default)]
         reason: Option<String>,
+        /// Close anyway while an agent lease is live. Same guard as
+        /// `RestartPendingUpdate` — guarding one deploy door and leaving the
+        /// other open would be the surface inconsistency the house rules call
+        /// a spec violation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     Pointer {
         command: AppControlPointerCommand,
@@ -1115,7 +1127,7 @@ impl AppControlCommand {
             Self::ResetThemeEditor => "reset_theme_editor",
             Self::SetThemeEditorValues { .. } => "set_theme_editor_values",
             Self::TriggerUpdateCheck => "trigger_update_check",
-            Self::RestartPendingUpdate => "restart_pending_update",
+            Self::RestartPendingUpdate { .. } => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
             Self::ScrollRightPanel { .. } => "scroll_right_panel",
@@ -1922,6 +1934,7 @@ mod tests {
     fn preserving_close_command_serializes_as_distinct_restart_safe_kind() {
         let command = AppControlCommand::CloseWindowPreservingSessions {
             reason: Some("superseded-client-handoff".to_string()),
+            force: false,
         };
         let value = serde_json::to_value(&command).expect("serialize preserving close");
 
@@ -1934,6 +1947,11 @@ mod tests {
             Some("superseded-client-handoff")
         );
         assert_eq!(command.name(), "close_window_preserving_sessions");
+        // `force` defaults false and is omitted from the wire, so an OLDER GUI
+        // reading a request from a newer CLI still means "do not force".
+        assert!(value.get("force").is_none(), "force must not be serialized when false");
+        let back: AppControlCommand = serde_json::from_value(value).unwrap();
+        assert_eq!(back, command);
     }
 
     #[test]
