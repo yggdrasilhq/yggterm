@@ -638,7 +638,7 @@ impl DesktopService {
         &self,
         id: u64,
         js: &str,
-        callback: impl FnOnce(Result<String, String>) + 'static,
+        callback: impl FnOnce(Result<String, crate::web_surface::EvalFailure>) + 'static,
     ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
@@ -687,6 +687,109 @@ impl DesktopService {
         ))]
         {
             let _ = (id, open);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// What is actually true about a web surface right now: present, mapped,
+    /// and whether the engine believes its content process is answering. All
+    /// three are UI-process properties, so a caller must still round-trip an
+    /// eval before believing a surface is alive.
+    pub fn web_surface_liveness(&self, id: u64) -> crate::web_surface::SurfaceLiveness {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .map(|host| host.surface_liveness(id))
+                .unwrap_or(crate::web_surface::SurfaceLiveness {
+                    present: false,
+                    mapped: false,
+                    web_process_responsive: false,
+                });
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            crate::web_surface::SurfaceLiveness {
+                present: false,
+                mapped: false,
+                web_process_responsive: false,
+            }
+        }
+    }
+
+    /// Read an open web surface's cookie jar (per-PROFILE — see
+    /// `WebSurfaceHost::cookies_export` for the root-path limitation).
+    pub fn export_web_surface_cookies(
+        &self,
+        id: u64,
+        callback: impl FnOnce(Result<Vec<crate::web_surface::CookieRecord>, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.cookies_export(id, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Write cookies into an open web surface's jar. The jar belongs to the
+    /// surface's PROFILE; a surface with no explicit profile is `default`,
+    /// which is the user's own browsing jar.
+    pub fn import_web_surface_cookies(
+        &self,
+        id: u64,
+        cookies: Vec<crate::web_surface::CookieRecord>,
+        callback: impl FnOnce(Result<usize, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.cookies_import(id, cookies, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, cookies, callback);
             Err("web surfaces require the GTK/WebKit backend".to_string())
         }
     }

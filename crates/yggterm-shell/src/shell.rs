@@ -185,8 +185,9 @@ use yggterm_server::{
     RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WebSurfaceReadAs,
-    WebSurfaceWaitUntil, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
+    WebElementRef, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
+    WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -5218,12 +5219,55 @@ struct DeclaredWebSurfaceOpen {
 /// without a url describes nothing to rebuild. Pure so the refusal is testable
 /// without a live surface.
 fn declared_web_surface_open_from_payload(payload: &Value) -> Option<DeclaredWebSurfaceOpen> {
+    declared_web_surface_open_or_refusal(payload).ok()
+}
+
+/// Why a retained declare could not become a surface.
+///
+/// N4: "no declared web surface" was ONE string covering five different facts,
+/// and the two that matter most are in here — a payload that named nothing to
+/// open, and a payload whose URL the trust gate refused. Telling them apart is
+/// the difference between "relaunch the app" and "that app is trying to open
+/// something this build will never open".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredOpenRefusal {
+    /// The payload carried no url at all.
+    NoUrl,
+    /// The url's scheme is not allowed on this path. Carries the scheme.
+    SchemeRefused(String),
+}
+
+/// The scheme of a url, lower-cased, for reporting. Never used to decide
+/// anything — [`web_surface_url_scheme_allowed`] is still the one gate.
+fn url_scheme_label(url: &str) -> String {
+    url.split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The refusing half of [`declared_web_surface_open_from_payload`], pure and
+/// testable.
+///
+/// ⛔ The scheme gate is NOT widened here and must not be. This payload is
+/// retained by the daemon from whatever the app wrote to its own stdout, and
+/// any process that can write a session's PTY can emit that OSC
+/// (docs/web-surfaces.md, accepted risk). Allowing `file://` on this path would
+/// let a crafted byte stream point a webview at
+/// `file:///home/user/.ssh/id_ed25519`, which `web read --as text` then
+/// exfiltrates. The fix for a local fixture is a loopback http server, which
+/// the existing allowlist already permits.
+fn declared_web_surface_open_or_refusal(
+    payload: &Value,
+) -> Result<DeclaredWebSurfaceOpen, DeclaredOpenRefusal> {
     let url = payload
         .get("url")
         .and_then(Value::as_str)
-        .filter(|url| web_surface_url_scheme_allowed(url))
-        .map(str::to_string)?;
-    Some(DeclaredWebSurfaceOpen {
+        .ok_or(DeclaredOpenRefusal::NoUrl)?;
+    if !web_surface_url_scheme_allowed(url) {
+        return Err(DeclaredOpenRefusal::SchemeRefused(url_scheme_label(url)));
+    }
+    let url = url.to_string();
+    Ok(DeclaredWebSurfaceOpen {
         url,
         title: payload
             .get("title")
@@ -5604,11 +5648,75 @@ async fn apply_sidebar_declare(
     refetch
 }
 
+/// Why a daemon-declare rebuild did or did not happen.
+///
+/// N4: the `ensure` response used to collapse five facts into "no declared web
+/// surface for <session>". Each of these needs a DIFFERENT action from the
+/// caller, and guessing which one it is cost real time in the field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclareRebuild {
+    /// A surface was materialized from the retained declare.
+    Rebuilt,
+    /// The daemon answered, and this session has no `web-surface` declare —
+    /// a plain shell, or an app that already emitted `close`.
+    NoDeclare,
+    /// A declare exists but is older than the rebuild ceiling: the app EXITED,
+    /// and the answer is to relaunch it, not to retry.
+    Stale { age_ms: u64 },
+    /// A fresh declare exists and its URL was refused by the scheme gate.
+    UrlRefused { scheme: String },
+    /// A declare exists and named nothing to open.
+    NoUrl,
+    /// The daemon fetch itself failed. A FAILED FETCH IS NOT AN ABSENT
+    /// DECLARE — collapsing them is what made this unreadable.
+    FetchFailed { error: String },
+}
+
+impl DeclareRebuild {
+    fn rebuilt(&self) -> bool {
+        matches!(self, Self::Rebuilt)
+    }
+
+    /// The stable reason string an agent branches on.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Rebuilt => "rebuilt",
+            Self::NoDeclare => "no_declare",
+            Self::Stale { .. } => "declare_stale",
+            Self::UrlRefused { .. } => "declare_url_scheme_refused",
+            Self::NoUrl => "declare_without_url",
+            Self::FetchFailed { .. } => "daemon_declare_unavailable",
+        }
+    }
+
+    /// A sentence a human can act on, without having to read this file.
+    fn detail(&self, session_path: &str) -> String {
+        match self {
+            Self::Rebuilt => format!("rebuilt {session_path} from the daemon's retained declare"),
+            Self::NoDeclare => format!(
+                "the daemon has no web-surface declare for {session_path} (a plain shell, or the app already closed its surface)"
+            ),
+            Self::Stale { age_ms } => format!(
+                "the declare for {session_path} is {age_ms}ms old (ceiling {WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS}ms) — the app exited; relaunch it rather than retrying"
+            ),
+            Self::UrlRefused { scheme } => format!(
+                "the declare for {session_path} names a {scheme}: url, which is refused BY DESIGN on this path: the payload comes from PTY bytes any process can write, so a crafted stream could point a webview at a local secret that `web read` then exfiltrates. Serve a fixture over loopback http instead"
+            ),
+            Self::NoUrl => {
+                format!("the declare for {session_path} carried no url to open")
+            }
+            Self::FetchFailed { error } => format!(
+                "could not ask the daemon for {session_path}'s declares ({error}) — this is NOT the same as having none"
+            ),
+        }
+    }
+}
+
 async fn rebuild_web_surface_from_daemon_declare(
     state: Signal<ShellState>,
     trace_home: PathBuf,
     session_path: &str,
-) -> bool {
+) -> DeclareRebuild {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     // Same distinction as the sidebar twin above: a fetch that FAILED is not an
     // app that never declared. See `daemon_declare_unavailable` there.
@@ -5632,36 +5740,45 @@ async fn rebuild_web_surface_from_daemon_declare(
                     "error": error.to_string(),
                 }),
             );
-            return false;
+            return DeclareRebuild::FetchFailed {
+                error: error.to_string(),
+            };
         }
     };
     let now_ms = current_millis();
-    let Some((record, open)) = declares
-        .into_iter()
-        .find(|record| record.verb == "web-surface")
-        .filter(|record| {
-            let age_ms = now_ms.saturating_sub(record.at_ms);
-            if age_ms > WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS {
-                append_trace_event(
-                    &trace_home,
-                    "ui",
-                    "web_surface",
-                    "daemon_declare_too_stale",
-                    json!({
-                        "session_path": session_path,
-                        "age_ms": age_ms,
-                        "max_age_ms": WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS,
-                    }),
-                );
-                return false;
-            }
-            true
-        })
-        .and_then(|record| {
-            declared_web_surface_open_from_payload(&record.payload).map(|open| (record, open))
-        })
-    else {
-        return false;
+    // Each step answers a DIFFERENT question, so each gets its own answer
+    // rather than folding into one `None`.
+    let Some(record) = declares.into_iter().find(|record| record.verb == "web-surface") else {
+        return DeclareRebuild::NoDeclare;
+    };
+    let age_ms = now_ms.saturating_sub(record.at_ms);
+    if age_ms > WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "web_surface",
+            "daemon_declare_too_stale",
+            json!({
+                "session_path": session_path,
+                "age_ms": age_ms,
+                "max_age_ms": WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS,
+            }),
+        );
+        return DeclareRebuild::Stale { age_ms };
+    }
+    let open = match declared_web_surface_open_or_refusal(&record.payload) {
+        Ok(open) => open,
+        Err(DeclaredOpenRefusal::NoUrl) => return DeclareRebuild::NoUrl,
+        Err(DeclaredOpenRefusal::SchemeRefused(scheme)) => {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "daemon_declare_url_refused",
+                json!({ "session_path": session_path, "scheme": scheme }),
+            );
+            return DeclareRebuild::UrlRefused { scheme };
+        }
     };
     let DeclaredWebSurfaceOpen {
         url,
@@ -5684,7 +5801,7 @@ async fn rebuild_web_surface_from_daemon_declare(
             "declare_action": record.action,
         }),
     );
-    materialize_declared_web_surface(
+    if materialize_declared_web_surface(
         state,
         trace_home,
         session_path.to_string(),
@@ -5698,6 +5815,13 @@ async fn rebuild_web_surface_from_daemon_declare(
         now_ms,
     )
     .await
+    {
+        DeclareRebuild::Rebuilt
+    } else {
+        // The declare was good and materialization still declined (a duplicate
+        // of a surface that already exists). Not an absent declare.
+        DeclareRebuild::NoDeclare
+    }
 }
 
 /// Turn an app's declared `open` payload into a live web surface.
@@ -23797,7 +23921,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::SetUiTheme { .. }
             | AppControlCommand::SetThemeEditorValues { .. }
             | AppControlCommand::TriggerUpdateCheck
-            | AppControlCommand::RestartPendingUpdate
+            | AppControlCommand::RestartPendingUpdate { .. }
             | AppControlCommand::ShowStartPage
             | AppControlCommand::StartAction { .. }
             | AppControlCommand::CreateTerminal { .. }
@@ -32974,20 +33098,26 @@ fn create_native_clipboard() -> Result<NativeClipboard> {
         .map_err(|error| anyhow!("failed to initialize native clipboard access: {error}"))
 }
 
+/// Decode a PNG to 8-bit RGBA.
+///
+/// The messages name the PNG, NOT a caller: this decoder serves the clipboard
+/// AND `capture-element --split`, whose `split_error` surfaced them verbatim, so
+/// an agent whose element rasterizer failed was told its clipboard was broken.
+/// Callers add their own context.
 fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
     let mut reader = decoder
         .read_info()
-        .map_err(|error| anyhow!("failed to decode clipboard PNG metadata: {error}"))?;
+        .map_err(|error| anyhow!("failed to decode PNG metadata: {error}"))?;
     let mut buffer = vec![
         0;
         reader
             .output_buffer_size()
-            .context("reading clipboard PNG output buffer size")?
+            .context("reading PNG output buffer size")?
     ];
     let info = reader
         .next_frame(&mut buffer)
-        .map_err(|error| anyhow!("failed to decode clipboard PNG pixels: {error}"))?;
+        .map_err(|error| anyhow!("failed to decode PNG pixels: {error}"))?;
     let width = info.width as usize;
     let height = info.height as usize;
     let pixels = &buffer[..info.buffer_size()];
@@ -33000,7 +33130,7 @@ fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
             }
             Ok((rgba, width, height))
         }
-        _ => Err(anyhow!("clipboard PNG must use 8-bit RGB or RGBA channels")),
+        _ => Err(anyhow!("PNG must use 8-bit RGB or RGBA channels")),
     }
 }
 
@@ -33313,7 +33443,8 @@ fn set_native_clipboard_contents(
             let png_bytes = BASE64_STANDARD
                 .decode(png_base64)
                 .map_err(|error| anyhow!("invalid base64 clipboard PNG payload: {error}"))?;
-            let (rgba_bytes, width, height) = decode_png_rgba(&png_bytes)?;
+            let (rgba_bytes, width, height) =
+                decode_png_rgba(&png_bytes).context("decoding the clipboard PNG payload")?;
             with_owned_native_clipboard(
                 state,
                 NativeClipboardOwnerKind::Image,
@@ -38480,6 +38611,9 @@ fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
 ) -> Value {
+    // Read BEFORE the long-lived `shell` borrow below: the lease report takes
+    // its own peek at the same signal.
+    let agent_leases = live_agent_leases(state, current_millis() as u64);
     let shell = state.read();
     let snapshot = shell.snapshot();
     let search_sidebar_matches = snapshot
@@ -38612,6 +38746,13 @@ fn describe_app_state_snapshot(
         "terminal_font_size": shell.settings.terminal_font_size,
         "terminal_zoom_percent": zoom_percent_f32(shell.settings.terminal_font_size, TERMINAL_ZOOM_BASE),
         "web_surface_zoom_percent": zoom_percent_f32(shell.settings.web_surface_zoom_percent, WEB_SURFACE_ZOOM_BASE),
+        // N5: the deploy pre-flight. `server app state | jq .agent_leases`
+        // answers "is an agent mid-flow" in one call, from the same field the
+        // reaper reads.
+        "agent_leases": {
+            "active_agent_leases": agent_leases.len(),
+            "leases": agent_leases,
+        },
         "web_surface_vertical_tabs": shell.settings.web_surface_vertical_tabs,
         "terminal_light_theme_name": shell.terminal_theme_name_for(UiTheme::ZedLight),
         "terminal_dark_theme_name": shell.terminal_theme_name_for(UiTheme::ZedDark),
@@ -46797,7 +46938,7 @@ async fn app_pane_run_action_with_order(
         });
     }
     if let Some(script) = reply.eval {
-        let outcome = web_surface_eval_for(&state, &desktop, None, &script).await;
+        let outcome = web_surface_eval_for(&state, &desktop, None, &script, None).await;
         if !outcome
             .get("accepted")
             .and_then(Value::as_bool)
@@ -46906,12 +47047,25 @@ async fn web_surface_eval_for(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
     script: &str,
+    frame: Option<&WebFrameRef>,
 ) -> Value {
     let (session, native_id) = match resolve_live_web_surface(state, session_path) {
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    // `--frame` wraps the caller's script so it evaluates in the FRAME's realm;
+    // the script itself is unchanged, which is what keeps one meaning of `eval`.
+    let wrapped;
+    let script = match frame {
+        Some(frame) => {
+            wrapped = web_frame_scoped_script(frame, script);
+            wrapped.as_str()
+        }
+        None => script,
+    };
+    let framed = frame.is_some();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -46921,28 +47075,102 @@ async fn web_surface_eval_for(
         Ok(Ok(Ok(value_json))) => {
             let value: Value = serde_json::from_str(&value_json)
                 .unwrap_or_else(|_| Value::String(value_json.clone()));
+            if !framed {
+                return json!({
+                    "accepted": true,
+                    "session_path": session,
+                    "native_id": native_id,
+                    "value": value,
+                    "frame_resolved": Value::Null,
+                });
+            }
+            // The wrapper's own answer, unwrapped — and `frame_resolved` is
+            // echoed either way, because a caller that passed `--frame` must be
+            // able to tell "this GUI ran it in the frame" from "this GUI does
+            // not know about frames and silently ran it on the top document".
+            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
             json!({
-                "accepted": true,
+                "accepted": ok,
                 "session_path": session,
                 "native_id": native_id,
-                "value": value,
+                "value": value.get("result").cloned().unwrap_or(Value::Null),
+                "frame_resolved": value.get("frame").cloned().unwrap_or(Value::Null),
+                "reason": value.get("reason").cloned().unwrap_or(Value::Null),
+                "detail": value.get("detail").cloned().unwrap_or(Value::Null),
             })
         }
-        Ok(Ok(Err(js_error))) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": format!("js: {js_error}"),
-        }),
+        // C8: a script that returned a Promise and a webview whose content
+        // process is gone are DIFFERENT problems, and this is the door an agent
+        // actually calls — so it pays a liveness probe to answer honestly
+        // rather than making the caller guess from one string.
+        Ok(Ok(Err(failure))) => {
+            let alive = desktop.web_surface_liveness(native_id).present
+                && web_do_eval_with_timeout(desktop, native_id, "1", Duration::from_secs(2))
+                    .await
+                    .is_ok();
+            let reason = eval_failure_reason(failure.kind, alive);
+            json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                // The engine's own words, preserved — but not the thing to
+                // branch on.
+                "engine_message": failure.message,
+            })
+        }
         Ok(Err(_)) => json!({
             "accepted": false,
             "session_path": session,
-            "reason": "eval callback dropped (surface destroyed mid-eval?)",
+            "reason": "webview_unreachable",
+            "detail": "the eval callback was dropped (the surface was destroyed mid-eval)",
         }),
         Err(_) => json!({
             "accepted": false,
             "session_path": session,
-            "reason": "eval timed out (10s)",
+            "reason": "webview_unreachable",
+            "detail": "the surface's web content process did not answer within 10s",
         }),
+    }
+}
+
+/// Turn an engine eval failure plus what we know about the surface into ONE
+/// honest reason.
+///
+/// C8: `"js: Unsupported result type"` used to be emitted BOTH for a script
+/// that returned a Promise or a DOM object AND for a webview whose content
+/// process was gone. Two completely different problems behind one string cost
+/// the last field run ten minutes of misdiagnosis — an agent debugging its
+/// script while the page was dead.
+///
+/// PURE, so all four combinations are pinned by a test.
+fn eval_failure_reason(kind: dioxus::desktop::EvalFailureKind, alive: bool) -> &'static str {
+    use dioxus::desktop::EvalFailureKind as Kind;
+    match kind {
+        // The script RAN. The page is healthy and the script is wrong, and that
+        // is true whether or not the surface later stopped answering.
+        Kind::UnsupportedResultType => "js_result_unsupported",
+        Kind::ScriptException if alive => "js_exception",
+        Kind::InvalidParameter if alive => "js_invalid_parameter",
+        // Everything else depends on whether anyone was home.
+        _ if !alive => "webview_unreachable",
+        _ => "engine_error",
+    }
+}
+
+/// The sentence that goes with a reason. Separate from the reason so an agent
+/// branches on a STABLE string and a human reads the explanation.
+fn eval_failure_detail(reason: &str) -> &'static str {
+    match reason {
+        "js_result_unsupported" => {
+            "the script returned a Promise or a non-serializable object; return a JSON value, or use `web await` for an async script"
+        }
+        "webview_unreachable" => {
+            "the surface's web content process did not answer; `web ensure` reports its liveness and can rebuild it"
+        }
+        "js_exception" => "the script threw",
+        "js_invalid_parameter" => "the engine rejected the script itself",
+        _ => "the engine failed the evaluation",
     }
 }
 
@@ -46955,40 +47183,338 @@ async fn web_do_eval(
     native_id: u64,
     script: &str,
 ) -> Result<Value, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    web_do_eval_with_timeout(desktop, native_id, script, Duration::from_secs(5)).await
+}
+
+/// The same one-shot eval with an explicit budget, for the few verbs whose work
+/// legitimately takes longer than a selector resolve — rasterizing a large
+/// image, for instance. One implementation, one timeout knob: a second copy
+/// with its own duration is how two evals end up reporting failure differently.
+async fn web_do_eval_with_timeout(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    script: &str,
+    budget: Duration,
+) -> Result<Value, String> {
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     })?;
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    match tokio::time::timeout(budget, rx).await {
         Ok(Ok(Ok(value_json))) => {
             Ok(serde_json::from_str(&value_json).unwrap_or_else(|_| Value::String(value_json)))
         }
-        Ok(Ok(Err(js_error))) => Err(format!("js: {js_error}")),
-        Ok(Err(_)) => Err("eval callback dropped (surface destroyed mid-do?)".to_string()),
-        Err(_) => Err("resolve eval timed out (5s)".to_string()),
+        Ok(Ok(Err(failure))) => {
+            // Classified WITHOUT a liveness round trip: this is the inner
+            // primitive every verb calls, and probing the surface on each
+            // failure would turn one bad script into a storm of health checks.
+            // The handlers that answer a user call `eval_failure_reason` with
+            // real liveness; here the kind alone already separates the case
+            // that matters most.
+            let reason = eval_failure_reason(failure.kind, true);
+            Err(format!("{reason}: {}", failure.message))
+        }
+        Ok(Err(_)) => Err("webview_unreachable: eval callback dropped (surface destroyed mid-verb?)".to_string()),
+        Err(_) => Err(format!(
+            "webview_unreachable: eval timed out ({}s)",
+            budget.as_secs()
+        )),
     }
 }
 
-/// Focus the element matching `selector` in the target surface (F3: do not
-/// trust ambient focus — a redirect, dialog, or human keystroke can move it).
-/// Errors `no element matches` / `focus_failed` if the target is absent or
-/// cannot take focus. Shared by `do type` and `do key --selector`.
-async fn web_do_focus_selector(
+// ---------------------------------------------------------------------------
+// Element addressing (C4): ONE matcher, four call sites.
+// ---------------------------------------------------------------------------
+
+/// JS source for `__yggPath(el)` — a stable-ish CSS path for an element, so a
+/// response can say WHAT it acted on. Prefers an id, else a bounded
+/// `tag:nth-of-type(n)` chain (8 levels max, so a deep DOM cannot make the
+/// answer unbounded). This is a REPORT, not a second addressing scheme: nothing
+/// resolves through it.
+const WEB_DO_CSS_PATH_FN_JS: &str = "var __yggPath=function(el){\
+    if(!el||el.nodeType!==1)return null;\
+    var esc=function(s){try{return CSS.escape(s);}catch(e){return String(s);}};\
+    var parts=[],node=el,guard=0;\
+    while(node&&node.nodeType===1&&guard<8){\
+    if(node.id){parts.unshift('#'+esc(node.id));break;}\
+    var part=node.tagName.toLowerCase();var p=node.parentNode;\
+    if(p&&p.children){var same=[],c=p.children;\
+    for(var i=0;i<c.length;i++)if(c[i].tagName===node.tagName)same.push(c[i]);\
+    if(same.length>1)part+=':nth-of-type('+(same.indexOf(node)+1)+')';}\
+    parts.unshift(part);node=p;guard++;}\
+    return parts.join(' > ');};";
+
+/// Resolve the addressed element, scroll it into view, and report everything
+/// the DOM knows about it at that instant. `__YGG_REF__` is replaced by the
+/// matcher expression; `__YGG_PATH_FN__` by [`WEB_DO_CSS_PATH_FN_JS`].
+///
+/// Resolution happens HERE, immediately before injection — that is what retires
+/// the stale-coordinate hazard: a rect resolved in an earlier request can be
+/// invalidated by any reflow, and this one cannot be.
+const WEB_DO_RESOLVE_JS: &str = "(function(){__YGG_PATH_FN__\
+    var el=__YGG_REF__;if(!el)return{found:false};\
+    var connected=(el.isConnected!==undefined)?!!el.isConnected\
+    :!!(document.contains&&document.contains(el));\
+    try{el.scrollIntoView({block:'center',inline:'center'});}catch(e){}\
+    var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
+    var hit=document.elementFromPoint(cx,cy);\
+    var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
+    return{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,\
+    visible:r.width>0&&r.height>0,isConnected:connected,cssPath:__yggPath(el),\
+    tag:el.tagName};})()";
+
+/// Focus the addressed element. Same matcher, different action.
+const WEB_DO_FOCUS_JS: &str = "(function(){var el=__YGG_REF__;if(!el)return{found:false};\
+    try{el.focus();}catch(e){}\
+    return{found:true,focused:document.activeElement===el};})()";
+
+/// The matcher: a JS expression evaluating to the addressed `Element` or `null`.
+///
+/// This is the ONE place that knows how a [`WebElementRef`] finds a node. Every
+/// consumer (resolve-and-click, focus-to-type, focus-to-key, fill, readback)
+/// composes it into its own script, so a click and the readback that verifies it
+/// can never disagree about which element was meant.
+fn web_element_ref_js(target: &WebElementRef) -> String {
+    let quote = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    match target {
+        WebElementRef::Css(selector) => {
+            format!("document.querySelector({})", quote(selector))
+        }
+        WebElementRef::Text {
+            text,
+            exact,
+            tag,
+            nth,
+        } => {
+            // Candidate pool, match, then drop any candidate that CONTAINS
+            // another candidate: on a substring match the whole ancestor chain
+            // up to <body> matches, and clicking <body> is never what was
+            // meant. Document order + innermost-wins + `nth` is fully
+            // deterministic — the same page always yields the same node.
+            let pool = tag.clone().unwrap_or_else(|| {
+                "a,button,input,select,textarea,label,summary,\
+                 [role],[onclick],[tabindex],div,span,td,th,li,p,h1,h2,h3,h4"
+                    .to_string()
+            });
+            format!(
+                "(function(){{var els=document.querySelectorAll({pool});\
+                 var want={want},exact={exact},nth={nth};\
+                 var norm=function(s){{return String(s==null?'':s).replace(/\\s+/g,' ').trim();}};\
+                 var out=[];\
+                 for(var i=0;i<els.length;i++){{var e=els[i];\
+                 var t=norm(e.getAttribute&&e.getAttribute('aria-label'));\
+                 if(!t&&(e.tagName==='INPUT'||e.tagName==='BUTTON'))t=norm(e.value);\
+                 if(!t)t=norm(e.innerText||e.textContent);\
+                 if(!t)continue;\
+                 if(exact?(t===want):(t.indexOf(want)!==-1))out.push(e);}}\
+                 var inner=[];\
+                 for(var j=0;j<out.length;j++){{var keep=true;\
+                 for(var k=0;k<out.length;k++){{if(k!==j&&out[j].contains&&out[j].contains(out[k]))\
+                 {{keep=false;break;}}}}\
+                 if(keep)inner.push(out[j]);}}\
+                 return inner[nth]||null;}})()",
+                pool = quote(&pool),
+                want = quote(text),
+                exact = if *exact { "true" } else { "false" },
+                nth = nth.unwrap_or(0),
+            )
+        }
+        WebElementRef::Role { role, label, nth } => format!(
+            "(function(){{var want={role},wantLabel={label},nth={nth};\
+             var norm=function(s){{return String(s==null?'':s).replace(/\\s+/g,' ').trim();}};\
+             var roleOf=function(e){{\
+             var r=e.getAttribute&&e.getAttribute('role');\
+             if(r)return norm(r).toLowerCase();\
+             var t=e.tagName;\
+             if(t==='BUTTON')return 'button';\
+             if(t==='A')return e.hasAttribute('href')?'link':'generic';\
+             if(t==='SELECT')return 'combobox';\
+             if(t==='TEXTAREA')return 'textbox';\
+             if(t==='IMG')return 'img';\
+             if(t==='NAV')return 'navigation';\
+             if(t==='MAIN')return 'main';\
+             if(t==='FORM')return 'form';\
+             if(t==='TABLE')return 'table';\
+             if(/^H[1-6]$/.test(t))return 'heading';\
+             if(t==='INPUT'){{var ty=(e.getAttribute('type')||'text').toLowerCase();\
+             if(ty==='submit'||ty==='button'||ty==='reset'||ty==='image')return 'button';\
+             if(ty==='checkbox')return 'checkbox';\
+             if(ty==='radio')return 'radio';\
+             if(ty==='search')return 'searchbox';\
+             if(ty==='range')return 'slider';\
+             if(ty==='number')return 'spinbutton';\
+             if(ty==='hidden')return 'none';\
+             return 'textbox';}}\
+             return 'generic';}};\
+             var labelOf=function(e){{\
+             var l=norm(e.getAttribute&&e.getAttribute('aria-label'));if(l)return l;\
+             var lb=e.getAttribute&&e.getAttribute('aria-labelledby');\
+             if(lb){{var acc=[],ids=lb.split(/\\s+/);\
+             for(var i=0;i<ids.length;i++){{var t=document.getElementById(ids[i]);\
+             if(t)acc.push(norm(t.innerText||t.textContent));}}\
+             l=norm(acc.join(' '));if(l)return l;}}\
+             if(e.labels&&e.labels.length){{var ls=[];\
+             for(var m=0;m<e.labels.length;m++)ls.push(norm(e.labels[m].innerText||e.labels[m].textContent));\
+             l=norm(ls.join(' '));if(l)return l;}}\
+             l=norm(e.getAttribute&&e.getAttribute('title'));if(l)return l;\
+             if(e.tagName==='INPUT'){{l=norm(e.value);if(l)return l;\
+             l=norm(e.getAttribute('placeholder'));if(l)return l;}}\
+             return norm(e.innerText||e.textContent);}};\
+             var all=document.querySelectorAll('*'),ex=[],part=[];\
+             for(var i=0;i<all.length;i++){{var e=all[i];\
+             if(roleOf(e)!==want)continue;var lab=labelOf(e);\
+             if(lab===wantLabel)ex.push(e);\
+             else if(wantLabel&&lab.indexOf(wantLabel)!==-1)part.push(e);}}\
+             var pool=ex.length?ex:part;return pool[nth]||null;}})()",
+            role = quote(&role.to_lowercase()),
+            label = quote(label),
+            nth = nth.unwrap_or(0),
+        ),
+    }
+}
+
+/// Compose a target-shaped script: substitute the matcher (and the css-path
+/// helper, when the template asks for it) into `template`.
+fn web_do_script_for_ref(template: &str, target: &WebElementRef) -> String {
+    template
+        .replace("__YGG_PATH_FN__", WEB_DO_CSS_PATH_FN_JS)
+        .replace("__YGG_REF__", &web_element_ref_js(target))
+}
+
+/// What the DOM said about the addressed node AT CLICK TIME.
+///
+/// The three questions a `do` response must keep separate (N3):
+/// `accepted` = the injector ran; these fields = what the DOM said about the
+/// node; `delivered` = what the page's own listener observed. Conflating any
+/// two of them is how "delivered" came to mean "we injected".
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedElement {
+    /// Viewport-space CSS centre — what gets injected.
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    on_target: bool,
+    is_connected: bool,
+    css_path: Option<String>,
+    tag: Option<String>,
+}
+
+/// PURE half of the resolver: turn the page's report into a decision.
+///
+/// Kept pure so the refusals are unit-testable without a webview — every
+/// interesting failure of this verb family is a decision made here.
+fn web_do_resolved_from_info(
+    target: &WebElementRef,
+    info: &Value,
+) -> Result<ResolvedElement, String> {
+    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!("no element matches {}", target.describe()));
+    }
+    let is_connected = info
+        .get("isConnected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_connected {
+        // A React re-render replaces the node behind an agent-injected id: the
+        // selector still resolves, but to a node no longer in the document, so
+        // an event fired at it reaches nothing. Refuse rather than report a
+        // success that delivered nothing.
+        return Err(format!(
+            "detached_node ({} resolved to a node that is not in the document)",
+            target.describe()
+        ));
+    }
+    if !info
+        .get("visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!("{} matched a zero-size element", target.describe()));
+    }
+    if !info
+        .get("onTarget")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "target_moved (the resolved point no longer hits {})",
+            target.describe()
+        ));
+    }
+    Ok(ResolvedElement {
+        x: info.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+        y: info.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+        w: info.get("w").and_then(Value::as_f64).unwrap_or(0.0),
+        h: info.get("h").and_then(Value::as_f64).unwrap_or(0.0),
+        on_target: true,
+        is_connected: true,
+        css_path: info
+            .get("cssPath")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tag: info
+            .get("tag")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+/// Resolve a [`WebElementRef`] in the page, right now.
+async fn web_do_resolve_ref(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    selector: &str,
+    target: &WebElementRef,
+) -> Result<ResolvedElement, String> {
+    let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, target);
+    let info = web_do_eval(desktop, native_id, &script).await?;
+    web_do_resolved_from_info(target, &info)
+}
+
+/// The positive report N3 asks for: what was clicked, not just that something
+/// was. Pure, so the response shape is pinned by a test.
+fn web_do_resolved_detail(verb: &str, target: &WebElementRef, resolved: &ResolvedElement) -> Value {
+    json!({
+        "verb": verb,
+        // Wire-identical to the pre-C4 response for a CSS target (a bare
+        // string), an object for the new addressing shapes.
+        "selector": serde_json::to_value(target).unwrap_or(Value::Null),
+        "target": target.describe(),
+        "x": resolved.x,
+        "y": resolved.y,
+        "resolved": {
+            "css_path": resolved.css_path,
+            "tag": resolved.tag,
+            "rect": [resolved.x - resolved.w / 2.0, resolved.y - resolved.h / 2.0, resolved.w, resolved.h],
+            "on_target": resolved.on_target,
+            "is_connected": resolved.is_connected,
+        },
+    })
+}
+
+/// Focus the addressed element (F3: do not trust ambient focus — a redirect,
+/// dialog, or human keystroke can move it). Shared by `do type`, `do key
+/// --selector` and `do fill`; it runs the SAME matcher the click path runs.
+async fn web_do_focus_ref(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    target: &WebElementRef,
 ) -> Result<(), String> {
-    let script = format!(
-        "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
-         el.focus();return{{found:true,focused:document.activeElement===el}};}})()",
-        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-    );
+    let script = web_do_script_for_ref(WEB_DO_FOCUS_JS, target);
     let info = web_do_eval(desktop, native_id, &script).await?;
     if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(format!("no element matches selector: {selector}"));
+        return Err(format!("no element matches {}", target.describe()));
     }
-    if !info.get("focused").and_then(Value::as_bool).unwrap_or(false) {
-        return Err("focus_failed (could not focus the selector target)".to_string());
+    if !info
+        .get("focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "focus_failed (could not focus {})",
+            target.describe()
+        ));
     }
     Ok(())
 }
@@ -47039,6 +47565,135 @@ async fn web_do_clear_focused_field(
     Ok(())
 }
 
+/// Which character belongs in which box of a segmented input — the ONE owner of
+/// that rule.
+///
+/// One character per box, with any remainder dropped into the LAST box, so a
+/// 4-box widget fed a 6-character code still gets a complete expectation
+/// instead of silently ignoring two characters. A single box therefore expects
+/// the whole string, which is what makes `--selector <one>` and
+/// `--selector-set <one>` mean the same thing.
+fn segmented_expectation(expected: &str, boxes: usize) -> Vec<String> {
+    if boxes == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = expected.chars().collect();
+    (0..boxes)
+        .map(|index| {
+            if index + 1 == boxes {
+                chars.get(index..).map(|rest| rest.iter().collect()).unwrap_or_default()
+            } else {
+                chars.get(index).map(|c| c.to_string()).unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+/// PURE readback rule: given what each box holds, which boxes are right?
+///
+/// This exists because the old readback was structurally incapable of reporting
+/// the failure it was written to catch. It compared the WHOLE expected string
+/// against `targets.first()` — one box, holding one character — so on a 6-box
+/// OTP it returned false (or null) for a perfectly good fill, and could never
+/// name the merge. The measured case: typing `292244` over a prior `278347`
+/// produced `278344`, and the boolean still read fine.
+///
+/// The live path runs the same rule PAGE-SIDE (only booleans cross back out —
+/// F4 redaction), sharing `segmented_expectation` so the chunking has exactly
+/// one owner; this function is the same rule expressed where it can be tested
+/// with no browser.
+fn segmented_match(expected: &str, per_box: &[Option<String>]) -> (bool, Vec<bool>) {
+    let want = segmented_expectation(expected, per_box.len());
+    let per: Vec<bool> = per_box
+        .iter()
+        .zip(want.iter())
+        .map(|(held, want)| held.as_deref() == Some(want.as_str()))
+        .collect();
+    (per.iter().all(|ok| *ok) && !per.is_empty(), per)
+}
+
+/// Build a JS array literal of the addressed elements, in order. Shared by the
+/// clear-verification and the segmented readback so both look at exactly the
+/// boxes the fill wrote to.
+fn web_do_refs_array_js(targets: &[WebElementRef]) -> String {
+    let refs: Vec<String> = targets.iter().map(web_element_ref_js).collect();
+    format!("[{}]", refs.join(","))
+}
+
+/// Is every box actually EMPTY? Returns `None` when it could not be read.
+///
+/// Typing into a partially-cleared segmented widget is how the merge is
+/// manufactured, so the fill path asserts this between clearing and typing
+/// rather than assuming the clear worked.
+async fn web_do_boxes_are_empty(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    targets: &[WebElementRef],
+) -> Option<Vec<bool>> {
+    if targets.is_empty() {
+        return Some(Vec::new());
+    }
+    let script = format!(
+        "(function(){{var refs={refs};var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push(v.length===0);}}\
+         return{{known:true,boxes:out}};}})()",
+        refs = web_do_refs_array_js(targets),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        info.get("boxes")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_bool().unwrap_or(false))
+            .collect(),
+    )
+}
+
+/// Per-box readback for a segmented input. `None` when it could not be read.
+///
+/// Only booleans come back (F4): the expected characters go IN (they are
+/// already in that page — the fill just typed them), the comparison happens
+/// page-side, and the answer names WHICH box is wrong without ever quoting a
+/// value.
+async fn web_do_verify_segmented_value(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    targets: &[WebElementRef],
+    expected: &str,
+) -> Option<Vec<bool>> {
+    if targets.is_empty() {
+        return None;
+    }
+    let want = segmented_expectation(expected, targets.len());
+    let script = format!(
+        "(function(){{var refs={refs};var want={want};var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push(v===want[i]);}}\
+         return{{known:true,boxes:out}};}})()",
+        refs = web_do_refs_array_js(targets),
+        want = serde_json::to_string(&want).unwrap_or_else(|_| "[]".to_string()),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        info.get("boxes")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_bool().unwrap_or(false))
+            .collect(),
+    )
+}
+
 /// Did the field actually end up holding `expected`? Returns `None` when it
 /// could not be read (unknown, which is not the same as "no").
 ///
@@ -47048,18 +47703,19 @@ async fn web_do_clear_focused_field(
 async fn web_do_verify_field_value(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    selector: Option<&str>,
+    target: Option<&WebElementRef>,
     expected: &str,
 ) -> Option<bool> {
+    // Same matcher as the focus/click paths, so the box that was written and
+    // the box that is read back can never be different elements.
+    let resolver = target
+        .map(web_element_ref_js)
+        .unwrap_or_else(|| "document.activeElement".to_string());
     let script = format!(
-        "(function(){{var sel={sel};\
-         var el=sel?document.querySelector(sel):document.activeElement;\
+        "(function(){{var el={resolver};\
          if(!el)return{{known:false}};\
          var v=(el.value!==undefined?el.value:el.textContent)||'';\
          return{{known:true,same:v==={want}}};}})()",
-        sel = selector
-            .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()))
-            .unwrap_or_else(|| "null".to_string()),
         want = serde_json::to_string(expected).unwrap_or_else(|_| "\"\"".to_string()),
     );
     let info = web_do_eval(desktop, native_id, &script).await.ok()?;
@@ -47227,6 +47883,78 @@ fn web_do_delivery_from_readback(armed_doc: Option<&str>, readback: Option<&Valu
     }
 }
 
+/// Every LIVE agent lease on a web surface, right now.
+///
+/// N5: `server app web lease` already exists for the reaper, so a deploy can
+/// simply CHECK it. Read from the SAME field `web_surface_reap_due` consults
+/// (`WebSurfaceTab::lease_until_ms`), so the report and the reaper can never
+/// disagree — a copy anywhere else would be a second encoding of "is this
+/// surface claimed".
+///
+/// Deliberately GUI-side only. The daemon has no knowledge of these leases and
+/// giving it one would be exactly that second encoding; the deploy pre-flight
+/// is `server app state | jq .agent_leases`, one call, beside the `server app
+/// clients` check.
+fn live_agent_leases(state: &Signal<ShellState>, now_ms: u64) -> Vec<Value> {
+    let shell = state.peek();
+    let mut leases: Vec<Value> = shell
+        .web_surfaces
+        .iter()
+        .flat_map(|(session_path, surface)| {
+            surface.tabs.iter().filter_map(move |tab| {
+                let until = tab.lease_until_ms?;
+                (until > now_ms).then(|| {
+                    json!({
+                        "session_path": session_path,
+                        "tab_id": tab.id,
+                        "lease_until_ms": until,
+                        "seconds_remaining": (until - now_ms) / 1000,
+                    })
+                })
+            })
+        })
+        .collect();
+    // Deterministic order, so a pre-flight diff is stable.
+    leases.sort_by(|a, b| {
+        (
+            a.get("session_path").and_then(Value::as_str),
+            a.get("tab_id").and_then(Value::as_u64),
+        )
+            .cmp(&(
+                b.get("session_path").and_then(Value::as_str),
+                b.get("tab_id").and_then(Value::as_u64),
+            ))
+    });
+    leases
+}
+
+/// The refusal a deploy door returns while an agent is driving. `None` = go
+/// ahead. PURE over the lease list, so the decision is testable.
+///
+/// The HONEST LIMIT of this lock, so nobody oversells it: it stops the
+/// app-control restart door, not `pkill yggterm`. The field finding that a
+/// flow and a deploy are mutually exclusive is about surface HAND-OFF across a
+/// GUI generation, which this does not solve and does not claim to.
+fn agent_lease_refusal(leases: &[Value], force: bool) -> Option<Value> {
+    if force || leases.is_empty() {
+        return None;
+    }
+    let sessions: Vec<&str> = leases
+        .iter()
+        .filter_map(|lease| lease.get("session_path").and_then(Value::as_str))
+        .collect();
+    Some(json!({
+        "accepted": false,
+        "reason": "agent_lease_active",
+        "detail": format!(
+            "{} agent lease(s) are live on {} — someone is driving. Re-run with --force to restart anyway.",
+            leases.len(),
+            sessions.join(", ")
+        ),
+        "leases": leases,
+    }))
+}
+
 /// App-control `lease`: claim a session's active web-surface tab for `ttl_secs`
 /// so the background reaper leaves it alone while unattended work runs.
 ///
@@ -47287,19 +48015,6 @@ fn web_surface_lease_for(
     }
 }
 
-/// Tear down the armed recorder and return the failure. Used by the paths that
-/// abort AFTER arming (selector focus failures) so no page keeps a stray
-/// listener when the verb never injected anything.
-async fn web_do_disarm_and_fail(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    session: String,
-    reason: String,
-) -> Value {
-    let _ = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS).await;
-    json!({ "accepted": false, "session_path": session, "reason": reason })
-}
-
 /// Process-wide agent-input preemption state (acceptance gate 9). A global for
 /// the same reason the slice-3 agent identity is one: every `do` call site would
 /// otherwise thread state it does not care about, and there is exactly one GUI
@@ -47348,9 +48063,26 @@ fn agent_input_batch_for_current_agent() -> crate::agent_input_arbiter::AgentBat
 /// The detection has to happen at that layer because the agent's own injected
 /// events carry `isTrusted: true` by design, so a page-side listener cannot
 /// distinguish them from the human. See `docs/agent-control-plane.md`.
-fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
+fn note_human_input_on_web_surface(
+    session_path: &str,
+    generation: u64,
+) -> crate::agent_input_arbiter::PreemptReport {
     let surface = crate::agent_input_arbiter::SurfaceKey::new(session_path, generation);
     let report = agent_input_arbiter_lock().note_human_input(&surface);
+    journal_web_surface_preempt(session_path, generation, &report, "human_input", None);
+    report
+}
+
+/// The ONE place a preemption is written to the trace. Both doors into gate 9 —
+/// the per-request gate and a batch's mid-flight abort — journal through here,
+/// so the two can never describe the same event differently.
+fn journal_web_surface_preempt(
+    session_path: &str,
+    generation: u64,
+    report: &crate::agent_input_arbiter::PreemptReport,
+    trigger: &str,
+    remaining: Option<usize>,
+) {
     if report.is_empty() {
         return;
     }
@@ -47364,7 +48096,10 @@ fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
                 "session_path": session_path,
                 "generation": generation,
                 "cancelled_batches": report.cancelled_batches,
-                "trigger": "human_input",
+                "trigger": trigger,
+                // How many actions of a batch were abandoned. `null` for a
+                // single verb, which has no remainder.
+                "remaining": remaining,
             }),
         );
     }
@@ -47423,189 +48158,100 @@ fn note_write_lock_preempt_on_web_surface(session_path: &str, generation: u64, p
     }
 }
 
-async fn web_surface_do_for(
-    state: &Signal<ShellState>,
+async fn web_do_doc_to_viewport(
     desktop: &dioxus::desktop::DesktopContext,
-    session_path: Option<&str>,
-    action: &WebSurfaceDoAction,
-    expected_generation: Option<u64>,
-    new_batch: bool,
-) -> Value {
-    let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
-        Ok(resolved) => resolved,
-        Err(reason) => return json!({ "accepted": false, "reason": reason }),
-    };
-    // Check the incarnation BEFORE injecting anything (F3).
-    if let Some(mut stale) = web_surface_stale_handle(expected_generation, handle) {
-        if let Some(obj) = stale.as_object_mut() {
-            obj.insert("session_path".to_string(), Value::String(session));
-        }
-        return stale;
-    }
-    // Human-preempt gate (acceptance gate 9): once real seat input lands on a
-    // surface, every agent batch that was driving it is cancelled and its later
-    // verbs are refused here — so a verb the agent planned before the user acted
-    // cannot land afterwards. Ordering/one-in-flight is NOT re-implemented: the
-    // app-control pump already drains one request at a time.
-    {
-        let batch = agent_input_batch_for_current_agent();
-        let surface_key =
-            crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
-        // `--new-batch`: the agent asserts it has re-observed the page, so this
-        // surface's lane is reopened before the seat-input read below. This is
-        // the ONLY reset an agent can reach — the batch id is per-GUI-process
-        // (`resolve_agent_identity` reads the GUI's own argv, so it is the same
-        // `"anonymous"` for every verb the GUI will ever serve), and `forget()`
-        // otherwise runs only when the surface closes or is rebuilt. Without it
-        // a single preempt is a permanent lockout rather than a yield, which is
-        // what the refusal's own "start a new batch after re-observing" text has
-        // always promised was possible.
-        //
-        // Ordering matters: the reset happens BEFORE `take_web_surface_seat_input`
-        // so a stale count left by the agent's own previous verb cannot instantly
-        // re-preempt the lane the agent just reopened. Real seat input that lands
-        // AFTER this point still preempts normally — re-observing does not buy
-        // the agent immunity, only a fresh start.
-        if new_batch {
-            agent_input_arbiter_lock().forget(&surface_key);
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "agent_input",
-                    "batch_reset",
-                    json!({
-                        "session_path": session,
-                        "batch_id": batch.batch_id,
-                        "generation": handle.generation,
-                    }),
-                );
-            }
-        }
-        // Did the human touch this surface since the last verb? The webview
-        // layer counts real seat input (clicks/keys/scrolls) and excludes our
-        // own injections, so a non-zero count is unambiguously the user.
-        if desktop.take_web_surface_seat_input(handle.native_id) > 0 {
-            note_human_input_on_web_surface(&session, handle.generation);
-        }
-        // A page's JS dialog is answered for it at the webview layer (otherwise
-        // an invisible surface blocks its whole web process forever). The
-        // question itself would then be lost, so record it here — the agent
-        // driving this surface is exactly who needs to know the page asked.
-        for dialog in desktop.take_web_surface_script_dialogs() {
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "web_surface",
-                    "script_dialog_answered",
-                    json!({
-                        "session_path": session,
-                        "native_id": dialog.surface_id,
-                        "kind": dialog.kind,
-                        "answered": dialog.answered,
-                        "uri": dialog.uri,
-                        "message": dialog.message,
-                    }),
-                );
-            }
-        }
-        let outcome = agent_input_arbiter_lock()
-            .admit(&surface_key, &batch, handle.generation);
-        if outcome == crate::agent_input_arbiter::AdmitOutcome::Preempted {
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "agent_input",
-                    crate::agent_input_arbiter::PREEMPTED,
-                    json!({
-                        "session_path": session,
-                        "batch_id": batch.batch_id,
-                        "generation": handle.generation,
-                    }),
-                );
-            }
-            return json!({
-                "accepted": false,
-                "reason": crate::agent_input_arbiter::PREEMPTED,
-                "session_path": session,
-                "detail": "the user took this surface; start a new batch after re-observing",
-            });
-        }
-    }
-    // Slice 4.1c — Shadow write-lock preempt gate. A Shadow view client must not
-    // inject into a profile whose daemon-owned write-lock it no longer holds:
-    // once the user's Active GUI preempts it (4.1a), the shadow's still-open
-    // jar-backed WebContext must stop taking agent-driven writes, or two clients
-    // write one jar. ONLY Shadows check — an Active client holds the lock by
-    // construction, or drives its own ephemeral read-only surface (4.1b), so the
-    // user's GUI never pays this round-trip. An ephemeral profile has its own
-    // in-memory context and no shared jar to fight over, so it is exempt. Fail
-    // CLOSED: a Shadow that cannot confirm it holds the lock refuses, matching
-    // the daemon's shadow-fails-closed doctrine (D7).
-    {
-        let identity = yggterm_server::current_client_identity();
-        if identity.role == yggterm_server::ClientRole::Shadow
-            && let Some(profile) = web_surface_active_profile(state, &session)
-            && !yggterm_core::web_profile::web_profile_is_ephemeral(&normalize_web_surface_profile(
-                Some(profile.as_str()),
-            ))
-        {
-            let holder_id = identity
-                .client_id
-                .clone()
-                .unwrap_or_else(|| format!("anonymous:{}", std::process::id()));
-            let endpoint = state.peek().bootstrap.server_endpoint.clone();
-            let holds = match yggterm_server::profile_write_lock_report(&endpoint) {
-                Ok(report) => write_lock_report_holds(&report, &profile, &holder_id),
-                // Cannot verify => do not write someone else's jar (fail closed).
-                Err(_) => false,
-            };
-            if !holds {
-                note_write_lock_preempt_on_web_surface(&session, handle.generation, &profile);
-                return json!({
-                    "accepted": false,
-                    "reason": crate::agent_input_arbiter::PREEMPTED,
-                    "session_path": session,
-                    "detail": "the profile write-lock was preempted by an Active client; this shadow may not write the jar until it re-acquires",
-                });
-            }
-        }
-    }
-    let native_id = handle.native_id;
-    // Document-space CSS (x, y) → viewport CSS by subtracting the live scroll
-    // offset. The vendored inject layer applies page zoom to reach widget px.
-    async fn doc_to_viewport(
-        desktop: &dioxus::desktop::DesktopContext,
-        native_id: u64,
-        x: f64,
-        y: f64,
-    ) -> Result<(f64, f64), String> {
-        let scroll = web_do_eval(
-            desktop,
-            native_id,
-            "(function(){return {sx:window.scrollX||window.pageXOffset||0,sy:window.scrollY||window.pageYOffset||0};})()",
-        )
-        .await?;
-        let sx = scroll.get("sx").and_then(Value::as_f64).unwrap_or(0.0);
-        let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
-        Ok((x - sx, y - sy))
-    }
-    // Arm the page-side delivery recorder BEFORE injecting. If arming fails the
-    // verb still runs — it just reports `delivered: "unknown"` rather than
-    // inventing a success claim.
-    let armed_doc = web_do_eval(
+    native_id: u64,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64), String> {
+    let scroll = web_do_eval(
         desktop,
         native_id,
-        &web_do_observe_arm_script(web_do_observed_event_types(action)),
+        "(function(){return {sx:window.scrollX||window.pageXOffset||0,sy:window.scrollY||window.pageYOffset||0};})()",
     )
-    .await
-    .ok()
-    .and_then(|value| value.as_str().map(ToOwned::to_owned));
-    let result = match action {
+    .await?;
+    let sx = scroll.get("sx").and_then(Value::as_f64).unwrap_or(0.0);
+    let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
+    Ok((x - sx, y - sy))
+}
+
+/// Gate 9's DECISION, extracted so it is drivable with no webview.
+///
+/// The rule, in order: a stale incarnation is refused as stale; then REAL SEAT
+/// INPUT WINS — before any reset, whether or not this verb opens a new batch;
+/// only then does a new batch reopen the lane, and only then is the batch
+/// admitted.
+///
+/// The seat read comes first because `web batch` sets `new_batch` on the
+/// agent's OWN behalf (nobody asserts anything), so a reset-first ordering made
+/// the highest-privilege verb on the plane the one verb that could never be
+/// preempted at its own start: `forget` removed the lane, `note_human_input`
+/// then found nothing to cancel, and a click that landed between the agent's
+/// last verb and its batch was consumed and discarded while all N injections
+/// ran. Seat-first costs the agent exactly one refusal — the count is consumed
+/// by that refusal, so the very next `--new-batch` verb reopens the lane — and
+/// it costs the human nothing, which is the trade gate 9 exists to make.
+///
+/// A count arriving on a surface with no lane yet still refuses: the REFUSAL is
+/// keyed on the count itself, not on what the lane happened to remember, so a
+/// human gesture is never silently absorbed by an empty arbiter.
+///
+/// It is `&mut AgentInputArbiter` and nothing else — no signals, no desktop, no
+/// tracing — which is what lets the batch locks below drive it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateDecision {
+    Allowed,
+    /// The human took the surface; every batch driving it is cancelled.
+    Preempted,
+    /// The verb was aimed at an incarnation that no longer exists.
+    StaleSurface,
+}
+
+fn web_do_gate(
+    seat_input_count: u64,
+    new_batch: bool,
+    arbiter: &mut crate::agent_input_arbiter::AgentInputArbiter,
+    surface: &crate::agent_input_arbiter::SurfaceKey,
+    batch: &crate::agent_input_arbiter::AgentBatch,
+    live_generation: u64,
+) -> (GateDecision, crate::agent_input_arbiter::PreemptReport) {
+    if arbiter.is_stale(surface, live_generation) {
+        return (
+            GateDecision::StaleSurface,
+            crate::agent_input_arbiter::PreemptReport::default(),
+        );
+    }
+    if seat_input_count > 0 {
+        // The human touched this surface since the last verb. Cancel every
+        // batch driving it and refuse THIS verb too — including a verb that
+        // opens a new batch, which is the whole point (see the note above).
+        return (GateDecision::Preempted, arbiter.note_human_input(surface));
+    }
+    if new_batch {
+        arbiter.forget(surface);
+    }
+    let report = crate::agent_input_arbiter::PreemptReport::default();
+    let decision = match arbiter.admit(surface, batch, live_generation) {
+        crate::agent_input_arbiter::AdmitOutcome::Allowed => GateDecision::Allowed,
+        crate::agent_input_arbiter::AdmitOutcome::Preempted => GateDecision::Preempted,
+        crate::agent_input_arbiter::AdmitOutcome::StaleSurface => GateDecision::StaleSurface,
+    };
+    (decision, report)
+}
+
+/// Perform ONE action against an already-resolved, already-gated surface.
+///
+/// No gating, no recorder, no response assembly — just the injection. Extracted
+/// from `web_surface_do_for` so `web batch` runs exactly the same code path per
+/// action rather than a parallel implementation that could drift.
+async fn web_do_perform(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    action: &WebSurfaceDoAction,
+) -> Result<Value, String> {
+    match action {
         WebSurfaceDoAction::Click { x, y, button } => {
-            match doc_to_viewport(desktop, native_id, *x, *y).await {
+            match web_do_doc_to_viewport(desktop, native_id, *x, *y).await {
                 Ok((vx, vy)) => {
                     // Crash-safety (WebKitGTK null-deref on a blind coordinate
                     // click — pending-bugs 2026-07-24, GUI hard-crash): a native
@@ -47655,41 +48301,25 @@ async fn web_surface_do_for(
             }
         }
         WebSurfaceDoAction::ClickSelector { selector, button } => {
-            // Resolve the element rect IN THE PAGE (scroll it into view), take
-            // its viewport-space center, and re-verify the point still hits the
-            // element (freshness guard — a reflow/navigation in the gap aborts).
-            let script = format!(
-                "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
-                 el.scrollIntoView({{block:'center',inline:'center'}});\
-                 var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
-                 var hit=document.elementFromPoint(cx,cy);\
-                 var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
-                 return{{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,visible:r.width>0&&r.height>0}};}})()",
-                sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-            );
-            match web_do_eval(desktop, native_id, &script).await {
-                Ok(info) => {
-                    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-                        Err(format!("no element matches selector: {selector}"))
-                    } else if !info.get("visible").and_then(Value::as_bool).unwrap_or(false) {
-                        Err(format!("selector matched a zero-size element: {selector}"))
-                    } else if !info.get("onTarget").and_then(Value::as_bool).unwrap_or(false) {
-                        // The resolved center is occluded / moved — do NOT click
-                        // whatever now sits there (F3 freshness guard).
-                        Err("target_moved (resolved point no longer hits the selector)".to_string())
-                    } else {
-                        let vx = info.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-                        let vy = info.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-                        desktop
-                            .inject_web_surface_click(native_id, vx, vy, web_do_gdk_button(*button))
-                            .map(|()| json!({ "verb": "click_selector", "selector": selector, "x": vx, "y": vy }))
-                    }
-                }
+            // Resolve AT CLICK TIME through the shared matcher (C4): CSS, or
+            // visible text, or role+label. The resolve script scrolls the node
+            // into view, takes its viewport-space centre and re-verifies that
+            // the point still hits it, so a reflow between resolution and
+            // injection aborts instead of clicking whatever moved in.
+            match web_do_resolve_ref(desktop, native_id, selector).await {
+                Ok(resolved) => desktop
+                    .inject_web_surface_click(
+                        native_id,
+                        resolved.x,
+                        resolved.y,
+                        web_do_gdk_button(*button),
+                    )
+                    .map(|()| web_do_resolved_detail("click_selector", selector, &resolved)),
                 Err(reason) => Err(reason),
             }
         }
         WebSurfaceDoAction::Move { x, y } => {
-            match doc_to_viewport(desktop, native_id, *x, *y).await {
+            match web_do_doc_to_viewport(desktop, native_id, *x, *y).await {
                 Ok((vx, vy)) => desktop
                     .inject_web_surface_move(native_id, vx, vy)
                     .map(|()| json!({ "verb": "move", "x": vx, "y": vy })),
@@ -47700,7 +48330,7 @@ async fn web_surface_do_for(
             // Position defaults to the viewport center; explicit coords are
             // document-space (subtract scroll).
             let pos = match (x, y) {
-                (Some(px), Some(py)) => doc_to_viewport(desktop, native_id, *px, *py).await,
+                (Some(px), Some(py)) => web_do_doc_to_viewport(desktop, native_id, *px, *py).await,
                 _ => web_do_eval(
                     desktop,
                     native_id,
@@ -47726,10 +48356,10 @@ async fn web_surface_do_for(
                 // Editing/navigation keys need a focused DOM element (the widget
                 // grab alone has no target). Focus the selector first when given.
                 if let Some(selector) = selector
-                    && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+                    && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
                 {
                     // Single exit path: the armed recorder is torn down below.
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    return Err(reason);
                 }
                 let state_bits = web_do_mods_to_state(mods);
                 let press = desktop.inject_web_surface_key(native_id, true, keyval, state_bits);
@@ -47744,9 +48374,9 @@ async fn web_surface_do_for(
             // Optionally resolve + focus the target first (F3: do not trust
             // ambient focus). Then deliver each character as a key press+release.
             if let Some(selector) = selector
-                && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+                && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
             {
-                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                return Err(reason);
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -47776,27 +48406,70 @@ async fn web_surface_do_for(
             // field. Clearing EVERY box matters — a segmented component keeps
             // its own state per box, so clearing only the focused one leaves the
             // rest holding old digits, which is the observed merge.
-            let targets: Vec<String> = if !selectors.is_empty() {
+            let targets: Vec<WebElementRef> = if !selectors.is_empty() {
                 selectors.clone()
             } else {
                 selector.iter().cloned().collect()
             };
             let mut cleared = 0u32;
             for target in &targets {
-                if let Err(reason) = web_do_focus_selector(desktop, native_id, target).await {
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
+                    return Err(reason);
                 }
                 if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    return Err(reason);
                 }
                 cleared += 1;
+            }
+            // ASSERT the clear (N2). "I sent select-all and Delete" is not
+            // evidence a segmented widget is empty, and typing into a
+            // partially-cleared one is exactly how the observed merge is
+            // manufactured. One retry per stubborn box, then REFUSE — an
+            // aborted fill is recoverable, a wrong OTP submitted to a bank is
+            // not.
+            let cleared_verified = web_do_boxes_are_empty(desktop, native_id, &targets).await;
+            if let Some(flags) = cleared_verified.as_ref() {
+                let stubborn: Vec<usize> = flags
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, empty)| !**empty)
+                    .map(|(index, _)| index)
+                    .collect();
+                for index in &stubborn {
+                    let Some(target) = targets.get(*index) else {
+                        continue;
+                    };
+                    if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
+                        return Err(reason);
+                    }
+                    if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
+                        return Err(reason);
+                    }
+                }
+                if !stubborn.is_empty() {
+                    let after = web_do_boxes_are_empty(desktop, native_id, &targets).await;
+                    let still: Vec<usize> = after
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, empty)| !**empty)
+                        .map(|(index, _)| index)
+                        .collect();
+                    if !still.is_empty() {
+                        return Err(format!(
+                                "clear_failed (box(es) {still:?} of {total} still hold text after \
+                                 two clear attempts; typing now would merge old and new)",
+                            total = targets.len()
+                        ));
+                    }
+                }
             }
             // Type into the FIRST box; a segmented component auto-advances focus
             // itself, and driving that is the point of using real keys.
             if let Some(first) = targets.first()
-                && let Err(reason) = web_do_focus_selector(desktop, native_id, first).await
+                && let Err(reason) = web_do_focus_ref(desktop, native_id, first).await
             {
-                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                return Err(reason);
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -47819,31 +48492,282 @@ async fn web_surface_do_for(
                     // string, so "I sent the keys" is not an answer — `matched`
                     // is. Compared by LENGTH and equality page-side so the
                     // secret never crosses back out (F4 redaction).
-                    let matched = web_do_verify_field_value(
-                        desktop,
-                        native_id,
-                        targets.first().map(String::as_str),
-                        &text,
-                    )
-                    .await;
+                    // Segmented inputs are read back PER BOX. The old
+                    // single-selector comparison held the whole expected string
+                    // against one box and so could never express the merge it
+                    // existed to catch (N2).
+                    let matched_boxes = if selectors.is_empty() {
+                        None
+                    } else {
+                        web_do_verify_segmented_value(desktop, native_id, &targets, &text).await
+                    };
+                    let matched = match matched_boxes.as_ref() {
+                        Some(boxes) => Some(boxes.iter().all(|ok| *ok) && !boxes.is_empty()),
+                        None if selectors.is_empty() => {
+                            web_do_verify_field_value(desktop, native_id, targets.first(), &text)
+                                .await
+                        }
+                        // Segmented, but the boxes could not be read: unknown,
+                        // which is not the same as "no".
+                        None => None,
+                    };
                     Ok(json!({
                         "verb": "fill",
                         "chars": typed,
                         "cleared_fields": cleared,
                         "segmented": !selectors.is_empty(),
+                        // Which boxes were verified EMPTY before typing; `null`
+                        // when the page could not be read.
+                        "cleared_verified": cleared_verified,
                         // `null` = could not be read back (not a failure claim).
                         "matched": matched,
+                        // Names the wrong box instead of a bare false.
+                        "matched_boxes": matched_boxes,
                     }))
                 }
             }
         }
-    };
-    // Always read the recorder back, success or failure, so no page keeps a
-    // stray listener.
+    }
+}
+
+/// Arm the delivery recorder, perform ONE action, read the recorder back.
+///
+/// The arm/read must happen PER ACTION, not per request: `delivered` answers
+/// "did the page see THIS action", and a batch that armed once would report the
+/// first action's observation for all twenty. Reading it back on every path
+/// (success or failure) is also what guarantees no page keeps a stray listener.
+async fn web_do_execute_one(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    action: &WebSurfaceDoAction,
+) -> (Result<Value, String>, WebDoDelivery) {
+    let armed_doc = web_do_eval(
+        desktop,
+        native_id,
+        &web_do_observe_arm_script(web_do_observed_event_types(action)),
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let result = web_do_perform(desktop, native_id, action).await;
     let readback = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS)
         .await
         .ok();
     let delivery = web_do_delivery_from_readback(armed_doc.as_deref(), readback.as_ref());
+    (result, delivery)
+}
+
+/// Write the delivery observation onto a success detail. Pure.
+///
+/// `accepted` means "the injector ran"; `delivered` is what the PAGE saw. They
+/// are different questions, and conflating them is what let a
+/// silently-dropped-event regression pass for weeks — so `is_trusted` is an
+/// OBSERVATION, reported only when an event actually arrived.
+fn web_do_apply_delivery(detail: &mut Value, delivery: WebDoDelivery) {
+    let Some(obj) = detail.as_object_mut() else {
+        return;
+    };
+    match delivery {
+        WebDoDelivery::Delivered { trusted } => {
+            obj.insert("delivered".to_string(), Value::Bool(true));
+            obj.insert("is_trusted".to_string(), Value::Bool(trusted));
+        }
+        WebDoDelivery::NotDelivered => {
+            obj.insert("delivered".to_string(), Value::Bool(false));
+        }
+        WebDoDelivery::Unknown => {
+            obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
+        }
+    }
+}
+
+/// Resolve a session's live web surface and open an agent lane on it: the F3
+/// incarnation check, gate 9, and the slice-4.1c shadow write-lock gate, in that
+/// order. `Err` is the refusal to return to the caller verbatim.
+///
+/// Shared by `do` and `batch` so a batch cannot accidentally drive a surface
+/// under weaker gating than a single verb — the gate is the same code, run once
+/// per REQUEST, and a batch additionally re-checks seat input between actions.
+async fn web_do_open_lane(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    expected_generation: Option<u64>,
+    new_batch: bool,
+) -> Result<(String, WebSurfaceHandle), Value> {
+    let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return Err(json!({ "accepted": false, "reason": reason })),
+    };
+    // Check the incarnation BEFORE injecting anything (F3).
+    if let Some(mut stale) = web_surface_stale_handle(expected_generation, handle) {
+        if let Some(obj) = stale.as_object_mut() {
+            obj.insert("session_path".to_string(), Value::String(session));
+        }
+        return Err(stale);
+    }
+    // Human-preempt gate (acceptance gate 9): once real seat input lands on a
+    // surface, every agent batch that was driving it is cancelled and its later
+    // verbs are refused here — so a verb the agent planned before the user acted
+    // cannot land afterwards. Ordering/one-in-flight is NOT re-implemented: the
+    // app-control pump already drains one request at a time.
+    //
+    // `--new-batch`: the agent asserts it has re-observed the page, so this
+    // surface's lane is reopened. This is the ONLY reset an agent can reach —
+    // the batch id is per-GUI-process (`resolve_agent_identity` reads the GUI's
+    // own argv, so it is the same `"anonymous"` for every verb the GUI will
+    // ever serve), and `forget()` otherwise runs only when the surface closes
+    // or is rebuilt. Without it a single preempt is a permanent lockout rather
+    // than a yield.
+    //
+    // A reset is NOT immunity: the seat-input read happens BEFORE it, so a
+    // human gesture waiting when the batch opens refuses the batch. The ORDER
+    // (stale, seat, reset, admit) lives in `web_do_gate`, which is pure over
+    // the arbiter so it can be driven by a test.
+    let batch = agent_input_batch_for_current_agent();
+    let surface_key =
+        crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
+    if new_batch && let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "agent_input",
+            "batch_reset",
+            json!({
+                "session_path": session,
+                "batch_id": batch.batch_id,
+                "generation": handle.generation,
+            }),
+        );
+    }
+    // Did the human touch this surface since the last verb? The webview layer
+    // counts real seat input (clicks/keys/scrolls) and excludes our own
+    // injections, so a non-zero count is unambiguously the user.
+    let seat_input = desktop.take_web_surface_seat_input(handle.native_id);
+    let (decision, preempt_report) = web_do_gate(
+        seat_input,
+        new_batch,
+        &mut agent_input_arbiter_lock(),
+        &surface_key,
+        &batch,
+        handle.generation,
+    );
+    journal_web_surface_preempt(
+        &session,
+        handle.generation,
+        &preempt_report,
+        "human_input",
+        None,
+    );
+    // A page's JS dialog is answered for it at the webview layer (otherwise an
+    // invisible surface blocks its whole web process forever). The question
+    // itself would then be lost, so record it here — the agent driving this
+    // surface is exactly who needs to know the page asked.
+    for dialog in desktop.take_web_surface_script_dialogs() {
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "web_surface",
+                "script_dialog_answered",
+                json!({
+                    "session_path": session,
+                    "native_id": dialog.surface_id,
+                    "kind": dialog.kind,
+                    "answered": dialog.answered,
+                    "uri": dialog.uri,
+                    "message": dialog.message,
+                }),
+            );
+        }
+    }
+    if decision == GateDecision::Preempted {
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "agent_input",
+                crate::agent_input_arbiter::PREEMPTED,
+                json!({
+                    "session_path": session,
+                    "batch_id": batch.batch_id,
+                    "generation": handle.generation,
+                }),
+            );
+        }
+        return Err(json!({
+            "accepted": false,
+            "reason": crate::agent_input_arbiter::PREEMPTED,
+            "session_path": session,
+            "detail": "the user took this surface; start a new batch after re-observing",
+        }));
+    }
+    if decision == GateDecision::StaleSurface {
+        return Err(json!({
+            "accepted": false,
+            "reason": "stale_handle",
+            "session_path": session,
+            "detail": "the surface was rebuilt since this verb was planned; re-observe it",
+        }));
+    }
+    // Slice 4.1c — Shadow write-lock preempt gate. A Shadow view client must not
+    // inject into a profile whose daemon-owned write-lock it no longer holds:
+    // once the user's Active GUI preempts it (4.1a), the shadow's still-open
+    // jar-backed WebContext must stop taking agent-driven writes, or two clients
+    // write one jar. ONLY Shadows check — an Active client holds the lock by
+    // construction, or drives its own ephemeral read-only surface (4.1b), so the
+    // user's GUI never pays this round-trip. An ephemeral profile has its own
+    // in-memory context and no shared jar to fight over, so it is exempt. Fail
+    // CLOSED: a Shadow that cannot confirm it holds the lock refuses, matching
+    // the daemon's shadow-fails-closed doctrine (D7).
+    {
+        let identity = yggterm_server::current_client_identity();
+        if identity.role == yggterm_server::ClientRole::Shadow
+            && let Some(profile) = web_surface_active_profile(state, &session)
+            && !yggterm_core::web_profile::web_profile_is_ephemeral(&normalize_web_surface_profile(
+                Some(profile.as_str()),
+            ))
+        {
+            let holder_id = identity
+                .client_id
+                .clone()
+                .unwrap_or_else(|| format!("anonymous:{}", std::process::id()));
+            let endpoint = state.peek().bootstrap.server_endpoint.clone();
+            let holds = match yggterm_server::profile_write_lock_report(&endpoint) {
+                Ok(report) => write_lock_report_holds(&report, &profile, &holder_id),
+                // Cannot verify => do not write someone else's jar (fail closed).
+                Err(_) => false,
+            };
+            if !holds {
+                note_write_lock_preempt_on_web_surface(&session, handle.generation, &profile);
+                return Err(json!({
+                    "accepted": false,
+                    "reason": crate::agent_input_arbiter::PREEMPTED,
+                    "session_path": session,
+                    "detail": "the profile write-lock was preempted by an Active client; this shadow may not write the jar until it re-acquires",
+                }));
+            }
+        }
+    }
+    Ok((session, handle))
+}
+
+async fn web_surface_do_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    action: &WebSurfaceDoAction,
+    expected_generation: Option<u64>,
+    new_batch: bool,
+) -> Value {
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, new_batch).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    // Arm, inject, read the recorder back — one action.
+    let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
     match result {
         Ok(mut detail) => {
             if let Some(obj) = detail.as_object_mut() {
@@ -47853,33 +48777,1493 @@ async fn web_surface_do_for(
                 // Always report the incarnation acted on, so the next verb can
                 // pin it with --generation without a separate lookup.
                 obj.insert("generation".to_string(), json!(handle.generation));
-                // `accepted` means "the injector ran"; `delivered` is what the
-                // PAGE saw. They are different questions, and conflating them
-                // is what let a silently-dropped-event regression pass for
-                // weeks — so `is_trusted` is now an OBSERVATION, reported only
-                // when an event actually arrived.
-                match delivery {
-                    WebDoDelivery::Delivered { trusted } => {
-                        obj.insert("delivered".to_string(), Value::Bool(true));
-                        obj.insert("is_trusted".to_string(), Value::Bool(trusted));
-                    }
-                    WebDoDelivery::NotDelivered => {
-                        obj.insert("delivered".to_string(), Value::Bool(false));
-                    }
-                    WebDoDelivery::Unknown => {
-                        obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
-                    }
-                }
             }
+            web_do_apply_delivery(&mut detail, delivery);
             detail
         }
         Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
 }
 
+/// The bookkeeping of ONE `web batch` run: the mid-batch human-abort decision
+/// and the envelope's counts, extracted from `web_surface_batch_for` so both
+/// are drivable with no webview.
+///
+/// Why it is a struct rather than three locals in the loop: the abort decision
+/// (`index > 0 && seat_input > 0`) is the single behaviour that makes it safe to
+/// hand an agent N injections behind one gate, and while it lived inline it had
+/// NO coverage — the batch tests all drove `web_do_gate`, which the loop never
+/// calls. Now the loop is a thin driver over this, and a test feeds it the REAL
+/// seat-input accounting from the engine.
+#[derive(Debug)]
+struct WebBatchTally {
+    total: usize,
+    stop_on_error: bool,
+    results: Vec<Value>,
+    succeeded: usize,
+    failed: usize,
+    aborted_at: Option<usize>,
+    abort_reason: Option<&'static str>,
+}
+
+/// What the tally says to do with the action at `index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchStep {
+    /// Run it.
+    Run,
+    /// The human took the surface; the batch stops HERE and this action does
+    /// not run. `remaining` is what the agent planned and will not get.
+    AbortPreempted { remaining: usize },
+}
+
+impl WebBatchTally {
+    fn new(total: usize, stop_on_error: bool) -> Self {
+        Self {
+            total,
+            stop_on_error,
+            results: Vec::with_capacity(total),
+            succeeded: 0,
+            failed: 0,
+            aborted_at: None,
+            abort_reason: None,
+        }
+    }
+
+    /// Called BEFORE each action with the seat-input count consumed for it.
+    ///
+    /// Index 0 is exempt because the gate that opened the lane already consumed
+    /// (and judged) the count for it — asking twice would re-read a counter
+    /// that is by then always zero. From index 1 on, a non-zero count is
+    /// unambiguously the user: the injector's own events are excluded at the
+    /// webview layer by the injection credits.
+    fn step(&mut self, index: usize, seat_input_count: u64) -> BatchStep {
+        if index > 0 && seat_input_count > 0 {
+            let remaining = self.total.saturating_sub(index);
+            self.aborted_at = Some(index);
+            self.abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
+            return BatchStep::AbortPreempted { remaining };
+        }
+        BatchStep::Run
+    }
+
+    fn record_ok(&mut self, index: usize, mut detail: Value) {
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert("index".to_string(), json!(index));
+            obj.insert("accepted".to_string(), Value::Bool(true));
+        }
+        self.results.push(detail);
+        self.succeeded += 1;
+    }
+
+    /// Record a FAILED action. Returns whether the batch keeps going.
+    ///
+    /// A failure is counted as failed and never as progress — the defect this
+    /// replaces incremented one `completed` counter on both arms, so a 31-field
+    /// fill in which all 31 selectors missed answered
+    /// `accepted: true, completed: 31` and an agent reading the envelope
+    /// concluded the form was filled.
+    fn record_err(&mut self, index: usize, reason: impl serde::Serialize) -> bool {
+        self.results.push(json!({
+            "index": index,
+            "accepted": false,
+            "reason": reason,
+        }));
+        self.failed += 1;
+        if self.stop_on_error {
+            self.aborted_at = Some(index);
+            self.abort_reason = Some("action_failed");
+            return false;
+        }
+        true
+    }
+
+    /// `accepted` for the WHOLE batch: the batch ran to the end AND every
+    /// action it attempted succeeded.
+    ///
+    /// Deliberately strict. `accepted` is the one field a caller that does not
+    /// walk `actions[]` will read, so it must never be true for a run that
+    /// delivered nothing. A partial success is `accepted: false` with
+    /// `succeeded`/`failed` telling the caller exactly how far it got.
+    fn accepted(&self) -> bool {
+        self.aborted_at.is_none() && self.failed == 0
+    }
+
+    /// How many actions actually ran (succeeded + failed). Never the same
+    /// number as `succeeded` unless nothing failed — that conflation was the
+    /// defect.
+    fn attempted(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    fn envelope(self, session: String, native_id: u64, generation: u64) -> Value {
+        json!({
+            "accepted": self.accepted(),
+            "session_path": session,
+            "native_id": native_id,
+            "generation": generation,
+            "requested": self.total,
+            // The three counts are separate on purpose: `attempted` is how far
+            // the loop got, `succeeded`/`failed` is what came of it.
+            "attempted": self.attempted(),
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "actions": self.results,
+            // `null` when the whole batch ran. An index names the action the
+            // batch stopped AT (that action did not run when the reason is
+            // `preempted`).
+            "aborted_at": self.aborted_at,
+            "abort_reason": self.abort_reason,
+        })
+    }
+}
+
+/// App-control `batch`: ONE explicitly-opened agent batch, N actions, closed by
+/// the agent finishing or by GENUINE seat input.
+///
+/// Why it exists: a `do` verb is one app-control round trip, and a form with 31
+/// fields is 31 of them — each paying resolve + gate + arm + read, each a
+/// separate opportunity for the lane to be closed under it. The batch resolves
+/// the handle and opens the lane ONCE, then repeats exactly the per-action unit
+/// a single `do` runs (`web_do_execute_one`), so a batched action and a lone
+/// action can never behave differently.
+///
+/// What a batch does NOT buy the agent: immunity, at either end. The gate that
+/// opens the lane reads seat input BEFORE the reset, so a click that landed
+/// before the batch started refuses it outright rather than being absorbed by
+/// the reset this verb performs on the agent's behalf. And between every later
+/// action the surface's seat-input counter is re-read, and a non-zero count
+/// ABORTS the remainder and journals `preempted` with `trigger: "human_input"`
+/// and `remaining: n`. The human wins at the batch's start AND mid-run, not
+/// merely at the next CLI invocation — which is the whole reason it is safe to
+/// hand an agent twenty injections behind one gate.
+///
+/// The envelope is strict about what it delivered: `accepted` is true only when
+/// the batch ran to the end AND every action succeeded. See
+/// [`WebBatchTally::accepted`].
+async fn web_surface_batch_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    actions: &[WebSurfaceDoAction],
+    expected_generation: Option<u64>,
+    stop_on_error: bool,
+) -> Value {
+    if actions.is_empty() {
+        return json!({
+            "accepted": false,
+            "reason": "empty_batch",
+            "detail": "a batch needs at least one action",
+        });
+    }
+    // A batch is by definition a fresh run of agent work, so it opens its own
+    // lane — the same assertion `--new-batch` makes for a single verb. That
+    // reset does NOT outrank the seat: `web_do_gate` reads seat input first, so
+    // a gesture waiting here refuses the batch.
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, true).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    let mut tally = WebBatchTally::new(actions.len(), stop_on_error);
+
+    for (index, action) in actions.iter().enumerate() {
+        // Re-read seat input BEFORE each action after the first. The counter is
+        // consumed by the read, and the injector's own events are excluded at
+        // the webview layer by the injection credits, so a non-zero count here
+        // is unambiguously the user. The DECISION lives in `WebBatchTally::step`
+        // so it can be driven by a test against the real accounting.
+        let seat_input = if index > 0 {
+            desktop.take_web_surface_seat_input(native_id)
+        } else {
+            0
+        };
+        if let BatchStep::AbortPreempted { remaining } = tally.step(index, seat_input) {
+            let report = note_human_input_on_web_surface(&session, handle.generation);
+            journal_web_surface_preempt(
+                &session,
+                handle.generation,
+                &report,
+                "human_input",
+                Some(remaining),
+            );
+            break;
+        }
+        let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
+        match result {
+            Ok(mut detail) => {
+                web_do_apply_delivery(&mut detail, delivery);
+                tally.record_ok(index, detail);
+            }
+            Err(reason) => {
+                if !tally.record_err(index, reason) {
+                    break;
+                }
+            }
+        }
+    }
+    tally.envelope(session, native_id, handle.generation)
+}
+
 #[cfg(test)]
 mod web_do_verb_tests {
     use super::*;
+
+    fn resolved_info(overrides: Value) -> Value {
+        let mut base = json!({
+            "found": true,
+            "x": 120.0,
+            "y": 240.0,
+            "w": 80.0,
+            "h": 32.0,
+            "onTarget": true,
+            "visible": true,
+            "isConnected": true,
+            "cssPath": "#pay > button:nth-of-type(2)",
+            "tag": "BUTTON",
+        });
+        let (Some(base_obj), Some(over)) = (base.as_object_mut(), overrides.as_object()) else {
+            return base;
+        };
+        for (key, value) in over {
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base
+    }
+
+    // N2 THE LOCK. Fed the literal measured case: an OTP typed over a previous
+    // one produced `278344` where `292244` was intended — a MERGE of old and
+    // new digits — and the readback boolean still said fine, because it
+    // compared the whole 6-character string against box 0, which holds one
+    // character. The rule below cannot express that failure wrongly: it names
+    // the boxes.
+    #[test]
+    fn segmented_readback_reports_a_merge_as_failure() {
+        let good: Vec<Option<String>> = ["2", "9", "2", "2", "4", "4"]
+            .iter()
+            .map(|c| Some((*c).to_string()))
+            .collect();
+        assert_eq!(segmented_match("292244", &good), (true, vec![true; 6]));
+
+        // The recorded merge: 292244 typed over 278347 landed as 278344.
+        let merged: Vec<Option<String>> = ["2", "7", "8", "3", "4", "4"]
+            .iter()
+            .map(|c| Some((*c).to_string()))
+            .collect();
+        let (ok, per_box) = segmented_match("292244", &merged);
+        assert!(!ok, "a merge must read as failure");
+        assert_eq!(per_box, vec![true, false, false, false, true, true]);
+        let wrong: Vec<usize> = per_box
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| !**ok)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(wrong, vec![1, 2, 3], "the wrong boxes must be nameable");
+
+        // A box that could not be read is not "right".
+        let unread = vec![
+            Some("2".to_string()),
+            None,
+            Some("2".to_string()),
+            Some("2".to_string()),
+            Some("4".to_string()),
+            Some("4".to_string()),
+        ];
+        assert_eq!(segmented_match("292244", &unread).0, false);
+    }
+
+    // Chunking has ONE owner, and the last box absorbs the remainder — so a
+    // widget with fewer boxes than characters still gets a complete
+    // expectation instead of silently ignoring the tail.
+    #[test]
+    fn segmented_expectation_puts_the_remainder_in_the_last_box() {
+        assert_eq!(
+            segmented_expectation("292244", 6),
+            vec!["2", "9", "2", "2", "4", "4"]
+        );
+        assert_eq!(segmented_expectation("292244", 4), vec!["2", "9", "2", "244"]);
+        // One box means the whole string, so `--selector x` and
+        // `--selector-set x` ask the same question.
+        assert_eq!(segmented_expectation("292244", 1), vec!["292244"]);
+        assert!(segmented_expectation("292244", 0).is_empty());
+        // Fewer characters than boxes: the empty boxes expect emptiness.
+        assert_eq!(segmented_expectation("29", 4), vec!["2", "9", "", ""]);
+    }
+
+    // The readback must look at the SAME boxes the fill wrote to — one array,
+    // built from the shared matcher.
+    #[test]
+    fn segmented_readback_addresses_every_box_through_the_shared_matcher() {
+        let targets = vec![
+            WebElementRef::Css("#a".into()),
+            WebElementRef::Css("#b".into()),
+        ];
+        let js = web_do_refs_array_js(&targets);
+        assert_eq!(
+            js,
+            "[document.querySelector(\"#a\"),document.querySelector(\"#b\")]"
+        );
+        assert!(web_do_refs_array_js(&[]).is_empty() || web_do_refs_array_js(&[]) == "[]");
+    }
+
+    // THE BATCH LOCK, gate half. Twenty sequential verbs under the ONE agent
+    // identity production is actually stuck with — `resolve_agent_identity`
+    // reads the GUI process's own argv, so every verb that GUI will ever serve
+    // carries `"anonymous"` — must every one of them be admitted.
+    //
+    // This is the exact shape of the single-shot `do` defect: verb 1 landed and
+    // verbs 2..N were all refused `preempted`, because the agent's own
+    // injection was booked as the human and a per-process batch id, once
+    // preempted, is refused forever.
+    //
+    // IT DRIVES THE REAL SEAT COUNT. An earlier version of this test passed a
+    // literal `0` to the gate, which SYNTHESIZED THE DEFECT AWAY — the whole
+    // bug was that the number arriving at the gate was 1 — so it asserted only
+    // that `admit` is idempotent, and it passed with the engine fix fully
+    // reverted. Here each iteration performs the injection the way production
+    // does (`grant_injection_credits` + the observer's `note_seat_input`) and
+    // the gate is fed whatever `take_seat_input_count` ACTUALLY produces.
+    // Revert `spend_injection_credit` (web_surface.rs) to `false` and this
+    // fails at iteration 0.
+    #[test]
+    fn twenty_sequential_verbs_all_admit_under_the_id_production_is_stuck_with() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        // The seat-input tally is keyed by native surface id and is
+        // thread-local, so a test thread owns its own.
+        let native_id = 91_001;
+        take_seat_input_count(native_id);
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        for iteration in 0..20 {
+            // The verb injects one event, and the observer sees it AFTER the
+            // lexical delivery scope closed — the queued-delivery shape that
+            // produced the bug. The credit is what must absorb it.
+            grant_injection_credits(native_id, 1);
+            note_seat_input(native_id);
+
+            let seat_input = take_seat_input_count(native_id);
+            let (decision, report) = web_do_gate(
+                seat_input,
+                iteration == 0,
+                &mut arbiter,
+                &surface,
+                &batch,
+                surface.generation,
+            );
+            assert_eq!(
+                decision,
+                GateDecision::Allowed,
+                "verb {iteration} of a batch was refused with seat_input={seat_input}"
+            );
+            assert!(report.is_empty(), "verb {iteration} invented a preemption");
+        }
+        assert!(
+            !arbiter.is_preempted(&surface, "anonymous"),
+            "a clean run must not leave the lane preempted"
+        );
+
+        // …and the human is still heard after all that throughput.
+        note_seat_input(native_id);
+        let seat_input = take_seat_input_count(native_id);
+        assert_eq!(seat_input, 1, "a real gesture after 20 injections must count");
+        assert_eq!(
+            web_do_gate(
+                seat_input,
+                false,
+                &mut arbiter,
+                &surface,
+                &batch,
+                surface.generation
+            )
+            .0,
+            GateDecision::Preempted
+        );
+    }
+
+    // THE BATCH LOCK, LOOP half — the one that was missing entirely.
+    //
+    // Every C7 test drove `web_do_gate`, which the batch loop never calls. The
+    // decision that actually makes it safe to hand an agent twenty injections
+    // behind one gate is the loop's per-action re-read, and it had NO coverage.
+    // This drives `WebBatchTally::step` with the REAL engine accounting, one
+    // injection per action, exactly as `web_surface_batch_for` does.
+    //
+    // Revert `spend_injection_credit` to `false` and action 1 aborts, because
+    // action 0's own injection is read back as the human.
+    #[test]
+    fn a_batch_of_twenty_injections_never_aborts_itself() {
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        let native_id = 91_002;
+        take_seat_input_count(native_id);
+        let mut tally = WebBatchTally::new(20, false);
+
+        for index in 0..20 {
+            // Index 0's count was consumed by the gate that opened the lane;
+            // from 1 on the loop re-reads before each action.
+            let seat_input = if index > 0 {
+                take_seat_input_count(native_id)
+            } else {
+                0
+            };
+            assert_eq!(
+                tally.step(index, seat_input),
+                BatchStep::Run,
+                "action {index} aborted itself with seat_input={seat_input}"
+            );
+            grant_injection_credits(native_id, 1);
+            note_seat_input(native_id);
+            tally.record_ok(index, json!({"delivered": true}));
+        }
+
+        let envelope = tally.envelope("web://session-a".to_string(), native_id, 7);
+        assert_eq!(envelope["accepted"], json!(true));
+        assert_eq!(envelope["requested"], json!(20));
+        assert_eq!(envelope["succeeded"], json!(20));
+        assert_eq!(envelope["failed"], json!(0));
+        assert_eq!(envelope["aborted_at"], Value::Null);
+    }
+
+    // …and the other half of the same loop: ONE real click mid-run stops the
+    // rest. This is the promise `web batch` is sold on ("the human still wins
+    // mid-batch"), and it is asserted here against the real accounting rather
+    // than against a hand-written count.
+    #[test]
+    fn a_real_click_mid_batch_aborts_the_remainder() {
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        let native_id = 91_003;
+        take_seat_input_count(native_id);
+        let mut tally = WebBatchTally::new(20, false);
+        let mut aborted = None;
+
+        for index in 0..20 {
+            if index == 7 {
+                // The user clicks. No credit is granted for it, which is the
+                // ONLY thing that distinguishes it from our own injections.
+                note_seat_input(native_id);
+            }
+            let seat_input = if index > 0 {
+                take_seat_input_count(native_id)
+            } else {
+                0
+            };
+            match tally.step(index, seat_input) {
+                BatchStep::Run => {
+                    grant_injection_credits(native_id, 1);
+                    note_seat_input(native_id);
+                    tally.record_ok(index, json!({"delivered": true}));
+                }
+                BatchStep::AbortPreempted { remaining } => {
+                    aborted = Some((index, remaining));
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            aborted,
+            Some((7, 13)),
+            "the click must stop the batch AT action 7, with 13 unrun"
+        );
+        let envelope = tally.envelope("web://session-a".to_string(), native_id, 7);
+        assert_eq!(envelope["accepted"], json!(false));
+        assert_eq!(envelope["aborted_at"], json!(7));
+        assert_eq!(envelope["abort_reason"], json!("preempted"));
+        assert_eq!(
+            envelope["succeeded"],
+            json!(7),
+            "the seven that ran before the click still count"
+        );
+        assert_eq!(envelope["attempted"], json!(7));
+    }
+
+    // F4: a batch whose actions ALL failed is not a batch that succeeded.
+    //
+    // With the documented default `stop_on_error: false`, a 31-field form fill
+    // in which every selector missed used to answer
+    // `accepted: true, completed: 31` — one counter incremented on both arms —
+    // so an agent reading the envelope concluded the form was filled.
+    #[test]
+    fn a_batch_reports_succeeded_and_failed_apart_and_is_not_accepted_when_nothing_landed() {
+        let mut tally = WebBatchTally::new(31, false);
+        for index in 0..31 {
+            assert_eq!(tally.step(index, 0), BatchStep::Run);
+            assert!(
+                tally.record_err(index, json!("no_such_element")),
+                "stop_on_error:false keeps going"
+            );
+        }
+        let envelope = tally.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(
+            envelope["accepted"],
+            json!(false),
+            "31 misses must never read as a filled form"
+        );
+        assert_eq!(envelope["requested"], json!(31));
+        assert_eq!(envelope["attempted"], json!(31));
+        assert_eq!(envelope["succeeded"], json!(0));
+        assert_eq!(envelope["failed"], json!(31));
+        // It ran to the end, so it was not aborted — `accepted` is NOT a
+        // synonym for "not aborted", which is exactly the conflation fixed.
+        assert_eq!(envelope["aborted_at"], Value::Null);
+
+        // A partial batch is also not `accepted`, and says how far it got.
+        let mut partial = WebBatchTally::new(3, false);
+        partial.step(0, 0);
+        partial.record_ok(0, json!({}));
+        partial.step(1, 0);
+        partial.record_err(1, json!("no_such_element"));
+        partial.step(2, 0);
+        partial.record_ok(2, json!({}));
+        let envelope = partial.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(envelope["accepted"], json!(false));
+        assert_eq!(envelope["succeeded"], json!(2));
+        assert_eq!(envelope["failed"], json!(1));
+        assert_eq!(envelope["attempted"], json!(3));
+
+        // `stop_on_error: true` still stops, and names why.
+        let mut halting = WebBatchTally::new(3, true);
+        halting.step(0, 0);
+        halting.record_ok(0, json!({}));
+        halting.step(1, 0);
+        assert!(
+            !halting.record_err(1, json!("no_such_element")),
+            "stop_on_error:true must halt the loop"
+        );
+        let envelope = halting.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(envelope["aborted_at"], json!(1));
+        assert_eq!(envelope["abort_reason"], json!("action_failed"));
+        assert_eq!(envelope["attempted"], json!(2));
+        assert_eq!(envelope["accepted"], json!(false));
+    }
+
+    // The other side of the same gate: the human still wins, mid-run, and the
+    // rest of the batch is refused from that point on.
+    #[test]
+    fn real_seat_input_mid_run_preempts_the_rest_of_the_batch() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        // The user clicks.
+        let (decision, report) = web_do_gate(1, false, &mut arbiter, &surface, &batch, 7);
+        assert_eq!(decision, GateDecision::Preempted);
+        assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
+        // …and stays preempted until the agent re-observes.
+        assert_eq!(
+            web_do_gate(0, false, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Preempted
+        );
+        // `--new-batch` (and a batch verb, which always opens one) is the reset.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+    }
+
+    // THE ORDER inside the gate, pinned: stale, then THE SEAT READ, then the
+    // reset, then admit.
+    //
+    // This test previously asserted the opposite — that a count arriving with a
+    // reset is "absorbed" as the agent's own leftover — and that expectation
+    // was the bug. Nothing absorbs a real gesture: with the injection credits
+    // in place, a non-zero count is unambiguously the human, so there is no
+    // leftover to forgive. And `web batch` sets the reset flag on the agent's
+    // OWN behalf, which made the reset-first order a hole exactly where it
+    // mattered most: the highest-privilege verb on the plane was the one verb
+    // that could never be preempted at its own start. A click landing between
+    // the agent's last verb and its batch was consumed and discarded, and all
+    // N injections ran.
+    //
+    // Revert `web_do_gate` to reset-before-read and this fails.
+    #[test]
+    fn a_reset_never_absorbs_a_gesture_that_arrived_before_it() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        // The agent has been driving this surface, so its batch is ACTIVE.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        // The user clicks, and the agent's very next verb is a `web batch` —
+        // which sets the reset flag on its own behalf. It is REFUSED, and it
+        // says which batch the gesture cancelled.
+        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
+        assert_eq!(
+            decision,
+            GateDecision::Preempted,
+            "a batch must not open over the user's click"
+        );
+        assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
+        // The refusal CONSUMED that count (production reads the counter once
+        // per verb), so re-observing and asking again gets the lane back. One
+        // refusal is the whole cost.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        // …and the next real gesture still wins.
+        assert_eq!(
+            web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Preempted
+        );
+    }
+
+    // The same rule on a surface NO agent has driven yet. `note_human_input`
+    // has no lane to cancel there and reports nothing, so if the refusal were
+    // keyed on the report the gesture would vanish — which is precisely what
+    // `forget()`-before-read did to every `web batch`. It is keyed on the
+    // COUNT.
+    #[test]
+    fn a_gesture_on_a_surface_with_no_lane_yet_still_refuses_the_batch() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
+        assert_eq!(decision, GateDecision::Preempted);
+        assert!(
+            report.is_empty(),
+            "nothing was driving the surface, so nothing was cancelled — but the verb is still refused"
+        );
+        // With the count consumed, the batch opens.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+    }
+
+    // A verb aimed at an incarnation that no longer exists is refused, not
+    // silently retargeted at whatever page is there now (F3).
+    #[test]
+    fn a_gate_on_a_rebuilt_surface_reports_stale_rather_than_admitting() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+        assert_eq!(
+            web_do_gate(0, false, &mut arbiter, &surface, &batch, 9).0,
+            GateDecision::StaleSurface
+        );
+    }
+
+    // C6: the field name → vault CLI mapping, whitelisted and testable without
+    // a vault. `totp` is its own subcommand rather than a field of `get`, and
+    // that is the ONE place that knows it.
+    #[test]
+    fn vault_field_args_map_each_named_field_to_one_cli_call() {
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "password", None).unwrap(),
+            vec!["get", "sbi", "--field", "password"]
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "PassWord", Some("avi")).unwrap(),
+            vec!["get", "sbi", "--field", "password", "avi"],
+            "field names are normalised, and --user is a positional disambiguator"
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "totp", None).unwrap(),
+            vec!["totp", "sbi"],
+            "totp is a subcommand, not a field of get"
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Card, "hdfc", "number", None).unwrap(),
+            vec!["card", "hdfc", "--field", "number"]
+        );
+        // An empty --user must not become a positional argument.
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "password", Some("")).unwrap(),
+            vec!["get", "sbi", "--field", "password"]
+        );
+    }
+
+    // A field this verb does not understand is refused BEFORE the surface is
+    // touched, and the message names what is allowed — the alternative is an
+    // opaque vault CLI error blamed on the page.
+    #[test]
+    fn an_unknown_vault_field_is_refused_with_the_allowed_set() {
+        let err = vault_field_args(VaultFieldSource::Login, "sbi", "cvv", None).unwrap_err();
+        assert!(err.contains("cvv"), "{err}");
+        assert!(err.contains("password"), "{err}");
+        // Card fields are not login fields and vice versa.
+        assert!(vault_field_args(VaultFieldSource::Card, "hdfc", "password", None).is_err());
+        assert!(vault_field_args(VaultFieldSource::Login, "sbi", "number", None).is_err());
+    }
+
+    // `fill-card` is blocked on ychrome-vault growing a `card` op. The
+    // classifier must recognise "that subcommand does not exist" and NOTHING
+    // else: mislabelling a locked vault as `vault_cli_no_card_op` would send an
+    // agent off debugging a CLI that is working fine.
+    #[test]
+    fn a_missing_card_op_is_distinguished_from_a_real_vault_failure() {
+        assert!(vault_failure_is_missing_subcommand(
+            "ychrome-vault card: error: unrecognized subcommand 'card'"
+        ));
+        assert!(vault_failure_is_missing_subcommand(
+            "error: unexpected argument 'card' found"
+        ));
+        assert!(!vault_failure_is_missing_subcommand(
+            "vault locked: run `ychrome-vault unlock` in a terminal first"
+        ));
+        assert!(!vault_failure_is_missing_subcommand(
+            "ychrome-vault card: no item named hdfc"
+        ));
+    }
+
+    // `ychrome-vault` prints its ERRORS to stdout, so a caller that captured
+    // stdout could capture `Error: … has no username` AS the credential and
+    // type it into a bank login. The exit-status check in `vault_cli_output` is
+    // why yggterm is safe today; this is the belt to that braces.
+    #[test]
+    fn an_error_string_is_never_typed_as_a_secret() {
+        assert_eq!(
+            vault_secret_is_unusable("Error: sbi has no username"),
+            Some("vault_returned_an_error_as_the_value")
+        );
+        assert_eq!(vault_secret_is_unusable(""), Some("vault_field_empty"));
+        // A real secret that merely CONTAINS the word is fine — the check is
+        // anchored, not a substring search.
+        assert_eq!(vault_secret_is_unusable("my-Error:-password"), None);
+        assert_eq!(vault_secret_is_unusable("hunter2"), None);
+    }
+
+    // THE C5 BUG, pinned. The poll loop used to RETURN on any eval error, so a
+    // navigation commit — which tears down and rebuilds the content process —
+    // killed the wait. That is precisely the situation `wait` exists for.
+    #[test]
+    fn an_eval_failure_is_not_yet_rather_than_the_end_of_the_wait() {
+        let failure: Result<Value, String> =
+            Err("eval callback dropped (surface destroyed mid-do?)".to_string());
+        assert_eq!(
+            wait_poll_outcome(&failure, None),
+            WaitStep::NotYet { eval_error: true },
+            "a navigation must not abort a wait"
+        );
+        // …and it is counted, so a wait that spent its whole budget failing is
+        // legible rather than looking like a quiet timeout.
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(false)), None),
+            WaitStep::NotYet { eval_error: false }
+        );
+        assert_eq!(wait_poll_outcome(&Ok(json!(true)), None), WaitStep::Met);
+        // `idle` returns a duration, not a boolean.
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(300.0)), Some(500)),
+            WaitStep::NotYet { eval_error: false }
+        );
+        assert_eq!(wait_poll_outcome(&Ok(json!(500.0)), Some(500)), WaitStep::Met);
+        // A non-numeric answer to an idle probe is not-yet, never "met".
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(true)), Some(500)),
+            WaitStep::NotYet { eval_error: false }
+        );
+    }
+
+    // `url:matches` against the recorded 4-hop chain: the predicate must be
+    // able to name the hop the caller is waiting for, and must NOT match the
+    // hops before it. Plain strings, no browser.
+    #[test]
+    fn url_matches_names_a_hop_of_the_recorded_redirect_chain() {
+        let chain = [
+            "https://rtionline.gov.in/request/request.php",
+            "https://merchant.sbi.bank.in/merchant/initpay",
+            "https://www.billdesk.com/pgidsk/pgmerc/sbiepay",
+            "https://pay.billdesk.com/web/v1_2/payments",
+            "https://auth.examplebank.test/netbanking/login",
+        ];
+        let probe = web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+            pattern: r"^https://auth\.examplebank\.bank\.in/".to_string(),
+        })
+        .expect("a valid pattern compiles");
+        let WaitProbe::Url { pattern } = probe else {
+            panic!("url:matches must be observed host-side, with no page eval");
+        };
+        for hop in &chain[..4] {
+            assert!(!pattern.is_match(hop), "matched too early on {hop}");
+        }
+        assert!(pattern.is_match(chain[4]));
+    }
+
+    // A bad pattern is refused UP FRONT, once — not rediscovered on every 100ms
+    // tick and finally reported as a timeout.
+    #[test]
+    fn a_bad_regex_is_refused_before_the_poll_loop_starts() {
+        let err = web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+            pattern: "[unclosed".to_string(),
+        })
+        .expect_err("an invalid pattern must refuse");
+        assert!(err.starts_with("bad_regex"), "{err}");
+    }
+
+    // `settled` is two observers and one rule. Each observer alone can veto.
+    #[test]
+    fn settled_requires_a_still_url_a_finished_load_and_a_quiet_page() {
+        // Everything quiet for long enough.
+        assert!(wait_settled_met(false, false, Some(900.0), 500));
+        // The url moved under us: a page bouncing through redirects is never
+        // settled, however quiet each hop looks.
+        assert!(!wait_settled_met(true, false, Some(900.0), 500));
+        // Committed but still fetching.
+        assert!(!wait_settled_met(false, true, Some(900.0), 500));
+        // Loaded, but still rewriting itself.
+        assert!(!wait_settled_met(false, false, Some(100.0), 500));
+        // The page half is unavailable mid-navigation: not-yet, never a
+        // fabricated success from the host half alone.
+        assert!(!wait_settled_met(false, false, None, 500));
+    }
+
+    // Each predicate must be observed where it can actually be answered: the
+    // two that exist to survive a navigation must not carry a page script as
+    // their only observer.
+    #[test]
+    fn each_wait_predicate_is_observed_where_it_can_be_answered() {
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::LoadFinished).unwrap(),
+            WaitProbe::Page { .. }
+        ));
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+                pattern: "billdesk".into()
+            })
+            .unwrap(),
+            WaitProbe::Url { .. }
+        ));
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::Settled { ms: 800 }).unwrap(),
+            WaitProbe::Settled { ms: 800, .. }
+        ));
+        // `idle` and the page half of `settled` share ONE mutation observer.
+        let (WaitProbe::Page { script: idle, .. }, WaitProbe::Settled { script: settled, .. }) = (
+            web_wait_probe(&WebSurfaceWaitUntil::Idle { ms: 300 }).unwrap(),
+            web_wait_probe(&WebSurfaceWaitUntil::Settled { ms: 300 }).unwrap(),
+        ) else {
+            panic!("unexpected probe shapes");
+        };
+        assert_eq!(idle, settled, "two mutation clocks would answer differently");
+    }
+
+    // C2: the band arithmetic, testable with no image. Remainder columns go to
+    // the LAST band, so the bands always reassemble to the original width — a
+    // captcha whose width is not a multiple of its character count must not
+    // silently lose a column.
+    #[test]
+    fn split_bands_tile_the_width_exactly() {
+        assert_eq!(
+            split_png_bands(120, 6),
+            vec![(0, 20), (20, 20), (40, 20), (60, 20), (80, 20), (100, 20)]
+        );
+        // 121 / 6 = 20 remainder 1: the last band absorbs it.
+        let uneven = split_png_bands(121, 6);
+        assert_eq!(uneven.last(), Some(&(100, 21)));
+        let covered: usize = uneven.iter().map(|(_, w)| *w).sum();
+        assert_eq!(covered, 121, "bands must tile the whole image");
+        // Degenerate asks answer honestly instead of panicking.
+        assert!(split_png_bands(0, 6).is_empty());
+        assert!(split_png_bands(120, 0).is_empty());
+        // More bands than columns clamps rather than emitting zero-width bands.
+        assert_eq!(split_png_bands(3, 10).len(), 3);
+        assert!(split_png_bands(3, 10).iter().all(|(_, w)| *w > 0));
+    }
+
+    // Each band must carry the RIGHT columns of every row — an off-by-one in
+    // the row stride would produce plausible-looking garbage.
+    #[test]
+    fn split_bands_carry_the_right_columns() {
+        // 4x2 RGBA, each pixel's red channel = its column index.
+        let mut rgba = Vec::new();
+        for _row in 0..2 {
+            for col in 0..4u8 {
+                rgba.extend_from_slice(&[col, 0, 0, 255]);
+            }
+        }
+        let plan = split_png_bands(4, 2);
+        let bands = split_rgba_bands(&rgba, 4, 2, &plan);
+        assert_eq!(bands.len(), 2);
+        // Band 0 holds columns 0,1 on both rows; band 1 holds columns 2,3.
+        assert_eq!(
+            bands[0].iter().step_by(4).copied().collect::<Vec<u8>>(),
+            vec![0, 1, 0, 1]
+        );
+        assert_eq!(
+            bands[1].iter().step_by(4).copied().collect::<Vec<u8>>(),
+            vec![2, 3, 2, 3]
+        );
+    }
+
+    // The capture script must name each failure distinctly: they need different
+    // actions from the caller, and one generic `unsupported` would be a lie
+    // about all three.
+    #[test]
+    fn the_capture_script_names_each_failure_separately() {
+        let js = web_do_script_for_ref(WEB_CAPTURE_ELEMENT_JS, &WebElementRef::Css("img".into()));
+        assert!(!js.contains("__YGG_REF__"), "{js}");
+        for reason in [
+            "not_found",
+            "element_not_rasterizable",
+            "image_not_decoded",
+            "tainted_canvas",
+            "zero_sized_source",
+        ] {
+            assert!(js.contains(reason), "capture script never reports {reason}");
+        }
+        // Synchronous only — a Promise cannot ride an eval return.
+        assert!(!js.contains("await"), "{js}");
+        assert!(!js.contains("Promise"), "{js}");
+        assert!(js.contains("toDataURL"), "{js}");
+    }
+
+    // C1: the trace and the response name DOMAINS, never cookies. A jar is
+    // credentials, and a trace file is not where they belong.
+    #[test]
+    fn cookie_reporting_names_domains_and_never_values() {
+        use crate::netscape_cookie_jar::parse_netscape_jar;
+        let jar = "#HttpOnly_rtionline.gov.in\tFALSE\t/\tTRUE\t0\tPHPSESSID\tq7v2n8m4k1\n\
+                   .gov.in\tTRUE\t/\tFALSE\t0\tlang\ten-IN\n\
+                   rtionline.gov.in\tFALSE\t/\tTRUE\t0\tcsrf\tabc\n";
+        let specs = parse_netscape_jar(jar).unwrap();
+        let domains = cookie_domains(&specs);
+        // Deduplicated and sorted — a report a human can scan, and stable
+        // across runs.
+        assert_eq!(domains, vec![".gov.in", "rtionline.gov.in"]);
+        let rendered = serde_json::to_string(&domains).unwrap();
+        assert!(!rendered.contains("q7v2n8m4k1"), "a value reached the report");
+        assert!(!rendered.contains("PHPSESSID"), "a cookie name reached the report");
+    }
+
+    // C8 THE LOCK: one string used to cover two completely different problems.
+    // A script that returned a Promise and a webview whose content process is
+    // gone need OPPOSITE responses from the caller, and conflating them cost a
+    // field run ten minutes of debugging the wrong thing.
+    #[test]
+    fn eval_failures_are_told_apart_across_every_combination() {
+        use dioxus::desktop::EvalFailureKind as Kind;
+        // The script RAN and returned something unserializable. The page is
+        // healthy and the SCRIPT is wrong — true whether or not the surface
+        // later stopped answering, which is why this arm ignores liveness.
+        assert_eq!(
+            eval_failure_reason(Kind::UnsupportedResultType, true),
+            "js_result_unsupported"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::UnsupportedResultType, false),
+            "js_result_unsupported"
+        );
+        // A live page that threw is a script bug; a dead one is not.
+        assert_eq!(eval_failure_reason(Kind::ScriptException, true), "js_exception");
+        assert_eq!(
+            eval_failure_reason(Kind::ScriptException, false),
+            "webview_unreachable"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::InvalidParameter, true),
+            "js_invalid_parameter"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::EngineError, true),
+            "engine_error"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::EngineError, false),
+            "webview_unreachable"
+        );
+        // Every reason carries an actionable sentence, and the two that matter
+        // point in opposite directions.
+        assert!(eval_failure_detail("js_result_unsupported").contains("web await"));
+        assert!(eval_failure_detail("webview_unreachable").contains("web ensure"));
+    }
+
+    // N4: the retained declare's refusals must be distinguishable, because
+    // "relaunch the app" and "that url will never be opened here" are different
+    // instructions.
+    #[test]
+    fn a_declare_refusal_names_which_fact_failed() {
+        // No url at all.
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"title": "x"})).err(),
+            Some(DeclaredOpenRefusal::NoUrl)
+        );
+        // A refused scheme names the scheme.
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"url": "file:///home/user/.ssh/id_ed25519"}))
+                .err(),
+            Some(DeclaredOpenRefusal::SchemeRefused("file".into()))
+        );
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"url": "javascript:alert(1)"})).err(),
+            Some(DeclaredOpenRefusal::SchemeRefused("javascript".into()))
+        );
+        // …and the allowed ones still work, including the loopback fixture
+        // route the file:// refusal points people at.
+        assert!(
+            declared_web_surface_open_or_refusal(&json!({"url": "http://127.0.0.1:8000/f.html"}))
+                .is_ok()
+        );
+        assert!(
+            declared_web_surface_open_or_refusal(&json!({"url": "https://rtionline.gov.in/"}))
+                .is_ok()
+        );
+    }
+
+    // ⛔ THE GATE STAYS SHUT. This payload is retained by the daemon from bytes
+    // any process on the session's PTY can write, so widening the scheme
+    // allowlist here would let a crafted byte stream point a webview at a local
+    // secret that `web read --as text` then exfiltrates. If this test ever
+    // fails, do not "fix" it by relaxing the gate.
+    #[test]
+    fn a_retained_declare_can_never_open_a_local_file() {
+        for url in [
+            "file:///home/user/.ssh/id_ed25519",
+            "FILE:///etc/shadow",
+            "javascript:fetch('/x')",
+            "data:text/html,<script>1</script>",
+        ] {
+            assert!(
+                declared_web_surface_open_from_payload(&json!({ "url": url })).is_none(),
+                "{url} must never materialize from a PTY-authored declare"
+            );
+        }
+    }
+
+    // The five outcomes must be legible as stable reason strings AND as
+    // sentences a human can act on — an agent branches on the first, a person
+    // reads the second.
+    #[test]
+    fn every_declare_rebuild_outcome_says_what_to_do_next() {
+        let cases = [
+            (DeclareRebuild::Rebuilt, "rebuilt"),
+            (DeclareRebuild::NoDeclare, "no_declare"),
+            (DeclareRebuild::Stale { age_ms: 91_000 }, "declare_stale"),
+            (
+                DeclareRebuild::UrlRefused {
+                    scheme: "file".into(),
+                },
+                "declare_url_scheme_refused",
+            ),
+            (DeclareRebuild::NoUrl, "declare_without_url"),
+            (
+                DeclareRebuild::FetchFailed {
+                    error: "connection refused".into(),
+                },
+                "daemon_declare_unavailable",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (outcome, reason) in &cases {
+            assert_eq!(outcome.reason(), *reason);
+            assert!(seen.insert(*reason), "{reason} is not a distinct reason");
+            let detail = outcome.detail("local://abc");
+            assert!(detail.contains("local://abc"), "{detail}");
+        }
+        // Only ONE of them means a surface exists.
+        assert!(DeclareRebuild::Rebuilt.rebuilt());
+        assert!(!DeclareRebuild::NoDeclare.rebuilt());
+        assert!(!DeclareRebuild::FetchFailed { error: "x".into() }.rebuilt());
+        // The two whose action is least obvious must SAY the action.
+        assert!(
+            DeclareRebuild::Stale { age_ms: 91_000 }
+                .detail("s")
+                .contains("relaunch")
+        );
+        assert!(
+            DeclareRebuild::UrlRefused {
+                scheme: "file".into()
+            }
+            .detail("s")
+            .contains("loopback")
+        );
+        // A failed FETCH is not an absent declare, and the message says so.
+        assert!(
+            DeclareRebuild::FetchFailed {
+                error: "connection refused".into()
+            }
+            .detail("s")
+            .contains("NOT the same")
+        );
+    }
+
+    // N5: an advisory lane lock. A deploy that lands mid-flow kills the flow,
+    // and the lease is already the surface's own claim — so the deploy door
+    // simply CHECKS it.
+    #[test]
+    fn a_live_agent_lease_refuses_the_deploy_door_unless_forced() {
+        let leases = vec![
+            json!({"session_path": "local://a", "tab_id": 1, "seconds_remaining": 240}),
+            json!({"session_path": "local://b", "tab_id": 2, "seconds_remaining": 30}),
+        ];
+        let refusal = agent_lease_refusal(&leases, false).expect("a live lease must refuse");
+        assert_eq!(refusal["reason"], json!("agent_lease_active"));
+        assert_eq!(refusal["accepted"], json!(false));
+        // The message NAMES who is driving — a bare refusal would just move the
+        // confusion somewhere else.
+        let detail = refusal["detail"].as_str().unwrap();
+        assert!(detail.contains("local://a"), "{detail}");
+        assert!(detail.contains("local://b"), "{detail}");
+        assert!(detail.contains("--force"), "{detail}");
+        assert_eq!(refusal["leases"].as_array().map(Vec::len), Some(2));
+
+        // `--force` is an override, not a second policy.
+        assert!(agent_lease_refusal(&leases, true).is_none());
+        // No lease, no refusal — the ordinary deploy is unaffected.
+        assert!(agent_lease_refusal(&[], false).is_none());
+    }
+
+    // C3a: the three ways of naming a frame each compile to a resolver, and all
+    // three answer with a PATH — which is the form `web frames` reports, so its
+    // output feeds straight back in.
+    #[test]
+    fn every_frame_ref_compiles_to_a_resolver_that_reports_its_path() {
+        let by_index = web_frame_resolver_js(&WebFrameRef::Index(2));
+        assert!(by_index.contains("var path=[2]"), "{by_index}");
+        let by_path = web_frame_resolver_js(&WebFrameRef::Path(vec![0, 2]));
+        assert!(by_path.contains("var path=[0,2]"), "{by_path}");
+        let by_url = web_frame_resolver_js(&WebFrameRef::UrlContains("billdesk".into()));
+        assert!(by_url.contains("\"billdesk\""), "{by_url}");
+        // A url search must skip the TOP document (path length 0), or every
+        // query would "match" the page it started from.
+        assert!(by_url.contains("path.length&&"), "{by_url}");
+        // All three distinguish "not there" from "there but cross-origin".
+        assert!(by_index.contains("cross:true"), "{by_index}");
+        assert!(by_path.contains("cross:true"), "{by_path}");
+    }
+
+    // The wrapper must run the caller's script in the FRAME's realm without
+    // altering it — that is what keeps ONE extractor per read mode instead of a
+    // second copy threading a document handle.
+    #[test]
+    fn a_frame_scoped_script_evaluates_the_original_source_untouched() {
+        let inner = "(function(){return document.title;})()";
+        let js = web_frame_scoped_script(&WebFrameRef::Index(1), inner);
+        // The inner script is passed as a STRING to the frame's own eval, so it
+        // is never rewritten.
+        assert!(js.contains("f.w.eval("), "{js}");
+        assert!(js.contains(&serde_json::to_string(inner).unwrap()), "{js}");
+        // Three honest refusals, not one.
+        for reason in ["frame_not_found", "frame_cross_origin", "frame_eval_failed"] {
+            assert!(js.contains(reason), "wrapper never reports {reason}");
+        }
+        // …and the frame it resolved is echoed, which is what a CLI checks to
+        // prove the GUI understood --frame at all.
+        assert!(js.contains("frame:{path:f.path,url:f.url}"), "{js}");
+    }
+
+    // A no-frame `read` searches EVERYTHING, and reports a frame it could not
+    // read rather than omitting it — "there is a frame here I cannot read" and
+    // "there is no frame here" are different facts, and reporting only the
+    // second is how a top-document [] came to read as "the site does not offer
+    // this".
+    #[test]
+    fn the_all_frames_walk_reports_unreadable_frames_instead_of_dropping_them() {
+        let js = web_all_frames_script("(function(){return 1;})()");
+        assert!(js.contains("accessible:false"), "{js}");
+        assert!(js.contains("'frame_cross_origin'"), "{js}");
+        // Bounded depth: a pathological nesting must not make the answer
+        // unbounded.
+        assert!(js.contains("path.length>=4"), "{js}");
+        // The top document is walked first and is frame [].
+        assert!(js.contains("walk(window,[])"), "{js}");
+    }
+
+    // BACK-COMPAT LOCK for `web read`'s response shape.
+    //
+    // `read` is an OLD verb with existing callers, and every one of them reads
+    // `.result`. When the no-`--frame` path learned to search every frame it
+    // answered `frames: [...]` and dropped `result` entirely, so those callers
+    // silently got `null` — the exact silent-null class the frame work exists
+    // to kill. `result` is the top document's answer and stays populated;
+    // `frames` is additive beside it.
+    //
+    // Delete the `"result"` line from `web_read_all_frames_response` and this
+    // fails.
+    #[test]
+    fn read_with_no_frame_still_answers_the_legacy_result_key() {
+        let top = json!({"forms": [{"id": "pay", "fields": 3}]});
+        let frames = vec![
+            json!({"frame": {"path": [], "url": "https://bank/", "accessible": true},
+                   "result": top, "error": Value::Null}),
+            json!({"frame": {"path": [0], "url": "https://gateway/", "accessible": true},
+                   "result": {"forms": []}, "error": Value::Null}),
+        ];
+        let answer = web_read_all_frames_response(
+            "local://web/session-a",
+            42,
+            WebSurfaceReadAs::Forms,
+            frames.clone(),
+        );
+        assert_eq!(
+            answer["result"], top,
+            "the legacy key must carry the top document's answer"
+        );
+        assert_eq!(answer["frames"].as_array().map(Vec::len), Some(2));
+        assert_eq!(answer["searched_all_frames"], json!(true));
+        assert_eq!(answer["accepted"], json!(true));
+
+        // The top document is identified by its EMPTY PATH, not by position —
+        // "first in the walk" is an ordering promise, this is an identity
+        // question.
+        let reordered = vec![frames[1].clone(), frames[0].clone()];
+        assert_eq!(web_read_top_document_result(&reordered), top);
+
+        // A walk with no reachable top document answers null rather than
+        // handing the caller some other frame's result under the old key.
+        assert_eq!(
+            web_read_top_document_result(&[frames[1].clone()]),
+            Value::Null
+        );
+        assert_eq!(web_read_top_document_result(&[]), Value::Null);
+    }
+
+    // The enumeration must carry the COUNTS. A top-document read returning []
+    // next to a frame reporting 107 elements is a legible answer; the [] alone
+    // was not.
+    #[test]
+    fn frame_enumeration_reports_how_much_is_in_each_frame() {
+        assert!(WEB_FRAMES_ENUM_JS.contains("elements:elements"));
+        assert!(WEB_FRAMES_ENUM_JS.contains("interactables:interactables"));
+        // A cross-origin frame is listed with a REASON, not skipped.
+        assert!(WEB_FRAMES_ENUM_JS.contains("reason:'cross_origin'"));
+        assert!(WEB_FRAMES_ENUM_JS.contains("accessible:false"));
+    }
+
+    // C9: the kickoff must return the call id SYNCHRONOUSLY. If it returned the
+    // promise, the eval's completion value would be a Promise — the exact
+    // `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT` this verb exists to route
+    // around, and the verb would fail on its own first step.
+    #[test]
+    fn the_await_kickoff_returns_an_id_not_a_promise() {
+        let js = web_await_kickoff_script("ygg-7", "return await fetch('/x').then(r=>r.status);");
+        assert!(js.trim_end().ends_with("return rid;})()"), "{js}");
+        assert!(js.contains("Promise.resolve("), "{js}");
+        // A synchronous throw must land in the SAME store as a rejected
+        // promise, or the two failure modes would answer differently.
+        assert_eq!(js.matches("store.ok=false").count(), 2, "{js}");
+        assert!(js.contains("async function()"), "{js}");
+    }
+
+    // The poll deletes its entry on read, so a page cannot accumulate stashes.
+    #[test]
+    fn the_await_poll_cleans_up_after_itself() {
+        let js = web_await_poll_script("ygg-7");
+        assert!(js.contains("delete bag[rid]"), "{js}");
+        assert!(js.contains("\"ygg-7\""), "{js}");
+    }
+
+    // …but the poll only deletes what it READ, and the one call that leaves an
+    // entry behind is the one that never gets a value: a `fetch` that never
+    // settles times out with its stash entry and its captured closure alive on
+    // `window` for the life of the document. That is the case the poll
+    // script's own header promises cannot happen.
+    //
+    // The decision lives in `AwaitEnd::leaves_stash_entry` rather than in a
+    // remembered cleanup call at each `return` — which is how the leak got in.
+    // Make it return `false` and this fails.
+    #[test]
+    fn only_a_timeout_leaves_a_stash_entry_and_it_is_discarded() {
+        assert!(
+            AwaitEnd::TimedOut.leaves_stash_entry(),
+            "a promise still pending in a live document keeps its entry"
+        );
+        assert!(
+            !AwaitEnd::Settled.leaves_stash_entry(),
+            "the poll deleted it as it read it"
+        );
+        assert!(
+            !AwaitEnd::DocumentReplaced.leaves_stash_entry(),
+            "the stash went with the document"
+        );
+
+        let js = web_await_discard_script("ygg-7");
+        assert!(js.contains("delete bag[rid]"), "{js}");
+        assert!(js.contains("\"ygg-7\""), "{js}");
+        // It must not wait for a value it will never get.
+        assert!(!js.contains("s.done"), "{js}");
+        // It reports whether there was anything to reclaim.
+        assert!(js.contains("hasOwnProperty"), "{js}");
+    }
+
+    // THE THREE HONEST ANSWERS. A fabricated result would be
+    // indistinguishable from a real one, which is the worst outcome for a verb
+    // whose whole job is returning a value.
+    #[test]
+    fn an_await_poll_has_three_answers_and_never_invents_a_result() {
+        // Settled, resolved.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": false, "done": true, "ok": true, "value": 200}))),
+            AwaitStep::Settled {
+                ok: true,
+                value: json!(200),
+                error: None
+            }
+        );
+        // Settled, rejected — still a real answer, and the message survives.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(
+                json!({"missing": false, "done": true, "ok": false, "error": "NetworkError"})
+            )),
+            AwaitStep::Settled {
+                ok: false,
+                value: Value::Null,
+                error: Some("NetworkError".into())
+            }
+        );
+        // Not yet.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": false, "done": false}))),
+            AwaitStep::Pending
+        );
+        // A poll EVAL FAILURE is not-yet, not the end — a navigation mid-await
+        // must not abort, exactly as in `web wait`.
+        assert_eq!(
+            web_await_poll_outcome(&Err("eval callback dropped".to_string())),
+            AwaitStep::Pending
+        );
+        // The stash is gone: the document was replaced. NOT a result.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": true}))),
+            AwaitStep::DocumentReplaced
+        );
+    }
+
+    // C4: every addressing shape must produce a matcher, and the CSS shape must
+    // still be the plain `querySelector` it always was — the two new shapes are
+    // additions to ONE matcher, not a second resolution path.
+    #[test]
+    fn every_addressing_shape_compiles_to_one_matcher() {
+        let css = web_element_ref_js(&WebElementRef::Css("#login".into()));
+        assert_eq!(css, "document.querySelector(\"#login\")");
+
+        let by_text = web_element_ref_js(&WebElementRef::Text {
+            text: "Proceed to Pay".into(),
+            exact: true,
+            tag: Some("button".into()),
+            nth: None,
+        });
+        // The wanted text is JSON-quoted (never string-concatenated), the pool
+        // is the caller's `tag`, and exactness reaches the page as a literal.
+        assert!(by_text.contains("\"Proceed to Pay\""), "{by_text}");
+        assert!(
+            by_text.contains("querySelectorAll(\"button\")"),
+            "{by_text}"
+        );
+        assert!(by_text.contains("exact=true"), "{by_text}");
+        // Innermost-wins is what stops a substring match selecting <body>.
+        assert!(by_text.contains("contains(out[k])"), "{by_text}");
+
+        let by_role = web_element_ref_js(&WebElementRef::Role {
+            role: "BUTTON".into(),
+            label: "Continue".into(),
+            nth: Some(2),
+        });
+        // Roles are compared lower-case, so `--role BUTTON` and `--role button`
+        // are the same question.
+        assert!(by_role.contains("var want=\"button\""), "{by_role}");
+        assert!(by_role.contains("nth=2"), "{by_role}");
+        // Exact labels are preferred over substring ones, deterministically.
+        assert!(by_role.contains("ex.length?ex:part"), "{by_role}");
+    }
+
+    // A quote in the text must not be able to close the string and inject JS.
+    #[test]
+    fn matcher_quotes_page_supplied_text_instead_of_concatenating_it() {
+        let js = web_element_ref_js(&WebElementRef::Text {
+            text: "\"); alert(1); //".into(),
+            exact: false,
+            tag: None,
+            nth: None,
+        });
+        assert!(!js.contains("alert(1); //\"),"), "{js}");
+        assert!(js.contains("\\\"); alert(1); //"), "{js}");
+    }
+
+    // The template composer must substitute BOTH placeholders — a leftover
+    // `__YGG_REF__` would be a syntax error in the page, which is the sort of
+    // failure that reads as "the site refused us".
+    #[test]
+    fn script_composition_leaves_no_placeholders() {
+        let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, &WebElementRef::Css("#a".into()));
+        assert!(!script.contains("__YGG_REF__"), "{script}");
+        assert!(!script.contains("__YGG_PATH_FN__"), "{script}");
+        assert!(script.contains("__yggPath"), "{script}");
+        let focus = web_do_script_for_ref(WEB_DO_FOCUS_JS, &WebElementRef::Css("#a".into()));
+        assert!(!focus.contains("__YGG_REF__"), "{focus}");
+    }
+
+    // N3: `accepted` (the injector ran), `resolved.*` (what the DOM said) and
+    // `delivered` (what the page observed) are three different questions. A
+    // successful click must now REPORT the middle one — before this, a click
+    // that resolved a detached node reported plain success.
+    #[test]
+    fn click_selector_success_reports_the_node_it_resolved() {
+        let target = WebElementRef::Text {
+            text: "Proceed to Pay".into(),
+            exact: false,
+            tag: None,
+            nth: None,
+        };
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})))
+            .expect("a live, visible, on-target node resolves");
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+
+        assert_eq!(detail["verb"], json!("click_selector"));
+        assert_eq!(detail["resolved"]["is_connected"], json!(true));
+        assert_eq!(detail["resolved"]["on_target"], json!(true));
+        assert_eq!(
+            detail["resolved"]["css_path"],
+            json!("#pay > button:nth-of-type(2)")
+        );
+        assert_eq!(detail["resolved"]["tag"], json!("BUTTON"));
+        // A non-degenerate box, expressed as the element's own rect (the click
+        // point is its centre).
+        assert_eq!(detail["resolved"]["rect"], json!([80.0, 224.0, 80.0, 32.0]));
+        assert_eq!(detail["target"], json!("text~:Proceed to Pay"));
+    }
+
+    // A CSS target must serialize back onto the wire EXACTLY as it always did —
+    // a bare string — so an existing caller reading `.selector` is unaffected.
+    #[test]
+    fn a_css_target_still_reports_as_a_bare_string() {
+        let target = WebElementRef::Css("#submit".into());
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({}))).unwrap();
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+        assert_eq!(detail["selector"], json!("#submit"));
+    }
+
+    // N3's real point: a node that resolved but is NOT in the document must be
+    // refused, not clicked. A React re-render drops agent-injected ids, so a
+    // selector can genuinely resolve to a corpse.
+    #[test]
+    fn a_detached_node_is_refused_rather_than_clicked() {
+        let target = WebElementRef::Css("#otp".into());
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"isConnected": false})))
+            .expect_err("a detached node must refuse");
+        assert!(err.starts_with("detached_node"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"visible": false})))
+            .expect_err("a zero-size element must refuse");
+        assert!(err.contains("zero-size"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"onTarget": false})))
+            .expect_err("an occluded/moved target must refuse");
+        assert!(err.starts_with("target_moved"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &json!({"found": false}))
+            .expect_err("no match must refuse");
+        assert!(err.contains("no element matches css:#otp"), "{err}");
+    }
 
     // Delivery is an OBSERVATION with three honest answers. A dropped event
     // must read `NotDelivered`, and a page that navigated under us must read
@@ -48230,10 +50614,18 @@ mod web_do_verb_tests {
 
     #[test]
     fn wait_scripts_are_iifes_and_only_idle_carries_a_threshold() {
-        // Boolean conditions → no threshold; Idle → the ms threshold + observer.
+        fn page_parts(until: WebSurfaceWaitUntil) -> (String, Option<u64>) {
+            match web_wait_probe(&until).expect("valid predicate") {
+                WaitProbe::Page {
+                    script,
+                    idle_threshold_ms,
+                } => (script, idle_threshold_ms),
+                other => panic!("{until:?} is not a page-side predicate: {other:?}"),
+            }
+        }
         for (until, wants_threshold) in [
-            (WebSurfaceWaitUntil::LoadFinished, false),
             (WebSurfaceWaitUntil::LoadCommitted, false),
+            (WebSurfaceWaitUntil::LoadFinished, false),
             (
                 WebSurfaceWaitUntil::Selector {
                     css: "#x".into(),
@@ -48249,27 +50641,28 @@ mod web_do_verb_tests {
             ),
             (WebSurfaceWaitUntil::Idle { ms: 500 }, true),
         ] {
-            let (script, threshold) = web_wait_script(&until);
-            assert!(script.starts_with("(function(){"), "{until:?} not an IIFE");
-            assert_eq!(threshold.is_some(), wants_threshold, "{until:?} threshold");
+            let label = format!("{until:?}");
+            let (script, threshold) = page_parts(until);
+            assert!(script.starts_with("(function(){"), "{label} not an IIFE");
+            assert_eq!(threshold.is_some(), wants_threshold, "{label} threshold");
         }
         // Idle carries its ms and installs the one-time observer.
-        let (idle_script, threshold) = web_wait_script(&WebSurfaceWaitUntil::Idle { ms: 750 });
+        let (idle_script, threshold) = page_parts(WebSurfaceWaitUntil::Idle { ms: 750 });
         assert_eq!(threshold, Some(750));
         assert!(idle_script.contains("MutationObserver"));
         // A visible-selector wait checks the rect; a plain one does not.
-        let (vis, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+        let (vis, _) = page_parts(WebSurfaceWaitUntil::Selector {
             css: "#x".into(),
             visible: true,
         });
         assert!(vis.contains("getBoundingClientRect"));
-        let (plain, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+        let (plain, _) = page_parts(WebSurfaceWaitUntil::Selector {
             css: "#x".into(),
             visible: false,
         });
         assert!(!plain.contains("getBoundingClientRect"));
         // The Js condition swallows exceptions (never aborts the wait).
-        let (js, _) = web_wait_script(&WebSurfaceWaitUntil::Js {
+        let (js, _) = page_parts(WebSurfaceWaitUntil::Js {
             expr: "a.b.c".into(),
         });
         assert!(js.contains("catch"));
@@ -48404,43 +50797,128 @@ fn web_read_mode_name(mode: WebSurfaceReadAs) -> &'static str {
     }
 }
 
-/// The JS that evaluates a `wait` condition. Returns a value the handler
-/// interprets: for `Idle` it is the ms-since-last-mutation number (met when
-/// `>= ms`); for every other condition it is a boolean (met when true). The
-/// `Idle` script installs a one-time MutationObserver on first call.
-fn web_wait_script(until: &WebSurfaceWaitUntil) -> (String, Option<u64>) {
-    match until {
-        WebSurfaceWaitUntil::LoadCommitted => (
-            "(function(){return document.readyState!=='loading';})()".to_string(),
-            None,
-        ),
-        WebSurfaceWaitUntil::LoadFinished => (
-            "(function(){return document.readyState==='complete';})()".to_string(),
-            None,
-        ),
+/// The page-side mutation clock, shared by `idle` and the page half of
+/// `settled`. ONE observer: a second `MutationObserver` under a different
+/// window key would answer a slightly different question every time the page
+/// re-ran one of the two scripts.
+const WEB_WAIT_IDLE_JS: &str =
+    "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
+     var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
+     o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
+     window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()";
+
+/// How one `wait` predicate is observed: in the page, on the host, or both.
+///
+/// The distinction is the whole point of C5. A page-side predicate is
+/// unavailable exactly when a navigation is in flight — which is when a caller
+/// waiting through a redirect chain most needs an answer — so the predicates
+/// that matter during navigation read the UI process's OWN page state instead.
+#[derive(Debug)]
+enum WaitProbe {
+    /// Page-side script. `idle_threshold_ms` is set only for `idle`, whose
+    /// script returns a duration rather than a boolean.
+    Page {
+        script: String,
+        idle_threshold_ms: Option<u64>,
+    },
+    /// Host-side only: the engine's current url. No eval, so a torn-down
+    /// content process cannot make this predicate unanswerable.
+    Url { pattern: regex::Regex },
+    /// Host-side url/loading PLUS the page's mutation clock.
+    Settled { script: String, ms: u64 },
+}
+
+fn web_wait_probe(until: &WebSurfaceWaitUntil) -> Result<WaitProbe, String> {
+    let page = |script: String| WaitProbe::Page {
+        script,
+        idle_threshold_ms: None,
+    };
+    Ok(match until {
+        WebSurfaceWaitUntil::LoadCommitted => {
+            page("(function(){return document.readyState!=='loading';})()".to_string())
+        }
+        WebSurfaceWaitUntil::LoadFinished => {
+            page("(function(){return document.readyState==='complete';})()".to_string())
+        }
         WebSurfaceWaitUntil::Selector { css, visible } => {
             let sel = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".to_string());
-            let script = if *visible {
+            page(if *visible {
                 format!("(function(){{var e=document.querySelector({sel});if(!e)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()")
             } else {
                 format!("(function(){{return !!document.querySelector({sel});}})()")
-            };
-            (script, None)
+            })
         }
-        WebSurfaceWaitUntil::Js { expr } => (
+        WebSurfaceWaitUntil::Js { expr } => page(format!(
             // Exceptions count as not-yet (return false), never abort the wait.
-            format!("(function(){{try{{return !!({expr});}}catch(e){{return false;}}}})()"),
-            None,
-        ),
-        WebSurfaceWaitUntil::Idle { ms } => (
-            "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
-             var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
-             o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
-             window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()"
-                .to_string(),
-            Some(*ms),
-        ),
+            "(function(){{try{{return !!({expr});}}catch(e){{return false;}}}})()"
+        )),
+        WebSurfaceWaitUntil::Idle { ms } => WaitProbe::Page {
+            script: WEB_WAIT_IDLE_JS.to_string(),
+            idle_threshold_ms: Some(*ms),
+        },
+        WebSurfaceWaitUntil::UrlMatches { pattern } => WaitProbe::Url {
+            // Compiled ONCE, before the loop, and refused up front — a bad
+            // pattern is a caller error, not something to rediscover on every
+            // 100 ms tick and report as a timeout.
+            pattern: regex::Regex::new(pattern)
+                .map_err(|error| format!("bad_regex: {error}"))?,
+        },
+        WebSurfaceWaitUntil::Settled { ms } => WaitProbe::Settled {
+            script: WEB_WAIT_IDLE_JS.to_string(),
+            ms: *ms,
+        },
+    })
+}
+
+/// What one poll tick decided. PURE, and `NotYet` is deliberately the answer to
+/// an eval FAILURE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitStep {
+    Met,
+    NotYet { eval_error: bool },
+}
+
+/// THE BUG THIS FIXES: the poll loop used to RETURN on any eval error.
+///
+/// During a multi-origin auto-submit chain the content process is repeatedly
+/// torn down and rebuilt, so every navigation commit failed the eval and killed
+/// the wait — which is why the records expedition could not wait through the chain
+/// at all and fell back to polling screenshots. An eval failure is NOT-YET: the
+/// page is simply unavailable this tick. Only a surface-resolution failure
+/// aborts, and the count of failed evals is reported so a wait that spent its
+/// whole budget failing is still legible instead of looking like a quiet
+/// timeout.
+fn wait_poll_outcome(eval: &Result<Value, String>, idle_threshold_ms: Option<u64>) -> WaitStep {
+    match eval {
+        Ok(value) => {
+            let met = match idle_threshold_ms {
+                Some(ms) => value.as_f64().map(|idle| idle >= ms as f64).unwrap_or(false),
+                None => value.as_bool().unwrap_or(false),
+            };
+            if met {
+                WaitStep::Met
+            } else {
+                WaitStep::NotYet { eval_error: false }
+            }
+        }
+        Err(_) => WaitStep::NotYet { eval_error: true },
     }
+}
+
+/// PURE `settled` rule: two observers, one predicate.
+///
+/// A url change resets it, so a page quietly bouncing through redirects can
+/// never be reported as settled; `is_loading` covers the case where the engine
+/// has committed a url but is still fetching; and the page's mutation clock
+/// covers a loaded page still rewriting itself. An unavailable page clock
+/// (mid-navigation) is not-yet, never a fabricated success.
+fn wait_settled_met(
+    url_changed: bool,
+    is_loading: bool,
+    page_idle_ms: Option<f64>,
+    want_ms: u64,
+) -> bool {
+    !url_changed && !is_loading && page_idle_ms.is_some_and(|idle| idle >= want_ms as f64)
 }
 
 /// App-control: block until a condition holds on a session's active web-surface
@@ -48459,29 +50937,79 @@ async fn web_surface_wait_for(
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "met": false, "reason": reason }),
     };
-    let (script, idle_ms) = web_wait_script(until);
+    let probe = match web_wait_probe(until) {
+        Ok(probe) => probe,
+        Err(reason) => {
+            return json!({
+                "accepted": false,
+                "met": false,
+                "session_path": session,
+                "reason": reason,
+            });
+        }
+    };
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms);
+    let mut eval_errors: u64 = 0;
+    let mut last_url: Option<String> = None;
+    let mut current_url: Option<String> = None;
     loop {
-        match web_do_eval(desktop, native_id, &script).await {
-            Ok(value) => {
-                let met = match idle_ms {
-                    Some(ms) => value.as_f64().map(|e| e >= ms as f64).unwrap_or(false),
-                    None => value.as_bool().unwrap_or(false),
-                };
-                if met {
-                    return json!({
-                        "accepted": true,
-                        "met": true,
-                        "elapsed_ms": start.elapsed().as_millis() as u64,
-                        "session_path": session,
-                        "native_id": native_id,
-                    });
+        let met = match &probe {
+            WaitProbe::Page {
+                script,
+                idle_threshold_ms,
+            } => {
+                let outcome = web_do_eval(desktop, native_id, script).await;
+                match wait_poll_outcome(&outcome, *idle_threshold_ms) {
+                    WaitStep::Met => true,
+                    WaitStep::NotYet { eval_error } => {
+                        if eval_error {
+                            eval_errors += 1;
+                        }
+                        false
+                    }
                 }
             }
-            Err(reason) => {
-                return json!({ "accepted": false, "met": false, "session_path": session, "reason": reason });
+            WaitProbe::Url { pattern } => {
+                let url = desktop
+                    .web_surface_page_state(native_id)
+                    .map(|(uri, _, _)| uri);
+                current_url = url.clone();
+                url.as_deref().is_some_and(|url| pattern.is_match(url))
             }
+            WaitProbe::Settled { script, ms } => {
+                let page_state = desktop.web_surface_page_state(native_id);
+                let url = page_state.as_ref().map(|(uri, _, _)| uri.clone());
+                // A missing page state means the engine cannot answer yet —
+                // treat it as loading rather than as settled.
+                let is_loading = page_state
+                    .as_ref()
+                    .map(|(_, _, loading)| *loading)
+                    .unwrap_or(true);
+                let url_changed = last_url.is_some() && last_url != url;
+                last_url = url.clone();
+                current_url = url;
+                let outcome = web_do_eval(desktop, native_id, script).await;
+                let page_idle_ms = match &outcome {
+                    Ok(value) => value.as_f64(),
+                    Err(_) => {
+                        eval_errors += 1;
+                        None
+                    }
+                };
+                wait_settled_met(url_changed, is_loading, page_idle_ms, *ms)
+            }
+        };
+        if met {
+            return json!({
+                "accepted": true,
+                "met": true,
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "session_path": session,
+                "native_id": native_id,
+                "eval_errors": eval_errors,
+                "url": current_url,
+            });
         }
         if start.elapsed() >= deadline {
             return json!({
@@ -48490,9 +51018,436 @@ async fn web_surface_wait_for(
                 "reason": "timeout",
                 "elapsed_ms": start.elapsed().as_millis() as u64,
                 "session_path": session,
+                // A wait that spent its whole budget failing to evaluate is a
+                // DIFFERENT failure from one that evaluated cleanly and never
+                // matched; reporting the count is what lets a caller tell them
+                // apart instead of guessing.
+                "eval_errors": eval_errors,
+                "url": current_url,
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Monotonic, process-wide id for one async call. A counter rather than a
+/// timestamp: two calls in the same millisecond must not share a stash slot.
+static WEB_AWAIT_CALL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The kickoff script: start the async work and return the call id
+/// SYNCHRONOUSLY, so the eval's completion value is a plain string and never a
+/// Promise.
+///
+/// A synchronous throw inside the user's script must land in the same store as
+/// a rejected promise, or the two failure modes would answer differently —
+/// hence the outer try/catch writing the identical shape.
+fn web_await_kickoff_script(rid: &str, script: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         if(!window.__yggAwait)window.__yggAwait={{}};\
+         var store={{done:false}};window.__yggAwait[rid]=store;\
+         try{{Promise.resolve((async function(){{{script}\n}})())\
+         .then(function(v){{store.done=true;store.ok=true;store.value=v;}})\
+         .catch(function(e){{store.done=true;store.ok=false;\
+         store.error=String(e&&e.message||e);}});}}\
+         catch(e){{store.done=true;store.ok=false;\
+         store.error=String(e&&e.message||e);}}\
+         return rid;}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// The poll script: read the stash, and DELETE the entry on read so a page
+/// cannot accumulate them.
+fn web_await_poll_script(rid: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         var bag=window.__yggAwait;var s=bag&&bag[rid];\
+         if(!s)return{{missing:true}};\
+         if(!s.done)return{{missing:false,done:false}};\
+         try{{delete bag[rid];}}catch(e){{}}\
+         return{{missing:false,done:true,ok:!!s.ok,value:s.value,error:s.error||null}};}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// Drop a stash entry WITHOUT reading it — the cleanup the timeout path owes.
+///
+/// The poll script deletes on read, but only when it read a SETTLED value. A
+/// `fetch` that never settles is exactly the case that times out, so without
+/// this the entry and its captured closure live on `window` for the life of the
+/// document — the accumulation the poll script's own header promises cannot
+/// happen.
+fn web_await_discard_script(rid: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         var bag=window.__yggAwait;if(!bag)return false;\
+         var had=Object.prototype.hasOwnProperty.call(bag,rid);\
+         try{{delete bag[rid];}}catch(e){{}}\
+         return had;}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// How one `web await` call ENDED, and therefore whether the page is still
+/// holding its stash entry.
+///
+/// A decision, not a description: the discard eval is wired to
+/// [`AwaitEnd::leaves_stash_entry`], so "which endings leak" is answered in one
+/// place that a test can drive rather than by remembering to add a cleanup call
+/// to each `return`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwaitEnd {
+    /// The poll read a settled value, and deleted the entry as it read it.
+    Settled,
+    /// The stash itself is gone with the document that held it.
+    DocumentReplaced,
+    /// We stopped waiting. NOTHING deleted the entry — the promise is still
+    /// pending in a document that is still there.
+    TimedOut,
+}
+
+impl AwaitEnd {
+    fn leaves_stash_entry(self) -> bool {
+        matches!(self, AwaitEnd::TimedOut)
+    }
+}
+
+/// What one await poll decided. PURE — the three answers are the whole point.
+#[derive(Debug, Clone, PartialEq)]
+enum AwaitStep {
+    /// The promise settled.
+    Settled { ok: bool, value: Value, error: Option<String> },
+    /// Not yet. A poll EVAL FAILURE lands here too: a navigation mid-await must
+    /// not abort the wait, same rule as `web wait`.
+    Pending,
+    /// The stash entry is gone, so the document that held it was replaced. This
+    /// is NEVER reported as a result — a fabricated answer here would be
+    /// indistinguishable from a real one, which is the worst possible outcome
+    /// for a verb whose whole job is returning a value.
+    DocumentReplaced,
+}
+
+fn web_await_poll_outcome(poll: &Result<Value, String>) -> AwaitStep {
+    let Ok(info) = poll else {
+        return AwaitStep::Pending;
+    };
+    if info.get("missing").and_then(Value::as_bool).unwrap_or(false) {
+        return AwaitStep::DocumentReplaced;
+    }
+    if !info.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        return AwaitStep::Pending;
+    }
+    AwaitStep::Settled {
+        ok: info.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        value: info.get("value").cloned().unwrap_or(Value::Null),
+        error: info
+            .get("error")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+/// App-control `await`: run an async script and return its resolved value.
+///
+/// THE ONE ASYNC BRIDGE. `eval` returns a completion value and a Promise is not
+/// one, so every caller that needed `fetch` or `await` invented the same
+/// stash-and-poll workaround. This owns it here, once, with the two ways it
+/// goes wrong answered honestly rather than papered over.
+async fn web_surface_await_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    script: &str,
+    timeout_ms: u64,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let rid = format!(
+        "ygg-{}",
+        WEB_AWAIT_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    if let Err(reason) = web_do_eval(desktop, native_id, &web_await_kickoff_script(&rid, script))
+        .await
+    {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "await_kickoff_failed",
+            "detail": reason,
+        });
+    }
+    let poll = web_await_poll_script(&rid);
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_millis(timeout_ms);
+    let mut poll_errors: u64 = 0;
+    // ONE exit. Every ending yields `(AwaitEnd, response)` so the stash cleanup
+    // below is decided by `AwaitEnd::leaves_stash_entry` rather than by
+    // remembering to bolt an eval onto each `return` — which is exactly how the
+    // timeout path came to leak.
+    let (end, mut response) = loop {
+        let outcome = web_do_eval(desktop, native_id, &poll).await;
+        if outcome.is_err() {
+            poll_errors += 1;
+        }
+        match web_await_poll_outcome(&outcome) {
+            AwaitStep::Settled { ok, value, error } => {
+                break (
+                    AwaitEnd::Settled,
+                    json!({
+                        "accepted": ok,
+                        "session_path": session,
+                        "native_id": native_id,
+                        "value": if ok { value } else { Value::Null },
+                        "reason": if ok { Value::Null } else { json!("await_rejected") },
+                        "error": error,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "poll_errors": poll_errors,
+                    }),
+                );
+            }
+            AwaitStep::DocumentReplaced => {
+                break (
+                    AwaitEnd::DocumentReplaced,
+                    json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "document_replaced",
+                        "detail": "the page navigated while the script was running, so its result is gone — this is NOT a result, and no value is invented for it",
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "poll_errors": poll_errors,
+                    }),
+                );
+            }
+            AwaitStep::Pending => {}
+        }
+        if start.elapsed() >= deadline {
+            break (
+                AwaitEnd::TimedOut,
+                json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": "await_timeout",
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "poll_errors": poll_errors,
+                }),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    if end.leaves_stash_entry() {
+        let discarded = web_do_eval(desktop, native_id, &web_await_discard_script(&rid))
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if let Some(obj) = response.as_object_mut() {
+            // Say whether the never-settling promise's entry was actually
+            // reclaimed; a page that has since navigated answers `false`, and
+            // that is a fact about the page, not a failure of the verb.
+            obj.insert("stash_discarded".to_string(), Value::Bool(discarded));
+        }
+    }
+    response
+}
+
+/// JS that finds a frame's `window` from a [`WebFrameRef`].
+///
+/// Returns `{w, path, url}` for a reachable frame, `{cross:true, path}` for a
+/// frame that exists but belongs to another origin, or `null` when nothing
+/// matches — three answers, because "not there" and "there but not readable"
+/// need different responses from the caller.
+fn web_frame_resolver_js(frame: &WebFrameRef) -> String {
+    let quote = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    match frame {
+        WebFrameRef::Index(index) => web_frame_path_resolver_js(&[*index]),
+        WebFrameRef::Path(path) => web_frame_path_resolver_js(path),
+        WebFrameRef::UrlContains(needle) => format!(
+            "(function(){{var want={want},found=null;\
+             function walk(w,path){{if(found)return;var url=null;\
+             try{{url=w.location.href;}}catch(e){{return;}}\
+             if(path.length&&url.indexOf(want)!==-1){{found={{w:w,path:path,url:url}};return;}}\
+             for(var i=0;i<w.frames.length;i++){{try{{walk(w.frames[i],path.concat([i]));}}catch(e){{}}}}}}\
+             walk(window,[]);return found;}})()",
+            want = quote(needle),
+        ),
+    }
+}
+
+fn web_frame_path_resolver_js(path: &[usize]) -> String {
+    format!(
+        "(function(){{var path={path};var w=window;\
+         for(var i=0;i<path.length;i++){{\
+         if(!w.frames||path[i]>=w.frames.length)return null;w=w.frames[path[i]];}}\
+         var url=null;try{{url=w.location.href;}}catch(e){{return{{cross:true,path:path}};}}\
+         return{{w:w,path:path,url:url}};}})()",
+        path = serde_json::to_string(path).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+/// Run `inner` inside a frame's own realm.
+///
+/// The trick that keeps ONE extractor per read mode: `otherWindow.eval(src)`
+/// evaluates in that window's global scope, so a script written against bare
+/// `document` runs against the FRAME's document without a single character of
+/// it changing. Rewriting every extractor to thread a `D`/`W` pair would be a
+/// second copy of each one, waiting to drift.
+fn web_frame_scoped_script(frame: &WebFrameRef, inner: &str) -> String {
+    format!(
+        "(function(){{var f={resolver};\
+         if(!f)return{{ok:false,reason:'frame_not_found'}};\
+         if(f.cross)return{{ok:false,reason:'frame_cross_origin',frame:{{path:f.path,url:null}}}};\
+         var out;try{{out=f.w.eval({src});}}\
+         catch(e){{return{{ok:false,reason:'frame_eval_failed',\
+         frame:{{path:f.path,url:f.url}},detail:String(e&&e.message||e)}};}}\
+         return{{ok:true,frame:{{path:f.path,url:f.url}},result:out}};}})()",
+        resolver = web_frame_resolver_js(frame),
+        src = serde_json::to_string(inner).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// Run `inner` in EVERY reachable frame, top document first.
+///
+/// This is what `read` does by default. A cross-origin frame is still REPORTED
+/// — with `accessible:false` and a reason — because "there is a frame here I
+/// cannot read" and "there is no frame here" are different facts, and reporting
+/// only the second is how a top-document `[]` came to read as "the site does
+/// not offer this".
+fn web_all_frames_script(inner: &str) -> String {
+    format!(
+        "(function(){{var src={src},out=[];\
+         function walk(w,path){{\
+         var url=null,accessible=true;\
+         try{{url=w.location.href;}}catch(e){{accessible=false;}}\
+         if(!accessible){{out.push({{frame:{{path:path,url:null,accessible:false}},\
+         result:null,error:'frame_cross_origin'}});return;}}\
+         var r=null,err=null;\
+         try{{r=w.eval(src);}}catch(e){{err=String(e&&e.message||e);}}\
+         out.push({{frame:{{path:path,url:url,accessible:true}},result:r,error:err}});\
+         if(path.length>=4)return;\
+         for(var i=0;i<w.frames.length;i++){{\
+         try{{walk(w.frames[i],path.concat([i]));}}catch(e){{\
+         out.push({{frame:{{path:path.concat([i]),url:null,accessible:false}},\
+         result:null,error:'frame_cross_origin'}});}}}}}}\
+         walk(window,[]);return out;}})()",
+        src = serde_json::to_string(inner).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// The TOP DOCUMENT's result out of an all-frames walk — i.e. exactly the
+/// answer `web read` gave before it learned to search frames.
+///
+/// This exists so the new `frames: [...]` shape can be ADDITIVE. `read` is an
+/// old verb with existing callers, all of them reading `.result`; answering
+/// only `frames[0].result` would have handed every one of them a silent `null`,
+/// which is the precise failure class the frame work was done to kill. The top
+/// document is the frame whose `path` is `[]` — found by that key rather than
+/// by position, because "first in the walk" is an ordering promise and this is
+/// an identity question.
+fn web_read_top_document_result(frames: &[Value]) -> Value {
+    frames
+        .iter()
+        .find(|frame| {
+            frame
+                .get("frame")
+                .and_then(|f| f.get("path"))
+                .and_then(Value::as_array)
+                .is_some_and(|path| path.is_empty())
+        })
+        .and_then(|frame| frame.get("result").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// The `web read` answer when NO `--frame` was given, assembled where a test
+/// can see it.
+///
+/// It is a function rather than an inline `json!` because the ADDITIVITY is the
+/// contract: `result` is the old shape and must stay populated and correct, and
+/// `frames` is the new information beside it. Inline, the `result` key was
+/// simply missing and every caller reading `.result` got a silent null.
+fn web_read_all_frames_response(
+    session: &str,
+    native_id: u64,
+    mode: WebSurfaceReadAs,
+    frames: Vec<Value>,
+) -> Value {
+    json!({
+        "accepted": true,
+        "session_path": session,
+        "native_id": native_id,
+        "as": web_read_mode_name(mode),
+        // `result` IS THE OLD SHAPE: the top document's answer, byte-for-byte
+        // what a pre-frames build returned for the same read.
+        "result": web_read_top_document_result(&frames),
+        // …and this is what is ADDED: what else is on the page.
+        "frames": frames,
+        "frame_resolved": Value::Null,
+        "searched_all_frames": true,
+    })
+}
+
+/// Enumerate every frame: path, url, reachability, and how much is IN it.
+///
+/// The element counts are the point. A top-document `read` returning `[]` next
+/// to a frame reporting 107 elements is a legible answer; the `[]` alone was
+/// not. Depth is capped at 4 so a pathological nesting cannot make the answer
+/// unbounded.
+const WEB_FRAMES_ENUM_JS: &str = "(function(){var out=[];\
+    function walk(w,path){\
+    var url=null,accessible=true;\
+    try{url=w.location.href;}catch(e){accessible=false;}\
+    if(!accessible){out.push({path:path,url:null,accessible:false,\
+    reason:'cross_origin',elements:null,interactables:null});return;}\
+    var d=w.document;\
+    var elements=d?d.querySelectorAll('*').length:null;\
+    var interactables=d?d.querySelectorAll(\
+    'a,button,input,select,textarea,[role],[onclick],[contenteditable]').length:null;\
+    out.push({path:path,url:url,accessible:true,title:d?d.title:null,\
+    elements:elements,interactables:interactables});\
+    if(path.length>=4)return;\
+    for(var i=0;i<w.frames.length;i++){\
+    try{walk(w.frames[i],path.concat([i]));}\
+    catch(e){out.push({path:path.concat([i]),url:null,accessible:false,\
+    reason:'cross_origin',elements:null,interactables:null});}}}\
+    walk(window,[]);return out;})()";
+
+/// App-control `frames`: what frames this page has, and how much is in each.
+async fn web_surface_frames_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    match web_do_eval(desktop, native_id, WEB_FRAMES_ENUM_JS).await {
+        Ok(frames) => {
+            let list = frames.as_array().cloned().unwrap_or_default();
+            let inaccessible = list
+                .iter()
+                .filter(|frame| {
+                    !frame
+                        .get("accessible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .count();
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "frames": list,
+                "cross_origin_frames": inaccessible,
+                // Say what this build can and cannot do with what it just
+                // listed, so a caller does not have to discover the split by
+                // trying it.
+                "detail": "a cross-origin frame is listed but not addressable by --frame; read it via the top document's own API, or click through the iframe element's rect",
+            })
+        }
+        Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
 }
 
@@ -48506,21 +51461,542 @@ async fn web_surface_read_for(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
     mode: WebSurfaceReadAs,
+    frame: Option<&WebFrameRef>,
 ) -> Value {
     let (session, native_id) = match resolve_live_web_surface(state, session_path) {
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    match web_do_eval(desktop, native_id, web_read_script(mode)).await {
-        Ok(result) => json!({
-            "accepted": true,
-            "session_path": session,
-            "native_id": native_id,
-            "as": web_read_mode_name(mode),
-            "result": result,
-        }),
+    let extractor = web_read_script(mode);
+    let Some(frame) = frame else {
+        // NO --frame = EVERY reachable frame, top document first. A silent `[]`
+        // from the top document is the failure this verb family had; searching
+        // everything by default is what stops it recurring.
+        let script = web_all_frames_script(extractor);
+        return match web_do_eval(desktop, native_id, &script).await {
+            Ok(frames) => {
+                let list = frames.as_array().cloned().unwrap_or_default();
+                web_read_all_frames_response(&session, native_id, mode, list)
+            }
+            Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
+        };
+    };
+    let script = web_frame_scoped_script(frame, extractor);
+    match web_do_eval(desktop, native_id, &script).await {
+        Ok(info) => {
+            if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "as": web_read_mode_name(mode),
+                    "reason": info.get("reason").and_then(Value::as_str).unwrap_or("frame_failed"),
+                    "detail": info.get("detail"),
+                    // ECHOED EVEN ON FAILURE: its ABSENCE is what tells a CLI
+                    // it is talking to a GUI that dropped the field entirely.
+                    "frame_resolved": info.get("frame").cloned().unwrap_or(Value::Null),
+                });
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "as": web_read_mode_name(mode),
+                "result": info.get("result").cloned().unwrap_or(Value::Null),
+                "frame_resolved": info.get("frame").cloned().unwrap_or(Value::Null),
+            })
+        }
         Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
+}
+
+/// In-page element rasterizer. `__YGG_REF__` is the shared matcher (C4).
+///
+/// Every failure gets its OWN reason, because they need different actions from
+/// the caller: an undecoded image means "wait and retry", a tainted canvas
+/// means "this image is cross-origin without CORS and cannot be read at all",
+/// and a non-rasterizable element means "there is no in-page rasterizer for
+/// arbitrary DOM". A single `unsupported` would be a lie about all three.
+const WEB_CAPTURE_ELEMENT_JS: &str = "(function(){var el=__YGG_REF__;\
+    if(!el)return{ok:false,reason:'not_found'};\
+    var tag=el.tagName;\
+    var w=el.naturalWidth||el.videoWidth||el.width||0;\
+    var h=el.naturalHeight||el.videoHeight||el.height||0;\
+    if(tag!=='IMG'&&tag!=='CANVAS'&&tag!=='VIDEO')\
+    return{ok:false,reason:'element_not_rasterizable',tag:tag};\
+    if(tag==='IMG'&&el.complete===false)return{ok:false,reason:'image_not_decoded',src:el.src};\
+    if(!w||!h)return{ok:false,reason:'zero_sized_source',tag:tag};\
+    try{var c=document.createElement('canvas');c.width=w;c.height=h;\
+    c.getContext('2d').drawImage(el,0,0,w,h);\
+    var url=c.toDataURL('image/png');\
+    return{ok:true,width:w,height:h,data:url.slice(url.indexOf(',')+1)};}\
+    catch(e){var name=String(e&&e.name||'');\
+    if(name==='SecurityError')return{ok:false,reason:'tainted_canvas',src:el.src||null};\
+    return{ok:false,reason:'rasterize_failed',detail:String(e&&e.message||e)};}})()";
+
+/// Where each vertical band starts and how wide it is. PURE, so the band
+/// arithmetic is testable with no image at all.
+///
+/// Remainder columns go to the LAST band rather than being dropped, so the
+/// bands always reassemble to the original width — a captcha whose width is not
+/// a multiple of its character count must not silently lose a column.
+fn split_png_bands(width: usize, bands: usize) -> Vec<(usize, usize)> {
+    if bands == 0 || width == 0 {
+        return Vec::new();
+    }
+    let bands = bands.min(width);
+    let each = width / bands;
+    (0..bands)
+        .map(|index| {
+            let x = index * each;
+            let w = if index + 1 == bands { width - x } else { each };
+            (x, w)
+        })
+        .collect()
+}
+
+/// Cut an RGBA buffer into vertical bands. PURE.
+fn split_rgba_bands(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    bands: &[(usize, usize)],
+) -> Vec<Vec<u8>> {
+    bands
+        .iter()
+        .map(|(x, w)| {
+            let mut out = Vec::with_capacity(w * height * 4);
+            for row in 0..height {
+                let start = (row * width + x) * 4;
+                out.extend_from_slice(&rgba[start..start + w * 4]);
+            }
+            out
+        })
+        .collect()
+}
+
+/// App-control `capture-element`: rasterize ONE addressed element to a PNG, in
+/// the page.
+///
+/// Compositor-independent by construction — `drawImage` + `toDataURL` run in
+/// the content process — so this works on an unmapped, never-revealed surface,
+/// which is the claim that retires the offscreen-renderer deferral. Read-only:
+/// it moves no pointer and mutates nothing, so it does not open an agent lane.
+async fn web_surface_capture_element_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    target: &WebElementRef,
+    output_path: &str,
+    split: Option<usize>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let path = std::path::PathBuf::from(output_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("create {}: {error}", parent.display()),
+        });
+    }
+    let script = web_do_script_for_ref(WEB_CAPTURE_ELEMENT_JS, target);
+    // Rasterizing a large image legitimately outruns the 5s selector budget.
+    let info = match web_do_eval_with_timeout(desktop, native_id, &script, Duration::from_secs(20))
+        .await
+    {
+        Ok(info) => info,
+        Err(reason) => return json!({ "accepted": false, "session_path": session, "reason": reason }),
+    };
+    if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let mut refusal = json!({
+            "accepted": false,
+            "session_path": session,
+            "target": target.describe(),
+            "reason": info
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("capture_failed"),
+        });
+        // Carry the page's own detail through verbatim — `src` on a tainted
+        // canvas is what tells the caller WHICH image it cannot read.
+        if let (Some(obj), Some(source)) = (refusal.as_object_mut(), info.as_object()) {
+            for key in ["src", "tag", "detail"] {
+                if let Some(value) = source.get(key) {
+                    obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        return refusal;
+    }
+    let Some(encoded) = info.get("data").and_then(Value::as_str) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "capture returned no data",
+        });
+    };
+    let bytes = match BASE64_STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": format!("capture data was not base64: {error}"),
+            });
+        }
+    };
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("write {}: {error}", path.display()),
+        });
+    }
+    let width = info.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = info.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let mut answer = json!({
+        "accepted": true,
+        "session_path": session,
+        "native_id": native_id,
+        "target": target.describe(),
+        "output_path": path.to_string_lossy(),
+        "bytes": bytes.len(),
+        "width": width,
+        "height": height,
+        // Named so a reader can tell this apart from the compositor paths at a
+        // glance: it is the PAGE's own pixels, and it does not need the window.
+        "capture_backend": "page_canvas_data_url",
+        "capture_faithful": true,
+        "mapped": false,
+    });
+    if let Some(bands) = split.filter(|bands| *bands > 1) {
+        let split_result = (|| -> Result<Vec<String>, String> {
+            let (rgba, w, h) = decode_png_rgba(&bytes).map_err(|error| error.to_string())?;
+            let plan = split_png_bands(w, bands);
+            let mut written = Vec::with_capacity(plan.len());
+            for (index, (band, pixels)) in plan
+                .iter()
+                .zip(split_rgba_bands(&rgba, w, h, &plan))
+                .enumerate()
+            {
+                let encoded = encode_rgba_png(band.1, h, &pixels)
+                    .map_err(|error| error.to_string())?;
+                let band_path = path.with_file_name(format!(
+                    "{}-{}.png",
+                    path.file_stem().unwrap_or_default().to_string_lossy(),
+                    index + 1
+                ));
+                std::fs::write(&band_path, encoded)
+                    .map_err(|error| format!("write {}: {error}", band_path.display()))?;
+                written.push(band_path.to_string_lossy().to_string());
+            }
+            Ok(written)
+        })();
+        if let Some(obj) = answer.as_object_mut() {
+            match split_result {
+                Ok(paths) => {
+                    obj.insert("split".to_string(), json!(paths.len()));
+                    obj.insert("split_paths".to_string(), json!(paths));
+                }
+                // The capture itself SUCCEEDED; only the post-step failed, and
+                // saying so beats discarding a good PNG.
+                Err(reason) => {
+                    obj.insert("split".to_string(), json!(0));
+                    obj.insert("split_error".to_string(), json!(reason));
+                }
+            }
+        }
+    }
+    answer
+}
+
+/// Is a session's web surface actually ALIVE — not merely present?
+///
+/// N1: `ensure` used to test `surface.tabs.is_empty()`, and a DEAD webview
+/// entry is not empty, so it handed back the same corpse and reported
+/// `rebuilt_from_daemon_declare: false`. The only recovery anyone found was
+/// `session remove` on the whole work session: an agent had to destroy a lane
+/// to fix a tab.
+///
+/// Four steps, and the fourth is the one that matters. `tabs`, the handle
+/// registry and `surface_liveness` are all UI-PROCESS facts and every one of
+/// them stays true over a content process that will never answer another
+/// script — the same class of mistake as trusting `page_state` to prove a page
+/// is alive. So the probe ends with a bounded round trip through the content
+/// process itself.
+async fn web_surface_liveness_probe(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: &str,
+) -> Value {
+    let handle = state.peek().web_surfaces.get(session_path).and_then(|surface| {
+        let active = surface.active_tab;
+        surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == active)
+            .and_then(|tab| web_surface_handle_for(session_path, tab.id))
+    });
+    let tabs = state
+        .peek()
+        .web_surfaces
+        .get(session_path)
+        .map(|surface| surface.tabs.len())
+        .unwrap_or(0);
+    let Some(handle) = handle else {
+        return json!({
+            "tabs": tabs,
+            "handle": false,
+            "present": false,
+            "mapped": false,
+            "web_process_responsive": false,
+            "eval_ok": false,
+            "alive": false,
+        });
+    };
+    let liveness = desktop.web_surface_liveness(handle.native_id);
+    // The round trip. A 2s budget: this is a health check, and a content
+    // process that needs longer than that to answer `1` is not healthy.
+    let eval_ok = web_do_eval_with_timeout(
+        desktop,
+        handle.native_id,
+        "1",
+        Duration::from_secs(2),
+    )
+    .await
+    .is_ok();
+    json!({
+        "tabs": tabs,
+        "handle": true,
+        "generation": handle.generation,
+        "present": liveness.present,
+        "mapped": liveness.mapped,
+        "web_process_responsive": liveness.web_process_responsive,
+        "eval_ok": eval_ok,
+        // ALIVE means the page answered. Everything above it is context for
+        // WHY it did not.
+        "alive": liveness.present && eval_ok,
+    })
+}
+
+/// App-control `cookies`: move a session's web-surface jar to or from a Netscape
+/// file.
+///
+/// This is the verb that makes an agent's flow SPLITTABLE — script the
+/// mechanical parts on curl, hand the session to a surface for the one step
+/// that genuinely needs a browser, hand it back. It was proven both necessary
+/// and sufficient in the field: transplanting one PHPSESSID into a browser made
+/// rtionline render the applicant's name and the fee.
+///
+/// ⚠ THE PROFILE. The cookie manager belongs to the surface's `WebContext`,
+/// which is its PROFILE, and a surface with no explicit profile is `default` —
+/// the user's own browsing jar. Nothing here can make that safe, so the answer
+/// always REPORTS which profile was written, and the trace records domains and
+/// counts and never a value.
+async fn web_surface_cookies_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    direction: WebCookieDirection,
+    jar_path: &str,
+) -> Value {
+    use crate::netscape_cookie_jar::{CookieSpec, format_netscape_jar, parse_netscape_jar};
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let profile = web_surface_active_profile(state, &session).unwrap_or_default();
+    let path = std::path::PathBuf::from(jar_path);
+    match direction {
+        WebCookieDirection::Import => {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": format!("read {}: {error}", path.display()),
+                    });
+                }
+            };
+            let specs = match parse_netscape_jar(&text) {
+                Ok(specs) => specs,
+                Err(reason) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": format!("bad_jar: {reason}"),
+                    });
+                }
+            };
+            let domains = cookie_domains(&specs);
+            let records: Vec<dioxus::desktop::CookieRecord> = specs
+                .iter()
+                .map(|spec| dioxus::desktop::CookieRecord {
+                    name: spec.name.clone(),
+                    value: spec.value.clone(),
+                    domain: spec.domain.clone(),
+                    path: spec.path.clone(),
+                    expires_unix: spec.expires_unix,
+                    secure: spec.secure,
+                    http_only: spec.http_only,
+                })
+                .collect();
+            let requested = records.len();
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+            if let Err(reason) = desktop.import_web_surface_cookies(native_id, records, move |outcome| {
+                let _ = tx.send(outcome);
+            }) {
+                return json!({ "accepted": false, "session_path": session, "reason": reason });
+            }
+            let added = match tokio::time::timeout(Duration::from_secs(20), rx).await {
+                Ok(Ok(Ok(added))) => added,
+                Ok(Ok(Err(reason))) => {
+                    return json!({ "accepted": false, "session_path": session, "reason": reason });
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie import callback dropped (surface destroyed?)",
+                    });
+                }
+                Err(_) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie import timed out (20s)",
+                    });
+                }
+            };
+            // Domains and counts. NEVER a name/value pair — a jar is
+            // credentials, and a trace file is not where they belong.
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "web_surface",
+                    "cookies_imported",
+                    json!({
+                        "session_path": session,
+                        "profile": profile,
+                        "count": added,
+                        "domains": domains,
+                    }),
+                );
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "direction": "import",
+                // WHICH JAR was written. An agent that meant to drive an
+                // `agent-N` profile and finds `default` here has just written
+                // the user's own browsing jar, and needs to know immediately.
+                "profile": profile,
+                "requested": requested,
+                "count": added,
+                "domains": domains,
+                "jar_path": path.to_string_lossy(),
+            })
+        }
+        WebCookieDirection::Export => {
+            let (tx, rx) =
+                tokio::sync::oneshot::channel::<Result<Vec<dioxus::desktop::CookieRecord>, String>>();
+            if let Err(reason) = desktop.export_web_surface_cookies(native_id, move |outcome| {
+                let _ = tx.send(outcome);
+            }) {
+                return json!({ "accepted": false, "session_path": session, "reason": reason });
+            }
+            let records = match tokio::time::timeout(Duration::from_secs(20), rx).await {
+                Ok(Ok(Ok(records))) => records,
+                Ok(Ok(Err(reason))) => {
+                    return json!({ "accepted": false, "session_path": session, "reason": reason });
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie export callback dropped (surface destroyed?)",
+                    });
+                }
+                Err(_) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie export timed out (20s)",
+                    });
+                }
+            };
+            let specs: Vec<CookieSpec> = records
+                .into_iter()
+                .map(|record| CookieSpec {
+                    name: record.name,
+                    value: record.value,
+                    domain: record.domain,
+                    path: record.path,
+                    expires_unix: record.expires_unix,
+                    secure: record.secure,
+                    http_only: record.http_only,
+                })
+                .collect();
+            let domains = cookie_domains(&specs);
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": format!("create {}: {error}", parent.display()),
+                });
+            }
+            // 0600: these bytes are live session credentials, not a report.
+            if let Err(error) =
+                crate::netscape_cookie_jar::write_jar_file(&path, &format_netscape_jar(&specs))
+            {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": format!("write {}: {error}", path.display()),
+                });
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "direction": "export",
+                "profile": profile,
+                "count": specs.len(),
+                "domains": domains,
+                "jar_path": path.to_string_lossy(),
+                // SAY WHAT THIS IS NOT. WebKitGTK 4.x has no dump-the-whole-jar
+                // API: `cookies()` is per-URI and libsoup enforces the cookie's
+                // path against it, so this is every ROOT-PATH cookie of every
+                // domain the jar knows, and path-scoped cookies are missing.
+                // Implying completeness would be the lie; reading the on-disk
+                // sqlite jar to close the gap would be a second encoding of the
+                // cookie store and blind to unflushed in-memory state.
+                "export_scope": "root_path_per_domain",
+            })
+        }
+    }
+}
+
+/// The domains a jar touches, deduplicated and sorted. Reported and journalled
+/// instead of the cookies themselves — it is the part a human needs to sanity
+/// check ("did I just write my bank cookie into the wrong profile?") and it
+/// carries no credential. PURE.
+fn cookie_domains(specs: &[crate::netscape_cookie_jar::CookieSpec]) -> Vec<String> {
+    let mut domains: Vec<String> = specs.iter().map(|spec| spec.domain.clone()).collect();
+    domains.sort();
+    domains.dedup();
+    domains
 }
 
 /// App-control: full-document PNG capture of a session's active web-surface
@@ -48851,7 +52327,8 @@ async fn web_surface_totp_for(
         false
     };
     let script = web_surface_totp_script(&code, &format!("yggterm · code for {entry_name}"));
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -48862,12 +52339,15 @@ async fn web_surface_totp_for(
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or(value_json),
-        Ok(Ok(Err(js_error))) => {
+        Ok(Ok(Err(failure))) => {
+            let reason = eval_failure_reason(failure.kind, true);
             return json!({
                 "accepted": false,
                 "session_path": session,
-                "reason": format!("js: {js_error}"),
-            })
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                "engine_message": failure.message,
+            });
         }
         Ok(Err(_)) => {
             return json!({
@@ -48993,6 +52473,217 @@ fn web_surface_fill_script(host: &str, credential: &WebLoginCredential) -> Strin
 /// from the local vault. The ENGINE's current page URI is the origin truth
 /// (the shell nav model may lag in-page navigation) — the page cannot lie
 /// about it, so a credential can only ever land on its own origin.
+/// The vault CLI arguments for one named field. PURE, so the whitelist and the
+/// subcommand mapping are testable without a vault.
+///
+/// `ychrome-vault` prints only the field asked for, and its `get --field` is
+/// whitelisted client-side to the login fields. Card fields go through a `card`
+/// op that does not exist yet — see [`VaultFieldSource::Card`].
+fn vault_field_args(
+    source: VaultFieldSource,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let field = field.trim().to_ascii_lowercase();
+    let (subcommand, allowed): (&str, &[&str]) = match source {
+        VaultFieldSource::Login => ("get", &["password", "username", "totp", "notes"]),
+        VaultFieldSource::Card => ("card", &["number", "expiry", "code", "holder"]),
+    };
+    if !allowed.contains(&field.as_str()) {
+        return Err(format!(
+            "unknown vault field {field:?} for this item kind (expected one of {allowed:?})"
+        ));
+    }
+    // `totp` is its own subcommand, not a field of `get` — one mapping, here.
+    let mut args: Vec<String> = if source == VaultFieldSource::Login && field == "totp" {
+        vec!["totp".to_string(), item.to_string()]
+    } else {
+        vec![
+            subcommand.to_string(),
+            item.to_string(),
+            "--field".to_string(),
+            field,
+        ]
+    };
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        args.push(user.to_string());
+    }
+    Ok(args)
+}
+
+/// Is this vault CLI failure "that subcommand does not exist"?
+///
+/// PURE so it is testable, and narrow on purpose: it must not swallow a real
+/// failure (a locked vault, a missing item) as "not implemented yet", because
+/// that would send an agent off relaunching a CLI that is working fine.
+fn vault_failure_is_missing_subcommand(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("unrecognized subcommand")
+        || error.contains("unknown subcommand")
+        || error.contains("invalid subcommand")
+        || error.contains("unexpected argument")
+}
+
+/// A secret the vault CLI would not vouch for. `ychrome-vault` prints its ERRORS
+/// to stdout, so a caller that captures stdout can capture `Error: … has no
+/// username` AS the credential — and type it into a bank login.
+///
+/// `vault_cli_output` already checks the exit status first, which is why yggterm
+/// is safe today; this is the belt to that braces, so a future exit-code
+/// regression in that CLI cannot silently become a typed error message. PURE.
+fn vault_secret_is_unusable(secret: &str) -> Option<&'static str> {
+    if secret.is_empty() {
+        return Some("vault_field_empty");
+    }
+    if secret.starts_with("Error:") || secret.starts_with("error:") {
+        return Some("vault_returned_an_error_as_the_value");
+    }
+    None
+}
+
+/// App-control `fill-vault`: type ONE named vault field into ONE addressed
+/// element, with real keys.
+///
+/// Why real keys and not a scripted value write: `web_surface_fill_script` sets
+/// `.value` through the native setter and dispatches `input`/`change`, which a
+/// component that keeps its own state ignores — the a services portal measurement
+/// showed the DOM reading correct while the widget held the stale value, so the
+/// readback LIED. This path reuses `WebSurfaceDoAction::Fill`, i.e. the same
+/// clear-with-real-keys → type-with-real-keys → read-back machinery a `do fill`
+/// runs, gated by the same lane.
+///
+/// Redaction invariants this upholds, and they are the point of the verb:
+/// the value appears in `data`, in `error` and in the trace event NOWHERE. The
+/// answer is `{item, field, chars, matched}` — a length and a page-side boolean
+/// — mirroring the field note's "injected password of <item> (15 chars, not
+/// shown)".
+async fn web_surface_fill_vault_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    target: &WebElementRef,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+    source: VaultFieldSource,
+    expected_generation: Option<u64>,
+) -> Value {
+    let args = match vault_field_args(source, item, field, user) {
+        Ok(args) => args,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, false).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    // Same page-origin guard as `web fill`: a credential goes into an https
+    // page or a loopback fixture, never a plaintext remote one.
+    let Some((page_url, _, _)) = desktop.web_surface_page_state(native_id) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "surface has no page state",
+        });
+    };
+    if !page_url.starts_with("https://") && !web_surface_url_is_loopback(&page_url) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("refusing to fill a non-https page: {page_url}"),
+        });
+    }
+    let owned: Vec<String> = args;
+    let secret = match task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        vault_cli_output(&borrowed)
+    })
+    .await
+    .unwrap_or_else(|join| Err(format!("vault task failed: {join}")))
+    {
+        Ok(secret) => secret,
+        Err(reason) => {
+            // The card op does not exist yet. Say exactly that instead of a
+            // generic failure, so the day it lands this verb starts working
+            // with no yggterm change — and so nobody debugs the wrong thing.
+            let reason = if source == VaultFieldSource::Card
+                && vault_failure_is_missing_subcommand(&reason)
+            {
+                "vault_cli_no_card_op".to_string()
+            } else {
+                reason
+            };
+            return json!({ "accepted": false, "session_path": session, "reason": reason });
+        }
+    };
+    if let Some(reason) = vault_secret_is_unusable(&secret) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "item": item,
+            "field": field,
+            "reason": reason,
+        });
+    }
+    let chars = secret.chars().count();
+    let action = WebSurfaceDoAction::Fill {
+        text: secret,
+        selector: Some(target.clone()),
+        selectors: Vec::new(),
+    };
+    let (result, delivery) = web_do_execute_one(desktop, native_id, &action).await;
+    // The trace carries NAMES and a length. Never the value, never the page's
+    // read-back string.
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "web_surface",
+            "fill_vault",
+            json!({
+                "session_path": session,
+                "item": item,
+                "field": field,
+                "source": source,
+                "chars": chars,
+                "accepted": result.is_ok(),
+            }),
+        );
+    }
+    match result {
+        Ok(detail) => {
+            let mut answer = json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "generation": handle.generation,
+                "item": item,
+                "field": field,
+                // A LENGTH, never the value.
+                "chars": chars,
+                // The page-side boolean from the fill readback; `null` means it
+                // could not be read, which is not the same as "no".
+                "matched": detail.get("matched").cloned().unwrap_or(Value::Null),
+                "cleared_verified": detail
+                    .get("cleared_verified")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            });
+            web_do_apply_delivery(&mut answer, delivery);
+            answer
+        }
+        Err(reason) => json!({
+            "accepted": false,
+            "session_path": session,
+            "item": item,
+            "field": field,
+            "reason": reason,
+        }),
+    }
+}
+
 async fn web_surface_fill_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -49043,7 +52734,8 @@ async fn web_surface_fill_for(
         }
     };
     let script = web_surface_fill_script(&host, &credential);
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -49069,11 +52761,16 @@ async fn web_surface_fill_for(
                 },
             })
         }
-        Ok(Ok(Err(js_error))) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": format!("js: {js_error}"),
-        }),
+        Ok(Ok(Err(failure))) => {
+            let reason = eval_failure_reason(failure.kind, true);
+            json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                "engine_message": failure.message,
+            })
+        }
         Ok(Err(_)) => json!({
             "accepted": false,
             "session_path": session,
@@ -51257,20 +54954,40 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
-        AppControlCommand::RestartPendingUpdate => {
-            restart_into_pending_update(state);
-            sleep(Duration::from_millis(40)).await;
-            AppControlResponse {
-                request_id: request.request_id.clone(),
-                handled_by_pid: std::process::id(),
-                completed_at_ms: current_millis() as u128,
-                output_path: None,
-                data: Some(json!({
-                    "command": "restart_pending_update",
-                    "window": describe_window(&desktop),
-                    "state": describe_app_state_snapshot(&state, &desktop),
-                })),
-                error: None,
+        AppControlCommand::RestartPendingUpdate { force } => {
+            // N5: a deploy that lands mid-flow kills the flow. The lease is
+            // already the surface's own claim, so this door simply CHECKS it.
+            let refusal = agent_lease_refusal(
+                &live_agent_leases(&state, current_millis() as u64),
+                force,
+            );
+            if let Some(refusal) = refusal {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    error: refusal
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    data: Some(refusal),
+                }
+            } else {
+                restart_into_pending_update(state);
+                sleep(Duration::from_millis(40)).await;
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "command": "restart_pending_update",
+                        "window": describe_window(&desktop),
+                        "state": describe_app_state_snapshot(&state, &desktop),
+                    })),
+                    error: None,
+                }
             }
         }
         AppControlCommand::CaptureScreenshot {
@@ -51770,28 +55487,49 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
-        AppControlCommand::CloseWindowPreservingSessions { reason } => {
-            let maximized = desktop.is_maximized();
-            state.with_mut(|shell| shell.remember_window_maximized(maximized));
-            let data = json!({
-                "close_requested": true,
-                "preserve_live_sessions": true,
-                "reason": reason,
-                "window": describe_window(&desktop),
-            });
-            let close_state = state;
-            let reason_for_task = reason.clone();
-            spawn(async move {
-                sleep(Duration::from_millis(80)).await;
-                close_window_preserving_live_sessions(close_state, reason_for_task);
-            });
-            AppControlResponse {
-                request_id: request.request_id.clone(),
-                handled_by_pid: std::process::id(),
-                completed_at_ms: current_millis() as u128,
-                output_path: None,
-                data: Some(data),
-                error: None,
+        AppControlCommand::CloseWindowPreservingSessions { reason, force } => {
+            // The OTHER deploy door. Guarding one and leaving this open would
+            // be exactly the surface inconsistency the house rules call a spec
+            // violation.
+            let refusal = agent_lease_refusal(
+                &live_agent_leases(&state, current_millis() as u64),
+                force,
+            );
+            if let Some(refusal) = refusal {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    error: refusal
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    data: Some(refusal),
+                }
+            } else {
+                let maximized = desktop.is_maximized();
+                state.with_mut(|shell| shell.remember_window_maximized(maximized));
+                let data = json!({
+                    "close_requested": true,
+                    "preserve_live_sessions": true,
+                    "reason": reason,
+                    "window": describe_window(&desktop),
+                });
+                let close_state = state;
+                let reason_for_task = reason.clone();
+                spawn(async move {
+                    sleep(Duration::from_millis(80)).await;
+                    close_window_preserving_live_sessions(close_state, reason_for_task);
+                });
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(data),
+                    error: None,
+                }
             }
         }
         AppControlCommand::Pointer { command } => {
@@ -51948,6 +55686,7 @@ async fn process_pending_app_control_requests(
                     &desktop,
                     params.session_path.as_deref(),
                     &script,
+                    None,
                 )
                 .await;
                 let error = result
@@ -53074,9 +56813,16 @@ async fn process_pending_app_control_requests(
         AppControlCommand::WebSurfaceEval {
             session_path,
             script,
+            frame,
         } => {
-            let result =
-                web_surface_eval_for(&state, &desktop, session_path.as_deref(), &script).await;
+            let result = web_surface_eval_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &script,
+                frame.as_ref(),
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -53119,6 +56865,122 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceAwait {
+            session_path,
+            script,
+            timeout_ms,
+        } => {
+            let data = web_surface_await_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &script,
+                timeout_ms,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("await failed")
+                        .to_string()
+                }),
+                data: Some(data),
+            }
+        }
+        AppControlCommand::WebSurfaceFrames { session_path } => {
+            let data = web_surface_frames_for(&state, &desktop, session_path.as_deref()).await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("frames verb failed")
+                        .to_string()
+                }),
+                data: Some(data),
+            }
+        }
+        AppControlCommand::WebSurfaceCookies {
+            session_path,
+            direction,
+            jar_path,
+        } => {
+            let data = web_surface_cookies_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                direction,
+                &jar_path,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: (accepted && direction == WebCookieDirection::Export)
+                    .then(|| jar_path.clone()),
+                data: Some(data.clone()),
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cookies verb failed")
+                        .to_string()
+                }),
+            }
+        }
+        AppControlCommand::WebSurfaceCaptureElement {
+            session_path,
+            target,
+            output_path,
+            split,
+        } => {
+            let data = web_surface_capture_element_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &target,
+                &output_path,
+                split,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: accepted.then(|| output_path.clone()),
+                data: Some(data.clone()),
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capture-element failed")
+                        .to_string()
+                }),
             }
         }
         AppControlCommand::WebSurfaceDevtools { session_path, open } => {
@@ -53164,6 +57026,46 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceFillVault {
+            session_path,
+            target,
+            item,
+            field,
+            user,
+            source,
+            generation,
+        } => {
+            let data = web_surface_fill_vault_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &target,
+                &item,
+                &field,
+                user.as_deref(),
+                source,
+                generation,
+            )
+            .await;
+            let error = (!data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+            .then(|| {
+                data.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fill-vault failed")
+                    .to_string()
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error,
             }
         }
         AppControlCommand::WebSurfaceTotp {
@@ -53224,9 +57126,57 @@ async fn process_pending_app_control_requests(
                 data: Some(result),
             }
         }
-        AppControlCommand::WebSurfaceRead { session_path, mode } => {
-            let result =
-                web_surface_read_for(&state, &desktop, session_path.as_deref(), mode).await;
+        AppControlCommand::WebSurfaceBatch {
+            session_path,
+            actions,
+            generation,
+            stop_on_error,
+        } => {
+            let data = web_surface_batch_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &actions,
+                generation,
+                stop_on_error,
+            )
+            .await;
+            let error = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then_some(None)
+                .unwrap_or_else(|| {
+                    Some(
+                        data.get("abort_reason")
+                            .and_then(Value::as_str)
+                            .or_else(|| data.get("reason").and_then(Value::as_str))
+                            .unwrap_or("web batch did not complete")
+                            .to_string(),
+                    )
+                });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error,
+            }
+        }
+        AppControlCommand::WebSurfaceRead {
+            session_path,
+            mode,
+            frame,
+        } => {
+            let result = web_surface_read_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                mode,
+                frame.as_ref(),
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -53276,17 +57226,41 @@ async fn process_pending_app_control_requests(
         } => {
             let ttl = ttl_secs.unwrap_or(600).clamp(30, 3600);
             let until = current_millis() + ttl * 1000;
-            // A session whose host was never mounted (a `--no-activate` spawn)
-            // or whose surface the reaper collected has nothing in
-            // `web_surfaces` — but the daemon kept the app's declare. Rebuild
-            // from it BEFORE answering, so `ensure` means ensure.
-            let rebuilt_from_daemon_declare = state.with(|shell| {
-                shell
-                    .web_surfaces
-                    .get(&session_path)
-                    .map(|surface| surface.tabs.is_empty())
-                    .unwrap_or(true)
-            }) && rebuild_web_surface_from_daemon_declare(state, home.clone(), &session_path).await;
+            // LIVENESS, not emptiness (N1). A dead webview entry is not empty,
+            // so the old `tabs.is_empty()` test handed a caller back the same
+            // corpse and reported success.
+            let probe_before =
+                web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let generation_before = probe_before.get("generation").and_then(Value::as_u64);
+            let alive_before = probe_before
+                .get("alive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut rebuild = None;
+            let mut reloaded = false;
+            if !alive_before {
+                if probe_before.get("tabs").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                    // Nothing here at all: the daemon's retained declare is the
+                    // only way back.
+                    rebuild = Some(
+                        rebuild_web_surface_from_daemon_declare(
+                            state,
+                            home.clone(),
+                            &session_path,
+                        )
+                        .await,
+                    );
+                } else {
+                    // A tab exists but its page is a corpse. Bump the tab's
+                    // reload nonce and let the reconciler's EXISTING
+                    // destroy-and-recreate branch do the work — that branch
+                    // mints a fresh generation, which is precisely the
+                    // healed-vs-corpse signal. A second destroy path here would
+                    // be a second owner of surface teardown.
+                    state.with_mut(|shell| shell.web_surface_reload_active_tab(&session_path));
+                    reloaded = true;
+                }
+            }
             let tabs = state.with_mut(|shell| {
                 let tabs = shell
                     .web_surfaces
@@ -53302,21 +57276,117 @@ async fn process_pending_app_control_requests(
             });
             let lease = (tabs > 0)
                 .then(|| web_surface_lease_for(&mut state, Some(session_path.as_str()), ttl));
+            let probe_after =
+                web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let generation_after = probe_after.get("generation").and_then(Value::as_u64);
+            let accepted = tabs > 0;
+            // HEALED means a NEW incarnation. A caller comparing the two
+            // generations learns whether it got a fresh page or the same
+            // corpse, which is the whole ask — `accepted: true` on its own
+            // never distinguished them.
+            let healed = !alive_before
+                && (generation_after != generation_before
+                    || rebuild.as_ref().is_some_and(DeclareRebuild::rebuilt));
+            // N4: five different facts used to share one string. Each of these
+            // needs a different action, and guessing which cost real time.
+            let (reason, detail) = if accepted && alive_before {
+                ("already_live", format!("{session_path} already has a live surface"))
+            } else if accepted && healed {
+                ("healed", format!("{session_path} was rebuilt into a new incarnation"))
+            } else if accepted && reloaded {
+                (
+                    "reload_pending",
+                    format!(
+                        "{session_path}'s page was unresponsive; a rebuild is queued — re-run ensure and compare generation_after"
+                    ),
+                )
+            } else if accepted {
+                ("present_but_unproven", format!("{session_path} has a tab, but its page did not answer a probe"))
+            } else {
+                match rebuild.as_ref() {
+                    Some(rebuild) => (rebuild.reason(), rebuild.detail(&session_path)),
+                    None => (
+                        "no_web_surface",
+                        format!("{session_path} has no web surface and no rebuild was attempted"),
+                    ),
+                }
+            };
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
                 completed_at_ms: current_millis() as u128,
                 output_path: None,
-                error: (tabs == 0)
-                    .then(|| format!("no declared web surface for {session_path}")),
+                error: (!accepted).then(|| detail.clone()),
                 data: Some(json!({
-                    "accepted": tabs > 0,
+                    "accepted": accepted,
                     "session_path": session_path,
                     "tabs": tabs,
                     "wanted_until_ms": until,
                     "ttl_secs": ttl,
                     "lease": lease,
-                    "rebuilt_from_daemon_declare": rebuilt_from_daemon_declare,
+                    "reason": reason,
+                    "detail": detail,
+                    "healed": healed,
+                    "generation_before": generation_before,
+                    "generation_after": generation_after,
+                    "probe": probe_before,
+                    "probe_after": probe_after,
+                    "rebuilt_from_daemon_declare": rebuild
+                        .as_ref()
+                        .is_some_and(DeclareRebuild::rebuilt),
+                })),
+            }
+        }
+        AppControlCommand::WebSurfaceReload { session_path } => {
+            // Bump the active tab's reload nonce; the reconciler's existing
+            // destroy-and-recreate branch mints a fresh generation. Reported so
+            // a caller can tell a healed surface from the same corpse.
+            let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let existed = state.with_mut(|shell| {
+                let existed = shell.web_surfaces.contains_key(&session_path);
+                if existed {
+                    shell.web_surface_reload_active_tab(&session_path);
+                }
+                existed
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!existed)
+                    .then(|| format!("{session_path} has no web surface to reload")),
+                data: Some(json!({
+                    "accepted": existed,
+                    "session_path": session_path,
+                    "generation_before": before.get("generation"),
+                    // The rebuild happens on the next reconcile, so the NEW
+                    // generation is not knowable here. Say so rather than
+                    // reporting the old one as if it were the new one.
+                    "generation_after": Value::Null,
+                    "detail": "reload queued; re-run `web ensure` and compare generation_after",
+                })),
+            }
+        }
+        AppControlCommand::WebSurfaceClose { session_path } => {
+            let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let closed = state.with_mut(|shell| shell.close_web_surface(&session_path));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!closed).then(|| format!("{session_path} has no web surface to close")),
+                data: Some(json!({
+                    "accepted": closed,
+                    "session_path": session_path,
+                    "generation_before": before.get("generation"),
+                    // `close_web_surface` also records a deliberate-close mark,
+                    // which blocks a HEARTBEAT resurrection for a grace window
+                    // — but NOT an explicit `web ensure`, because the rebuild
+                    // path never consults that map. Do not "fix" that: a
+                    // heartbeat is liveness, an ensure is intent.
+                    "detail": "closed; `web ensure` can rebuild it from the daemon's declare",
                 })),
             }
         }
@@ -54050,6 +58120,53 @@ async fn process_pending_app_control_requests(
             output_path: None,
             data: Some(describe_app_rows_snapshot(&state)),
             error: None,
+        },
+        // A well-formed request whose `kind` this GUI build does not know.
+        // App-control is a filesystem dropbox, so a NEWER CLI can hand this
+        // window a verb it has never heard of. Before `AppControlCommand::
+        // Unsupported` existed the request file was silently deleted and the
+        // caller saw a bare timeout; answering honestly is the whole point of
+        // the variant. Deliberately does not echo a payload — the request file
+        // is the one copy of it.
+        AppControlCommand::Unsupported => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(json!({
+                "accepted": false,
+                "reason": "unsupported_command_kind",
+                "gui_version": env!("CARGO_PKG_VERSION"),
+            })),
+            error: Some(
+                "this GUI build does not implement that app-control command; swap the GUI binary (server app clients shows its pid/started_at)"
+                    .to_string(),
+            ),
+        },
+        // A kind this GUI KNOWS, whose payload it cannot read — a field of an
+        // existing command changed shape (e.g. `selector` became an object when
+        // text/role addressing landed). Same dropbox, same failure mode, same
+        // answer: refuse with the reason rather than let the file be deleted and
+        // the caller time out. The serde message names the field and what it
+        // expected, which is the whole clue.
+        AppControlCommand::Unreadable {
+            requested_kind,
+            detail,
+        } => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(json!({
+                "accepted": false,
+                "reason": "unreadable_command_payload",
+                "kind": requested_kind,
+                "detail": detail,
+                "gui_version": env!("CARGO_PKG_VERSION"),
+            })),
+            error: Some(format!(
+                "this GUI build cannot read that app-control command's payload ({requested_kind}): {detail}; swap the GUI binary (server app clients shows its pid/started_at)"
+            )),
         },
         AppControlCommand::ListCommands => {
             let keymap = state.read().keymap.clone();

@@ -25,8 +25,9 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, WebSurfaceDoAction, WebSurfaceReadAs,
-    WebSurfaceWaitUntil, app_control_captures_dir,
+    ProbeTerminalViewportInputMode, ScreenshotTarget, VaultFieldSource, WebCookieDirection,
+    WebElementRef, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
+    app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -17594,9 +17595,16 @@ pub fn run_app_control_trigger_update_check(timeout_ms: u64) -> anyhow::Result<(
     Ok(())
 }
 
-pub fn run_app_control_restart_pending_update(timeout_ms: u64) -> anyhow::Result<()> {
+/// `force` overrides the agent-lease guard: a deploy that lands mid-flow kills
+/// the flow, so the GUI refuses while a lease is live unless the caller says it
+/// means it.
+pub fn run_app_control_restart_pending_update(force: bool, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
-    let response = request_app_control(&home, AppControlCommand::RestartPendingUpdate, timeout_ms)?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::RestartPendingUpdate { force },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -17699,11 +17707,12 @@ pub fn run_app_control_close_window(timeout_ms: u64) -> anyhow::Result<()> {
 pub fn run_app_control_close_window_preserving_sessions(
     timeout_ms: u64,
     reason: Option<String>,
+    force: bool,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
-        AppControlCommand::CloseWindowPreservingSessions { reason },
+        AppControlCommand::CloseWindowPreservingSessions { reason, force },
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
@@ -19772,18 +19781,47 @@ fn daemon_screen_read_terminal_buffer_payload(
 pub fn run_app_control_web_surface_eval(
     session_path: Option<&str>,
     script: &str,
+    frame: Option<WebFrameRef>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
+    let asked_for_a_frame = frame.is_some();
     let response = request_app_control(
         &home,
         AppControlCommand::WebSurfaceEval {
             session_path: session_path.map(str::to_string),
             script: script.to_string(),
+            frame,
         },
         timeout_ms,
     )?;
+    require_frame_echo(&response, asked_for_a_frame)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// HARD-FAIL when `--frame` was asked for and the answer does not mention it.
+///
+/// A `#[serde(default)]` field is dropped WITHOUT COMPLAINT by an older GUI, so
+/// the request still succeeds — against the TOP DOCUMENT, returning `[]`, which
+/// is precisely the silent failure `--frame` exists to kill. A timeout would be
+/// better than that; a wrong answer that looks right is the worst outcome. So
+/// the response must echo `frame_resolved`, and its ABSENCE is the signal.
+fn require_frame_echo(response: &AppControlResponse, asked_for_a_frame: bool) -> anyhow::Result<()> {
+    if !asked_for_a_frame {
+        return Ok(());
+    }
+    let echoed = response
+        .data
+        .as_ref()
+        .is_some_and(|data| data.get("frame_resolved").is_some());
+    if !echoed {
+        anyhow::bail!(
+            "this GUI build does not implement --frame: it answered without echoing \
+             `frame_resolved`, which means the query ran against the TOP DOCUMENT. \
+             Swap the GUI binary (`server app clients` shows its pid/started_at)."
+        );
+    }
     Ok(())
 }
 
@@ -19894,6 +19932,210 @@ pub fn run_app_control_web_surface_do(
     Ok(())
 }
 
+/// Force a session's web surface into a NEW incarnation, and close one.
+///
+/// The recovery an agent previously had to reach `session remove` for — which
+/// destroyed a whole work session to fix one tab.
+pub fn run_app_control_web_surface_reload(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceReload {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_web_surface_close(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceClose {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Run an async script and return its resolved value (`web await`).
+///
+/// The request timeout is the AWAIT budget plus headroom, following the `wait`
+/// precedent: a verb that legitimately blocks sets its own transport timeout,
+/// or the answer gets cut off by the transport and the caller cannot tell a
+/// slow promise from a wedged window.
+pub fn run_app_control_web_surface_await(
+    session_path: Option<&str>,
+    script: &str,
+    await_timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceAwait {
+            session_path: session_path.map(str::to_string),
+            script: script.to_string(),
+            timeout_ms: await_timeout_ms,
+        },
+        await_timeout_ms.saturating_add(5_000),
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Enumerate the page's frames: url, element counts, reachability.
+pub fn run_app_control_web_surface_frames(
+    session_path: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFrames {
+            session_path: session_path.map(str::to_string),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Move a session's web-surface cookie jar to or from a Netscape file.
+///
+/// The jar path is absolutized CLI-side for the same reason a screenshot's
+/// output path is: the GUI has its own cwd, so a relative path on an import
+/// would read a file the caller never wrote.
+pub fn run_app_control_web_surface_cookies(
+    session_path: Option<&str>,
+    direction: WebCookieDirection,
+    jar_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let jar = std::path::Path::new(jar_path);
+    let jar = if jar.is_absolute() {
+        jar.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(jar)
+    };
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceCookies {
+            session_path: session_path.map(str::to_string),
+            direction,
+            jar_path: jar.to_string_lossy().to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Rasterize one addressed element to a PNG, in the page (`capture-element`).
+///
+/// The output path is absolutized CLI-side: the GUI has its own cwd, so a
+/// relative path would land somewhere the caller never looks — the same reason
+/// `run_app_control_web_surface_screenshot` does it.
+pub fn run_app_control_web_surface_capture_element(
+    session_path: Option<&str>,
+    target: WebElementRef,
+    output_path: &str,
+    split: Option<usize>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let absolute = std::path::Path::new(output_path);
+    let absolute = if absolute.is_absolute() {
+        absolute.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(absolute)
+    };
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceCaptureElement {
+            session_path: session_path.map(str::to_string),
+            target,
+            output_path: absolute.to_string_lossy().to_string(),
+            split,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Type one named vault field into one addressed element (`fill-vault`).
+///
+/// Nothing about the secret crosses this boundary: the CLI names the ITEM and
+/// the FIELD, the GUI reads the value in-process and types it, and the response
+/// carries a length plus a page-side boolean.
+pub fn run_app_control_web_surface_fill_vault(
+    session_path: Option<&str>,
+    target: WebElementRef,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+    source: VaultFieldSource,
+    generation: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFillVault {
+            session_path: session_path.map(str::to_string),
+            target,
+            item: item.to_string(),
+            field: field.to_string(),
+            user: user.map(str::to_string),
+            source,
+            generation,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Run N `do` actions in ONE agent batch (agent control plane `batch`).
+///
+/// The request timeout scales with the batch: every action can pay a resolve
+/// eval, an arm, the injection and a readback, so a fixed timeout would cut off
+/// a long batch mid-flight and leave the caller unable to tell "the window is
+/// wedged" from "the batch is still working". Follows the `wait` precedent of a
+/// verb setting its own generous timeout.
+pub fn run_app_control_web_surface_batch(
+    session_path: Option<&str>,
+    actions: Vec<WebSurfaceDoAction>,
+    generation: Option<u64>,
+    stop_on_error: bool,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let request_timeout_ms = (actions.len() as u64).saturating_mul(3_000) + 15_000;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceBatch {
+            session_path: session_path.map(str::to_string),
+            actions,
+            generation,
+            stop_on_error,
+        },
+        request_timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 /// Claim a session's web surface so the background reaper leaves it alone while
 /// unattended agent work runs (agent control plane `lease`, slice 2b). The lease
 /// only ever EXTENDS the background hold; `ttl_secs: 0` releases it.
@@ -19938,17 +20180,21 @@ pub fn run_app_control_web_surface_lease(
 pub fn run_app_control_web_surface_read(
     session_path: Option<&str>,
     mode: WebSurfaceReadAs,
+    frame: Option<WebFrameRef>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
+    let asked_for_a_frame = frame.is_some();
     let response = request_app_control(
         &home,
         AppControlCommand::WebSurfaceRead {
             session_path: session_path.map(str::to_string),
             mode,
+            frame,
         },
         timeout_ms,
     )?;
+    require_frame_echo(&response, asked_for_a_frame)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }

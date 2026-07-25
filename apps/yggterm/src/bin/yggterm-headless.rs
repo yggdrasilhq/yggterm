@@ -1627,6 +1627,7 @@ fn main() -> Result<()> {
                     run_app_control_close_window_preserving_sessions(
                         timeout_ms,
                         Some("manual-preserve-close".to_string()),
+                        args.iter().any(|arg| arg == "--force"),
                     )
                 } else {
                     run_app_control_close_window(timeout_ms)
@@ -1751,7 +1752,14 @@ fn main() -> Result<()> {
                     .unwrap_or("check");
                 match action {
                     "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
-                    "restart" => run_app_control_restart_pending_update(timeout_ms),
+                    // Refuses while an agent holds a live web-surface lease
+                    // (`agent_lease_active`) — a deploy that lands mid-flow
+                    // kills the flow. `--force` says you mean it. Pre-flight
+                    // with `server app state | jq .agent_leases`.
+                    "restart" => run_app_control_restart_pending_update(
+                        args.iter().any(|arg| arg == "--force"),
+                        timeout_ms,
+                    ),
                     other => anyhow::bail!("unsupported app update action: {other}"),
                 }
             }
