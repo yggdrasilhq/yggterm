@@ -22,10 +22,15 @@ fix) once the fix is verified live on jojo.
   five shell + three python launcher re-encodings are deleted and the launcher
   marker is `v4` so installed launchers get rewritten.
   **WHAT IS STILL OWED, and why this entry is still open:** a GUI swap on the
-  live host and then, in order — `server app state` shows
-  `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_probed` with `LIBGL_ALWAYS_SOFTWARE` and
-  `GALLIUM_DRIVER` and `WEBKIT_DISABLE_DMABUF_RENDERER` all ABSENT and
-  `YGGTERM_WEB_SURFACE_UNDER_GLASS=1`; `drm-engine-gfx` PRESENT and RISING in
+  live host and then, in order — `server app desktop-identity` shows, under the
+  client's `webkit_gl_environment`, `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_probed`
+  with `LIBGL_ALWAYS_SOFTWARE` and `GALLIUM_DRIVER` and
+  `WEBKIT_DISABLE_DMABUF_RENDERER` all ABSENT and
+  `YGGTERM_WEB_SURFACE_UNDER_GLASS=1`. ⚠⚠ **Read it from `webkit_gl_environment`,
+  never from the `exec_environ` map beside it**: that map is
+  `/proc/<pid>/environ`, i.e. the environment the process was LAUNCHED with, and
+  every GL key is written after exec — it shows nothing on a fresh launch and the
+  PREDECESSOR's decision after a hot restart; `drm-engine-gfx` PRESENT and RISING in
   `/proc/<webproc>/fdinfo/*` (this is the decisive gauge — a CPU number alone
   proves nothing); a `render_top` cores delta against the §3a baseline under the
   same workload; three relaunches including one through the supervisor, all

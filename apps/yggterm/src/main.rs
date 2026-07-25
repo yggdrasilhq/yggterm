@@ -6281,6 +6281,7 @@ mod tests {
             xdg_session_id: None,
             xdg_runtime_dir: Some("/run/user/1000".to_string()),
             xauthority: Some("/run/user/1000/xauth".to_string()),
+            webkit_gl_environment: BTreeMap::new(),
         };
         assert!(should_retire_superseded_client(
             &old, 9999, &current, &scope
@@ -6311,6 +6312,7 @@ mod tests {
             xdg_session_id: None,
             xdg_runtime_dir: None,
             xauthority: Some("/run/user/1000/xauth".to_string()),
+            webkit_gl_environment: BTreeMap::new(),
         };
         assert!(!should_retire_superseded_client(
             &same_exe, 9999, &current, &scope
@@ -6331,6 +6333,7 @@ mod tests {
             xdg_session_id: None,
             xdg_runtime_dir: None,
             xauthority: Some("/tmp/xvfb/Xauthority".to_string()),
+            webkit_gl_environment: BTreeMap::new(),
         };
         assert!(!should_retire_superseded_client(
             &other_display,

@@ -198,10 +198,17 @@ breaks clipboard/paste, screenshot faithfulness, and native compositing.**
   the GPU is rasterizing. `render_top`'s `gpu_ms` prints `-` when that counter was
   unreadable, which is NOT a zero: conflating "no permission" with "no GPU work" is
   exactly how this product ran with its GPU switched off for months.
-- **Which GL path a window is on is now a state field, not an ssh into /proc.**
-  `server app state` carries `YGGTERM_WEBKIT_GL_POLICY` plus `LIBGL_ALWAYS_SOFTWARE`,
-  `GALLIUM_DRIVER`, `WEBKIT_DISABLE_DMABUF_RENDERER` and
-  `YGGTERM_WEB_SURFACE_UNDER_GLASS`.
+- **Which GL path a window is on is a published field — and /proc CANNOT answer it.**
+  `server app desktop-identity` gives each client a `webkit_gl_environment` map
+  (`YGGTERM_WEBKIT_GL_POLICY`, `LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`,
+  `WEBKIT_DISABLE_DMABUF_RENDERER`, `YGGTERM_WEB_SURFACE_UNDER_GLASS`) that the GUI
+  publishes from its OWN environment. ⚠⚠ Do not read these out of
+  `/proc/<pid>/environ` — or out of the `exec_environ` map next to it, which is the
+  same thing. `setenv`/`unsetenv` move the environ array to the heap while the kernel
+  keeps exposing the exec-time copy, so `/proc` shows nothing on a fresh launch and
+  the PREDECESSOR's values after a hot restart or `server app launch`. A missing key
+  in `webkit_gl_environment` means the process REMOVED it (hardware GL clears the
+  software force); an empty map means the client published nothing, never "software".
 
 - **`app state` `viewport_y` is STALE when the window is backgrounded.** It can disagree
   with what the user sees. Use the `viewport_force_log` (probe-scroll) and the user's
