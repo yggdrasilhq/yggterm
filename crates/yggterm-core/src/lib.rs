@@ -4,6 +4,7 @@ pub mod agent_scheme;
 pub mod app_registry;
 mod browser;
 pub mod click_grid;
+pub mod gl_probe;
 mod icon;
 mod install;
 mod perf;
