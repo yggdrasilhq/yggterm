@@ -5195,6 +5195,323 @@ fn declared_web_surface_open_from_payload(payload: &Value) -> Option<DeclaredWeb
 /// intent a heartbeat lacks — can materialize the surface with no reveal.
 /// Returns false when the app declared nothing (a plain shell, or an app that
 /// already emitted `close`).
+/// Rebuild this client's rail contribution from the declare the DAEMON already
+/// ingested, for a session this client never saw declare.
+///
+/// A contribution is normally built by parsing OSC 7717 out of the terminal
+/// byte stream — which means it belongs to whichever client was rendering that
+/// terminal at the time. Every other client shows Session Metadata and no
+/// error. Two real consequences, both hit on 2026-07-25:
+///
+///   1. **A GUI restart lost the rail** until the app happened to re-declare;
+///      recovering it meant re-running the app by hand.
+///   2. **A shadow view client could never show a rail at all**, so nothing
+///      rail-shaped could be verified on the agentic surface — which is the
+///      only surface live testing is allowed to use.
+///
+/// The daemon has ingested every declare since `cb4eff9`, and web surfaces
+/// already rebuild from it (`rebuild_web_surface_from_daemon_declare`). This is
+/// the sibling for the `sidebar` verb, feeding the SAME applier the live path
+/// uses so the two cannot mean different things.
+async fn rebuild_sidebar_contribution_from_daemon_declare(
+    state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: &str,
+    ssh_target: Option<String>,
+) -> bool {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let declares = terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home)
+        .await
+        .map(|(records, _running)| records)
+        .unwrap_or_default();
+    let now_ms = current_millis();
+    let Some(record) = declares
+        .into_iter()
+        .find(|record| record.verb == "sidebar" && record.action == "declare")
+    else {
+        return false;
+    };
+    // Decoded by the SAME parser the live OSC path uses — see
+    // `parse_terminal_js_event`.
+    //
+    // The daemon stores the declare's PAYLOAD verbatim, while the event enum is
+    // serde-tagged on `kind` and carries the `action` the OSC held alongside the
+    // payload. So the tag and action are re-attached here rather than writing a
+    // second decoder for the same JSON. Getting this wrong fails silently — the
+    // first cut did exactly that, and the rebuild simply did nothing.
+    let mut tagged = record.payload.clone();
+    let Some(object) = tagged.as_object_mut() else {
+        return false;
+    };
+    object.insert(
+        "kind".to_string(),
+        Value::String("sidebar_contribution".into()),
+    );
+    object.insert("action".to_string(), Value::String(record.action.clone()));
+    let decoded = crate::terminal_protocol::parse_terminal_js_event(tagged);
+    let Some(crate::terminal_protocol::TerminalJsEvent::SidebarContribution {
+        control,
+        panes,
+        policy_version,
+        app_name,
+        zoom_version,
+        appearance_version,
+        document_version,
+        env_id,
+        ..
+    }) = decoded
+    else {
+        // A payload this build cannot read is not an error, but it MUST be
+        // visible: a silent `false` here is indistinguishable from "no declare".
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "sidebar_contribution",
+            "daemon_declare_undecodable",
+            json!({
+                "session_path": session_path,
+                "payload_keys": record
+                    .payload
+                    .as_object()
+                    .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            }),
+        );
+        return false;
+    };
+    // LIVENESS IS THE ENDPOINT, NOT THE TIMESTAMP.
+    //
+    // The first cut gated on the record's age, reasoning that an app
+    // re-declares every ~4s. yedit does not: it declares ONCE and exits, and
+    // the GUI's `/ping` keeps the contribution alive from there. So its record
+    // is legitimately twenty minutes old while the app is perfectly healthy —
+    // live-caught, the rebuild refused a declare whose control endpoint was
+    // answering fine. Age measures how long ago the app SPOKE, which for a
+    // declare-and-exit app says nothing about whether it is still there.
+    //
+    // Asking the endpoint costs one 1500ms-fused request and is the same test
+    // the ping heartbeat already trusts.
+    let Some(control_url) = control.clone() else {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "sidebar_contribution",
+            "daemon_declare_without_control",
+            json!({ "session_path": session_path }),
+        );
+        return false;
+    };
+    let (probe_url, probe_target) = (control_url.clone(), ssh_target.clone());
+    let reachable = task::spawn_blocking(move || {
+        let (effective, forward) = resolve_control_endpoint_url(&probe_url, probe_target.as_deref());
+        let alive = control_ping_request(&build_control_ping_url(&effective, None, None)).is_ok();
+        // The probe's own forward is dropped here; the rebuild opens the one it
+        // keeps. Leaving this one alive would leak an `ssh -L` per probe.
+        drop(forward);
+        alive
+    })
+    .await
+    .unwrap_or(false);
+    if !reachable {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "sidebar_contribution",
+            "daemon_declare_endpoint_dead",
+            json!({
+                "session_path": session_path,
+                "control": control_url,
+                "declare_age_ms": (now_ms as u64).saturating_sub(record.at_ms),
+            }),
+        );
+        return false;
+    }
+    apply_sidebar_declare(
+        state,
+        trace_home,
+        session_path.to_string(),
+        ssh_target,
+        SidebarDeclare {
+            control,
+            panes,
+            policy_version,
+            app_name,
+            zoom_version,
+            appearance_version,
+            document_version,
+            env_id,
+        },
+        SidebarDeclareSource::DaemonReplay,
+        now_ms as u64,
+    )
+    .await;
+    true
+}
+
+/// One app declare's payload, independent of how it reached us.
+#[derive(Debug, Clone)]
+struct SidebarDeclare {
+    control: Option<String>,
+    panes: Vec<SidebarPaneDeclaration>,
+    policy_version: Option<String>,
+    app_name: Option<String>,
+    zoom_version: Option<String>,
+    appearance_version: Option<String>,
+    document_version: Option<String>,
+    env_id: Option<String>,
+}
+
+/// Where a declare came from. Only the trace cares — but it cares a lot: a rail
+/// that appeared without the app saying anything just now is a REPLAY, and an
+/// investigation that cannot tell those apart chases the wrong thing.
+#[derive(Debug, Clone)]
+enum SidebarDeclareSource {
+    /// Parsed out of the session's terminal byte stream (OSC 7717), live.
+    TerminalStream { claimed_session: String },
+    /// Replayed from the daemon's ingested copy, because THIS client never saw
+    /// the original — a fresh GUI after a restart, or a shadow view client.
+    DaemonReplay,
+}
+
+impl SidebarDeclareSource {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::TerminalStream { .. } => "terminal_stream",
+            Self::DaemonReplay => "daemon_replay",
+        }
+    }
+}
+
+/// Apply one app declare to this client's contribution table.
+///
+/// THE ONE ENCODING of what a declare means. The OSC path and the daemon-replay
+/// path both come through here, because two copies of this logic is exactly how
+/// a rail that works live starts failing after a restart — and the divergence
+/// would be invisible until someone restarted the GUI.
+///
+/// A re-declare is the liveness heartbeat: bump and refresh panes, but NEVER
+/// re-resolve — resolving spawns an `ssh -L`, and once per heartbeat would leak
+/// one ssh every few seconds. ⚠ Idempotence holds for an UNCHANGED url only. A
+/// declare carrying a NEW control url means the app moved (its daemon restarted
+/// on a fresh port) — or a retained-scrollback replay re-delivered a STALE
+/// declare before the fresh one (live 2026-07-23: the GUI pinned yedit to a dead
+/// port and every fetch read "Connection refused" forever). The stale entry is
+/// torn down (its forward killed) and the declare re-creates it.
+async fn apply_sidebar_declare(
+    state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: String,
+    ssh_target: Option<String>,
+    declare: SidebarDeclare,
+    source: SidebarDeclareSource,
+    now_ms: u64,
+) -> SidebarRefetch {
+    let SidebarDeclare {
+        control,
+        panes,
+        policy_version,
+        app_name,
+        zoom_version,
+        appearance_version,
+        document_version,
+        env_id,
+    } = declare;
+    let mut state = state;
+    let (known, mut refetch) = state.with_mut(|shell| {
+        shell.sweep_stale_sidebar_contributions(now_ms);
+        let mut known = shell.sidebar_contributions.contains_key(&session_path);
+        if known && !shell.sidebar_contribution_matches_declare(&session_path, control.as_deref()) {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "control_url_moved",
+                json!({
+                    "session_path": session_path,
+                    "stored": shell
+                        .sidebar_contributions
+                        .get(&session_path)
+                        .map(|contribution| contribution.declared_control_url.clone()),
+                    "declared": control.clone(),
+                }),
+            );
+            shell.close_sidebar_contribution(&session_path);
+            known = false;
+        }
+        let refetch = if known {
+            shell.upsert_sidebar_contribution(
+                &session_path,
+                panes.clone(),
+                policy_version.clone(),
+                app_name.clone(),
+                zoom_version.clone(),
+                appearance_version.clone(),
+                document_version.clone(),
+                env_id.clone(),
+                now_ms,
+                None,
+            )
+        } else {
+            SidebarRefetch::default()
+        };
+        (known, refetch)
+    });
+    if !known && let Some(control_url) = control {
+        let resolve_url = control_url.clone();
+        let resolve_target = ssh_target.clone();
+        // The GUI fetches this endpoint over a plain socket, so a remote
+        // loopback needs an `ssh -L` forward — NOT the webview's SOCKS proxy.
+        let (effective_control, forward_child) = task::spawn_blocking(move || {
+            resolve_control_endpoint_url(&resolve_url, resolve_target.as_deref())
+        })
+        .await
+        .unwrap_or((control_url.clone(), None));
+        let forward_child =
+            forward_child.map(|child| std::sync::Arc::new(std::sync::Mutex::new(child)));
+        let pane_ids: Vec<String> = panes.iter().map(|pane| pane.id.clone()).collect();
+        refetch = state.with_mut(|shell| {
+            shell.upsert_sidebar_contribution(
+                &session_path,
+                panes.clone(),
+                policy_version.clone(),
+                app_name.clone(),
+                zoom_version.clone(),
+                appearance_version.clone(),
+                document_version.clone(),
+                env_id.clone(),
+                now_ms,
+                Some((
+                    control_url.clone(),
+                    effective_control.clone(),
+                    forward_child,
+                )),
+            )
+        });
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "sidebar_contribution",
+            "declare",
+            json!({
+                "session_path": session_path,
+                "claimed_session": match &source {
+                    SidebarDeclareSource::TerminalStream { claimed_session } => {
+                        Value::String(claimed_session.clone())
+                    }
+                    SidebarDeclareSource::DaemonReplay => Value::Null,
+                },
+                "source": source.label(),
+                "control": effective_control,
+                "panes": pane_ids,
+                "policy_version": policy_version,
+                "zoom_version": zoom_version,
+                "app_name": app_name,
+            }),
+        );
+    }
+    refetch
+}
+
 async fn rebuild_web_surface_from_daemon_declare(
     state: Signal<ShellState>,
     trace_home: PathBuf,
@@ -50134,6 +50451,39 @@ async fn process_pending_app_control_requests(
             // otherwise the rail renders "Loading…" forever. Same path the
             // titlebar button takes.
             if let AppControlRightPanelMode::AppPane { id } = &mode {
+                // A client that never saw the app's declare has no contribution
+                // and would silently open an empty pane. Replay the declare the
+                // daemon ingested first — this is what lets a fresh GUI, or a
+                // shadow view client, show a rail it did not witness being
+                // declared (docs/pending-bugs.md, 2026-07-25).
+                let needs_rebuild = active_session_path.as_deref().is_some_and(|session| {
+                    state
+                        .peek()
+                        .sidebar_contributions
+                        .get(session)
+                        .is_none_or(|contribution| {
+                            !contribution.panes.iter().any(|pane| &pane.id == id)
+                        })
+                });
+                if needs_rebuild && let Some(session) = active_session_path.clone() {
+                    // A REMOTE app's control endpoint is a loopback port on its
+                    // own host, so rebuilding one needs the same ssh target the
+                    // live declare path uses to open an `ssh -L`.
+                    let ssh_target = state
+                        .peek()
+                        .server
+                        .live_sessions()
+                        .iter()
+                        .find(|live| live.session_path == session)
+                        .and_then(|live| live.ssh_target.clone());
+                    rebuild_sidebar_contribution_from_daemon_declare(
+                        state,
+                        home.clone(),
+                        &session,
+                        ssh_target,
+                    )
+                    .await;
+                }
                 if let Ok(seq) = safe_shell_mut(state, "app_control_open_app_pane", |shell| {
                     shell.open_app_pane(id)
                 }) {
@@ -68677,109 +69027,27 @@ fn TerminalCanvas(
                                         // refused" forever). The stale entry
                                         // is torn down (its forward killed)
                                         // and the declare re-creates it.
-                                        let (known, mut refetch) = state.with_mut(|shell| {
-                                            shell.sweep_stale_sidebar_contributions(now_ms);
-                                            let mut known = shell
-                                                .sidebar_contributions
-                                                .contains_key(&contribution_session_path);
-                                            if known
-                                                && !shell.sidebar_contribution_matches_declare(
-                                                    &contribution_session_path,
-                                                    control.as_deref(),
-                                                )
-                                            {
-                                                append_trace_event(
-                                                    &trace_home,
-                                                    "ui",
-                                                    "sidebar_contribution",
-                                                    "control_url_moved",
-                                                    json!({
-                                                        "session_path": contribution_session_path,
-                                                        "stored": shell
-                                                            .sidebar_contributions
-                                                            .get(&contribution_session_path)
-                                                            .map(|c| c.declared_control_url.clone()),
-                                                        "declared": control.clone(),
-                                                    }),
-                                                );
-                                                shell.close_sidebar_contribution(
-                                                    &contribution_session_path,
-                                                );
-                                                known = false;
-                                            }
-                                            let refetch = if known {
-                                                shell.upsert_sidebar_contribution(
-                                                    &contribution_session_path,
-                                                    panes.clone(),
-                                                    policy_version.clone(),
-                                                    app_name.clone(),
-                                                    zoom_version.clone(),
-                                                    appearance_version.clone(),
-                                                    document_version.clone(),
-                                                    env_id.clone(),
-                                                    now_ms,
-                                                    None,
-                                                )
-                                            } else {
-                                                SidebarRefetch::default()
-                                            };
-                                            (known, refetch)
-                                        });
-                                        if !known && let Some(control_url) = control {
-                                            let resolve_url = control_url.clone();
-                                            let resolve_target = web_surface_ssh_target.clone();
-                                            // The GUI fetches this endpoint over
-                                            // a plain socket, so a remote loopback
-                                            // needs an `ssh -L` forward — NOT the
-                                            // webview's SOCKS proxy.
-                                            let (effective_control, forward_child) =
-                                                task::spawn_blocking(move || {
-                                                    resolve_control_endpoint_url(
-                                                        &resolve_url,
-                                                        resolve_target.as_deref(),
-                                                    )
-                                                })
-                                                .await
-                                                .unwrap_or((control_url.clone(), None));
-                                            let forward_child = forward_child.map(|child| {
-                                                std::sync::Arc::new(std::sync::Mutex::new(child))
-                                            });
-                                            let pane_ids: Vec<String> =
-                                                panes.iter().map(|pane| pane.id.clone()).collect();
-                                            refetch = state.with_mut(|shell| {
-                                                shell.upsert_sidebar_contribution(
-                                                    &contribution_session_path,
-                                                    panes.clone(),
-                                                    policy_version.clone(),
-                                                    app_name.clone(),
-                                                    zoom_version.clone(),
-                                                    appearance_version.clone(),
-                                                    document_version.clone(),
-                                                    env_id.clone(),
-                                                    now_ms,
-                                                    Some((
-                                                        control_url.clone(),
-                                                        effective_control.clone(),
-                                                        forward_child,
-                                                    )),
-                                                )
-                                            });
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "sidebar_contribution",
-                                                "declare",
-                                                json!({
-                                                    "session_path": contribution_session_path,
-                                                    "claimed_session": claimed_session,
-                                                    "control": effective_control,
-                                                    "panes": pane_ids,
-                                                    "policy_version": policy_version,
-                                                    "zoom_version": zoom_version,
-                                                    "app_name": app_name,
-                                                }),
-                                            );
-                                        }
+                                        let mut refetch = apply_sidebar_declare(
+                                            state,
+                                            trace_home.clone(),
+                                            contribution_session_path.clone(),
+                                            web_surface_ssh_target.clone(),
+                                            SidebarDeclare {
+                                                control: control.clone(),
+                                                panes: panes.clone(),
+                                                policy_version: policy_version.clone(),
+                                                app_name: app_name.clone(),
+                                                zoom_version: zoom_version.clone(),
+                                                appearance_version: appearance_version.clone(),
+                                                document_version: document_version.clone(),
+                                                env_id: env_id.clone(),
+                                            },
+                                            SidebarDeclareSource::TerminalStream {
+                                                claimed_session: claimed_session.clone(),
+                                            },
+                                            now_ms,
+                                        )
+                                        .await;
                                         // The app's web-surface policy changed (or
                                         // this is its first declare). Fetch it
                                         // before any surface is created: a
