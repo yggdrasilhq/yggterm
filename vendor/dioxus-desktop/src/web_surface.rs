@@ -2169,6 +2169,36 @@ mod seat_input_tests {
         );
     }
 
+    /// THE BATCH LOCK, engine half. `web batch` fires up to N injections behind
+    /// ONE gate, so the credit machinery has to hold for a whole run — not just
+    /// for the two consecutive verbs the earlier test drives.
+    ///
+    /// Twenty injections, each observed AFTER its delivery scope closed (the
+    /// queued-delivery shape that produced the single-shot `do` bug), must read
+    /// as ZERO seat input every single time. Revert `spend_injection_credit` to
+    /// `false` and this fails at iteration 1, which is what makes it a lock
+    /// rather than a decoration.
+    #[test]
+    fn twenty_injections_never_read_as_the_human() {
+        let id = 4247;
+        take_seat_input_count(id); // clear
+
+        for iteration in 0..20 {
+            grant_injection_credits(id, 1);
+            note_seat_input(id);
+            assert_eq!(
+                take_seat_input_count(id),
+                0,
+                "injection {iteration} of a batch was booked as the human"
+            );
+        }
+
+        // …and the human is still heard afterwards: throughput must not cost
+        // the user the surface.
+        note_seat_input(id);
+        assert_eq!(take_seat_input_count(id), 1);
+    }
+
     #[test]
     fn taking_the_count_consumes_it() {
         let id = 4243;

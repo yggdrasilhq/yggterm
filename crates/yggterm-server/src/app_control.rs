@@ -817,6 +817,31 @@ pub enum AppControlCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         new_batch: bool,
     },
+    /// Run N `do` actions inside ONE explicitly-opened agent batch (agent
+    /// control plane `batch`).
+    ///
+    /// A `do` verb is one app-control round trip; a 31-field form is 31 of them,
+    /// each paying resolve + gate + arm + read and each a fresh chance for the
+    /// lane to close underneath. A batch resolves the surface and opens the lane
+    /// once, then runs exactly the same per-action unit a single `do` runs.
+    ///
+    /// It buys throughput, NOT immunity: the surface's seat-input counter is
+    /// re-read between actions, and real human input aborts the remainder with
+    /// `preempted` and `remaining: n`. The human wins mid-batch.
+    WebSurfaceBatch {
+        #[serde(default)]
+        session_path: Option<String>,
+        actions: Vec<WebSurfaceDoAction>,
+        /// Pin the surface incarnation the batch was planned against (F3), same
+        /// meaning as on `WebSurfaceDo`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+        /// Stop at the first action that fails. Default false: a form fill
+        /// where one optional field is missing should still deliver the other
+        /// thirty, and the per-action report names what failed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_on_error: bool,
+    },
     /// Structured, read-only observation of a session's active web-surface tab —
     /// the agent control plane `read` verb (slice 2b, rung 1). Returns the
     /// interactable tree / forms / tables / readable / links / text / html as
@@ -994,6 +1019,7 @@ impl AppControlCommand {
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::WebSurfaceDo { .. } => "web_surface_do",
+            Self::WebSurfaceBatch { .. } => "web_surface_batch",
             Self::WebSurfaceRead { .. } => "web_surface_read",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",

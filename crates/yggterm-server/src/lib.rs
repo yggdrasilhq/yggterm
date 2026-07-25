@@ -19817,6 +19817,35 @@ pub fn run_app_control_web_surface_do(
     Ok(())
 }
 
+/// Run N `do` actions in ONE agent batch (agent control plane `batch`).
+///
+/// The request timeout scales with the batch: every action can pay a resolve
+/// eval, an arm, the injection and a readback, so a fixed timeout would cut off
+/// a long batch mid-flight and leave the caller unable to tell "the window is
+/// wedged" from "the batch is still working". Follows the `wait` precedent of a
+/// verb setting its own generous timeout.
+pub fn run_app_control_web_surface_batch(
+    session_path: Option<&str>,
+    actions: Vec<WebSurfaceDoAction>,
+    generation: Option<u64>,
+    stop_on_error: bool,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let request_timeout_ms = (actions.len() as u64).saturating_mul(3_000) + 15_000;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceBatch {
+            session_path: session_path.map(str::to_string),
+            actions,
+            generation,
+            stop_on_error,
+        },
+        request_timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 /// Claim a session's web surface so the background reaper leaves it alone while
 /// unattended agent work runs (agent control plane `lease`, slice 2b). The lease
 /// only ever EXTENDS the background hold; `ttl_secs: 0` releases it.
