@@ -804,6 +804,73 @@ pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
     ENV_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A SECOND mutex over the same env is the same thing as no mutex at all, and
+/// the crate carried one for long enough to make a shipped harness flaky: tests
+/// holding `codex_cli`'s lock ran concurrently with tests holding `lib.rs`'s
+/// `TERMINAL_IDENTITY_TEST_LOCK`, cleared each other's palette, and
+/// `agent_arm_matrix::locality_does_not_fork_the_invocation` reported a locality
+/// fork that did not exist.
+///
+/// Enumerating the guards by hand is what let the second one survive, so this
+/// scans the source instead. It is deliberately a scan and not a convention:
+/// the same shape guards the helper-textarea focus sites in the shell, for the
+/// same reason — a rule nobody can forget beats a rule everybody agrees with.
+#[cfg(test)]
+#[test]
+fn the_terminal_identity_env_has_exactly_one_test_guard() {
+    let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+
+    let mut stack = vec![crate_src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read crate src") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (index, line) in text.lines().enumerate() {
+                // A `static … Mutex<()>` whose name mentions the identity env is
+                // a rival guard. `env_test_guard`'s own ENV_TEST_LOCK is the one
+                // legitimate declaration, and it is matched by name below.
+                let declares_a_lock = line.contains("Mutex<()>") && line.contains("static ");
+                let names_the_env = line.contains("TERMINAL_IDENTITY") || line.contains("APPEARANCE");
+                if declares_a_lock && names_the_env {
+                    offenders.push(format!(
+                        "{}:{} — {}",
+                        path.display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the terminal-identity env must have exactly one test guard \
+         (codex_cli::env_test_guard); these declare a rival lock, which \
+         serializes nothing:\n{}",
+        offenders.join("\n"),
+    );
+
+    // The scan must be able to FIND something, or it is a lock that can only
+    // pass — this crate has shipped one of those before. Prove the traversal
+    // reaches real source by requiring the guard's own declaration.
+    let this_file = crate_src.join("codex_cli.rs");
+    let text = std::fs::read_to_string(&this_file).expect("read codex_cli.rs");
+    assert!(
+        text.contains("static ENV_TEST_LOCK: std::sync::Mutex<()>"),
+        "the scan did not find env_test_guard's own lock, so it is not reading \
+         the source it claims to police",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

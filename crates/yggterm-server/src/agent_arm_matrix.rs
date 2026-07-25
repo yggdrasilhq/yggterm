@@ -386,7 +386,6 @@ fn locality_does_not_fork_the_invocation() {
     // seam is branching on locality.
     let _env = crate::codex_cli::env_test_guard();
     let profile = pinned_terminal_identity();
-    crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
 
     for arm in ARMS {
         let twin = ARMS
@@ -394,31 +393,52 @@ fn locality_does_not_fork_the_invocation() {
             .find(|other| other.kind == arm.kind && other.locality != arm.locality)
             .expect("every arm has a locality twin");
 
-        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID);
-        let launch = agent_launch_command(arm.kind, Some(ARM_CWD), None);
-
-        // Refuse to compare two identity-free commands. Without this the
-        // assertions below pass on any host that exports no palette, which is
-        // the stale-green the module doc forbids.
-        for (label, command) in [("resume", &resume), ("launch", &launch)] {
-            assert!(
-                command.contains(&profile.background),
-                "{}: the {label} command carries no terminal identity, so comparing it against \
-                 its twin proves nothing — got {command}",
-                arm.name(),
-            );
-        }
-
+        // Re-pin immediately before each PAIR, and build the pair back to back.
+        // The builders read the palette from process-global env, and applying a
+        // theme anywhere in the crate re-syncs that env from itself — so the
+        // only window this test can actually control is the one between the pin
+        // and the two calls being compared. Pinning once outside the loop is not
+        // enough; that is what left this assertion racing.
+        crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
+        let resume_arm = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID);
+        let resume_twin = persistent_agent_resume_command(twin.kind, Some(ARM_CWD), ARM_SESSION_ID);
         assert_eq!(
-            resume,
-            persistent_agent_resume_command(twin.kind, Some(ARM_CWD), ARM_SESSION_ID),
+            resume_arm,
+            resume_twin,
             "{}: resume command forks on locality",
             arm.name(),
         );
+
+        crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
+        let launch_arm = agent_launch_command(arm.kind, Some(ARM_CWD), None);
+        let launch_twin = agent_launch_command(twin.kind, Some(ARM_CWD), None);
         assert_eq!(
-            launch,
-            agent_launch_command(twin.kind, Some(ARM_CWD), None),
+            launch_arm,
+            launch_twin,
             "{}: launch command forks on locality",
+            arm.name(),
+        );
+    }
+}
+
+/// The equality above compares an arm against its twin, which passes trivially
+/// if BOTH sides carry no terminal identity at all — and on a host that exports
+/// no palette, that is exactly what happens. So prove separately, and with the
+/// shortest possible window between pinning and reading, that the identity
+/// really does reach the built command on every arm. Without this the matrix
+/// would go green with the palette dropped from the remote arm entirely, which
+/// is the stale-green the module doc says this table cannot have.
+#[test]
+fn every_arm_carries_the_pinned_terminal_identity_into_its_invocation() {
+    let _env = crate::codex_cli::env_test_guard();
+    let profile = pinned_terminal_identity();
+
+    for arm in ARMS {
+        crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
+        let launch = agent_launch_command(arm.kind, Some(ARM_CWD), None);
+        assert!(
+            launch.contains(&profile.background),
+            "{}: the launch command dropped the pinned terminal identity — got {launch}",
             arm.name(),
         );
     }
