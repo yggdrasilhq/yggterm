@@ -48,6 +48,7 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
+    run_app_control_web_surface_batch,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_lease,
     run_app_control_web_surface_eval,
@@ -568,6 +569,86 @@ fn parse_web_element_ref(
     Ok(None)
 }
 
+/// Split one batch-script line into argv tokens, honouring `'`/`"` quoting and
+/// backslash escapes.
+///
+/// A batch line IS a `do` invocation, so it has to tokenize the way a shell
+/// would or `--text "Proceed to Pay"` would arrive as three arguments. Kept
+/// deliberately small: quotes and backslashes, no expansion, no globbing, no
+/// variables — a batch script is a list of verbs, not a shell.
+fn tokenize_argv_line(line: &str) -> anyhow::Result<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let escaped = chars.next().context("trailing backslash in batch line")?;
+                current.push(escaped);
+                has_token = true;
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(c);
+                has_token = true;
+            }
+            c if Some(c) == quote => quote = None,
+            c if c.is_whitespace() && quote.is_none() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        anyhow::bail!("unterminated quote in batch line");
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+/// Parse a batch script — one `do`-style invocation per line — into actions.
+///
+/// Blank lines and `#` comments are skipped. Every line goes through the SAME
+/// `parse_web_surface_do_action` a CLI verb goes through, so a batched action
+/// and a typed one can never mean different things; that shared parser is the
+/// single source of truth for what a `do` verb IS.
+fn parse_web_do_batch_script(script: &str) -> anyhow::Result<Vec<yggterm_server::WebSurfaceDoAction>> {
+    let mut actions = Vec::new();
+    for (index, line) in script.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let tokens = tokenize_argv_line(trimmed)
+            .with_context(|| format!("batch line {}", index + 1))?;
+        // `parse_web_surface_do_action` reads the verb at args[4] — the shape a
+        // real `server app web do …` invocation has — so the line is spliced
+        // onto that prefix rather than parsed by a second, parallel reader.
+        let mut argv: Vec<String> = ["server", "app", "web", "do"]
+            .iter()
+            .map(|part| (*part).to_string())
+            .collect();
+        argv.extend(tokens);
+        actions.push(
+            parse_web_surface_do_action(&argv)
+                .with_context(|| format!("batch line {}: {trimmed}", index + 1))?,
+        );
+    }
+    if actions.is_empty() {
+        anyhow::bail!("batch script contained no actions");
+    }
+    Ok(actions)
+}
+
 /// Parse a `server app web do <verb> …` invocation into a typed
 /// `WebSurfaceDoAction` (agent control plane `do` verb, slice 2b). Coordinates
 /// are document-space CSS pixels; the GUI resolves selectors + maps to widget
@@ -1031,6 +1112,8 @@ fn print_server_app_help() {
       | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)
       | --selector-set <css,css,…>   (segmented inputs: one box per character)
       | --x <n> --y <n>              (blind coordinates; prefer an addressed target)
+  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]
+    one `do` invocation per line; # comments and blank lines skipped
   yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
@@ -3096,6 +3179,38 @@ fn main() -> Result<()> {
                             generation,
                             new_batch,
                             timeout_ms,
+                        )
+                    }
+                    "batch" => {
+                        // One explicitly-opened agent batch, N verbs, one gate:
+                        //   web batch --script <file> [--stop-on-error]
+                        //             [--generation <n>] [--session <path>]
+                        // Each line is a `do` invocation; the human still wins
+                        // mid-batch (the GUI re-reads seat input between
+                        // actions and aborts the remainder).
+                        let script = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app web batch stdin")?;
+                            value
+                        } else {
+                            let path = cli_flag_value(&args, "--script").context(
+                                "missing --script <file> (or --stdin) for server app web batch",
+                            )?;
+                            std::fs::read_to_string(path)
+                                .with_context(|| format!("reading batch script {path}"))?
+                        };
+                        let actions = parse_web_do_batch_script(&script)?;
+                        let generation = cli_flag_value(&args, "--generation")
+                            .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
+                            .transpose()?;
+                        let stop_on_error = args.iter().any(|arg| arg == "--stop-on-error");
+                        run_app_control_web_surface_batch(
+                            session_path,
+                            actions,
+                            generation,
+                            stop_on_error,
                         )
                     }
                     "ensure" => {
