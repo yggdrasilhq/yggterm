@@ -6,6 +6,38 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★ A HOT RESTART STILL KILLS LIVE PTYs, AND THE DAEMONS PILE UP INTO A
+  CHAIN (measured 2026-07-25 across the 2.12.11 swap on guihost).** The
+  keep-alive spec is explicit that an update restart must not kill sessions:
+  *"All sessions like this restart from testing or updating are to be treated
+  as keep alive."* It does. Snapshot diff across the swap, same host, same
+  session set:
+  - live **rows** 24 → 26, **none vanished** — the row-preservation fix from the
+    2.11.6 regression still holds, so this is NOT that bug;
+  - live **PTYs** 13 Running → 9. **Seven sessions lost their terminal**
+    (5 `remote-cc://dev/...`, `remote-session://oc/...`,
+    `remote-session://charts-webapp/...`).
+  Severity is bounded and should not be overstated: **click = resume still
+  recovers them** (verified — re-opening one returned it Running at 168x63 with
+  zero contract violations and its real scrollback), and an agent CLI's own
+  history lives in its JSONL, so no user work is lost. What is lost is the LIVE
+  attach that "keep alive" promises across an update.
+  **The structural half — likely the same root cause.** Each swap leaves its
+  predecessor alive and still owning PTYs, so guihost now runs a CHAIN:
+  `3489946 (Jul 24 05:06, ppid=1) → 3535306 (Jul 24 06:37) → 773597 (Jul 25
+  13:14, v2.12.11)`, with real `bash` children under ALL THREE. The current
+  daemon reports `owned_terminal_session_count: 5` plus four keys under
+  `preserved_terminal_owner_keys` — and 5+4 = exactly the 9 survivors, so
+  "preserved" means *still owned by an ancestor*, not *safely carried over*.
+  This is the same pile-up as the parked dev-daemon item below, now reproduced
+  on guihost and getting one daemon worse per deploy.
+  ⚠ It is also the ROOT CAUSE of the stranded-declare entry below: a session on
+  an ancestor daemon is absent from the current daemon's declare store, so the
+  rail rebuild finds nothing and fails silently.
+  **Diagnose** by diffing `owned_terminal_session_keys` against
+  `preserved_terminal_owner_keys`, and by PTY ancestry (`ppid` of the `bash`
+  children) — never by row count, which stays healthy through this.
+
 - **⚠ TRAP: A VERSION BUMP LOCKS THE NEW CLI OUT OF THE RUNNING DAEMON — drive
   the hot-restart from the OLD binary (hit 2026-07-25 deploying 2.12.11).** The
   daemon socket path is version-keyed (`~/.yggterm/server-2-12-11.sock`).
