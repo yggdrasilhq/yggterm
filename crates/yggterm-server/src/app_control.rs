@@ -1018,6 +1018,23 @@ pub enum AppControlCommand {
         #[serde(default)]
         ttl_secs: Option<u64>,
     },
+    /// Force a session's web surface into a NEW incarnation.
+    ///
+    /// Bumps the active tab's reload nonce; the reconciler's existing
+    /// destroy-and-recreate branch does the work and mints a fresh generation.
+    /// The recovery an agent previously had to reach `session remove` for.
+    WebSurfaceReload {
+        session_path: String,
+    },
+    /// Close a session's web surface.
+    ///
+    /// Also records the deliberate-close mark, which blocks a HEARTBEAT
+    /// resurrection for a grace window but NOT an explicit `web ensure` — a
+    /// heartbeat is liveness, an ensure is intent, and the rebuild path
+    /// deliberately never consults that map.
+    WebSurfaceClose {
+        session_path: String,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -1163,6 +1180,8 @@ impl AppControlCommand {
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",
             Self::EnsureWebSurface { .. } => "ensure_web_surface",
+            Self::WebSurfaceReload { .. } => "web_surface_reload",
+            Self::WebSurfaceClose { .. } => "web_surface_close",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",

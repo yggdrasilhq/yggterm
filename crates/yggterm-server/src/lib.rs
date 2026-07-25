@@ -19818,6 +19818,42 @@ pub fn run_app_control_web_surface_do(
     Ok(())
 }
 
+/// Force a session's web surface into a NEW incarnation, and close one.
+///
+/// The recovery an agent previously had to reach `session remove` for — which
+/// destroyed a whole work session to fix one tab.
+pub fn run_app_control_web_surface_reload(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceReload {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_web_surface_close(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceClose {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 /// Move a session's web-surface cookie jar to or from a Netscape file.
 ///
 /// The jar path is absolutized CLI-side for the same reason a screenshot's

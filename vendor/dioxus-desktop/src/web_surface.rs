@@ -1024,6 +1024,75 @@ fn build_popup_webview(
     Some(webkit)
 }
 
+/// WHY an eval failed, as distinct from WHAT the engine said about it.
+///
+/// The engine funnels everything through one `GError`, and the shell used to
+/// stringify it — so `"js: Unsupported result type"` was emitted BOTH for a
+/// script that returned a Promise or a DOM object AND for a webview whose
+/// content process was gone. Two completely different problems, one string, and
+/// the last field run spent ten minutes on the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalFailureKind {
+    /// `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT` — the script RAN and returned
+    /// something that cannot cross the bridge (a Promise, a DOM node, a
+    /// function). The page is healthy; the script is wrong.
+    UnsupportedResultType,
+    /// The script threw.
+    ScriptException,
+    /// The engine rejected the call itself.
+    InvalidParameter,
+    /// Anything outside the JavaScript error quark — the engine, not the
+    /// script.
+    EngineError,
+}
+
+/// An eval failure with its classification kept alongside the engine's own
+/// message, so a caller never has to pattern-match on English.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalFailure {
+    /// What class of failure this is.
+    pub kind: EvalFailureKind,
+    /// The engine's own message, preserved verbatim.
+    pub message: String,
+}
+
+impl EvalFailure {
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    fn classify(error: &gtk::glib::Error) -> Self {
+        use webkit2gtk::JavascriptError;
+        let kind = if error.matches(JavascriptError::InvalidResult) {
+            EvalFailureKind::UnsupportedResultType
+        } else if error.matches(JavascriptError::ScriptFailed) {
+            EvalFailureKind::ScriptException
+        } else if error.matches(JavascriptError::InvalidParameter) {
+            EvalFailureKind::InvalidParameter
+        } else {
+            EvalFailureKind::EngineError
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Three separate facts about a surface, deliberately not collapsed into a
+/// single "alive" boolean — see [`WebSurfaceHost::surface_liveness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceLiveness {
+    /// The host still holds an entry for this surface id.
+    pub present: bool,
+    /// The engine webview widget is realized and mapped.
+    pub mapped: bool,
+    /// The engine believes its web content process is answering.
+    pub web_process_responsive: bool,
+}
+
 /// One cookie as the ENGINE layer knows it.
 ///
 /// Deliberately plain and file-format-agnostic: the vendored engine layer must
@@ -1653,6 +1722,42 @@ impl WebSurfaceHost {
         Ok(())
     }
 
+    /// What is actually true about surface `id` right now.
+    ///
+    /// `is_open` answers only "does the entry exist", and an entry whose web
+    /// CONTENT PROCESS has died is not empty — which is how `ensure` came to
+    /// hand a caller back the same corpse and report success. These are three
+    /// separate facts and they must not be collapsed:
+    ///
+    /// - `present`: we still hold the surface entry.
+    /// - `mapped`: the widget is realized and mapped (injection needs this).
+    /// - `web_process_responsive`: the engine's own view of its content
+    ///   process.
+    ///
+    /// All three are UI-PROCESS properties, so all three can read healthy over
+    /// a content process that will never answer another script. That is why the
+    /// shell follows this with a bounded eval round trip before believing it —
+    /// the same class of mistake as trusting `page_state` to prove a page is
+    /// alive.
+    pub fn surface_liveness(&self, id: u64) -> SurfaceLiveness {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let Some(surface) = surfaces.get(&id) else {
+            return SurfaceLiveness {
+                present: false,
+                mapped: false,
+                web_process_responsive: false,
+            };
+        };
+        let webkit = surface.webview.webview();
+        SurfaceLiveness {
+            present: true,
+            mapped: gtk::prelude::WidgetExt::is_mapped(&webkit),
+            web_process_responsive: webkit.is_web_process_responsive(),
+        }
+    }
+
     pub fn is_open(&self, id: u64) -> bool {
         self.surfaces.borrow().contains_key(&id)
     }
@@ -1665,7 +1770,7 @@ impl WebSurfaceHost {
         &self,
         id: u64,
         js: &str,
-        callback: impl FnOnce(Result<String, String>) + 'static,
+        callback: impl FnOnce(Result<String, EvalFailure>) + 'static,
     ) -> Result<(), String> {
         use javascriptcore::ValueExt as _;
         use webkit2gtk::WebViewExt as _;
@@ -1684,7 +1789,7 @@ impl WebSurfaceHost {
                     .and_then(|value| value.to_json(0))
                     .map(|json| json.to_string())
                     .unwrap_or_default()),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(EvalFailure::classify(&error)),
             };
             callback(outcome);
         });
