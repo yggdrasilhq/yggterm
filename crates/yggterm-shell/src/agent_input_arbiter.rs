@@ -129,6 +129,16 @@ impl AgentInputArbiter {
         Self::default()
     }
 
+    /// Was this verb aimed at an incarnation that no longer exists?
+    ///
+    /// THE one owner of the staleness rule. [`Self::admit`] asks it, and so
+    /// does the shell's gate — which has to answer "stale" BEFORE it decides
+    /// anything about seat input, and must not re-spell the comparison to do
+    /// so.
+    pub fn is_stale(&self, surface: &SurfaceKey, live_generation: u64) -> bool {
+        surface.generation != live_generation
+    }
+
     /// Decide whether a verb from `batch` may drive `surface`, recording the
     /// batch as active when it may. `live_generation` is the surface's CURRENT
     /// incarnation (slice-2b F3).
@@ -138,7 +148,7 @@ impl AgentInputArbiter {
         batch: &AgentBatch,
         live_generation: u64,
     ) -> AdmitOutcome {
-        if surface.generation != live_generation {
+        if self.is_stale(surface, live_generation) {
             return AdmitOutcome::StaleSurface;
         }
         let lane = self.lanes.entry(surface.clone()).or_default();

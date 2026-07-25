@@ -128,6 +128,88 @@ untouched (`rebuilt_from_daemon_declare: true` in the response says that is
 what happened). It only rebuilds on an explicit `ensure`: a heartbeat must
 never resurrect a surface the app or the user closed.
 
+### The rest of the `web` plane (2026-07-25)
+
+`yggterm server app web --help` is now generated from the dispatcher's own verb
+list, so it cannot go stale — **never conclude "not deployed" from a usage
+string**, but do trust this one. Full reference:
+`docs/web-surfaces.md#the-server-app-web-verb-plane-2026-07-25`. The parts that
+change how you work:
+
+```bash
+# Address an element the way a HUMAN would, resolved at click time. Gateway and
+# bank UIs have no stable ids.
+yggterm server app web do click --text "Proceed to Pay" --exact --session <path>
+yggterm server app web do click --role button --label "Continue" --session <path>
+
+# N verbs behind ONE gate. The human still wins — at the batch's START as well
+# as mid-run: a click waiting when the batch opens refuses it (`preempted`),
+# and real seat input mid-run aborts the remainder with `remaining: n`. That
+# refusal consumes the count, so simply re-issuing the batch opens it.
+#   ⚠ READ THE ENVELOPE, not just `accepted`: `{requested, attempted,
+#   succeeded, failed}`. `accepted` is TRUE only when the batch ran to the end
+#   AND every action succeeded — a 31-field fill where every selector missed is
+#   `accepted:false, succeeded:0, failed:31`, never "the form filled".
+yggterm server app web batch --script fill-form.txt --session <path>
+
+# Split the flow: script it on curl, hand the session over, hand it back.
+yggterm server app web cookies --import login.jar --session <path>
+#   ⚠ the jar is per-PROFILE; an unqualified surface is `default`, the USER'S
+#   OWN browsing jar. Check the `profile` field in the response.
+#   An EXPORTED jar is written 0600 — it is a live credential, not a report.
+
+# Pixels of ONE element, in-page — works on a surface nobody has ever seen.
+yggterm server app web capture-element --selector img#captcha out.png --split 6
+
+# See into iframes. `read` with NO --frame searches every reachable frame.
+#   `result` is still the TOP DOCUMENT's answer (the old shape, unchanged);
+#   `frames[]` is added beside it. Nothing that read `.result` broke.
+yggterm server app web frames --session <path>
+yggterm server app web read --as forms --frame billdesk --session <path>
+
+# Wait THROUGH a redirect chain (read from the engine, not the page).
+yggterm server app web wait --until url:matches:'^https://auth\.' --session <path>
+yggterm server app web wait --until settled:800 --session <path>
+
+# The one async bridge — `eval` cannot return a Promise.
+yggterm server app web await --script fetch-status.js --session <path>
+
+# A credential without ever seeing it: the CLI names the item and field.
+yggterm server app web fill-vault --item sbi --field password \
+  --role textbox --label "Password" --session <path>
+```
+
+**Recovering a dead tab without destroying the session.** `web ensure` probes
+LIVENESS (it round-trips an eval through the content process, because tabs /
+handles / engine flags all stay true over a corpse). Compare
+`generation_before` with `generation_after` — `healed: true` means a NEW page,
+not the same one. `web reload --session` and `web close --session` reach the
+same recovery directly. Refusals now name the fact that failed (`no_declare`,
+`declare_stale` = the app EXITED, relaunch it; `declare_url_scheme_refused`;
+`daemon_declare_unavailable` = the fetch failed, which is NOT an absent
+declare).
+
+**Before deploying, check whether someone is driving:**
+
+```bash
+yggterm server app state | jq .agent_leases
+# `server app update restart` REFUSES with agent_lease_active while a lease is
+# live; --force overrides. (It cannot stop `pkill yggterm`.)
+```
+
+**Reading a refusal.** `js_result_unsupported` = your script returned a Promise
+or a DOM object; the page is FINE. `webview_unreachable` = nobody answered;
+run `web ensure`. Those two used to share one string and the ambiguity cost a
+field run ten minutes. Likewise `accepted` (the injector ran), `resolved.*`
+(what the DOM said about the node) and `delivered` (what the page's listener
+saw) are three different questions — a `do click` reports all three.
+
+**Version mismatch is now honest.** App-control is a filesystem dropbox, so CLI
+and GUI must be swapped together; a verb this GUI does not implement answers
+`unsupported_command_kind` instead of timing out. And a `--frame` request to a
+GUI that predates frames HARD-FAILS on the missing `frame_resolved` echo rather
+than silently querying the top document.
+
 ## Screenshot
 
 ```bash
