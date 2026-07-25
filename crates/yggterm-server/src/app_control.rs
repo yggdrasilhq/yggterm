@@ -806,6 +806,26 @@ pub enum AppControlCommand {
     /// Enumerate the command registry: every command's id, title, and in-force
     /// KeyTip chord. Read-only; the discovery half of `InvokeCommand`.
     ListCommands,
+    /// A well-formed request whose `kind` this build does not know.
+    ///
+    /// App-control is a FILESYSTEM DROPBOX, not RPC: a newer CLI writes a
+    /// request file and an older GUI reads it. Before this variant existed,
+    /// `take_next_app_control_request` failed to deserialize such a file,
+    /// DELETED it, and moved on — so a version mismatch surfaced to the caller
+    /// as a bare TIMEOUT with no clue that the verb simply was not implemented
+    /// by the running window. `#[serde(other)]` turns that into an honest
+    /// refusal: the request still parses (as this variant), the GUI answers,
+    /// and the caller is told to swap the GUI binary.
+    ///
+    /// This is deserialize-only in practice — nothing constructs it — and it
+    /// deliberately does NOT capture the unknown payload: the request file is
+    /// still on disk while it is in flight, and a copy here would be a second
+    /// encoding of it.
+    ///
+    /// Malformed JSON is still deleted; only a well-formed request with an
+    /// unknown `kind` lands here.
+    #[serde(other)]
+    Unsupported,
 }
 
 impl AppControlCommand {
@@ -829,6 +849,9 @@ impl AppControlCommand {
                 | Self::WebSurfaceRead { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
+                // An unknown kind is never executed — it can only be refused,
+                // so it mutates nothing.
+                | Self::Unsupported
         )
     }
 
@@ -909,6 +932,7 @@ impl AppControlCommand {
             Self::DescribeState => "describe_state",
             Self::InvokeCommand { .. } => "invoke_command",
             Self::ListCommands => "list_commands",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -1435,6 +1459,71 @@ pub fn current_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request carrying a `kind` this build has never heard of must PARSE
+    /// (into `Unsupported`) rather than fail deserialization.
+    ///
+    /// Why it matters: `take_next_app_control_request` deletes a request it
+    /// cannot deserialize and moves on, so before `#[serde(other)]` a newer
+    /// CLI talking to an older GUI produced a bare TIMEOUT — the caller could
+    /// not tell "not implemented here" from "the window is wedged". Every new
+    /// verb inherits that failure mode, which is why this lands first.
+    ///
+    /// This test FAILS without `#[serde(other)] Unsupported`: the payload
+    /// below is a well-formed `AppControlRequest` whose command kind does not
+    /// exist, and serde rejects the whole request with "unknown variant".
+    #[test]
+    fn a_command_kind_this_build_does_not_know_parses_as_unsupported() {
+        let payload = r#"{
+            "request_id": "r1",
+            "created_at_ms": 0,
+            "command": { "kind": "web_surface_from_the_future", "session_path": "x" }
+        }"#;
+        let request: AppControlRequest =
+            serde_json::from_str(payload).expect("an unknown kind must parse, not error");
+        assert_eq!(request.command, AppControlCommand::Unsupported);
+        assert_eq!(request.command.name(), "unsupported");
+        // It can only ever be refused, so it mutates nothing.
+        assert!(request.command.is_read_only());
+    }
+
+    /// The other half of the contract: genuinely malformed JSON must still be
+    /// rejected (and therefore still deleted by the taker). `#[serde(other)]`
+    /// must not turn a corrupt file into a silently-accepted request.
+    #[test]
+    fn malformed_json_still_fails_to_parse() {
+        assert!(serde_json::from_str::<AppControlRequest>("{ not json").is_err());
+        // A request missing the `command` field is malformed, not "unknown kind".
+        assert!(
+            serde_json::from_str::<AppControlRequest>(r#"{"request_id":"r1","created_at_ms":0}"#)
+                .is_err()
+        );
+    }
+
+    /// The taker must hand an unknown kind THROUGH to the dispatcher instead of
+    /// deleting the file — that is the behaviour change a caller feels.
+    #[test]
+    fn take_next_hands_an_unknown_kind_to_the_dispatcher() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("00000000-unknown.json"),
+            br#"{"request_id":"unknown-1","created_at_ms":0,"command":{"kind":"not_a_real_verb"}}"#,
+        )
+        .unwrap();
+
+        let taken = take_next_app_control_request(&home, worker_pid).unwrap();
+        let Some((inflight_path, request)) = taken else {
+            panic!("an unknown kind must be delivered, not deleted");
+        };
+        assert_eq!(request.request_id, "unknown-1");
+        assert_eq!(request.command, AppControlCommand::Unsupported);
+        assert!(inflight_path.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
 
     #[test]
     fn read_only_commands_are_pure_observation() {
