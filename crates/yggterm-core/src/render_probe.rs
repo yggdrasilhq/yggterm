@@ -28,6 +28,15 @@
 //! process as plain context. That asymmetry is the finding, not a gap: it is the
 //! argument for profile partitioning as the actual lever.
 //!
+//! # The GPU gauge
+//!
+//! CPU alone cannot tell "cheap because the GPU did the work" from "cheap because
+//! nothing happened", and that ambiguity is exactly what let a host run with its GPU
+//! switched off for months. So every sample also carries `drm-engine-*` time from
+//! `/proc/<pid>/fdinfo/*` ([`parse_fdinfo_drm_engine_ns`]) — nonzero and rising means
+//! the GPU really is rasterizing. `None` there means the counter was UNREADABLE and
+//! is never rendered as a zero.
+//!
 //! # Wire format
 //!
 //! Samples are emitted as ordinary perf events whose `duration_ms` is **CPU
@@ -187,6 +196,66 @@ pub fn parse_status_rss_kb(text: &str) -> Option<u64> {
     None
 }
 
+/// Sum every `drm-engine-*` counter (nanoseconds of GPU engine time) in one
+/// `/proc/<pid>/fdinfo/<fd>` file. `None` when the file names no DRM engine at all,
+/// which is how "this fd is not a GPU fd" stays distinct from "this GPU did no work".
+///
+/// Exact live format, captured from `krunner` on the GUI host 2026-07-25 — tab
+/// separated, one engine per line, alongside `drm-driver:\tamdgpu` and a block of
+/// `drm-memory-*` lines that must NOT be summed into the time:
+///
+/// ```text
+/// drm-driver:     amdgpu
+/// drm-engine-gfx: 56369242 ns
+/// drm-engine-compute:     3434919 ns
+/// ```
+///
+/// This is THE discriminator for the forced-software-GL bug: the GUI's
+/// `WebKitWebProcess` holds no DRM fd at all while an ordinary desktop app on the same
+/// machine shows tens of milliseconds of `drm-engine-gfx`. "The GPU works for
+/// everything except us" is a fact this number states and a CPU number cannot.
+pub fn parse_fdinfo_drm_engine_ns(text: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("drm-engine-") else {
+            continue;
+        };
+        let Some((_engine, value)) = rest.split_once(':') else {
+            continue;
+        };
+        let mut fields = value.split_whitespace();
+        let Some(nanos) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        // The kernel writes the unit; anything else is a key we do not understand.
+        if fields.next() != Some("ns") {
+            continue;
+        }
+        total = Some(total.unwrap_or(0).saturating_add(nanos));
+    }
+    total
+}
+
+/// Total GPU engine nanoseconds across every fd this process holds.
+///
+/// `None` means WE COULD NOT LOOK (the fdinfo directory is unreadable — another user's
+/// process, or a hardened `/proc`). `Some(0)` means we looked and this process is
+/// doing no GPU work. Collapsing those two into a zero is the exact mistake that
+/// produced the forced-software-GL bug: one EACCES read as "there is no GPU here".
+pub fn drm_engine_ns_for_pid(pid: i32) -> Option<u64> {
+    let entries = fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?;
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(nanos) = parse_fdinfo_drm_engine_ns(&text) {
+            total = total.saturating_add(nanos);
+        }
+    }
+    Some(total)
+}
+
 /// Extract `AT_CLKTCK` from a raw 64-bit `auxv` blob (pairs of little-endian u64
 /// `(key, value)`, terminated by a zero key).
 ///
@@ -245,11 +314,20 @@ pub struct RenderProcSample {
     pub interval_ms: f64,
     pub rss_kb: Option<u64>,
     pub pss_kb: Option<u64>,
+    /// GPU engine nanoseconds consumed since the previous sample, a delta exactly like
+    /// `cpu_ms`. `None` when the counter was unreadable at either end of the interval —
+    /// never a zero standing in for "we could not look".
+    pub gpu_ns: Option<u64>,
 }
 
 impl RenderProcSample {
     pub fn core_fraction(&self) -> f64 {
         core_fraction(self.cpu_ms, self.interval_ms)
+    }
+
+    /// GPU engine milliseconds, the unit the tables and payloads report.
+    pub fn gpu_ms(&self) -> Option<f64> {
+        self.gpu_ns.map(|nanos| nanos as f64 / 1_000_000.0)
     }
 }
 
@@ -260,6 +338,9 @@ pub struct RenderProcObservation {
     pub stat: ProcStat,
     pub rss_kb: Option<u64>,
     pub pss_kb: Option<u64>,
+    /// CUMULATIVE GPU engine nanoseconds, as `/proc` reports them. The delta is taken
+    /// by [`RenderProbe::observe`], the same place the CPU delta is taken.
+    pub gpu_ns: Option<u64>,
 }
 
 /// Holds the previous observation so every reported number is a delta.
@@ -270,6 +351,7 @@ pub struct RenderProcObservation {
 #[derive(Debug, Default)]
 pub struct RenderProbe {
     last_ticks: BTreeMap<i32, u64>,
+    last_gpu_ns: BTreeMap<i32, u64>,
     last_at_ms: Option<u64>,
     user_hz: Option<u64>,
 }
@@ -306,10 +388,14 @@ impl RenderProbe {
             .unwrap_or(0.0);
         let mut samples = Vec::new();
         let mut next_ticks = BTreeMap::new();
+        let mut next_gpu_ns = BTreeMap::new();
         for observation in observations {
             let pid = observation.stat.pid;
             let ticks = observation.stat.cpu_ticks();
             next_ticks.insert(pid, ticks);
+            if let Some(gpu_ns) = observation.gpu_ns {
+                next_gpu_ns.insert(pid, gpu_ns);
+            }
             let Some(previous) = self.last_ticks.get(&pid).copied() else {
                 continue;
             };
@@ -318,6 +404,14 @@ impl RenderProbe {
             }
             // A tick counter that went BACKWARDS means pid reuse, not negative work.
             let delta = ticks.saturating_sub(previous);
+            // Same rule for the GPU counter, plus one more: a delta needs BOTH ends.
+            // An fd closed mid-interval drops the total, and a pid whose fdinfo became
+            // unreadable has no reading at all — both must read as "no number", never
+            // as a zero that would look like an idle GPU.
+            let gpu_ns = match (self.last_gpu_ns.get(&pid).copied(), observation.gpu_ns) {
+                (Some(previous), Some(current)) => Some(current.saturating_sub(previous)),
+                _ => None,
+            };
             samples.push(RenderProcSample {
                 pid,
                 ppid: observation.stat.ppid,
@@ -327,9 +421,11 @@ impl RenderProbe {
                 interval_ms,
                 rss_kb: observation.rss_kb,
                 pss_kb: observation.pss_kb,
+                gpu_ns,
             });
         }
         self.last_ticks = next_ticks;
+        self.last_gpu_ns = next_gpu_ns;
         self.last_at_ms = Some(now_ms);
         samples
     }
@@ -378,6 +474,7 @@ pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
             pss_kb: fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
                 .ok()
                 .and_then(|text| parse_smaps_rollup_pss_kb(&text)),
+            gpu_ns: drm_engine_ns_for_pid(pid),
             stat,
         });
     }
@@ -391,6 +488,11 @@ pub struct RenderRoleRollup {
     pub cpu_ms: f64,
     /// PSS where available, else RSS, summed across the role's processes.
     pub mem_kb: u64,
+    /// GPU engine nanoseconds summed across the role's processes, or `None` when NO
+    /// process in the role had a readable counter. The distinction survives the rollup
+    /// on purpose: "this role did no GPU work" and "we could not see the GPU" are
+    /// different findings, and only one of them means the GPU is switched off.
+    pub gpu_ns: Option<u64>,
     pub procs: usize,
     pub interval_ms: f64,
     /// The single busiest process in this role, and its share. This is what exposed
@@ -404,6 +506,11 @@ impl RenderRoleRollup {
     pub fn core_fraction(&self) -> f64 {
         core_fraction(self.cpu_ms, self.interval_ms)
     }
+
+    /// GPU engine milliseconds, the unit the tables and payloads report.
+    pub fn gpu_ms(&self) -> Option<f64> {
+        self.gpu_ns.map(|nanos| nanos as f64 / 1_000_000.0)
+    }
 }
 
 /// Roll per-process samples up by role.
@@ -416,6 +523,7 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
                 role: sample.role,
                 cpu_ms: 0.0,
                 mem_kb: 0,
+                gpu_ns: None,
                 procs: 0,
                 interval_ms: sample.interval_ms,
                 hot_pid: sample.pid,
@@ -423,6 +531,9 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
             });
         entry.cpu_ms += sample.cpu_ms;
         entry.mem_kb += sample.pss_kb.or(sample.rss_kb).unwrap_or(0);
+        if let Some(gpu_ns) = sample.gpu_ns {
+            entry.gpu_ns = Some(entry.gpu_ns.unwrap_or(0).saturating_add(gpu_ns));
+        }
         entry.procs += 1;
         if sample.cpu_ms > entry.hot_cpu_ms {
             entry.hot_cpu_ms = sample.cpu_ms;
@@ -460,6 +571,10 @@ pub fn emit_render_role_events(home: &Path, rollups: &[RenderRoleRollup], contex
             "hot_pid": rollup.hot_pid,
             "hot_cpu_ms": rollup.hot_cpu_ms.max(0.0),
         });
+        // Absent, not zero, when the counter was unreadable — see RenderRoleRollup.
+        if let Some(gpu_ms) = rollup.gpu_ms() {
+            payload["gpu_ms"] = json!(gpu_ms);
+        }
         if let Some(extra) = context.as_object()
             && let Some(object) = payload.as_object_mut()
         {
@@ -496,6 +611,9 @@ pub fn emit_render_perf_events(home: &Path, samples: &[RenderProcSample], contex
         }
         if let Some(pss_kb) = sample.pss_kb {
             payload["pss_kb"] = json!(pss_kb);
+        }
+        if let Some(gpu_ms) = sample.gpu_ms() {
+            payload["gpu_ms"] = json!(gpu_ms);
         }
         if let Some(extra) = context.as_object() {
             if let Some(object) = payload.as_object_mut() {
@@ -633,7 +751,130 @@ mod tests {
             stat: parse_proc_stat(&stat_line(pid, comm, ppid, ticks, 0)).unwrap(),
             rss_kb: Some(1000),
             pss_kb: Some(600),
+            gpu_ns: None,
         }
+    }
+
+    fn observation_with_gpu(
+        pid: i32,
+        comm: &str,
+        ppid: i32,
+        ticks: u64,
+        gpu_ns: u64,
+    ) -> RenderProcObservation {
+        RenderProcObservation {
+            gpu_ns: Some(gpu_ns),
+            ..observation(pid, comm, ppid, ticks)
+        }
+    }
+
+    /// The verbatim live fixture from the GUI host (krunner, `/proc/<pid>/fdinfo/15`,
+    /// 2026-07-25) — the frame of reference for "the GPU works for everything except
+    /// us". Both engines sum; the `drm-memory-*` block must not leak into the time.
+    const KRUNNER_FDINFO: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t26\nino:\t1128\n\
+drm-driver:\tamdgpu\ndrm-client-id:\t141\ndrm-memory-vram:\t8192 KiB\n\
+drm-memory-gtt:\t3564 KiB\ndrm-engine-gfx:\t56369242 ns\n\
+drm-engine-compute:\t3434919 ns\n";
+
+    #[test]
+    fn sums_every_drm_engine_and_ignores_the_memory_block() {
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns(KRUNNER_FDINFO),
+            Some(56_369_242 + 3_434_919)
+        );
+        // An fd that is not a GPU fd names no engine at all.
+        assert_eq!(parse_fdinfo_drm_engine_ns("pos:\t0\nflags:\t02\n"), None);
+        // ...including one that carries only the memory gauges.
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns("drm-driver:\tamdgpu\ndrm-memory-vram:\t8192 KiB\n"),
+            None
+        );
+        // A counter in some other unit is a key we do not understand, not nanoseconds.
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns("drm-engine-gfx:\t500 us\n"),
+            None
+        );
+    }
+
+    /// The GPU gauge must be a DELTA like everything else here. A lifetime total would
+    /// make a long-lived process look busy forever — the same `ps %CPU` lie this
+    /// module exists to avoid, wearing a different hat.
+    #[test]
+    fn gpu_time_is_a_delta_and_a_missing_reading_is_not_a_zero() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe(
+            &[observation_with_gpu(10, "WebKitWebProces", 1, 0, 1_000_000)],
+            1_000,
+        );
+        let samples = probe.observe(
+            &[observation_with_gpu(
+                10,
+                "WebKitWebProces",
+                1,
+                10,
+                4_000_000,
+            )],
+            2_000,
+        );
+        assert_eq!(samples[0].gpu_ns, Some(3_000_000));
+        assert_eq!(samples[0].gpu_ms(), Some(3.0));
+        // A pid whose fdinfo became unreadable reports NO number, never zero: "we
+        // could not look" and "the GPU was idle" are different findings.
+        let samples = probe.observe(&[observation(10, "WebKitWebProces", 1, 20)], 3_000);
+        assert_eq!(samples[0].gpu_ns, None);
+        assert_eq!(samples[0].gpu_ms(), None);
+        // ...and a counter that went backwards (an fd closed mid-interval) reads as
+        // zero work rather than underflowing into an astronomical delta.
+        probe.observe(
+            &[observation_with_gpu(
+                10,
+                "WebKitWebProces",
+                1,
+                30,
+                9_000_000,
+            )],
+            4_000,
+        );
+        let samples = probe.observe(
+            &[observation_with_gpu(10, "WebKitWebProces", 1, 40, 12)],
+            5_000,
+        );
+        assert_eq!(samples[0].gpu_ns, Some(0));
+    }
+
+    /// The rollup keeps the same distinction: a role where nobody could be read has no
+    /// number, and the payload therefore carries no `gpu_ms` key at all.
+    #[test]
+    fn role_rollup_sums_gpu_time_and_keeps_unreadable_distinct_from_idle() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe(
+            &[
+                observation_with_gpu(11, "WebKitWebProces", 10, 0, 0),
+                observation_with_gpu(12, "WebKitWebProces", 10, 0, 500_000),
+                observation(13, "yggterm", 1, 0),
+            ],
+            1_000,
+        );
+        let samples = probe.observe(
+            &[
+                observation_with_gpu(11, "WebKitWebProces", 10, 5, 2_000_000),
+                observation_with_gpu(12, "WebKitWebProces", 10, 5, 1_500_000),
+                observation(13, "yggterm", 1, 5),
+            ],
+            2_000,
+        );
+        let rolled = roll_up_roles(&samples);
+        let web = rolled
+            .iter()
+            .find(|rollup| rollup.role == RenderRole::WebContent)
+            .unwrap();
+        assert_eq!(web.gpu_ns, Some(2_000_000 + 1_000_000));
+        assert_eq!(web.gpu_ms(), Some(3.0));
+        let gui = rolled
+            .iter()
+            .find(|rollup| rollup.role == RenderRole::Gui)
+            .unwrap();
+        assert_eq!(gui.gpu_ns, None, "unreadable must not roll up as zero");
     }
 
     /// THE anti-regression test for this whole module: the first observation must
@@ -745,6 +986,7 @@ mod tests {
             role: RenderRole::WebGpu,
             cpu_ms: 0.0,
             mem_kb: 0,
+            gpu_ns: None,
             procs: 1,
             interval_ms: 60_000.0,
             hot_pid: 99,
@@ -754,6 +996,7 @@ mod tests {
             role: RenderRole::WebContent,
             cpu_ms: 250.0,
             mem_kb: 4096,
+            gpu_ns: Some(7_000_000),
             procs: 3,
             interval_ms: 60_000.0,
             hot_pid: 42,
@@ -769,6 +1012,11 @@ mod tests {
         assert!(log.contains("\"hot_pid\":42"));
         assert!(log.contains("\"procs\":3"));
         assert!(log.contains("\"web_surfaces\":2"));
+        // The GPU gauge rides in the payload: with hardware GL this is nonzero and
+        // with the software rasterizer it is not, which is the ONE field that
+        // distinguishes "cheap because the GPU did it" from "cheap because nothing
+        // happened".
+        assert!(log.contains("\"gpu_ms\":7.0"));
         assert!(!log.contains("web_gpu"));
         let _ = fs::remove_dir_all(&home);
     }
