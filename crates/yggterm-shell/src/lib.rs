@@ -9,6 +9,7 @@ mod hot_update_policy;
 // allow(dead_code) while the render/chord integration is wired in incrementally.
 #[allow(dead_code)]
 mod keytip;
+mod netscape_cookie_jar;
 // Phase 1 of the consolidated scroll-controller: the canonical, regression-locked
 // DECISION spec (mode + transitions). The JS wiring (Phase 2) mirrors it. Marked
 // allow(dead_code) until the JS migration consults it. See scroll_mode.rs.

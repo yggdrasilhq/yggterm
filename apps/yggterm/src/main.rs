@@ -49,6 +49,7 @@ use yggterm_server::{
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
+    run_app_control_web_surface_cookies,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_fill_vault,
     run_app_control_web_surface_lease,
@@ -1141,6 +1142,12 @@ fn print_server_app_help() {
     that makes every page-side predicate unavailable
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
+  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]
+    Netscape format, both ways (what `curl -c`/`-b` writes and reads).
+    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the
+    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers
+    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to
+    the engine API and are reported as export_scope=root_path_per_domain.
   yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]
     in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface
   yggterm server app web devtools [--close] [--session <path>]
@@ -3159,6 +3166,40 @@ fn main() -> Result<()> {
                             .next()
                             .unwrap_or("web-surface.png");
                         run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "cookies" => {
+                        // Move the surface's cookie jar to or from a Netscape
+                        // file — the format `curl -c`/`-b` speaks:
+                        //   web cookies --import <jar> | --export <jar>
+                        // This is what makes a flow SPLITTABLE: script the
+                        // mechanical parts on curl, hand the session to a
+                        // surface for the one interactive step, hand it back.
+                        //
+                        // ⚠ The jar is per-PROFILE and an unqualified surface
+                        // is `default` — the user's own browsing jar. Drive
+                        // agent work on a `--profile agent-<n>` surface before
+                        // importing. The response reports which profile was
+                        // written; check it.
+                        use yggterm_server::WebCookieDirection;
+                        let (direction, jar) = match (
+                            cli_flag_value(&args, "--import"),
+                            cli_flag_value(&args, "--export"),
+                        ) {
+                            (Some(jar), None) => (WebCookieDirection::Import, jar),
+                            (None, Some(jar)) => (WebCookieDirection::Export, jar),
+                            (Some(_), Some(_)) => anyhow::bail!(
+                                "web cookies takes --import <jar> OR --export <jar>, not both"
+                            ),
+                            (None, None) => anyhow::bail!(
+                                "web cookies needs --import <jar> or --export <jar> (Netscape format)"
+                            ),
+                        };
+                        run_app_control_web_surface_cookies(
+                            session_path,
+                            direction,
+                            jar,
+                            timeout_ms,
+                        )
                     }
                     "capture-element" | "capture" => {
                         // Rasterize ONE addressed element to a PNG, in the page:
