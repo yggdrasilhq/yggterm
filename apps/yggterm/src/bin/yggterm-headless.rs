@@ -170,6 +170,7 @@ fn print_server_help() {
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
+  yggterm-headless server perf-incidents [--since-ms <ms>] [--top <n>] [--list] [--json]
   yggterm-headless server trace <tail|follow|bundle|transitions>
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
@@ -988,12 +989,17 @@ fn maybe_handoff_to_preferred_headless_executable(
     if classify_builtin_cli_command(args).is_some_and(builtin_cli_command_is_pure) {
         return Ok(());
     }
-    // `perf-summary` reads the LOCAL perf-telemetry.jsonl in-process and never talks to
-    // the daemon, so it must run in THIS (newest) binary. Handing it off to a stale
-    // active-executable (e.g. a dev deploy that overwrote ~/.local/bin but not
-    // install-state) would hit a binary that predates the command and fail.
+    // `perf-summary` / `perf-incidents` read the LOCAL profiling logs in-process and
+    // never talk to the daemon, so they must run in THIS (newest) binary. Handing them
+    // off to a stale active-executable (e.g. a dev deploy that overwrote ~/.local/bin
+    // but not install-state) would hit a binary that predates the command and fail —
+    // which is precisely how `perf-incidents` would answer "unsupported server command"
+    // on the very host whose incidents you are trying to read.
     if matches!(args.first().map(String::as_str), Some("server"))
-        && matches!(args.get(1).map(String::as_str), Some("perf-summary"))
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("perf-summary") | Some("perf-incidents")
+        )
     {
         return Ok(());
     }
@@ -2586,6 +2592,68 @@ fn main() -> Result<()> {
                     summary.total_ms
                 );
             }
+        }
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("server")
+        && args.get(1).map(String::as_str) == Some("perf-incidents")
+    {
+        // The read side of the DURABLE half of profiling. `perf-summary`
+        // aggregates the rolling telemetry; this reads the snapshots the daemon
+        // kept when the app actually went hot — the ones still there days later
+        // when the user reports "the fan flared this morning". The writer has
+        // been live all along and only the reader was missing, which is how 183
+        // records sat unread on the live host. Ranked by COUNT: the driver worth
+        // fixing is the one that keeps happening.
+        let since_ms =
+            cli_flag_value(&args, "--since-ms").and_then(|value| value.parse::<u64>().ok());
+        let top = cli_flag_value(&args, "--top")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20);
+        let list = args.iter().any(|arg| arg == "--list");
+        let json = args.iter().any(|arg| arg == "--json");
+        if list || json {
+            let records = yggterm_core::read_perf_incidents(store.home_dir(), since_ms);
+            let tail = records
+                .iter()
+                .rev()
+                .take(top)
+                .cloned()
+                .collect::<Vec<serde_json::Value>>();
+            println!("{}", serde_json::to_string_pretty(&tail)?);
+            return Ok(());
+        }
+        let summaries = yggterm_core::summarize_perf_incidents(store.home_dir(), since_ms);
+        if summaries.is_empty() {
+            println!(
+                "(no perf incidents recorded — they are written only while Performance \
+                 Profiling is on and a window actually went hot; log: {})",
+                store
+                    .home_dir()
+                    .join(yggterm_core::PERF_INCIDENT_FILENAME)
+                    .display()
+            );
+            return Ok(());
+        }
+        let total: usize = summaries.iter().map(|summary| summary.count).sum();
+        println!("{total} incidents recorded");
+        println!(
+            "{:<22} {:<40} {:>6} {:>12} {:>20}",
+            "trigger", "span", "count", "worst_ms", "last"
+        );
+        for summary in summaries.iter().take(top) {
+            println!(
+                "{:<22} {:<40} {:>6} {:>12.0} {:>20}",
+                summary.trigger_kind,
+                if summary.span.is_empty() {
+                    "-"
+                } else {
+                    summary.span.as_str()
+                },
+                summary.count,
+                summary.worst_total_ms,
+                summary.last_ts_ms
+            );
         }
         return Ok(());
     }

@@ -134,6 +134,21 @@ pub enum WorkspaceViewMode {
 }
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
+/// How long a cache entry may be served STALE while its revalidation runs in the
+/// background.
+///
+/// Past the TTL the entry is no longer trusted enough to serve forever — but it
+/// is still the answer we just used successfully, for a target our own build has
+/// not changed for. Blocking the user's click on an ssh round trip that
+/// re-proves what `local_build_id` already proves is what made
+/// `remote/resolve_yggterm_binary` the single biggest perf-incident trigger on
+/// the live host (65 of 183 recorded incidents). So: serve it, revalidate
+/// behind the request, and let the NEXT call see the verdict.
+///
+/// The bound still exists because staleness must not be unbounded: if every
+/// background revalidation hangs (an unreachable host), an entry this old goes
+/// back to being proven in the foreground.
+const REMOTE_COMMAND_CACHE_HARD_STALE_MS: u64 = 6 * 60 * 60_000;
 const REMOTE_YGGTERM_COMMAND_TIMEOUT_MS: u64 = 45_000;
 const REMOTE_PYTHON_COMMAND_TIMEOUT_MS: u64 = 20_000;
 
@@ -162,6 +177,11 @@ static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<
 > = OnceLock::new();
 static REMOTE_YGGTERM_COMMAND_RESOLVE_LOCKS: OnceLock<
     Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+> = OnceLock::new();
+/// Cache keys with a background revalidation in flight, so a burst of requests
+/// against one stale entry starts ONE ssh probe, not one per request.
+static REMOTE_YGGTERM_COMMAND_REVALIDATIONS: OnceLock<
+    Mutex<std::collections::HashSet<String>>,
 > = OnceLock::new();
 static LOCAL_BUILD_ID_MEMO: OnceLock<Mutex<Option<LocalBuildIdMemo>>> = OnceLock::new();
 
@@ -12249,6 +12269,84 @@ fn fresh_cached_remote_binary_expr(cache_key: &str, local_build_id: u64) -> Opti
     Some(cached.binary_expr.clone())
 }
 
+/// A cached entry for the same local build that is past the verify TTL but
+/// still inside the hard-stale bound — safe to SERVE while it is revalidated
+/// behind the caller's back. `None` when there is nothing servable.
+fn stale_servable_remote_binary_expr(cache_key: &str, local_build_id: u64) -> Option<String> {
+    let cache = remote_command_cache().lock().ok()?;
+    let cached = cache.get(cache_key)?;
+    if cached.local_build_id != local_build_id {
+        // OUR binary changed: the remote must be re-proven before use, or a
+        // protocol mismatch ships silently. Never serve this stale.
+        return None;
+    }
+    let age_ms = current_millis_u64().saturating_sub(cached.verified_at_ms);
+    if age_ms > REMOTE_COMMAND_CACHE_HARD_STALE_MS {
+        return None;
+    }
+    Some(cached.binary_expr.clone())
+}
+
+/// Revalidate a cache key on a background thread: refresh `verified_at_ms` on
+/// success, EVICT on failure so the next call resolves properly. At most one
+/// per key in flight.
+fn spawn_remote_binary_revalidation(
+    cache_key: String,
+    ssh_target: String,
+    exec_prefix: Option<String>,
+    binary_expr: String,
+    local_build_id: u64,
+) {
+    {
+        let Ok(mut in_flight) = REMOTE_YGGTERM_COMMAND_REVALIDATIONS
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+        else {
+            return;
+        };
+        if !in_flight.insert(cache_key.clone()) {
+            return;
+        }
+    }
+    let spawn_failure_key = cache_key.clone();
+    let spawned = std::thread::Builder::new()
+        .name("remote-binary-revalidate".to_string())
+        .spawn(move || {
+            let verified =
+                check_remote_protocol_version(&ssh_target, exec_prefix.as_deref(), &binary_expr)
+                    .is_ok();
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                if verified {
+                    cache.insert(
+                        cache_key.clone(),
+                        RemoteCommandCacheEntry {
+                            binary_expr,
+                            verified_at_ms: current_millis_u64(),
+                            local_build_id,
+                        },
+                    );
+                } else {
+                    cache.remove(&cache_key);
+                }
+            }
+            if let Ok(mut in_flight) = REMOTE_YGGTERM_COMMAND_REVALIDATIONS
+                .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                .lock()
+            {
+                in_flight.remove(&cache_key);
+            }
+        });
+    if spawned.is_err()
+        && let Ok(mut in_flight) = REMOTE_YGGTERM_COMMAND_REVALIDATIONS
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+    {
+        // Could not spawn: clear the flag so the next call tries again rather
+        // than serving stale forever behind a revalidation that never ran.
+        in_flight.remove(&spawn_failure_key);
+    }
+}
+
 fn remote_command_resolve_lock(cache_key: &str) -> Arc<Mutex<()>> {
     remote_command_resolve_locks()
         .lock()
@@ -12830,6 +12928,30 @@ fn resolve_remote_yggterm_binary(
         finish_span(serde_json::json!({
             "ssh_target": ssh_target,
             "result": "cache_hit",
+            "binary_expr": binary_expr.clone(),
+            "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+            "build_id": local_build_id,
+        }));
+        return Ok((binary_expr, RemoteDeployState::Ready));
+    }
+    // STALE-WHILE-REVALIDATE. Past the TTL the old behaviour blocked the user's
+    // click on an ssh round trip that re-proves what `local_build_id` already
+    // proves — the top perf-incident trigger on the live host (65 of 183). Serve
+    // the entry we just used successfully and prove it behind the request; the
+    // verdict lands before the next call. Only for OUR unchanged build: a
+    // build-id change still resolves in the foreground, because that is the case
+    // where a protocol mismatch could ship silently.
+    if let Some(binary_expr) = stale_servable_remote_binary_expr(&cache_key, local_build_id) {
+        spawn_remote_binary_revalidation(
+            cache_key.clone(),
+            ssh_target.to_string(),
+            exec_prefix.map(str::to_string),
+            binary_expr.clone(),
+            local_build_id,
+        );
+        finish_span(serde_json::json!({
+            "ssh_target": ssh_target,
+            "result": "cache_stale_served_while_revalidating",
             "binary_expr": binary_expr.clone(),
             "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
             "build_id": local_build_id,
@@ -27049,6 +27171,62 @@ terminal_window_id: None,
             .recv_timeout(Duration::from_secs(5))
             .expect("fresh cache entry must resolve without waiting on the resolve lock");
         assert_eq!(resolved.expect("cache hit"), "$HOME/.yggterm/bin/yggterm");
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.remove(&cache_key);
+        }
+    }
+
+    /// Stale-while-revalidate (optimization pass, 2026-07-25). Past the verify
+    /// TTL the resolver used to block the caller on an ssh round trip that
+    /// re-proves what `local_build_id` already proves — the top perf-incident
+    /// trigger on the live host, 65 of 183 recorded incidents.
+    ///
+    /// The test drives the SERVABILITY predicate rather than the resolver,
+    /// because the resolver's other exits shell out; the predicate is the whole
+    /// policy: same build + inside the hard bound => serve, otherwise don't.
+    #[test]
+    fn a_stale_entry_for_the_same_build_is_servable_and_a_changed_build_is_not() {
+        let cache_key = remote_cache_key("unit-test-swr", None);
+        let build_id = super::current_local_build_id();
+        let past_the_ttl = current_millis_u64()
+            .saturating_sub(super::REMOTE_COMMAND_CACHE_VERIFY_TTL_MS + 60_000);
+        let insert = |verified_at_ms: u64, local_build_id: u64| {
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.insert(
+                    cache_key.clone(),
+                    RemoteCommandCacheEntry {
+                        binary_expr: "$HOME/.yggterm/bin/yggterm".to_string(),
+                        verified_at_ms,
+                        local_build_id,
+                    },
+                );
+            }
+        };
+
+        // Stale for OUR build: servable, so the click does not wait on ssh.
+        insert(past_the_ttl, build_id);
+        assert!(super::fresh_cached_remote_binary_expr(&cache_key, build_id).is_none());
+        assert_eq!(
+            super::stale_servable_remote_binary_expr(&cache_key, build_id).as_deref(),
+            Some("$HOME/.yggterm/bin/yggterm")
+        );
+
+        // OUR binary changed: never served stale — that is the case where a
+        // protocol mismatch could ship silently.
+        assert!(
+            super::stale_servable_remote_binary_expr(&cache_key, build_id.wrapping_add(1))
+                .is_none()
+        );
+
+        // Past the hard bound: staleness is not unbounded, so it goes back to
+        // being proven in the foreground.
+        insert(
+            current_millis_u64()
+                .saturating_sub(super::REMOTE_COMMAND_CACHE_HARD_STALE_MS + 60_000),
+            build_id,
+        );
+        assert!(super::stale_servable_remote_binary_expr(&cache_key, build_id).is_none());
+
         if let Ok(mut cache) = remote_command_cache().lock() {
             cache.remove(&cache_key);
         }
