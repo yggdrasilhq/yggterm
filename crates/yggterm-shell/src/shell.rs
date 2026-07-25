@@ -37835,43 +37835,13 @@ fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
+/// This process's own memory, through the ONE owner of "how much memory does pid N
+/// use" (`yggterm_core::render_probe`). The shell used to carry its own smaps_rollup
+/// parser here while the render probe parsed the same file per pid — two encodings of
+/// one concept, free to drift on the next kernel field rename.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, Default)]
-struct ProcessMemorySample {
-    rss_kb: u64,
-    pss_kb: u64,
-    anonymous_kb: u64,
-}
-#[cfg(target_os = "linux")]
-fn process_memory_sample_from_smaps_rollup(text: &str) -> ProcessMemorySample {
-    let mut sample = ProcessMemorySample::default();
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(label) = parts.next() else {
-            continue;
-        };
-        let value = parts
-            .next()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or_default();
-        match label {
-            "Rss:" => sample.rss_kb = value,
-            "Pss:" => sample.pss_kb = value,
-            "Anonymous:" => sample.anonymous_kb = value,
-            _ => {}
-        }
-    }
-    sample
-}
-#[cfg(target_os = "linux")]
-fn current_process_memory_sample() -> Option<ProcessMemorySample> {
-    let text = fs::read_to_string("/proc/self/smaps_rollup").ok()?;
-    let sample = process_memory_sample_from_smaps_rollup(&text);
-    (sample.rss_kb > 0).then_some(sample)
-}
-#[cfg(not(target_os = "linux"))]
-fn current_process_memory_sample() -> Option<()> {
-    None
+fn current_process_memory_sample() -> Option<yggterm_core::render_probe::ProcMemory> {
+    yggterm_core::render_probe::read_process_memory(std::process::id() as i32)
 }
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
     let raw = match endpoint {
@@ -128103,16 +128073,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.next_background_copy_scan_after_ms = cooldown;
         shell.request_background_copy_scan_if_unscheduled();
         assert_eq!(shell.next_background_copy_scan_after_ms, cooldown);
-    }
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_memory_sample_from_smaps_rollup_parses_rss_pss_and_anonymous() {
-        let sample = process_memory_sample_from_smaps_rollup(
-            "Rss:                123456 kB\nPss:                 98765 kB\nAnonymous:           54321 kB\n",
-        );
-        assert_eq!(sample.rss_kb, 123456);
-        assert_eq!(sample.pss_kb, 98765);
-        assert_eq!(sample.anonymous_kb, 54321);
     }
     fn test_managed_conversation_session(kind: SessionKind) -> ManagedSessionView {
         ManagedSessionView {
