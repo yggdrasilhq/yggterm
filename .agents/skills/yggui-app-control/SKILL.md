@@ -74,16 +74,28 @@ ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh stop --name agen
   (instrument-lie, live-caught 2026-07-23).
 - A Shadow is read-only for geometry/ownership by daemon role gate: it cannot
   `terminal new`/resize/focus. For SPAWNING probe sessions, use the user's
-  worker but restore their active session immediately after, or spawn via
-  `terminal new` and `app open` their session back — the no-activate spawn is
-  a recorded follow-up.
+  worker with `terminal new --no-activate` (their view never moves), then
+  `app open <session> --client <shadow>` to look at it.
 - The shadow's screenshots come from `shadow-client.sh capture` (grim on its
   own compositor) or `app screenshot --client agent-1`.
-- ⚠ The shadow's TERMINAL viewport renders BLANK — the role gate denies it
-  the PTY attach (D8, correct). Use the shadow for tree/session/metadata/
-  start-page observation and for parking view switches; read terminal
-  CONTENT via `terminal read-buffer <session>` or `server snapshot`
-  (read-only, safe untargeted — they never move the user's view).
+- ✅ **THE SHADOW'S TERMINAL VIEWPORT PAINTS (fixed 2026-07-25).** It used to
+  render blank, and the old note here blamed "the role gate denies it the PTY
+  attach." That was the right observation with the wrong owner: the gate was
+  correct, the CLIENT was wrong to ask. A shadow now takes the **read-only**
+  path — it never sends `terminal_ensure`/`terminal_resize`/`focus_live`, and
+  paints from the read stream, which the gate already allowed. `app open
+  <session> --client <shadow>` switches its viewport and shows real scrollback
+  while the user's GUI does not move.
+  - **Its xterm pins to the daemon's PTY grid**, because a shadow may not
+    resize the PTY (D8) and a differently-sized viewer would wrap the frame
+    wrongly. So `session_view_contract_violations` stays `[]` and the frame is
+    faithful — a shadow screenshot is now valid pixel proof for a terminal bug.
+  - ⚠ Start it big: `--size 2560x1440` (now the default). A window SMALLER
+    than the pinned grid clips rows out of every capture, silently.
+  - A session with no live runtime still shows nothing on a shadow — it may
+    not start one. That is the honest limit, not a bug.
+  - `terminal read-buffer <session>` and `server snapshot` remain the cheapest
+    way to read CONTENT (safe untargeted; they never move the user's view).
 
 ### Background work WITHOUT the shadow (the verbs plane — prefer these for ACTION)
 
