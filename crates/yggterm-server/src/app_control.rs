@@ -222,6 +222,27 @@ impl WebElementRef {
     }
 }
 
+/// Which vault record a `fill-vault` verb reads from.
+///
+/// One command with a source, not two commands: the page-origin guard, the
+/// injection path, the redaction rules and the response shape are identical —
+/// only the vault CLI subcommand differs. Two commands would be a second
+/// encoding of all of that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultFieldSource {
+    /// A login item: `password`, `username`, `totp`, `notes`.
+    #[default]
+    Login,
+    /// A card item: `number`, `expiry`, `code`, `holder`.
+    ///
+    /// BLOCKED on `ychrome-vault` growing a `card` op — no agent op reaches
+    /// `cipher.card` today. The verb refuses with `vault_cli_no_card_op` rather
+    /// than a generic failure, so the day that op lands this starts working
+    /// with no yggterm change.
+    Card,
+}
+
 /// One trusted action injected into a web surface's page (agent control plane
 /// `do` verb, slice 2b). Delivered via GTK-level event synthesis into the target
 /// webview — `isTrusted: true`, NO seat pointer moved — so a backgrounded
@@ -769,6 +790,38 @@ pub enum AppControlCommand {
         #[serde(default)]
         user: Option<String>,
     },
+    /// Type ONE named vault field into ONE addressed element, with real keys.
+    ///
+    /// The secret never reaches argv, stdout, a log, or the agent's transcript:
+    /// the GUI shells out to `ychrome-vault` IN-PROCESS, holds the value only
+    /// long enough to synthesize keystrokes into the page, and answers with a
+    /// LENGTH and a page-side boolean. The trace event carries the item and
+    /// field NAMES only.
+    ///
+    /// Distinct from `WebSurfaceFill`, which auto-matches a login form by host
+    /// and writes both fields. This one is for the case a form cannot be
+    /// auto-matched — a bank's login page, a gateway's card box — where the
+    /// agent has already read the page and knows exactly which element it
+    /// wants filled.
+    WebSurfaceFillVault {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// The element to type into. Same addressing as `do` (see
+        /// [`WebElementRef`]) — CSS, visible text, or role+label.
+        target: WebElementRef,
+        /// Vault entry NAME.
+        item: String,
+        /// Which field of it.
+        field: String,
+        /// Username disambiguator when several entries share `item`'s name.
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        source: VaultFieldSource,
+        /// Pin the surface incarnation (F3), same meaning as on `WebSurfaceDo`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+    },
     /// Put a vault entry's current TOTP code into the page's one-time-code
     /// field (and onto the clipboard). Same entry/user semantics as fill.
     WebSurfaceTotp {
@@ -1017,6 +1070,7 @@ impl AppControlCommand {
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
+            Self::WebSurfaceFillVault { .. } => "web_surface_fill_vault",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::WebSurfaceDo { .. } => "web_surface_do",
             Self::WebSurfaceBatch { .. } => "web_surface_batch",

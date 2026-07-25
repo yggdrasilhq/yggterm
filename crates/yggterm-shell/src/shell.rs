@@ -183,8 +183,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebElementRef, WebSurfaceDoAction,
-    WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebElementRef,
+    WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -48583,6 +48583,86 @@ mod web_do_verb_tests {
         );
     }
 
+    // C6: the field name → vault CLI mapping, whitelisted and testable without
+    // a vault. `totp` is its own subcommand rather than a field of `get`, and
+    // that is the ONE place that knows it.
+    #[test]
+    fn vault_field_args_map_each_named_field_to_one_cli_call() {
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "password", None).unwrap(),
+            vec!["get", "sbi", "--field", "password"]
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "PassWord", Some("avi")).unwrap(),
+            vec!["get", "sbi", "--field", "password", "avi"],
+            "field names are normalised, and --user is a positional disambiguator"
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "totp", None).unwrap(),
+            vec!["totp", "sbi"],
+            "totp is a subcommand, not a field of get"
+        );
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Card, "hdfc", "number", None).unwrap(),
+            vec!["card", "hdfc", "--field", "number"]
+        );
+        // An empty --user must not become a positional argument.
+        assert_eq!(
+            vault_field_args(VaultFieldSource::Login, "sbi", "password", Some("")).unwrap(),
+            vec!["get", "sbi", "--field", "password"]
+        );
+    }
+
+    // A field this verb does not understand is refused BEFORE the surface is
+    // touched, and the message names what is allowed — the alternative is an
+    // opaque vault CLI error blamed on the page.
+    #[test]
+    fn an_unknown_vault_field_is_refused_with_the_allowed_set() {
+        let err = vault_field_args(VaultFieldSource::Login, "sbi", "cvv", None).unwrap_err();
+        assert!(err.contains("cvv"), "{err}");
+        assert!(err.contains("password"), "{err}");
+        // Card fields are not login fields and vice versa.
+        assert!(vault_field_args(VaultFieldSource::Card, "hdfc", "password", None).is_err());
+        assert!(vault_field_args(VaultFieldSource::Login, "sbi", "number", None).is_err());
+    }
+
+    // `fill-card` is blocked on ychrome-vault growing a `card` op. The
+    // classifier must recognise "that subcommand does not exist" and NOTHING
+    // else: mislabelling a locked vault as `vault_cli_no_card_op` would send an
+    // agent off debugging a CLI that is working fine.
+    #[test]
+    fn a_missing_card_op_is_distinguished_from_a_real_vault_failure() {
+        assert!(vault_failure_is_missing_subcommand(
+            "ychrome-vault card: error: unrecognized subcommand 'card'"
+        ));
+        assert!(vault_failure_is_missing_subcommand(
+            "error: unexpected argument 'card' found"
+        ));
+        assert!(!vault_failure_is_missing_subcommand(
+            "vault locked: run `ychrome-vault unlock` in a terminal first"
+        ));
+        assert!(!vault_failure_is_missing_subcommand(
+            "ychrome-vault card: no item named hdfc"
+        ));
+    }
+
+    // `ychrome-vault` prints its ERRORS to stdout, so a caller that captured
+    // stdout could capture `Error: … has no username` AS the credential and
+    // type it into a bank login. The exit-status check in `vault_cli_output` is
+    // why yggterm is safe today; this is the belt to that braces.
+    #[test]
+    fn an_error_string_is_never_typed_as_a_secret() {
+        assert_eq!(
+            vault_secret_is_unusable("Error: sbi has no username"),
+            Some("vault_returned_an_error_as_the_value")
+        );
+        assert_eq!(vault_secret_is_unusable(""), Some("vault_field_empty"));
+        // A real secret that merely CONTAINS the word is fine — the check is
+        // anchored, not a substring search.
+        assert_eq!(vault_secret_is_unusable("my-Error:-password"), None);
+        assert_eq!(vault_secret_is_unusable("hunter2"), None);
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -49820,6 +49900,217 @@ fn web_surface_fill_script(host: &str, credential: &WebLoginCredential) -> Strin
 /// from the local vault. The ENGINE's current page URI is the origin truth
 /// (the shell nav model may lag in-page navigation) — the page cannot lie
 /// about it, so a credential can only ever land on its own origin.
+/// The vault CLI arguments for one named field. PURE, so the whitelist and the
+/// subcommand mapping are testable without a vault.
+///
+/// `ychrome-vault` prints only the field asked for, and its `get --field` is
+/// whitelisted client-side to the login fields. Card fields go through a `card`
+/// op that does not exist yet — see [`VaultFieldSource::Card`].
+fn vault_field_args(
+    source: VaultFieldSource,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let field = field.trim().to_ascii_lowercase();
+    let (subcommand, allowed): (&str, &[&str]) = match source {
+        VaultFieldSource::Login => ("get", &["password", "username", "totp", "notes"]),
+        VaultFieldSource::Card => ("card", &["number", "expiry", "code", "holder"]),
+    };
+    if !allowed.contains(&field.as_str()) {
+        return Err(format!(
+            "unknown vault field {field:?} for this item kind (expected one of {allowed:?})"
+        ));
+    }
+    // `totp` is its own subcommand, not a field of `get` — one mapping, here.
+    let mut args: Vec<String> = if source == VaultFieldSource::Login && field == "totp" {
+        vec!["totp".to_string(), item.to_string()]
+    } else {
+        vec![
+            subcommand.to_string(),
+            item.to_string(),
+            "--field".to_string(),
+            field,
+        ]
+    };
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        args.push(user.to_string());
+    }
+    Ok(args)
+}
+
+/// Is this vault CLI failure "that subcommand does not exist"?
+///
+/// PURE so it is testable, and narrow on purpose: it must not swallow a real
+/// failure (a locked vault, a missing item) as "not implemented yet", because
+/// that would send an agent off relaunching a CLI that is working fine.
+fn vault_failure_is_missing_subcommand(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("unrecognized subcommand")
+        || error.contains("unknown subcommand")
+        || error.contains("invalid subcommand")
+        || error.contains("unexpected argument")
+}
+
+/// A secret the vault CLI would not vouch for. `ychrome-vault` prints its ERRORS
+/// to stdout, so a caller that captures stdout can capture `Error: … has no
+/// username` AS the credential — and type it into a bank login.
+///
+/// `vault_cli_output` already checks the exit status first, which is why yggterm
+/// is safe today; this is the belt to that braces, so a future exit-code
+/// regression in that CLI cannot silently become a typed error message. PURE.
+fn vault_secret_is_unusable(secret: &str) -> Option<&'static str> {
+    if secret.is_empty() {
+        return Some("vault_field_empty");
+    }
+    if secret.starts_with("Error:") || secret.starts_with("error:") {
+        return Some("vault_returned_an_error_as_the_value");
+    }
+    None
+}
+
+/// App-control `fill-vault`: type ONE named vault field into ONE addressed
+/// element, with real keys.
+///
+/// Why real keys and not a scripted value write: `web_surface_fill_script` sets
+/// `.value` through the native setter and dispatches `input`/`change`, which a
+/// component that keeps its own state ignores — the a services portal measurement
+/// showed the DOM reading correct while the widget held the stale value, so the
+/// readback LIED. This path reuses `WebSurfaceDoAction::Fill`, i.e. the same
+/// clear-with-real-keys → type-with-real-keys → read-back machinery a `do fill`
+/// runs, gated by the same lane.
+///
+/// Redaction invariants this upholds, and they are the point of the verb:
+/// the value appears in `data`, in `error` and in the trace event NOWHERE. The
+/// answer is `{item, field, chars, matched}` — a length and a page-side boolean
+/// — mirroring the field note's "injected password of <item> (15 chars, not
+/// shown)".
+async fn web_surface_fill_vault_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    target: &WebElementRef,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+    source: VaultFieldSource,
+    expected_generation: Option<u64>,
+) -> Value {
+    let args = match vault_field_args(source, item, field, user) {
+        Ok(args) => args,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, false).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    // Same page-origin guard as `web fill`: a credential goes into an https
+    // page or a loopback fixture, never a plaintext remote one.
+    let Some((page_url, _, _)) = desktop.web_surface_page_state(native_id) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "surface has no page state",
+        });
+    };
+    if !page_url.starts_with("https://") && !web_surface_url_is_loopback(&page_url) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("refusing to fill a non-https page: {page_url}"),
+        });
+    }
+    let owned: Vec<String> = args;
+    let secret = match task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        vault_cli_output(&borrowed)
+    })
+    .await
+    .unwrap_or_else(|join| Err(format!("vault task failed: {join}")))
+    {
+        Ok(secret) => secret,
+        Err(reason) => {
+            // The card op does not exist yet. Say exactly that instead of a
+            // generic failure, so the day it lands this verb starts working
+            // with no yggterm change — and so nobody debugs the wrong thing.
+            let reason = if source == VaultFieldSource::Card
+                && vault_failure_is_missing_subcommand(&reason)
+            {
+                "vault_cli_no_card_op".to_string()
+            } else {
+                reason
+            };
+            return json!({ "accepted": false, "session_path": session, "reason": reason });
+        }
+    };
+    if let Some(reason) = vault_secret_is_unusable(&secret) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "item": item,
+            "field": field,
+            "reason": reason,
+        });
+    }
+    let chars = secret.chars().count();
+    let action = WebSurfaceDoAction::Fill {
+        text: secret,
+        selector: Some(target.clone()),
+        selectors: Vec::new(),
+    };
+    let (result, delivery) = web_do_execute_one(desktop, native_id, &action).await;
+    // The trace carries NAMES and a length. Never the value, never the page's
+    // read-back string.
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "web_surface",
+            "fill_vault",
+            json!({
+                "session_path": session,
+                "item": item,
+                "field": field,
+                "source": source,
+                "chars": chars,
+                "accepted": result.is_ok(),
+            }),
+        );
+    }
+    match result {
+        Ok(detail) => {
+            let mut answer = json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "generation": handle.generation,
+                "item": item,
+                "field": field,
+                // A LENGTH, never the value.
+                "chars": chars,
+                // The page-side boolean from the fill readback; `null` means it
+                // could not be read, which is not the same as "no".
+                "matched": detail.get("matched").cloned().unwrap_or(Value::Null),
+                "cleared_verified": detail
+                    .get("cleared_verified")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            });
+            web_do_apply_delivery(&mut answer, delivery);
+            answer
+        }
+        Err(reason) => json!({
+            "accepted": false,
+            "session_path": session,
+            "item": item,
+            "field": field,
+            "reason": reason,
+        }),
+    }
+}
+
 async fn web_surface_fill_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -53991,6 +54282,46 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceFillVault {
+            session_path,
+            target,
+            item,
+            field,
+            user,
+            source,
+            generation,
+        } => {
+            let data = web_surface_fill_vault_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &target,
+                &item,
+                &field,
+                user.as_deref(),
+                source,
+                generation,
+            )
+            .await;
+            let error = (!data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+            .then(|| {
+                data.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fill-vault failed")
+                    .to_string()
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error,
             }
         }
         AppControlCommand::WebSurfaceTotp {
