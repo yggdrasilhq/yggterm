@@ -23082,7 +23082,14 @@ mod tests {
     use yggterm_core::{SessionNodeKind, SessionTitleStore, TranscriptRole};
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static TERMINAL_IDENTITY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // The terminal-identity env has ONE guard, and it lives with the module that
+    // owns that env (`codex_cli`). This used to be a second `Mutex` declared
+    // here, which is the same thing as no mutual exclusion at all: tests holding
+    // different locks ran concurrently and cleared each other's palette. That is
+    // what made `agent_arm_matrix::locality_does_not_fork_the_invocation` report
+    // a locality fork that did not exist.
+    use crate::codex_cli::env_test_guard as terminal_identity_test_guard;
 
     #[test]
     fn default_screenshot_post_process_is_a_noop() {
@@ -32752,7 +32759,7 @@ terminal_window_id: None,
 
     #[test]
     fn start_remote_codex_session_exports_synced_terminal_appearance() {
-        let _guard = TERMINAL_IDENTITY_TEST_LOCK.lock().expect("env lock");
+        let _guard = terminal_identity_test_guard();
         let previous_terminal = std::env::var_os("YGGTERM_TERMINAL_APPEARANCE");
         let previous_shell = std::env::var_os("YGGTERM_APPEARANCE");
         let previous_colorfgbg = std::env::var_os("COLORFGBG");
@@ -32827,7 +32834,7 @@ terminal_window_id: None,
 
     #[test]
     fn refresh_terminal_identity_updates_restored_remote_launch_commands() {
-        let _guard = TERMINAL_IDENTITY_TEST_LOCK.lock().expect("env lock");
+        let _guard = terminal_identity_test_guard();
         let previous_terminal = std::env::var_os("YGGTERM_TERMINAL_APPEARANCE");
         let previous_shell = std::env::var_os("YGGTERM_APPEARANCE");
         let previous_colorfgbg = std::env::var_os("COLORFGBG");
