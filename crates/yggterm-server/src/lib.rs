@@ -16550,6 +16550,15 @@ fn process_environment_snapshot(pid: u32) -> BTreeMap<String, String> {
         "YGGTERM_ENABLE_XTERM_CANVAS",
         "YGGTERM_XTERM_CANVAS_POLICY",
         "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
+        // Which GL path this GUI is on, and the four variables that ARE that path.
+        // Before these were here, answering "is the GPU switched off in this window"
+        // meant an ssh into /proc/<pid>/environ — which is exactly why nobody noticed
+        // for months that it was.
+        yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+        "LIBGL_ALWAYS_SOFTWARE",
+        "GALLIUM_DRIVER",
+        "WEBKIT_DISABLE_DMABUF_RENDERER",
+        "YGGTERM_WEB_SURFACE_UNDER_GLASS",
     ];
     let payload = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
     payload

@@ -74,6 +74,23 @@ This is the README's prescribed path for D1/D4/D6-class behavioral guards.
 Run via `yggterm-headless server …` on the host (or the active launcher). Prefer
 these over screenshots.
 
+**The perf trio — reach for these before guessing why the fan is loud.** All three
+read LOCAL logs in-process and never touch the daemon, so they answer even when it
+is busy (and they must run from the NEWEST binary — see the no-handoff carve-out in
+`yggterm-headless.rs`, or you get `unsupported server command` on the very host you
+are profiling).
+
+- `server perf-summary [--category render] [--since-ms N] [--top N] [--json]` — the
+  rolling aggregate, ranked by total. The `clock` column says whether a row's
+  milliseconds are WALL or CPU time; `render` rows are CPU.
+- `server perf-incidents [--list] [--json]` — the durable snapshots of "the app went
+  hot", grouped by trigger and ranked by count. `span_cpu_hot` is a CPU-time span past
+  1.2 cores; `span_busy`/`span_stall` are wall-clock triggers.
+- `cargo run -p yggterm-core --example render_top -- <gui-pid> 15000` — LIVE per-process
+  render cost of the GUI tree: cores, PSS and **`gpu_ms`** per role. Every number is a
+  delta between two samples. (Being promoted to `server render-top`; until then the
+  example is the reader.)
+
 - `server snapshot` — the daemon view. `active_session` (and `live_sessions[]`) carry
   per-session `launch_phase`, `remote_deploy_state`, **`pty_cols`/`pty_rows`** (the SQUISH
   gauge — the PTY's real grid), and **`terminal_lines`** (the daemon's authoritative
@@ -168,6 +185,23 @@ breaks clipboard/paste, screenshot faithfulness, and native compositing.**
   and screenshot fidelity won't work until it is. See `finding-app-screenshot-unfaithful-on-wayland`.
 
 ## 3. Caveats — which instruments lie (hard-won)
+
+- **`ps %CPU` is a LIFETIME AVERAGE, not current load.** A process that pegged a core
+  for two hours and then idled reads identically to one pegging it now, and a busy GUI
+  on a 16-core box reads a reassuring `load average: 0.79`. This is how "105% of a core"
+  misled a whole campaign. Use `render_top` (deltas) or CPU-seconds from `/proc`.
+- **A render number is per PROCESS, never per surface.** WebKitGTK runs one web process
+  per profile serving every surface on it, so a per-surface CPU number would be a
+  fabrication. Surface counts ride along as caller-supplied context.
+- **Low CPU does not mean the GPU is working.** `drm-engine-gfx` in
+  `/proc/<webproc>/fdinfo/*` — nonzero and RISING across two reads — is the only proof
+  the GPU is rasterizing. `render_top`'s `gpu_ms` prints `-` when that counter was
+  unreadable, which is NOT a zero: conflating "no permission" with "no GPU work" is
+  exactly how this product ran with its GPU switched off for months.
+- **Which GL path a window is on is now a state field, not an ssh into /proc.**
+  `server app state` carries `YGGTERM_WEBKIT_GL_POLICY` plus `LIBGL_ALWAYS_SOFTWARE`,
+  `GALLIUM_DRIVER`, `WEBKIT_DISABLE_DMABUF_RENDERER` and
+  `YGGTERM_WEB_SURFACE_UNDER_GLASS`.
 
 - **`app state` `viewport_y` is STALE when the window is backgrounded.** It can disagree
   with what the user sees. Use the `viewport_force_log` (probe-scroll) and the user's

@@ -7,12 +7,43 @@ fix) once the fix is verified live on jojo.
 ## Standing traps / other open bugs
 
 - **★★★ WE FORCE SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL — THE
-  SINGLE LARGEST CPU ITEM IN THE PRODUCT (root-caused 2026-07-25, measured,
-  NOT yet fixed; needs a GUI restart to activate so it was left to the user).**
-  `configure_linux_webkit_compositing()` (`apps/yggterm/src/main.rs:4046-4053`)
-  sets `LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe` +
+  SINGLE LARGEST CPU ITEM IN THE PRODUCT (root-caused + measured 2026-07-25;
+  ⚠ CODE FIX COMMITTED, NOT DEPLOYED AND NOT LIVE-PROVEN — this entry stays
+  until it is).**
+  ⛔ **Do not read the FIX paragraph below as the shipped design; it is
+  superseded.** What landed instead of the one-env-var workaround: the binary
+  PROBES the host (`crates/yggterm-core/src/gl_probe.rs` — Surfaceless platform
+  only, never GBM; `renderD*` only, never `card0`; no disk cache; in a child
+  process so a Mesa SIGSEGV is one `Unknown` and not a dead window), one policy
+  turns that into `hardware_gl` (`linux_webkit_gl_policy_from_input`), and
+  `shm_force_for_arming` now refuses SHM on a hardware host so the three settings
+  cannot be split apart. `YGGTERM_FORCE_SOFTWARE_GL=1` restores the old
+  behaviour; `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` still forces hardware. The
+  five shell + three python launcher re-encodings are deleted and the launcher
+  marker is `v4` so installed launchers get rewritten.
+  **WHAT IS STILL OWED, and why this entry is still open:** a GUI swap on the
+  live host and then, in order — `server app state` shows
+  `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_probed` with `LIBGL_ALWAYS_SOFTWARE` and
+  `GALLIUM_DRIVER` and `WEBKIT_DISABLE_DMABUF_RENDERER` all ABSENT and
+  `YGGTERM_WEB_SURFACE_UNDER_GLASS=1`; `drm-engine-gfx` PRESENT and RISING in
+  `/proc/<webproc>/fdinfo/*` (this is the decisive gauge — a CPU number alone
+  proves nothing); a `render_top` cores delta against the §3a baseline under the
+  same workload; three relaunches including one through the supervisor, all
+  reading the same policy (that is the env-inheritance poisoning risk proven
+  closed on the host, not just in a unit test); and a faithful terminal
+  screenshot, because hardware GL changes the presentation path for the xterm
+  WebGL renderer and "CPU went down" is not evidence the terminal still paints.
+  ⚠ It also arms Phase F under-glass in production for the first time.
+  ⚠ **Installed users were never in the measured before-state**: their launcher
+  exported `WEBKIT_DISABLE_COMPOSITING_MODE=1`, which is hardware GL libraries
+  with compositing OFF while the WebGL renderer is still selected — a fifth
+  combination outside the four-way matrix below. The 22x does not describe them.
+
+  The original finding, unchanged:
+  `configure_linux_webkit_compositing()` (`apps/yggterm/src/main.rs`)
+  set `LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe` +
   `WEBKIT_DISABLE_DMABUF_RENDERER=1` unless `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1`
-  is set. Its comment justifies this as *"jojo: AMD iGPU exposing only
+  was set. Its comment justified this as *"jojo: AMD iGPU exposing only
   llvmpipe."* ⛔ **That premise is FALSE on jojo and has been for some time.**
   `eglinfo` platform matrix, jojo, 2026-07-25: GBM → `llvmpipe`, but **Wayland →
   `AMD Radeon 780M (radeonsi, phoenix, ACO)`**, Surfaceless → same, Device →
