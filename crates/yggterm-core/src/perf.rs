@@ -324,6 +324,119 @@ pub fn summarize_perf_telemetry(
     summaries
 }
 
+/// One incident kind, aggregated across the log — what `server perf-incidents`
+/// reports.
+///
+/// The records have been written since the feature landed, but nothing could
+/// READ them: the CLI answered `unsupported server command`, so 183 durable
+/// snapshots of "the app went hot" sat on guihost unopened until someone parsed
+/// them by hand (2026-07-25). That hand-parse is what named the top driver
+/// (`remote/resolve_yggterm_binary`, 65 of 183), which is the whole reason this
+/// reader exists: an instrument nobody can read is not an instrument.
+#[derive(Debug, Clone, Serialize)]
+pub struct PerfIncidentSummary {
+    /// The trigger's first word — `span_busy`, `span_stall`,
+    /// `copy_generation_busy`.
+    pub trigger_kind: String,
+    /// The span the trigger named, `category/name`, or empty when the trigger
+    /// does not name one.
+    pub span: String,
+    pub count: usize,
+    pub first_ts_ms: u64,
+    pub last_ts_ms: u64,
+    /// Worst `total_ms` this kind reached in any one incident window.
+    pub worst_total_ms: f64,
+}
+
+/// Every incident record, oldest-first, optionally since a timestamp. Raw
+/// `Value`s: the record carries a caller-supplied `extra` whose shape is the
+/// caller's business, so parsing it here would be a second encoding of it.
+pub fn read_perf_incidents(home: &Path, since_ms: Option<u64>) -> Vec<Value> {
+    let mut records = Vec::new();
+    for path in crate::retention::jsonl_read_paths(&home.join(PERF_INCIDENT_FILENAME)) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(since) = since_ms
+                && record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0) < since
+            {
+                continue;
+            }
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|record| record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0));
+    records
+}
+
+/// Group incidents by what triggered them, most frequent first.
+///
+/// Ranked by COUNT rather than by duration on purpose: incidents measure "the
+/// app stalled", and the thing worth fixing first is the one that keeps
+/// happening. Reading the 183 records this way is what turned a pile of
+/// snapshots into one name.
+pub fn summarize_perf_incidents(home: &Path, since_ms: Option<u64>) -> Vec<PerfIncidentSummary> {
+    let mut grouped: BTreeMap<(String, String), PerfIncidentSummary> = BTreeMap::new();
+    for record in read_perf_incidents(home, since_ms) {
+        let ts_ms = record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+        let trigger = record
+            .get("trigger")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut parts = trigger.split_whitespace();
+        let trigger_kind = parts.next().unwrap_or("").to_string();
+        // `span_busy remote/resolve_yggterm_binary total_ms=…` — the middle
+        // token is the span. `copy_generation_busy total_ms=…` names none.
+        let span = parts
+            .next()
+            .filter(|token| !token.contains('='))
+            .unwrap_or("")
+            .to_string();
+        let total_ms = trigger
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("total_ms="))
+            .or_else(|| {
+                trigger
+                    .split_whitespace()
+                    .find_map(|token| token.strip_prefix("max_ms="))
+            })
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let entry = grouped
+            .entry((trigger_kind.clone(), span.clone()))
+            .or_insert_with(|| PerfIncidentSummary {
+                trigger_kind,
+                span,
+                count: 0,
+                first_ts_ms: ts_ms,
+                last_ts_ms: ts_ms,
+                worst_total_ms: 0.0,
+            });
+        entry.count += 1;
+        entry.first_ts_ms = entry.first_ts_ms.min(ts_ms);
+        entry.last_ts_ms = entry.last_ts_ms.max(ts_ms);
+        entry.worst_total_ms = entry.worst_total_ms.max(total_ms);
+    }
+    let mut summaries: Vec<PerfIncidentSummary> = grouped.into_values().collect();
+    summaries.sort_by(|a, b| {
+        b.count.cmp(&a.count).then_with(|| {
+            b.worst_total_ms
+                .partial_cmp(&a.worst_total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    summaries
+}
+
 pub const PERF_INCIDENT_FILENAME: &str = "perf-incidents.jsonl";
 pub const PERF_INCIDENT_ROTATED_FILENAME: &str = "perf-incidents.previous.jsonl";
 // Incidents are tiny (one record) and rare, so a generous cap keeps WEEKS of them —
@@ -533,6 +646,48 @@ mod tests {
         let only_attach = summarize_perf_telemetry(&home, None, Some("attach"));
         assert_eq!(only_attach.len(), 1);
         assert_eq!(only_attach[0].name, "managed_cli");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The reader that turns a pile of incident snapshots into one NAME. Ranked
+    /// by count, because an incident measures "the app stalled" and the driver
+    /// worth fixing is the one that keeps happening — which is exactly how
+    /// `remote/resolve_yggterm_binary` (65 of 183) was found on the live host.
+    #[test]
+    fn perf_incidents_group_by_trigger_and_rank_by_count() {
+        let dir = temp_test_dir("incidents");
+        let home = dir.clone();
+        let write = |ts_ms: u64, trigger: &str| {
+            append_bounded_jsonl_record(
+                &home.join(PERF_INCIDENT_FILENAME),
+                PERF_INCIDENT_ROTATED_FILENAME,
+                PERF_INCIDENT_MAX_BYTES,
+                &json!({ "ts_ms": ts_ms, "window_ms": 60_000, "trigger": trigger }),
+            );
+        };
+        write(1_000, "span_busy remote/resolve_yggterm_binary total_ms=40000");
+        write(2_000, "span_busy remote/resolve_yggterm_binary total_ms=52000");
+        write(3_000, "span_busy daemon/persist total_ms=39000");
+        write(4_000, "copy_generation_busy total_ms=31000");
+
+        let summary = summarize_perf_incidents(&home, None);
+        assert_eq!(summary[0].trigger_kind, "span_busy");
+        assert_eq!(summary[0].span, "remote/resolve_yggterm_binary");
+        assert_eq!(summary[0].count, 2);
+        assert_eq!(summary[0].worst_total_ms, 52000.0);
+        assert_eq!(summary[0].first_ts_ms, 1_000);
+        assert_eq!(summary[0].last_ts_ms, 2_000);
+        // A trigger that names no span still groups, with an empty span.
+        let generation = summary
+            .iter()
+            .find(|entry| entry.trigger_kind == "copy_generation_busy")
+            .expect("copy_generation_busy present");
+        assert_eq!(generation.span, "");
+        assert_eq!(generation.worst_total_ms, 31000.0);
+        // `--since-ms` drops everything older.
+        assert_eq!(summarize_perf_incidents(&home, Some(3_000)).len(), 2);
+        assert_eq!(read_perf_incidents(&home, Some(4_000)).len(), 1);
 
         let _ = fs::remove_dir_all(dir);
     }
