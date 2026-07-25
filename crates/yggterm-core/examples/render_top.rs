@@ -9,7 +9,7 @@
 //! cargo run -p yggterm-core --example render_top -- <root-pid> [interval-ms]
 //! ```
 
-use yggterm_core::render_probe::{RenderProbe, observe_process_tree, roll_up_by_role, user_hz};
+use yggterm_core::render_probe::{RenderProbe, observe_process_tree, roll_up_roles, user_hz};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -45,17 +45,19 @@ fn main() {
         "{:<14} {:>6} {:>10} {:>8} {:>12}",
         "role", "procs", "cpu_ms", "cores", "mem_mb"
     );
-    let rolled = roll_up_by_role(&samples);
+    let rolled = roll_up_roles(&samples);
     let mut total_cores = 0.0;
     let mut total_mem_mb = 0.0;
-    for (role, cpu_ms, mem_kb, count) in &rolled {
-        let cores = cpu_ms / interval_ms as f64;
-        let mem_mb = *mem_kb as f64 / 1024.0;
+    for rollup in &rolled {
+        let cores = rollup.core_fraction();
+        let mem_mb = rollup.mem_kb as f64 / 1024.0;
         total_cores += cores;
         total_mem_mb += mem_mb;
         println!(
-            "{:<14} {count:>6} {cpu_ms:>10.1} {cores:>8.3} {mem_mb:>12.1}",
-            role.as_str()
+            "{:<14} {:>6} {:>10.1} {cores:>8.3} {mem_mb:>12.1}",
+            rollup.role.as_str(),
+            rollup.procs,
+            rollup.cpu_ms
         );
     }
     println!(
