@@ -95,6 +95,29 @@ bursts leaves the battery drain.
 
 ### 3c. The incident log, which nobody had read
 
+> **UPDATE 2026-07-25 — BOTH ITEMS IN THIS SECTION ARE BUILT.** `server
+> perf-incidents` exists and was run against the live log; the SWR fix below is on
+> `main` with its policy unit-tested, and lands with the next daemon bump (it is
+> daemon-side, so a GUI-only swap does not activate it).
+>
+> The reader's own output on jojo, which independently reproduces the hand-parse
+> below and adds what it missed:
+>
+> | trigger | span | incidents | worst_ms |
+> |---|---|---|---|
+> | `span_busy` | `remote/resolve_yggterm_binary` | **65** | **483,265** |
+> | `span_busy` | `startup/initial_server_sync` | 33 | 193,919 |
+> | `span_busy` | `daemon_request/shutdown` | 30 | 118,531 |
+> | `copy_generation_busy` | — | 23 | 51,802 |
+> | `span_busy` | `daemon_request/remove_session` | 10 | 83,323 |
+> | `span_busy` | `daemon_request/hot_restart` | 10 | 50,906 |
+> | `span_stall` | `remote/resolve_yggterm_binary` | 4 | 31,756 |
+>
+> 192 incidents now. **`resolve_yggterm_binary` is 69 of 192 across both trigger
+> kinds — 36% — and its worst single window is 483 SECONDS**, eight minutes of
+> wall-clock inside one 60s sample window (i.e. many calls piled up). The
+> hand-parse under-counted it by missing the `span_stall` rows.
+
 `~/.yggterm/perf-incidents.jsonl` on jojo holds **183 recorded load incidents** and the
 writer has been live all along (`record_perf_incident_if_hot`). Only the CLI reader is
 missing: `server perf-incidents` returns *"unsupported server command"*. That log is
@@ -156,8 +179,9 @@ Remaining in WS1:
   GUI (the allocator-trim chore near `shell.rs:23753` is the pattern to copy) passing
   live/stashed surface counts and window visibility as context.
 - **`server render-top`**, promoting `examples/render_top.rs` into a real command.
-- **`server perf-incidents`**, a reader for the 183 records already on disk. Cheapest
-  high-value item in this doc.
+- ~~**`server perf-incidents`**, a reader for the 183 records already on disk.~~
+  ✅ **SHIPPED 2026-07-25** and run live — see the update box in §3c. Groups by
+  trigger, ranked by count, `--list`/`--json` for raw records.
 - **Collapse the duplicate `/proc` parser.** `shell.rs:37685
   current_process_memory_sample` / `process_memory_sample_from_smaps_rollup` parses
   `smaps_rollup` for self only; `render_probe` parses it per pid. Single source of truth
@@ -204,8 +228,12 @@ The "cli dev tools++ for agents" the user asked for.
 
 Independent of the render work, so it can run in parallel.
 
-- `resolve_yggterm_binary`: stale-while-revalidate, per section 3c. **Do this first**,
-  it is the top measured incident driver.
+- ~~`resolve_yggterm_binary`: stale-while-revalidate, per section 3c.~~ ✅ **BUILT
+  2026-07-25**, unit-tested, **not yet active** — it is daemon-side, so it starts
+  paying off at the next daemon bump. Past the TTL the resolver now returns the
+  entry it just used and revalidates on a background thread; a changed
+  `local_build_id` still resolves in the foreground, and staleness is bounded at
+  six hours.
 - `copy_scan`: incremental off mtime, skip unchanged stores, back off when nothing
   changed.
 - `daemon/persist`: dirty-flag or debounce; the state is re-serialized far more often
