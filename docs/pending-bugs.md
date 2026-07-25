@@ -6,6 +6,35 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★ A CONTRIBUTED RAIL DOES NOT SURVIVE A CLIENT THAT DID NOT SEE THE
+  DECLARE (found 2026-07-25).** An app's rail (yedit's notes, ychrome's tabs)
+  is built client-side by parsing OSC 7717 out of the terminal byte stream. Any
+  client that was not rendering that terminal when the app declared has NO
+  contribution and shows Session Metadata instead — with no error. Two real
+  consequences, both hit this day:
+  1. **After a GUI restart the rail is gone** until the app re-declares. I had
+     to re-run `yedit` in the session by hand to get it back.
+  2. **The agentic surface cannot test app rails at all.** A shadow view client
+     never had the byte stream, so `app right-panel pane:<id> --client agent-1`
+     opens nothing. This blocks live verification of anything rail-shaped
+     (the rail drag-reorder and yedit's inline rename are both code-complete
+     and unit-locked but pixel-unproven for exactly this reason) — and it
+     collides with the standing rule that ALL live testing runs on the agentic
+     surface ([[feedback-agentic-surface-is-the-default]]).
+  **The fix already has a precedent.** The daemon ingests every declare
+  (`cb4eff9`), and web surfaces already rebuild from it:
+  `rebuild_web_surface_from_daemon_declare` fetches via
+  `terminal_app_declares_async` and filters `verb == "web-surface"`. yedit's
+  declare is the same records list with `verb == "sidebar"`. What is missing is
+  a sibling that rebuilds a SIDEBAR contribution the same way, called when a
+  session becomes active and has no contribution. The obstacle is only that the
+  declare-application logic (parse panes/control/versions → resolve the control
+  URL → `upsert_sidebar_contribution`) is inline in the OSC match arm and needs
+  extracting so it can be fed a daemon-sourced record too.
+  ⚠ Do NOT "fix" this by having the agent re-run the app to force a declare —
+  that is the workaround I used, and it only works when a terminal lane exists.
+
+
 - **★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
   before ever "fixing" a focus steal again.** The user could not type in yedit;
   three previous fixes all missed, because every one of them hardened something
