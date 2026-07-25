@@ -23878,6 +23878,24 @@ fn allocator_trim_can_run(shell: &ShellState) -> bool {
         && shell.title_requests_in_flight.is_empty()
         && shell.summary_requests_in_flight.is_empty()
 }
+/// Whether a memory reading may gate an allocator trim.
+///
+/// ⚠ The source requirement is not decoration. This chore's whole report is the
+/// anonymous-memory delta the trim moved, and `/proc/<pid>/status` cannot see anonymous
+/// memory at all. Before the one-owner collapse, `current_process_memory_sample` read
+/// `smaps_rollup` alone and returned `None` when it was unreadable, so the chore simply
+/// never ran on hosts where that file is absent (hardened kernels). Routing it through
+/// `read_process_memory` silently added a `status` fallback and started firing
+/// `malloc_trim(0)` on exactly those hosts — a behaviour change nobody asked for,
+/// inside what was described as a pure refactor. It is spelled out here rather than
+/// left to drift.
+#[cfg(target_os = "linux")]
+fn allocator_trim_sample_is_actionable(
+    memory: &yggterm_core::render_probe::ProcMemory,
+) -> bool {
+    memory.source.knows_pss_and_anonymous() && memory.rss_kb >= ALLOCATOR_TRIM_RSS_THRESHOLD_KB
+}
+
 #[cfg(target_os = "linux")]
 fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) -> bool {
     let now_ms = current_millis();
@@ -23899,7 +23917,7 @@ fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) 
     let Some(before) = current_process_memory_sample() else {
         return false;
     };
-    if before.rss_kb < ALLOCATOR_TRIM_RSS_THRESHOLD_KB {
+    if !allocator_trim_sample_is_actionable(&before) {
         return false;
     }
     if ALLOCATOR_TRIM_IN_FLIGHT
@@ -23919,16 +23937,10 @@ fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) 
             "trimmed": trimmed,
             "started_at_ms": trim_started_at_ms,
             "finished_at_ms": finished_at_ms,
-            "before": {
-                "rss_kb": before.rss_kb,
-                "pss_kb": before.pss_kb,
-                "anonymous_kb": before.anonymous_kb,
-            },
-            "after": after.map(|sample| json!({
-                "rss_kb": sample.rss_kb,
-                "pss_kb": sample.pss_kb,
-                "anonymous_kb": sample.anonymous_kb,
-            })),
+            // One owner for how a memory reading is published, so a source that
+            // cannot see anonymous memory cannot report a zero for it.
+            "before": before.perf_fields(),
+            "after": after.map(|sample| sample.perf_fields()),
         });
         append_perf_event(&perf_home, "memory", "allocator_trim", payload);
         LAST_ALLOCATOR_TRIM_MS.store(finished_at_ms, Ordering::Relaxed);
@@ -101471,6 +101483,45 @@ mod tests {
         unsafe {
             std::env::remove_var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY);
         }
+    }
+
+    /// The trim chore may only act on a reading that can SEE what the trim moves.
+    ///
+    /// `/proc/<pid>/status` knows `VmRSS` and nothing else, so on that source the
+    /// chore's whole report — the anonymous-memory delta — is two placeholder zeroes.
+    /// Before the one-owner collapse the chore simply never ran on a host whose
+    /// `smaps_rollup` is unreadable; routing it through `read_process_memory` silently
+    /// started firing `malloc_trim(0)` there. This fails if that fallback is admitted
+    /// again, and it fails if the RSS floor is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_trim_chore_refuses_a_reading_that_cannot_see_anonymous_memory() {
+        use yggterm_core::render_probe::{ProcMemory, ProcMemorySource};
+        let over_threshold = ALLOCATOR_TRIM_RSS_THRESHOLD_KB + 1;
+        let rollup = ProcMemory {
+            rss_kb: over_threshold,
+            pss_kb: 1,
+            anonymous_kb: 1,
+            source: ProcMemorySource::SmapsRollup,
+        };
+        assert!(
+            allocator_trim_sample_is_actionable(&rollup),
+            "a big rollup reading is what the chore exists for"
+        );
+        assert!(
+            !allocator_trim_sample_is_actionable(&ProcMemory {
+                source: ProcMemorySource::StatusVmRss,
+                ..rollup
+            }),
+            "the status fallback cannot see anonymous memory, so it cannot gate a trim"
+        );
+        assert!(
+            !allocator_trim_sample_is_actionable(&ProcMemory {
+                rss_kb: ALLOCATOR_TRIM_RSS_THRESHOLD_KB - 1,
+                ..rollup
+            }),
+            "and the RSS floor still holds"
+        );
     }
 
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────

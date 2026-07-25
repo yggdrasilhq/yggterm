@@ -182,6 +182,22 @@ pub enum ProcMemorySource {
     StatusVmRss,
 }
 
+impl ProcMemorySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProcMemorySource::SmapsRollup => "smaps_rollup",
+            ProcMemorySource::StatusVmRss => "status_vm_rss",
+        }
+    }
+
+    /// Whether this source can answer PSS and anonymous memory at all. `status` knows
+    /// only `VmRSS`, so on that source those two fields carry placeholder zeroes that
+    /// no reader may see.
+    pub fn knows_pss_and_anonymous(&self) -> bool {
+        matches!(self, ProcMemorySource::SmapsRollup)
+    }
+}
+
 /// How much memory one process is using.
 ///
 /// This module is the ONE owner of that question. The GUI shell used to carry its own
@@ -211,6 +227,27 @@ impl ProcMemory {
         } else {
             self.rss_kb
         }
+    }
+
+    /// The fields of this reading that are safe to put on the wire, and the source
+    /// that produced them. THE one owner of "how a memory reading is published".
+    ///
+    /// ⚠ `pss_kb` and `anonymous_kb` are ABSENT — not zero — on the `status` fallback,
+    /// because that file cannot see them. Emitting their placeholder zeroes is exactly
+    /// what [`ProcMemorySource`] exists to prevent, and it is the same substitution
+    /// `gpu_ms` already refuses one struct over: "we could not look" and "it was zero"
+    /// are different findings. Without this an `allocator_trim` event on the fallback
+    /// path read as "anonymous memory 0 -> 0, the trim moved nothing".
+    pub fn perf_fields(&self) -> Value {
+        let mut payload = json!({
+            "rss_kb": self.rss_kb,
+            "memory_source": self.source.as_str(),
+        });
+        if self.source.knows_pss_and_anonymous() {
+            payload["pss_kb"] = json!(self.pss_kb);
+            payload["anonymous_kb"] = json!(self.anonymous_kb);
+        }
+        payload
     }
 }
 
@@ -788,10 +825,15 @@ pub fn emit_render_perf_events(home: &Path, samples: &[RenderProcSample], contex
             "comm": sample.comm,
             "role": sample.role.as_str(),
         });
-        if let Some(memory) = sample.memory {
-            payload["rss_kb"] = json!(memory.rss_kb);
-            payload["pss_kb"] = json!(memory.pss_kb);
-            payload["anonymous_kb"] = json!(memory.anonymous_kb);
+        // One owner for which memory fields reach the wire — see `perf_fields`.
+        if let Some(memory) = sample.memory
+            && let Some(fields) = memory.perf_fields().as_object()
+        {
+            if let Some(object) = payload.as_object_mut() {
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
         }
         if let Some(gpu_ms) = sample.gpu_ms() {
             payload["gpu_ms"] = json!(gpu_ms);
@@ -915,6 +957,46 @@ mod tests {
         assert_eq!(fallback.preferred_kb(), 543_284);
     }
 
+    /// ⚠⚠ THE FALLBACK'S PLACEHOLDER ZEROES MUST NOT REACH THE WIRE.
+    ///
+    /// `source` exists so "a caller that cannot tell which it got would silently read
+    /// the fallback's zeroes as real numbers" cannot happen — but `source` was never
+    /// serialized anywhere, while `pss_kb` and `anonymous_kb` were emitted
+    /// unconditionally. On the `status` fallback that published `pss_kb: 0,
+    /// anonymous_kb: 0` as findings, and an `allocator_trim` event read as "anonymous
+    /// memory 0 -> 0, the trim moved nothing". Absent-vs-zero is the same distinction
+    /// `gpu_ms` already keeps one struct over.
+    #[test]
+    fn the_fallback_publishes_no_number_it_could_not_read() {
+        let fallback = ProcMemory {
+            rss_kb: 543_284,
+            pss_kb: 0,
+            anonymous_kb: 0,
+            source: ProcMemorySource::StatusVmRss,
+        };
+        let fields = fallback.perf_fields();
+        assert_eq!(fields.get("rss_kb"), Some(&json!(543_284)));
+        assert_eq!(fields.get("memory_source"), Some(&json!("status_vm_rss")));
+        assert!(
+            fields.get("pss_kb").is_none(),
+            "the status fallback cannot see PSS, so it must publish no PSS — not a zero"
+        );
+        assert!(
+            fields.get("anonymous_kb").is_none(),
+            "same for anonymous memory, which is the number the trim chore MOVES"
+        );
+        let rollup = ProcMemory {
+            rss_kb: 123_456,
+            pss_kb: 98_765,
+            anonymous_kb: 54_321,
+            source: ProcMemorySource::SmapsRollup,
+        };
+        let fields = rollup.perf_fields();
+        assert_eq!(fields.get("pss_kb"), Some(&json!(98_765)));
+        assert_eq!(fields.get("anonymous_kb"), Some(&json!(54_321)));
+        assert_eq!(fields.get("memory_source"), Some(&json!("smaps_rollup")));
+    }
+
     /// One owner, wired to the right pid. This fails outright if the collapse
     /// mis-builds the `/proc` path — the sort of thing a pure parser test cannot see.
     #[cfg(target_os = "linux")]
@@ -923,7 +1005,19 @@ mod tests {
         let memory = read_process_memory(std::process::id() as i32)
             .expect("this process must be able to read its own memory");
         assert!(memory.rss_kb > 0);
-        assert_eq!(memory.source, ProcMemorySource::SmapsRollup);
+        // ⚠ Deliberately NOT `assert_eq!(source, SmapsRollup)`. That asserts an
+        // ambient fact about the test host — this module documents `smaps_rollup` as
+        // unreadable on some hardened kernels, which is the whole reason the fallback
+        // exists. What must hold on EVERY host is that whichever source answered says
+        // so, and that a source which cannot see PSS did not invent one.
+        match memory.source {
+            ProcMemorySource::SmapsRollup => assert!(memory.pss_kb > 0),
+            ProcMemorySource::StatusVmRss => {
+                assert_eq!(memory.pss_kb, 0);
+                assert_eq!(memory.anonymous_kb, 0);
+                assert!(memory.perf_fields().get("pss_kb").is_none());
+            }
+        }
         // A pid that cannot exist has no memory, and that is None rather than zeroes.
         assert_eq!(read_process_memory(-1), None);
     }
@@ -1370,6 +1464,66 @@ drm-engine-compute:\t3434919 ns\n";
         let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
         assert!(log.contains("\"web_surface_live_count\":3"));
         assert!(log.contains("\"role\":\"web_content\""));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The wire, not just the helper. `perf_fields` being right is worthless if the
+    /// emitter still spells the fields itself — which is exactly how the fallback's
+    /// zeroes got out in the first place.
+    #[test]
+    fn the_emitted_event_carries_only_the_numbers_the_source_could_read() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-render-probe-memory-source-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        crate::perf::set_perf_profiling_enabled(true);
+
+        let fallback = |pid: i32, ticks: u64| RenderProcObservation {
+            memory: Some(ProcMemory {
+                rss_kb: 543_284,
+                pss_kb: 0,
+                anonymous_kb: 0,
+                source: ProcMemorySource::StatusVmRss,
+            }),
+            ..observation(pid, "WebKitWebProces", 1, ticks)
+        };
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[fallback(11, 0)], 1_000);
+        let samples = probe.observe_at(&[fallback(11, 25)], 2_000);
+        emit_render_perf_events(&home, &samples, &json!({}));
+
+        let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
+        assert!(log.contains("\"rss_kb\":543284"), "log: {log}");
+        assert!(
+            log.contains("\"memory_source\":\"status_vm_rss\""),
+            "log: {log}"
+        );
+        assert!(
+            !log.contains("\"pss_kb\""),
+            "a fallback reading must publish no PSS at all, not a zero: {log}"
+        );
+        assert!(
+            !log.contains("\"anonymous_kb\""),
+            "a fallback reading must publish no anonymous memory at all: {log}"
+        );
+
+        // The rollup source publishes all three, so the absence above is a statement
+        // about the SOURCE and not a field that quietly went missing for everyone.
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[observation(12, "WebKitWebProces", 1, 0)], 1_000);
+        let samples = probe.observe_at(&[observation(12, "WebKitWebProces", 1, 25)], 2_000);
+        emit_render_perf_events(&home, &samples, &json!({}));
+        let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
+        assert!(log.contains("\"pss_kb\":600"), "log: {log}");
+        assert!(log.contains("\"anonymous_kb\":400"), "log: {log}");
+        assert!(
+            log.contains("\"memory_source\":\"smaps_rollup\""),
+            "log: {log}"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 }
