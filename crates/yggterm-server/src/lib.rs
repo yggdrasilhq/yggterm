@@ -19891,6 +19891,31 @@ pub fn run_app_control_web_surface_close(
     Ok(())
 }
 
+/// Run an async script and return its resolved value (`web await`).
+///
+/// The request timeout is the AWAIT budget plus headroom, following the `wait`
+/// precedent: a verb that legitimately blocks sets its own transport timeout,
+/// or the answer gets cut off by the transport and the caller cannot tell a
+/// slow promise from a wedged window.
+pub fn run_app_control_web_surface_await(
+    session_path: Option<&str>,
+    script: &str,
+    await_timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceAwait {
+            session_path: session_path.map(str::to_string),
+            script: script.to_string(),
+            timeout_ms: await_timeout_ms,
+        },
+        await_timeout_ms.saturating_add(5_000),
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 /// Enumerate the page's frames: url, element counts, reachability.
 pub fn run_app_control_web_surface_frames(
     session_path: Option<&str>,

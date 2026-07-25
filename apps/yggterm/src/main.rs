@@ -48,7 +48,8 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
-    run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
+    run_app_control_web_surface_await, run_app_control_web_surface_batch,
+    run_app_control_web_surface_capture_element,
     run_app_control_web_surface_close, run_app_control_web_surface_cookies,
     run_app_control_web_surface_frames,
     run_app_control_web_surface_reload,
@@ -1160,6 +1161,9 @@ fn print_server_app_help() {
   yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]
     read with NO --frame searches EVERY reachable frame and returns
     frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []
+  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]
+    the script is the BODY of an async function; `return` its value.
+    `eval` cannot return a Promise — this is the one verb that can.
   yggterm server app web frames [--session <path>]
     --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)
   yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
@@ -3222,6 +3226,43 @@ fn main() -> Result<()> {
                             .next()
                             .unwrap_or("web-surface.png");
                         run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "await" => {
+                        // The ONE async bridge:
+                        //   web await (--script <file>|--stdin) [--await-timeout <ms>]
+                        // The script is the BODY of an async function; `return`
+                        // its value. `eval` cannot return a Promise, and this
+                        // is the verb that means nobody has to hand-roll a
+                        // stash-and-poll around that fact again.
+                        let script = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app web await stdin")?;
+                            value
+                        } else if let Some(path) = cli_flag_value(&args, "--script") {
+                            // A FILE by default, unlike `eval`'s `--script`,
+                            // because an async body is rarely a one-liner. A
+                            // path that does not exist is read as the script
+                            // itself rather than failing silently.
+                            std::fs::read_to_string(path)
+                                .unwrap_or_else(|_| path.to_string())
+                        } else {
+                            cli_positional_args(&args, 4)
+                                .into_iter()
+                                .next()
+                                .map(str::to_string)
+                                .context("missing script (positional, --script <file> or --stdin) for server app web await")?
+                        };
+                        let await_timeout_ms = cli_flag_value(&args, "--await-timeout")
+                            .map(|raw| raw.parse::<u64>().context("--await-timeout needs ms"))
+                            .transpose()?
+                            .unwrap_or(15_000);
+                        run_app_control_web_surface_await(
+                            session_path,
+                            &script,
+                            await_timeout_ms,
+                        )
                     }
                     "frames" => {
                         // What frames this page has, and how much is IN each:
