@@ -13671,13 +13671,13 @@ const REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES: u32 = 5;
 const REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalWriteStrategy {
+pub(crate) enum TerminalWriteStrategy {
     LocalRuntime,
     RemoteDirectFallback,
     LocalRuntimeFallback,
 }
 
-fn terminal_write_strategy_for_path(
+pub(crate) fn terminal_write_strategy_for_path(
     path: &str,
     local_runtime_running: bool,
 ) -> TerminalWriteStrategy {
