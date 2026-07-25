@@ -208,6 +208,34 @@ pub enum WebSurfaceDoAction {
         #[serde(default)]
         selector: Option<String>,
     },
+    /// **Set** a field to `text`: clear what is there with real keys, type the
+    /// new value with real keys, then read the value back and report whether it
+    /// took. `Type` APPENDS — this replaces.
+    ///
+    /// Why it is its own verb rather than a flag on `Type`: a field that already
+    /// holds a value cannot be corrected by typing over it. Measured on
+    /// a services portal's 6-box `input.input-otp` — writing `292244` over a prior
+    /// `278347` produced **`278344`**, a MERGE of old and new digits, because
+    /// nothing cleared first. The same run proved a JS/eval route cannot fix it:
+    /// setting `.value` via the native setter plus `input`/`change` events, and
+    /// even a synthetic `ClipboardEvent('paste')`, left the component's own
+    /// internal state holding the stale digits. Only real input drives that
+    /// class of widget, so clearing has to be real input too.
+    ///
+    /// `selectors` handles the SEGMENTED case (one box per character, focus
+    /// auto-advancing): every listed box is cleared in order first, because
+    /// clearing only the focused box leaves the others holding old digits —
+    /// which is precisely the merge above. Then the first box is focused and the
+    /// text is typed, letting the component's own auto-advance carry it.
+    Fill {
+        text: String,
+        /// The single field to replace. Ignored when `selectors` is non-empty.
+        #[serde(default)]
+        selector: Option<String>,
+        /// A segmented input's boxes, in visual order.
+        #[serde(default)]
+        selectors: Vec<String>,
+    },
 }
 
 /// What structured view a `read` verb returns (agent control plane, rung 1 —
@@ -1524,6 +1552,17 @@ mod tests {
                 y: None,
                 dx: 0.0,
                 dy: 120.0,
+            },
+            // `fill` in both shapes: one field, and a segmented box set.
+            WebSurfaceDoAction::Fill {
+                text: "292244".to_string(),
+                selector: Some("#otp".to_string()),
+                selectors: Vec::new(),
+            },
+            WebSurfaceDoAction::Fill {
+                text: "292244".to_string(),
+                selector: None,
+                selectors: (0..6).map(|i| format!("input.input-otp:nth-child({i})")).collect(),
             },
         ] {
             let command = AppControlCommand::WebSurfaceDo {

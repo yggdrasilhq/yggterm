@@ -526,7 +526,7 @@ fn parse_web_surface_do_action(
     let verb = args
         .get(4)
         .map(String::as_str)
-        .context("missing verb for server app web do (click|move|scroll|type|key)")?;
+        .context("missing verb for server app web do (click|move|scroll|type|fill|key)")?;
     let button = match cli_flag_value(args, "--button") {
         Some("middle" | "auxiliary" | "2") => AppControlPointerButton::Middle,
         Some("secondary" | "right" | "3") => AppControlPointerButton::Secondary,
@@ -577,6 +577,26 @@ fn parse_web_surface_do_action(
                 .to_string(),
             selector: cli_flag_value(args, "--selector").map(str::to_string),
         },
+        // `fill` REPLACES a field's contents; `type` appends. Use it whenever the
+        // field may already hold something — see the merge failure documented on
+        // `WebSurfaceDoAction::Fill`. `--selector-set` is the comma-separated
+        // box list of a segmented input (a 6-box OTP), which must be cleared
+        // box-by-box or the old characters survive inside the widget.
+        "fill" | "set" => WebSurfaceDoAction::Fill {
+            text: cli_flag_value(args, "--text")
+                .context("missing --text for server app web do fill")?
+                .to_string(),
+            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selectors: cli_flag_value(args, "--selector-set")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
         "key" | "press" => WebSurfaceDoAction::Key {
             key: cli_flag_value(args, "--key")
                 .context("missing --key for server app web do key")?
@@ -586,7 +606,7 @@ fn parse_web_surface_do_action(
                 .unwrap_or_default(),
             selector: cli_flag_value(args, "--selector").map(str::to_string),
         },
-        other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|key)"),
+        other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|fill|key)"),
     };
     Ok(action)
 }
@@ -941,7 +961,7 @@ fn print_server_app_help() {
   yggterm server app command <list|invoke <id>>
   yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
   yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
-  yggterm server app web do <click|move|scroll|type|key> [--selector <css>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--session <path>]
+  yggterm server app web do <click|move|scroll|type|fill|key> [--selector <css>|--selector-set <css,css,…>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
   yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
