@@ -248,11 +248,19 @@ Remaining in WS1:
   GUI (the allocator-trim chore near `shell.rs:23753` is the pattern to copy) passing
   live/stashed surface counts and window visibility as context.
 - ~~**`server render-top`**, promoting `examples/render_top.rs` into a real command.~~
-  ✅ **BUILT 2026-07-25** (not yet run on the live host). `--pid` names any process
-  tree; with no `--pid` the registered-client registry picks the GUI, through the same
-  `choose_app_control_pid` the `server app` verbs use. `--json` prints the same report
-  the table is built from. The example is deleted: one read path, not two. It reads
-  /proc in-process and is in the no-handoff carve-out, which now has a test.
+  ✅ **BUILT 2026-07-25 — LANDED, NOT SHIPPED: the arm has never executed once.**
+  `--pid` names any process tree; with no `--pid` the registered-client registry picks
+  the GUI, through the same `choose_app_control_pid` the `server app` verbs use.
+  `--json` prints the same report the table is built from. The example is deleted: one
+  read path, not two. It reads /proc in-process and is in the no-handoff carve-out.
+  What is actually under test, so nobody has to re-derive it: the rollup and ranking
+  (`render_probe::tests::render_top_report_rolls_up_roles_and_ranks_processes_by_cpu`,
+  `render_top_ranking_is_stable_for_equal_cost_processes`), the untargeted GUI choice
+  including the read-vs-mutation split (`choose_app_control_pid` tests in
+  `yggterm-server`), and the carve-out
+  (`local_state_readers_never_hand_off_to_the_installed_binary`).
+  What is NOT: the flag parsing and its defaults (`--interval-ms` 5000, `--top` 10),
+  which live inline in the CLI arm and are only reachable by running it.
 - ~~**`server perf-incidents`**, a reader for the 183 records already on disk.~~
   ✅ **SHIPPED 2026-07-25** and run live — see the update box in §3c. Groups by
   trigger, ranked by count, `--list`/`--json` for raw records.
@@ -325,7 +333,13 @@ Independent of the render work, so it can run in parallel.
   unconditional primitive is kept for `PrepareUpdateRestart` and the handover paths.
 - `snapshot_response`: memoize by generation. **Half done.** The per-session screen
   work under it is memoized on `(output seq, resize seq, PTY width, model size)` —
-  built 2026-07-25, not deployed. The remaining cost is the 2.1 MB
+  built 2026-07-25, not deployed. Precisely what the memo removes on a hit: the
+  `screen_state` lock, the `formatted_screen_max_column` walk and the clip
+  rewrite. It does **not** remove the clone — the hit path still hands back an
+  owned `String` copy of the formatted screen, so the allocation is unchanged.
+  (Commit `aaf3906`'s opening line reads as if the clone went away; it did not.
+  Killing it means handing callers the `Arc<str>` the memo already holds, which
+  is a separate change with its own caller ripple.) The remaining cost is the 2.1 MB
   `remote_machines` deep copy in `snapshot()` itself; the fix there is `Arc` +
   copy-on-write, NOT a generation counter (there are 15+ mutation sites and a
   hand-bumped counter that one of them forgets serves a stale session list to the

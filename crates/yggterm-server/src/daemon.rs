@@ -8330,7 +8330,11 @@ fn run_background_copy_chore(
             working_paths,
         )
     };
-    let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
+    // A `PerfGuard`, not a `PerfSpan`: the tree load and the update build
+    // below both `?`, and a chore that failed after a multi-second disk walk
+    // is precisely the run worth a duration — an explicit `finish` at the
+    // bottom is the one that never runs on those.
+    let mut perf = yggterm_core::PerfGuard::new(&perf_home, "daemon", "background_copy_chore");
     // The local cwd-tree scan walks every codex + Claude Code transcript on
     // this machine. It used to run INSIDE the read block above, which held
     // the daemon runtime lock across a multi-second disk walk and blocked
@@ -8355,7 +8359,7 @@ fn run_background_copy_chore(
         &ssh_targets,
         remote_cc_confirmed,
     ));
-    perf.finish(serde_json::json!({
+    perf.annotate(serde_json::json!({
         "updates": updates.len(),
         "live_sessions": live_sessions.len(),
         "remote_machines": remote_machines.len(),
@@ -15672,7 +15676,7 @@ mod tests {
              daemon runtime lock across it blocks every concurrent request"
         );
         let span_at = body
-            .find("PerfSpan::start(&perf_home, \"daemon\", \"background_copy_chore\")")
+            .find("PerfGuard::new(&perf_home, \"daemon\", \"background_copy_chore\")")
             .expect("chore should still be measured");
         let scan_at = body
             .find("load_codex_tree(")
@@ -15681,6 +15685,16 @@ mod tests {
             span_at < scan_at,
             "the tree scan must be INSIDE the chore span — outside it the chore \
              reported a p50 of 0.0 ms while doing its most expensive work"
+        );
+        // The tree load, the update build and the persist all `?`, so a chore
+        // that failed AFTER the multi-second walk is the run most worth a
+        // duration — and an explicit `finish` is the thing those `?`s skip.
+        // Drop-recorded, or the slow failures are invisible. That the guard
+        // really records on the early return is measured in
+        // yggterm-core `perf::tests`.
+        assert!(
+            !body.contains("PerfSpan::start("),
+            "a span finished by hand records nothing on the chore's `?` branches"
         );
     }
 
