@@ -49795,6 +49795,55 @@ mod web_do_verb_tests {
         assert!(js.contains("walk(window,[])"), "{js}");
     }
 
+    // BACK-COMPAT LOCK for `web read`'s response shape.
+    //
+    // `read` is an OLD verb with existing callers, and every one of them reads
+    // `.result`. When the no-`--frame` path learned to search every frame it
+    // answered `frames: [...]` and dropped `result` entirely, so those callers
+    // silently got `null` — the exact silent-null class the frame work exists
+    // to kill. `result` is the top document's answer and stays populated;
+    // `frames` is additive beside it.
+    //
+    // Delete the `"result"` line from `web_read_all_frames_response` and this
+    // fails.
+    #[test]
+    fn read_with_no_frame_still_answers_the_legacy_result_key() {
+        let top = json!({"forms": [{"id": "pay", "fields": 3}]});
+        let frames = vec![
+            json!({"frame": {"path": [], "url": "https://bank/", "accessible": true},
+                   "result": top, "error": Value::Null}),
+            json!({"frame": {"path": [0], "url": "https://gateway/", "accessible": true},
+                   "result": {"forms": []}, "error": Value::Null}),
+        ];
+        let answer = web_read_all_frames_response(
+            "local://web/session-a",
+            42,
+            WebSurfaceReadAs::Forms,
+            frames.clone(),
+        );
+        assert_eq!(
+            answer["result"], top,
+            "the legacy key must carry the top document's answer"
+        );
+        assert_eq!(answer["frames"].as_array().map(Vec::len), Some(2));
+        assert_eq!(answer["searched_all_frames"], json!(true));
+        assert_eq!(answer["accepted"], json!(true));
+
+        // The top document is identified by its EMPTY PATH, not by position —
+        // "first in the walk" is an ordering promise, this is an identity
+        // question.
+        let reordered = vec![frames[1].clone(), frames[0].clone()];
+        assert_eq!(web_read_top_document_result(&reordered), top);
+
+        // A walk with no reachable top document answers null rather than
+        // handing the caller some other frame's result under the old key.
+        assert_eq!(
+            web_read_top_document_result(&[frames[1].clone()]),
+            Value::Null
+        );
+        assert_eq!(web_read_top_document_result(&[]), Value::Null);
+    }
+
     // The enumeration must carry the COUNTS. A top-document read returning []
     // next to a frame reporting 107 elements is a legible answer; the [] alone
     // was not.
@@ -51000,6 +51049,58 @@ fn web_all_frames_script(inner: &str) -> String {
     )
 }
 
+/// The TOP DOCUMENT's result out of an all-frames walk — i.e. exactly the
+/// answer `web read` gave before it learned to search frames.
+///
+/// This exists so the new `frames: [...]` shape can be ADDITIVE. `read` is an
+/// old verb with existing callers, all of them reading `.result`; answering
+/// only `frames[0].result` would have handed every one of them a silent `null`,
+/// which is the precise failure class the frame work was done to kill. The top
+/// document is the frame whose `path` is `[]` — found by that key rather than
+/// by position, because "first in the walk" is an ordering promise and this is
+/// an identity question.
+fn web_read_top_document_result(frames: &[Value]) -> Value {
+    frames
+        .iter()
+        .find(|frame| {
+            frame
+                .get("frame")
+                .and_then(|f| f.get("path"))
+                .and_then(Value::as_array)
+                .is_some_and(|path| path.is_empty())
+        })
+        .and_then(|frame| frame.get("result").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// The `web read` answer when NO `--frame` was given, assembled where a test
+/// can see it.
+///
+/// It is a function rather than an inline `json!` because the ADDITIVITY is the
+/// contract: `result` is the old shape and must stay populated and correct, and
+/// `frames` is the new information beside it. Inline, the `result` key was
+/// simply missing and every caller reading `.result` got a silent null.
+fn web_read_all_frames_response(
+    session: &str,
+    native_id: u64,
+    mode: WebSurfaceReadAs,
+    frames: Vec<Value>,
+) -> Value {
+    json!({
+        "accepted": true,
+        "session_path": session,
+        "native_id": native_id,
+        "as": web_read_mode_name(mode),
+        // `result` IS THE OLD SHAPE: the top document's answer, byte-for-byte
+        // what a pre-frames build returned for the same read.
+        "result": web_read_top_document_result(&frames),
+        // …and this is what is ADDED: what else is on the page.
+        "frames": frames,
+        "frame_resolved": Value::Null,
+        "searched_all_frames": true,
+    })
+}
+
 /// Enumerate every frame: path, url, reachability, and how much is IN it.
 ///
 /// The element counts are the point. A top-document `read` returning `[]` next
@@ -51088,18 +51189,7 @@ async fn web_surface_read_for(
         return match web_do_eval(desktop, native_id, &script).await {
             Ok(frames) => {
                 let list = frames.as_array().cloned().unwrap_or_default();
-                json!({
-                    "accepted": true,
-                    "session_path": session,
-                    "native_id": native_id,
-                    "as": web_read_mode_name(mode),
-                    // The top document is frame `[]`, so a caller reading
-                    // `frames[0].result` gets exactly what the old shape gave
-                    // it — and now also learns what else is on the page.
-                    "frames": list,
-                    "frame_resolved": Value::Null,
-                    "searched_all_frames": true,
-                })
+                web_read_all_frames_response(&session, native_id, mode, list)
             }
             Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
         };
