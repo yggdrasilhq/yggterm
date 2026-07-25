@@ -1879,6 +1879,40 @@ pub struct RemoteMachineSnapshot {
     pub sessions: Vec<RemoteScannedSession>,
 }
 
+/// The routing half of a machine — everything needed to REACH the host, and
+/// deliberately nothing about which sessions live on it. `RemoteMachineSnapshot`
+/// stays the one owner of the session list; this exists so a per-session job
+/// can carry its machine without dragging that list along. Carrying the whole
+/// snapshot cost a deep copy of every scanned session (1.75 MB on the live
+/// host) once per target, and the copy pipeline never read `sessions` for
+/// anything but a lookup it already had the answer to. Making the list
+/// unrepresentable here is the lock: nobody can reintroduce the copy without
+/// changing a type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMachineRef {
+    pub machine_key: String,
+    pub label: String,
+    pub ssh_target: String,
+    pub prefix: Option<String>,
+    pub remote_binary_expr: Option<String>,
+    pub remote_deploy_state: RemoteDeployState,
+    pub health: RemoteMachineHealth,
+}
+
+impl RemoteMachineSnapshot {
+    pub fn routing_ref(&self) -> RemoteMachineRef {
+        RemoteMachineRef {
+            machine_key: self.machine_key.clone(),
+            label: self.label.clone(),
+            ssh_target: self.ssh_target.clone(),
+            prefix: self.prefix.clone(),
+            remote_binary_expr: self.remote_binary_expr.clone(),
+            remote_deploy_state: self.remote_deploy_state,
+            health: self.health,
+        }
+    }
+}
+
 pub(crate) struct RemoteMachineRefreshScan {
     pub remote_binary_expr: Option<String>,
     pub remote_deploy_state: RemoteDeployState,
@@ -3038,7 +3072,7 @@ impl YggtermServer {
         ))
     }
 
-    pub fn remote_shutdown_targets(&self) -> Vec<(RemoteMachineSnapshot, String)> {
+    pub fn remote_shutdown_targets(&self) -> Vec<(RemoteMachineRef, String)> {
         let mut targets = Vec::new();
         let mut seen = HashSet::<(String, String)>::new();
         for path in self.sessions.keys() {
@@ -3056,7 +3090,7 @@ impl YggtermServer {
                 .iter()
                 .find(|machine| machine.machine_key == machine_key)
             {
-                targets.push((remote_shutdown_machine_ref(machine), session_id.to_string()));
+                targets.push((machine.routing_ref(), session_id.to_string()));
             }
         }
         targets
@@ -3065,7 +3099,7 @@ impl YggtermServer {
     pub fn remote_shutdown_target_for_path(
         &self,
         path: &str,
-    ) -> Option<(RemoteMachineSnapshot, String)> {
+    ) -> Option<(RemoteMachineRef, String)> {
         let (raw_machine_key, path_session_id) = parse_remote_scanned_session_path(path)?;
         let machine_key = normalize_machine_key(raw_machine_key);
         let machine = self
@@ -3079,7 +3113,7 @@ impl YggtermServer {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| path_session_id.to_string());
-        Some((remote_shutdown_machine_ref(machine), session_id))
+        Some((machine.routing_ref(), session_id))
     }
 
     /// Resolve the host + session id + agent kind for a session whose PTY is
@@ -3099,7 +3133,7 @@ impl YggtermServer {
     pub fn remote_agent_pty_target_for_path(
         &self,
         path: &str,
-    ) -> Option<(RemoteMachineSnapshot, String, SessionKind)> {
+    ) -> Option<(RemoteMachineRef, String, SessionKind)> {
         if let Some((machine, session_id)) = self.remote_shutdown_target_for_path(path) {
             return Some((machine, session_id, SessionKind::Codex));
         }
@@ -3110,7 +3144,7 @@ impl YggtermServer {
             .iter()
             .find(|machine| machine.machine_key == machine_key)?;
         Some((
-            remote_shutdown_machine_ref(machine),
+            machine.routing_ref(),
             session_id.to_string(),
             SessionKind::ClaudeCode,
         ))
@@ -3504,7 +3538,7 @@ impl YggtermServer {
     pub fn remote_copy_target_for_session_path(
         &self,
         session_path: &str,
-    ) -> Option<(RemoteMachineSnapshot, String, String)> {
+    ) -> Option<(RemoteMachineRef, String, String)> {
         let (raw_machine_key, path_session_id) = parse_remote_scanned_session_path(session_path)?;
         let machine_key = normalize_machine_key(raw_machine_key);
         let machine = self
@@ -3532,7 +3566,7 @@ impl YggtermServer {
                     .filter(|value| !value.is_empty())
             })
             .unwrap_or_default();
-        Some((remote_shutdown_machine_ref(machine), session_id, cwd))
+        Some((machine.routing_ref(), session_id, cwd))
     }
 
     pub fn set_session_title_hint_passive(&mut self, session_path: &str, title: &str) -> bool {
@@ -8228,21 +8262,6 @@ fn canonicalize_remote_machine_alias(machine_key: &str) -> String {
 
 fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
-}
-
-fn remote_shutdown_machine_ref(machine: &RemoteMachineSnapshot) -> RemoteMachineSnapshot {
-    // Shutdown/terminate only needs remote command routing. Carrying mirrored session lists here
-    // turns simple close/shutdown paths into accidental O(n^2) clones for large machine snapshots.
-    RemoteMachineSnapshot {
-        machine_key: machine.machine_key.clone(),
-        label: machine.label.clone(),
-        ssh_target: machine.ssh_target.clone(),
-        prefix: machine.prefix.clone(),
-        remote_binary_expr: machine.remote_binary_expr.clone(),
-        remote_deploy_state: machine.remote_deploy_state,
-        health: machine.health,
-        sessions: Vec::new(),
-    }
 }
 
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
@@ -16453,6 +16472,23 @@ fn ensure_live_app_control_pid(
     }
 }
 
+/// The GUI process tree a read like `server render-top` should measure when
+/// the caller did not name one.
+///
+/// Goes through `choose_app_control_pid`, the same private owner of "which GUI
+/// do I mean" that the `server app` verbs use, so a read and a verb can never
+/// disagree about the default target. `require_explicit_target` is false here:
+/// unlike a verb, a read with exactly one registered client should just answer.
+pub fn choose_registered_gui_pid(
+    home: &Path,
+    requested_pid: Option<u32>,
+    requested_client: Option<&str>,
+) -> anyhow::Result<Option<u32>> {
+    let endpoint = crate::daemon::default_endpoint(home);
+    let records = active_client_instance_records(home, &endpoint)?;
+    choose_app_control_pid(&records, requested_pid, requested_client, false)
+}
+
 pub fn active_client_instance_records(
     home: &Path,
     endpoint: &ServerEndpoint,
@@ -20613,7 +20649,7 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
 }
 
 pub fn persist_remote_generated_copy(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
     cwd: &str,
     title: Option<&str>,
@@ -20627,7 +20663,7 @@ pub fn persist_remote_generated_copy(
 }
 
 pub fn persist_remote_generated_copy_with_options(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
     cwd: &str,
     title: Option<&str>,
@@ -20681,7 +20717,7 @@ pub fn persist_remote_generated_copy_with_options(
 }
 
 pub fn terminate_remote_codex_session(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
 ) -> anyhow::Result<()> {
     // Daemon-native termination is the SSOT: the remote host daemon owns the
@@ -20709,7 +20745,7 @@ pub fn terminate_remote_codex_session(
 /// with `terminal session not found`. That error was then discarded by the
 /// caller, so the failure was completely silent.
 pub fn resize_remote_agent_session_pty(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
     kind: SessionKind,
     cols: u16,
@@ -20733,7 +20769,7 @@ pub fn resize_remote_agent_session_pty(
 }
 
 pub fn request_remote_codex_session_shutdown(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
     force_after: Duration,
 ) -> anyhow::Result<()> {
@@ -20748,7 +20784,7 @@ pub fn request_remote_codex_session_shutdown(
 }
 
 fn request_remote_codex_session_quit(
-    machine: &RemoteMachineSnapshot,
+    machine: &RemoteMachineRef,
     session_id: &str,
 ) -> anyhow::Result<()> {
     // Graceful quit now goes through the daemon-native terminate path (idempotent
@@ -33473,7 +33509,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn remote_shutdown_targets_do_not_clone_machine_session_lists() {
+    fn remote_shutdown_targets_carry_routing_only_never_the_machine() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -33567,7 +33603,7 @@ terminal_window_id: None,
         assert_eq!(targets.len(), 2);
         assert_eq!(server.remote_machines[0].sessions.len(), 2);
         for (machine, session_id) in targets {
-            assert!(machine.sessions.is_empty());
+            assert_eq!(machine, server.remote_machines[0].routing_ref());
             assert_eq!(machine.machine_key, "jojo");
             assert_eq!(machine.ssh_target, "jojo");
             assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
@@ -33639,7 +33675,7 @@ terminal_window_id: None,
             .expect("shutdown target");
 
         assert_eq!(session_id, "live-2");
-        assert!(machine.sessions.is_empty());
+        assert_eq!(machine, server.remote_machines[0].routing_ref());
         assert_eq!(machine.machine_key, "jojo");
         assert_eq!(machine.ssh_target, "jojo");
         assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));

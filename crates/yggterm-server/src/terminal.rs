@@ -1106,6 +1106,9 @@ struct PtySessionRuntime {
     current_cols: Arc<AtomicU16>,
     current_rows: Arc<AtomicU16>,
     screen_state: Arc<Mutex<TerminalScreenState>>,
+    /// Memo for [`PtySessionRuntime::screen_snapshot`], keyed by
+    /// [`ScreenSnapshotKey`] — every input the snapshot is a function of.
+    screen_snapshot_memo: Arc<Mutex<Option<(ScreenSnapshotKey, Arc<str>)>>>,
     /// The latest libyggterm OSC 7717 declare per verb, lifted off this
     /// session's stream by the daemon itself. The GUI's xterm parser reads the
     /// same bytes, but only while a client host is mounted — this copy is what
@@ -1256,6 +1259,38 @@ fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreen
         }
         i += len;
     }
+}
+
+/// Everything [`PtySessionRuntime::screen_snapshot`] is a function of.
+///
+/// `output_seq` is bumped at exactly the points where
+/// `screen_state.process(bytes)` runs (reader thread and `seed_snapshot`,
+/// under the same chunk lock), so an unchanged seq means the vt100 model was
+/// not fed anything — the one generation counter here that cannot go stale.
+///
+/// It is NOT the whole key, and that is the dangerous part. `resize` mutates
+/// the model without touching seq, through two branches: the ordinary path,
+/// and the `resize_screen_model_repaired` branch that fixes a model painting
+/// wider than its PTY. And the snapshot is CLIPPED to the PTY width. A memo
+/// keyed on seq alone would serve a screen clipped to the OLD width across a
+/// resize — precisely the frame-corruption class the clip was added to fix
+/// (docs/xterm-bugs.md#screen-model-wider-than-viewer), and it would read as a
+/// regression of that fix rather than of this cache.
+///
+/// So the key also carries the clip width, the model's own size, and the
+/// resize counter. The counter closes the one hole the sizes leave: a resize
+/// AWAY and back to the same grid with no output in between returns every size
+/// to its old value while the model has been re-laid-out (columns dropped at
+/// the narrow step do not come back), so a size-only key would serve cells the
+/// model no longer holds. The counter does not cover the repair branch, which
+/// returns before incrementing it — that one is caught by `model_size`. Between
+/// them nothing has to remember to invalidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenSnapshotKey {
+    output_seq: u64,
+    resize_seq: u64,
+    pty_cols: u16,
+    model_size: Option<(u16, u16)>,
 }
 
 /// The rightmost column a formatted screen paints into, in cells.
@@ -1884,6 +1919,7 @@ impl PtySessionRuntime {
             current_cols,
             current_rows,
             screen_state,
+            screen_snapshot_memo: Arc::new(Mutex::new(None)),
             app_declares,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
@@ -2009,6 +2045,39 @@ impl PtySessionRuntime {
     /// through. Clipping HERE (the one place the screen is served) covers every
     /// client path at once, rather than each replay call site remembering to.
     fn screen_snapshot(&self) -> String {
+        // Three hot callers ask for this on every snapshot response, every
+        // working-flags poll and every chore tick, and between two asks the
+        // answer is usually byte-identical: the format walk plus the clip
+        // rewrite run over the whole screen each time for nothing.
+        let key = self.screen_snapshot_key();
+        if let Some((memo_key, memo)) = self
+            .screen_snapshot_memo
+            .lock()
+            .expect("pty screen snapshot memo lock poisoned")
+            .as_ref()
+            && *memo_key == key
+        {
+            return memo.to_string();
+        }
+        let snapshot = self.render_screen_snapshot(key.pty_cols);
+        *self
+            .screen_snapshot_memo
+            .lock()
+            .expect("pty screen snapshot memo lock poisoned") =
+            Some((key, Arc::from(snapshot.as_str())));
+        snapshot
+    }
+
+    fn screen_snapshot_key(&self) -> ScreenSnapshotKey {
+        ScreenSnapshotKey {
+            output_seq: self.seq.load(Ordering::SeqCst),
+            resize_seq: self.resize_count.load(Ordering::SeqCst),
+            pty_cols: self.current_cols.load(Ordering::SeqCst),
+            model_size: self.screen_state.lock().ok().map(|state| state.size()),
+        }
+    }
+
+    fn render_screen_snapshot(&self, pty_cols: u16) -> String {
         let formatted = self
             .screen_state
             .lock()
@@ -2016,7 +2085,6 @@ impl PtySessionRuntime {
             .formatted
             .trim_matches('\0')
             .to_string();
-        let pty_cols = self.current_cols.load(Ordering::SeqCst);
         if pty_cols == 0 || formatted_screen_max_column(&formatted) <= pty_cols {
             return formatted;
         }
@@ -3753,6 +3821,210 @@ PY"#;
         let c = next_runtime_spawn_id(now);
         assert!(a != 0 && b != 0 && c != 0, "spawn ids must be non-zero");
         assert!(a != b && b != c && a != c, "same-millisecond spawns must still differ");
+    }
+
+    /// Wait until `probe` accepts the runtime's served screen, or fail.
+    /// Returns the accepted snapshot so the caller can assert on it.
+    fn wait_for_screen_snapshot(
+        runtime: &PtySessionRuntime,
+        what: &str,
+        probe: impl Fn(&str) -> bool,
+    ) -> String {
+        for _ in 0..600 {
+            let screen = runtime.screen_snapshot();
+            if probe(&screen) {
+                return screen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what} on the served screen");
+    }
+
+    /// Let the child go quiet, so the phases below can assert that exactly ONE
+    /// key input moved. Settles when `output_seq` holds still.
+    fn settle_pty_output(runtime: &PtySessionRuntime) {
+        for _ in 0..200 {
+            let before = runtime.screen_snapshot_key().output_seq;
+            std::thread::sleep(Duration::from_millis(25));
+            if runtime.screen_snapshot_key().output_seq == before {
+                return;
+            }
+        }
+        panic!("pty never went quiet");
+    }
+
+    /// The memo may only serve a stored screen when EVERY input is unchanged —
+    /// driven through the REAL `screen_snapshot()` / `screen_snapshot_key()` on
+    /// a REAL pty, because a test that only compares hand-built keys is a
+    /// tautology over `#[derive(PartialEq)]` and stays green while the key is
+    /// broken.
+    ///
+    /// Each phase moves exactly one key input and asserts the SERVED SCREEN
+    /// followed:
+    ///
+    /// - `output_seq`: a late paint from the child must reach the screen.
+    /// - `resize_seq`: resized away and back to the same grid, every size is
+    ///   back to its old value, but the narrow step dropped columns the model
+    ///   never gets back — a size-only key would serve those dead cells.
+    /// - `model_size` + `pty_cols`: the model drifts WIDER than its pty (the
+    ///   live Round 21 shape: 168-col pty, 204-col model). Nothing else moves,
+    ///   so `model_size` is the only signal the memo has, and the screen it
+    ///   serves must be clipped to the pty width — serving the ghost columns
+    ///   IS `docs/xterm-bugs.md#screen-model-wider-than-viewer`.
+    /// - the `resize_screen_model_repaired` branch returns BEFORE
+    ///   `resize_count.fetch_add`, asserted here against the real `resize()`
+    ///   rather than trusted from a comment.
+    #[test]
+    fn screen_snapshot_memo_follows_output_resize_and_model_drift_on_a_real_pty() {
+        let late_paint_gate = std::env::temp_dir().join(format!(
+            "yggterm-screen-memo-gate-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_file(&late_paint_gate);
+        let runtime = PtySessionRuntime::spawn(
+            "local://screen-memo",
+            // The second paint is gated on a file the TEST creates, not on a
+            // sleep: a timing gap would make "the late paint cannot be here
+            // yet" a race under a loaded parallel suite, and a lock that can
+            // flake is a lock nobody trusts.
+            &format!(
+                "printf 'BASELINE\\033[3;100HFARCOL'; \
+                 while [ ! -f '{gate}' ]; do sleep 0.05; done; \
+                 printf '\\033[7;1HLATEPAINT'; sleep 600",
+                gate = late_paint_gate.display()
+            ),
+            None,
+            Some((120, 24)),
+        )
+        .expect("spawn screen memo test runtime");
+
+        // --- output_seq: the memo must not outlive the child's next paint. ---
+        let early = wait_for_screen_snapshot(&runtime, "the first paint", |screen| {
+            screen.contains("BASELINE") && screen.contains("FARCOL")
+        });
+        assert!(
+            !early.contains("LATEPAINT"),
+            "precondition: the late paint is gated and the gate is not open yet"
+        );
+        assert_eq!(
+            early,
+            runtime.screen_snapshot(),
+            "an untouched session must serve the same screen twice (the memo hit)"
+        );
+        std::fs::write(&late_paint_gate, b"go").expect("open the late-paint gate");
+        wait_for_screen_snapshot(&runtime, "the late paint", |screen| {
+            screen.contains("LATEPAINT")
+        });
+        let _ = std::fs::remove_file(&late_paint_gate);
+        settle_pty_output(&runtime);
+
+        // --- resize_seq: away and back, with no output in between. ---
+        let before_round_trip = runtime.screen_snapshot_key();
+        let served_before_round_trip = runtime.screen_snapshot();
+        assert!(
+            served_before_round_trip.contains("FARCOL"),
+            "precondition: column 100 is painted before the narrow step"
+        );
+        runtime.resize(60, 24).expect("narrow the pty");
+        runtime.resize(120, 24).expect("widen the pty back");
+        let after_round_trip = runtime.screen_snapshot_key();
+        assert_eq!(
+            after_round_trip.output_seq, before_round_trip.output_seq,
+            "a resize round trip must produce no child output"
+        );
+        assert_eq!(
+            after_round_trip.pty_cols, before_round_trip.pty_cols,
+            "the pty is back to its old width"
+        );
+        assert_eq!(
+            after_round_trip.model_size, before_round_trip.model_size,
+            "the model is back to its old grid"
+        );
+        assert_ne!(
+            after_round_trip.resize_seq, before_round_trip.resize_seq,
+            "resize_seq is the ONLY input that sees a round trip"
+        );
+        let served_after_round_trip = runtime.screen_snapshot();
+        assert!(
+            served_after_round_trip.contains("BASELINE"),
+            "column 1 survives a narrowing"
+        );
+        assert!(
+            !served_after_round_trip.contains("FARCOL"),
+            "the narrow step destroyed column 100; the memo must not serve it back"
+        );
+
+        // --- model_size + pty_cols: the model drifts wider than its pty. ---
+        let before_drift = runtime.screen_snapshot_key();
+        assert!(
+            !runtime.screen_snapshot().contains("GHOSTCOL"),
+            "precondition: nothing is painted past the pty width yet"
+        );
+        {
+            let mut screen_state = runtime
+                .screen_state
+                .lock()
+                .expect("pty screen state lock poisoned");
+            screen_state.resize(24, 200);
+            screen_state.process(b"\x1b[5;1HLEFTEDGE\x1b[5;150HGHOSTCOL");
+        }
+        let after_drift = runtime.screen_snapshot_key();
+        assert_eq!(
+            after_drift.output_seq, before_drift.output_seq,
+            "the drift is a model-only mutation"
+        );
+        assert_eq!(
+            after_drift.resize_seq, before_drift.resize_seq,
+            "the drift never went through resize()"
+        );
+        assert_eq!(
+            after_drift.pty_cols, before_drift.pty_cols,
+            "the pty did not move"
+        );
+        assert_ne!(
+            after_drift.model_size, before_drift.model_size,
+            "model_size is the ONLY input that sees a model-only mutation"
+        );
+        let drifted = runtime.screen_snapshot();
+        assert!(
+            drifted.contains("LEFTEDGE"),
+            "the memo must re-render when only the model moved: {drifted:?}"
+        );
+        assert!(
+            !drifted.contains("GHOSTCOL"),
+            "the served screen must be clipped to the PTY width, not the model's"
+        );
+        assert!(
+            formatted_screen_max_column(&drifted) <= 120,
+            "clipped screen still paints past the pty: {}",
+            formatted_screen_max_column(&drifted)
+        );
+
+        // --- the repair branch never touches resize_seq. ---
+        let before_repair = runtime.screen_snapshot_key();
+        runtime
+            .resize(120, 24)
+            .expect("resize to the size the pty already is");
+        let after_repair = runtime.screen_snapshot_key();
+        assert_eq!(
+            after_repair.resize_seq, before_repair.resize_seq,
+            "resize_screen_model_repaired returns before resize_count.fetch_add — \
+             model_size is the only key input that can see that branch"
+        );
+        assert_eq!(after_repair.output_seq, before_repair.output_seq);
+        assert_eq!(after_repair.pty_cols, before_repair.pty_cols);
+        assert_eq!(
+            after_repair.model_size,
+            Some((24, 120)),
+            "the repair narrowed the model back onto its pty"
+        );
+        assert_ne!(after_repair.model_size, before_repair.model_size);
+        let repaired = runtime.screen_snapshot();
+        assert!(repaired.contains("LEFTEDGE"));
+        assert!(!repaired.contains("GHOSTCOL"));
+
+        runtime.shutdown(None).expect("shutdown test runtime");
     }
 
     #[test]
