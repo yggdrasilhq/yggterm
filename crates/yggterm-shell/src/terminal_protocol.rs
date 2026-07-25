@@ -441,13 +441,27 @@ pub struct SidebarPaneDeclarationWire {
     pub placement: Option<String>,
 }
 
+/// Parse a wire-shaped JSON event into the typed event.
+///
+/// The daemon stores an app's declare payload VERBATIM (`AppDeclareRecord`), so
+/// a client replaying one from the daemon must decode it exactly as the live
+/// OSC path does. Sharing this function is what keeps that true: a second
+/// decoder would drift, and the drift would only show up after a restart —
+/// precisely when nobody is looking for a parsing bug.
+///
+/// `None` when the JSON is not a shape this build understands (an older or
+/// newer app), which the caller treats as "no declare" rather than an error.
+pub fn parse_terminal_js_event(value: serde_json::Value) -> Option<TerminalJsEvent> {
+    serde_json::from_value::<TerminalJsEventWire>(value)
+        .ok()
+        .map(Into::into)
+}
+
 /// Parse a wire-shaped JSON event into the typed event — test-only surface
 /// for asserting wire field mappings (e.g. `placement`) without a webview.
 #[cfg(test)]
 pub fn parse_terminal_js_event_for_test(value: serde_json::Value) -> TerminalJsEvent {
-    serde_json::from_value::<TerminalJsEventWire>(value)
-        .expect("wire event deserializes")
-        .into()
+    parse_terminal_js_event(value).expect("wire event deserializes")
 }
 
 impl From<TerminalJsEventWire> for TerminalJsEvent {
