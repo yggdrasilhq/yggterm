@@ -725,10 +725,13 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 /// Why the SHAPE is the fix (this is a performance bug, not a style choice).
 /// A CSS animation's phase is anchored to the moment its element was created, so
 /// N dots created at N different times blink at N different phases. On a
-/// software-GL host (guihost — hardware GL is a trap there, see
-/// [[campaign-yggterm-unified]]) every opacity flip costs a FULL-WINDOW
-/// cairo/pixman blit on the GUI main thread, so cost scales with the number of
-/// distinct phases, not with the handful of pixels that changed. Measured live on
+/// software-GL host every opacity flip costs a FULL-WINDOW cairo/pixman blit on
+/// the GUI main thread, so cost scales with the number of distinct phases, not
+/// with the handful of pixels that changed. (⚠ The parenthetical this comment
+/// used to carry — "guihost — hardware GL is a trap there" — was FALSE: that host's
+/// GPU works, and we were forcing llvmpipe on it ourselves. The measurement below
+/// still stands on its own, and the shape is right on a hardware host too; it is
+/// simply no longer paying for a premise that was never true.) Measured live on
 /// guihost with 5 working dots: per-dot animations = 9.4 presented frames/s and
 /// 10.8% GUI CPU; this root-driven variable = 2.1 frames/s and 5.0% GUI CPU —
 /// flat in the number of dots. Isolating the dots (`contain:paint` /
@@ -77049,7 +77052,8 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
             return false;
         }
         // Wayland: WebGL (xterm.js 6's GPU renderer). It presents once WebKitGTK
-        // compositing is enabled with a software-GL safety net — see main.rs
+        // compositing is enabled; whether that compositing runs on the GPU or on
+        // llvmpipe is main.rs's probed decision, not a standing fact — see
         // configure_linux_webkit_compositing. Mirrors main.rs's authoritative policy
         // (xterm_webgl_enabled_for_wayland). The earlier "WebGL black" was compositing
         // being disabled, now fixed. See finding-xterm6-webgl-migration.
@@ -77064,8 +77068,8 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
 /// `terminal_xterm_canvas_renderer_enabled_from_env` exactly. NOTE: xterm.js 6 has
 /// two render tiers — DOM (slowest, reliable fallback) and WebGL (fastest, bundled as
 /// addon-webgl); the 2D canvas renderer was REMOVED in xterm 6. On Wayland we use
-/// WebGL: it presents once WebKitGTK accelerated compositing is enabled with a
-/// software-GL safety net (see main.rs configure_linux_webkit_compositing). X11 keeps
+/// WebGL: it presents once WebKitGTK accelerated compositing is enabled, on the GPU
+/// where the host has one (see main.rs configure_linux_webkit_compositing). X11 keeps
 /// DOM (idle-CPU guard). This reason string + the `renderer_decision` trace record the
 /// decision per platform.
 fn terminal_xterm_renderer_policy_reason() -> String {
@@ -111300,8 +111304,8 @@ mod tests {
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None, None, false, true
         ));
-        // Wayland uses the WebGL GPU renderer (presents via compositing + software-GL
-        // safety net configured in main.rs configure_linux_webkit_compositing).
+        // Wayland uses the WebGL GPU renderer (presents via the compositing path
+        // main.rs configure_linux_webkit_compositing selects for this host).
         assert!(terminal_xterm_canvas_renderer_enabled_from_env(
             None,
             Some("wayland"),

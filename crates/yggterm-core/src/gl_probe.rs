@@ -193,6 +193,14 @@ pub fn render_node_present() -> bool {
 // able to take the GUI down with it; it runs in a short-lived re-exec of ourselves.
 // ---------------------------------------------------------------------------
 
+/// Where the GL decision publishes itself, and the reason it has to.
+/// `configure_linux_webkit_compositing` runs before tracing is initialized and before
+/// the store exists, so an exported reason is the only way the choice is observable at
+/// all. Declared here rather than in the GUI binary because the DAEMON's
+/// `process_environment_snapshot` reads it back out of `/proc/<pid>/environ` — two
+/// crates, one string.
+pub const ENV_YGGTERM_WEBKIT_GL_POLICY: &str = "YGGTERM_WEBKIT_GL_POLICY";
+
 /// Hidden argv flag selecting probe mode. Absent from every launcher and desktop
 /// entry, so nothing acquires a probe by accident.
 pub const GL_PROBE_FLAG: &str = "--internal-gl-probe";

@@ -52,6 +52,12 @@ TWO stacked root causes, both fixed:
    everything by flipping the root stamp.
 2. **The presentation path (env).** `configure_linux_webkit_compositing` set
    `WEBKIT_DISABLE_DMABUF_RENDERER=1` (historical llvmpipe-crash workaround).
+   ⚠ **Updated 2026-07-25:** that workaround is now gated on the host's PROBED GL
+   class, and SHM is refused outright on a hardware-GL host — it exists only as
+   the workaround for a broken hardware EGL/DMABuf path, so where the path works
+   it is not a candidate at all. Measured: hardware GL + SHM costs the same as
+   software GL, i.e. an explicit `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` on a
+   hardware host must still land on DMABuf, and now does.
    WebKit's SHM presentation path CLEARS a transparent webview's regions
    straight through every sibling widget beneath — the hole punched through
    page webviews and backdrop to the window background (black on an opaque
