@@ -1457,3 +1457,89 @@ true` on every ensure, so the round-12b declare ingestion removed the last revea
    conclusion ("the click lands 59px high"). Version every probe payload, or
    clear it before the run — the same discipline the field guide already demands
    of screenshots.
+
+## Field findings — records filing expedition (2026-07-25)
+
+An agent sent to file seven central-government records applications on
+`rtionline.gov.in` **did not use this plane at all.** With a GUI restart announced
+ten minutes out, it drove the whole application flow on `curl` and the payment leg
+on a local Playwright + Chrome-for-Testing over CDP, wrote a ~200-line driver, and
+got one application to the payment gateway's confirm screen. That decision was
+correct on every axis available to it. The findings below are why, and each carries
+the verb that would have won the work back. The chain it had to drive was
+rtionline → `merchant.sbi.bank.in` → `billdesk.com/pgidsk` →
+`pay.billdesk.com/web/v1_2/sdk` (**an iframe holding the entire payment UI**) →
+`auth.examplebank.test` → `my.examplebank.test` — five origins, one of them
+inside a frame, with a session-bound captcha on every POST.
+
+1. **★★ No cookie bridge between the CLI plane and the browser plane.** The cheap
+   rung (curl) and the interactive rung (a surface) cannot exchange a session, so a
+   flow that is 90% scriptable and 10% interactive must pick one plane for all of
+   it. → **`web cookies --session <s> --import <jar> | --export <jar>`**, Netscape
+   jar format. Proven necessary *and* sufficient: transplanting one `PHPSESSID`
+   into Chrome made rtionline render the applicant's name and fee on its payment
+   page. Smallest verb on this list, largest unlock.
+2. **★★ Per-element pixels on a headless surface — the deferred item is cheaper
+   than recorded.** The 2026-07-23 finding #4 above concluded that pixel proof of a
+   soft-stashed surface needs an offscreen renderer and deferred it. For the case
+   that actually blocks flows — reading a same-origin `<img>` (captcha, QR, chart) —
+   it does not. → **`web capture-element --session <s> --selector <sel> <out.png>`**
+   implemented in-page as `canvas.drawImage(el) → toDataURL()`. Compositor-
+   independent, works on an unmapped surface today. Does not replace the full-frame
+   snapshot; removes the reason most flows wanted one.
+3. **★★ `web do` single-shot is disqualifying, not annoying.** This form has **31
+   fields**. Second independent site to hit the preempt-on-own-injection bug. →
+   beyond the recorded counter fix, **`web batch --session <s> --agent <id>
+   --script <file>`**: one explicitly-opened batch, N verbs, closed by the agent or
+   by genuine seat input. **Lock: a test that fires 20 sequential `do`s and asserts
+   all 20 deliver** — today's tests only ever drive one, which is why this shipped
+   broken.
+4. **★★ No frame addressing, and the failure is SILENT.** BillDesk's iframe held
+   107 elements while the top document held 17; a top-document query returned `[]`,
+   which reads as "the site does not offer this". → **`--frame <url-substr|index>`
+   on `eval`/`read`/`do`, a `web frames --session` verb (url + element count), and
+   `read` searching all frames by default.**
+5. **★★ No text/role click.** BillDesk's bank rows are anonymous divs; IDFC's
+   buttons are unnamed `<button type=submit>`. `--selector` cannot address them;
+   `getByText("IDFC First Bank Limited")` clicked first try. →
+   **`web do click --text "..."` / `--role <r> --label "..."`**, resolved at click
+   time (also retires the stale-coordinate hazard in the 2026-07-24 finding #4).
+6. **★ No wait for a multi-origin redirect chain.** `--until load:finished` is
+   per-navigation; this chain commits 4+ times across 4 origins via JS auto-submits.
+   → **`--until url:matches:<regex>`** and **`--until settled:<ms>`**.
+7. **★ Secret injection has no generic verb.** The throwaway driver added
+   `fillvault <selector> <item> <field>`: it shells to `ychrome-vault` *inside* the
+   driver process, so the value never reaches argv, stdout, a log, or the agent's
+   transcript — the only output is `injected password of <item> (15 chars, not
+   shown)`. Proven against a live bank login. → **`web fill-vault --session <s>
+   --selector <sel> --item <name> --field <f>`**, journaling field-name only.
+8. **★ A co-browse flow and a GUI deploy are still mutually exclusive** — this run
+   confirms it by *avoidance*: the announced restart is the whole reason the plane
+   was never opened. Any flow longer than a deploy cycle will keep choosing a
+   browser the deploy cannot kill. Surface hand-off across a GUI generation is the
+   fix; until then say "check `app clients` pids first" and mean it.
+
+**⛔ What actually stopped the expedition was `ychrome-vault`, and its fix is
+unshippable by construction.** It cannot read Bitwarden **card-type** ciphers:
+`get --field` is whitelisted client-side to `password|username|totp|notes`, `fields`
+reads only custom fields, and no agent op reaches `cipher.card` (`edit` returns only
+`id`/`name`, so there is no read-through-write either). Every card in the vault is
+affected. And the agent **outlives the binary**, while `stop-agent` **drops the
+keys** — an agent cannot unlock itself, so adding a `card` op costs the user's
+unlock. The standing "improve the tool during the run that needed it" directive is
+therefore *structurally impossible for this one tool*, alone among the fleet.
+→ **(a) agent op `card` + `get --field card.number|card.exp|card.code|card.holder`,
+and a `web fill-card --session <s> --item <name>` that injects without printing;
+(b) more important — an agent HANDOVER: hot-reload the binary, or a socket
+`takeover` that passes the unlocked state to the successor, so a vault-CLI fix
+never costs an unlock.** Also: `ychrome-vault get` prints its *errors to stdout*, so
+`PW=$(ychrome-vault get …)` captures `Error: … has no username` **as the
+credential** — errors belong on stderr with a non-zero exit.
+
+**Two portable instrument lessons.** (i) A one-shot challenge is consumed by any
+attempt, not just a successful one — rtionline's captcha was burnt by a *failed*
+POST, and two submissions were lost to re-using it while the reading was correct.
+(ii) `tesseract` is not adequate for this captcha class (5↔S, 7↔T, 8↔S, 1↔I on 3 of
+3 samples, even with a 16-way threshold×psm vote); the reliable read is to split the
+image into per-character vertical bands, upscale ~12×, and let the model read the
+strip. Worth a `capture-element --split <n>` convenience once finding 2 lands.
