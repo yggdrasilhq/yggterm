@@ -126,6 +126,37 @@ pub fn format_netscape_jar(cookies: &[CookieSpec]) -> String {
     out
 }
 
+/// Write a jar file OWNER-ONLY (`0600`).
+///
+/// The bytes are live session credentials — the whole point of the verb is that
+/// a transplanted `PHPSESSID` logs you in — so a jar written at the ambient
+/// umask (typically `0644`) is a world-readable credential sitting in whatever
+/// directory the agent was pointed at. The jar format's owner owns this too:
+/// nowhere else may write one.
+///
+/// The mode is set on the OPEN and again after the write, because `mode()`
+/// applies only when the file is created — exporting over a jar that already
+/// exists at `0644` must tighten it, not inherit it.
+pub fn write_jar_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +262,59 @@ mod tests {
             http_only: false,
         };
         assert!(format_netscape_jar(&[cookie]).contains("example.com\tFALSE\t/\tFALSE\t0\ta\t1"));
+    }
+
+    /// An exported jar is a CREDENTIAL FILE, so it is written owner-only.
+    ///
+    /// `fs::write` lands it at the ambient umask — typically `0644` — and the
+    /// bytes are live session cookies: the module's own premise is that
+    /// transplanting one `PHPSESSID` logs you in. Both cases are covered
+    /// because they need different mechanisms: a NEW file gets its mode from
+    /// the open, and an EXISTING one has to be tightened after it.
+    ///
+    /// Replace `write_jar_file`'s body with `std::fs::write(path, text)` and
+    /// this fails.
+    #[cfg(unix)]
+    #[test]
+    fn an_exported_jar_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-jar-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jar");
+
+        let cookies = vec![CookieSpec {
+            name: "PHPSESSID".into(),
+            value: "a-live-session".into(),
+            domain: ".example.com".into(),
+            path: "/".into(),
+            expires_unix: None,
+            secure: true,
+            http_only: true,
+        }];
+        write_jar_file(&path, &format_netscape_jar(&cookies)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a fresh jar must not be world-readable");
+        // …and it is still a jar the round trip accepts.
+        assert_eq!(
+            parse_netscape_jar(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            cookies
+        );
+
+        // Exporting OVER a jar that already exists at 0644 must tighten it —
+        // `mode()` on the open applies only at creation.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_jar_file(&path, &format_netscape_jar(&cookies)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "re-exporting must not inherit a loose mode");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
