@@ -50,6 +50,7 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
     run_app_control_web_surface_close, run_app_control_web_surface_cookies,
+    run_app_control_web_surface_frames,
     run_app_control_web_surface_reload,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_fill_vault,
@@ -587,6 +588,34 @@ fn regex_escape_literal(literal: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// Parse `--frame <index|path|url-substring>` into a [`WebFrameRef`].
+///
+/// Three spellings, one meaning: a bare number is `window.frames[n]`, a
+/// dotted/comma path (`0.2`) is a descent — the form `web frames` reports, so
+/// its output feeds straight back in — and anything else is a url substring.
+fn parse_web_frame_ref(args: &[String]) -> anyhow::Result<Option<yggterm_server::WebFrameRef>> {
+    use yggterm_server::WebFrameRef;
+    let Some(raw) = cli_flag_value(args, "--frame") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("--frame needs an index, a path like 0.2, or a url substring");
+    }
+    if let Ok(index) = raw.parse::<usize>() {
+        return Ok(Some(WebFrameRef::Index(index)));
+    }
+    let separators: &[char] = &['.', ','];
+    if raw.contains(separators) && raw.split(separators).all(|part| part.trim().parse::<usize>().is_ok()) {
+        let path = raw
+            .split(separators)
+            .map(|part| part.trim().parse::<usize>().unwrap_or(0))
+            .collect();
+        return Ok(Some(WebFrameRef::Path(path)));
+    }
+    Ok(Some(WebFrameRef::UrlContains(raw.to_string())))
 }
 
 /// Split one batch-script line into argv tokens, honouring `'`/`"` quoting and
@@ -1127,8 +1156,12 @@ fn print_server_app_help() {
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app keytips audit
   yggterm server app command <list|invoke <id>>
-  yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
-  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
+  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]
+  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]
+    read with NO --frame searches EVERY reachable frame and returns
+    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []
+  yggterm server app web frames [--session <path>]
+    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)
   yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
     target (resolved in the page at click time, precedence in this order):
       --selector <css> | --role <r> --label <s> [--nth <n>]
@@ -3176,7 +3209,12 @@ fn main() -> Result<()> {
                                 })
                                 .context("missing script (positional, --script or --stdin) for server app web eval")?
                         };
-                        run_app_control_web_surface_eval(session_path, &script, timeout_ms)
+                        run_app_control_web_surface_eval(
+                            session_path,
+                            &script,
+                            parse_web_frame_ref(&args)?,
+                            timeout_ms,
+                        )
                     }
                     "screenshot" => {
                         let output = cli_positional_args(&args, 4)
@@ -3184,6 +3222,14 @@ fn main() -> Result<()> {
                             .next()
                             .unwrap_or("web-surface.png");
                         run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "frames" => {
+                        // What frames this page has, and how much is IN each:
+                        //   web frames [--session <path>]
+                        // A top-document `read` returning [] next to a frame
+                        // reporting 107 elements is a legible answer; the []
+                        // alone was not.
+                        run_app_control_web_surface_frames(session_path, timeout_ms)
                     }
                     "cookies" => {
                         // Move the surface's cookie jar to or from a Netscape
@@ -3420,7 +3466,12 @@ fn main() -> Result<()> {
                                 "unknown --as for web read: {other} (snapshot|forms|tables|readable|links|text|html)"
                             ),
                         };
-                        run_app_control_web_surface_read(session_path, mode, timeout_ms)
+                        run_app_control_web_surface_read(
+                            session_path,
+                            mode,
+                            parse_web_frame_ref(&args)?,
+                            timeout_ms,
+                        )
                     }
                     "wait" => {
                         // Event-driven synchronization (agent control plane slice

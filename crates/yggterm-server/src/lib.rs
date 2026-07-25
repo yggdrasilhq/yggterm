@@ -26,7 +26,7 @@ pub use app_control::{
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
     ProbeTerminalViewportInputMode, ScreenshotTarget, VaultFieldSource, WebCookieDirection,
-    WebElementRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
+    WebElementRef, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
     app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
@@ -19704,18 +19704,47 @@ fn daemon_screen_read_terminal_buffer_payload(
 pub fn run_app_control_web_surface_eval(
     session_path: Option<&str>,
     script: &str,
+    frame: Option<WebFrameRef>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
+    let asked_for_a_frame = frame.is_some();
     let response = request_app_control(
         &home,
         AppControlCommand::WebSurfaceEval {
             session_path: session_path.map(str::to_string),
             script: script.to_string(),
+            frame,
         },
         timeout_ms,
     )?;
+    require_frame_echo(&response, asked_for_a_frame)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// HARD-FAIL when `--frame` was asked for and the answer does not mention it.
+///
+/// A `#[serde(default)]` field is dropped WITHOUT COMPLAINT by an older GUI, so
+/// the request still succeeds — against the TOP DOCUMENT, returning `[]`, which
+/// is precisely the silent failure `--frame` exists to kill. A timeout would be
+/// better than that; a wrong answer that looks right is the worst outcome. So
+/// the response must echo `frame_resolved`, and its ABSENCE is the signal.
+fn require_frame_echo(response: &AppControlResponse, asked_for_a_frame: bool) -> anyhow::Result<()> {
+    if !asked_for_a_frame {
+        return Ok(());
+    }
+    let echoed = response
+        .data
+        .as_ref()
+        .is_some_and(|data| data.get("frame_resolved").is_some());
+    if !echoed {
+        anyhow::bail!(
+            "this GUI build does not implement --frame: it answered without echoing \
+             `frame_resolved`, which means the query ran against the TOP DOCUMENT. \
+             Swap the GUI binary (`server app clients` shows its pid/started_at)."
+        );
+    }
     Ok(())
 }
 
@@ -19855,6 +19884,23 @@ pub fn run_app_control_web_surface_close(
         &home,
         AppControlCommand::WebSurfaceClose {
             session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Enumerate the page's frames: url, element counts, reachability.
+pub fn run_app_control_web_surface_frames(
+    session_path: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFrames {
+            session_path: session_path.map(str::to_string),
         },
         timeout_ms,
     )?;
@@ -20032,17 +20078,21 @@ pub fn run_app_control_web_surface_lease(
 pub fn run_app_control_web_surface_read(
     session_path: Option<&str>,
     mode: WebSurfaceReadAs,
+    frame: Option<WebFrameRef>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
+    let asked_for_a_frame = frame.is_some();
     let response = request_app_control(
         &home,
         AppControlCommand::WebSurfaceRead {
             session_path: session_path.map(str::to_string),
             mode,
+            frame,
         },
         timeout_ms,
     )?;
+    require_frame_echo(&response, asked_for_a_frame)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
