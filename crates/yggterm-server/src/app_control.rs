@@ -787,6 +787,35 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         output_path: String,
     },
+    /// Rasterize ONE addressed element to a PNG, IN THE PAGE.
+    ///
+    /// `canvas.drawImage(el)` + `toDataURL()` — no compositor, no window
+    /// mapping, no screenshot backend. That is the whole point: it works on an
+    /// unmapped/headless surface today, which retires the "needs an offscreen
+    /// renderer" deferral and unblocks the things an agent actually gets stuck
+    /// on — captchas, QR codes, charts, signature pads.
+    ///
+    /// Both `drawImage` of a decoded image and `toDataURL` are SYNCHRONOUS, so
+    /// the whole capture is one plain completion value and never touches the
+    /// async bridge (`eval` cannot return a Promise).
+    ///
+    /// Only genuinely rasterizable elements work — `<img>`, `<canvas>`,
+    /// `<video>`. There is no in-page rasterizer for arbitrary DOM and this
+    /// verb does not pretend otherwise: a `div` gets
+    /// `element_not_rasterizable`, an undecoded image gets `image_not_decoded`,
+    /// and a cross-origin image without CORS gets `tainted_canvas` — three
+    /// different facts, three different reasons.
+    WebSurfaceCaptureElement {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// What to capture. Same addressing as `do` (see [`WebElementRef`]).
+        target: WebElementRef,
+        output_path: String,
+        /// Also write `<out>-1.png … <out>-n.png`, the image cut into `n` equal
+        /// vertical bands. The per-character captcha case.
+        #[serde(default)]
+        split: Option<usize>,
+    },
     /// Open/close the WebKit inspector (devtools) on a session's active
     /// web-surface tab.
     WebSurfaceDevtools {
@@ -1017,6 +1046,7 @@ impl AppControlCommand {
                 | Self::DescribeState
                 | Self::ReadTerminalBuffer { .. }
                 | Self::WebSurfaceScreenshot { .. }
+                | Self::WebSurfaceCaptureElement { .. }
                 | Self::WebSurfaceRead { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
@@ -1089,6 +1119,7 @@ impl AppControlCommand {
             Self::SetTreeSelection { .. } => "set_tree_selection",
             Self::WebSurfaceEval { .. } => "web_surface_eval",
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
+            Self::WebSurfaceCaptureElement { .. } => "web_surface_capture_element",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceFillVault { .. } => "web_surface_fill_vault",
