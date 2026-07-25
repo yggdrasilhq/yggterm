@@ -629,6 +629,29 @@ A node that resolves but is not in the document is REFUSED (`detached_node`), be
 a React re-render drops agent-injected ids and an event fired at a detached node
 delivers nothing.
 
+### `batch`: what the envelope means
+
+`web batch` answers `{accepted, requested, attempted, succeeded, failed,
+actions, aborted_at, abort_reason}`. The counts are separate on purpose:
+
+- `requested` — actions asked for.
+- `attempted` — actions that actually ran (`succeeded + failed`). Short of
+  `requested` only when the batch stopped early.
+- `succeeded` / `failed` — what came of them.
+- **`accepted` is strict: the batch ran to the end AND every action it
+  attempted succeeded.** A partial batch is `accepted: false`. This is the one
+  field a caller that does not walk `actions[]` will read, so it must never be
+  true for a run that delivered nothing — with the default
+  `stop_on_error: false`, a 31-field fill in which all 31 selectors miss is
+  `accepted: false, attempted: 31, succeeded: 0, failed: 31`.
+
+The human wins at the batch's START as well as mid-run. Seat input is read
+BEFORE the lane reset, so a click that landed between the agent's last verb and
+its `web batch` refuses the batch (`preempted`) instead of being absorbed by the
+reset the verb performs on the agent's own behalf. That refusal consumes the
+count, so the next `batch` (or `do --new-batch`) opens normally — one refusal is
+the whole cost of yielding.
+
 ### Frames
 
 `web read` with no `--frame` searches EVERY reachable frame and returns

@@ -33,7 +33,8 @@ mod web_surface;
     target_os = "android"
 )))]
 pub use web_surface::{
-    CookieRecord, EvalFailure, EvalFailureKind, SurfaceCloseRequest, SurfaceLiveness, SurfacePopup,
+    grant_injection_credits, note_seat_input, take_seat_input_count, CookieRecord, EvalFailure,
+    EvalFailureKind, SurfaceCloseRequest, SurfaceLiveness, SurfacePopup,
 };
 mod webview;
 
