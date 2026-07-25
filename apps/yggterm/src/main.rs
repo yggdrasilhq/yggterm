@@ -49,7 +49,8 @@ use yggterm_server::{
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
-    run_app_control_web_surface_cookies,
+    run_app_control_web_surface_close, run_app_control_web_surface_cookies,
+    run_app_control_web_surface_reload,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_fill_vault,
     run_app_control_web_surface_lease,
@@ -1140,6 +1141,13 @@ fn print_server_app_help() {
         | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>
     url:* and settled:* are read from the ENGINE, so they survive a navigation
     that makes every page-side predicate unavailable
+  yggterm server app web ensure --session <path> [--ttl <secs>]
+    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,
+    and reports generation_before/generation_after + healed so a caller can tell
+    a new page from the same one. Refusals name WHICH fact failed (no_declare,
+    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).
+  yggterm server app web reload --session <path>
+  yggterm server app web close --session <path>
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
   yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]
@@ -3354,6 +3362,22 @@ fn main() -> Result<()> {
                         let session = session_path
                             .context("web ensure needs --session <path> (a backgrounded surface has no active default)")?;
                         run_app_control_ensure_web_surface(session, ttl_secs, timeout_ms)
+                    }
+                    "reload" | "close" => {
+                        // Recover a surface without destroying its session:
+                        //   web reload --session <path>   (new incarnation)
+                        //   web close  --session <path>
+                        // Both report generation_before; compare it against a
+                        // following `web ensure`'s generation_after to tell a
+                        // HEALED surface from the same corpse.
+                        let session = session_path.context(
+                            "web reload/close needs --session <path>",
+                        )?;
+                        if action == "reload" {
+                            run_app_control_web_surface_reload(session, timeout_ms)
+                        } else {
+                            run_app_control_web_surface_close(session, timeout_ms)
+                        }
                     }
                     "lease" => {
                         // Claim the surface so the background reaper leaves it

@@ -5172,12 +5172,55 @@ struct DeclaredWebSurfaceOpen {
 /// without a url describes nothing to rebuild. Pure so the refusal is testable
 /// without a live surface.
 fn declared_web_surface_open_from_payload(payload: &Value) -> Option<DeclaredWebSurfaceOpen> {
+    declared_web_surface_open_or_refusal(payload).ok()
+}
+
+/// Why a retained declare could not become a surface.
+///
+/// N4: "no declared web surface" was ONE string covering five different facts,
+/// and the two that matter most are in here — a payload that named nothing to
+/// open, and a payload whose URL the trust gate refused. Telling them apart is
+/// the difference between "relaunch the app" and "that app is trying to open
+/// something this build will never open".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredOpenRefusal {
+    /// The payload carried no url at all.
+    NoUrl,
+    /// The url's scheme is not allowed on this path. Carries the scheme.
+    SchemeRefused(String),
+}
+
+/// The scheme of a url, lower-cased, for reporting. Never used to decide
+/// anything — [`web_surface_url_scheme_allowed`] is still the one gate.
+fn url_scheme_label(url: &str) -> String {
+    url.split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The refusing half of [`declared_web_surface_open_from_payload`], pure and
+/// testable.
+///
+/// ⛔ The scheme gate is NOT widened here and must not be. This payload is
+/// retained by the daemon from whatever the app wrote to its own stdout, and
+/// any process that can write a session's PTY can emit that OSC
+/// (docs/web-surfaces.md, accepted risk). Allowing `file://` on this path would
+/// let a crafted byte stream point a webview at
+/// `file:///home/user/.ssh/id_ed25519`, which `web read --as text` then
+/// exfiltrates. The fix for a local fixture is a loopback http server, which
+/// the existing allowlist already permits.
+fn declared_web_surface_open_or_refusal(
+    payload: &Value,
+) -> Result<DeclaredWebSurfaceOpen, DeclaredOpenRefusal> {
     let url = payload
         .get("url")
         .and_then(Value::as_str)
-        .filter(|url| web_surface_url_scheme_allowed(url))
-        .map(str::to_string)?;
-    Some(DeclaredWebSurfaceOpen {
+        .ok_or(DeclaredOpenRefusal::NoUrl)?;
+    if !web_surface_url_scheme_allowed(url) {
+        return Err(DeclaredOpenRefusal::SchemeRefused(url_scheme_label(url)));
+    }
+    let url = url.to_string();
+    Ok(DeclaredWebSurfaceOpen {
         url,
         title: payload
             .get("title")
@@ -5558,11 +5601,75 @@ async fn apply_sidebar_declare(
     refetch
 }
 
+/// Why a daemon-declare rebuild did or did not happen.
+///
+/// N4: the `ensure` response used to collapse five facts into "no declared web
+/// surface for <session>". Each of these needs a DIFFERENT action from the
+/// caller, and guessing which one it is cost real time in the field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclareRebuild {
+    /// A surface was materialized from the retained declare.
+    Rebuilt,
+    /// The daemon answered, and this session has no `web-surface` declare —
+    /// a plain shell, or an app that already emitted `close`.
+    NoDeclare,
+    /// A declare exists but is older than the rebuild ceiling: the app EXITED,
+    /// and the answer is to relaunch it, not to retry.
+    Stale { age_ms: u64 },
+    /// A fresh declare exists and its URL was refused by the scheme gate.
+    UrlRefused { scheme: String },
+    /// A declare exists and named nothing to open.
+    NoUrl,
+    /// The daemon fetch itself failed. A FAILED FETCH IS NOT AN ABSENT
+    /// DECLARE — collapsing them is what made this unreadable.
+    FetchFailed { error: String },
+}
+
+impl DeclareRebuild {
+    fn rebuilt(&self) -> bool {
+        matches!(self, Self::Rebuilt)
+    }
+
+    /// The stable reason string an agent branches on.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Rebuilt => "rebuilt",
+            Self::NoDeclare => "no_declare",
+            Self::Stale { .. } => "declare_stale",
+            Self::UrlRefused { .. } => "declare_url_scheme_refused",
+            Self::NoUrl => "declare_without_url",
+            Self::FetchFailed { .. } => "daemon_declare_unavailable",
+        }
+    }
+
+    /// A sentence a human can act on, without having to read this file.
+    fn detail(&self, session_path: &str) -> String {
+        match self {
+            Self::Rebuilt => format!("rebuilt {session_path} from the daemon's retained declare"),
+            Self::NoDeclare => format!(
+                "the daemon has no web-surface declare for {session_path} (a plain shell, or the app already closed its surface)"
+            ),
+            Self::Stale { age_ms } => format!(
+                "the declare for {session_path} is {age_ms}ms old (ceiling {WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS}ms) — the app exited; relaunch it rather than retrying"
+            ),
+            Self::UrlRefused { scheme } => format!(
+                "the declare for {session_path} names a {scheme}: url, which is refused BY DESIGN on this path: the payload comes from PTY bytes any process can write, so a crafted stream could point a webview at a local secret that `web read` then exfiltrates. Serve a fixture over loopback http instead"
+            ),
+            Self::NoUrl => {
+                format!("the declare for {session_path} carried no url to open")
+            }
+            Self::FetchFailed { error } => format!(
+                "could not ask the daemon for {session_path}'s declares ({error}) — this is NOT the same as having none"
+            ),
+        }
+    }
+}
+
 async fn rebuild_web_surface_from_daemon_declare(
     state: Signal<ShellState>,
     trace_home: PathBuf,
     session_path: &str,
-) -> bool {
+) -> DeclareRebuild {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     // Same distinction as the sidebar twin above: a fetch that FAILED is not an
     // app that never declared. See `daemon_declare_unavailable` there.
@@ -5586,36 +5693,45 @@ async fn rebuild_web_surface_from_daemon_declare(
                     "error": error.to_string(),
                 }),
             );
-            return false;
+            return DeclareRebuild::FetchFailed {
+                error: error.to_string(),
+            };
         }
     };
     let now_ms = current_millis();
-    let Some((record, open)) = declares
-        .into_iter()
-        .find(|record| record.verb == "web-surface")
-        .filter(|record| {
-            let age_ms = now_ms.saturating_sub(record.at_ms);
-            if age_ms > WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS {
-                append_trace_event(
-                    &trace_home,
-                    "ui",
-                    "web_surface",
-                    "daemon_declare_too_stale",
-                    json!({
-                        "session_path": session_path,
-                        "age_ms": age_ms,
-                        "max_age_ms": WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS,
-                    }),
-                );
-                return false;
-            }
-            true
-        })
-        .and_then(|record| {
-            declared_web_surface_open_from_payload(&record.payload).map(|open| (record, open))
-        })
-    else {
-        return false;
+    // Each step answers a DIFFERENT question, so each gets its own answer
+    // rather than folding into one `None`.
+    let Some(record) = declares.into_iter().find(|record| record.verb == "web-surface") else {
+        return DeclareRebuild::NoDeclare;
+    };
+    let age_ms = now_ms.saturating_sub(record.at_ms);
+    if age_ms > WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "web_surface",
+            "daemon_declare_too_stale",
+            json!({
+                "session_path": session_path,
+                "age_ms": age_ms,
+                "max_age_ms": WEB_SURFACE_DECLARE_REBUILD_MAX_AGE_MS,
+            }),
+        );
+        return DeclareRebuild::Stale { age_ms };
+    }
+    let open = match declared_web_surface_open_or_refusal(&record.payload) {
+        Ok(open) => open,
+        Err(DeclaredOpenRefusal::NoUrl) => return DeclareRebuild::NoUrl,
+        Err(DeclaredOpenRefusal::SchemeRefused(scheme)) => {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "daemon_declare_url_refused",
+                json!({ "session_path": session_path, "scheme": scheme }),
+            );
+            return DeclareRebuild::UrlRefused { scheme };
+        }
     };
     let DeclaredWebSurfaceOpen {
         url,
@@ -5638,7 +5754,7 @@ async fn rebuild_web_surface_from_daemon_declare(
             "declare_action": record.action,
         }),
     );
-    materialize_declared_web_surface(
+    if materialize_declared_web_surface(
         state,
         trace_home,
         session_path.to_string(),
@@ -5652,6 +5768,13 @@ async fn rebuild_web_surface_from_daemon_declare(
         now_ms,
     )
     .await
+    {
+        DeclareRebuild::Rebuilt
+    } else {
+        // The declare was good and materialization still declined (a duplicate
+        // of a surface that already exists). Not an absent declare.
+        DeclareRebuild::NoDeclare
+    }
 }
 
 /// Turn an app's declared `open` payload into a live web surface.
@@ -46735,7 +46858,8 @@ async fn web_surface_eval_for(
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -46752,21 +46876,78 @@ async fn web_surface_eval_for(
                 "value": value,
             })
         }
-        Ok(Ok(Err(js_error))) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": format!("js: {js_error}"),
-        }),
+        // C8: a script that returned a Promise and a webview whose content
+        // process is gone are DIFFERENT problems, and this is the door an agent
+        // actually calls — so it pays a liveness probe to answer honestly
+        // rather than making the caller guess from one string.
+        Ok(Ok(Err(failure))) => {
+            let alive = desktop.web_surface_liveness(native_id).present
+                && web_do_eval_with_timeout(desktop, native_id, "1", Duration::from_secs(2))
+                    .await
+                    .is_ok();
+            let reason = eval_failure_reason(failure.kind, alive);
+            json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                // The engine's own words, preserved — but not the thing to
+                // branch on.
+                "engine_message": failure.message,
+            })
+        }
         Ok(Err(_)) => json!({
             "accepted": false,
             "session_path": session,
-            "reason": "eval callback dropped (surface destroyed mid-eval?)",
+            "reason": "webview_unreachable",
+            "detail": "the eval callback was dropped (the surface was destroyed mid-eval)",
         }),
         Err(_) => json!({
             "accepted": false,
             "session_path": session,
-            "reason": "eval timed out (10s)",
+            "reason": "webview_unreachable",
+            "detail": "the surface's web content process did not answer within 10s",
         }),
+    }
+}
+
+/// Turn an engine eval failure plus what we know about the surface into ONE
+/// honest reason.
+///
+/// C8: `"js: Unsupported result type"` used to be emitted BOTH for a script
+/// that returned a Promise or a DOM object AND for a webview whose content
+/// process was gone. Two completely different problems behind one string cost
+/// the last field run ten minutes of misdiagnosis — an agent debugging its
+/// script while the page was dead.
+///
+/// PURE, so all four combinations are pinned by a test.
+fn eval_failure_reason(kind: dioxus::desktop::EvalFailureKind, alive: bool) -> &'static str {
+    use dioxus::desktop::EvalFailureKind as Kind;
+    match kind {
+        // The script RAN. The page is healthy and the script is wrong, and that
+        // is true whether or not the surface later stopped answering.
+        Kind::UnsupportedResultType => "js_result_unsupported",
+        Kind::ScriptException if alive => "js_exception",
+        Kind::InvalidParameter if alive => "js_invalid_parameter",
+        // Everything else depends on whether anyone was home.
+        _ if !alive => "webview_unreachable",
+        _ => "engine_error",
+    }
+}
+
+/// The sentence that goes with a reason. Separate from the reason so an agent
+/// branches on a STABLE string and a human reads the explanation.
+fn eval_failure_detail(reason: &str) -> &'static str {
+    match reason {
+        "js_result_unsupported" => {
+            "the script returned a Promise or a non-serializable object; return a JSON value, or use `web await` for an async script"
+        }
+        "webview_unreachable" => {
+            "the surface's web content process did not answer; `web ensure` reports its liveness and can rebuild it"
+        }
+        "js_exception" => "the script threw",
+        "js_invalid_parameter" => "the engine rejected the script itself",
+        _ => "the engine failed the evaluation",
     }
 }
 
@@ -46792,7 +46973,8 @@ async fn web_do_eval_with_timeout(
     script: &str,
     budget: Duration,
 ) -> Result<Value, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     })?;
@@ -46800,9 +46982,21 @@ async fn web_do_eval_with_timeout(
         Ok(Ok(Ok(value_json))) => {
             Ok(serde_json::from_str(&value_json).unwrap_or_else(|_| Value::String(value_json)))
         }
-        Ok(Ok(Err(js_error))) => Err(format!("js: {js_error}")),
-        Ok(Err(_)) => Err("eval callback dropped (surface destroyed mid-do?)".to_string()),
-        Err(_) => Err(format!("eval timed out ({}s)", budget.as_secs())),
+        Ok(Ok(Err(failure))) => {
+            // Classified WITHOUT a liveness round trip: this is the inner
+            // primitive every verb calls, and probing the surface on each
+            // failure would turn one bad script into a storm of health checks.
+            // The handlers that answer a user call `eval_failure_reason` with
+            // real liveness; here the kind alone already separates the case
+            // that matters most.
+            let reason = eval_failure_reason(failure.kind, true);
+            Err(format!("{reason}: {}", failure.message))
+        }
+        Ok(Err(_)) => Err("webview_unreachable: eval callback dropped (surface destroyed mid-verb?)".to_string()),
+        Err(_) => Err(format!(
+            "webview_unreachable: eval timed out ({}s)",
+            budget.as_secs()
+        )),
     }
 }
 
@@ -48879,6 +49073,157 @@ mod web_do_verb_tests {
         assert!(!rendered.contains("PHPSESSID"), "a cookie name reached the report");
     }
 
+    // C8 THE LOCK: one string used to cover two completely different problems.
+    // A script that returned a Promise and a webview whose content process is
+    // gone need OPPOSITE responses from the caller, and conflating them cost a
+    // field run ten minutes of debugging the wrong thing.
+    #[test]
+    fn eval_failures_are_told_apart_across_every_combination() {
+        use dioxus::desktop::EvalFailureKind as Kind;
+        // The script RAN and returned something unserializable. The page is
+        // healthy and the SCRIPT is wrong — true whether or not the surface
+        // later stopped answering, which is why this arm ignores liveness.
+        assert_eq!(
+            eval_failure_reason(Kind::UnsupportedResultType, true),
+            "js_result_unsupported"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::UnsupportedResultType, false),
+            "js_result_unsupported"
+        );
+        // A live page that threw is a script bug; a dead one is not.
+        assert_eq!(eval_failure_reason(Kind::ScriptException, true), "js_exception");
+        assert_eq!(
+            eval_failure_reason(Kind::ScriptException, false),
+            "webview_unreachable"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::InvalidParameter, true),
+            "js_invalid_parameter"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::EngineError, true),
+            "engine_error"
+        );
+        assert_eq!(
+            eval_failure_reason(Kind::EngineError, false),
+            "webview_unreachable"
+        );
+        // Every reason carries an actionable sentence, and the two that matter
+        // point in opposite directions.
+        assert!(eval_failure_detail("js_result_unsupported").contains("web await"));
+        assert!(eval_failure_detail("webview_unreachable").contains("web ensure"));
+    }
+
+    // N4: the retained declare's refusals must be distinguishable, because
+    // "relaunch the app" and "that url will never be opened here" are different
+    // instructions.
+    #[test]
+    fn a_declare_refusal_names_which_fact_failed() {
+        // No url at all.
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"title": "x"})).err(),
+            Some(DeclaredOpenRefusal::NoUrl)
+        );
+        // A refused scheme names the scheme.
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"url": "file:///home/user/.ssh/id_ed25519"}))
+                .err(),
+            Some(DeclaredOpenRefusal::SchemeRefused("file".into()))
+        );
+        assert_eq!(
+            declared_web_surface_open_or_refusal(&json!({"url": "javascript:alert(1)"})).err(),
+            Some(DeclaredOpenRefusal::SchemeRefused("javascript".into()))
+        );
+        // …and the allowed ones still work, including the loopback fixture
+        // route the file:// refusal points people at.
+        assert!(
+            declared_web_surface_open_or_refusal(&json!({"url": "http://127.0.0.1:8000/f.html"}))
+                .is_ok()
+        );
+        assert!(
+            declared_web_surface_open_or_refusal(&json!({"url": "https://rtionline.gov.in/"}))
+                .is_ok()
+        );
+    }
+
+    // ⛔ THE GATE STAYS SHUT. This payload is retained by the daemon from bytes
+    // any process on the session's PTY can write, so widening the scheme
+    // allowlist here would let a crafted byte stream point a webview at a local
+    // secret that `web read --as text` then exfiltrates. If this test ever
+    // fails, do not "fix" it by relaxing the gate.
+    #[test]
+    fn a_retained_declare_can_never_open_a_local_file() {
+        for url in [
+            "file:///home/user/.ssh/id_ed25519",
+            "FILE:///etc/shadow",
+            "javascript:fetch('/x')",
+            "data:text/html,<script>1</script>",
+        ] {
+            assert!(
+                declared_web_surface_open_from_payload(&json!({ "url": url })).is_none(),
+                "{url} must never materialize from a PTY-authored declare"
+            );
+        }
+    }
+
+    // The five outcomes must be legible as stable reason strings AND as
+    // sentences a human can act on — an agent branches on the first, a person
+    // reads the second.
+    #[test]
+    fn every_declare_rebuild_outcome_says_what_to_do_next() {
+        let cases = [
+            (DeclareRebuild::Rebuilt, "rebuilt"),
+            (DeclareRebuild::NoDeclare, "no_declare"),
+            (DeclareRebuild::Stale { age_ms: 91_000 }, "declare_stale"),
+            (
+                DeclareRebuild::UrlRefused {
+                    scheme: "file".into(),
+                },
+                "declare_url_scheme_refused",
+            ),
+            (DeclareRebuild::NoUrl, "declare_without_url"),
+            (
+                DeclareRebuild::FetchFailed {
+                    error: "connection refused".into(),
+                },
+                "daemon_declare_unavailable",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (outcome, reason) in &cases {
+            assert_eq!(outcome.reason(), *reason);
+            assert!(seen.insert(*reason), "{reason} is not a distinct reason");
+            let detail = outcome.detail("local://abc");
+            assert!(detail.contains("local://abc"), "{detail}");
+        }
+        // Only ONE of them means a surface exists.
+        assert!(DeclareRebuild::Rebuilt.rebuilt());
+        assert!(!DeclareRebuild::NoDeclare.rebuilt());
+        assert!(!DeclareRebuild::FetchFailed { error: "x".into() }.rebuilt());
+        // The two whose action is least obvious must SAY the action.
+        assert!(
+            DeclareRebuild::Stale { age_ms: 91_000 }
+                .detail("s")
+                .contains("relaunch")
+        );
+        assert!(
+            DeclareRebuild::UrlRefused {
+                scheme: "file".into()
+            }
+            .detail("s")
+            .contains("loopback")
+        );
+        // A failed FETCH is not an absent declare, and the message says so.
+        assert!(
+            DeclareRebuild::FetchFailed {
+                error: "connection refused".into()
+            }
+            .detail("s")
+            .contains("NOT the same")
+        );
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -50002,6 +50347,75 @@ async fn web_surface_capture_element_for(
     answer
 }
 
+/// Is a session's web surface actually ALIVE — not merely present?
+///
+/// N1: `ensure` used to test `surface.tabs.is_empty()`, and a DEAD webview
+/// entry is not empty, so it handed back the same corpse and reported
+/// `rebuilt_from_daemon_declare: false`. The only recovery anyone found was
+/// `session remove` on the whole work session: an agent had to destroy a lane
+/// to fix a tab.
+///
+/// Four steps, and the fourth is the one that matters. `tabs`, the handle
+/// registry and `surface_liveness` are all UI-PROCESS facts and every one of
+/// them stays true over a content process that will never answer another
+/// script — the same class of mistake as trusting `page_state` to prove a page
+/// is alive. So the probe ends with a bounded round trip through the content
+/// process itself.
+async fn web_surface_liveness_probe(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: &str,
+) -> Value {
+    let handle = state.peek().web_surfaces.get(session_path).and_then(|surface| {
+        let active = surface.active_tab;
+        surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == active)
+            .and_then(|tab| web_surface_handle_for(session_path, tab.id))
+    });
+    let tabs = state
+        .peek()
+        .web_surfaces
+        .get(session_path)
+        .map(|surface| surface.tabs.len())
+        .unwrap_or(0);
+    let Some(handle) = handle else {
+        return json!({
+            "tabs": tabs,
+            "handle": false,
+            "present": false,
+            "mapped": false,
+            "web_process_responsive": false,
+            "eval_ok": false,
+            "alive": false,
+        });
+    };
+    let liveness = desktop.web_surface_liveness(handle.native_id);
+    // The round trip. A 2s budget: this is a health check, and a content
+    // process that needs longer than that to answer `1` is not healthy.
+    let eval_ok = web_do_eval_with_timeout(
+        desktop,
+        handle.native_id,
+        "1",
+        Duration::from_secs(2),
+    )
+    .await
+    .is_ok();
+    json!({
+        "tabs": tabs,
+        "handle": true,
+        "generation": handle.generation,
+        "present": liveness.present,
+        "mapped": liveness.mapped,
+        "web_process_responsive": liveness.web_process_responsive,
+        "eval_ok": eval_ok,
+        // ALIVE means the page answered. Everything above it is context for
+        // WHY it did not.
+        "alive": liveness.present && eval_ok,
+    })
+}
+
 /// App-control `cookies`: move a session's web-surface jar to or from a Netscape
 /// file.
 ///
@@ -50542,7 +50956,8 @@ async fn web_surface_totp_for(
         false
     };
     let script = web_surface_totp_script(&code, &format!("yggterm · code for {entry_name}"));
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -50553,12 +50968,15 @@ async fn web_surface_totp_for(
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or(value_json),
-        Ok(Ok(Err(js_error))) => {
+        Ok(Ok(Err(failure))) => {
+            let reason = eval_failure_reason(failure.kind, true);
             return json!({
                 "accepted": false,
                 "session_path": session,
-                "reason": format!("js: {js_error}"),
-            })
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                "engine_message": failure.message,
+            });
         }
         Ok(Err(_)) => {
             return json!({
@@ -50945,7 +51363,8 @@ async fn web_surface_fill_for(
         }
     };
     let script = web_surface_fill_script(&host, &credential);
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let (tx, rx) =
+        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -50971,11 +51390,16 @@ async fn web_surface_fill_for(
                 },
             })
         }
-        Ok(Ok(Err(js_error))) => json!({
-            "accepted": false,
-            "session_path": session,
-            "reason": format!("js: {js_error}"),
-        }),
+        Ok(Ok(Err(failure))) => {
+            let reason = eval_failure_reason(failure.kind, true);
+            json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": reason,
+                "detail": eval_failure_detail(reason),
+                "engine_message": failure.message,
+            })
+        }
         Ok(Err(_)) => json!({
             "accepted": false,
             "session_path": session,
@@ -55321,17 +55745,41 @@ async fn process_pending_app_control_requests(
         } => {
             let ttl = ttl_secs.unwrap_or(600).clamp(30, 3600);
             let until = current_millis() + ttl * 1000;
-            // A session whose host was never mounted (a `--no-activate` spawn)
-            // or whose surface the reaper collected has nothing in
-            // `web_surfaces` — but the daemon kept the app's declare. Rebuild
-            // from it BEFORE answering, so `ensure` means ensure.
-            let rebuilt_from_daemon_declare = state.with(|shell| {
-                shell
-                    .web_surfaces
-                    .get(&session_path)
-                    .map(|surface| surface.tabs.is_empty())
-                    .unwrap_or(true)
-            }) && rebuild_web_surface_from_daemon_declare(state, home.clone(), &session_path).await;
+            // LIVENESS, not emptiness (N1). A dead webview entry is not empty,
+            // so the old `tabs.is_empty()` test handed a caller back the same
+            // corpse and reported success.
+            let probe_before =
+                web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let generation_before = probe_before.get("generation").and_then(Value::as_u64);
+            let alive_before = probe_before
+                .get("alive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut rebuild = None;
+            let mut reloaded = false;
+            if !alive_before {
+                if probe_before.get("tabs").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                    // Nothing here at all: the daemon's retained declare is the
+                    // only way back.
+                    rebuild = Some(
+                        rebuild_web_surface_from_daemon_declare(
+                            state,
+                            home.clone(),
+                            &session_path,
+                        )
+                        .await,
+                    );
+                } else {
+                    // A tab exists but its page is a corpse. Bump the tab's
+                    // reload nonce and let the reconciler's EXISTING
+                    // destroy-and-recreate branch do the work — that branch
+                    // mints a fresh generation, which is precisely the
+                    // healed-vs-corpse signal. A second destroy path here would
+                    // be a second owner of surface teardown.
+                    state.with_mut(|shell| shell.web_surface_reload_active_tab(&session_path));
+                    reloaded = true;
+                }
+            }
             let tabs = state.with_mut(|shell| {
                 let tabs = shell
                     .web_surfaces
@@ -55347,21 +55795,117 @@ async fn process_pending_app_control_requests(
             });
             let lease = (tabs > 0)
                 .then(|| web_surface_lease_for(&mut state, Some(session_path.as_str()), ttl));
+            let probe_after =
+                web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let generation_after = probe_after.get("generation").and_then(Value::as_u64);
+            let accepted = tabs > 0;
+            // HEALED means a NEW incarnation. A caller comparing the two
+            // generations learns whether it got a fresh page or the same
+            // corpse, which is the whole ask — `accepted: true` on its own
+            // never distinguished them.
+            let healed = !alive_before
+                && (generation_after != generation_before
+                    || rebuild.as_ref().is_some_and(DeclareRebuild::rebuilt));
+            // N4: five different facts used to share one string. Each of these
+            // needs a different action, and guessing which cost real time.
+            let (reason, detail) = if accepted && alive_before {
+                ("already_live", format!("{session_path} already has a live surface"))
+            } else if accepted && healed {
+                ("healed", format!("{session_path} was rebuilt into a new incarnation"))
+            } else if accepted && reloaded {
+                (
+                    "reload_pending",
+                    format!(
+                        "{session_path}'s page was unresponsive; a rebuild is queued — re-run ensure and compare generation_after"
+                    ),
+                )
+            } else if accepted {
+                ("present_but_unproven", format!("{session_path} has a tab, but its page did not answer a probe"))
+            } else {
+                match rebuild.as_ref() {
+                    Some(rebuild) => (rebuild.reason(), rebuild.detail(&session_path)),
+                    None => (
+                        "no_web_surface",
+                        format!("{session_path} has no web surface and no rebuild was attempted"),
+                    ),
+                }
+            };
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
                 completed_at_ms: current_millis() as u128,
                 output_path: None,
-                error: (tabs == 0)
-                    .then(|| format!("no declared web surface for {session_path}")),
+                error: (!accepted).then(|| detail.clone()),
                 data: Some(json!({
-                    "accepted": tabs > 0,
+                    "accepted": accepted,
                     "session_path": session_path,
                     "tabs": tabs,
                     "wanted_until_ms": until,
                     "ttl_secs": ttl,
                     "lease": lease,
-                    "rebuilt_from_daemon_declare": rebuilt_from_daemon_declare,
+                    "reason": reason,
+                    "detail": detail,
+                    "healed": healed,
+                    "generation_before": generation_before,
+                    "generation_after": generation_after,
+                    "probe": probe_before,
+                    "probe_after": probe_after,
+                    "rebuilt_from_daemon_declare": rebuild
+                        .as_ref()
+                        .is_some_and(DeclareRebuild::rebuilt),
+                })),
+            }
+        }
+        AppControlCommand::WebSurfaceReload { session_path } => {
+            // Bump the active tab's reload nonce; the reconciler's existing
+            // destroy-and-recreate branch mints a fresh generation. Reported so
+            // a caller can tell a healed surface from the same corpse.
+            let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let existed = state.with_mut(|shell| {
+                let existed = shell.web_surfaces.contains_key(&session_path);
+                if existed {
+                    shell.web_surface_reload_active_tab(&session_path);
+                }
+                existed
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!existed)
+                    .then(|| format!("{session_path} has no web surface to reload")),
+                data: Some(json!({
+                    "accepted": existed,
+                    "session_path": session_path,
+                    "generation_before": before.get("generation"),
+                    // The rebuild happens on the next reconcile, so the NEW
+                    // generation is not knowable here. Say so rather than
+                    // reporting the old one as if it were the new one.
+                    "generation_after": Value::Null,
+                    "detail": "reload queued; re-run `web ensure` and compare generation_after",
+                })),
+            }
+        }
+        AppControlCommand::WebSurfaceClose { session_path } => {
+            let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
+            let closed = state.with_mut(|shell| shell.close_web_surface(&session_path));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!closed).then(|| format!("{session_path} has no web surface to close")),
+                data: Some(json!({
+                    "accepted": closed,
+                    "session_path": session_path,
+                    "generation_before": before.get("generation"),
+                    // `close_web_surface` also records a deliberate-close mark,
+                    // which blocks a HEARTBEAT resurrection for a grace window
+                    // — but NOT an explicit `web ensure`, because the rebuild
+                    // path never consults that map. Do not "fix" that: a
+                    // heartbeat is liveness, an ensure is intent.
+                    "detail": "closed; `web ensure` can rebuild it from the daemon's declare",
                 })),
             }
         }
