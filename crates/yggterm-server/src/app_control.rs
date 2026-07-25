@@ -152,6 +152,76 @@ pub enum AppControlKeyCommand {
     Type { text: String },
 }
 
+/// How a `do` verb names the element it wants — the ONE addressing type for
+/// every selector-shaped field on [`WebSurfaceDoAction`].
+///
+/// Why it exists: gateway and bank UIs have no stable ids. BillDesk's bank rows
+/// are anonymous `div`s; IDFC's continue button is an unnamed
+/// `<button type=submit>`. A CSS selector cannot name either, and a *coordinate*
+/// goes stale the moment the page reflows. Text and role/label are how a human
+/// names those controls, so they are how an agent should too.
+///
+/// It is deliberately ONE type carried by the existing `selector` fields rather
+/// than a parallel `ClickText` action: a second action variant would be a second
+/// encoding of "which element", and the four call sites (click, focus-for-type,
+/// focus-for-key, fill) would drift apart.
+///
+/// `#[serde(untagged)]` with `Css(String)` first is what keeps the wire
+/// compatible: every previously-written payload spells the field as a BARE
+/// STRING (`"selector":"#login"`) and still deserializes, into `Css`. That
+/// back-compat is pinned by `a_bare_string_selector_still_parses_as_css`.
+///
+/// Resolution happens AT CLICK TIME, in the page, immediately before injection —
+/// so a match is never carried across a reflow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebElementRef {
+    /// A CSS selector, resolved with `document.querySelector` (first match).
+    Css(String),
+    /// The element whose visible text (or `aria-label`, or an input's `value`)
+    /// matches. Ties are broken deterministically: candidates in document order,
+    /// ancestors of another candidate dropped (so a `contains` match on `<body>`
+    /// never wins over the button inside it), then `nth` (default 0).
+    Text {
+        text: String,
+        /// Exact (trimmed, whitespace-collapsed) equality instead of substring.
+        #[serde(default)]
+        exact: bool,
+        /// Restrict the candidate set to a CSS selector (e.g. `button`).
+        #[serde(default)]
+        tag: Option<String>,
+        /// Which match to take when several remain. Default 0.
+        #[serde(default)]
+        nth: Option<usize>,
+    },
+    /// The element with an explicit or implicit ARIA `role` whose accessible
+    /// label matches. Exact label matches are preferred over substring ones; the
+    /// preference is a fixed rule, not a heuristic that can vary per run.
+    Role {
+        role: String,
+        label: String,
+        #[serde(default)]
+        nth: Option<usize>,
+    },
+}
+
+impl WebElementRef {
+    /// A short, log-safe description of what was asked for. Never a page value.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Css(selector) => format!("css:{selector}"),
+            Self::Text { text, exact, .. } => {
+                if *exact {
+                    format!("text=:{text}")
+                } else {
+                    format!("text~:{text}")
+                }
+            }
+            Self::Role { role, label, .. } => format!("role:{role}[{label}]"),
+        }
+    }
+}
+
 /// One trusted action injected into a web surface's page (agent control plane
 /// `do` verb, slice 2b). Delivered via GTK-level event synthesis into the target
 /// webview — `isTrusted: true`, NO seat pointer moved — so a backgrounded
@@ -173,7 +243,9 @@ pub enum WebSurfaceDoAction {
     /// Click the element matching `selector` (engine resolves its rect + scrolls
     /// it into view, then clicks its center). Sugar over `Click`.
     ClickSelector {
-        selector: String,
+        /// The element to click. A bare string is a CSS selector; an object
+        /// addresses by text or role/label (see [`WebElementRef`]).
+        selector: WebElementRef,
         #[serde(default)]
         button: AppControlPointerButton,
     },
@@ -194,7 +266,7 @@ pub enum WebSurfaceDoAction {
     Type {
         text: String,
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
     },
     /// Press a single named key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`, or
     /// a single character) with optional modifiers (`ctrl`, `shift`, `alt`,
@@ -206,7 +278,7 @@ pub enum WebSurfaceDoAction {
         #[serde(default)]
         mods: Vec<String>,
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
     },
     /// **Set** a field to `text`: clear what is there with real keys, type the
     /// new value with real keys, then read the value back and report whether it
@@ -231,10 +303,10 @@ pub enum WebSurfaceDoAction {
         text: String,
         /// The single field to replace. Ignored when `selectors` is non-empty.
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
         /// A segmented input's boxes, in visual order.
         #[serde(default)]
-        selectors: Vec<String>,
+        selectors: Vec<WebElementRef>,
     },
 }
 
@@ -1525,6 +1597,98 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    /// WIRE BACK-COMPAT LOCK for `WebElementRef`.
+    ///
+    /// Every `do` payload written before text/role addressing existed spells
+    /// the target as a BARE STRING. `#[serde(untagged)]` with `Css(String)`
+    /// first is what keeps those parsing; a tagged enum would break every
+    /// in-flight request file and every scripted caller on the day it landed.
+    /// This test fails the moment someone reaches for a tagged representation.
+    #[test]
+    fn a_bare_string_selector_still_parses_as_css() {
+        let old_payload = r##"{"verb":"click_selector","selector":"#login"}"##;
+        let action: WebSurfaceDoAction = serde_json::from_str(old_payload).unwrap();
+        assert_eq!(
+            action,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Css("#login".into()),
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        // …and the optional-selector fields too, which is the other half of the
+        // wire: `type`/`key`/`fill` all carried `Option<String>`.
+        let typed: WebSurfaceDoAction =
+            serde_json::from_str(r##"{"verb":"type","text":"hi","selector":"#user"}"##).unwrap();
+        assert_eq!(
+            typed,
+            WebSurfaceDoAction::Type {
+                text: "hi".into(),
+                selector: Some(WebElementRef::Css("#user".into())),
+            }
+        );
+        let filled: WebSurfaceDoAction = serde_json::from_str(
+            r##"{"verb":"fill","text":"292244","selectors":["#a","#b","#c"]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            filled,
+            WebSurfaceDoAction::Fill {
+                text: "292244".into(),
+                selector: None,
+                selectors: vec![
+                    WebElementRef::Css("#a".into()),
+                    WebElementRef::Css("#b".into()),
+                    WebElementRef::Css("#c".into()),
+                ],
+            }
+        );
+    }
+
+    /// The new addressing shapes must be distinguishable from each other and
+    /// from a bare selector — an untagged enum resolves by SHAPE, so this is
+    /// the test that catches a field rename silently re-routing a payload.
+    #[test]
+    fn text_and_role_refs_parse_into_their_own_shapes() {
+        let by_text: WebSurfaceDoAction = serde_json::from_str(
+            r#"{"verb":"click_selector","selector":{"text":"Proceed to Pay","exact":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_text,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Text {
+                    text: "Proceed to Pay".into(),
+                    exact: true,
+                    tag: None,
+                    nth: None,
+                },
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        let by_role: WebSurfaceDoAction = serde_json::from_str(
+            r#"{"verb":"click_selector","selector":{"role":"button","label":"Continue","nth":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_role,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Role {
+                    role: "button".into(),
+                    label: "Continue".into(),
+                    nth: Some(1),
+                },
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        // Round-trips: a re-serialized Css ref is still a bare string, so an
+        // old GUI reading a request written by a new CLI still understands the
+        // ordinary case.
+        assert_eq!(
+            serde_json::to_value(WebElementRef::Css("#x".into())).unwrap(),
+            serde_json::json!("#x")
+        );
+    }
+
     #[test]
     fn read_only_commands_are_pure_observation() {
         // Pure-observation: no UI/session mutation → no forced re-render needed.
@@ -1593,7 +1757,7 @@ mod tests {
         let command = AppControlCommand::WebSurfaceDo {
             session_path: Some("local://abc".to_string()),
             action: WebSurfaceDoAction::ClickSelector {
-                selector: "button[type=submit]".to_string(),
+                selector: WebElementRef::Css("button[type=submit]".to_string()),
                 button: AppControlPointerButton::Primary,
             },
             generation: None,
@@ -1645,13 +1809,15 @@ mod tests {
             // `fill` in both shapes: one field, and a segmented box set.
             WebSurfaceDoAction::Fill {
                 text: "292244".to_string(),
-                selector: Some("#otp".to_string()),
+                selector: Some(WebElementRef::Css("#otp".to_string())),
                 selectors: Vec::new(),
             },
             WebSurfaceDoAction::Fill {
                 text: "292244".to_string(),
                 selector: None,
-                selectors: (0..6).map(|i| format!("input.input-otp:nth-child({i})")).collect(),
+                selectors: (0..6)
+                    .map(|i| WebElementRef::Css(format!("input.input-otp:nth-child({i})")))
+                    .collect(),
             },
         ] {
             let command = AppControlCommand::WebSurfaceDo {

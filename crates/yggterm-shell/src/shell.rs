@@ -183,8 +183,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WebSurfaceReadAs,
-    WebSurfaceWaitUntil, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebElementRef, WebSurfaceDoAction,
+    WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -46793,26 +46793,298 @@ async fn web_do_eval(
     }
 }
 
-/// Focus the element matching `selector` in the target surface (F3: do not
-/// trust ambient focus — a redirect, dialog, or human keystroke can move it).
-/// Errors `no element matches` / `focus_failed` if the target is absent or
-/// cannot take focus. Shared by `do type` and `do key --selector`.
-async fn web_do_focus_selector(
+// ---------------------------------------------------------------------------
+// Element addressing (C4): ONE matcher, four call sites.
+// ---------------------------------------------------------------------------
+
+/// JS source for `__yggPath(el)` — a stable-ish CSS path for an element, so a
+/// response can say WHAT it acted on. Prefers an id, else a bounded
+/// `tag:nth-of-type(n)` chain (8 levels max, so a deep DOM cannot make the
+/// answer unbounded). This is a REPORT, not a second addressing scheme: nothing
+/// resolves through it.
+const WEB_DO_CSS_PATH_FN_JS: &str = "var __yggPath=function(el){\
+    if(!el||el.nodeType!==1)return null;\
+    var esc=function(s){try{return CSS.escape(s);}catch(e){return String(s);}};\
+    var parts=[],node=el,guard=0;\
+    while(node&&node.nodeType===1&&guard<8){\
+    if(node.id){parts.unshift('#'+esc(node.id));break;}\
+    var part=node.tagName.toLowerCase();var p=node.parentNode;\
+    if(p&&p.children){var same=[],c=p.children;\
+    for(var i=0;i<c.length;i++)if(c[i].tagName===node.tagName)same.push(c[i]);\
+    if(same.length>1)part+=':nth-of-type('+(same.indexOf(node)+1)+')';}\
+    parts.unshift(part);node=p;guard++;}\
+    return parts.join(' > ');};";
+
+/// Resolve the addressed element, scroll it into view, and report everything
+/// the DOM knows about it at that instant. `__YGG_REF__` is replaced by the
+/// matcher expression; `__YGG_PATH_FN__` by [`WEB_DO_CSS_PATH_FN_JS`].
+///
+/// Resolution happens HERE, immediately before injection — that is what retires
+/// the stale-coordinate hazard: a rect resolved in an earlier request can be
+/// invalidated by any reflow, and this one cannot be.
+const WEB_DO_RESOLVE_JS: &str = "(function(){__YGG_PATH_FN__\
+    var el=__YGG_REF__;if(!el)return{found:false};\
+    var connected=(el.isConnected!==undefined)?!!el.isConnected\
+    :!!(document.contains&&document.contains(el));\
+    try{el.scrollIntoView({block:'center',inline:'center'});}catch(e){}\
+    var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
+    var hit=document.elementFromPoint(cx,cy);\
+    var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
+    return{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,\
+    visible:r.width>0&&r.height>0,isConnected:connected,cssPath:__yggPath(el),\
+    tag:el.tagName};})()";
+
+/// Focus the addressed element. Same matcher, different action.
+const WEB_DO_FOCUS_JS: &str = "(function(){var el=__YGG_REF__;if(!el)return{found:false};\
+    try{el.focus();}catch(e){}\
+    return{found:true,focused:document.activeElement===el};})()";
+
+/// The matcher: a JS expression evaluating to the addressed `Element` or `null`.
+///
+/// This is the ONE place that knows how a [`WebElementRef`] finds a node. Every
+/// consumer (resolve-and-click, focus-to-type, focus-to-key, fill, readback)
+/// composes it into its own script, so a click and the readback that verifies it
+/// can never disagree about which element was meant.
+fn web_element_ref_js(target: &WebElementRef) -> String {
+    let quote = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    match target {
+        WebElementRef::Css(selector) => {
+            format!("document.querySelector({})", quote(selector))
+        }
+        WebElementRef::Text {
+            text,
+            exact,
+            tag,
+            nth,
+        } => {
+            // Candidate pool, match, then drop any candidate that CONTAINS
+            // another candidate: on a substring match the whole ancestor chain
+            // up to <body> matches, and clicking <body> is never what was
+            // meant. Document order + innermost-wins + `nth` is fully
+            // deterministic — the same page always yields the same node.
+            let pool = tag.clone().unwrap_or_else(|| {
+                "a,button,input,select,textarea,label,summary,\
+                 [role],[onclick],[tabindex],div,span,td,th,li,p,h1,h2,h3,h4"
+                    .to_string()
+            });
+            format!(
+                "(function(){{var els=document.querySelectorAll({pool});\
+                 var want={want},exact={exact},nth={nth};\
+                 var norm=function(s){{return String(s==null?'':s).replace(/\\s+/g,' ').trim();}};\
+                 var out=[];\
+                 for(var i=0;i<els.length;i++){{var e=els[i];\
+                 var t=norm(e.getAttribute&&e.getAttribute('aria-label'));\
+                 if(!t&&(e.tagName==='INPUT'||e.tagName==='BUTTON'))t=norm(e.value);\
+                 if(!t)t=norm(e.innerText||e.textContent);\
+                 if(!t)continue;\
+                 if(exact?(t===want):(t.indexOf(want)!==-1))out.push(e);}}\
+                 var inner=[];\
+                 for(var j=0;j<out.length;j++){{var keep=true;\
+                 for(var k=0;k<out.length;k++){{if(k!==j&&out[j].contains&&out[j].contains(out[k]))\
+                 {{keep=false;break;}}}}\
+                 if(keep)inner.push(out[j]);}}\
+                 return inner[nth]||null;}})()",
+                pool = quote(&pool),
+                want = quote(text),
+                exact = if *exact { "true" } else { "false" },
+                nth = nth.unwrap_or(0),
+            )
+        }
+        WebElementRef::Role { role, label, nth } => format!(
+            "(function(){{var want={role},wantLabel={label},nth={nth};\
+             var norm=function(s){{return String(s==null?'':s).replace(/\\s+/g,' ').trim();}};\
+             var roleOf=function(e){{\
+             var r=e.getAttribute&&e.getAttribute('role');\
+             if(r)return norm(r).toLowerCase();\
+             var t=e.tagName;\
+             if(t==='BUTTON')return 'button';\
+             if(t==='A')return e.hasAttribute('href')?'link':'generic';\
+             if(t==='SELECT')return 'combobox';\
+             if(t==='TEXTAREA')return 'textbox';\
+             if(t==='IMG')return 'img';\
+             if(t==='NAV')return 'navigation';\
+             if(t==='MAIN')return 'main';\
+             if(t==='FORM')return 'form';\
+             if(t==='TABLE')return 'table';\
+             if(/^H[1-6]$/.test(t))return 'heading';\
+             if(t==='INPUT'){{var ty=(e.getAttribute('type')||'text').toLowerCase();\
+             if(ty==='submit'||ty==='button'||ty==='reset'||ty==='image')return 'button';\
+             if(ty==='checkbox')return 'checkbox';\
+             if(ty==='radio')return 'radio';\
+             if(ty==='search')return 'searchbox';\
+             if(ty==='range')return 'slider';\
+             if(ty==='number')return 'spinbutton';\
+             if(ty==='hidden')return 'none';\
+             return 'textbox';}}\
+             return 'generic';}};\
+             var labelOf=function(e){{\
+             var l=norm(e.getAttribute&&e.getAttribute('aria-label'));if(l)return l;\
+             var lb=e.getAttribute&&e.getAttribute('aria-labelledby');\
+             if(lb){{var acc=[],ids=lb.split(/\\s+/);\
+             for(var i=0;i<ids.length;i++){{var t=document.getElementById(ids[i]);\
+             if(t)acc.push(norm(t.innerText||t.textContent));}}\
+             l=norm(acc.join(' '));if(l)return l;}}\
+             if(e.labels&&e.labels.length){{var ls=[];\
+             for(var m=0;m<e.labels.length;m++)ls.push(norm(e.labels[m].innerText||e.labels[m].textContent));\
+             l=norm(ls.join(' '));if(l)return l;}}\
+             l=norm(e.getAttribute&&e.getAttribute('title'));if(l)return l;\
+             if(e.tagName==='INPUT'){{l=norm(e.value);if(l)return l;\
+             l=norm(e.getAttribute('placeholder'));if(l)return l;}}\
+             return norm(e.innerText||e.textContent);}};\
+             var all=document.querySelectorAll('*'),ex=[],part=[];\
+             for(var i=0;i<all.length;i++){{var e=all[i];\
+             if(roleOf(e)!==want)continue;var lab=labelOf(e);\
+             if(lab===wantLabel)ex.push(e);\
+             else if(wantLabel&&lab.indexOf(wantLabel)!==-1)part.push(e);}}\
+             var pool=ex.length?ex:part;return pool[nth]||null;}})()",
+            role = quote(&role.to_lowercase()),
+            label = quote(label),
+            nth = nth.unwrap_or(0),
+        ),
+    }
+}
+
+/// Compose a target-shaped script: substitute the matcher (and the css-path
+/// helper, when the template asks for it) into `template`.
+fn web_do_script_for_ref(template: &str, target: &WebElementRef) -> String {
+    template
+        .replace("__YGG_PATH_FN__", WEB_DO_CSS_PATH_FN_JS)
+        .replace("__YGG_REF__", &web_element_ref_js(target))
+}
+
+/// What the DOM said about the addressed node AT CLICK TIME.
+///
+/// The three questions a `do` response must keep separate (N3):
+/// `accepted` = the injector ran; these fields = what the DOM said about the
+/// node; `delivered` = what the page's own listener observed. Conflating any
+/// two of them is how "delivered" came to mean "we injected".
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedElement {
+    /// Viewport-space CSS centre — what gets injected.
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    on_target: bool,
+    is_connected: bool,
+    css_path: Option<String>,
+    tag: Option<String>,
+}
+
+/// PURE half of the resolver: turn the page's report into a decision.
+///
+/// Kept pure so the refusals are unit-testable without a webview — every
+/// interesting failure of this verb family is a decision made here.
+fn web_do_resolved_from_info(
+    target: &WebElementRef,
+    info: &Value,
+) -> Result<ResolvedElement, String> {
+    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!("no element matches {}", target.describe()));
+    }
+    let is_connected = info
+        .get("isConnected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_connected {
+        // A React re-render replaces the node behind an agent-injected id: the
+        // selector still resolves, but to a node no longer in the document, so
+        // an event fired at it reaches nothing. Refuse rather than report a
+        // success that delivered nothing.
+        return Err(format!(
+            "detached_node ({} resolved to a node that is not in the document)",
+            target.describe()
+        ));
+    }
+    if !info
+        .get("visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!("{} matched a zero-size element", target.describe()));
+    }
+    if !info
+        .get("onTarget")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "target_moved (the resolved point no longer hits {})",
+            target.describe()
+        ));
+    }
+    Ok(ResolvedElement {
+        x: info.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+        y: info.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+        w: info.get("w").and_then(Value::as_f64).unwrap_or(0.0),
+        h: info.get("h").and_then(Value::as_f64).unwrap_or(0.0),
+        on_target: true,
+        is_connected: true,
+        css_path: info
+            .get("cssPath")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tag: info
+            .get("tag")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+/// Resolve a [`WebElementRef`] in the page, right now.
+async fn web_do_resolve_ref(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    selector: &str,
+    target: &WebElementRef,
+) -> Result<ResolvedElement, String> {
+    let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, target);
+    let info = web_do_eval(desktop, native_id, &script).await?;
+    web_do_resolved_from_info(target, &info)
+}
+
+/// The positive report N3 asks for: what was clicked, not just that something
+/// was. Pure, so the response shape is pinned by a test.
+fn web_do_resolved_detail(verb: &str, target: &WebElementRef, resolved: &ResolvedElement) -> Value {
+    json!({
+        "verb": verb,
+        // Wire-identical to the pre-C4 response for a CSS target (a bare
+        // string), an object for the new addressing shapes.
+        "selector": serde_json::to_value(target).unwrap_or(Value::Null),
+        "target": target.describe(),
+        "x": resolved.x,
+        "y": resolved.y,
+        "resolved": {
+            "css_path": resolved.css_path,
+            "tag": resolved.tag,
+            "rect": [resolved.x - resolved.w / 2.0, resolved.y - resolved.h / 2.0, resolved.w, resolved.h],
+            "on_target": resolved.on_target,
+            "is_connected": resolved.is_connected,
+        },
+    })
+}
+
+/// Focus the addressed element (F3: do not trust ambient focus — a redirect,
+/// dialog, or human keystroke can move it). Shared by `do type`, `do key
+/// --selector` and `do fill`; it runs the SAME matcher the click path runs.
+async fn web_do_focus_ref(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    target: &WebElementRef,
 ) -> Result<(), String> {
-    let script = format!(
-        "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
-         el.focus();return{{found:true,focused:document.activeElement===el}};}})()",
-        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-    );
+    let script = web_do_script_for_ref(WEB_DO_FOCUS_JS, target);
     let info = web_do_eval(desktop, native_id, &script).await?;
     if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(format!("no element matches selector: {selector}"));
+        return Err(format!("no element matches {}", target.describe()));
     }
-    if !info.get("focused").and_then(Value::as_bool).unwrap_or(false) {
-        return Err("focus_failed (could not focus the selector target)".to_string());
+    if !info
+        .get("focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "focus_failed (could not focus {})",
+            target.describe()
+        ));
     }
     Ok(())
 }
@@ -46872,18 +47144,19 @@ async fn web_do_clear_focused_field(
 async fn web_do_verify_field_value(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    selector: Option<&str>,
+    target: Option<&WebElementRef>,
     expected: &str,
 ) -> Option<bool> {
+    // Same matcher as the focus/click paths, so the box that was written and
+    // the box that is read back can never be different elements.
+    let resolver = target
+        .map(web_element_ref_js)
+        .unwrap_or_else(|| "document.activeElement".to_string());
     let script = format!(
-        "(function(){{var sel={sel};\
-         var el=sel?document.querySelector(sel):document.activeElement;\
+        "(function(){{var el={resolver};\
          if(!el)return{{known:false}};\
          var v=(el.value!==undefined?el.value:el.textContent)||'';\
          return{{known:true,same:v==={want}}};}})()",
-        sel = selector
-            .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()))
-            .unwrap_or_else(|| "null".to_string()),
         want = serde_json::to_string(expected).unwrap_or_else(|_| "\"\"".to_string()),
     );
     let info = web_do_eval(desktop, native_id, &script).await.ok()?;
@@ -47479,36 +47752,20 @@ async fn web_surface_do_for(
             }
         }
         WebSurfaceDoAction::ClickSelector { selector, button } => {
-            // Resolve the element rect IN THE PAGE (scroll it into view), take
-            // its viewport-space center, and re-verify the point still hits the
-            // element (freshness guard — a reflow/navigation in the gap aborts).
-            let script = format!(
-                "(function(){{var el=document.querySelector({sel});if(!el)return{{found:false}};\
-                 el.scrollIntoView({{block:'center',inline:'center'}});\
-                 var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
-                 var hit=document.elementFromPoint(cx,cy);\
-                 var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
-                 return{{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,visible:r.width>0&&r.height>0}};}})()",
-                sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-            );
-            match web_do_eval(desktop, native_id, &script).await {
-                Ok(info) => {
-                    if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-                        Err(format!("no element matches selector: {selector}"))
-                    } else if !info.get("visible").and_then(Value::as_bool).unwrap_or(false) {
-                        Err(format!("selector matched a zero-size element: {selector}"))
-                    } else if !info.get("onTarget").and_then(Value::as_bool).unwrap_or(false) {
-                        // The resolved center is occluded / moved — do NOT click
-                        // whatever now sits there (F3 freshness guard).
-                        Err("target_moved (resolved point no longer hits the selector)".to_string())
-                    } else {
-                        let vx = info.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-                        let vy = info.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-                        desktop
-                            .inject_web_surface_click(native_id, vx, vy, web_do_gdk_button(*button))
-                            .map(|()| json!({ "verb": "click_selector", "selector": selector, "x": vx, "y": vy }))
-                    }
-                }
+            // Resolve AT CLICK TIME through the shared matcher (C4): CSS, or
+            // visible text, or role+label. The resolve script scrolls the node
+            // into view, takes its viewport-space centre and re-verifies that
+            // the point still hits it, so a reflow between resolution and
+            // injection aborts instead of clicking whatever moved in.
+            match web_do_resolve_ref(desktop, native_id, selector).await {
+                Ok(resolved) => desktop
+                    .inject_web_surface_click(
+                        native_id,
+                        resolved.x,
+                        resolved.y,
+                        web_do_gdk_button(*button),
+                    )
+                    .map(|()| web_do_resolved_detail("click_selector", selector, &resolved)),
                 Err(reason) => Err(reason),
             }
         }
@@ -47550,7 +47807,7 @@ async fn web_surface_do_for(
                 // Editing/navigation keys need a focused DOM element (the widget
                 // grab alone has no target). Focus the selector first when given.
                 if let Some(selector) = selector
-                    && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+                    && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
                 {
                     // Single exit path: the armed recorder is torn down below.
                     return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
@@ -47568,7 +47825,7 @@ async fn web_surface_do_for(
             // Optionally resolve + focus the target first (F3: do not trust
             // ambient focus). Then deliver each character as a key press+release.
             if let Some(selector) = selector
-                && let Err(reason) = web_do_focus_selector(desktop, native_id, selector).await
+                && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
             {
                 return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
             }
@@ -47600,14 +47857,14 @@ async fn web_surface_do_for(
             // field. Clearing EVERY box matters — a segmented component keeps
             // its own state per box, so clearing only the focused one leaves the
             // rest holding old digits, which is the observed merge.
-            let targets: Vec<String> = if !selectors.is_empty() {
+            let targets: Vec<WebElementRef> = if !selectors.is_empty() {
                 selectors.clone()
             } else {
                 selector.iter().cloned().collect()
             };
             let mut cleared = 0u32;
             for target in &targets {
-                if let Err(reason) = web_do_focus_selector(desktop, native_id, target).await {
+                if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
                     return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
                 }
                 if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
@@ -47618,7 +47875,7 @@ async fn web_surface_do_for(
             // Type into the FIRST box; a segmented component auto-advances focus
             // itself, and driving that is the point of using real keys.
             if let Some(first) = targets.first()
-                && let Err(reason) = web_do_focus_selector(desktop, native_id, first).await
+                && let Err(reason) = web_do_focus_ref(desktop, native_id, first).await
             {
                 return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
             }
@@ -47643,13 +47900,8 @@ async fn web_surface_do_for(
                     // string, so "I sent the keys" is not an answer — `matched`
                     // is. Compared by LENGTH and equality page-side so the
                     // secret never crosses back out (F4 redaction).
-                    let matched = web_do_verify_field_value(
-                        desktop,
-                        native_id,
-                        targets.first().map(String::as_str),
-                        &text,
-                    )
-                    .await;
+                    let matched =
+                        web_do_verify_field_value(desktop, native_id, targets.first(), &text).await;
                     Ok(json!({
                         "verb": "fill",
                         "chars": typed,
@@ -47704,6 +47956,155 @@ async fn web_surface_do_for(
 #[cfg(test)]
 mod web_do_verb_tests {
     use super::*;
+
+    fn resolved_info(overrides: Value) -> Value {
+        let mut base = json!({
+            "found": true,
+            "x": 120.0,
+            "y": 240.0,
+            "w": 80.0,
+            "h": 32.0,
+            "onTarget": true,
+            "visible": true,
+            "isConnected": true,
+            "cssPath": "#pay > button:nth-of-type(2)",
+            "tag": "BUTTON",
+        });
+        let (Some(base_obj), Some(over)) = (base.as_object_mut(), overrides.as_object()) else {
+            return base;
+        };
+        for (key, value) in over {
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base
+    }
+
+    // C4: every addressing shape must produce a matcher, and the CSS shape must
+    // still be the plain `querySelector` it always was — the two new shapes are
+    // additions to ONE matcher, not a second resolution path.
+    #[test]
+    fn every_addressing_shape_compiles_to_one_matcher() {
+        let css = web_element_ref_js(&WebElementRef::Css("#login".into()));
+        assert_eq!(css, "document.querySelector(\"#login\")");
+
+        let by_text = web_element_ref_js(&WebElementRef::Text {
+            text: "Proceed to Pay".into(),
+            exact: true,
+            tag: Some("button".into()),
+            nth: None,
+        });
+        // The wanted text is JSON-quoted (never string-concatenated), the pool
+        // is the caller's `tag`, and exactness reaches the page as a literal.
+        assert!(by_text.contains("\"Proceed to Pay\""), "{by_text}");
+        assert!(
+            by_text.contains("querySelectorAll(\"button\")"),
+            "{by_text}"
+        );
+        assert!(by_text.contains("exact=true"), "{by_text}");
+        // Innermost-wins is what stops a substring match selecting <body>.
+        assert!(by_text.contains("contains(out[k])"), "{by_text}");
+
+        let by_role = web_element_ref_js(&WebElementRef::Role {
+            role: "BUTTON".into(),
+            label: "Continue".into(),
+            nth: Some(2),
+        });
+        // Roles are compared lower-case, so `--role BUTTON` and `--role button`
+        // are the same question.
+        assert!(by_role.contains("var want=\"button\""), "{by_role}");
+        assert!(by_role.contains("nth=2"), "{by_role}");
+        // Exact labels are preferred over substring ones, deterministically.
+        assert!(by_role.contains("ex.length?ex:part"), "{by_role}");
+    }
+
+    // A quote in the text must not be able to close the string and inject JS.
+    #[test]
+    fn matcher_quotes_page_supplied_text_instead_of_concatenating_it() {
+        let js = web_element_ref_js(&WebElementRef::Text {
+            text: "\"); alert(1); //".into(),
+            exact: false,
+            tag: None,
+            nth: None,
+        });
+        assert!(!js.contains("alert(1); //\"),"), "{js}");
+        assert!(js.contains("\\\"); alert(1); //"), "{js}");
+    }
+
+    // The template composer must substitute BOTH placeholders — a leftover
+    // `__YGG_REF__` would be a syntax error in the page, which is the sort of
+    // failure that reads as "the site refused us".
+    #[test]
+    fn script_composition_leaves_no_placeholders() {
+        let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, &WebElementRef::Css("#a".into()));
+        assert!(!script.contains("__YGG_REF__"), "{script}");
+        assert!(!script.contains("__YGG_PATH_FN__"), "{script}");
+        assert!(script.contains("__yggPath"), "{script}");
+        let focus = web_do_script_for_ref(WEB_DO_FOCUS_JS, &WebElementRef::Css("#a".into()));
+        assert!(!focus.contains("__YGG_REF__"), "{focus}");
+    }
+
+    // N3: `accepted` (the injector ran), `resolved.*` (what the DOM said) and
+    // `delivered` (what the page observed) are three different questions. A
+    // successful click must now REPORT the middle one — before this, a click
+    // that resolved a detached node reported plain success.
+    #[test]
+    fn click_selector_success_reports_the_node_it_resolved() {
+        let target = WebElementRef::Text {
+            text: "Proceed to Pay".into(),
+            exact: false,
+            tag: None,
+            nth: None,
+        };
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})))
+            .expect("a live, visible, on-target node resolves");
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+
+        assert_eq!(detail["verb"], json!("click_selector"));
+        assert_eq!(detail["resolved"]["is_connected"], json!(true));
+        assert_eq!(detail["resolved"]["on_target"], json!(true));
+        assert_eq!(
+            detail["resolved"]["css_path"],
+            json!("#pay > button:nth-of-type(2)")
+        );
+        assert_eq!(detail["resolved"]["tag"], json!("BUTTON"));
+        // A non-degenerate box, expressed as the element's own rect (the click
+        // point is its centre).
+        assert_eq!(detail["resolved"]["rect"], json!([80.0, 224.0, 80.0, 32.0]));
+        assert_eq!(detail["target"], json!("text~:Proceed to Pay"));
+    }
+
+    // A CSS target must serialize back onto the wire EXACTLY as it always did —
+    // a bare string — so an existing caller reading `.selector` is unaffected.
+    #[test]
+    fn a_css_target_still_reports_as_a_bare_string() {
+        let target = WebElementRef::Css("#submit".into());
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({}))).unwrap();
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+        assert_eq!(detail["selector"], json!("#submit"));
+    }
+
+    // N3's real point: a node that resolved but is NOT in the document must be
+    // refused, not clicked. A React re-render drops agent-injected ids, so a
+    // selector can genuinely resolve to a corpse.
+    #[test]
+    fn a_detached_node_is_refused_rather_than_clicked() {
+        let target = WebElementRef::Css("#otp".into());
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"isConnected": false})))
+            .expect_err("a detached node must refuse");
+        assert!(err.starts_with("detached_node"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"visible": false})))
+            .expect_err("a zero-size element must refuse");
+        assert!(err.contains("zero-size"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"onTarget": false})))
+            .expect_err("an occluded/moved target must refuse");
+        assert!(err.starts_with("target_moved"), "{err}");
+
+        let err = web_do_resolved_from_info(&target, &json!({"found": false}))
+            .expect_err("no match must refuse");
+        assert!(err.contains("no element matches css:#otp"), "{err}");
+    }
 
     // Delivery is an OBSERVATION with three honest answers. A dropped event
     // must read `NotDelivered`, and a page that navigated under us must read
