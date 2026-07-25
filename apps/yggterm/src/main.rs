@@ -1113,6 +1113,9 @@ fn print_server_app_help() {
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
+  yggterm server app update <check|restart> [--force]
+    restart REFUSES while an agent web-surface lease is live (agent_lease_active);
+    pre-flight with `server app state | jq .agent_leases`
   yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
@@ -2385,6 +2388,7 @@ fn main() -> Result<()> {
                     run_app_control_close_window_preserving_sessions(
                         timeout_ms,
                         Some("manual-preserve-close".to_string()),
+                        args.iter().any(|arg| arg == "--force"),
                     )
                 } else {
                     run_app_control_close_window(timeout_ms)
@@ -2540,7 +2544,13 @@ fn main() -> Result<()> {
                     .unwrap_or("check");
                 match action {
                     "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
-                    "restart" => run_app_control_restart_pending_update(timeout_ms),
+                    // N5: refuses while an agent holds a live web-surface
+                    // lease — a deploy that lands mid-flow kills the flow.
+                    // `--force` says you mean it.
+                    "restart" => run_app_control_restart_pending_update(
+                        args.iter().any(|arg| arg == "--force"),
+                        timeout_ms,
+                    ),
                     other => anyhow::bail!("unsupported app update action: {other}"),
                 }
             }
@@ -4741,6 +4751,9 @@ fn terminate_superseded_client_pid(pid: u32) -> bool {
 fn superseded_client_close_command() -> yggterm_server::AppControlCommand {
     yggterm_server::AppControlCommand::CloseWindowPreservingSessions {
         reason: Some("superseded-client-handoff".to_string()),
+        // A client handoff is not a deploy: the superseding client is already
+        // taking the window, so an agent lease must not block it.
+        force: true,
     }
 }
 
