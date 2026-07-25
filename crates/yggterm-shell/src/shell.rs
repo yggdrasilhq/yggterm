@@ -5230,15 +5230,51 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
     ssh_target: Option<String>,
 ) -> bool {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    let declares = terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home)
-        .await
-        .map(|(records, _running)| records)
-        .unwrap_or_default();
+    // A FAILED fetch and an EMPTY answer are different facts, and collapsing
+    // them with `unwrap_or_default()` is what made this path fail invisibly:
+    // when the session's PTY is held by a PRESERVED owner (a predecessor daemon
+    // that has not drained), the successor proxies the request to that owner —
+    // and an owner older than 2.12.10 cannot even deserialize
+    // `TerminalAppDeclares`, so it writes nothing and the proxy surfaces
+    // `parsing daemon response: ""`. Swallowed, that read exactly like "this app
+    // never declared": no rail, no error, nothing in the trace to look at.
+    let declares = match terminal_app_declares_async(
+        endpoint,
+        session_path.to_string(),
+        &trace_home,
+    )
+    .await
+    {
+        Ok((records, _running)) => records,
+        Err(error) => {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_unavailable",
+                json!({
+                    "session_path": session_path,
+                    "error": error.to_string(),
+                }),
+            );
+            return false;
+        }
+    };
     let now_ms = current_millis();
     let Some(record) = declares
         .into_iter()
         .find(|record| record.verb == "sidebar" && record.action == "declare")
     else {
+        // Reached the owner and it genuinely holds no sidebar declare — a
+        // different answer from the error above, and traced as such so the two
+        // can never again look identical from the outside.
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "app_declare",
+            "daemon_declare_absent",
+            json!({ "session_path": session_path }),
+        );
         return false;
     };
     // Decoded by the SAME parser the live OSC path uses — see
@@ -5528,10 +5564,31 @@ async fn rebuild_web_surface_from_daemon_declare(
     session_path: &str,
 ) -> bool {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    let declares = terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home)
-        .await
-        .map(|(records, _running)| records)
-        .unwrap_or_default();
+    // Same distinction as the sidebar twin above: a fetch that FAILED is not an
+    // app that never declared. See `daemon_declare_unavailable` there.
+    let declares = match terminal_app_declares_async(
+        endpoint,
+        session_path.to_string(),
+        &trace_home,
+    )
+    .await
+    {
+        Ok((records, _running)) => records,
+        Err(error) => {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_unavailable",
+                json!({
+                    "session_path": session_path,
+                    "verb": "web-surface",
+                    "error": error.to_string(),
+                }),
+            );
+            return false;
+        }
+    };
     let now_ms = current_millis();
     let Some((record, open)) = declares
         .into_iter()
