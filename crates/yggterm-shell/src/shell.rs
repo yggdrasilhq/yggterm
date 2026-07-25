@@ -27744,9 +27744,7 @@ fn copy_generation_target_for_session(
     };
     let remote_context = scanned_remote
         .as_ref()
-        .and_then(|remote| {
-            (!remote.recent_context.trim().is_empty()).then(|| remote.recent_context.clone())
-        })
+        .and_then(usable_scanned_session_context)
         .or_else(|| remote_scanned_session_context(server, &session.session_path));
     let storage_path = scanned_remote
         .as_ref()
@@ -27791,8 +27789,7 @@ fn copy_generation_target_for_browser_row(
                 .unwrap_or_else(|| remote.cwd.clone()),
             title: row.label.clone(),
             source_updated_at: remote_session_updated_at(&remote),
-            remote_context: (!remote.recent_context.trim().is_empty())
-                .then(|| remote.recent_context.clone()),
+            remote_context: usable_scanned_session_context(&remote),
             remote_machine: Some(machine.routing_ref()),
             cached_summary: remote.cached_summary.clone(),
             storage_path: (!remote.storage_path.trim().is_empty())
@@ -29176,16 +29173,8 @@ fn hydrate_remote_copy_job_context(
     if target.remote_context.is_some() {
         return job;
     }
-    target.remote_context = remote_machines.iter().find_map(|machine| {
-        machine
-            .sessions
-            .iter()
-            .find(|session| session.session_path == target.session_path)
-            .and_then(|session| {
-                (!session.recent_context.trim().is_empty())
-                    .then(|| session.recent_context.clone())
-            })
-    });
+    target.remote_context =
+        remote_scanned_session_context_from_machines(remote_machines, &target.session_path);
     job
 }
 fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
@@ -29294,15 +29283,33 @@ fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
     });
 }
 fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) -> Option<String> {
-    server.remote_machines().iter().find_map(|machine| {
+    remote_scanned_session_context_from_machines(server.remote_machines(), session_path)
+}
+/// Find the scanned excerpt for one session across a slice of machines, owned
+/// in ONE place. Both the server-borrowing caller above and the
+/// slice-borrowing hydration in `hydrate_remote_copy_job_context` land here,
+/// exactly as `remote_generated_copy` / `remote_generated_copy_from_machines`
+/// do — a second copy of this walk is a second answer to "which excerpt does
+/// this session have" that can drift from the first.
+fn remote_scanned_session_context_from_machines(
+    remote_machines: &[RemoteMachineSnapshot],
+    session_path: &str,
+) -> Option<String> {
+    remote_machines.iter().find_map(|machine| {
         machine
             .sessions
             .iter()
             .find(|session| session.session_path == session_path)
-            .and_then(|session| {
-                (!session.recent_context.trim().is_empty()).then(|| session.recent_context.clone())
-            })
+            .and_then(usable_scanned_session_context)
     })
+}
+/// What counts as a USABLE scanned excerpt: a `recent_context` that is not
+/// blank. The one owner of that rule — the walk above, both
+/// `CopyGenerationTarget` builders, and the copy-job hydration all ask here,
+/// so "usable" cannot come to mean something slightly different in one of
+/// them.
+fn usable_scanned_session_context(session: &RemoteScannedSession) -> Option<String> {
+    (!session.recent_context.trim().is_empty()).then(|| session.recent_context.clone())
 }
 fn remote_generated_copy(
     server: &YggtermServer,
@@ -116834,6 +116841,82 @@ mod tests {
         assert_eq!(
             target.remote_context.as_deref(),
             Some("live preview context")
+        );
+    }
+    /// One owner for "which scanned excerpt does this session have". The
+    /// server-borrowing reader and the slice-borrowing copy-job hydration must
+    /// answer identically for EVERY session, including the blank one — two
+    /// copies of the walk are two answers that can drift.
+    #[test]
+    fn scanned_context_reader_and_copy_job_hydration_agree_session_for_session() {
+        let machine = copy_scan_test_machine();
+        let machines = std::slice::from_ref(&machine);
+        let targets = remote_copy_targets_for_machines(machines);
+        assert_eq!(targets.len(), 3, "fixture covers blank and non-blank");
+
+        for target in targets {
+            let session_path = target.session_path.clone();
+            let job = hydrate_remote_copy_job_context(BackgroundCopyJob::Title(target), machines);
+            let BackgroundCopyJob::Title(hydrated) = job else {
+                panic!("title job should stay a title job");
+            };
+            assert_eq!(
+                hydrated.remote_context,
+                remote_scanned_session_context_from_machines(machines, &session_path),
+                "hydration and the reader disagree about {session_path}"
+            );
+        }
+    }
+    /// Lifting an owned excerpt out of a scanned record — "is it usable, and
+    /// if so give me a copy" — happens EXACTLY once, in
+    /// `usable_scanned_session_context`. Four callers ask it: the machine
+    /// walk, both `CopyGenerationTarget` builders and the copy-job hydration.
+    /// A second inline spelling is a second answer to "usable".
+    ///
+    /// Deliberately NOT covered: the live-over-scanned field merge in
+    /// `merge_remote_live_sessions` guards `title_hint`, `cwd`,
+    /// `storage_path` and `started_at` the same way. That is a merge rule
+    /// ("do not overwrite with a blank"), not the excerpt rule, and it never
+    /// produces an owned excerpt — folding the two together would be the
+    /// second encoding, not the fix.
+    #[test]
+    fn lifting_a_usable_scanned_excerpt_is_spelled_exactly_once() {
+        let source = include_str!("shell.rs");
+        // Assembled at runtime so this test's own body is never a match.
+        let lift = format!("recent_context.{}", "clone()");
+        assert!(
+            source.contains("fn usable_scanned_session_context("),
+            "coverage floor: the owner of the rule must exist"
+        );
+        assert_eq!(
+            source.matches(lift.as_str()).count(),
+            1,
+            "the blank-excerpt rule must live only in usable_scanned_session_context"
+        );
+    }
+    /// The copy-job hydration must DELEGATE the machine walk, the way
+    /// `remote_generated_copy` delegates to `remote_generated_copy_from_machines`.
+    #[test]
+    fn copy_job_hydration_delegates_the_machine_walk() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn hydrate_remote_copy_job_context(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("hydrate_remote_copy_job_context should be present");
+        // Coverage floor: a split that matched nothing makes the rest vacuous.
+        assert!(
+            body.contains("BackgroundCopyJob::Title(target)") && body.len() > 200,
+            "scanner did not capture the hydration body ({} bytes)",
+            body.len()
+        );
+        assert!(
+            body.contains("remote_scanned_session_context_from_machines("),
+            "hydration must ask the one owner of the walk"
+        );
+        assert!(
+            !body.contains(".sessions"),
+            "hydration re-walking the machines is a second encoding of the same lookup"
         );
     }
     #[test]
