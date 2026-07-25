@@ -7,9 +7,40 @@ fix) once the fix is verified live on guihost.
 ## Standing traps / other open bugs
 
 - **★★★ WE FORCE SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL — THE
-  SINGLE LARGEST CPU ITEM IN THE PRODUCT (root-caused + measured 2026-07-25;
-  ⚠ CODE FIX COMMITTED, NOT DEPLOYED AND NOT LIVE-PROVEN — this entry stays
-  until it is).**
+  SINGLE LARGEST CPU ITEM IN THE PRODUCT. ✅ FIXED, DEPLOYED AND LIVE-PROVEN
+  2026-07-26 (GUI-only swap, daemon 1152900 untouched). Keep this entry until
+  a sustained re-measure lands (see the honest caveat at the end), then delete.**
+  **The live proof, on the GUI host, before → after the swap:**
+  | | before (GUI 1151877) | after (GUI 1419187) |
+  |---|---|---|
+  | DRM render-node fds held | **0** | **7** (GUI 3, web content 4, `amdgpu`) |
+  | GPU engine time accumulated | **0 ns** | GUI 335 ms, web content 698 ms |
+  | VRAM allocated | — | 268 MB (`drm-total-vram`) |
+  | idle CPU, whole tree | **0.449 cores** | **0.065 cores** |
+  | published policy | — | `YGGTERM_WEBKIT_GL_POLICY: hardware_gl_probed` |
+  **The structural half is the part that cannot be argued with**: llvmpipe never
+  opens a DRM node, so 0 fds → 7 fds on `/dev/dri/renderD128` with
+  `drm-driver: amdgpu` IS the fix working. It is also NOT cheap-because-broken —
+  a faithful screenshot right after the swap shows the active session painting
+  cleanly at 168×63 with the full sidebar and rail.
+  ⚠ **Be honest about the CPU number.** 0.449 → 0.065 is a same-host, same-daemon,
+  both-idle comparison, but the new GUI was minutes old with ONE terminal host
+  mounted while the old one had been up 5.5 h. Some of that drop is a fresh
+  process, not the GPU. Re-measure after the GUI has been up for hours before
+  quoting 7x as the steady-state figure.
+  ⚠ **`YGGTERM_WEB_SURFACE_UNDER_GLASS=1` is now armed in production for the
+  first time** (it follows from hardware GL). Under-glass previously crash-looped
+  this host under llvmpipe, which is a different premise — but watch
+  `coredumpctl`. `YGGTERM_FORCE_SOFTWARE_GL=1` restores the old behaviour whole.
+  ⚠ **The GPU gauge needs the client dedup.** `drm-engine-*` counters are
+  per-DRM-CLIENT, and duplicated fds each report the same cumulative value, so a
+  naive per-fd sum over-counts by the fd count (measured 5.00x on Xorg, 4.00x on
+  a compositor). `render_probe` dedups on `drm-client-id`; anything hand-rolled
+  must too.
+  ⚠ **Zero engine time in a window means IDLE, not software.** The first
+  post-swap read said "software rasterization" on a host that had just switched
+  to hardware, because nothing painted during it. Read the DRM-fd count FIRST —
+  that is structural — and engine time second.
   ⛔ **Do not read the FIX paragraph below as the shipped design; it is
   superseded.** What landed instead of the one-env-var workaround: the binary
   PROBES the host (`crates/yggterm-core/src/gl_probe.rs` — Surfaceless platform
