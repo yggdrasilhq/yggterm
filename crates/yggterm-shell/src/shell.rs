@@ -154,7 +154,8 @@ use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
-    SessionStore, SessionSummaryTimelineEntry, SplitAxis, SplitGroup, SplitMember,
+    SessionStore, SessionSummaryTimelineEntry, SessionTitleResolver, SplitAxis, SplitGroup,
+    SplitMember,
     SplitMemberView, TerminalTelemetryEvent,
     WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_perf_event,
@@ -180,7 +181,8 @@ use yggterm_server::{
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ScreenshotTarget,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
-    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+    RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
+    RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WebSurfaceDoAction, WebSurfaceReadAs,
@@ -7450,7 +7452,19 @@ struct CopyGenerationTarget {
     title: String,
     source_updated_at: Option<OffsetDateTime>,
     remote_context: Option<String>,
-    remote_machine: Option<RemoteMachineSnapshot>,
+    /// Routing only — deliberately NOT the whole `RemoteMachineSnapshot`. The
+    /// copy scan builds one target per scanned session, and carrying the
+    /// machine's session list here deep-copied every session on the machine
+    /// into every target (measured: 1.75 MB x 644 targets per scan on the live
+    /// host). The one thing the scan read out of that list now rides
+    /// `cached_summary` below, copied from the session the target IS.
+    remote_machine: Option<RemoteMachineRef>,
+    /// The summary the remote host already generated for THIS session, copied
+    /// at target construction from the same record that gave us
+    /// `session_path`. Read it from anywhere else and a target can end up
+    /// paired with another session's summary, which decides "summary missing"
+    /// wrongly and burns an LLM call.
+    cached_summary: Option<String>,
     storage_path: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27655,7 +27669,10 @@ fn copy_generation_target_for_session(
         title: session.title.clone(),
         source_updated_at: source_updated_at_for_session(server, session),
         remote_context: remote_context.or(preview_context),
-        remote_machine,
+        remote_machine: remote_machine.map(RemoteMachineSnapshot::routing_ref),
+        cached_summary: scanned_remote
+            .as_ref()
+            .and_then(|remote| remote.cached_summary.clone()),
         storage_path: (!storage_path.trim().is_empty()).then_some(storage_path),
     })
 }
@@ -27685,7 +27702,8 @@ fn copy_generation_target_for_browser_row(
             source_updated_at: remote_session_updated_at(&remote),
             remote_context: (!remote.recent_context.trim().is_empty())
                 .then(|| remote.recent_context.clone()),
-            remote_machine: Some(machine),
+            remote_machine: Some(machine.routing_ref()),
+            cached_summary: remote.cached_summary.clone(),
             storage_path: (!remote.storage_path.trim().is_empty())
                 .then(|| remote.storage_path.clone()),
         });
@@ -27706,6 +27724,7 @@ fn copy_generation_target_for_browser_row(
         source_updated_at: local_session_updated_at(&row.full_path),
         remote_context: None,
         remote_machine: None,
+        cached_summary: None,
         storage_path: Some(row.full_path.clone()),
     })
 }
@@ -28898,8 +28917,12 @@ fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static s
         None => false,
     }
 }
+/// Takes the OPEN resolver, never a `SessionStore`. Through the store's
+/// one-shot wrappers each of the three reads below opened its own sqlite
+/// connection and re-ran the schema batch, so a scan over every scanned
+/// session on every machine paid three connection opens per target.
 fn background_copy_job_for_target(
-    store: &SessionStore,
+    resolver: &SessionTitleResolver,
     target: &CopyGenerationTarget,
     copy_retry_after_ms: &HashMap<String, u64>,
     passive_copy_failures: &HashSet<String>,
@@ -28907,8 +28930,8 @@ fn background_copy_job_for_target(
     generated_summaries: &BTreeMap<String, String>,
     now: u64,
 ) -> Option<BackgroundCopyJob> {
-    let stored_title = store
-        .resolve_title_for_session_id(&target.session_id)
+    let stored_title = resolver
+        .resolve_for_session(&target.session_id)
         .ok()
         .flatten();
     let in_memory_title = session_title_overrides
@@ -28931,28 +28954,22 @@ fn background_copy_job_for_target(
     let in_memory_summary = generated_summaries
         .get(&target.session_path)
         .filter(|summary| !memoized_low_signal_generated_copy(summary));
-    let stored_summary = store
-        .resolve_summary_for_session_id(&target.session_id)
+    let stored_summary = resolver
+        .resolve_summary_for_session(&target.session_id)
         .ok()
         .flatten();
     let summary_needs_refresh = target
         .source_updated_at
         .and_then(|updated_at| {
-            store
-                .summary_needs_refresh_for_session_id(&target.session_id, updated_at)
+            resolver
+                .summary_needs_refresh(&target.session_id, updated_at)
                 .ok()
         })
         .unwrap_or(stored_summary.is_none());
-    let cached_summary = target.remote_machine.as_ref().and_then(|machine| {
-        machine
-            .sessions
-            .iter()
-            .find(|session| session.session_path == target.session_path)
-            .and_then(|session| session.cached_summary.clone())
-    });
     let summary_missing = in_memory_summary.is_none()
         && summary_needs_refresh
-        && cached_summary
+        && target
+            .cached_summary
             .as_deref()
             .is_none_or(memoized_low_signal_generated_copy);
     if summary_missing
@@ -28968,6 +28985,43 @@ fn background_copy_job_for_target(
     }
     None
 }
+/// One copy target per scanned remote session. Pure so the pairing can be
+/// asserted: every target must carry ITS OWN session's `cached_summary`, and
+/// a target that got another session's would decide "summary missing" wrongly
+/// and spend an LLM call proving it.
+fn remote_copy_targets_for_machines(
+    remote_machines: &[RemoteMachineSnapshot],
+) -> Vec<CopyGenerationTarget> {
+    let mut targets = Vec::new();
+    for machine in remote_machines {
+        // Hoisted out of the session loop: `routing_ref` drops the session
+        // list, so each target clones a few short strings instead of the whole
+        // machine. The daemon's `collect_remote_copy_candidates` has had this
+        // shape for a while; the shell never got it, and paid ~1.1 GB of
+        // allocation per scan for the difference.
+        let machine_ref = machine.routing_ref();
+        for session in &machine.sessions {
+            targets.push(CopyGenerationTarget {
+                session_path: session.session_path.clone(),
+                session_id: session.session_id.clone(),
+                cwd: session.cwd.clone(),
+                title: session.title_hint.clone(),
+                source_updated_at: remote_session_updated_at(session),
+                // Left empty on purpose and hydrated for the ONE winning job
+                // by `hydrate_remote_copy_job_context`: only the selected
+                // target's context is ever read, and copying every session's
+                // transcript excerpt into a throwaway target cost another
+                // megabyte per scan.
+                remote_context: None,
+                remote_machine: Some(machine_ref.clone()),
+                cached_summary: session.cached_summary.clone(),
+                storage_path: (!session.storage_path.trim().is_empty())
+                    .then(|| session.storage_path.clone()),
+            });
+        }
+    }
+    targets
+}
 fn next_background_copy_job(
     _settings: &AppSettings,
     _local_root: &SessionNode,
@@ -28980,27 +29034,13 @@ fn next_background_copy_job(
     generated_summaries: &BTreeMap<String, String>,
 ) -> Option<BackgroundCopyJob> {
     let store = SessionStore::open_or_init().ok()?;
+    let resolver = store.generated_copy_resolver().ok()?;
     let mut targets = live_targets;
-    for machine in remote_machines {
-        for session in &machine.sessions {
-            targets.push(CopyGenerationTarget {
-                session_path: session.session_path.clone(),
-                session_id: session.session_id.clone(),
-                cwd: session.cwd.clone(),
-                title: session.title_hint.clone(),
-                source_updated_at: remote_session_updated_at(session),
-                remote_context: (!session.recent_context.trim().is_empty())
-                    .then(|| session.recent_context.clone()),
-                remote_machine: Some(machine.clone()),
-                storage_path: (!session.storage_path.trim().is_empty())
-                    .then(|| session.storage_path.clone()),
-            });
-        }
-    }
+    targets.extend(remote_copy_targets_for_machines(remote_machines));
     let now = current_millis();
     if let Some(active_target) = active_target
         && let Some(job) = background_copy_job_for_target(
-            &store,
+            &resolver,
             &active_target,
             copy_retry_after_ms,
             passive_copy_failures,
@@ -29009,11 +29049,11 @@ fn next_background_copy_job(
             now,
         )
     {
-        return Some(job);
+        return Some(hydrate_remote_copy_job_context(job, remote_machines));
     }
     for target in targets {
         if let Some(job) = background_copy_job_for_target(
-            &store,
+            &resolver,
             &target,
             copy_retry_after_ms,
             passive_copy_failures,
@@ -29021,10 +29061,41 @@ fn next_background_copy_job(
             generated_summaries,
             now,
         ) {
-            return Some(job);
+            return Some(hydrate_remote_copy_job_context(job, remote_machines));
         }
     }
     None
+}
+/// Fill in the transcript excerpt for the ONE job the scan selected, from the
+/// same `remote_machines` slice the targets were built from (so the context
+/// and the routing can't come from different reads of remote state).
+///
+/// A target that already carries a context keeps it: live-session targets are
+/// built with a preview context that is NOT in the scanned record, and
+/// clobbering it here would send the generator to ssh for something it already
+/// had.
+fn hydrate_remote_copy_job_context(
+    job: BackgroundCopyJob,
+    remote_machines: &[RemoteMachineSnapshot],
+) -> BackgroundCopyJob {
+    let mut job = job;
+    let target = match &mut job {
+        BackgroundCopyJob::Title(target) | BackgroundCopyJob::Summary(target) => target,
+    };
+    if target.remote_context.is_some() {
+        return job;
+    }
+    target.remote_context = remote_machines.iter().find_map(|machine| {
+        machine
+            .sessions
+            .iter()
+            .find(|session| session.session_path == target.session_path)
+            .and_then(|session| {
+                (!session.recent_context.trim().is_empty())
+                    .then(|| session.recent_context.clone())
+            })
+    });
+    job
 }
 fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
     if !implicit_copy_generation_enabled() {
@@ -32525,16 +32596,19 @@ fn parse_preview_timestamp(raw: &str) -> Option<OffsetDateTime> {
             .ok()
         })
 }
-fn remote_machine_for_session_path(
-    server: &YggtermServer,
+/// Borrows, never clones: every caller either reads a routing field or looks
+/// the session back up in `machine.sessions`, and a clone here copied the
+/// whole scanned machine (1.75 MB on the live host) once per call — including
+/// once per live session inside the copy scan's read block.
+fn remote_machine_for_session_path<'a>(
+    server: &'a YggtermServer,
     session_path: &str,
-) -> Option<RemoteMachineSnapshot> {
-    server.remote_machines().iter().find_map(|machine| {
+) -> Option<&'a RemoteMachineSnapshot> {
+    server.remote_machines().iter().find(|machine| {
         machine
             .sessions
             .iter()
             .any(|session| session.session_path == session_path)
-            .then(|| machine.clone())
     })
 }
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
@@ -34633,6 +34707,7 @@ fn enrich_sidebar_rows_with_live_titles(
                 source_updated_at: None,
                 remote_context: None,
                 remote_machine: None,
+                cached_summary: None,
                 storage_path: None,
             })
         {
@@ -34703,6 +34778,7 @@ fn enrich_sidebar_rows_with_live_titles(
                 source_updated_at: None,
                 remote_context: None,
                 remote_machine: None,
+                cached_summary: None,
                 storage_path: None,
             }) {
                 title = recovered_title;
@@ -116489,6 +116565,175 @@ mod tests {
         let label = live_session_label(&remote_machines, &session, &HashMap::new());
         assert_eq!(label, "Stabilize daemon resume path");
     }
+    fn copy_scan_test_machine() -> RemoteMachineSnapshot {
+        let session = |id: &str, cached_summary: Option<&str>, context: &str| RemoteScannedSession {
+            session_path: format!("remote-session://guihost/{id}"),
+            session_id: id.to_string(),
+            cwd: format!("/home/user/{id}"),
+            started_at: "2026-04-01T00:00:00Z".to_string(),
+            modified_epoch: 1,
+            event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
+            title_hint: format!("/home/user/{id}"),
+            recent_context: context.to_string(),
+            cached_precis: None,
+            cached_summary: cached_summary.map(ToOwned::to_owned),
+            live_runtime: false,
+            storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
+        };
+        RemoteMachineSnapshot {
+            machine_key: "guihost".to_string(),
+            label: "guihost".to_string(),
+            ssh_target: "guihost".to_string(),
+            prefix: Some("sudo -u pi".to_string()),
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![
+                session("one", Some("summary one"), "USER: one"),
+                session("two", None, "USER: two"),
+                session("three", Some("summary three"), ""),
+            ],
+        }
+    }
+    #[test]
+    fn remote_copy_targets_pair_each_session_with_its_own_cached_summary() {
+        let machine = copy_scan_test_machine();
+        let targets = remote_copy_targets_for_machines(std::slice::from_ref(&machine));
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].cached_summary.as_deref(), Some("summary one"));
+        assert_eq!(
+            targets[1].cached_summary, None,
+            "a session with no cached summary must not inherit its neighbour's"
+        );
+        assert_eq!(targets[2].cached_summary.as_deref(), Some("summary three"));
+        for target in &targets {
+            assert_eq!(
+                target.remote_machine.as_ref(),
+                Some(&machine.routing_ref()),
+                "targets carry routing only"
+            );
+            assert_eq!(
+                target.remote_context, None,
+                "the transcript excerpt rides the selected job, not every target"
+            );
+        }
+    }
+    #[test]
+    fn selected_copy_job_hydrates_the_context_of_its_own_session() {
+        let machine = copy_scan_test_machine();
+        let targets = remote_copy_targets_for_machines(std::slice::from_ref(&machine));
+
+        let job = hydrate_remote_copy_job_context(
+            BackgroundCopyJob::Title(targets[1].clone()),
+            std::slice::from_ref(&machine),
+        );
+        let BackgroundCopyJob::Title(target) = job else {
+            panic!("title job should stay a title job");
+        };
+        assert_eq!(target.session_path, "remote-session://guihost/two");
+        assert_eq!(
+            target.remote_context.as_deref(),
+            Some("USER: two"),
+            "without this the generator re-fetches the excerpt over ssh"
+        );
+
+        let blank = hydrate_remote_copy_job_context(
+            BackgroundCopyJob::Summary(targets[2].clone()),
+            std::slice::from_ref(&machine),
+        );
+        let BackgroundCopyJob::Summary(target) = blank else {
+            panic!("summary job should stay a summary job");
+        };
+        assert_eq!(
+            target.remote_context, None,
+            "an empty scanned excerpt stays empty rather than borrowing one"
+        );
+    }
+    #[test]
+    fn hydrating_a_copy_job_keeps_a_context_the_target_already_had() {
+        let machine = copy_scan_test_machine();
+        let mut target = remote_copy_targets_for_machines(std::slice::from_ref(&machine))
+            .remove(0);
+        // Live-session targets carry a preview context that is NOT in the
+        // scanned record; clobbering it here would throw away the only copy.
+        target.remote_context = Some("live preview context".to_string());
+
+        let job = hydrate_remote_copy_job_context(
+            BackgroundCopyJob::Title(target),
+            std::slice::from_ref(&machine),
+        );
+        let BackgroundCopyJob::Title(target) = job else {
+            panic!("title job should stay a title job");
+        };
+        assert_eq!(
+            target.remote_context.as_deref(),
+            Some("live preview context")
+        );
+    }
+    #[test]
+    fn copy_scan_target_building_never_clones_a_whole_remote_machine() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn remote_copy_targets_for_machines(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("remote_copy_targets_for_machines should be present");
+        // Coverage floor: a split that silently matched nothing would make
+        // every assertion below vacuously true (the blind-scanner lesson from
+        // harness phase 1b).
+        assert!(
+            body.contains("CopyGenerationTarget {") && body.len() > 400,
+            "scanner did not capture the target-building body ({} bytes)",
+            body.len()
+        );
+        assert!(
+            !body.contains("machine.clone()"),
+            "one deep copy of the machine per scanned session is the copy_scan headline cost"
+        );
+        assert!(body.contains("machine.routing_ref()"));
+    }
+    #[test]
+    fn background_copy_job_scan_opens_one_title_store_for_the_whole_sweep() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-copy-scan-resolver-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let machine = copy_scan_test_machine();
+        let mut targets = Vec::new();
+        for _ in 0..64 {
+            targets.extend(remote_copy_targets_for_machines(std::slice::from_ref(
+                &machine,
+            )));
+        }
+
+        let resolver = SessionTitleResolver::new(&home).expect("open resolver");
+        let opens_before = yggterm_core::session_title_store_open_count();
+        for target in &targets {
+            let _ = background_copy_job_for_target(
+                &resolver,
+                target,
+                &HashMap::new(),
+                &HashSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                0,
+            );
+        }
+        let opens = yggterm_core::session_title_store_open_count() - opens_before;
+
+        assert_eq!(
+            opens, 0,
+            "{} targets must reuse the one open resolver; each store wrapper opens a \
+             fresh sqlite connection AND re-runs the schema batch",
+            targets.len()
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
     #[test]
     fn remote_generation_fetch_gate_requires_machine_and_storage() {
         let mut target = CopyGenerationTarget {
@@ -116499,10 +116744,11 @@ mod tests {
             source_updated_at: None,
             remote_context: None,
             remote_machine: None,
+            cached_summary: None,
             storage_path: None,
         };
         assert!(!target_can_fetch_remote_generation_context(&target));
-        target.remote_machine = Some(RemoteMachineSnapshot {
+        target.remote_machine = Some(RemoteMachineRef {
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -116510,7 +116756,6 @@ mod tests {
             remote_binary_expr: None,
             remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
-            sessions: vec![],
         });
         assert!(!target_can_fetch_remote_generation_context(&target));
         target.storage_path = Some("/home/user/.codex/sessions/foo.jsonl".to_string());
@@ -116525,7 +116770,7 @@ mod tests {
             title: "1".to_string(),
             source_updated_at: None,
             remote_context: Some("cached remote context".to_string()),
-            remote_machine: Some(RemoteMachineSnapshot {
+            remote_machine: Some(RemoteMachineRef {
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "definitely-not-a-real-host.invalid".to_string(),
@@ -116533,8 +116778,8 @@ mod tests {
                 remote_binary_expr: None,
                 remote_deploy_state: RemoteDeployState::Ready,
                 health: RemoteMachineHealth::Healthy,
-                sessions: vec![],
             }),
+            cached_summary: None,
             storage_path: Some("/home/user/.codex/sessions/foo.jsonl".to_string()),
         };
         let endpoint = ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-test.sock"));
@@ -138594,6 +138839,7 @@ Updated at   Branch  Conversation\n\
             source_updated_at: None,
             remote_context: None,
             remote_machine: None,
+            cached_summary: None,
             storage_path: None,
         };
         assert_eq!(
