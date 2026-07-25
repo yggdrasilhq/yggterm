@@ -13,12 +13,80 @@ improvement that is asserted rather than measured does not count.
 
 ## 1. The mechanism (why jojo burns)
 
+> ⛔ **CORRECTED 2026-07-25 — READ §1a FIRST. The paragraph below is true but it is
+> NOT the dominant term.** WebKit painting on the laptop is a real cost. But we were
+> also making that painting **4x to 22x more expensive than it needs to be**, by
+> forcing WebKit onto a software rasterizer on a host whose GPU works. Read §1a before
+> costing any workstream here — it changes what "move the render off jojo" is worth.
+
 The GUI lives on jojo. ychrome surfaces are native child webviews composited into the
 jojo viewport. So when an agent drives ychrome, **WebKit paints on the laptop**, at
 whatever rate the page asks for, whether or not a human is looking at it.
 
 That is the bug. The fix is not to throttle painting harder. Agent browsing should
 never have been on jojo at all.
+
+## 1a. We disabled the GPU ourselves (root cause, 2026-07-25)
+
+`configure_linux_webkit_compositing()` (`apps/yggterm/src/main.rs:4046-4053`) forces
+`LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe` + `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+unless `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` is set, on the stated premise that the GUI
+host's iGPU "exposes only llvmpipe". **That premise is false.** The EGL platform matrix on
+jojo:
+
+| EGL platform | renderer |
+|---|---|
+| GBM | `llvmpipe` |
+| **Wayland** | **AMD Radeon 780M (radeonsi, phoenix, ACO)** |
+| Surfaceless | AMD Radeon 780M |
+| Device | AMD Radeon 780M |
+
+Only GBM fails, and only because it probes `card0` and takes `EACCES` on
+`DRM_IOCTL_AMDGPU_INFO` while the compositor holds DRM master. Every ioctl on
+`/dev/dri/renderD128` succeeds. **One EACCES on the wrong node was generalized into
+"this host has no GPU."**
+
+Measured, same page and duration, CPU-seconds from `/proc` (never `ps %CPU`):
+
+| workload | soft GL + SHM (today) | hw GL + DMABUF | ratio |
+|---|---|---|---|
+| **WebGL glyph grid (= xterm.js 6's renderer)** | **151.56 s / 20 s = 756% of a core** | 6.85 s (34%) | **22x** |
+| CSS animation | 15.33 s (77%) | 4.12 s (21%) | 3.7x |
+| DOM/JS-heavy | 11.13 s (45%) | 6.44 s (26%) | 1.7x |
+| static idle page | 1.36 s (5.4%) | 0.96 s (3.8%) | 1.4x |
+
+**This explains the §3a baseline that §3a could not explain.** The 0.220 cores attributed
+to "the Dioxus shell repainting" and the 0.272 cores in one web process are the *same*
+phenomenon: xterm 6 removed the 2D canvas renderer, so the **terminal** paints through the
+WebGL addon, and under llvmpipe every frame is rasterized on CPU across 16 threads. The
+idle floor is not chrome being wasteful — it is the GPU being switched off.
+
+Three consequences for this pass:
+
+1. **The floor has a one-line fix that no workstream here proposed.** Setting
+   `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` unlocks all three gates at once (launcher stops
+   exporting `WEBKIT_DISABLE_COMPOSITING_MODE=1`; the GL net is skipped; under-glass arms,
+   clearing the SHM force). Do this before costing WS2, which is a large architectural
+   move justified partly by a number this changes.
+2. ⚠⚠ **The three settings are ONE decision — do not split them.** Hardware GL + SHM
+   measured 15.82 s (no better than software); software GL + DMABUF measured **34.14 s,
+   the worst of the four**. The guard's logic was right; only its premise was wrong.
+3. **The real fix is to stop hard-coding the premise.** Probe the Wayland/Surfaceless EGL
+   platform at startup and choose from what the host reports, rather than defaulting to the
+   slowest configuration and requiring an opt-out that nobody knew to set. `render_probe`
+   is the natural owner, and it closes the same instrument gap WS1 exists for.
+
+⚠ The safety net is also not buying its stated benefit: 26 GUI coredumps in 10 days (still
+crashing 2026-07-25), **24 with zero GL/Mesa/EGL frames**; the one genuine WebKit SEGV is in
+JavaScriptCore GC. Verify any claimed win with `drm-engine-gfx` in `/proc/<webproc>/fdinfo/*`
+(nonzero ⇒ the GPU really is rasterizing) plus a CPU-seconds delta.
+
+**Secondary, same file:** `configure_linux_webkit_memory_policy()` sets
+`CacheModel::DocumentViewer` (WebKit's most cache-shedding mode, meant for a single-document
+viewer) and a 320 MB `MemoryPressureSettings` cap — conservative 0.33 ≈ 105 MB, strict
+0.50 ≈ 160 MB. Live web processes run 400-650 MB, i.e. permanently past "strict", so they
+GC-thrash by construction. For a daily-driver browser the browser-shaped setting is
+`web-browser`. Not yet measured in isolation; worth a number before changing.
 
 ### The line this pass draws
 
