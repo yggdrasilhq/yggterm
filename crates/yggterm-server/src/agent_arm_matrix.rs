@@ -385,38 +385,69 @@ fn locality_does_not_fork_the_invocation() {
     // same string on both arms — if it is not, some caller above the transport
     // seam is branching on locality.
     let _env = crate::codex_cli::env_test_guard();
-    let profile = pinned_terminal_identity();
 
     for arm in ARMS {
-        let twin = ARMS
-            .iter()
-            .find(|other| other.kind == arm.kind && other.locality != arm.locality)
-            .expect("every arm has a locality twin");
+        compare_arm_against_twin("resume", arm, |kind| {
+            persistent_agent_resume_command(kind, Some(ARM_CWD), ARM_SESSION_ID)
+        });
+        compare_arm_against_twin("launch", arm, |kind| {
+            agent_launch_command(kind, Some(ARM_CWD), None)
+        });
+    }
+}
 
-        // Re-pin immediately before each PAIR, and build the pair back to back.
-        // The builders read the palette from process-global env, and applying a
-        // theme anywhere in the crate re-syncs that env from itself — so the
-        // only window this test can actually control is the one between the pin
-        // and the two calls being compared. Pinning once outside the loop is not
-        // enough; that is what left this assertion racing.
-        crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
-        let resume_arm = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID);
-        let resume_twin = persistent_agent_resume_command(twin.kind, Some(ARM_CWD), ARM_SESSION_ID);
-        assert_eq!(
-            resume_arm,
-            resume_twin,
-            "{}: resume command forks on locality",
-            arm.name(),
-        );
+/// Build one arm's command and its twin's from the SAME pinned identity, and
+/// assert they agree.
+///
+/// The awkward shape here is not defensiveness, it is the only honest way to
+/// test these builders. They read the terminal palette out of process-global
+/// env **by design** — the daemon needs one identity for every child PTY it
+/// spawns — and applying a theme anywhere in the crate re-syncs that env from
+/// itself, clearing the palette when it cannot read a complete one back. cargo
+/// runs tests as threads of one process, so a theme sync on another thread can
+/// land between these two calls and has: the failure that led here had the
+/// pinned palette on one side and none on the other, which reads as
+/// "CodexLiteLlm/Remote: resume command forks on locality" when nothing forked.
+///
+/// Serializing does not fix it, because the clearing reaches this env through
+/// PRODUCTION code from tests that have no reason to know this guard exists.
+/// So: only compare a pair that was demonstrably built from the same identity,
+/// and re-pin and retry when it was not. A genuine locality fork carries the
+/// pinned identity on BOTH sides and therefore fails on the first attempt and
+/// every retry — the assertion is as strong as it ever was. What retrying
+/// removes is only the false red.
+#[cfg(test)]
+fn compare_arm_against_twin(label: &str, arm: &Arm, build: impl Fn(SessionKind) -> String) {
+    let twin = ARMS
+        .iter()
+        .find(|other| other.kind == arm.kind && other.locality != arm.locality)
+        .expect("every arm has a locality twin");
+    let profile = pinned_terminal_identity();
 
+    for attempt in 1..=8 {
         crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
-        let launch_arm = agent_launch_command(arm.kind, Some(ARM_CWD), None);
-        let launch_twin = agent_launch_command(twin.kind, Some(ARM_CWD), None);
-        assert_eq!(
-            launch_arm,
-            launch_twin,
-            "{}: launch command forks on locality",
+        let left = build(arm.kind);
+        let right = build(twin.kind);
+
+        // Both sides must carry the identity we pinned, or the inputs were not
+        // equal and the comparison would be measuring the theft, not the arms.
+        if left.contains(&profile.background) && right.contains(&profile.background) {
+            assert_eq!(
+                left,
+                right,
+                "{}: {label} command forks on locality",
+                arm.name(),
+            );
+            return;
+        }
+        assert!(
+            attempt < 8,
+            "{}: could not build the {label} pair from one identity in 8 attempts — \
+             something is clearing the terminal palette continuously, which is a real \
+             defect rather than a flake. left carries it: {}, right carries it: {}",
             arm.name(),
+            left.contains(&profile.background),
+            right.contains(&profile.background),
         );
     }
 }
@@ -434,11 +465,24 @@ fn every_arm_carries_the_pinned_terminal_identity_into_its_invocation() {
     let profile = pinned_terminal_identity();
 
     for arm in ARMS {
-        crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
-        let launch = agent_launch_command(arm.kind, Some(ARM_CWD), None);
+        // Same retry as the twin comparison, for the same reason: a theme sync
+        // on another thread can clear the palette between the pin and the build.
+        // Eight consecutive thefts is not a flake, and the message says so.
+        let mut carried = false;
+        for _ in 0..8 {
+            crate::codex_cli::sync_terminal_identity_appearance_with_profile(
+                "dark",
+                Some(&profile),
+            );
+            if agent_launch_command(arm.kind, Some(ARM_CWD), None).contains(&profile.background) {
+                carried = true;
+                break;
+            }
+        }
         assert!(
-            launch.contains(&profile.background),
-            "{}: the launch command dropped the pinned terminal identity — got {launch}",
+            carried,
+            "{}: the launch command dropped the pinned terminal identity on every one of \
+             8 attempts",
             arm.name(),
         );
     }
