@@ -437,6 +437,9 @@ fn refresh_remote_copy(
     sessions.sort_by(|left, right| left.storage_path.cmp(&right.storage_path));
     apply_limit(&mut sessions, options.limit);
     machine.sessions = sessions.clone();
+    // Routing only: the persist path never reads the session list, and hoisting
+    // it here keeps the per-session loop from copying the machine.
+    let machine_ref = machine.routing_ref();
     let mut summary = RemoteMachineRefreshSummary {
         machine_key: machine.machine_key.clone(),
         ssh_target: machine.ssh_target.clone(),
@@ -530,7 +533,7 @@ fn refresh_remote_copy(
         }
         if !options.dry_run {
             persist_remote_generated_copy(
-                &machine,
+                &machine_ref,
                 &scanned.session_id,
                 &scanned.cwd,
                 title.as_deref(),

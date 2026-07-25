@@ -7,6 +7,7 @@ use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::Cell;
 use std::path::Path;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -37,8 +38,33 @@ pub struct SessionSummaryTimelineEntry {
     pub model: Option<String>,
 }
 
+/// How stale a LIVE working session's summary may get before it regenerates.
+/// One owner for the number: callers that want the live arity pass this rather
+/// than re-spelling `minutes(30)`, which is how two horizons for one concept
+/// start drifting.
+pub const LIVE_SUMMARY_REFRESH_HORIZON: TimeDuration = TimeDuration::minutes(30);
+
+thread_local! {
+    /// Every `SessionTitleStore::open` on THIS thread — i.e. every sqlite
+    /// connection plus its full schema batch. Per-thread, not global, so a
+    /// caller can assert its own sweep opened the connection once without a
+    /// concurrent sweep (or a parallel test) changing the answer.
+    ///
+    /// It exists because a per-item open is invisible from the outside: the
+    /// results are identical, and the cost only shows up as milliseconds in a
+    /// perf span nobody reads. The copy scan carried three per target for
+    /// months that way.
+    static TITLE_STORE_OPENS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Count of `SessionTitleStore::open` calls made on the current thread.
+pub fn session_title_store_open_count() -> usize {
+    TITLE_STORE_OPENS.with(Cell::get)
+}
+
 impl SessionTitleStore {
     pub fn open(home: &Path) -> Result<Self> {
+        TITLE_STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
         let db_path = home.join(TITLE_DB_FILENAME);
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open title db {}", db_path.display()))?;
@@ -455,9 +481,9 @@ impl SessionTitleResolver {
     /// Summary-timeline fix (2026-06-11): the fixed 3-day horizon meant a LIVE
     /// working session refreshed its summary at most every 3 days — the
     /// summary_timeline table never grew and summaries went stale mid-project.
-    /// Live working sessions pass a short horizon (the trigger is already
-    /// working-gated, capped per tick, and 429-paced, so cost stays bounded);
-    /// stored/remote scans keep the 3-day default.
+    /// Live working sessions pass [`LIVE_SUMMARY_REFRESH_HORIZON`] (the
+    /// trigger is already working-gated, capped per tick, and 429-paced, so
+    /// cost stays bounded); stored/remote scans keep the 3-day default.
     pub fn summary_needs_refresh_with_horizon(
         &self,
         session_id: &str,
