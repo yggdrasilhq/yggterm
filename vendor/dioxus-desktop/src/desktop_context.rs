@@ -691,6 +691,70 @@ impl DesktopService {
         }
     }
 
+    /// Read an open web surface's cookie jar (per-PROFILE — see
+    /// `WebSurfaceHost::cookies_export` for the root-path limitation).
+    pub fn export_web_surface_cookies(
+        &self,
+        id: u64,
+        callback: impl FnOnce(Result<Vec<crate::web_surface::CookieRecord>, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.cookies_export(id, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Write cookies into an open web surface's jar. The jar belongs to the
+    /// surface's PROFILE; a surface with no explicit profile is `default`,
+    /// which is the user's own browsing jar.
+    pub fn import_web_surface_cookies(
+        &self,
+        id: u64,
+        cookies: Vec<crate::web_surface::CookieRecord>,
+        callback: impl FnOnce(Result<usize, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.cookies_import(id, cookies, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, cookies, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Capture an open web surface's full document to a PNG at `path`; the
     /// callback fires when the file is written (or capture failed).
     pub fn snapshot_web_surface_full_page(

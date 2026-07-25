@@ -25,8 +25,9 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, VaultFieldSource, WebElementRef,
-    WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, app_control_captures_dir,
+    ProbeTerminalViewportInputMode, ScreenshotTarget, VaultFieldSource, WebCookieDirection,
+    WebElementRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
+    app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -19810,6 +19811,37 @@ pub fn run_app_control_web_surface_do(
             action,
             generation,
             new_batch,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Move a session's web-surface cookie jar to or from a Netscape file.
+///
+/// The jar path is absolutized CLI-side for the same reason a screenshot's
+/// output path is: the GUI has its own cwd, so a relative path on an import
+/// would read a file the caller never wrote.
+pub fn run_app_control_web_surface_cookies(
+    session_path: Option<&str>,
+    direction: WebCookieDirection,
+    jar_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let jar = std::path::Path::new(jar_path);
+    let jar = if jar.is_absolute() {
+        jar.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(jar)
+    };
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceCookies {
+            session_path: session_path.map(str::to_string),
+            direction,
+            jar_path: jar.to_string_lossy().to_string(),
         },
         timeout_ms,
     )?;

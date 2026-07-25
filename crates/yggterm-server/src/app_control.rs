@@ -222,6 +222,20 @@ impl WebElementRef {
     }
 }
 
+/// Which way a `cookies` verb moves a jar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebCookieDirection {
+    /// Read the surface's jar into a Netscape file. Read-only.
+    Export,
+    /// Write a Netscape file's cookies into the surface's jar.
+    ///
+    /// ⚠ The jar is per-PROFILE, and a surface with no explicit profile is
+    /// `default` — the USER'S OWN browsing jar. Drive agent work on a
+    /// `--profile agent-<n>` surface before importing anything.
+    Import,
+}
+
 /// Which vault record a `fill-vault` verb reads from.
 ///
 /// One command with a source, not two commands: the page-origin guard, the
@@ -787,6 +801,24 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         output_path: String,
     },
+    /// Move a session's web-surface cookie jar to or from a Netscape file.
+    ///
+    /// This is what makes "script it on curl, hand the session to a surface for
+    /// the one interactive step, hand it back" possible. It was proven both
+    /// necessary AND sufficient in the field: transplanting a single PHPSESSID
+    /// into a browser made rtionline render the applicant's name and the fee.
+    ///
+    /// ⚠ The cookie manager is per-`WebContext` = per-PROFILE, and a surface
+    /// with no explicit profile is `default`, i.e. the user's own browsing jar.
+    /// The response reports which profile was written; the trace records
+    /// domains and counts and NEVER values.
+    WebSurfaceCookies {
+        #[serde(default)]
+        session_path: Option<String>,
+        direction: WebCookieDirection,
+        /// The Netscape jar file to read or write. Absolutized CLI-side.
+        jar_path: String,
+    },
     /// Rasterize ONE addressed element to a PNG, IN THE PAGE.
     ///
     /// `canvas.drawImage(el)` + `toDataURL()` — no compositor, no window
@@ -1120,6 +1152,7 @@ impl AppControlCommand {
             Self::WebSurfaceEval { .. } => "web_surface_eval",
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
             Self::WebSurfaceCaptureElement { .. } => "web_surface_capture_element",
+            Self::WebSurfaceCookies { .. } => "web_surface_cookies",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceFillVault { .. } => "web_surface_fill_vault",

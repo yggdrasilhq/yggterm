@@ -257,6 +257,13 @@ version = "0.18.2"
 version = "=2.0.2"
 features = ["v2_40"]
 
+# The cookie manager's API speaks libsoup cookies, so reading or writing a
+# surface's jar needs the same soup3 webkit2gtk itself depends on. Already in
+# Cargo.lock transitively, so this downloads nothing — it only names it.
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.soup]
+version = "0.5"
+package = "soup3"
+
 [target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.webkit2gtk-sys]
 version = "=2.0.2"
 

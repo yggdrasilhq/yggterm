@@ -32,7 +32,7 @@ mod web_surface;
     target_os = "ios",
     target_os = "android"
 )))]
-pub use web_surface::{SurfaceCloseRequest, SurfacePopup};
+pub use web_surface::{CookieRecord, SurfaceCloseRequest, SurfacePopup};
 mod webview;
 
 // mobile shortcut is only supported on mobile platforms

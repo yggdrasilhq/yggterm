@@ -1024,6 +1024,78 @@ fn build_popup_webview(
     Some(webkit)
 }
 
+/// One cookie as the ENGINE layer knows it.
+///
+/// Deliberately plain and file-format-agnostic: the vendored engine layer must
+/// not learn what a Netscape jar looks like, and the jar codec
+/// (`yggterm-shell::netscape_cookie_jar`) must not learn about libsoup. This
+/// struct is the seam between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieRecord {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// A leading `.` means "and subdomains", matching both libsoup and the jar
+    /// file — one encoding of that fact, all the way through.
+    pub domain: String,
+    /// Path scope.
+    pub path: String,
+    /// `None` is a session cookie.
+    pub expires_unix: Option<i64>,
+    /// Https-only.
+    pub secure: bool,
+    /// Not readable from `document.cookie`.
+    pub http_only: bool,
+}
+
+impl CookieRecord {
+    /// Identity for de-duplication: the tuple a browser treats as ONE cookie.
+    /// The value is deliberately not part of it — the same cookie returned by
+    /// the http and https queries is one cookie, not two.
+    fn same_cookie(&self, other: &Self) -> bool {
+        self.name == other.name && self.domain == other.domain && self.path == other.path
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    fn from_soup(cookie: &mut soup::Cookie) -> Self {
+        Self {
+            name: cookie.name().map(|v| v.to_string()).unwrap_or_default(),
+            value: cookie.value().map(|v| v.to_string()).unwrap_or_default(),
+            domain: cookie.domain().map(|v| v.to_string()).unwrap_or_default(),
+            path: cookie.path().map(|v| v.to_string()).unwrap_or_default(),
+            expires_unix: cookie.expires().map(|when| when.to_unix()),
+            secure: cookie.is_secure(),
+            http_only: cookie.is_http_only(),
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    fn to_soup(&self) -> soup::Cookie {
+        // max_age -1 = a session cookie; an absolute expiry is set explicitly
+        // below, so there is one place that decides a cookie's lifetime.
+        let mut cookie = soup::Cookie::new(&self.name, &self.value, &self.domain, &self.path, -1);
+        cookie.set_secure(self.secure);
+        cookie.set_http_only(self.http_only);
+        if let Some(expires) = self.expires_unix {
+            if let Ok(when) = gtk::glib::DateTime::from_unix_utc(expires) {
+                cookie.set_expires(&when);
+            }
+        }
+        cookie
+    }
+}
+
 impl WebSurfaceHost {
     pub(crate) fn new(overlay: gtk::Overlay, backdrop: gtk::Widget) -> Self {
         let backdrop_css = gtk::CssProvider::new();
@@ -1630,6 +1702,162 @@ impl WebSurfaceHost {
             surface.webview.close_devtools();
         }
         Ok(surface.webview.is_devtools_open())
+    }
+
+    /// One cookie as the engine layer knows it.
+    ///
+    /// Deliberately plain: this layer must not learn what a jar FILE looks
+    /// like. The Netscape codec lives in `yggterm-shell` and converts.
+    ///
+    /// (Defined next to the two methods that use it so the whole cookie bridge
+    /// reads in one place.)
+
+    /// Read surface `id`'s cookie jar.
+    ///
+    /// HONEST LIMITATION, reported rather than hidden: WebKitGTK 4.x has no
+    /// dump-the-whole-jar API. `cookies()` is per-URI and libsoup enforces the
+    /// cookie's PATH against that URI, so querying each domain at its root
+    /// returns every root-path cookie and misses path-scoped ones. The shell
+    /// labels the result `export_scope: "root_path_per_domain"` instead of
+    /// implying completeness.
+    ///
+    /// Reaching into the on-disk sqlite jar to close that gap would be a second
+    /// encoding of the cookie store AND blind to unflushed in-memory state, so
+    /// it is deliberately not done.
+    pub fn cookies_export(
+        &self,
+        id: u64,
+        callback: impl FnOnce(Result<Vec<CookieRecord>, String>) + 'static,
+    ) -> Result<(), String> {
+        use webkit2gtk::CookieManagerExt as _;
+        let manager = self.cookie_manager(id)?;
+        let cancellable: Option<gtk::gio::Cancellable> = None;
+        let manager_for_domains = manager.clone();
+        // Fired EXACTLY once, whichever path finishes: the domain enumeration
+        // failing, an empty jar, or the last per-domain query completing. A
+        // caller left waiting forever is worse than a refusal.
+        let deliver = std::rc::Rc::new(std::cell::RefCell::new(Some(callback)));
+        let deliver_once = {
+            let deliver = deliver.clone();
+            move |outcome: Result<Vec<CookieRecord>, String>| {
+                if let Some(callback) = deliver.borrow_mut().take() {
+                    callback(outcome);
+                }
+            }
+        };
+        manager.domains_with_cookies(cancellable.as_ref(), move |domains| {
+            let domains: Vec<gtk::glib::GString> = match domains {
+                Ok(domains) => domains,
+                Err(error) => return deliver_once(Err(error.to_string())),
+            };
+            if domains.is_empty() {
+                return deliver_once(Ok(Vec::new()));
+            }
+            // Both schemes per domain: a `secure` cookie is only returned for
+            // an https URI, and a non-secure one set on a plain-http site is
+            // only returned for http. Querying one scheme silently loses half
+            // the jar.
+            let outstanding = std::rc::Rc::new(std::cell::Cell::new(domains.len() * 2));
+            let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<CookieRecord>::new()));
+            let deliver_once = std::rc::Rc::new(deliver_once);
+            for domain in domains {
+                for scheme in ["https", "http"] {
+                    let host = domain.trim_start_matches('.').to_string();
+                    let uri = format!("{scheme}://{host}/");
+                    let outstanding = outstanding.clone();
+                    let collected = collected.clone();
+                    let deliver_once = deliver_once.clone();
+                    let cancellable: Option<gtk::gio::Cancellable> = None;
+                    manager_for_domains.cookies(&uri, cancellable.as_ref(), move |result| {
+                        if let Ok(cookies) = result {
+                            let mut collected = collected.borrow_mut();
+                            for mut cookie in cookies {
+                                let record = CookieRecord::from_soup(&mut cookie);
+                                // Union by identity: the same cookie comes back
+                                // from both scheme queries.
+                                if !collected
+                                    .iter()
+                                    .any(|existing: &CookieRecord| existing.same_cookie(&record))
+                                {
+                                    collected.push(record);
+                                }
+                            }
+                        }
+                        outstanding.set(outstanding.get().saturating_sub(1));
+                        if outstanding.get() == 0 {
+                            let mut cookies = collected.borrow().clone();
+                            // Deterministic order: the same jar must export
+                            // byte-identically every time.
+                            cookies.sort_by(|a, b| {
+                                (&a.domain, &a.path, &a.name).cmp(&(&b.domain, &b.path, &b.name))
+                            });
+                            deliver_once(Ok(cookies));
+                        }
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Write cookies into surface `id`'s jar.
+    ///
+    /// The jar belongs to the surface's `WebContext`, i.e. its PROFILE — a
+    /// surface with no explicit profile is `default`, which is the USER'S OWN
+    /// browsing jar. The shell reports which profile was written for exactly
+    /// that reason.
+    pub fn cookies_import(
+        &self,
+        id: u64,
+        cookies: Vec<CookieRecord>,
+        callback: impl FnOnce(Result<usize, String>) + 'static,
+    ) -> Result<(), String> {
+        use webkit2gtk::CookieManagerExt as _;
+        let manager = self.cookie_manager(id)?;
+        if cookies.is_empty() {
+            callback(Ok(0));
+            return Ok(());
+        }
+        let outstanding = std::rc::Rc::new(std::cell::Cell::new(cookies.len()));
+        let added = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let callback = std::rc::Rc::new(std::cell::RefCell::new(Some(callback)));
+        for record in cookies {
+            let mut cookie = record.to_soup();
+            let outstanding = outstanding.clone();
+            let added = added.clone();
+            let callback = callback.clone();
+            let cancellable: Option<gtk::gio::Cancellable> = None;
+            manager.add_cookie(&mut cookie, cancellable.as_ref(), move |result| {
+                if result.is_ok() {
+                    added.set(added.get() + 1);
+                }
+                outstanding.set(outstanding.get().saturating_sub(1));
+                if outstanding.get() == 0 {
+                    if let Some(callback) = callback.borrow_mut().take() {
+                        callback(Ok(added.get()));
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// The cookie manager for surface `id`'s web context.
+    ///
+    /// Per-`WebContext` means per-PROFILE: two surfaces on the same profile
+    /// share one jar, and two on different profiles cannot see each other's.
+    fn cookie_manager(&self, id: u64) -> Result<webkit2gtk::CookieManager, String> {
+        use webkit2gtk::{WebContextExt as _, WebViewExt as _};
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        surface
+            .webview
+            .webview()
+            .context()
+            .ok_or("surface has no web context")?
+            .cookie_manager()
+            .ok_or_else(|| "web context has no cookie manager".to_string())
     }
 
     /// Capture surface `id`'s FULL DOCUMENT (whole page, not just the visible
