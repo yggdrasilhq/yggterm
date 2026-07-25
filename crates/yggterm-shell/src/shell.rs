@@ -47513,19 +47513,6 @@ fn web_surface_lease_for(
     }
 }
 
-/// Tear down the armed recorder and return the failure. Used by the paths that
-/// abort AFTER arming (selector focus failures) so no page keeps a stray
-/// listener when the verb never injected anything.
-async fn web_do_disarm_and_fail(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    session: String,
-    reason: String,
-) -> Value {
-    let _ = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS).await;
-    json!({ "accepted": false, "session_path": session, "reason": reason })
-}
-
 /// Process-wide agent-input preemption state (acceptance gate 9). A global for
 /// the same reason the slice-3 agent identity is one: every `do` call site would
 /// otherwise thread state it does not care about, and there is exactly one GUI
@@ -47574,9 +47561,26 @@ fn agent_input_batch_for_current_agent() -> crate::agent_input_arbiter::AgentBat
 /// The detection has to happen at that layer because the agent's own injected
 /// events carry `isTrusted: true` by design, so a page-side listener cannot
 /// distinguish them from the human. See `docs/agent-control-plane.md`.
-fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
+fn note_human_input_on_web_surface(
+    session_path: &str,
+    generation: u64,
+) -> crate::agent_input_arbiter::PreemptReport {
     let surface = crate::agent_input_arbiter::SurfaceKey::new(session_path, generation);
     let report = agent_input_arbiter_lock().note_human_input(&surface);
+    journal_web_surface_preempt(session_path, generation, &report, "human_input", None);
+    report
+}
+
+/// The ONE place a preemption is written to the trace. Both doors into gate 9 —
+/// the per-request gate and a batch's mid-flight abort — journal through here,
+/// so the two can never describe the same event differently.
+fn journal_web_surface_preempt(
+    session_path: &str,
+    generation: u64,
+    report: &crate::agent_input_arbiter::PreemptReport,
+    trigger: &str,
+    remaining: Option<usize>,
+) {
     if report.is_empty() {
         return;
     }
@@ -47590,7 +47594,10 @@ fn note_human_input_on_web_surface(session_path: &str, generation: u64) {
                 "session_path": session_path,
                 "generation": generation,
                 "cancelled_batches": report.cancelled_batches,
-                "trigger": "human_input",
+                "trigger": trigger,
+                // How many actions of a batch were abandoned. `null` for a
+                // single verb, which has no remainder.
+                "remaining": remaining,
             }),
         );
     }
@@ -47649,189 +47656,78 @@ fn note_write_lock_preempt_on_web_surface(session_path: &str, generation: u64, p
     }
 }
 
-async fn web_surface_do_for(
-    state: &Signal<ShellState>,
+async fn web_do_doc_to_viewport(
     desktop: &dioxus::desktop::DesktopContext,
-    session_path: Option<&str>,
-    action: &WebSurfaceDoAction,
-    expected_generation: Option<u64>,
-    new_batch: bool,
-) -> Value {
-    let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
-        Ok(resolved) => resolved,
-        Err(reason) => return json!({ "accepted": false, "reason": reason }),
-    };
-    // Check the incarnation BEFORE injecting anything (F3).
-    if let Some(mut stale) = web_surface_stale_handle(expected_generation, handle) {
-        if let Some(obj) = stale.as_object_mut() {
-            obj.insert("session_path".to_string(), Value::String(session));
-        }
-        return stale;
-    }
-    // Human-preempt gate (acceptance gate 9): once real seat input lands on a
-    // surface, every agent batch that was driving it is cancelled and its later
-    // verbs are refused here — so a verb the agent planned before the user acted
-    // cannot land afterwards. Ordering/one-in-flight is NOT re-implemented: the
-    // app-control pump already drains one request at a time.
-    {
-        let batch = agent_input_batch_for_current_agent();
-        let surface_key =
-            crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
-        // `--new-batch`: the agent asserts it has re-observed the page, so this
-        // surface's lane is reopened before the seat-input read below. This is
-        // the ONLY reset an agent can reach — the batch id is per-GUI-process
-        // (`resolve_agent_identity` reads the GUI's own argv, so it is the same
-        // `"anonymous"` for every verb the GUI will ever serve), and `forget()`
-        // otherwise runs only when the surface closes or is rebuilt. Without it
-        // a single preempt is a permanent lockout rather than a yield, which is
-        // what the refusal's own "start a new batch after re-observing" text has
-        // always promised was possible.
-        //
-        // Ordering matters: the reset happens BEFORE `take_web_surface_seat_input`
-        // so a stale count left by the agent's own previous verb cannot instantly
-        // re-preempt the lane the agent just reopened. Real seat input that lands
-        // AFTER this point still preempts normally — re-observing does not buy
-        // the agent immunity, only a fresh start.
-        if new_batch {
-            agent_input_arbiter_lock().forget(&surface_key);
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "agent_input",
-                    "batch_reset",
-                    json!({
-                        "session_path": session,
-                        "batch_id": batch.batch_id,
-                        "generation": handle.generation,
-                    }),
-                );
-            }
-        }
-        // Did the human touch this surface since the last verb? The webview
-        // layer counts real seat input (clicks/keys/scrolls) and excludes our
-        // own injections, so a non-zero count is unambiguously the user.
-        if desktop.take_web_surface_seat_input(handle.native_id) > 0 {
-            note_human_input_on_web_surface(&session, handle.generation);
-        }
-        // A page's JS dialog is answered for it at the webview layer (otherwise
-        // an invisible surface blocks its whole web process forever). The
-        // question itself would then be lost, so record it here — the agent
-        // driving this surface is exactly who needs to know the page asked.
-        for dialog in desktop.take_web_surface_script_dialogs() {
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "web_surface",
-                    "script_dialog_answered",
-                    json!({
-                        "session_path": session,
-                        "native_id": dialog.surface_id,
-                        "kind": dialog.kind,
-                        "answered": dialog.answered,
-                        "uri": dialog.uri,
-                        "message": dialog.message,
-                    }),
-                );
-            }
-        }
-        let outcome = agent_input_arbiter_lock()
-            .admit(&surface_key, &batch, handle.generation);
-        if outcome == crate::agent_input_arbiter::AdmitOutcome::Preempted {
-            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "agent_input",
-                    crate::agent_input_arbiter::PREEMPTED,
-                    json!({
-                        "session_path": session,
-                        "batch_id": batch.batch_id,
-                        "generation": handle.generation,
-                    }),
-                );
-            }
-            return json!({
-                "accepted": false,
-                "reason": crate::agent_input_arbiter::PREEMPTED,
-                "session_path": session,
-                "detail": "the user took this surface; start a new batch after re-observing",
-            });
-        }
-    }
-    // Slice 4.1c — Shadow write-lock preempt gate. A Shadow view client must not
-    // inject into a profile whose daemon-owned write-lock it no longer holds:
-    // once the user's Active GUI preempts it (4.1a), the shadow's still-open
-    // jar-backed WebContext must stop taking agent-driven writes, or two clients
-    // write one jar. ONLY Shadows check — an Active client holds the lock by
-    // construction, or drives its own ephemeral read-only surface (4.1b), so the
-    // user's GUI never pays this round-trip. An ephemeral profile has its own
-    // in-memory context and no shared jar to fight over, so it is exempt. Fail
-    // CLOSED: a Shadow that cannot confirm it holds the lock refuses, matching
-    // the daemon's shadow-fails-closed doctrine (D7).
-    {
-        let identity = yggterm_server::current_client_identity();
-        if identity.role == yggterm_server::ClientRole::Shadow
-            && let Some(profile) = web_surface_active_profile(state, &session)
-            && !yggterm_core::web_profile::web_profile_is_ephemeral(&normalize_web_surface_profile(
-                Some(profile.as_str()),
-            ))
-        {
-            let holder_id = identity
-                .client_id
-                .clone()
-                .unwrap_or_else(|| format!("anonymous:{}", std::process::id()));
-            let endpoint = state.peek().bootstrap.server_endpoint.clone();
-            let holds = match yggterm_server::profile_write_lock_report(&endpoint) {
-                Ok(report) => write_lock_report_holds(&report, &profile, &holder_id),
-                // Cannot verify => do not write someone else's jar (fail closed).
-                Err(_) => false,
-            };
-            if !holds {
-                note_write_lock_preempt_on_web_surface(&session, handle.generation, &profile);
-                return json!({
-                    "accepted": false,
-                    "reason": crate::agent_input_arbiter::PREEMPTED,
-                    "session_path": session,
-                    "detail": "the profile write-lock was preempted by an Active client; this shadow may not write the jar until it re-acquires",
-                });
-            }
-        }
-    }
-    let native_id = handle.native_id;
-    // Document-space CSS (x, y) → viewport CSS by subtracting the live scroll
-    // offset. The vendored inject layer applies page zoom to reach widget px.
-    async fn doc_to_viewport(
-        desktop: &dioxus::desktop::DesktopContext,
-        native_id: u64,
-        x: f64,
-        y: f64,
-    ) -> Result<(f64, f64), String> {
-        let scroll = web_do_eval(
-            desktop,
-            native_id,
-            "(function(){return {sx:window.scrollX||window.pageXOffset||0,sy:window.scrollY||window.pageYOffset||0};})()",
-        )
-        .await?;
-        let sx = scroll.get("sx").and_then(Value::as_f64).unwrap_or(0.0);
-        let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
-        Ok((x - sx, y - sy))
-    }
-    // Arm the page-side delivery recorder BEFORE injecting. If arming fails the
-    // verb still runs — it just reports `delivered: "unknown"` rather than
-    // inventing a success claim.
-    let armed_doc = web_do_eval(
+    native_id: u64,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64), String> {
+    let scroll = web_do_eval(
         desktop,
         native_id,
-        &web_do_observe_arm_script(web_do_observed_event_types(action)),
+        "(function(){return {sx:window.scrollX||window.pageXOffset||0,sy:window.scrollY||window.pageYOffset||0};})()",
     )
-    .await
-    .ok()
-    .and_then(|value| value.as_str().map(ToOwned::to_owned));
-    let result = match action {
+    .await?;
+    let sx = scroll.get("sx").and_then(Value::as_f64).unwrap_or(0.0);
+    let sy = scroll.get("sy").and_then(Value::as_f64).unwrap_or(0.0);
+    Ok((x - sx, y - sy))
+}
+
+/// Gate 9's DECISION, extracted so it is drivable with no webview.
+///
+/// The rule, in order: an explicit new batch resets the lane FIRST (so a stale
+/// count left by the agent's own previous verb cannot instantly re-preempt the
+/// lane it just reopened); then real seat input preempts; then the batch is
+/// admitted against the surface's live incarnation.
+///
+/// It is `&mut AgentInputArbiter` and nothing else — no signals, no desktop, no
+/// tracing — which is what lets the 20-verb lock below drive it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateDecision {
+    Allowed,
+    /// The human took the surface; every batch driving it is cancelled.
+    Preempted,
+    /// The verb was aimed at an incarnation that no longer exists.
+    StaleSurface,
+}
+
+fn web_do_gate(
+    seat_input_count: u64,
+    new_batch: bool,
+    arbiter: &mut crate::agent_input_arbiter::AgentInputArbiter,
+    surface: &crate::agent_input_arbiter::SurfaceKey,
+    batch: &crate::agent_input_arbiter::AgentBatch,
+    live_generation: u64,
+) -> (GateDecision, crate::agent_input_arbiter::PreemptReport) {
+    if new_batch {
+        arbiter.forget(surface);
+    }
+    let report = if seat_input_count > 0 {
+        arbiter.note_human_input(surface)
+    } else {
+        crate::agent_input_arbiter::PreemptReport::default()
+    };
+    let decision = match arbiter.admit(surface, batch, live_generation) {
+        crate::agent_input_arbiter::AdmitOutcome::Allowed => GateDecision::Allowed,
+        crate::agent_input_arbiter::AdmitOutcome::Preempted => GateDecision::Preempted,
+        crate::agent_input_arbiter::AdmitOutcome::StaleSurface => GateDecision::StaleSurface,
+    };
+    (decision, report)
+}
+
+/// Perform ONE action against an already-resolved, already-gated surface.
+///
+/// No gating, no recorder, no response assembly — just the injection. Extracted
+/// from `web_surface_do_for` so `web batch` runs exactly the same code path per
+/// action rather than a parallel implementation that could drift.
+async fn web_do_perform(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    action: &WebSurfaceDoAction,
+) -> Result<Value, String> {
+    match action {
         WebSurfaceDoAction::Click { x, y, button } => {
-            match doc_to_viewport(desktop, native_id, *x, *y).await {
+            match web_do_doc_to_viewport(desktop, native_id, *x, *y).await {
                 Ok((vx, vy)) => {
                     // Crash-safety (WebKitGTK null-deref on a blind coordinate
                     // click — pending-bugs 2026-07-24, GUI hard-crash): a native
@@ -47899,7 +47795,7 @@ async fn web_surface_do_for(
             }
         }
         WebSurfaceDoAction::Move { x, y } => {
-            match doc_to_viewport(desktop, native_id, *x, *y).await {
+            match web_do_doc_to_viewport(desktop, native_id, *x, *y).await {
                 Ok((vx, vy)) => desktop
                     .inject_web_surface_move(native_id, vx, vy)
                     .map(|()| json!({ "verb": "move", "x": vx, "y": vy })),
@@ -47910,7 +47806,7 @@ async fn web_surface_do_for(
             // Position defaults to the viewport center; explicit coords are
             // document-space (subtract scroll).
             let pos = match (x, y) {
-                (Some(px), Some(py)) => doc_to_viewport(desktop, native_id, *px, *py).await,
+                (Some(px), Some(py)) => web_do_doc_to_viewport(desktop, native_id, *px, *py).await,
                 _ => web_do_eval(
                     desktop,
                     native_id,
@@ -47939,7 +47835,7 @@ async fn web_surface_do_for(
                     && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
                 {
                     // Single exit path: the armed recorder is torn down below.
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    return Err(reason);
                 }
                 let state_bits = web_do_mods_to_state(mods);
                 let press = desktop.inject_web_surface_key(native_id, true, keyval, state_bits);
@@ -47956,7 +47852,7 @@ async fn web_surface_do_for(
             if let Some(selector) = selector
                 && let Err(reason) = web_do_focus_ref(desktop, native_id, selector).await
             {
-                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                return Err(reason);
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -47994,10 +47890,10 @@ async fn web_surface_do_for(
             let mut cleared = 0u32;
             for target in &targets {
                 if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    return Err(reason);
                 }
                 if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
-                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    return Err(reason);
                 }
                 cleared += 1;
             }
@@ -48020,10 +47916,10 @@ async fn web_surface_do_for(
                         continue;
                     };
                     if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
-                        return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                        return Err(reason);
                     }
                     if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
-                        return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                        return Err(reason);
                     }
                 }
                 if !stubborn.is_empty() {
@@ -48036,17 +47932,11 @@ async fn web_surface_do_for(
                         .map(|(index, _)| index)
                         .collect();
                     if !still.is_empty() {
-                        return web_do_disarm_and_fail(
-                            desktop,
-                            native_id,
-                            session,
-                            format!(
+                        return Err(format!(
                                 "clear_failed (box(es) {still:?} of {total} still hold text after \
                                  two clear attempts; typing now would merge old and new)",
-                                total = targets.len()
-                            ),
-                        )
-                        .await;
+                            total = targets.len()
+                        ));
                     }
                 }
             }
@@ -48055,7 +47945,7 @@ async fn web_surface_do_for(
             if let Some(first) = targets.first()
                 && let Err(reason) = web_do_focus_ref(desktop, native_id, first).await
             {
-                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                return Err(reason);
             }
             let mut typed = 0u32;
             let mut error: Option<String> = None;
@@ -48113,13 +48003,245 @@ async fn web_surface_do_for(
                 }
             }
         }
-    };
-    // Always read the recorder back, success or failure, so no page keeps a
-    // stray listener.
+    }
+}
+
+/// Arm the delivery recorder, perform ONE action, read the recorder back.
+///
+/// The arm/read must happen PER ACTION, not per request: `delivered` answers
+/// "did the page see THIS action", and a batch that armed once would report the
+/// first action's observation for all twenty. Reading it back on every path
+/// (success or failure) is also what guarantees no page keeps a stray listener.
+async fn web_do_execute_one(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    action: &WebSurfaceDoAction,
+) -> (Result<Value, String>, WebDoDelivery) {
+    let armed_doc = web_do_eval(
+        desktop,
+        native_id,
+        &web_do_observe_arm_script(web_do_observed_event_types(action)),
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let result = web_do_perform(desktop, native_id, action).await;
     let readback = web_do_eval(desktop, native_id, WEB_DO_OBSERVE_READ_JS)
         .await
         .ok();
     let delivery = web_do_delivery_from_readback(armed_doc.as_deref(), readback.as_ref());
+    (result, delivery)
+}
+
+/// Write the delivery observation onto a success detail. Pure.
+///
+/// `accepted` means "the injector ran"; `delivered` is what the PAGE saw. They
+/// are different questions, and conflating them is what let a
+/// silently-dropped-event regression pass for weeks — so `is_trusted` is an
+/// OBSERVATION, reported only when an event actually arrived.
+fn web_do_apply_delivery(detail: &mut Value, delivery: WebDoDelivery) {
+    let Some(obj) = detail.as_object_mut() else {
+        return;
+    };
+    match delivery {
+        WebDoDelivery::Delivered { trusted } => {
+            obj.insert("delivered".to_string(), Value::Bool(true));
+            obj.insert("is_trusted".to_string(), Value::Bool(trusted));
+        }
+        WebDoDelivery::NotDelivered => {
+            obj.insert("delivered".to_string(), Value::Bool(false));
+        }
+        WebDoDelivery::Unknown => {
+            obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
+        }
+    }
+}
+
+/// Resolve a session's live web surface and open an agent lane on it: the F3
+/// incarnation check, gate 9, and the slice-4.1c shadow write-lock gate, in that
+/// order. `Err` is the refusal to return to the caller verbatim.
+///
+/// Shared by `do` and `batch` so a batch cannot accidentally drive a surface
+/// under weaker gating than a single verb — the gate is the same code, run once
+/// per REQUEST, and a batch additionally re-checks seat input between actions.
+async fn web_do_open_lane(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    expected_generation: Option<u64>,
+    new_batch: bool,
+) -> Result<(String, WebSurfaceHandle), Value> {
+    let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return Err(json!({ "accepted": false, "reason": reason })),
+    };
+    // Check the incarnation BEFORE injecting anything (F3).
+    if let Some(mut stale) = web_surface_stale_handle(expected_generation, handle) {
+        if let Some(obj) = stale.as_object_mut() {
+            obj.insert("session_path".to_string(), Value::String(session));
+        }
+        return Err(stale);
+    }
+    // Human-preempt gate (acceptance gate 9): once real seat input lands on a
+    // surface, every agent batch that was driving it is cancelled and its later
+    // verbs are refused here — so a verb the agent planned before the user acted
+    // cannot land afterwards. Ordering/one-in-flight is NOT re-implemented: the
+    // app-control pump already drains one request at a time.
+    //
+    // `--new-batch`: the agent asserts it has re-observed the page, so this
+    // surface's lane is reopened before the seat-input read. This is the ONLY
+    // reset an agent can reach — the batch id is per-GUI-process
+    // (`resolve_agent_identity` reads the GUI's own argv, so it is the same
+    // `"anonymous"` for every verb the GUI will ever serve), and `forget()`
+    // otherwise runs only when the surface closes or is rebuilt. Without it a
+    // single preempt is a permanent lockout rather than a yield.
+    //
+    // The ORDER (reset, then seat read, then admit) lives in `web_do_gate`,
+    // which is pure over the arbiter so it can be driven by a test.
+    let batch = agent_input_batch_for_current_agent();
+    let surface_key =
+        crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
+    if new_batch && let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "agent_input",
+            "batch_reset",
+            json!({
+                "session_path": session,
+                "batch_id": batch.batch_id,
+                "generation": handle.generation,
+            }),
+        );
+    }
+    // Did the human touch this surface since the last verb? The webview layer
+    // counts real seat input (clicks/keys/scrolls) and excludes our own
+    // injections, so a non-zero count is unambiguously the user.
+    let seat_input = desktop.take_web_surface_seat_input(handle.native_id);
+    let (decision, preempt_report) = web_do_gate(
+        seat_input,
+        new_batch,
+        &mut agent_input_arbiter_lock(),
+        &surface_key,
+        &batch,
+        handle.generation,
+    );
+    journal_web_surface_preempt(
+        &session,
+        handle.generation,
+        &preempt_report,
+        "human_input",
+        None,
+    );
+    // A page's JS dialog is answered for it at the webview layer (otherwise an
+    // invisible surface blocks its whole web process forever). The question
+    // itself would then be lost, so record it here — the agent driving this
+    // surface is exactly who needs to know the page asked.
+    for dialog in desktop.take_web_surface_script_dialogs() {
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "web_surface",
+                "script_dialog_answered",
+                json!({
+                    "session_path": session,
+                    "native_id": dialog.surface_id,
+                    "kind": dialog.kind,
+                    "answered": dialog.answered,
+                    "uri": dialog.uri,
+                    "message": dialog.message,
+                }),
+            );
+        }
+    }
+    if decision == GateDecision::Preempted {
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "agent_input",
+                crate::agent_input_arbiter::PREEMPTED,
+                json!({
+                    "session_path": session,
+                    "batch_id": batch.batch_id,
+                    "generation": handle.generation,
+                }),
+            );
+        }
+        return Err(json!({
+            "accepted": false,
+            "reason": crate::agent_input_arbiter::PREEMPTED,
+            "session_path": session,
+            "detail": "the user took this surface; start a new batch after re-observing",
+        }));
+    }
+    if decision == GateDecision::StaleSurface {
+        return Err(json!({
+            "accepted": false,
+            "reason": "stale_handle",
+            "session_path": session,
+            "detail": "the surface was rebuilt since this verb was planned; re-observe it",
+        }));
+    }
+    // Slice 4.1c — Shadow write-lock preempt gate. A Shadow view client must not
+    // inject into a profile whose daemon-owned write-lock it no longer holds:
+    // once the user's Active GUI preempts it (4.1a), the shadow's still-open
+    // jar-backed WebContext must stop taking agent-driven writes, or two clients
+    // write one jar. ONLY Shadows check — an Active client holds the lock by
+    // construction, or drives its own ephemeral read-only surface (4.1b), so the
+    // user's GUI never pays this round-trip. An ephemeral profile has its own
+    // in-memory context and no shared jar to fight over, so it is exempt. Fail
+    // CLOSED: a Shadow that cannot confirm it holds the lock refuses, matching
+    // the daemon's shadow-fails-closed doctrine (D7).
+    {
+        let identity = yggterm_server::current_client_identity();
+        if identity.role == yggterm_server::ClientRole::Shadow
+            && let Some(profile) = web_surface_active_profile(state, &session)
+            && !yggterm_core::web_profile::web_profile_is_ephemeral(&normalize_web_surface_profile(
+                Some(profile.as_str()),
+            ))
+        {
+            let holder_id = identity
+                .client_id
+                .clone()
+                .unwrap_or_else(|| format!("anonymous:{}", std::process::id()));
+            let endpoint = state.peek().bootstrap.server_endpoint.clone();
+            let holds = match yggterm_server::profile_write_lock_report(&endpoint) {
+                Ok(report) => write_lock_report_holds(&report, &profile, &holder_id),
+                // Cannot verify => do not write someone else's jar (fail closed).
+                Err(_) => false,
+            };
+            if !holds {
+                note_write_lock_preempt_on_web_surface(&session, handle.generation, &profile);
+                return Err(json!({
+                    "accepted": false,
+                    "reason": crate::agent_input_arbiter::PREEMPTED,
+                    "session_path": session,
+                    "detail": "the profile write-lock was preempted by an Active client; this shadow may not write the jar until it re-acquires",
+                }));
+            }
+        }
+    }
+    Ok((session, handle))
+}
+
+async fn web_surface_do_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    action: &WebSurfaceDoAction,
+    expected_generation: Option<u64>,
+    new_batch: bool,
+) -> Value {
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, new_batch).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    // Arm, inject, read the recorder back — one action.
+    let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
     match result {
         Ok(mut detail) => {
             if let Some(obj) = detail.as_object_mut() {
@@ -48129,28 +48251,116 @@ async fn web_surface_do_for(
                 // Always report the incarnation acted on, so the next verb can
                 // pin it with --generation without a separate lookup.
                 obj.insert("generation".to_string(), json!(handle.generation));
-                // `accepted` means "the injector ran"; `delivered` is what the
-                // PAGE saw. They are different questions, and conflating them
-                // is what let a silently-dropped-event regression pass for
-                // weeks — so `is_trusted` is now an OBSERVATION, reported only
-                // when an event actually arrived.
-                match delivery {
-                    WebDoDelivery::Delivered { trusted } => {
-                        obj.insert("delivered".to_string(), Value::Bool(true));
-                        obj.insert("is_trusted".to_string(), Value::Bool(trusted));
-                    }
-                    WebDoDelivery::NotDelivered => {
-                        obj.insert("delivered".to_string(), Value::Bool(false));
-                    }
-                    WebDoDelivery::Unknown => {
-                        obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
-                    }
-                }
             }
+            web_do_apply_delivery(&mut detail, delivery);
             detail
         }
         Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
+}
+
+/// App-control `batch`: ONE explicitly-opened agent batch, N actions, closed by
+/// the agent finishing or by GENUINE seat input.
+///
+/// Why it exists: a `do` verb is one app-control round trip, and a form with 31
+/// fields is 31 of them — each paying resolve + gate + arm + read, each a
+/// separate opportunity for the lane to be closed under it. The batch resolves
+/// the handle and opens the lane ONCE, then repeats exactly the per-action unit
+/// a single `do` runs (`web_do_execute_one`), so a batched action and a lone
+/// action can never behave differently.
+///
+/// What a batch does NOT buy the agent: immunity. Between every action the
+/// surface's seat-input counter is re-read, and a non-zero count ABORTS the
+/// remainder and journals `preempted` with `trigger: "human_input"` and
+/// `remaining: n`. The human wins mid-batch, not merely at the next CLI
+/// invocation — which is the whole reason it is safe to hand an agent twenty
+/// injections behind one gate.
+async fn web_surface_batch_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    actions: &[WebSurfaceDoAction],
+    expected_generation: Option<u64>,
+    stop_on_error: bool,
+) -> Value {
+    if actions.is_empty() {
+        return json!({
+            "accepted": false,
+            "reason": "empty_batch",
+            "detail": "a batch needs at least one action",
+        });
+    }
+    // A batch is by definition a fresh run of agent work, so it opens its own
+    // lane — the same assertion `--new-batch` makes for a single verb.
+    let (session, handle) =
+        match web_do_open_lane(state, desktop, session_path, expected_generation, true).await {
+            Ok(resolved) => resolved,
+            Err(refusal) => return refusal,
+        };
+    let native_id = handle.native_id;
+    let total = actions.len();
+    let mut results: Vec<Value> = Vec::with_capacity(total);
+    let mut completed = 0usize;
+    let mut aborted_at: Option<usize> = None;
+    let mut abort_reason: Option<&'static str> = None;
+
+    for (index, action) in actions.iter().enumerate() {
+        // Re-read seat input BEFORE each action after the first. The counter is
+        // consumed by the read, and the injector's own events are excluded at
+        // the webview layer by the injection credits, so a non-zero count here
+        // is unambiguously the user.
+        if index > 0 && desktop.take_web_surface_seat_input(native_id) > 0 {
+            let report = note_human_input_on_web_surface(&session, handle.generation);
+            journal_web_surface_preempt(
+                &session,
+                handle.generation,
+                &report,
+                "human_input",
+                Some(total - index),
+            );
+            aborted_at = Some(index);
+            abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
+            break;
+        }
+        let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
+        match result {
+            Ok(mut detail) => {
+                if let Some(obj) = detail.as_object_mut() {
+                    obj.insert("index".to_string(), json!(index));
+                    obj.insert("accepted".to_string(), Value::Bool(true));
+                }
+                web_do_apply_delivery(&mut detail, delivery);
+                results.push(detail);
+                completed += 1;
+            }
+            Err(reason) => {
+                results.push(json!({
+                    "index": index,
+                    "accepted": false,
+                    "reason": reason,
+                }));
+                if stop_on_error {
+                    aborted_at = Some(index);
+                    abort_reason = Some("action_failed");
+                    break;
+                }
+                completed += 1;
+            }
+        }
+    }
+    json!({
+        "accepted": aborted_at.is_none(),
+        "session_path": session,
+        "native_id": native_id,
+        "generation": handle.generation,
+        "requested": total,
+        "completed": completed,
+        "actions": results,
+        // `null` when the whole batch ran. An index names the action the batch
+        // stopped AT (that action did not run when the reason is `preempted`).
+        "aborted_at": aborted_at,
+        "abort_reason": abort_reason,
+    })
 }
 
 #[cfg(test)]
@@ -48253,6 +48463,124 @@ mod web_do_verb_tests {
             "[document.querySelector(\"#a\"),document.querySelector(\"#b\")]"
         );
         assert!(web_do_refs_array_js(&[]).is_empty() || web_do_refs_array_js(&[]) == "[]");
+    }
+
+    // THE BATCH LOCK, gate half. Twenty sequential verbs under the ONE agent
+    // identity production is actually stuck with — `resolve_agent_identity`
+    // reads the GUI process's own argv, so every verb that GUI will ever serve
+    // carries `"anonymous"` — must every one of them be admitted.
+    //
+    // This is the exact shape of the single-shot `do` defect: verb 1 landed and
+    // verbs 2..N were all refused `preempted`, because the agent's own
+    // injection was booked as the human and a per-process batch id, once
+    // preempted, is refused forever. The engine half of the lock
+    // (`twenty_injections_never_read_as_the_human`, web_surface.rs) pins the
+    // seat-input accounting; this pins the gate that consumes it.
+    #[test]
+    fn twenty_sequential_verbs_all_admit_under_the_id_production_is_stuck_with() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        for iteration in 0..20 {
+            // The engine reports no seat input, because the injection credits
+            // absorbed our own events (that is the other half of the lock).
+            let (decision, report) = web_do_gate(
+                0,
+                iteration == 0,
+                &mut arbiter,
+                &surface,
+                &batch,
+                surface.generation,
+            );
+            assert_eq!(
+                decision,
+                GateDecision::Allowed,
+                "verb {iteration} of a batch was refused"
+            );
+            assert!(report.is_empty(), "verb {iteration} invented a preemption");
+        }
+        assert!(
+            !arbiter.is_preempted(&surface, "anonymous"),
+            "a clean run must not leave the lane preempted"
+        );
+    }
+
+    // The other side of the same gate: the human still wins, mid-run, and the
+    // rest of the batch is refused from that point on.
+    #[test]
+    fn real_seat_input_mid_run_preempts_the_rest_of_the_batch() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        // The user clicks.
+        let (decision, report) = web_do_gate(1, false, &mut arbiter, &surface, &batch, 7);
+        assert_eq!(decision, GateDecision::Preempted);
+        assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
+        // …and stays preempted until the agent re-observes.
+        assert_eq!(
+            web_do_gate(0, false, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Preempted
+        );
+        // `--new-batch` (and a batch verb, which always opens one) is the reset.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+    }
+
+    // THE ORDER inside the gate, pinned: reset FIRST, then the seat read, then
+    // admit. A count arriving with the reset is deliberately absorbed — that is
+    // the agent asserting it has re-observed the page, which is the whole
+    // contract of `--new-batch` — while input arriving AFTER the reset preempts
+    // exactly as before. Re-observing buys a fresh start, never immunity.
+    #[test]
+    fn a_reset_absorbs_the_count_it_arrives_with_but_not_the_next_one() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        assert_eq!(
+            web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Preempted
+        );
+        // Re-observed: the lane reopens even though a stale count is reported
+        // in the same tick (it is the agent's own leftover, not a new gesture).
+        assert_eq!(
+            web_do_gate(1, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
+        );
+        // The very next real gesture still wins.
+        assert_eq!(
+            web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Preempted
+        );
+    }
+
+    // A verb aimed at an incarnation that no longer exists is refused, not
+    // silently retargeted at whatever page is there now (F3).
+    #[test]
+    fn a_gate_on_a_rebuilt_surface_reports_stale_rather_than_admitting() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+        assert_eq!(
+            web_do_gate(0, false, &mut arbiter, &surface, &batch, 9).0,
+            GateDecision::StaleSurface
+        );
     }
 
     // C4: every addressing shape must produce a matcher, and the CSS shape must
@@ -53721,6 +54049,44 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceBatch {
+            session_path,
+            actions,
+            generation,
+            stop_on_error,
+        } => {
+            let data = web_surface_batch_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &actions,
+                generation,
+                stop_on_error,
+            )
+            .await;
+            let error = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then_some(None)
+                .unwrap_or_else(|| {
+                    Some(
+                        data.get("abort_reason")
+                            .and_then(Value::as_str)
+                            .or_else(|| data.get("reason").and_then(Value::as_str))
+                            .unwrap_or("web batch did not complete")
+                            .to_string(),
+                    )
+                });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error,
             }
         }
         AppControlCommand::WebSurfaceRead { session_path, mode } => {
