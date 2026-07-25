@@ -183,8 +183,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebElementRef,
-    WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
+    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
+    WebElementRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -48861,6 +48861,24 @@ mod web_do_verb_tests {
         assert!(js.contains("toDataURL"), "{js}");
     }
 
+    // C1: the trace and the response name DOMAINS, never cookies. A jar is
+    // credentials, and a trace file is not where they belong.
+    #[test]
+    fn cookie_reporting_names_domains_and_never_values() {
+        use crate::netscape_cookie_jar::parse_netscape_jar;
+        let jar = "#HttpOnly_rtionline.gov.in\tFALSE\t/\tTRUE\t0\tPHPSESSID\tq7v2n8m4k1\n\
+                   .gov.in\tTRUE\t/\tFALSE\t0\tlang\ten-IN\n\
+                   rtionline.gov.in\tFALSE\t/\tTRUE\t0\tcsrf\tabc\n";
+        let specs = parse_netscape_jar(jar).unwrap();
+        let domains = cookie_domains(&specs);
+        // Deduplicated and sorted — a report a human can scan, and stable
+        // across runs.
+        assert_eq!(domains, vec![".gov.in", "rtionline.gov.in"]);
+        let rendered = serde_json::to_string(&domains).unwrap();
+        assert!(!rendered.contains("q7v2n8m4k1"), "a value reached the report");
+        assert!(!rendered.contains("PHPSESSID"), "a cookie name reached the report");
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -49982,6 +50000,218 @@ async fn web_surface_capture_element_for(
         }
     }
     answer
+}
+
+/// App-control `cookies`: move a session's web-surface jar to or from a Netscape
+/// file.
+///
+/// This is the verb that makes an agent's flow SPLITTABLE — script the
+/// mechanical parts on curl, hand the session to a surface for the one step
+/// that genuinely needs a browser, hand it back. It was proven both necessary
+/// and sufficient in the field: transplanting one PHPSESSID into a browser made
+/// rtionline render the applicant's name and the fee.
+///
+/// ⚠ THE PROFILE. The cookie manager belongs to the surface's `WebContext`,
+/// which is its PROFILE, and a surface with no explicit profile is `default` —
+/// the user's own browsing jar. Nothing here can make that safe, so the answer
+/// always REPORTS which profile was written, and the trace records domains and
+/// counts and never a value.
+async fn web_surface_cookies_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    direction: WebCookieDirection,
+    jar_path: &str,
+) -> Value {
+    use crate::netscape_cookie_jar::{CookieSpec, format_netscape_jar, parse_netscape_jar};
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let profile = web_surface_active_profile(state, &session).unwrap_or_default();
+    let path = std::path::PathBuf::from(jar_path);
+    match direction {
+        WebCookieDirection::Import => {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": format!("read {}: {error}", path.display()),
+                    });
+                }
+            };
+            let specs = match parse_netscape_jar(&text) {
+                Ok(specs) => specs,
+                Err(reason) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": format!("bad_jar: {reason}"),
+                    });
+                }
+            };
+            let domains = cookie_domains(&specs);
+            let records: Vec<dioxus::desktop::CookieRecord> = specs
+                .iter()
+                .map(|spec| dioxus::desktop::CookieRecord {
+                    name: spec.name.clone(),
+                    value: spec.value.clone(),
+                    domain: spec.domain.clone(),
+                    path: spec.path.clone(),
+                    expires_unix: spec.expires_unix,
+                    secure: spec.secure,
+                    http_only: spec.http_only,
+                })
+                .collect();
+            let requested = records.len();
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+            if let Err(reason) = desktop.import_web_surface_cookies(native_id, records, move |outcome| {
+                let _ = tx.send(outcome);
+            }) {
+                return json!({ "accepted": false, "session_path": session, "reason": reason });
+            }
+            let added = match tokio::time::timeout(Duration::from_secs(20), rx).await {
+                Ok(Ok(Ok(added))) => added,
+                Ok(Ok(Err(reason))) => {
+                    return json!({ "accepted": false, "session_path": session, "reason": reason });
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie import callback dropped (surface destroyed?)",
+                    });
+                }
+                Err(_) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie import timed out (20s)",
+                    });
+                }
+            };
+            // Domains and counts. NEVER a name/value pair — a jar is
+            // credentials, and a trace file is not where they belong.
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "web_surface",
+                    "cookies_imported",
+                    json!({
+                        "session_path": session,
+                        "profile": profile,
+                        "count": added,
+                        "domains": domains,
+                    }),
+                );
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "direction": "import",
+                // WHICH JAR was written. An agent that meant to drive an
+                // `agent-N` profile and finds `default` here has just written
+                // the user's own browsing jar, and needs to know immediately.
+                "profile": profile,
+                "requested": requested,
+                "count": added,
+                "domains": domains,
+                "jar_path": path.to_string_lossy(),
+            })
+        }
+        WebCookieDirection::Export => {
+            let (tx, rx) =
+                tokio::sync::oneshot::channel::<Result<Vec<dioxus::desktop::CookieRecord>, String>>();
+            if let Err(reason) = desktop.export_web_surface_cookies(native_id, move |outcome| {
+                let _ = tx.send(outcome);
+            }) {
+                return json!({ "accepted": false, "session_path": session, "reason": reason });
+            }
+            let records = match tokio::time::timeout(Duration::from_secs(20), rx).await {
+                Ok(Ok(Ok(records))) => records,
+                Ok(Ok(Err(reason))) => {
+                    return json!({ "accepted": false, "session_path": session, "reason": reason });
+                }
+                Ok(Err(_)) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie export callback dropped (surface destroyed?)",
+                    });
+                }
+                Err(_) => {
+                    return json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "cookie export timed out (20s)",
+                    });
+                }
+            };
+            let specs: Vec<CookieSpec> = records
+                .into_iter()
+                .map(|record| CookieSpec {
+                    name: record.name,
+                    value: record.value,
+                    domain: record.domain,
+                    path: record.path,
+                    expires_unix: record.expires_unix,
+                    secure: record.secure,
+                    http_only: record.http_only,
+                })
+                .collect();
+            let domains = cookie_domains(&specs);
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": format!("create {}: {error}", parent.display()),
+                });
+            }
+            if let Err(error) = std::fs::write(&path, format_netscape_jar(&specs)) {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": format!("write {}: {error}", path.display()),
+                });
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "direction": "export",
+                "profile": profile,
+                "count": specs.len(),
+                "domains": domains,
+                "jar_path": path.to_string_lossy(),
+                // SAY WHAT THIS IS NOT. WebKitGTK 4.x has no dump-the-whole-jar
+                // API: `cookies()` is per-URI and libsoup enforces the cookie's
+                // path against it, so this is every ROOT-PATH cookie of every
+                // domain the jar knows, and path-scoped cookies are missing.
+                // Implying completeness would be the lie; reading the on-disk
+                // sqlite jar to close the gap would be a second encoding of the
+                // cookie store and blind to unflushed in-memory state.
+                "export_scope": "root_path_per_domain",
+            })
+        }
+    }
+}
+
+/// The domains a jar touches, deduplicated and sorted. Reported and journalled
+/// instead of the cookies themselves — it is the part a human needs to sanity
+/// check ("did I just write my bank cookie into the wrong profile?") and it
+/// carries no credential. PURE.
+fn cookie_domains(specs: &[crate::netscape_cookie_jar::CookieSpec]) -> Vec<String> {
+    let mut domains: Vec<String> = specs.iter().map(|spec| spec.domain.clone()).collect();
+    domains.sort();
+    domains.dedup();
+    domains
 }
 
 /// App-control: full-document PNG capture of a session's active web-surface
@@ -54791,6 +55021,38 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceCookies {
+            session_path,
+            direction,
+            jar_path,
+        } => {
+            let data = web_surface_cookies_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                direction,
+                &jar_path,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: (accepted && direction == WebCookieDirection::Export)
+                    .then(|| jar_path.clone()),
+                data: Some(data.clone()),
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cookies verb failed")
+                        .to_string()
+                }),
             }
         }
         AppControlCommand::WebSurfaceCaptureElement {
