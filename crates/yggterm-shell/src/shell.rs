@@ -48602,6 +48602,138 @@ async fn web_surface_do_for(
     }
 }
 
+/// The bookkeeping of ONE `web batch` run: the mid-batch human-abort decision
+/// and the envelope's counts, extracted from `web_surface_batch_for` so both
+/// are drivable with no webview.
+///
+/// Why it is a struct rather than three locals in the loop: the abort decision
+/// (`index > 0 && seat_input > 0`) is the single behaviour that makes it safe to
+/// hand an agent N injections behind one gate, and while it lived inline it had
+/// NO coverage — the batch tests all drove `web_do_gate`, which the loop never
+/// calls. Now the loop is a thin driver over this, and a test feeds it the REAL
+/// seat-input accounting from the engine.
+#[derive(Debug)]
+struct WebBatchTally {
+    total: usize,
+    stop_on_error: bool,
+    results: Vec<Value>,
+    succeeded: usize,
+    failed: usize,
+    aborted_at: Option<usize>,
+    abort_reason: Option<&'static str>,
+}
+
+/// What the tally says to do with the action at `index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchStep {
+    /// Run it.
+    Run,
+    /// The human took the surface; the batch stops HERE and this action does
+    /// not run. `remaining` is what the agent planned and will not get.
+    AbortPreempted { remaining: usize },
+}
+
+impl WebBatchTally {
+    fn new(total: usize, stop_on_error: bool) -> Self {
+        Self {
+            total,
+            stop_on_error,
+            results: Vec::with_capacity(total),
+            succeeded: 0,
+            failed: 0,
+            aborted_at: None,
+            abort_reason: None,
+        }
+    }
+
+    /// Called BEFORE each action with the seat-input count consumed for it.
+    ///
+    /// Index 0 is exempt because the gate that opened the lane already consumed
+    /// (and judged) the count for it — asking twice would re-read a counter
+    /// that is by then always zero. From index 1 on, a non-zero count is
+    /// unambiguously the user: the injector's own events are excluded at the
+    /// webview layer by the injection credits.
+    fn step(&mut self, index: usize, seat_input_count: u64) -> BatchStep {
+        if index > 0 && seat_input_count > 0 {
+            let remaining = self.total.saturating_sub(index);
+            self.aborted_at = Some(index);
+            self.abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
+            return BatchStep::AbortPreempted { remaining };
+        }
+        BatchStep::Run
+    }
+
+    fn record_ok(&mut self, index: usize, mut detail: Value) {
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert("index".to_string(), json!(index));
+            obj.insert("accepted".to_string(), Value::Bool(true));
+        }
+        self.results.push(detail);
+        self.succeeded += 1;
+    }
+
+    /// Record a FAILED action. Returns whether the batch keeps going.
+    ///
+    /// A failure is counted as failed and never as progress — the defect this
+    /// replaces incremented one `completed` counter on both arms, so a 31-field
+    /// fill in which all 31 selectors missed answered
+    /// `accepted: true, completed: 31` and an agent reading the envelope
+    /// concluded the form was filled.
+    fn record_err(&mut self, index: usize, reason: impl serde::Serialize) -> bool {
+        self.results.push(json!({
+            "index": index,
+            "accepted": false,
+            "reason": reason,
+        }));
+        self.failed += 1;
+        if self.stop_on_error {
+            self.aborted_at = Some(index);
+            self.abort_reason = Some("action_failed");
+            return false;
+        }
+        true
+    }
+
+    /// `accepted` for the WHOLE batch: the batch ran to the end AND every
+    /// action it attempted succeeded.
+    ///
+    /// Deliberately strict. `accepted` is the one field a caller that does not
+    /// walk `actions[]` will read, so it must never be true for a run that
+    /// delivered nothing. A partial success is `accepted: false` with
+    /// `succeeded`/`failed` telling the caller exactly how far it got.
+    fn accepted(&self) -> bool {
+        self.aborted_at.is_none() && self.failed == 0
+    }
+
+    /// How many actions actually ran (succeeded + failed). Never the same
+    /// number as `succeeded` unless nothing failed — that conflation was the
+    /// defect.
+    fn attempted(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    fn envelope(self, session: String, native_id: u64, generation: u64) -> Value {
+        json!({
+            "accepted": self.accepted(),
+            "session_path": session,
+            "native_id": native_id,
+            "generation": generation,
+            "requested": self.total,
+            // The three counts are separate on purpose: `attempted` is how far
+            // the loop got, `succeeded`/`failed` is what came of it.
+            "attempted": self.attempted(),
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "actions": self.results,
+            // `null` when the whole batch ran. An index names the action the
+            // batch stopped AT (that action did not run when the reason is
+            // `preempted`).
+            "aborted_at": self.aborted_at,
+            "abort_reason": self.abort_reason,
+        })
+    }
+}
+
 /// App-control `batch`: ONE explicitly-opened agent batch, N actions, closed by
 /// the agent finishing or by GENUINE seat input.
 ///
@@ -48612,12 +48744,19 @@ async fn web_surface_do_for(
 /// a single `do` runs (`web_do_execute_one`), so a batched action and a lone
 /// action can never behave differently.
 ///
-/// What a batch does NOT buy the agent: immunity. Between every action the
-/// surface's seat-input counter is re-read, and a non-zero count ABORTS the
-/// remainder and journals `preempted` with `trigger: "human_input"` and
-/// `remaining: n`. The human wins mid-batch, not merely at the next CLI
-/// invocation — which is the whole reason it is safe to hand an agent twenty
-/// injections behind one gate.
+/// What a batch does NOT buy the agent: immunity, at either end. The gate that
+/// opens the lane reads seat input BEFORE the reset, so a click that landed
+/// before the batch started refuses it outright rather than being absorbed by
+/// the reset this verb performs on the agent's behalf. And between every later
+/// action the surface's seat-input counter is re-read, and a non-zero count
+/// ABORTS the remainder and journals `preempted` with `trigger: "human_input"`
+/// and `remaining: n`. The human wins at the batch's start AND mid-run, not
+/// merely at the next CLI invocation — which is the whole reason it is safe to
+/// hand an agent twenty injections behind one gate.
+///
+/// The envelope is strict about what it delivered: `accepted` is true only when
+/// the batch ran to the end AND every action succeeded. See
+/// [`WebBatchTally::accepted`].
 async fn web_surface_batch_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -48634,76 +48773,53 @@ async fn web_surface_batch_for(
         });
     }
     // A batch is by definition a fresh run of agent work, so it opens its own
-    // lane — the same assertion `--new-batch` makes for a single verb.
+    // lane — the same assertion `--new-batch` makes for a single verb. That
+    // reset does NOT outrank the seat: `web_do_gate` reads seat input first, so
+    // a gesture waiting here refuses the batch.
     let (session, handle) =
         match web_do_open_lane(state, desktop, session_path, expected_generation, true).await {
             Ok(resolved) => resolved,
             Err(refusal) => return refusal,
         };
     let native_id = handle.native_id;
-    let total = actions.len();
-    let mut results: Vec<Value> = Vec::with_capacity(total);
-    let mut completed = 0usize;
-    let mut aborted_at: Option<usize> = None;
-    let mut abort_reason: Option<&'static str> = None;
+    let mut tally = WebBatchTally::new(actions.len(), stop_on_error);
 
     for (index, action) in actions.iter().enumerate() {
         // Re-read seat input BEFORE each action after the first. The counter is
         // consumed by the read, and the injector's own events are excluded at
         // the webview layer by the injection credits, so a non-zero count here
-        // is unambiguously the user.
-        if index > 0 && desktop.take_web_surface_seat_input(native_id) > 0 {
+        // is unambiguously the user. The DECISION lives in `WebBatchTally::step`
+        // so it can be driven by a test against the real accounting.
+        let seat_input = if index > 0 {
+            desktop.take_web_surface_seat_input(native_id)
+        } else {
+            0
+        };
+        if let BatchStep::AbortPreempted { remaining } = tally.step(index, seat_input) {
             let report = note_human_input_on_web_surface(&session, handle.generation);
             journal_web_surface_preempt(
                 &session,
                 handle.generation,
                 &report,
                 "human_input",
-                Some(total - index),
+                Some(remaining),
             );
-            aborted_at = Some(index);
-            abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
             break;
         }
         let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
         match result {
             Ok(mut detail) => {
-                if let Some(obj) = detail.as_object_mut() {
-                    obj.insert("index".to_string(), json!(index));
-                    obj.insert("accepted".to_string(), Value::Bool(true));
-                }
                 web_do_apply_delivery(&mut detail, delivery);
-                results.push(detail);
-                completed += 1;
+                tally.record_ok(index, detail);
             }
             Err(reason) => {
-                results.push(json!({
-                    "index": index,
-                    "accepted": false,
-                    "reason": reason,
-                }));
-                if stop_on_error {
-                    aborted_at = Some(index);
-                    abort_reason = Some("action_failed");
+                if !tally.record_err(index, reason) {
                     break;
                 }
-                completed += 1;
             }
         }
     }
-    json!({
-        "accepted": aborted_at.is_none(),
-        "session_path": session,
-        "native_id": native_id,
-        "generation": handle.generation,
-        "requested": total,
-        "completed": completed,
-        "actions": results,
-        // `null` when the whole batch ran. An index names the action the batch
-        // stopped AT (that action did not run when the reason is `preempted`).
-        "aborted_at": aborted_at,
-        "abort_reason": abort_reason,
-    })
+    tally.envelope(session, native_id, handle.generation)
 }
 
 #[cfg(test)]
@@ -48816,21 +48932,40 @@ mod web_do_verb_tests {
     // This is the exact shape of the single-shot `do` defect: verb 1 landed and
     // verbs 2..N were all refused `preempted`, because the agent's own
     // injection was booked as the human and a per-process batch id, once
-    // preempted, is refused forever. The engine half of the lock
-    // (`twenty_injections_never_read_as_the_human`, web_surface.rs) pins the
-    // seat-input accounting; this pins the gate that consumes it.
+    // preempted, is refused forever.
+    //
+    // IT DRIVES THE REAL SEAT COUNT. An earlier version of this test passed a
+    // literal `0` to the gate, which SYNTHESIZED THE DEFECT AWAY — the whole
+    // bug was that the number arriving at the gate was 1 — so it asserted only
+    // that `admit` is idempotent, and it passed with the engine fix fully
+    // reverted. Here each iteration performs the injection the way production
+    // does (`grant_injection_credits` + the observer's `note_seat_input`) and
+    // the gate is fed whatever `take_seat_input_count` ACTUALLY produces.
+    // Revert `spend_injection_credit` (web_surface.rs) to `false` and this
+    // fails at iteration 0.
     #[test]
     fn twenty_sequential_verbs_all_admit_under_the_id_production_is_stuck_with() {
         use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        // The seat-input tally is keyed by native surface id and is
+        // thread-local, so a test thread owns its own.
+        let native_id = 91_001;
+        take_seat_input_count(native_id);
         let mut arbiter = AgentInputArbiter::new();
         let surface = SurfaceKey::new("web://session-a", 7);
         let batch = AgentBatch::new("anonymous");
 
         for iteration in 0..20 {
-            // The engine reports no seat input, because the injection credits
-            // absorbed our own events (that is the other half of the lock).
+            // The verb injects one event, and the observer sees it AFTER the
+            // lexical delivery scope closed — the queued-delivery shape that
+            // produced the bug. The credit is what must absorb it.
+            grant_injection_credits(native_id, 1);
+            note_seat_input(native_id);
+
+            let seat_input = take_seat_input_count(native_id);
             let (decision, report) = web_do_gate(
-                0,
+                seat_input,
                 iteration == 0,
                 &mut arbiter,
                 &surface,
@@ -48840,7 +48975,7 @@ mod web_do_verb_tests {
             assert_eq!(
                 decision,
                 GateDecision::Allowed,
-                "verb {iteration} of a batch was refused"
+                "verb {iteration} of a batch was refused with seat_input={seat_input}"
             );
             assert!(report.is_empty(), "verb {iteration} invented a preemption");
         }
@@ -48848,6 +48983,181 @@ mod web_do_verb_tests {
             !arbiter.is_preempted(&surface, "anonymous"),
             "a clean run must not leave the lane preempted"
         );
+
+        // …and the human is still heard after all that throughput.
+        note_seat_input(native_id);
+        let seat_input = take_seat_input_count(native_id);
+        assert_eq!(seat_input, 1, "a real gesture after 20 injections must count");
+        assert_eq!(
+            web_do_gate(
+                seat_input,
+                false,
+                &mut arbiter,
+                &surface,
+                &batch,
+                surface.generation
+            )
+            .0,
+            GateDecision::Preempted
+        );
+    }
+
+    // THE BATCH LOCK, LOOP half — the one that was missing entirely.
+    //
+    // Every C7 test drove `web_do_gate`, which the batch loop never calls. The
+    // decision that actually makes it safe to hand an agent twenty injections
+    // behind one gate is the loop's per-action re-read, and it had NO coverage.
+    // This drives `WebBatchTally::step` with the REAL engine accounting, one
+    // injection per action, exactly as `web_surface_batch_for` does.
+    //
+    // Revert `spend_injection_credit` to `false` and action 1 aborts, because
+    // action 0's own injection is read back as the human.
+    #[test]
+    fn a_batch_of_twenty_injections_never_aborts_itself() {
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        let native_id = 91_002;
+        take_seat_input_count(native_id);
+        let mut tally = WebBatchTally::new(20, false);
+
+        for index in 0..20 {
+            // Index 0's count was consumed by the gate that opened the lane;
+            // from 1 on the loop re-reads before each action.
+            let seat_input = if index > 0 {
+                take_seat_input_count(native_id)
+            } else {
+                0
+            };
+            assert_eq!(
+                tally.step(index, seat_input),
+                BatchStep::Run,
+                "action {index} aborted itself with seat_input={seat_input}"
+            );
+            grant_injection_credits(native_id, 1);
+            note_seat_input(native_id);
+            tally.record_ok(index, json!({"delivered": true}));
+        }
+
+        let envelope = tally.envelope("web://session-a".to_string(), native_id, 7);
+        assert_eq!(envelope["accepted"], json!(true));
+        assert_eq!(envelope["requested"], json!(20));
+        assert_eq!(envelope["succeeded"], json!(20));
+        assert_eq!(envelope["failed"], json!(0));
+        assert_eq!(envelope["aborted_at"], Value::Null);
+    }
+
+    // …and the other half of the same loop: ONE real click mid-run stops the
+    // rest. This is the promise `web batch` is sold on ("the human still wins
+    // mid-batch"), and it is asserted here against the real accounting rather
+    // than against a hand-written count.
+    #[test]
+    fn a_real_click_mid_batch_aborts_the_remainder() {
+        use dioxus_desktop::{grant_injection_credits, note_seat_input, take_seat_input_count};
+
+        let native_id = 91_003;
+        take_seat_input_count(native_id);
+        let mut tally = WebBatchTally::new(20, false);
+        let mut aborted = None;
+
+        for index in 0..20 {
+            if index == 7 {
+                // The user clicks. No credit is granted for it, which is the
+                // ONLY thing that distinguishes it from our own injections.
+                note_seat_input(native_id);
+            }
+            let seat_input = if index > 0 {
+                take_seat_input_count(native_id)
+            } else {
+                0
+            };
+            match tally.step(index, seat_input) {
+                BatchStep::Run => {
+                    grant_injection_credits(native_id, 1);
+                    note_seat_input(native_id);
+                    tally.record_ok(index, json!({"delivered": true}));
+                }
+                BatchStep::AbortPreempted { remaining } => {
+                    aborted = Some((index, remaining));
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            aborted,
+            Some((7, 13)),
+            "the click must stop the batch AT action 7, with 13 unrun"
+        );
+        let envelope = tally.envelope("web://session-a".to_string(), native_id, 7);
+        assert_eq!(envelope["accepted"], json!(false));
+        assert_eq!(envelope["aborted_at"], json!(7));
+        assert_eq!(envelope["abort_reason"], json!("preempted"));
+        assert_eq!(
+            envelope["succeeded"],
+            json!(7),
+            "the seven that ran before the click still count"
+        );
+        assert_eq!(envelope["attempted"], json!(7));
+    }
+
+    // F4: a batch whose actions ALL failed is not a batch that succeeded.
+    //
+    // With the documented default `stop_on_error: false`, a 31-field form fill
+    // in which every selector missed used to answer
+    // `accepted: true, completed: 31` — one counter incremented on both arms —
+    // so an agent reading the envelope concluded the form was filled.
+    #[test]
+    fn a_batch_reports_succeeded_and_failed_apart_and_is_not_accepted_when_nothing_landed() {
+        let mut tally = WebBatchTally::new(31, false);
+        for index in 0..31 {
+            assert_eq!(tally.step(index, 0), BatchStep::Run);
+            assert!(
+                tally.record_err(index, json!("no_such_element")),
+                "stop_on_error:false keeps going"
+            );
+        }
+        let envelope = tally.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(
+            envelope["accepted"],
+            json!(false),
+            "31 misses must never read as a filled form"
+        );
+        assert_eq!(envelope["requested"], json!(31));
+        assert_eq!(envelope["attempted"], json!(31));
+        assert_eq!(envelope["succeeded"], json!(0));
+        assert_eq!(envelope["failed"], json!(31));
+        // It ran to the end, so it was not aborted — `accepted` is NOT a
+        // synonym for "not aborted", which is exactly the conflation fixed.
+        assert_eq!(envelope["aborted_at"], Value::Null);
+
+        // A partial batch is also not `accepted`, and says how far it got.
+        let mut partial = WebBatchTally::new(3, false);
+        partial.step(0, 0);
+        partial.record_ok(0, json!({}));
+        partial.step(1, 0);
+        partial.record_err(1, json!("no_such_element"));
+        partial.step(2, 0);
+        partial.record_ok(2, json!({}));
+        let envelope = partial.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(envelope["accepted"], json!(false));
+        assert_eq!(envelope["succeeded"], json!(2));
+        assert_eq!(envelope["failed"], json!(1));
+        assert_eq!(envelope["attempted"], json!(3));
+
+        // `stop_on_error: true` still stops, and names why.
+        let mut halting = WebBatchTally::new(3, true);
+        halting.step(0, 0);
+        halting.record_ok(0, json!({}));
+        halting.step(1, 0);
+        assert!(
+            !halting.record_err(1, json!("no_such_element")),
+            "stop_on_error:true must halt the loop"
+        );
+        let envelope = halting.envelope("web://session-a".to_string(), 5, 1);
+        assert_eq!(envelope["aborted_at"], json!(1));
+        assert_eq!(envelope["abort_reason"], json!("action_failed"));
+        assert_eq!(envelope["attempted"], json!(2));
+        assert_eq!(envelope["accepted"], json!(false));
     }
 
     // The other side of the same gate: the human still wins, mid-run, and the
