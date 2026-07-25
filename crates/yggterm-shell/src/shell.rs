@@ -3377,6 +3377,45 @@ fn web_surface_internal_page_label(url: &str) -> Option<&'static str> {
 struct WebSurfaceHandle {
     native_id: u64,
     generation: u64,
+    /// Shown in the overlay right now.
+    visible: bool,
+    /// Soft-stashed: alive and addressable, detached from the overlay while
+    /// its session is backgrounded. Sharpens the note below — a PRESENT entry
+    /// can still be one nobody is looking at, and telling those apart is the
+    /// difference between "3 surfaces cost this much" and "3 surfaces cost
+    /// this much while 2 of them are off-screen".
+    stashed: bool,
+}
+
+/// Realized web surfaces, counted by what they are DOING. Distinct from
+/// `ShellState.web_surfaces`, which is the DESIRED state keyed by session (one
+/// entry however many tabs) — the render cost belongs to the realized
+/// webviews, not to the wish for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebSurfaceAppliedCounts {
+    total: usize,
+    visible: usize,
+    stashed: usize,
+}
+
+fn web_surface_applied_counts(
+    handles: &HashMap<(String, u64), WebSurfaceHandle>,
+) -> WebSurfaceAppliedCounts {
+    WebSurfaceAppliedCounts {
+        total: handles.len(),
+        visible: handles.values().filter(|handle| handle.visible).count(),
+        stashed: handles.values().filter(|handle| handle.stashed).count(),
+    }
+}
+
+/// Counts from the reconciler's own publication — never recomputed from
+/// `ShellState`, which does not know what was actually realized.
+fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
+    WEB_SURFACE_NATIVE_IDS
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .map(|handles| web_surface_applied_counts(&handles))
+        .unwrap_or_default()
 }
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
 /// so a generation identifies an incarnation on its own — a stale handle can
@@ -3408,6 +3447,8 @@ fn publish_web_surface_native_ids(applied: &HashMap<(String, u64), AppliedWebSur
                 WebSurfaceHandle {
                     native_id: entry.native_id,
                     generation: entry.generation,
+                    visible: entry.visible,
+                    stashed: entry.stashed_at_ms.is_some(),
                 },
             )
         }));
@@ -20806,6 +20847,54 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
     });
 }
 
+/// The half of the render-probe context that comes from `ShellState`, lifted
+/// out of the loop so the payload below is assertable at all — inside a
+/// `spawn`ed `json!` it was unreachable from a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderProbeShellContext {
+    web_surface_sessions: usize,
+    live_sessions: usize,
+    /// The PHYSICAL fact, not `effective_window_focused()`. The CPU number has
+    /// to be read against whether a human could actually see the window; the
+    /// effective variant folds in the app-control override, which is a
+    /// different question and is reported separately below.
+    window_focused: bool,
+    force_foreground: bool,
+    app_control_backgrounded: bool,
+}
+
+fn render_probe_shell_context(shell: &ShellState) -> RenderProbeShellContext {
+    RenderProbeShellContext {
+        web_surface_sessions: shell.web_surfaces.len(),
+        live_sessions: shell.server.live_session_views().len(),
+        window_focused: shell.window_focused,
+        force_foreground: shell.app_control_force_foreground,
+        app_control_backgrounded: shell.app_control_backgrounded,
+    }
+}
+
+/// What the kernel cannot know, attached to every render sample.
+///
+/// `web_surfaces` and `live_sessions` keep their names and meanings: guihost's log
+/// already carries them and the §3a baseline is read against them. The realized
+/// counts are ADDED alongside — a session with three tabs is one `web_surfaces`
+/// entry and three `web_surface_views`, and the CPU belongs to the three.
+fn render_probe_context(
+    shell: &RenderProbeShellContext,
+    surfaces: WebSurfaceAppliedCounts,
+) -> Value {
+    json!({
+        "web_surfaces": shell.web_surface_sessions,
+        "live_sessions": shell.live_sessions,
+        "web_surface_views": surfaces.total,
+        "web_surface_views_visible": surfaces.visible,
+        "web_surface_views_stashed": surfaces.stashed,
+        "window_focused": shell.window_focused,
+        "force_foreground": shell.force_foreground,
+        "app_control_backgrounded": shell.app_control_backgrounded,
+    })
+}
+
 /// Continuously sample what the GUI and its WebKit children actually burn.
 ///
 /// This closes the instrument gap the optimization pass was blocked on: the perf plane
@@ -20819,6 +20908,11 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
 ///    manufacture the very cost it exists to measure. Reads only.
 /// 2. **The `/proc` walk happens off the UI thread** (`spawn_blocking`), because it
 ///    opens several files per process in the tree.
+///
+/// The tick sleeps FIRST and the first `observe` produces nothing by design (with no
+/// previous observation the only number available is a lifetime average), so at a
+/// 60 s interval the first render event lands at t ≈ 120 s after GUI start. A freshly
+/// deployed GUI whose log has no render row yet is not evidence of anything.
 fn spawn_render_probe_loop(state: Signal<ShellState>) {
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
@@ -20827,13 +20921,9 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
         loop {
             sleep(Duration::from_millis(RENDER_PROBE_INTERVAL_MS)).await;
             // Read-only peek: `closing_app` plus the context the kernel cannot know.
-            let Some((closing, web_surfaces, live_sessions)) =
+            let Some((closing, shell_context)) =
                 safe_shell_read(state, "render_probe_context", |shell| {
-                    (
-                        shell.closing_app,
-                        shell.web_surfaces.len(),
-                        shell.server.live_session_views().len(),
-                    )
+                    (shell.closing_app, render_probe_shell_context(shell))
                 })
             else {
                 continue;
@@ -20841,6 +20931,10 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             if closing {
                 return;
             }
+            // Outside the ShellState read on purpose: the publication takes its
+            // own lock, and nesting it under the signal read is how a deadlock
+            // gets built by accident.
+            let surfaces = published_web_surface_counts();
             // Cheap atomic; the profiling toggle can flip at runtime and an off
             // profiler should cost nothing at all.
             if !yggterm_core::perf_profiling_enabled() {
@@ -20863,10 +20957,7 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             yggterm_core::render_probe::emit_render_role_events(
                 &perf_home,
                 &rollups,
-                &json!({
-                    "web_surfaces": web_surfaces,
-                    "live_sessions": live_sessions,
-                }),
+                &render_probe_context(&shell_context, surfaces),
             );
         }
     });
@@ -47843,6 +47934,8 @@ mod web_do_verb_tests {
         let handle = WebSurfaceHandle {
             native_id: 7,
             generation: 42,
+            visible: true,
+            stashed: false,
         };
         assert!(web_surface_stale_handle(None, handle).is_none());
         assert!(web_surface_stale_handle(Some(42), handle).is_none());
@@ -101852,6 +101945,76 @@ mod tests {
         // pinned pane wins — one webview cannot sit at two rects.
         assert_eq!(web_surface_tab_place_rect(pinned, page, 2, 2), pinned);
         assert_eq!(web_surface_tab_place_rect(None, None, 2, 2), None);
+    }
+
+    #[test]
+    fn web_surface_applied_counts_split_visible_from_stashed() {
+        let handle = |native_id: u64, visible: bool, stashed: bool| WebSurfaceHandle {
+            native_id,
+            generation: native_id,
+            visible,
+            stashed,
+        };
+        let mut handles = HashMap::new();
+        handles.insert(("local://a".to_string(), 1), handle(1, true, false));
+        handles.insert(("local://a".to_string(), 2), handle(2, false, true));
+        handles.insert(("local://b".to_string(), 1), handle(3, false, true));
+
+        let counts = web_surface_applied_counts(&handles);
+
+        assert_eq!(counts.total, 3, "two sessions, three realized webviews");
+        assert_eq!(counts.visible, 1);
+        assert_eq!(
+            counts.stashed, 2,
+            "soft-stashed surfaces stay alive and cost CPU; that is the whole point of              counting them apart"
+        );
+        assert_eq!(
+            web_surface_applied_counts(&HashMap::new()),
+            WebSurfaceAppliedCounts::default()
+        );
+    }
+
+    #[test]
+    fn render_probe_context_reports_realized_views_not_just_sessions() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/".to_string(),
+            Some("app".to_string()),
+            "http://localhost:8000/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            false,
+            0,
+        );
+        shell.window_focused = false;
+        shell.app_control_backgrounded = true;
+
+        let context = render_probe_context(
+            &render_probe_shell_context(&shell),
+            WebSurfaceAppliedCounts {
+                total: 3,
+                visible: 1,
+                stashed: 2,
+            },
+        );
+
+        // The legacy keys keep their meaning — guihost's log already carries them
+        // and the §3a baseline is read against them.
+        assert_eq!(context.get("web_surfaces"), Some(&json!(1)));
+        assert!(context.get("live_sessions").is_some());
+        // …and the realized counts are what the CPU actually belongs to: one
+        // desired surface, three webviews, two of them off-screen.
+        assert_eq!(context.get("web_surface_views"), Some(&json!(3)));
+        assert_eq!(context.get("web_surface_views_visible"), Some(&json!(1)));
+        assert_eq!(context.get("web_surface_views_stashed"), Some(&json!(2)));
+        // The physical fact, not `effective_window_focused()` — which would
+        // read `true` here purely because app-control holds the override.
+        assert_eq!(context.get("window_focused"), Some(&json!(false)));
+        assert_eq!(context.get("app_control_backgrounded"), Some(&json!(true)));
+        assert_eq!(context.get("force_foreground"), Some(&json!(false)));
     }
 
     #[test]
