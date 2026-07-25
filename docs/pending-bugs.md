@@ -768,6 +768,55 @@ fix) once the fix is verified live on jojo.
   re-anchoring the client base can help, which is exactly what the reconcile
   does).
 
+  **★★ UPDATE 2026-07-25 — A SECOND MECHANISM IN THIS FAMILY, FOUND WITH THE
+  SHADOW LANE, ROOT-CAUSED AND FIXED. It also answers this entry's own open
+  question about the SIGWINCHes, and that answer is NOT the one guessed above.**
+  Reproduced on jojo against a live `remote-cc` session, and settled with GROUND
+  TRUTH for once: the CC transcript on the remote says `of exam manipulation`
+  and the terminal painted `uof examrnmanipulation`. Full write-up, including
+  the socket-probe recipe that measures a screen payload's true width:
+  [`docs/xterm-bugs.md#screen-model-wider-than-viewer`](xterm-bugs.md#screen-model-wider-than-viewer).
+  - **The daemon's vt100 SCREEN MODEL had drifted wider than its own PTY** —
+    model ~204 columns against a 168x63 PTY and a 168x63 viewer. Everything past
+    column 168 is a ghost from when the grid was wider, because the CLI cannot
+    paint wider than the grid it was handed.
+  - **Why that garbles rather than overflows:** the screen is serialized with
+    absolute `CSI r;cH` per row and `CSI nC` for runs of blanks. In a narrower
+    terminal each over-long row WRAPS, shifting every row below; the later
+    absolute jumps land on that spill, and the blank-runs skip cells instead of
+    clearing them, so the spill shows through in the gaps. Same CUF mechanism
+    this entry already names — but the wrong base is manufactured INSIDE a
+    single reconcile write, not inherited from a stream seam.
+  - **⛔ The SIGWINCH answer above is wrong.** It is not (only) that CC repaints
+    diff-wise: `TerminalSession::resize` returned `resize_noop` after comparing
+    the PTY alone, so a resize to the size the PTY already had **never touched
+    the stale model**. Two real SIGWINCHes could not have repaired it.
+  - **FIXED in three layers** (2 daemon, 1 client): the served screen is clipped
+    to the session's own PTY width at the one place it is served
+    (`screen_snapshot_clipped_to_pty_width`); the resize fast path now compares
+    the model too and repairs it (`resize_screen_model_repaired`); and the client
+    reconcile measures the payload and refuses to paint one wider than its own
+    grid (`screen_reconcile_clipped_to_viewer_width`) — which is what protects a
+    viewer attached to an OLDER daemon, the live case here.
+  - ⚠ **The client layer is GUI-only and IS deployed on jojo; the two daemon
+    layers need a daemon bump.** Until that lands, a session on a preserved
+    owner is still SERVED ghosts and only the client's clip stops them reaching
+    the screen.
+  - ⚠ **The guard has not yet refused an oversized payload LIVE.** By the time
+    the fixed GUI was up, the model had healed to 168 and the payload fitted, so
+    the guard was correctly silent. The live pair is still worth having as a
+    natural experiment — same session, same code path, model 204 → merged text,
+    model 168 → text byte-matching the transcript.
+  - ⚠ **Why it reads as intermittent:** the drift heals on any resize whose grid
+    DIFFERS from the cached one; only a resize to the size the PTY already has
+    hits the `resize_noop` hole. Same session garbles, "fixes itself" after a
+    window resize, garbles again.
+  - ★ **Method note:** this was found on a shadow client with the user's GUI
+    untouched, and the decisive step was reading the daemon's screen off the
+    socket instead of trusting any summary field. `server snapshot` is NOT that
+    instrument — for a session on a preserved owner it answers with the stale
+    stored launch seed, which looks like a healthy session with nothing wrong.
+
 - **Remote CC session stays permanently blank: `resume-cc` deadlocks before it
   launches the CLI (dev, 2026-07-20).** User-reported as "it never renders", and
   it is NOT a render bug — the xterm buffer is genuinely empty (0 non-whitespace
