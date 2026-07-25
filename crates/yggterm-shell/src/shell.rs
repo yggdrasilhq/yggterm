@@ -50384,11 +50384,12 @@ async fn reconcile_terminal_from_daemon_for(
 /// its device-px `width`/`height`, the terminal viewport's CSS-px rect
 /// (`css_left`/`css_top`/`css_width`/`css_height`) and `win_w`/`win_h` so callers
 /// can overlay it onto a full-window chrome snapshot (`overlay_terminal_canvas_layer`).
-async fn eval_active_terminal_canvas_composite() -> Value {
-    // No format!/interpolation → plain raw string (no brace-doubling needed).
-    // The value MUST be returned via dioxus.send (receive_probe_eval_value reads the
-    // send channel, NOT the script's return value) — a plain `return` hangs the recv.
-    let script = r#"
+/// The faithful-screenshot compositor, run inside the webview.
+///
+/// Named so a lock can read it: this script IS the agent's primary instrument
+/// for "what is on the terminal", and when it lies every proof built on it is
+/// worthless.
+const TERMINAL_CANVAS_COMPOSITE_SCRIPT: &str = r#"
         (() => {
             const send = (v) => { try { dioxus.send(v); } catch (_e) {} };
             try {
@@ -50408,6 +50409,31 @@ async fn eval_active_terminal_canvas_composite() -> Value {
                 // the active host — over the whole main-surface frame.
                 const visible = entries.filter(isVisible)
                     .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                // ⚠ `mountedAt` is NOT stacking order, and trusting it made this
+                // instrument LIE. A session switched back to is REVEALED, not
+                // re-mounted, so its host is the OLDEST — while the host it
+                // replaced is the newest and stays `isVisible` for a while after
+                // the switch (the retention applies visibility:hidden later).
+                // Drawing "newest last" then painted the stale host over the real
+                // one: after nine rapid switches `app screenshot` returned a
+                // near-blank frame with `capture_faithful: true`, while grim on
+                // the same client showed a perfectly painted terminal. A frame
+                // that claims to be faithful and is not is worse than no frame.
+                // The ACTIVE host is the one the eye is on, so it draws LAST.
+                const activePath = String(window.__yggtermActiveTerminalSessionPath || '');
+                const isActive = (e) => {
+                    if (!activePath) { return false; }
+                    if (String(e.sessionPath || '') === activePath) { return true; }
+                    // The switch script also stamps every host, so the answer
+                    // survives a registry entry whose sessionPath is stale.
+                    const h = document.getElementById(e.hostId);
+                    return !!h && h.getAttribute('data-active-session-host') === 'true';
+                };
+                // Draw order: non-active hosts oldest-first (so the newest of
+                // THOSE still wins among themselves, the old rule), then the
+                // active host last of all.
+                const ordered = visible.filter((e) => !isActive(e)).reverse()
+                    .concat(visible.filter(isActive));
                 if (!visible.length) { send({ ok: false, reason: 'no_terminal_host' }); return; }
                 // Frame = the main-surface body, which holds every pane. Falls
                 // back to the union of visible host rects, then to the single host.
@@ -50450,12 +50476,12 @@ async fn eval_active_terminal_canvas_composite() -> Value {
                 ctx.fillStyle = (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') ? bg : '#000000';
                 ctx.fillRect(0, 0, W, H);
                 // Draw every visible pane's canvas layers at their offset within
-                // the frame. Oldest last so the newest (focused) pane wins any
-                // overlap, matching z-order.
+                // the frame, in the order settled above: the ACTIVE host last,
+                // so it wins every overlap.
                 let drawn = 0;
                 let canvasCount = 0;
                 const paths = [];
-                for (const e of Array.from(visible).reverse()) {
+                for (const e of ordered) {
                     const host = document.getElementById(e.hostId);
                     if (!host) { continue; }
                     paths.push(String(e.sessionPath || ''));
@@ -50489,7 +50515,13 @@ async fn eval_active_terminal_canvas_composite() -> Value {
                     layers: drawn,
                     canvas_count: canvasCount,
                     host_count: visible.length,
-                    session_path: String(visible[0].sessionPath || ''),
+                    // The host drawn LAST — i.e. the one this frame is actually
+                    // showing. Report it, so a caller can tell when the frame is
+                    // not the session it asked about.
+                    session_path: String(
+                        (ordered.length ? ordered[ordered.length - 1].sessionPath : '') || ''
+                    ),
+                    active_session_path: activePath,
                     session_paths: paths,
                 });
             } catch (error) {
@@ -50497,7 +50529,12 @@ async fn eval_active_terminal_canvas_composite() -> Value {
             }
         })()
     "#;
-    receive_probe_eval_value(script, "").await
+
+async fn eval_active_terminal_canvas_composite() -> Value {
+    // No format!/interpolation → plain raw string (no brace-doubling needed).
+    // The value MUST be returned via dioxus.send (receive_probe_eval_value reads the
+    // send channel, NOT the script's return value) — a plain `return` hangs the recv.
+    receive_probe_eval_value(TERMINAL_CANVAS_COMPOSITE_SCRIPT, "").await
 }
 /// Decode the base64 `dataUrl` from an [`eval_active_terminal_canvas_composite`]
 /// result into raw PNG bytes.
@@ -106941,6 +106978,46 @@ mod tests {
                 false,
             ),
             (false, false)
+        );
+    }
+    /// The faithful screenshot is the agent's primary instrument for "what is on
+    /// the terminal", so the one thing it must never do is composite the WRONG
+    /// host and still report `capture_faithful: true`. It did: `mountedAt` is
+    /// not stacking order — a session switched back to is REVEALED rather than
+    /// re-mounted, so its host is the OLDEST while the host it replaced is the
+    /// newest and stays `isVisible` for a while after the switch. Drawing
+    /// "newest last" painted the stale host over the real one, and after nine
+    /// rapid switches `app screenshot` returned a near-blank frame while grim on
+    /// the same client showed a perfectly painted terminal (live, 2026-07-25).
+    ///
+    /// A source scan, because the ordering lives in an embedded script — but it
+    /// scans for the DECISION, not for cosmetics.
+    #[test]
+    fn the_faithful_composite_draws_the_active_host_last() {
+        let script = super::TERMINAL_CANVAS_COMPOSITE_SCRIPT;
+        assert!(
+            script.contains("__yggtermActiveTerminalSessionPath"),
+            "the composite must know which host the eye is on"
+        );
+        assert!(
+            script.contains("data-active-session-host"),
+            "and must survive a registry entry whose sessionPath went stale"
+        );
+        // The draw loop iterates the ACTIVE-LAST order, never the raw
+        // newest-first list that caused the lie.
+        assert!(
+            script.contains("for (const e of ordered)"),
+            "the draw loop must consume the active-last ordering"
+        );
+        assert!(
+            !script.contains("for (const e of Array.from(visible).reverse())"),
+            "drawing by mountedAt is exactly the regression this locks"
+        );
+        // The frame must say which host it actually drew, so a caller can tell
+        // when it is not the session they asked about.
+        assert!(
+            script.contains("active_session_path: activePath"),
+            "the payload must report the active path alongside the drawn one"
         );
     }
     // Semi-hot reveal reconcile: the daemon-frame repaint must fire for a
