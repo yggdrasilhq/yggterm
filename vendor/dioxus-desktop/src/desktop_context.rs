@@ -638,7 +638,7 @@ impl DesktopService {
         &self,
         id: u64,
         js: &str,
-        callback: impl FnOnce(Result<String, String>) + 'static,
+        callback: impl FnOnce(Result<String, crate::web_surface::EvalFailure>) + 'static,
     ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
@@ -688,6 +688,45 @@ impl DesktopService {
         {
             let _ = (id, open);
             Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// What is actually true about a web surface right now: present, mapped,
+    /// and whether the engine believes its content process is answering. All
+    /// three are UI-process properties, so a caller must still round-trip an
+    /// eval before believing a surface is alive.
+    pub fn web_surface_liveness(&self, id: u64) -> crate::web_surface::SurfaceLiveness {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .map(|host| host.surface_liveness(id))
+                .unwrap_or(crate::web_surface::SurfaceLiveness {
+                    present: false,
+                    mapped: false,
+                    web_process_responsive: false,
+                });
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            crate::web_surface::SurfaceLiveness {
+                present: false,
+                mapped: false,
+                web_process_responsive: false,
+            }
         }
     }
 
