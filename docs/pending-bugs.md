@@ -835,10 +835,17 @@ fix) once the fix is verified live on guihost.
     reconcile measures the payload and refuses to paint one wider than its own
     grid (`screen_reconcile_clipped_to_viewer_width`) — which is what protects a
     viewer attached to an OLDER daemon, the live case here.
-  - ⚠ **The client layer is GUI-only and IS deployed on guihost; the two daemon
-    layers need a daemon bump.** Until that lands, a session on a preserved
-    owner is still SERVED ghosts and only the client's clip stops them reaching
-    the screen.
+  - ✅ **All three layers are now DEPLOYED on guihost (2.12.13, daemon pid
+    1152900, 2026-07-25 evening).** ⚠ But read the next line before assuming a
+    given session is covered.
+  - ⚠ **A daemon-side fix only covers the sessions that daemon OWNS.** After the
+    swap, `local://5220ce5d` (the 120x36 shell with the 295-wide model) is still
+    served at 295, because a plain shell is not migratable and stays with its
+    2.12.12 birth daemon — the durable half of the daemon-chaining bug above.
+    For every such stranded session the CLIENT clip is the whole protection, and
+    it is proven. Post-swap the two daemon-side events are correctly SILENT: a
+    daemon that has just started has no drifted model to clip, so silence here
+    is the expected reading, not evidence of a working fix.
   - ✅ **The guard HAS now refused an oversized payload live (2026-07-25
     evening, before the 2.12.13 deploy).** Walking every session on the live
     2.12.12 daemon found a **plain `bash -i` shell** — not an agent session —
