@@ -1135,6 +1135,46 @@ fn print_server_help() {
     );
 }
 
+/// EVERY `server app web` action, with its usage.
+///
+/// This exists because a hand-maintained usage string is exactly the thing that
+/// drifts: `ensure`, `fill` and `totp` were implemented and undocumented, and a
+/// stale usage block is what produced a "not deployed" misdiagnosis in the
+/// field on 2026-07-22 (docs/agent-control-plane.md). An agent reading `--help`
+/// and concluding a verb does not exist is a failure mode of the DOCS.
+///
+/// One list, rendered into the usage text, and a test that fails when the
+/// dispatcher's own match arms disagree with it. An alias carries an empty
+/// usage string — it is named in its primary's line.
+const WEB_ACTIONS: &[(&str, &str)] = &[
+    ("eval", "  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]\n"),
+    ("read", "  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]\n    read with NO --frame searches EVERY reachable frame and returns\n    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []\n"),
+    ("await", "  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]\n    the script is the BODY of an async function; `return` its value.\n    `eval` cannot return a Promise — this is the one verb that can.\n"),
+    ("frames", "  yggterm server app web frames [--session <path>]\n    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)\n"),
+    ("do", "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n"),
+    ("fill-vault", "  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]\n"),
+    ("fill-card", "  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]\n"),
+    ("fill", "  yggterm server app web fill [--entry <name>] [--user <u>] [--session <path>]\n    auto-match the page host against the vault and fill the login form.\n    For ONE named field into ONE addressed element, use fill-vault.\n"),
+    ("totp", "  yggterm server app web totp [--entry <name>] [--user <u>] [--session <path>]  (alias: code)\n    put the entry's current TOTP code into the page's one-time-code field\n"),
+    ("batch", "  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]\n    one `do` invocation per line; # comments and blank lines skipped\n"),
+    ("wait", "  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]\n    cond: load:committed | load:finished | idle:<ms> | settled:<ms>\n        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>\n    url:* and settled:* are read from the ENGINE, so they survive a navigation\n    that makes every page-side predicate unavailable\n"),
+    ("ensure", "  yggterm server app web ensure --session <path> [--ttl <secs>]\n    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,\n    and reports generation_before/generation_after + healed so a caller can tell\n    a new page from the same one. Refusals name WHICH fact failed (no_declare,\n    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).\n"),
+    ("reload", "  yggterm server app web reload --session <path>\n"),
+    ("close", "  yggterm server app web close --session <path>\n"),
+    ("lease", "  yggterm server app web lease --ttl <secs> [--session <path>]\n"),
+    ("screenshot", "  yggterm server app web screenshot [output.png] [--session <path>]\n"),
+    ("cookies", "  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]\n    Netscape format, both ways (what `curl -c`/`-b` writes and reads).\n    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the\n    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers\n    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to\n    the engine API and are reported as export_scope=root_path_per_domain.\n"),
+    ("capture-element", "  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]\n    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface\n"),
+    ("devtools", "  yggterm server app web devtools [--close] [--session <path>]\n"),
+    ("code", ""),
+    ("capture", ""),
+];
+
+/// Render the `server app web` usage block from [`WEB_ACTIONS`].
+fn web_usage_block() -> String {
+    WEB_ACTIONS.iter().map(|(_, usage)| *usage).collect()
+}
+
 fn print_server_app_help() {
     println!(
         "usage:
@@ -1157,53 +1197,12 @@ fn print_server_app_help() {
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app keytips audit
   yggterm server app command <list|invoke <id>>
-  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]
-  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]
-    read with NO --frame searches EVERY reachable frame and returns
-    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []
-  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]
-    the script is the BODY of an async function; `return` its value.
-    `eval` cannot return a Promise — this is the one verb that can.
-  yggterm server app web frames [--session <path>]
-    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)
-  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
-    target (resolved in the page at click time, precedence in this order):
-      --selector <css> | --role <r> --label <s> [--nth <n>]
-      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)
-      | --selector-set <css,css,…>   (segmented inputs: one box per character)
-      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)
-  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]
-  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]
-  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]
-    one `do` invocation per line; # comments and blank lines skipped
-  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]
-    cond: load:committed | load:finished | idle:<ms> | settled:<ms>
-        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>
-    url:* and settled:* are read from the ENGINE, so they survive a navigation
-    that makes every page-side predicate unavailable
-  yggterm server app web ensure --session <path> [--ttl <secs>]
-    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,
-    and reports generation_before/generation_after + healed so a caller can tell
-    a new page from the same one. Refusals name WHICH fact failed (no_declare,
-    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).
-  yggterm server app web reload --session <path>
-  yggterm server app web close --session <path>
-  yggterm server app web lease --ttl <secs> [--session <path>]
-  yggterm server app web screenshot [output.png] [--session <path>]
-  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]
-    Netscape format, both ways (what `curl -c`/`-b` writes and reads).
-    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the
-    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers
-    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to
-    the engine API and are reported as export_scope=root_path_per_domain.
-  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]
-    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface
-  yggterm server app web devtools [--close] [--session <path>]
-
+{web_usage}
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
-  with one GUI and no target it routes there automatically."
+  with one GUI and no target it routes there automatically.",
+        web_usage = web_usage_block()
     );
 }
 
@@ -5467,6 +5466,128 @@ fn run_server_smoke() -> Result<()> {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&temp_home);
     result
+}
+
+#[cfg(test)]
+mod web_usage_tests {
+    use super::*;
+
+    /// Every action name the `server app web` dispatcher accepts, read from the
+    /// dispatcher's own match arms.
+    ///
+    /// This is a SCANNER, and a scanner that silently matches nothing passes
+    /// green while proving nothing — the exact failure a brace-counting lock in
+    /// this repo shipped with. So it returns the arms AND the test asserts a
+    /// coverage floor below.
+    fn dispatcher_web_actions() -> Vec<String> {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("            \"web\" => {")
+            .expect("the web dispatcher block moved; fix this scanner, do not delete it");
+        let end = source[start..]
+            .find("other => anyhow::bail!(\"unsupported app web action")
+            .expect("the web dispatcher's catch-all moved")
+            + start;
+        let mut actions = Vec::new();
+        // The OUTER match's arms sit at exactly this indentation. Matching on
+        // indentation is what keeps the INNER matches out of the answer — the
+        // `--as` modes and `--until` forms are options of a verb, not verbs,
+        // and counting them would make this lock unsatisfiable and then
+        // deleted.
+        const ARM_INDENT: &str = "                    \"";
+        for line in source[start..end].lines() {
+            if !line.starts_with(ARM_INDENT) {
+                continue;
+            }
+            let trimmed = line.trim();
+            // An arm looks like:  "eval" => {   or   "totp" | "code" => {
+            let Some(head) = trimmed.split("=>").next() else {
+                continue;
+            };
+            if !trimmed.contains("=>") || !head.trim_start().starts_with('"') {
+                continue;
+            }
+            for part in head.split('|') {
+                let part = part.trim();
+                if let Some(name) = part
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                {
+                    actions.push(name.to_string());
+                }
+            }
+        }
+        actions
+    }
+
+    /// THE DRIFT LOCK. `ensure`, `fill` and `totp` were implemented and
+    /// undocumented, and a stale usage block is what produced a "not deployed"
+    /// misdiagnosis in the field — an agent read `--help`, did not see the
+    /// verb, and concluded the build lacked it.
+    ///
+    /// Fails today against the pre-D1 usage string, which is the point.
+    #[test]
+    fn every_web_action_appears_in_the_usage_string() {
+        let dispatcher = dispatcher_web_actions();
+        // COVERAGE FLOOR: a scanner that finds nothing must fail, not pass.
+        assert!(
+            dispatcher.len() >= 15,
+            "the arm scanner found only {} actions — it went blind; fix it rather than \
+             lowering this floor",
+            dispatcher.len()
+        );
+        assert!(dispatcher.contains(&"eval".to_string()), "sanity: {dispatcher:?}");
+
+        let documented: std::collections::BTreeSet<&str> =
+            WEB_ACTIONS.iter().map(|(name, _)| *name).collect();
+        let implemented: std::collections::BTreeSet<String> =
+            dispatcher.iter().cloned().collect();
+
+        let undocumented: Vec<&String> = implemented
+            .iter()
+            .filter(|name| !documented.contains(name.as_str()))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "these web actions are implemented and undocumented: {undocumented:?} — add them to \
+             WEB_ACTIONS. An agent that reads --help and does not see a verb concludes the build \
+             lacks it."
+        );
+
+        let phantom: Vec<&&str> = documented
+            .iter()
+            .filter(|name| !implemented.contains(&(**name).to_string()))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "these web actions are documented and NOT implemented: {phantom:?} — worse than an \
+             omission, because it sends a caller after a verb that will never answer."
+        );
+    }
+
+    /// The rendered block must actually contain a line per non-alias action —
+    /// a `WEB_ACTIONS` entry with an empty usage string would satisfy the set
+    /// comparison above while printing nothing.
+    #[test]
+    fn the_rendered_usage_names_every_non_alias_action() {
+        let rendered = web_usage_block();
+        for (name, usage) in WEB_ACTIONS {
+            if usage.is_empty() {
+                // An alias: it must still be findable in its primary's line.
+                assert!(
+                    rendered.contains(name),
+                    "alias {name} is documented nowhere"
+                );
+                continue;
+            }
+            assert!(
+                rendered.contains(&format!("server app web {name} ")),
+                "{name} has a usage entry that does not name it"
+            );
+        }
+        // And the whole block is non-trivial.
+        assert!(rendered.lines().count() > 25, "the usage block collapsed");
+    }
 }
 
 #[cfg(test)]

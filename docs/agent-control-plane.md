@@ -1268,6 +1268,16 @@ bounded by the ~600s reap hold unless a `lease` extends it — the single `not l
 seen this run is consistent with hold-expiry, not a missing feature. Lesson for
 the file: never conclude "not deployed" from a usage string.
 
+**Closed 2026-07-25.** The usage string is no longer hand-maintained: it renders
+from `WEB_ACTIONS` in `apps/yggterm/src/main.rs`, and
+`every_web_action_appears_in_the_usage_string` FAILS when the dispatcher's own
+match arms disagree with it (in either direction — an undocumented verb and a
+documented-but-unimplemented one are both errors, the second being worse because
+it sends a caller after something that will never answer). The scanner that reads
+those arms carries a coverage floor, so a scanner that goes blind fails rather
+than passing green. The full verb plane is documented in
+`docs/web-surfaces.md#the-server-app-web-verb-plane-2026-07-25`.
+
 ## Field findings — invisible co-browse maiden run (2026-07-23)
 
 The FIRST real research task run entirely through the invisible path: spawn a
