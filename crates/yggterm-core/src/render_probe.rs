@@ -99,7 +99,10 @@ impl RenderRole {
         if comm.starts_with("WebKitGPU") {
             return RenderRole::WebGpu;
         }
-        if matches!(comm, "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire") {
+        if matches!(
+            comm,
+            "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire"
+        ) {
             return RenderRole::Compositor;
         }
         if comm == "yggterm" || comm.starts_with("yggterm-gui") {
@@ -287,7 +290,11 @@ pub fn user_hz() -> u64 {
 
 /// Convert a tick delta into CPU milliseconds. Pure so the arithmetic is testable.
 pub fn cpu_ms_from_ticks(delta_ticks: u64, user_hz: u64) -> f64 {
-    let hz = if user_hz == 0 { DEFAULT_USER_HZ } else { user_hz };
+    let hz = if user_hz == 0 {
+        DEFAULT_USER_HZ
+    } else {
+        user_hz
+    };
     (delta_ticks as f64) * 1000.0 / (hz as f64)
 }
 
@@ -354,6 +361,8 @@ pub struct RenderProbe {
     last_gpu_ns: BTreeMap<i32, u64>,
     last_at_ms: Option<u64>,
     user_hz: Option<u64>,
+    /// The probe's OWN clock, lazily started on first use so `Default` stays trivial.
+    started: Option<std::time::Instant>,
 }
 
 impl RenderProbe {
@@ -373,10 +382,29 @@ impl RenderProbe {
 
     /// Turn a set of observations into deltas against the previous call.
     ///
-    /// `now_ms` is monotonic wall time supplied by the caller so this stays pure and
-    /// testable. Processes that vanished are forgotten; processes that appeared are
-    /// recorded and reported only from their *second* observation onward.
-    pub fn observe(
+    /// **The probe owns its clock, and it is `Instant` — monotonic.** The caller does
+    /// not get to supply one, because a caller that supplied a WALL clock (as the
+    /// GUI's sampling loop did) breaks the denominator in a way nothing reports: an
+    /// NTP step or a suspend/resume inflates `interval_ms` by the gap while the CPU
+    /// tick counters do not advance, so `core_fraction` reads artificially LOW right
+    /// after the laptop wakes — on the one host whose fan is the complaint. Two
+    /// answers to "how much time passed" is one too many.
+    ///
+    /// Processes that vanished are forgotten; processes that appeared are recorded and
+    /// reported only from their *second* observation onward.
+    pub fn observe(&mut self, observations: &[RenderProcObservation]) -> Vec<RenderProcSample> {
+        let now_ms = self
+            .started
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        self.observe_at(observations, now_ms)
+    }
+
+    /// The delta arithmetic, with the clock injected. **Deliberately private**: it is
+    /// the testable core, and keeping it in-module is what makes it impossible for an
+    /// outside caller to hand this probe a clock that can jump.
+    fn observe_at(
         &mut self,
         observations: &[RenderProcObservation],
         now_ms: u64,
@@ -701,7 +729,8 @@ mod tests {
 
     #[test]
     fn parses_memory_gauges() {
-        let rollup = "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
+        let rollup =
+            "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
         assert_eq!(parse_smaps_rollup_pss_kb(rollup), Some(65432));
         let status = "Name:\tyggterm\nVmPeak:\t 900 kB\nVmRSS:\t  543284 kB\nThreads:\t42\n";
         assert_eq!(parse_status_rss_kb(status), Some(543284));
@@ -802,11 +831,11 @@ drm-engine-compute:\t3434919 ns\n";
     #[test]
     fn gpu_time_is_a_delta_and_a_missing_reading_is_not_a_zero() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(
+        probe.observe_at(
             &[observation_with_gpu(10, "WebKitWebProces", 1, 0, 1_000_000)],
             1_000,
         );
-        let samples = probe.observe(
+        let samples = probe.observe_at(
             &[observation_with_gpu(
                 10,
                 "WebKitWebProces",
@@ -820,12 +849,12 @@ drm-engine-compute:\t3434919 ns\n";
         assert_eq!(samples[0].gpu_ms(), Some(3.0));
         // A pid whose fdinfo became unreadable reports NO number, never zero: "we
         // could not look" and "the GPU was idle" are different findings.
-        let samples = probe.observe(&[observation(10, "WebKitWebProces", 1, 20)], 3_000);
+        let samples = probe.observe_at(&[observation(10, "WebKitWebProces", 1, 20)], 3_000);
         assert_eq!(samples[0].gpu_ns, None);
         assert_eq!(samples[0].gpu_ms(), None);
         // ...and a counter that went backwards (an fd closed mid-interval) reads as
         // zero work rather than underflowing into an astronomical delta.
-        probe.observe(
+        probe.observe_at(
             &[observation_with_gpu(
                 10,
                 "WebKitWebProces",
@@ -835,7 +864,7 @@ drm-engine-compute:\t3434919 ns\n";
             )],
             4_000,
         );
-        let samples = probe.observe(
+        let samples = probe.observe_at(
             &[observation_with_gpu(10, "WebKitWebProces", 1, 40, 12)],
             5_000,
         );
@@ -847,7 +876,7 @@ drm-engine-compute:\t3434919 ns\n";
     #[test]
     fn role_rollup_sums_gpu_time_and_keeps_unreadable_distinct_from_idle() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(
+        probe.observe_at(
             &[
                 observation_with_gpu(11, "WebKitWebProces", 10, 0, 0),
                 observation_with_gpu(12, "WebKitWebProces", 10, 0, 500_000),
@@ -855,7 +884,7 @@ drm-engine-compute:\t3434919 ns\n";
             ],
             1_000,
         );
-        let samples = probe.observe(
+        let samples = probe.observe_at(
             &[
                 observation_with_gpu(11, "WebKitWebProces", 10, 5, 2_000_000),
                 observation_with_gpu(12, "WebKitWebProces", 10, 5, 1_500_000),
@@ -883,7 +912,7 @@ drm-engine-compute:\t3434919 ns\n";
     #[test]
     fn first_observation_reports_nothing() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 100_000)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 100_000)], 1_000);
         assert!(
             samples.is_empty(),
             "first sample must not report a lifetime average"
@@ -893,9 +922,9 @@ drm-engine-compute:\t3434919 ns\n";
     #[test]
     fn second_observation_reports_the_delta_only() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 100_000)], 1_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 100_000)], 1_000);
         // 50 ticks (500 CPU ms) burned over a 1000 ms interval = half a core.
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 100_050)], 2_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 100_050)], 2_000);
         assert_eq!(samples.len(), 1);
         let sample = &samples[0];
         assert_eq!(sample.cpu_ms, 500.0);
@@ -904,13 +933,45 @@ drm-engine-compute:\t3434919 ns\n";
         assert_eq!(sample.role, RenderRole::Gui);
     }
 
+    /// The probe times ITSELF, off a monotonic `Instant`. The GUI's sampling loop used
+    /// to hand it `current_millis()` — a `SystemTime` wall clock — so an NTP step or a
+    /// suspend/resume inflated `interval_ms` by the gap while the CPU tick counters
+    /// stood still, and `core_fraction` read artificially low right after every wake.
+    /// The caller cannot make that mistake any more, because it no longer passes a
+    /// clock at all.
+    #[test]
+    fn the_probe_times_itself_over_a_monotonic_interval() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe(&[observation(10, "yggterm", 1, 0)]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let samples = probe.observe(&[observation(10, "yggterm", 1, 3)]);
+        assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0].interval_ms >= 20.0 && samples[0].interval_ms <= 5_000.0,
+            "interval must be the real elapsed time, got {}",
+            samples[0].interval_ms
+        );
+    }
+
+    /// A clock that steps BACKWARDS must yield no sample rather than a nonsense rate.
+    /// Pinning the saturating degradation as intended behaviour: a signed subtraction
+    /// here would turn one bad clock reading into a negative interval and an infinite
+    /// core fraction.
+    #[test]
+    fn a_clock_that_steps_backwards_reports_no_sample() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[observation(10, "yggterm", 1, 0)], 5_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 50)], 1_000);
+        assert!(samples.is_empty());
+    }
+
     /// PID reuse resets the counter downward. That must read as zero work, never as a
     /// huge negative that underflows into an astronomical delta.
     #[test]
     fn tick_counter_going_backwards_reads_as_zero() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 5_000)], 1_000);
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 12)], 2_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 5_000)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 12)], 2_000);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].cpu_ms, 0.0);
     }
@@ -918,12 +979,12 @@ drm-engine-compute:\t3434919 ns\n";
     #[test]
     fn vanished_process_is_forgotten_and_new_one_waits_a_turn() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 100)], 1_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 100)], 1_000);
         // pid 10 gone, pid 11 new: nothing reportable this turn.
-        let samples = probe.observe(&[observation(11, "WebKitWebProces", 10, 900)], 2_000);
+        let samples = probe.observe_at(&[observation(11, "WebKitWebProces", 10, 900)], 2_000);
         assert!(samples.is_empty());
         // Now pid 11 has a baseline and reports its own delta.
-        let samples = probe.observe(&[observation(11, "WebKitWebProces", 10, 910)], 3_000);
+        let samples = probe.observe_at(&[observation(11, "WebKitWebProces", 10, 910)], 3_000);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].role, RenderRole::WebContent);
         assert_eq!(samples[0].cpu_ms, 100.0);
@@ -937,13 +998,13 @@ drm-engine-compute:\t3434919 ns\n";
             observation(11, "WebKitWebProces", 10, 0),
             observation(12, "WebKitWebProces", 10, 0),
         ];
-        probe.observe(&first, 1_000);
+        probe.observe_at(&first, 1_000);
         let second = [
             observation(10, "yggterm", 1, 70),
             observation(11, "WebKitWebProces", 10, 30),
             observation(12, "WebKitWebProces", 10, 5),
         ];
-        let samples = probe.observe(&second, 2_000);
+        let samples = probe.observe_at(&second, 2_000);
         let rolled = roll_up_roles(&samples);
         assert_eq!(rolled.len(), 2);
         let web = rolled
@@ -974,10 +1035,8 @@ drm-engine-compute:\t3434919 ns\n";
     /// tree must cost almost nothing: roles with neither CPU nor memory are dropped.
     #[test]
     fn role_events_skip_roles_with_no_cpu_and_no_memory() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-role-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-role-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);
@@ -1025,17 +1084,15 @@ drm-engine-compute:\t3434919 ns\n";
     /// with no aggregator changes: `duration_ms` present, in CPU milliseconds.
     #[test]
     fn emits_events_the_existing_aggregator_can_read() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-probe-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-probe-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);
 
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "WebKitWebProces", 1, 0)], 1_000);
-        let samples = probe.observe(&[observation(10, "WebKitWebProces", 1, 25)], 2_000);
+        probe.observe_at(&[observation(10, "WebKitWebProces", 1, 0)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "WebKitWebProces", 1, 25)], 2_000);
         emit_render_perf_events(&home, &samples, &json!({ "web_surface_live_count": 3 }));
 
         let summary = crate::perf::summarize_perf_telemetry(&home, None, Some("render"));
