@@ -558,6 +558,9 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
         || !desktop_text.contains("Icon=")
         || !desktop_text.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}\n"))
         || desktop_text.contains("NoDisplay=true")
+        // An entry written before the supervisor still launches the GUI
+        // directly, so a crash there leaves the user with no window. Repair it.
+        || (!desktop_text.is_empty() && !desktop_text.contains("--supervise"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -570,10 +573,22 @@ fn non_direct_install_channel_may_repair_linux_launcher(channel: InstallChannel)
     !matches!(channel, InstallChannel::Direct | InstallChannel::Unknown)
 }
 
+/// ★ `Exec=` carries `--supervise`, `TryExec=` does not.
+///
+/// The desktop environment turns this entry into a TRANSIENT systemd unit with
+/// `Restart=no` that we do not author, so a segfaulting window never came back
+/// (measured: ten core dumps in two weeks on the live host). Launching through
+/// the supervisor gives that unit `Restart=on-abnormal` semantics from inside:
+/// the shim forks the real GUI as a child and only relaunches it after a crash
+/// signal — never after a clean quit or an update handoff.
+///
+/// `TryExec` stays a bare path because the spec defines it as a program to look
+/// up, not a command line; and `StartupWMClass` still matches because the CHILD
+/// owns the window.
 #[cfg(target_os = "linux")]
 fn linux_desktop_entry_contents(desktop_exec_path: &Path, no_display: bool) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay={}\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={} --supervise\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay={}\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
         YGGTERM_DESKTOP_APP_ID,
@@ -1663,7 +1678,9 @@ mod tests {
     #[test]
     fn linux_desktop_entry_uses_theme_icon_and_canonical_wm_class() {
         let desktop = linux_desktop_entry_contents(Path::new("/home/user/.local/bin/yggterm"), false);
-        assert!(desktop.contains("Exec=/home/user/.local/bin/yggterm\n"));
+        // Exec launches the supervisor (so a segfaulting window comes back);
+        // TryExec must stay a bare path, which is what the spec says it is.
+        assert!(desktop.contains("Exec=/home/user/.local/bin/yggterm --supervise\n"));
         assert!(desktop.contains("TryExec=/home/user/.local/bin/yggterm\n"));
         assert!(desktop.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}\n")));
         assert!(desktop.contains(&format!("StartupWMClass={YGGTERM_DESKTOP_APP_ID}\n")));

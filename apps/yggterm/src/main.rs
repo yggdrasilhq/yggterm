@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod supervisor;
+
 use anyhow::{Context, Result};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -700,6 +702,13 @@ fn launch_app_background(
         )
     })?;
     let mut command = Command::new(&current_exe);
+    // ⛔ Deliberately NOT supervised (see `supervisor`). This launcher polls for
+    // a client record whose pid is the pid it SPAWNED, and under a supervisor
+    // that pid belongs to the shim while the record belongs to the child — so
+    // `--wait-visible` would wait forever and report `registered: false`. The
+    // desktop entry is the path that matters for the reported gap (the user's
+    // window vanishing on a segfault); an agent that launched a GUI can launch
+    // it again. Supervising here needs the poll to match the child first.
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
@@ -1362,6 +1371,15 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 }
 
 fn main() -> Result<()> {
+    // BEFORE anything else, including the update-relaunch wait: in supervise
+    // mode this process owns no window, no store and no daemon connection — it
+    // forks the real GUI and waits on it, so that when the window dies from a
+    // SIGSEGV the user gets it back. See `supervisor` for why the policy is
+    // on-abnormal and why the daemon could not do this job.
+    let supervise_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if supervisor::should_run_as_supervisor(&supervise_args) {
+        std::process::exit(supervisor::run_supervisor(&supervise_args)?);
+    }
     maybe_wait_for_update_relaunch_parent_exit();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     // Agent presence (cursor v1) — see the twin in the headless binary.
@@ -5720,6 +5738,7 @@ mod tests {
             started_at_ms: 1,
             client_id: None,
             linux_desktop_app_id: None,
+            client_role: None,
             process_start_ticks: Some(77),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
@@ -5751,6 +5770,7 @@ mod tests {
             started_at_ms: 1,
             client_id: None,
             linux_desktop_app_id: None,
+            client_role: None,
             process_start_ticks: Some(77),
             executable_path: Some(current_text),
             display: Some(":1".to_string()),
@@ -5768,6 +5788,7 @@ mod tests {
             started_at_ms: 1,
             client_id: None,
             linux_desktop_app_id: None,
+            client_role: None,
             process_start_ticks: Some(88),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
