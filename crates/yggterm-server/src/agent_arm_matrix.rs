@@ -348,25 +348,75 @@ fn every_arm_builds_the_invocation_its_descriptor_declares() {
     }
 }
 
+/// A terminal identity pinned for the duration of a test, so the invocation
+/// under comparison is a fixed string instead of whatever the host happens to
+/// export.
+///
+/// Two separate defects made this necessary, and both are worth naming because
+/// the module doc above promises this table "can never go stale-green":
+///
+///  - **It was flaky.** These builders read the palette from process-global env,
+///    which `codex_cli`'s own tests clear and rewrite. Comparing an arm against
+///    its twin means calling the SAME function with the SAME arguments twice, so
+///    an interleaved write between the two calls produced a diff and the test
+///    reported it as "launch command forks on locality" — a locality fork that
+///    did not exist. It failed only on a host that HAS a palette exported, i.e.
+///    inside a yggterm session.
+///  - **It was vacuous.** On a bare host with no palette, both sides were
+///    colourless and the assertion compared two commands that carried none of
+///    the identity it exists to protect. It would have passed with the palette
+///    dropped from the remote arm entirely.
+///
+/// Pinning fixes both: the comparison is deterministic, and it is made against a
+/// palette that is known to be present.
+#[cfg(test)]
+fn pinned_terminal_identity() -> crate::codex_cli::TerminalIdentityColorProfile {
+    crate::codex_cli::TerminalIdentityColorProfile {
+        foreground: "#e5e5e5".to_string(),
+        background: "#262a33".to_string(),
+        palette: (0..16).map(|i| format!("#{i:02x}{i:02x}{i:02x}")).collect(),
+    }
+}
+
 #[test]
 fn locality_does_not_fork_the_invocation() {
     // Spec §2 corollary 2: local and remote differ only INSIDE the transport
     // (direct spawn vs login-shell-wrapped ssh). The command itself must be the
     // same string on both arms — if it is not, some caller above the transport
     // seam is branching on locality.
+    let _env = crate::codex_cli::env_test_guard();
+    let profile = pinned_terminal_identity();
+    crate::codex_cli::sync_terminal_identity_appearance_with_profile("dark", Some(&profile));
+
     for arm in ARMS {
         let twin = ARMS
             .iter()
             .find(|other| other.kind == arm.kind && other.locality != arm.locality)
             .expect("every arm has a locality twin");
+
+        let resume = persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID);
+        let launch = agent_launch_command(arm.kind, Some(ARM_CWD), None);
+
+        // Refuse to compare two identity-free commands. Without this the
+        // assertions below pass on any host that exports no palette, which is
+        // the stale-green the module doc forbids.
+        for (label, command) in [("resume", &resume), ("launch", &launch)] {
+            assert!(
+                command.contains(&profile.background),
+                "{}: the {label} command carries no terminal identity, so comparing it against \
+                 its twin proves nothing — got {command}",
+                arm.name(),
+            );
+        }
+
         assert_eq!(
-            persistent_agent_resume_command(arm.kind, Some(ARM_CWD), ARM_SESSION_ID),
+            resume,
             persistent_agent_resume_command(twin.kind, Some(ARM_CWD), ARM_SESSION_ID),
             "{}: resume command forks on locality",
             arm.name(),
         );
         assert_eq!(
-            agent_launch_command(arm.kind, Some(ARM_CWD), None),
+            launch,
             agent_launch_command(twin.kind, Some(ARM_CWD), None),
             "{}: launch command forks on locality",
             arm.name(),

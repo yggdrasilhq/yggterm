@@ -782,21 +782,32 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
     sync_terminal_identity_appearance(&appearance);
 }
 
+/// Serializes every test that touches the process-global terminal identity.
+///
+/// This module OWNS that env (`sync_terminal_identity_appearance_with_profile`
+/// writes `TERM*`, `YGGTERM_APPEARANCE`, `COLORFGBG` and the 18 palette keys as
+/// process-wide state, because the daemon needs one identity for every child
+/// PTY it spawns). cargo runs tests in parallel threads of ONE process, so any
+/// test that reads or writes that env must serialize against every other one —
+/// including tests in OTHER modules, which is why this guard is `pub(crate)`
+/// rather than private to the test module below.
+///
+/// It did not used to be. `agent_arm_matrix::locality_does_not_fork_the_invocation`
+/// compares two commands built from identical arguments, and it read the palette
+/// out of this env while these tests were clearing it, so it failed roughly
+/// whenever the scheduler interleaved them on a host that HAD a palette set —
+/// i.e. inside a yggterm session, which is where agents run. Poison is tolerated
+/// (`into_inner`) so one panicking test does not cascade-fail the rest.
+#[cfg(test)]
+pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // These tests mutate process-global environment variables (NO_COLOR,
-    // YGGTERM_*_APPEARANCE, COLORFGBG). cargo runs tests in parallel by default,
-    // so without serialization they race and intermittently read each other's
-    // env state. Acquire this lock at the top of every env-mutating test. Poison
-    // is tolerated (into_inner) so one panicking test doesn't cascade-fail the rest.
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use super::env_test_guard;
 
     #[test]
     fn managed_cli_focus_cache_reuses_recent_available_probe() {
