@@ -81,7 +81,11 @@ fn main() {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     for sample in by_cpu.iter().take(10) {
-        let mem_mb = sample.pss_kb.or(sample.rss_kb).unwrap_or(0) as f64 / 1024.0;
+        let mem_mb = sample
+            .memory
+            .map(|memory| memory.preferred_kb())
+            .unwrap_or(0) as f64
+            / 1024.0;
         let gpu_ms = sample
             .gpu_ms()
             .map(|value| format!("{value:.1}"))

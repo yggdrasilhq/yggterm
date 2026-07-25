@@ -172,23 +172,83 @@ pub fn parse_proc_stat(text: &str) -> Option<ProcStat> {
     })
 }
 
-/// Parse `Pss:` (KiB) out of `/proc/<pid>/smaps_rollup`.
-///
-/// PSS, not RSS, is the honest memory number for WebKit: several processes map the
-/// same engine text, so summing RSS across a WebKit set double-counts it badly.
-pub fn parse_smaps_rollup_pss_kb(text: &str) -> Option<u64> {
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("Pss:") else {
-            continue;
-        };
-        let value = rest.split_whitespace().next()?;
-        return value.parse().ok();
-    }
-    None
+/// Where a [`ProcMemory`] reading came from. Carried in the value rather than implied
+/// by the call site, because the two sources are not interchangeable: `smaps_rollup`
+/// knows PSS and anonymous memory, `status` knows only RSS. A caller that cannot tell
+/// which it got would silently read the fallback's zeroes as real numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcMemorySource {
+    SmapsRollup,
+    StatusVmRss,
 }
 
-/// Parse `VmRSS:` (KiB) out of `/proc/<pid>/status`.
-pub fn parse_status_rss_kb(text: &str) -> Option<u64> {
+/// How much memory one process is using.
+///
+/// This module is the ONE owner of that question. The GUI shell used to carry its own
+/// `smaps_rollup` parser for the allocator-trim chore while this one parsed the same
+/// file per pid — two encodings of one concept, free to drift apart on the next kernel
+/// field rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcMemory {
+    pub rss_kb: u64,
+    /// PSS, or 0 when the reading came from the `status` fallback.
+    pub pss_kb: u64,
+    /// Anonymous (non-file-backed) memory, or 0 on the `status` fallback. This is the
+    /// number the allocator-trim chore moves.
+    pub anonymous_kb: u64,
+    pub source: ProcMemorySource,
+}
+
+impl ProcMemory {
+    /// The honest single number for "how much memory does this process cost".
+    ///
+    /// PSS where we have it: several WebKit processes map the same engine text, so
+    /// summing RSS across a WebKit set double-counts it badly. RSS is the fallback,
+    /// and it is only ever reached when PSS was genuinely unavailable.
+    pub fn preferred_kb(&self) -> u64 {
+        if self.pss_kb > 0 {
+            self.pss_kb
+        } else {
+            self.rss_kb
+        }
+    }
+}
+
+/// Parse `/proc/<pid>/smaps_rollup` in one pass.
+///
+/// `None` when the text carries no `Rss:` at all (an empty or truncated rollup, which
+/// the kernel produces for a process that is exiting) — the same guard the shell's
+/// allocator-trim chore has always applied before deciding it is worth trimming.
+pub fn parse_smaps_rollup(text: &str) -> Option<ProcMemory> {
+    let mut memory = ProcMemory {
+        rss_kb: 0,
+        pss_kb: 0,
+        anonymous_kb: 0,
+        source: ProcMemorySource::SmapsRollup,
+    };
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        let value = parts
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or_default();
+        match label {
+            "Rss:" => memory.rss_kb = value,
+            "Pss:" => memory.pss_kb = value,
+            "Anonymous:" => memory.anonymous_kb = value,
+            _ => {}
+        }
+    }
+    (memory.rss_kb > 0).then_some(memory)
+}
+
+/// Parse `VmRSS:` (KiB) out of `/proc/<pid>/status`. Private on purpose: it is the
+/// FALLBACK half of [`read_process_memory`] and has no business being anyone's answer
+/// on its own, because it cannot see PSS.
+fn parse_status_rss_kb(text: &str) -> Option<u64> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("VmRSS:") else {
             continue;
@@ -197,6 +257,30 @@ pub fn parse_status_rss_kb(text: &str) -> Option<u64> {
         return value.parse().ok();
     }
     None
+}
+
+/// Read one process's memory: `smaps_rollup` first, `status` VmRSS only if that failed.
+///
+/// The fallback is legal precisely because it lives inside the one owner and is
+/// LABELLED in the value it returns, so it can never masquerade as a PSS reading.
+/// `smaps_rollup` is unreadable on some hardened kernels and absent for kernel
+/// threads, and one file per pid instead of two halves this probe's syscall cost.
+pub fn read_process_memory(pid: i32) -> Option<ProcMemory> {
+    if let Some(memory) = fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|text| parse_smaps_rollup(&text))
+    {
+        return Some(memory);
+    }
+    let rss_kb = fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|text| parse_status_rss_kb(&text))?;
+    Some(ProcMemory {
+        rss_kb,
+        pss_kb: 0,
+        anonymous_kb: 0,
+        source: ProcMemorySource::StatusVmRss,
+    })
 }
 
 /// Sum every `drm-engine-*` counter (nanoseconds of GPU engine time) in one
@@ -319,8 +403,9 @@ pub struct RenderProcSample {
     pub cpu_ms: f64,
     /// Wall milliseconds the delta was measured over.
     pub interval_ms: f64,
-    pub rss_kb: Option<u64>,
-    pub pss_kb: Option<u64>,
+    /// Memory as one labelled reading, never three parallel Options that could come
+    /// from different sources. `None` when `/proc` would not answer for this pid.
+    pub memory: Option<ProcMemory>,
     /// GPU engine nanoseconds consumed since the previous sample, a delta exactly like
     /// `cpu_ms`. `None` when the counter was unreadable at either end of the interval —
     /// never a zero standing in for "we could not look".
@@ -343,8 +428,7 @@ impl RenderProcSample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderProcObservation {
     pub stat: ProcStat,
-    pub rss_kb: Option<u64>,
-    pub pss_kb: Option<u64>,
+    pub memory: Option<ProcMemory>,
     /// CUMULATIVE GPU engine nanoseconds, as `/proc` reports them. The delta is taken
     /// by [`RenderProbe::observe`], the same place the CPU delta is taken.
     pub gpu_ns: Option<u64>,
@@ -447,8 +531,7 @@ impl RenderProbe {
                 comm: observation.stat.comm.clone(),
                 cpu_ms: cpu_ms_from_ticks(delta, hz),
                 interval_ms,
-                rss_kb: observation.rss_kb,
-                pss_kb: observation.pss_kb,
+                memory: observation.memory,
                 gpu_ns,
             });
         }
@@ -496,12 +579,7 @@ pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
         }
         let pid = stat.pid;
         observations.push(RenderProcObservation {
-            rss_kb: fs::read_to_string(format!("/proc/{pid}/status"))
-                .ok()
-                .and_then(|text| parse_status_rss_kb(&text)),
-            pss_kb: fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
-                .ok()
-                .and_then(|text| parse_smaps_rollup_pss_kb(&text)),
+            memory: read_process_memory(pid),
             gpu_ns: drm_engine_ns_for_pid(pid),
             stat,
         });
@@ -558,7 +636,10 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
                 hot_cpu_ms: f64::MIN,
             });
         entry.cpu_ms += sample.cpu_ms;
-        entry.mem_kb += sample.pss_kb.or(sample.rss_kb).unwrap_or(0);
+        entry.mem_kb += sample
+            .memory
+            .map(|memory| memory.preferred_kb())
+            .unwrap_or(0);
         if let Some(gpu_ns) = sample.gpu_ns {
             entry.gpu_ns = Some(entry.gpu_ns.unwrap_or(0).saturating_add(gpu_ns));
         }
@@ -634,11 +715,10 @@ pub fn emit_render_perf_events(home: &Path, samples: &[RenderProcSample], contex
             "comm": sample.comm,
             "role": sample.role.as_str(),
         });
-        if let Some(rss_kb) = sample.rss_kb {
-            payload["rss_kb"] = json!(rss_kb);
-        }
-        if let Some(pss_kb) = sample.pss_kb {
-            payload["pss_kb"] = json!(pss_kb);
+        if let Some(memory) = sample.memory {
+            payload["rss_kb"] = json!(memory.rss_kb);
+            payload["pss_kb"] = json!(memory.pss_kb);
+            payload["anonymous_kb"] = json!(memory.anonymous_kb);
         }
         if let Some(gpu_ms) = sample.gpu_ms() {
             payload["gpu_ms"] = json!(gpu_ms);
@@ -727,15 +807,52 @@ mod tests {
         assert_eq!(RenderRole::classify("bash"), RenderRole::Other);
     }
 
+    /// Moved here from the GUI shell, which carried its own copy of this parser for
+    /// the allocator-trim chore while this module parsed the same file per pid.
     #[test]
-    fn parses_memory_gauges() {
-        let rollup =
-            "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
-        assert_eq!(parse_smaps_rollup_pss_kb(rollup), Some(65432));
+    fn parses_rss_pss_and_anonymous_in_one_pass() {
+        let memory = parse_smaps_rollup(
+            "Rss:                123456 kB\nPss:                 98765 kB\nAnonymous:           54321 kB\n",
+        )
+        .expect("a rollup with an Rss line parses");
+        assert_eq!(memory.rss_kb, 123456);
+        assert_eq!(memory.pss_kb, 98765);
+        assert_eq!(memory.anonymous_kb, 54321);
+        assert_eq!(memory.source, ProcMemorySource::SmapsRollup);
+        assert_eq!(memory.preferred_kb(), 98765, "PSS wins where we have it");
+        // No Rss line at all is a truncated rollup (a process on its way out), which
+        // the allocator-trim chore has always refused to act on.
+        assert_eq!(parse_smaps_rollup("Pss: 4 kB\n"), None);
+        assert_eq!(parse_smaps_rollup(""), None);
+    }
+
+    /// The fallback must be LABELLED, never silently passed off as a PSS reading: a
+    /// caller that could not tell the difference would read its zeroes as real.
+    #[test]
+    fn the_status_fallback_is_labelled_and_prefers_rss() {
         let status = "Name:\tyggterm\nVmPeak:\t 900 kB\nVmRSS:\t  543284 kB\nThreads:\t42\n";
         assert_eq!(parse_status_rss_kb(status), Some(543284));
-        assert_eq!(parse_smaps_rollup_pss_kb("no pss here"), None);
         assert_eq!(parse_status_rss_kb("Name:\tx\n"), None);
+        let fallback = ProcMemory {
+            rss_kb: 543_284,
+            pss_kb: 0,
+            anonymous_kb: 0,
+            source: ProcMemorySource::StatusVmRss,
+        };
+        assert_eq!(fallback.preferred_kb(), 543_284);
+    }
+
+    /// One owner, wired to the right pid. This fails outright if the collapse
+    /// mis-builds the `/proc` path — the sort of thing a pure parser test cannot see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_this_processs_own_memory_from_proc() {
+        let memory = read_process_memory(std::process::id() as i32)
+            .expect("this process must be able to read its own memory");
+        assert!(memory.rss_kb > 0);
+        assert_eq!(memory.source, ProcMemorySource::SmapsRollup);
+        // A pid that cannot exist has no memory, and that is None rather than zeroes.
+        assert_eq!(read_process_memory(-1), None);
     }
 
     #[test]
@@ -778,8 +895,12 @@ mod tests {
     fn observation(pid: i32, comm: &str, ppid: i32, ticks: u64) -> RenderProcObservation {
         RenderProcObservation {
             stat: parse_proc_stat(&stat_line(pid, comm, ppid, ticks, 0)).unwrap(),
-            rss_kb: Some(1000),
-            pss_kb: Some(600),
+            memory: Some(ProcMemory {
+                rss_kb: 1000,
+                pss_kb: 600,
+                anonymous_kb: 400,
+                source: ProcMemorySource::SmapsRollup,
+            }),
             gpu_ns: None,
         }
     }
