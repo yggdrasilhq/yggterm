@@ -2,6 +2,35 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.13
+
+- **Fixed: a session made in a wider window no longer paints garbled text.** A
+  busy agent session could show letters from two different frames merged into
+  one line — `uof examrnmanipulation` where the agent had written `of exam
+  manipulation` — and resizing the window sometimes cleared it and sometimes
+  did not. Three sizes were in play and only two were ever compared: the
+  session's own terminal, the window showing it, and yggterm's private copy of
+  the screen, which kept painting to the width the window used to have. The
+  private copy is now trimmed to the session's real width wherever the screen is
+  handed out, a resize repairs it instead of skipping the work when the terminal
+  size happens to match, and the window refuses to paint a screen wider than
+  itself.
+- **Fixed: the window comes back if it crashes.** If yggterm's window died on a
+  crash, nothing brought it back and every session went invisible until you
+  relaunched by hand. It now restarts itself after a crash — and only after a
+  crash: quitting, a restart for an update, and closing the window all stay
+  final. Rate-limited, so a window that cannot start does not spin.
+- **Fixed: clicking a session on a remote machine no longer waits on a re-check
+  you already passed.** Every ten minutes the first click on a remote machine
+  paid for a fresh round trip to re-prove a program that had just worked; on a
+  slow link that was the single biggest cause of the app stalling. The known-good
+  answer is now used immediately and re-proven in the background. A changed
+  program is still proven before use.
+- **Fixed: a screenshot taken right after switching back to a session showed the
+  session you left.** The picture was assembled oldest-last, and a session you
+  return to is older than the one it replaced, so the stale one was drawn on top.
+  The session you are looking at is now drawn last.
+
 ## 2.12.10
 
 - **Fixed: an app's page can be brought back without putting it on your screen.**
