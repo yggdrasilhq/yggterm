@@ -47135,6 +47135,135 @@ async fn web_do_clear_focused_field(
     Ok(())
 }
 
+/// Which character belongs in which box of a segmented input — the ONE owner of
+/// that rule.
+///
+/// One character per box, with any remainder dropped into the LAST box, so a
+/// 4-box widget fed a 6-character code still gets a complete expectation
+/// instead of silently ignoring two characters. A single box therefore expects
+/// the whole string, which is what makes `--selector <one>` and
+/// `--selector-set <one>` mean the same thing.
+fn segmented_expectation(expected: &str, boxes: usize) -> Vec<String> {
+    if boxes == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = expected.chars().collect();
+    (0..boxes)
+        .map(|index| {
+            if index + 1 == boxes {
+                chars.get(index..).map(|rest| rest.iter().collect()).unwrap_or_default()
+            } else {
+                chars.get(index).map(|c| c.to_string()).unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+/// PURE readback rule: given what each box holds, which boxes are right?
+///
+/// This exists because the old readback was structurally incapable of reporting
+/// the failure it was written to catch. It compared the WHOLE expected string
+/// against `targets.first()` — one box, holding one character — so on a 6-box
+/// OTP it returned false (or null) for a perfectly good fill, and could never
+/// name the merge. The measured case: typing `292244` over a prior `278347`
+/// produced `278344`, and the boolean still read fine.
+///
+/// The live path runs the same rule PAGE-SIDE (only booleans cross back out —
+/// F4 redaction), sharing `segmented_expectation` so the chunking has exactly
+/// one owner; this function is the same rule expressed where it can be tested
+/// with no browser.
+fn segmented_match(expected: &str, per_box: &[Option<String>]) -> (bool, Vec<bool>) {
+    let want = segmented_expectation(expected, per_box.len());
+    let per: Vec<bool> = per_box
+        .iter()
+        .zip(want.iter())
+        .map(|(held, want)| held.as_deref() == Some(want.as_str()))
+        .collect();
+    (per.iter().all(|ok| *ok) && !per.is_empty(), per)
+}
+
+/// Build a JS array literal of the addressed elements, in order. Shared by the
+/// clear-verification and the segmented readback so both look at exactly the
+/// boxes the fill wrote to.
+fn web_do_refs_array_js(targets: &[WebElementRef]) -> String {
+    let refs: Vec<String> = targets.iter().map(web_element_ref_js).collect();
+    format!("[{}]", refs.join(","))
+}
+
+/// Is every box actually EMPTY? Returns `None` when it could not be read.
+///
+/// Typing into a partially-cleared segmented widget is how the merge is
+/// manufactured, so the fill path asserts this between clearing and typing
+/// rather than assuming the clear worked.
+async fn web_do_boxes_are_empty(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    targets: &[WebElementRef],
+) -> Option<Vec<bool>> {
+    if targets.is_empty() {
+        return Some(Vec::new());
+    }
+    let script = format!(
+        "(function(){{var refs={refs};var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push(v.length===0);}}\
+         return{{known:true,boxes:out}};}})()",
+        refs = web_do_refs_array_js(targets),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        info.get("boxes")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_bool().unwrap_or(false))
+            .collect(),
+    )
+}
+
+/// Per-box readback for a segmented input. `None` when it could not be read.
+///
+/// Only booleans come back (F4): the expected characters go IN (they are
+/// already in that page — the fill just typed them), the comparison happens
+/// page-side, and the answer names WHICH box is wrong without ever quoting a
+/// value.
+async fn web_do_verify_segmented_value(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    targets: &[WebElementRef],
+    expected: &str,
+) -> Option<Vec<bool>> {
+    if targets.is_empty() {
+        return None;
+    }
+    let want = segmented_expectation(expected, targets.len());
+    let script = format!(
+        "(function(){{var refs={refs};var want={want};var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push(v===want[i]);}}\
+         return{{known:true,boxes:out}};}})()",
+        refs = web_do_refs_array_js(targets),
+        want = serde_json::to_string(&want).unwrap_or_else(|_| "[]".to_string()),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        info.get("boxes")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_bool().unwrap_or(false))
+            .collect(),
+    )
+}
+
 /// Did the field actually end up holding `expected`? Returns `None` when it
 /// could not be read (unknown, which is not the same as "no").
 ///
@@ -47872,6 +48001,55 @@ async fn web_surface_do_for(
                 }
                 cleared += 1;
             }
+            // ASSERT the clear (N2). "I sent select-all and Delete" is not
+            // evidence a segmented widget is empty, and typing into a
+            // partially-cleared one is exactly how the observed merge is
+            // manufactured. One retry per stubborn box, then REFUSE — an
+            // aborted fill is recoverable, a wrong OTP submitted to a bank is
+            // not.
+            let cleared_verified = web_do_boxes_are_empty(desktop, native_id, &targets).await;
+            if let Some(flags) = cleared_verified.as_ref() {
+                let stubborn: Vec<usize> = flags
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, empty)| !**empty)
+                    .map(|(index, _)| index)
+                    .collect();
+                for index in &stubborn {
+                    let Some(target) = targets.get(*index) else {
+                        continue;
+                    };
+                    if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
+                        return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    }
+                    if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
+                        return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                    }
+                }
+                if !stubborn.is_empty() {
+                    let after = web_do_boxes_are_empty(desktop, native_id, &targets).await;
+                    let still: Vec<usize> = after
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, empty)| !**empty)
+                        .map(|(index, _)| index)
+                        .collect();
+                    if !still.is_empty() {
+                        return web_do_disarm_and_fail(
+                            desktop,
+                            native_id,
+                            session,
+                            format!(
+                                "clear_failed (box(es) {still:?} of {total} still hold text after \
+                                 two clear attempts; typing now would merge old and new)",
+                                total = targets.len()
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
             // Type into the FIRST box; a segmented component auto-advances focus
             // itself, and driving that is the point of using real keys.
             if let Some(first) = targets.first()
@@ -47900,15 +48078,37 @@ async fn web_surface_do_for(
                     // string, so "I sent the keys" is not an answer — `matched`
                     // is. Compared by LENGTH and equality page-side so the
                     // secret never crosses back out (F4 redaction).
-                    let matched =
-                        web_do_verify_field_value(desktop, native_id, targets.first(), &text).await;
+                    // Segmented inputs are read back PER BOX. The old
+                    // single-selector comparison held the whole expected string
+                    // against one box and so could never express the merge it
+                    // existed to catch (N2).
+                    let matched_boxes = if selectors.is_empty() {
+                        None
+                    } else {
+                        web_do_verify_segmented_value(desktop, native_id, &targets, &text).await
+                    };
+                    let matched = match matched_boxes.as_ref() {
+                        Some(boxes) => Some(boxes.iter().all(|ok| *ok) && !boxes.is_empty()),
+                        None if selectors.is_empty() => {
+                            web_do_verify_field_value(desktop, native_id, targets.first(), &text)
+                                .await
+                        }
+                        // Segmented, but the boxes could not be read: unknown,
+                        // which is not the same as "no".
+                        None => None,
+                    };
                     Ok(json!({
                         "verb": "fill",
                         "chars": typed,
                         "cleared_fields": cleared,
                         "segmented": !selectors.is_empty(),
+                        // Which boxes were verified EMPTY before typing; `null`
+                        // when the page could not be read.
+                        "cleared_verified": cleared_verified,
                         // `null` = could not be read back (not a failure claim).
                         "matched": matched,
+                        // Names the wrong box instead of a bare false.
+                        "matched_boxes": matched_boxes,
                     }))
                 }
             }
@@ -47977,6 +48177,82 @@ mod web_do_verb_tests {
             base_obj.insert(key.clone(), value.clone());
         }
         base
+    }
+
+    // N2 THE LOCK. Fed the literal measured case: an OTP typed over a previous
+    // one produced `278344` where `292244` was intended — a MERGE of old and
+    // new digits — and the readback boolean still said fine, because it
+    // compared the whole 6-character string against box 0, which holds one
+    // character. The rule below cannot express that failure wrongly: it names
+    // the boxes.
+    #[test]
+    fn segmented_readback_reports_a_merge_as_failure() {
+        let good: Vec<Option<String>> = ["2", "9", "2", "2", "4", "4"]
+            .iter()
+            .map(|c| Some((*c).to_string()))
+            .collect();
+        assert_eq!(segmented_match("292244", &good), (true, vec![true; 6]));
+
+        // The recorded merge: 292244 typed over 278347 landed as 278344.
+        let merged: Vec<Option<String>> = ["2", "7", "8", "3", "4", "4"]
+            .iter()
+            .map(|c| Some((*c).to_string()))
+            .collect();
+        let (ok, per_box) = segmented_match("292244", &merged);
+        assert!(!ok, "a merge must read as failure");
+        assert_eq!(per_box, vec![true, false, false, false, true, true]);
+        let wrong: Vec<usize> = per_box
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| !**ok)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(wrong, vec![1, 2, 3], "the wrong boxes must be nameable");
+
+        // A box that could not be read is not "right".
+        let unread = vec![
+            Some("2".to_string()),
+            None,
+            Some("2".to_string()),
+            Some("2".to_string()),
+            Some("4".to_string()),
+            Some("4".to_string()),
+        ];
+        assert_eq!(segmented_match("292244", &unread).0, false);
+    }
+
+    // Chunking has ONE owner, and the last box absorbs the remainder — so a
+    // widget with fewer boxes than characters still gets a complete
+    // expectation instead of silently ignoring the tail.
+    #[test]
+    fn segmented_expectation_puts_the_remainder_in_the_last_box() {
+        assert_eq!(
+            segmented_expectation("292244", 6),
+            vec!["2", "9", "2", "2", "4", "4"]
+        );
+        assert_eq!(segmented_expectation("292244", 4), vec!["2", "9", "2", "244"]);
+        // One box means the whole string, so `--selector x` and
+        // `--selector-set x` ask the same question.
+        assert_eq!(segmented_expectation("292244", 1), vec!["292244"]);
+        assert!(segmented_expectation("292244", 0).is_empty());
+        // Fewer characters than boxes: the empty boxes expect emptiness.
+        assert_eq!(segmented_expectation("29", 4), vec!["2", "9", "", ""]);
+    }
+
+    // The readback must look at the SAME boxes the fill wrote to — one array,
+    // built from the shared matcher.
+    #[test]
+    fn segmented_readback_addresses_every_box_through_the_shared_matcher() {
+        let targets = vec![
+            WebElementRef::Css("#a".into()),
+            WebElementRef::Css("#b".into()),
+        ];
+        let js = web_do_refs_array_js(&targets);
+        assert_eq!(
+            js,
+            "[document.querySelector(\"#a\"),document.querySelector(\"#b\")]"
+        );
+        assert!(web_do_refs_array_js(&[]).is_empty() || web_do_refs_array_js(&[]) == "[]");
     }
 
     // C4: every addressing shape must produce a matcher, and the CSS shape must
