@@ -593,6 +593,7 @@ fn server_socket_path_lexists(path: &Path) -> bool {
 fn drain_unix_client_outcomes(
     receiver: &std::sync::mpsc::Receiver<Result<DaemonRequestOutcome>>,
     restart_after_exit: &mut Option<PathBuf>,
+    start_migration_drain: &mut bool,
 ) -> bool {
     let mut should_shutdown = false;
     while let Ok(result) = receiver.try_recv() {
@@ -603,6 +604,9 @@ fn drain_unix_client_outcomes(
                 }
                 if outcome.should_shutdown {
                     should_shutdown = true;
+                }
+                if outcome.start_migration_drain {
+                    *start_migration_drain = true;
                 }
             }
             Err(error) => warn!(error=%format!("{error:#}"), "daemon request failed"),
@@ -11968,9 +11972,25 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
         let mut restart_after_exit = None::<PathBuf>;
+        // Started at most once: the drain thread polls until our hands are empty
+        // and retires us itself, so a second handoff RPC must not stack another.
+        let mut migration_drain_started = false;
         loop {
-            if drain_unix_client_outcomes(&client_outcome_rx, &mut restart_after_exit) {
+            let mut start_migration_drain = false;
+            if drain_unix_client_outcomes(
+                &client_outcome_rx,
+                &mut restart_after_exit,
+                &mut start_migration_drain,
+            ) {
                 break;
+            }
+            if start_migration_drain && !migration_drain_started {
+                migration_drain_started = true;
+                spawn_progressive_session_migration(
+                    endpoint.clone(),
+                    home_dir.clone(),
+                    runtime.clone(),
+                );
             }
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -13169,6 +13189,20 @@ fn canonical_hot_restart_executable(raw_path: &str) -> Result<PathBuf> {
 struct DaemonRequestOutcome {
     should_shutdown: bool,
     restart_executable: Option<PathBuf>,
+    /// This request handed our sessions to a successor and we are now the
+    /// lingering preserved owner — so the accept loop must start the drain that
+    /// hands them over one by one.
+    ///
+    /// It has to be requested from here because
+    /// `spawn_progressive_session_migration` needs the daemon's
+    /// `Arc<Mutex<DaemonRuntime>>`, and the handoff itself runs inside a
+    /// `&mut self` method that does not have one. Before this, the drain was
+    /// started at exactly ONE site — the `disk_binary_replaced` self-retire
+    /// branch — so an explicit `HotRestart` RPC (what a deploy sends) preserved
+    /// its PTYs and then never migrated them. On jojo that was masked only
+    /// because the predecessor still had a drain thread alive from an earlier
+    /// self-retire; a second RPC-only deploy would have stranded everything.
+    start_migration_drain: bool,
 }
 
 /// May a booting daemon cold-restore the LIVE sessions in `server-state.json`?
@@ -13300,12 +13334,15 @@ fn daemon_request_outcome_for_response(
         return DaemonRequestOutcome {
             should_shutdown: false,
             restart_executable: None,
+            start_migration_drain: false,
         };
     }
     if matches!(response, ServerResponse::HotUpdateHandoff { .. }) {
         return DaemonRequestOutcome {
             should_shutdown: false,
             restart_executable: None,
+            // We kept our PTYs and a successor is up: start handing them over.
+            start_migration_drain: true,
         };
     }
 
@@ -13313,10 +13350,12 @@ fn daemon_request_outcome_for_response(
         ServerRequest::Shutdown => DaemonRequestOutcome {
             should_shutdown: true,
             restart_executable: None,
+            start_migration_drain: false,
         },
         ServerRequest::RetireDaemon { .. } => DaemonRequestOutcome {
             should_shutdown: true,
             restart_executable: None,
+            start_migration_drain: false,
         },
         ServerRequest::HotRestart {
             daemon_executable, ..
@@ -13326,10 +13365,14 @@ fn daemon_request_outcome_for_response(
                 canonical_hot_restart_executable(daemon_executable)
                     .unwrap_or_else(|_| PathBuf::from(daemon_executable)),
             ),
+            // The NON-preserving arm: this daemon owns nothing to hand over, so
+            // it restarts outright. Nothing to drain.
+            start_migration_drain: false,
         },
         _ => DaemonRequestOutcome {
             should_shutdown: false,
             restart_executable: None,
+            start_migration_drain: false,
         },
     }
 }
@@ -15154,6 +15197,11 @@ mod tests {
             "unix accept loop must collect request outcomes asynchronously"
         );
         assert!(
+            unix_loop.contains("spawn_progressive_session_migration("),
+            "unix accept loop must start the migration drain after a preserving handoff — \
+             otherwise an RPC deploy keeps its PTYs forever and the daemons chain"
+        );
+        assert!(
             unix_loop.contains("drain_unix_client_outcomes("),
             "unix accept loop must drain completed client outcomes without blocking accept"
         );
@@ -16714,6 +16762,20 @@ mod tests {
         );
         assert!(!handoff_outcome.should_shutdown);
         assert_eq!(handoff_outcome.restart_executable, None);
+        // A preserving handoff must ASK for the drain. Without this the daemon
+        // kept its PTYs and never handed them over, because
+        // `spawn_progressive_session_migration` had exactly one call site — the
+        // `disk_binary_replaced` self-retire branch — and an explicit
+        // `HotRestart` RPC (what a deploy sends) does not go through it. The
+        // result was a chain of daemons each still owning live sessions.
+        assert!(
+            handoff_outcome.start_migration_drain,
+            "a preserving handoff must start the progressive-migration drain"
+        );
+        // ...and nothing else may, or a plain request would spawn drain threads.
+        assert!(!retire_outcome.start_migration_drain);
+        assert!(!shutdown_outcome.start_migration_drain);
+        assert!(!error_outcome.start_migration_drain);
     }
 
     #[test]
