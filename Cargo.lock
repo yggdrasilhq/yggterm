@@ -6888,6 +6888,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "flate2",
+ "libloading 0.8.9",
  "reqwest",
  "rusqlite",
  "semver",
