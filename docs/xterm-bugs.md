@@ -1499,7 +1499,13 @@ job (the JSONL pretty-formatting surface).
 
 ## remote-cc-pty-never-resized
 
-**STATUS:** FIXED (code landed; activates on the next daemon changeover)
+**STATUS:** FIXED — **live-verified 2026-07-25 on guihost at 2.12.11**, on exactly
+the daemon changeover this entry was waiting for. A `remote-cc://dev/...` session
+whose PTY had been dropped by the 2.12.11 hot restart was re-opened (click =
+resume); it came back at client grid **168x63** with
+`blank_rows_below_cursor: 2` and `session_view_contract_violations: []`, i.e. the
+frame fills the grid instead of floating a composer mid-viewport. The old failure
+was a ~20-row dead band, so this is unambiguous.
 
 ### Symptom
 A remote **Claude Code** session renders a frame built for a *smaller screen*: the
