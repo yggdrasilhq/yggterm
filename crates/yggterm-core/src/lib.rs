@@ -7,6 +7,7 @@ pub mod click_grid;
 mod icon;
 mod install;
 mod perf;
+pub mod render_probe;
 mod retention;
 mod session_kind;
 mod telemetry;
