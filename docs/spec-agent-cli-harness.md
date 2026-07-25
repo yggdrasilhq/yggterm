@@ -537,6 +537,35 @@ a source-scan lock in each crate now fails the build if you do.
    belong to a phase that can prove the change live.
 2. **Four-arm test matrix**: the A3 harness (jsdom/PTY-level where possible)
    so later phases can't regress one arm silently.
+   ✅ **2a SHIPPED 2026-07-25 (the identity/invocation/routing axes)**:
+   `crates/yggterm-server/src/agent_arm_matrix.rs` — one row per arm, every row
+   answered by the same accessors. Locks: row scheme and runtime-key scheme per
+   arm; the remote wrapper subcommands; the resume/launch invocation
+   (**structurally**, see the trap below); and `terminal_write_strategy_for_path`
+   for every arm both with and without a live local runtime — the cell that was
+   wrong for `remote-cc://` and cost the user a typable session.
+   **The cells that must AGREE are asserted against the arm's locality twin**
+   rather than a transcribed constant, so "the store layout does not fork on
+   locality" and "the invocation does not fork on locality" (§2 corollary 2) are
+   *checked*, not restated.
+   ⚠ **The spec's "four arms" undercounts what ships:** `AGENT_CLIS` carries
+   THREE CLIs, so the matrix is SIX arms. `every_registered_cli_has_both_arms`
+   derives the requirement from the registry — registering a CLI without arms
+   fails, which is the A6 drill's first gate.
+   ⚠ **Trap that shaped the design: the built command is not a constant.** It
+   carries `TERM_PROGRAM_VERSION` (the crate version, so a byte-for-byte lock
+   breaks on every bump) and `YGGTERM_CC_EXTRA_ARGS` from ambient env. The
+   assertions are therefore ordered-token structural checks on the invocation
+   TAIL, with `-C "$PWD"` asserted present exactly when the descriptor says the
+   CLI re-roots.
+   **Both phase-1 recorded forks are now locked in both directions** (the
+   phase-0 burn-down contract): codex re-roots and codex-litellm does not, and
+   the codex home env var forks by locality. Unifying either fails the test
+   until its `RECORDED_ARM_FORKS` row is deleted.
+   **2b, NOT built:** the GUI-side arm axes — readiness/overlay (§7.3), attach
+   seed (§7.6), mount/reveal (§7.10) — live in `yggterm-shell` and need their
+   own twin of this table. That is where the `remote-cc` readiness hole lives,
+   so 2b is a prerequisite for phase 3 rather than a nicety.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a
    by-product) + **attach single-writer** (A1, A2 close here).
 4. **Extraction unification** (title/summary/working via descriptor).
