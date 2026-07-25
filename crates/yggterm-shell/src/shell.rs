@@ -53873,6 +53873,28 @@ async fn process_pending_app_control_requests(
             data: Some(describe_app_rows_snapshot(&state)),
             error: None,
         },
+        // A well-formed request whose `kind` this GUI build does not know.
+        // App-control is a filesystem dropbox, so a NEWER CLI can hand this
+        // window a verb it has never heard of. Before `AppControlCommand::
+        // Unsupported` existed the request file was silently deleted and the
+        // caller saw a bare timeout; answering honestly is the whole point of
+        // the variant. Deliberately does not echo a payload — the request file
+        // is the one copy of it.
+        AppControlCommand::Unsupported => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(json!({
+                "accepted": false,
+                "reason": "unsupported_command_kind",
+                "gui_version": env!("CARGO_PKG_VERSION"),
+            })),
+            error: Some(
+                "this GUI build does not implement that app-control command; swap the GUI binary (server app clients shows its pid/started_at)"
+                    .to_string(),
+            ),
+        },
         AppControlCommand::ListCommands => {
             let keymap = state.read().keymap.clone();
             let commands: Vec<Value> = command_registry::SHELL_COMMANDS
