@@ -46719,6 +46719,82 @@ async fn web_do_focus_selector(
     Ok(())
 }
 
+/// Empty the focused field using REAL keys: select-all, then Delete, then a run
+/// of BackSpace as the fallback.
+///
+/// Real input, not `el.value = ""`, for the same reason [`WebSurfaceDoAction::Fill`]
+/// exists: a component that keeps its own state (React-controlled, segmented OTP
+/// boxes) ignores a scripted value write, so a scripted clear leaves the stale
+/// characters live inside the widget while the DOM reads empty — the worst of
+/// both, because the readback then LIES.
+///
+/// The BackSpace run is bounded by the field's own length (read first, capped),
+/// so this cannot spin on a field that refuses to clear; a segmented box holds
+/// one character, and select-all+Delete already covers the ordinary case.
+async fn web_do_clear_focused_field(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+) -> Result<(), String> {
+    const CTRL: u32 = 1 << 2; // GDK_CONTROL_MASK
+    let len = web_do_eval(
+        desktop,
+        native_id,
+        "(function(){var el=document.activeElement;if(!el)return{n:0};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';return{n:v.length};})()",
+    )
+    .await
+    .ok()
+    .and_then(|info| info.get("n").and_then(Value::as_u64))
+    .unwrap_or(0);
+
+    let a = web_do_char_to_keyval('a');
+    desktop.inject_web_surface_key(native_id, true, a, CTRL)?;
+    desktop.inject_web_surface_key(native_id, false, a, CTRL)?;
+    if let Some(del) = web_do_key_name_to_keyval("Delete") {
+        desktop.inject_web_surface_key(native_id, true, del, 0)?;
+        desktop.inject_web_surface_key(native_id, false, del, 0)?;
+    }
+    // Fallback for widgets that ignore select-all. Capped at what was actually
+    // there (plus one for a trailing composition), never an open loop.
+    if let Some(bs) = web_do_key_name_to_keyval("BackSpace") {
+        for _ in 0..len.min(64) + 1 {
+            desktop.inject_web_surface_key(native_id, true, bs, 0)?;
+            desktop.inject_web_surface_key(native_id, false, bs, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// Did the field actually end up holding `expected`? Returns `None` when it
+/// could not be read (unknown, which is not the same as "no").
+///
+/// The comparison happens PAGE-SIDE and only a boolean comes back: this verb is
+/// used for OTPs and passwords, so the value must never re-enter a log, a trace
+/// event, or an app-control response (F4 output redaction).
+async fn web_do_verify_field_value(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    selector: Option<&str>,
+    expected: &str,
+) -> Option<bool> {
+    let script = format!(
+        "(function(){{var sel={sel};\
+         var el=sel?document.querySelector(sel):document.activeElement;\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         return{{known:true,same:v==={want}}};}})()",
+        sel = selector
+            .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()))
+            .unwrap_or_else(|| "null".to_string()),
+        want = serde_json::to_string(expected).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(info.get("same").and_then(Value::as_bool).unwrap_or(false))
+}
+
 /// GDK button number for an app-control pointer button.
 fn web_do_gdk_button(button: AppControlPointerButton) -> u32 {
     match button {
@@ -46800,7 +46876,9 @@ fn web_do_observed_event_types(action: &WebSurfaceDoAction) -> &'static [&'stati
         }
         WebSurfaceDoAction::Move { .. } => &["mousemove"],
         WebSurfaceDoAction::Scroll { .. } => &["wheel"],
-        WebSurfaceDoAction::Key { .. } | WebSurfaceDoAction::Type { .. } => &["keydown"],
+        WebSurfaceDoAction::Key { .. }
+        | WebSurfaceDoAction::Type { .. }
+        | WebSurfaceDoAction::Fill { .. } => &["keydown"],
     }
 }
 
@@ -47413,6 +47491,76 @@ async fn web_surface_do_for(
                 // Never log the typed text (F4 output redaction) — only its length.
                 Some(reason) => Err(reason),
                 None => Ok(json!({ "verb": "type", "chars": typed })),
+            }
+        }
+        WebSurfaceDoAction::Fill {
+            text,
+            selector,
+            selectors,
+        } => {
+            // Which boxes to clear: the segmented set if given, else the single
+            // field. Clearing EVERY box matters — a segmented component keeps
+            // its own state per box, so clearing only the focused one leaves the
+            // rest holding old digits, which is the observed merge.
+            let targets: Vec<String> = if !selectors.is_empty() {
+                selectors.clone()
+            } else {
+                selector.iter().cloned().collect()
+            };
+            let mut cleared = 0u32;
+            for target in &targets {
+                if let Err(reason) = web_do_focus_selector(desktop, native_id, target).await {
+                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                }
+                if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
+                    return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+                }
+                cleared += 1;
+            }
+            // Type into the FIRST box; a segmented component auto-advances focus
+            // itself, and driving that is the point of using real keys.
+            if let Some(first) = targets.first()
+                && let Err(reason) = web_do_focus_selector(desktop, native_id, first).await
+            {
+                return web_do_disarm_and_fail(desktop, native_id, session, reason).await;
+            }
+            let mut typed = 0u32;
+            let mut error: Option<String> = None;
+            for c in text.chars() {
+                let keyval = web_do_char_to_keyval(c);
+                if let Err(reason) = desktop
+                    .inject_web_surface_key(native_id, true, keyval, 0)
+                    .and(desktop.inject_web_surface_key(native_id, false, keyval, 0))
+                {
+                    error = Some(reason);
+                    break;
+                }
+                typed += 1;
+            }
+            match error {
+                Some(reason) => Err(reason),
+                None => {
+                    // Read the value back. The whole reason this verb exists is
+                    // that a field can report success and still hold the wrong
+                    // string, so "I sent the keys" is not an answer — `matched`
+                    // is. Compared by LENGTH and equality page-side so the
+                    // secret never crosses back out (F4 redaction).
+                    let matched = web_do_verify_field_value(
+                        desktop,
+                        native_id,
+                        targets.first().map(String::as_str),
+                        &text,
+                    )
+                    .await;
+                    Ok(json!({
+                        "verb": "fill",
+                        "chars": typed,
+                        "cleared_fields": cleared,
+                        "segmented": !selectors.is_empty(),
+                        // `null` = could not be read back (not a failure claim).
+                        "matched": matched,
+                    }))
+                }
             }
         }
     };
