@@ -28,6 +28,15 @@
 //! process as plain context. That asymmetry is the finding, not a gap: it is the
 //! argument for profile partitioning as the actual lever.
 //!
+//! # The GPU gauge
+//!
+//! CPU alone cannot tell "cheap because the GPU did the work" from "cheap because
+//! nothing happened", and that ambiguity is exactly what let a host run with its GPU
+//! switched off for months. So every sample also carries `drm-engine-*` time from
+//! `/proc/<pid>/fdinfo/*` ([`parse_fdinfo_drm_engine_ns`]) — nonzero and rising means
+//! the GPU really is rasterizing. `None` there means the counter was UNREADABLE and
+//! is never rendered as a zero.
+//!
 //! # Wire format
 //!
 //! Samples are emitted as ordinary perf events whose `duration_ms` is **CPU
@@ -90,7 +99,10 @@ impl RenderRole {
         if comm.starts_with("WebKitGPU") {
             return RenderRole::WebGpu;
         }
-        if matches!(comm, "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire") {
+        if matches!(
+            comm,
+            "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire"
+        ) {
             return RenderRole::Compositor;
         }
         if comm == "yggterm" || comm.starts_with("yggterm-gui") {
@@ -160,23 +172,120 @@ pub fn parse_proc_stat(text: &str) -> Option<ProcStat> {
     })
 }
 
-/// Parse `Pss:` (KiB) out of `/proc/<pid>/smaps_rollup`.
-///
-/// PSS, not RSS, is the honest memory number for WebKit: several processes map the
-/// same engine text, so summing RSS across a WebKit set double-counts it badly.
-pub fn parse_smaps_rollup_pss_kb(text: &str) -> Option<u64> {
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("Pss:") else {
-            continue;
-        };
-        let value = rest.split_whitespace().next()?;
-        return value.parse().ok();
-    }
-    None
+/// Where a [`ProcMemory`] reading came from. Carried in the value rather than implied
+/// by the call site, because the two sources are not interchangeable: `smaps_rollup`
+/// knows PSS and anonymous memory, `status` knows only RSS. A caller that cannot tell
+/// which it got would silently read the fallback's zeroes as real numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcMemorySource {
+    SmapsRollup,
+    StatusVmRss,
 }
 
-/// Parse `VmRSS:` (KiB) out of `/proc/<pid>/status`.
-pub fn parse_status_rss_kb(text: &str) -> Option<u64> {
+impl ProcMemorySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProcMemorySource::SmapsRollup => "smaps_rollup",
+            ProcMemorySource::StatusVmRss => "status_vm_rss",
+        }
+    }
+
+    /// Whether this source can answer PSS and anonymous memory at all. `status` knows
+    /// only `VmRSS`, so on that source those two fields carry placeholder zeroes that
+    /// no reader may see.
+    pub fn knows_pss_and_anonymous(&self) -> bool {
+        matches!(self, ProcMemorySource::SmapsRollup)
+    }
+}
+
+/// How much memory one process is using.
+///
+/// This module is the ONE owner of that question. The GUI shell used to carry its own
+/// `smaps_rollup` parser for the allocator-trim chore while this one parsed the same
+/// file per pid — two encodings of one concept, free to drift apart on the next kernel
+/// field rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcMemory {
+    pub rss_kb: u64,
+    /// PSS, or 0 when the reading came from the `status` fallback.
+    pub pss_kb: u64,
+    /// Anonymous (non-file-backed) memory, or 0 on the `status` fallback. This is the
+    /// number the allocator-trim chore moves.
+    pub anonymous_kb: u64,
+    pub source: ProcMemorySource,
+}
+
+impl ProcMemory {
+    /// The honest single number for "how much memory does this process cost".
+    ///
+    /// PSS where we have it: several WebKit processes map the same engine text, so
+    /// summing RSS across a WebKit set double-counts it badly. RSS is the fallback,
+    /// and it is only ever reached when PSS was genuinely unavailable.
+    pub fn preferred_kb(&self) -> u64 {
+        if self.pss_kb > 0 {
+            self.pss_kb
+        } else {
+            self.rss_kb
+        }
+    }
+
+    /// The fields of this reading that are safe to put on the wire, and the source
+    /// that produced them. THE one owner of "how a memory reading is published".
+    ///
+    /// ⚠ `pss_kb` and `anonymous_kb` are ABSENT — not zero — on the `status` fallback,
+    /// because that file cannot see them. Emitting their placeholder zeroes is exactly
+    /// what [`ProcMemorySource`] exists to prevent, and it is the same substitution
+    /// `gpu_ms` already refuses one struct over: "we could not look" and "it was zero"
+    /// are different findings. Without this an `allocator_trim` event on the fallback
+    /// path read as "anonymous memory 0 -> 0, the trim moved nothing".
+    pub fn perf_fields(&self) -> Value {
+        let mut payload = json!({
+            "rss_kb": self.rss_kb,
+            "memory_source": self.source.as_str(),
+        });
+        if self.source.knows_pss_and_anonymous() {
+            payload["pss_kb"] = json!(self.pss_kb);
+            payload["anonymous_kb"] = json!(self.anonymous_kb);
+        }
+        payload
+    }
+}
+
+/// Parse `/proc/<pid>/smaps_rollup` in one pass.
+///
+/// `None` when the text carries no `Rss:` at all (an empty or truncated rollup, which
+/// the kernel produces for a process that is exiting) — the same guard the shell's
+/// allocator-trim chore has always applied before deciding it is worth trimming.
+pub fn parse_smaps_rollup(text: &str) -> Option<ProcMemory> {
+    let mut memory = ProcMemory {
+        rss_kb: 0,
+        pss_kb: 0,
+        anonymous_kb: 0,
+        source: ProcMemorySource::SmapsRollup,
+    };
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        let value = parts
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or_default();
+        match label {
+            "Rss:" => memory.rss_kb = value,
+            "Pss:" => memory.pss_kb = value,
+            "Anonymous:" => memory.anonymous_kb = value,
+            _ => {}
+        }
+    }
+    (memory.rss_kb > 0).then_some(memory)
+}
+
+/// Parse `VmRSS:` (KiB) out of `/proc/<pid>/status`. Private on purpose: it is the
+/// FALLBACK half of [`read_process_memory`] and has no business being anyone's answer
+/// on its own, because it cannot see PSS.
+fn parse_status_rss_kb(text: &str) -> Option<u64> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("VmRSS:") else {
             continue;
@@ -185,6 +294,163 @@ pub fn parse_status_rss_kb(text: &str) -> Option<u64> {
         return value.parse().ok();
     }
     None
+}
+
+/// Read one process's memory: `smaps_rollup` first, `status` VmRSS only if that failed.
+///
+/// The fallback is legal precisely because it lives inside the one owner and is
+/// LABELLED in the value it returns, so it can never masquerade as a PSS reading.
+/// `smaps_rollup` is unreadable on some hardened kernels and absent for kernel
+/// threads, and one file per pid instead of two halves this probe's syscall cost.
+pub fn read_process_memory(pid: i32) -> Option<ProcMemory> {
+    if let Some(memory) = fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|text| parse_smaps_rollup(&text))
+    {
+        return Some(memory);
+    }
+    let rss_kb = fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|text| parse_status_rss_kb(&text))?;
+    Some(ProcMemory {
+        rss_kb,
+        pss_kb: 0,
+        anonymous_kb: 0,
+        source: ProcMemorySource::StatusVmRss,
+    })
+}
+
+/// Sum every `drm-engine-*` counter (nanoseconds of GPU engine time) in one
+/// `/proc/<pid>/fdinfo/<fd>` file. `None` when the file names no DRM engine at all,
+/// which is how "this fd is not a GPU fd" stays distinct from "this GPU did no work".
+///
+/// Exact live format, captured from `krunner` on the GUI host 2026-07-25 — tab
+/// separated, one engine per line, alongside `drm-driver:\tamdgpu` and a block of
+/// `drm-memory-*` lines that must NOT be summed into the time:
+///
+/// ```text
+/// drm-driver:     amdgpu
+/// drm-engine-gfx: 56369242 ns
+/// drm-engine-compute:     3434919 ns
+/// ```
+///
+/// This is THE discriminator for the forced-software-GL bug: the GUI's
+/// `WebKitWebProcess` holds no DRM fd at all while an ordinary desktop app on the same
+/// machine shows tens of milliseconds of `drm-engine-gfx`. "The GPU works for
+/// everything except us" is a fact this number states and a CPU number cannot.
+pub fn parse_fdinfo_drm_engine_ns(text: &str) -> Option<u64> {
+    parse_fdinfo_drm_client(text).map(|client| client.engine_ns)
+}
+
+/// One DRM client as a single `fdinfo` file describes it.
+///
+/// `client_id` is the kernel's own de-duplication key. It matters because
+/// **`dup`'d DRM fds share one `struct file`, so every one of them reports the SAME
+/// cumulative counters** — summing across fds multiplies the answer by however many
+/// the process happens to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdinfoDrmClient {
+    /// `drm-client-id`, when the kernel wrote one.
+    pub client_id: Option<u64>,
+    /// Every `drm-engine-*` counter in this file, summed. One file describes one
+    /// client, so summing WITHIN a file is correct; summing ACROSS files is not.
+    pub engine_ns: u64,
+}
+
+/// Parse one `/proc/<pid>/fdinfo/<fd>` file into the DRM client it describes.
+/// `None` when the file names no DRM engine at all, which is how "this fd is not a
+/// GPU fd" stays distinct from "this GPU did no work".
+pub fn parse_fdinfo_drm_client(text: &str) -> Option<FdinfoDrmClient> {
+    let mut engine_ns: Option<u64> = None;
+    let mut client_id: Option<u64> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("drm-client-id:") {
+            client_id = rest.trim().parse::<u64>().ok();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("drm-engine-") else {
+            continue;
+        };
+        let Some((_engine, value)) = rest.split_once(':') else {
+            continue;
+        };
+        let mut fields = value.split_whitespace();
+        let Some(nanos) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        // The kernel writes the unit; anything else is a key we do not understand.
+        if fields.next() != Some("ns") {
+            continue;
+        }
+        engine_ns = Some(engine_ns.unwrap_or(0).saturating_add(nanos));
+    }
+    engine_ns.map(|engine_ns| FdinfoDrmClient {
+        client_id,
+        engine_ns,
+    })
+}
+
+/// Sum GPU engine time across one process's fdinfo files, counting each DRM CLIENT
+/// once.
+///
+/// ⚠ Reproduced live on the dev host 2026-07-25, which is why this is not a naive sum:
+/// `Xorg` holds 5 fds all reporting `drm-client-id: 5` and the same 960_695_430_760 ns,
+/// `xfwm4` holds 4 fds on client-id 7 and the same 163_800 ns. Adding them up gave 5x
+/// and 4x the truth. Since the inflation is a constant multiple, the DELTA is inflated
+/// by the same factor — so a gauge whose whole job is to answer "is the GPU really
+/// rasterizing, and how much" was silently reporting several times the real number.
+///
+/// A file the kernel gave no `drm-client-id` cannot be de-duplicated, so each such fd
+/// counts once under its own identity: over-counting is the failure being fixed, but
+/// dropping a real client would be worse.
+fn sum_drm_engine_ns_by_client<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> u64 {
+    let mut by_client: BTreeMap<(Option<u64>, &str), u64> = BTreeMap::new();
+    for (fd_name, text) in files {
+        let Some(client) = parse_fdinfo_drm_client(text) else {
+            continue;
+        };
+        // Identity: the kernel's client id where it exists, else this fd alone.
+        let key = (
+            client.client_id,
+            if client.client_id.is_some() {
+                ""
+            } else {
+                fd_name
+            },
+        );
+        let slot = by_client.entry(key).or_insert(0);
+        // Every fd of one client reports the same cumulative counters; take the
+        // largest rather than the last, so two reads racing mid-interval cannot
+        // make the total go backwards.
+        *slot = (*slot).max(client.engine_ns);
+    }
+    by_client
+        .into_values()
+        .fold(0u64, |total, nanos| total.saturating_add(nanos))
+}
+
+/// Total GPU engine nanoseconds across every fd this process holds.
+///
+/// `None` means WE COULD NOT LOOK (the fdinfo directory is unreadable — another user's
+/// process, or a hardened `/proc`). `Some(0)` means we looked and this process is
+/// doing no GPU work. Collapsing those two into a zero is the exact mistake that
+/// produced the forced-software-GL bug: one EACCES read as "there is no GPU here".
+pub fn drm_engine_ns_for_pid(pid: i32) -> Option<u64> {
+    let entries = fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?;
+    let files: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            fs::read_to_string(entry.path())
+                .ok()
+                .map(|text| (name, text))
+        })
+        .collect();
+    Some(sum_drm_engine_ns_by_client(
+        files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str())),
+    ))
 }
 
 /// Extract `AT_CLKTCK` from a raw 64-bit `auxv` blob (pairs of little-endian u64
@@ -218,7 +484,11 @@ pub fn user_hz() -> u64 {
 
 /// Convert a tick delta into CPU milliseconds. Pure so the arithmetic is testable.
 pub fn cpu_ms_from_ticks(delta_ticks: u64, user_hz: u64) -> f64 {
-    let hz = if user_hz == 0 { DEFAULT_USER_HZ } else { user_hz };
+    let hz = if user_hz == 0 {
+        DEFAULT_USER_HZ
+    } else {
+        user_hz
+    };
     (delta_ticks as f64) * 1000.0 / (hz as f64)
 }
 
@@ -243,13 +513,23 @@ pub struct RenderProcSample {
     pub cpu_ms: f64,
     /// Wall milliseconds the delta was measured over.
     pub interval_ms: f64,
-    pub rss_kb: Option<u64>,
-    pub pss_kb: Option<u64>,
+    /// Memory as one labelled reading, never three parallel Options that could come
+    /// from different sources. `None` when `/proc` would not answer for this pid.
+    pub memory: Option<ProcMemory>,
+    /// GPU engine nanoseconds consumed since the previous sample, a delta exactly like
+    /// `cpu_ms`. `None` when the counter was unreadable at either end of the interval —
+    /// never a zero standing in for "we could not look".
+    pub gpu_ns: Option<u64>,
 }
 
 impl RenderProcSample {
     pub fn core_fraction(&self) -> f64 {
         core_fraction(self.cpu_ms, self.interval_ms)
+    }
+
+    /// GPU engine milliseconds, the unit the tables and payloads report.
+    pub fn gpu_ms(&self) -> Option<f64> {
+        self.gpu_ns.map(|nanos| nanos as f64 / 1_000_000.0)
     }
 }
 
@@ -258,8 +538,10 @@ impl RenderProcSample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderProcObservation {
     pub stat: ProcStat,
-    pub rss_kb: Option<u64>,
-    pub pss_kb: Option<u64>,
+    pub memory: Option<ProcMemory>,
+    /// CUMULATIVE GPU engine nanoseconds, as `/proc` reports them. The delta is taken
+    /// by [`RenderProbe::observe`], the same place the CPU delta is taken.
+    pub gpu_ns: Option<u64>,
 }
 
 /// Holds the previous observation so every reported number is a delta.
@@ -270,8 +552,11 @@ pub struct RenderProcObservation {
 #[derive(Debug, Default)]
 pub struct RenderProbe {
     last_ticks: BTreeMap<i32, u64>,
+    last_gpu_ns: BTreeMap<i32, u64>,
     last_at_ms: Option<u64>,
     user_hz: Option<u64>,
+    /// The probe's OWN clock, lazily started on first use so `Default` stays trivial.
+    started: Option<std::time::Instant>,
 }
 
 impl RenderProbe {
@@ -291,10 +576,29 @@ impl RenderProbe {
 
     /// Turn a set of observations into deltas against the previous call.
     ///
-    /// `now_ms` is monotonic wall time supplied by the caller so this stays pure and
-    /// testable. Processes that vanished are forgotten; processes that appeared are
-    /// recorded and reported only from their *second* observation onward.
-    pub fn observe(
+    /// **The probe owns its clock, and it is `Instant` — monotonic.** The caller does
+    /// not get to supply one, because a caller that supplied a WALL clock (as the
+    /// GUI's sampling loop did) breaks the denominator in a way nothing reports: an
+    /// NTP step or a suspend/resume inflates `interval_ms` by the gap while the CPU
+    /// tick counters do not advance, so `core_fraction` reads artificially LOW right
+    /// after the laptop wakes — on the one host whose fan is the complaint. Two
+    /// answers to "how much time passed" is one too many.
+    ///
+    /// Processes that vanished are forgotten; processes that appeared are recorded and
+    /// reported only from their *second* observation onward.
+    pub fn observe(&mut self, observations: &[RenderProcObservation]) -> Vec<RenderProcSample> {
+        let now_ms = self
+            .started
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        self.observe_at(observations, now_ms)
+    }
+
+    /// The delta arithmetic, with the clock injected. **Deliberately private**: it is
+    /// the testable core, and keeping it in-module is what makes it impossible for an
+    /// outside caller to hand this probe a clock that can jump.
+    fn observe_at(
         &mut self,
         observations: &[RenderProcObservation],
         now_ms: u64,
@@ -306,10 +610,14 @@ impl RenderProbe {
             .unwrap_or(0.0);
         let mut samples = Vec::new();
         let mut next_ticks = BTreeMap::new();
+        let mut next_gpu_ns = BTreeMap::new();
         for observation in observations {
             let pid = observation.stat.pid;
             let ticks = observation.stat.cpu_ticks();
             next_ticks.insert(pid, ticks);
+            if let Some(gpu_ns) = observation.gpu_ns {
+                next_gpu_ns.insert(pid, gpu_ns);
+            }
             let Some(previous) = self.last_ticks.get(&pid).copied() else {
                 continue;
             };
@@ -318,6 +626,14 @@ impl RenderProbe {
             }
             // A tick counter that went BACKWARDS means pid reuse, not negative work.
             let delta = ticks.saturating_sub(previous);
+            // Same rule for the GPU counter, plus one more: a delta needs BOTH ends.
+            // An fd closed mid-interval drops the total, and a pid whose fdinfo became
+            // unreadable has no reading at all — both must read as "no number", never
+            // as a zero that would look like an idle GPU.
+            let gpu_ns = match (self.last_gpu_ns.get(&pid).copied(), observation.gpu_ns) {
+                (Some(previous), Some(current)) => Some(current.saturating_sub(previous)),
+                _ => None,
+            };
             samples.push(RenderProcSample {
                 pid,
                 ppid: observation.stat.ppid,
@@ -325,11 +641,12 @@ impl RenderProbe {
                 comm: observation.stat.comm.clone(),
                 cpu_ms: cpu_ms_from_ticks(delta, hz),
                 interval_ms,
-                rss_kb: observation.rss_kb,
-                pss_kb: observation.pss_kb,
+                memory: observation.memory,
+                gpu_ns,
             });
         }
         self.last_ticks = next_ticks;
+        self.last_gpu_ns = next_gpu_ns;
         self.last_at_ms = Some(now_ms);
         samples
     }
@@ -372,12 +689,8 @@ pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
         }
         let pid = stat.pid;
         observations.push(RenderProcObservation {
-            rss_kb: fs::read_to_string(format!("/proc/{pid}/status"))
-                .ok()
-                .and_then(|text| parse_status_rss_kb(&text)),
-            pss_kb: fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
-                .ok()
-                .and_then(|text| parse_smaps_rollup_pss_kb(&text)),
+            memory: read_process_memory(pid),
+            gpu_ns: drm_engine_ns_for_pid(pid),
             stat,
         });
     }
@@ -391,6 +704,11 @@ pub struct RenderRoleRollup {
     pub cpu_ms: f64,
     /// PSS where available, else RSS, summed across the role's processes.
     pub mem_kb: u64,
+    /// GPU engine nanoseconds summed across the role's processes, or `None` when NO
+    /// process in the role had a readable counter. The distinction survives the rollup
+    /// on purpose: "this role did no GPU work" and "we could not see the GPU" are
+    /// different findings, and only one of them means the GPU is switched off.
+    pub gpu_ns: Option<u64>,
     pub procs: usize,
     pub interval_ms: f64,
     /// The single busiest process in this role, and its share. This is what exposed
@@ -404,6 +722,11 @@ impl RenderRoleRollup {
     pub fn core_fraction(&self) -> f64 {
         core_fraction(self.cpu_ms, self.interval_ms)
     }
+
+    /// GPU engine milliseconds, the unit the tables and payloads report.
+    pub fn gpu_ms(&self) -> Option<f64> {
+        self.gpu_ns.map(|nanos| nanos as f64 / 1_000_000.0)
+    }
 }
 
 /// Roll per-process samples up by role.
@@ -416,13 +739,20 @@ pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
                 role: sample.role,
                 cpu_ms: 0.0,
                 mem_kb: 0,
+                gpu_ns: None,
                 procs: 0,
                 interval_ms: sample.interval_ms,
                 hot_pid: sample.pid,
                 hot_cpu_ms: f64::MIN,
             });
         entry.cpu_ms += sample.cpu_ms;
-        entry.mem_kb += sample.pss_kb.or(sample.rss_kb).unwrap_or(0);
+        entry.mem_kb += sample
+            .memory
+            .map(|memory| memory.preferred_kb())
+            .unwrap_or(0);
+        if let Some(gpu_ns) = sample.gpu_ns {
+            entry.gpu_ns = Some(entry.gpu_ns.unwrap_or(0).saturating_add(gpu_ns));
+        }
         entry.procs += 1;
         if sample.cpu_ms > entry.hot_cpu_ms {
             entry.hot_cpu_ms = sample.cpu_ms;
@@ -460,6 +790,10 @@ pub fn emit_render_role_events(home: &Path, rollups: &[RenderRoleRollup], contex
             "hot_pid": rollup.hot_pid,
             "hot_cpu_ms": rollup.hot_cpu_ms.max(0.0),
         });
+        // Absent, not zero, when the counter was unreadable — see RenderRoleRollup.
+        if let Some(gpu_ms) = rollup.gpu_ms() {
+            payload["gpu_ms"] = json!(gpu_ms);
+        }
         if let Some(extra) = context.as_object()
             && let Some(object) = payload.as_object_mut()
         {
@@ -491,11 +825,18 @@ pub fn emit_render_perf_events(home: &Path, samples: &[RenderProcSample], contex
             "comm": sample.comm,
             "role": sample.role.as_str(),
         });
-        if let Some(rss_kb) = sample.rss_kb {
-            payload["rss_kb"] = json!(rss_kb);
+        // One owner for which memory fields reach the wire — see `perf_fields`.
+        if let Some(memory) = sample.memory
+            && let Some(fields) = memory.perf_fields().as_object()
+        {
+            if let Some(object) = payload.as_object_mut() {
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
         }
-        if let Some(pss_kb) = sample.pss_kb {
-            payload["pss_kb"] = json!(pss_kb);
+        if let Some(gpu_ms) = sample.gpu_ms() {
+            payload["gpu_ms"] = json!(gpu_ms);
         }
         if let Some(extra) = context.as_object() {
             if let Some(object) = payload.as_object_mut() {
@@ -581,14 +922,104 @@ mod tests {
         assert_eq!(RenderRole::classify("bash"), RenderRole::Other);
     }
 
+    /// Moved here from the GUI shell, which carried its own copy of this parser for
+    /// the allocator-trim chore while this module parsed the same file per pid.
     #[test]
-    fn parses_memory_gauges() {
-        let rollup = "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
-        assert_eq!(parse_smaps_rollup_pss_kb(rollup), Some(65432));
+    fn parses_rss_pss_and_anonymous_in_one_pass() {
+        let memory = parse_smaps_rollup(
+            "Rss:                123456 kB\nPss:                 98765 kB\nAnonymous:           54321 kB\n",
+        )
+        .expect("a rollup with an Rss line parses");
+        assert_eq!(memory.rss_kb, 123456);
+        assert_eq!(memory.pss_kb, 98765);
+        assert_eq!(memory.anonymous_kb, 54321);
+        assert_eq!(memory.source, ProcMemorySource::SmapsRollup);
+        assert_eq!(memory.preferred_kb(), 98765, "PSS wins where we have it");
+        // No Rss line at all is a truncated rollup (a process on its way out), which
+        // the allocator-trim chore has always refused to act on.
+        assert_eq!(parse_smaps_rollup("Pss: 4 kB\n"), None);
+        assert_eq!(parse_smaps_rollup(""), None);
+    }
+
+    /// The fallback must be LABELLED, never silently passed off as a PSS reading: a
+    /// caller that could not tell the difference would read its zeroes as real.
+    #[test]
+    fn the_status_fallback_is_labelled_and_prefers_rss() {
         let status = "Name:\tyggterm\nVmPeak:\t 900 kB\nVmRSS:\t  543284 kB\nThreads:\t42\n";
         assert_eq!(parse_status_rss_kb(status), Some(543284));
-        assert_eq!(parse_smaps_rollup_pss_kb("no pss here"), None);
         assert_eq!(parse_status_rss_kb("Name:\tx\n"), None);
+        let fallback = ProcMemory {
+            rss_kb: 543_284,
+            pss_kb: 0,
+            anonymous_kb: 0,
+            source: ProcMemorySource::StatusVmRss,
+        };
+        assert_eq!(fallback.preferred_kb(), 543_284);
+    }
+
+    /// ⚠⚠ THE FALLBACK'S PLACEHOLDER ZEROES MUST NOT REACH THE WIRE.
+    ///
+    /// `source` exists so "a caller that cannot tell which it got would silently read
+    /// the fallback's zeroes as real numbers" cannot happen — but `source` was never
+    /// serialized anywhere, while `pss_kb` and `anonymous_kb` were emitted
+    /// unconditionally. On the `status` fallback that published `pss_kb: 0,
+    /// anonymous_kb: 0` as findings, and an `allocator_trim` event read as "anonymous
+    /// memory 0 -> 0, the trim moved nothing". Absent-vs-zero is the same distinction
+    /// `gpu_ms` already keeps one struct over.
+    #[test]
+    fn the_fallback_publishes_no_number_it_could_not_read() {
+        let fallback = ProcMemory {
+            rss_kb: 543_284,
+            pss_kb: 0,
+            anonymous_kb: 0,
+            source: ProcMemorySource::StatusVmRss,
+        };
+        let fields = fallback.perf_fields();
+        assert_eq!(fields.get("rss_kb"), Some(&json!(543_284)));
+        assert_eq!(fields.get("memory_source"), Some(&json!("status_vm_rss")));
+        assert!(
+            fields.get("pss_kb").is_none(),
+            "the status fallback cannot see PSS, so it must publish no PSS — not a zero"
+        );
+        assert!(
+            fields.get("anonymous_kb").is_none(),
+            "same for anonymous memory, which is the number the trim chore MOVES"
+        );
+        let rollup = ProcMemory {
+            rss_kb: 123_456,
+            pss_kb: 98_765,
+            anonymous_kb: 54_321,
+            source: ProcMemorySource::SmapsRollup,
+        };
+        let fields = rollup.perf_fields();
+        assert_eq!(fields.get("pss_kb"), Some(&json!(98_765)));
+        assert_eq!(fields.get("anonymous_kb"), Some(&json!(54_321)));
+        assert_eq!(fields.get("memory_source"), Some(&json!("smaps_rollup")));
+    }
+
+    /// One owner, wired to the right pid. This fails outright if the collapse
+    /// mis-builds the `/proc` path — the sort of thing a pure parser test cannot see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_this_processs_own_memory_from_proc() {
+        let memory = read_process_memory(std::process::id() as i32)
+            .expect("this process must be able to read its own memory");
+        assert!(memory.rss_kb > 0);
+        // ⚠ Deliberately NOT `assert_eq!(source, SmapsRollup)`. That asserts an
+        // ambient fact about the test host — this module documents `smaps_rollup` as
+        // unreadable on some hardened kernels, which is the whole reason the fallback
+        // exists. What must hold on EVERY host is that whichever source answered says
+        // so, and that a source which cannot see PSS did not invent one.
+        match memory.source {
+            ProcMemorySource::SmapsRollup => assert!(memory.pss_kb > 0),
+            ProcMemorySource::StatusVmRss => {
+                assert_eq!(memory.pss_kb, 0);
+                assert_eq!(memory.anonymous_kb, 0);
+                assert!(memory.perf_fields().get("pss_kb").is_none());
+            }
+        }
+        // A pid that cannot exist has no memory, and that is None rather than zeroes.
+        assert_eq!(read_process_memory(-1), None);
     }
 
     #[test]
@@ -631,9 +1062,205 @@ mod tests {
     fn observation(pid: i32, comm: &str, ppid: i32, ticks: u64) -> RenderProcObservation {
         RenderProcObservation {
             stat: parse_proc_stat(&stat_line(pid, comm, ppid, ticks, 0)).unwrap(),
-            rss_kb: Some(1000),
-            pss_kb: Some(600),
+            memory: Some(ProcMemory {
+                rss_kb: 1000,
+                pss_kb: 600,
+                anonymous_kb: 400,
+                source: ProcMemorySource::SmapsRollup,
+            }),
+            gpu_ns: None,
         }
+    }
+
+    fn observation_with_gpu(
+        pid: i32,
+        comm: &str,
+        ppid: i32,
+        ticks: u64,
+        gpu_ns: u64,
+    ) -> RenderProcObservation {
+        RenderProcObservation {
+            gpu_ns: Some(gpu_ns),
+            ..observation(pid, comm, ppid, ticks)
+        }
+    }
+
+    /// The verbatim live fixture from the GUI host (krunner, `/proc/<pid>/fdinfo/15`,
+    /// 2026-07-25) — the frame of reference for "the GPU works for everything except
+    /// us". Both engines sum; the `drm-memory-*` block must not leak into the time.
+    const KRUNNER_FDINFO: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t26\nino:\t1128\n\
+drm-driver:\tamdgpu\ndrm-client-id:\t141\ndrm-memory-vram:\t8192 KiB\n\
+drm-memory-gtt:\t3564 KiB\ndrm-engine-gfx:\t56369242 ns\n\
+drm-engine-compute:\t3434919 ns\n";
+
+    #[test]
+    fn sums_every_drm_engine_and_ignores_the_memory_block() {
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns(KRUNNER_FDINFO),
+            Some(56_369_242 + 3_434_919)
+        );
+        // An fd that is not a GPU fd names no engine at all.
+        assert_eq!(parse_fdinfo_drm_engine_ns("pos:\t0\nflags:\t02\n"), None);
+        // ...including one that carries only the memory gauges.
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns("drm-driver:\tamdgpu\ndrm-memory-vram:\t8192 KiB\n"),
+            None
+        );
+        // A counter in some other unit is a key we do not understand, not nanoseconds.
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns("drm-engine-gfx:\t500 us\n"),
+            None
+        );
+    }
+
+    /// ⚠⚠ A PROCESS'S DUP'D DRM FDS ARE ONE CLIENT, AND THEY ALL REPORT THE SAME
+    /// CUMULATIVE COUNTERS. Summing over fds multiplies the answer.
+    ///
+    /// Measured on the dev host 2026-07-25, which is where this shape comes from:
+    ///
+    /// ```text
+    /// pid=37057 Xorg   — 5 fds, all drm-client-id 5, each 960_695_430_760 ns
+    /// pid=38801 xfwm4  — 4 fds, all drm-client-id 7, each 163_800 ns
+    /// pid=1991809 betterbird — 5 fds over TWO client ids (9587, 9589)
+    /// ```
+    ///
+    /// The naive sum returned 4_803_477_153_800 for Xorg where the truth is
+    /// 960_695_430_760 — a silent 5x on the one gauge that answers "is the GPU really
+    /// rasterizing". Since the factor is constant, the DELTA is inflated by it too.
+    #[test]
+    fn one_drm_client_counted_once_however_many_fds_it_holds() {
+        fn fdinfo(client_id: u64, gfx_ns: u64, compute_ns: u64) -> String {
+            format!(
+                "pos:\t0\nflags:\t02\ndrm-driver:\tamdgpu\ndrm-client-id:\t{client_id}\n\
+                 drm-memory-vram:\t8192 KiB\ndrm-engine-gfx:\t{gfx_ns} ns\n\
+                 drm-engine-compute:\t{compute_ns} ns\ndrm-engine-capacity-video:\t2\n"
+            )
+        }
+        // xfwm4's exact shape: four fds, one client, identical counters.
+        let one_client = fdinfo(7, 82_108, 81_692);
+        let four_fds = [
+            ("3", one_client.as_str()),
+            ("14", one_client.as_str()),
+            ("16", one_client.as_str()),
+            ("17", one_client.as_str()),
+        ];
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns(&one_client),
+            Some(163_800),
+            "one file describes one client, so summing WITHIN a file is right"
+        );
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client(four_fds),
+            163_800,
+            "four dup'd fds of one client are 163_800 ns, not 655_200"
+        );
+        // betterbird's shape: distinct clients DO add up.
+        let idle_client = fdinfo(9587, 0, 0);
+        let busy_client = fdinfo(9589, 1_487_337_748, 0);
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([
+                ("13", idle_client.as_str()),
+                ("36", busy_client.as_str()),
+                ("37", busy_client.as_str()),
+                ("41", busy_client.as_str()),
+                ("42", busy_client.as_str()),
+            ]),
+            1_487_337_748,
+            "two clients, four fds on the busy one: count each client once"
+        );
+        // A kernel that wrote no client id cannot be de-duplicated; each such fd
+        // counts once under its own identity rather than being dropped.
+        let anonymous = "drm-driver:\tamdgpu\ndrm-engine-gfx:\t100 ns\n";
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([("3", anonymous), ("4", anonymous)]),
+            200
+        );
+        // Non-GPU fds contribute nothing and are not mistaken for a zero-work client.
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([("0", "pos:\t0\nflags:\t02\n")]),
+            0
+        );
+    }
+
+    /// The GPU gauge must be a DELTA like everything else here. A lifetime total would
+    /// make a long-lived process look busy forever — the same `ps %CPU` lie this
+    /// module exists to avoid, wearing a different hat.
+    #[test]
+    fn gpu_time_is_a_delta_and_a_missing_reading_is_not_a_zero() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(
+            &[observation_with_gpu(10, "WebKitWebProces", 1, 0, 1_000_000)],
+            1_000,
+        );
+        let samples = probe.observe_at(
+            &[observation_with_gpu(
+                10,
+                "WebKitWebProces",
+                1,
+                10,
+                4_000_000,
+            )],
+            2_000,
+        );
+        assert_eq!(samples[0].gpu_ns, Some(3_000_000));
+        assert_eq!(samples[0].gpu_ms(), Some(3.0));
+        // A pid whose fdinfo became unreadable reports NO number, never zero: "we
+        // could not look" and "the GPU was idle" are different findings.
+        let samples = probe.observe_at(&[observation(10, "WebKitWebProces", 1, 20)], 3_000);
+        assert_eq!(samples[0].gpu_ns, None);
+        assert_eq!(samples[0].gpu_ms(), None);
+        // ...and a counter that went backwards (an fd closed mid-interval) reads as
+        // zero work rather than underflowing into an astronomical delta.
+        probe.observe_at(
+            &[observation_with_gpu(
+                10,
+                "WebKitWebProces",
+                1,
+                30,
+                9_000_000,
+            )],
+            4_000,
+        );
+        let samples = probe.observe_at(
+            &[observation_with_gpu(10, "WebKitWebProces", 1, 40, 12)],
+            5_000,
+        );
+        assert_eq!(samples[0].gpu_ns, Some(0));
+    }
+
+    /// The rollup keeps the same distinction: a role where nobody could be read has no
+    /// number, and the payload therefore carries no `gpu_ms` key at all.
+    #[test]
+    fn role_rollup_sums_gpu_time_and_keeps_unreadable_distinct_from_idle() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(
+            &[
+                observation_with_gpu(11, "WebKitWebProces", 10, 0, 0),
+                observation_with_gpu(12, "WebKitWebProces", 10, 0, 500_000),
+                observation(13, "yggterm", 1, 0),
+            ],
+            1_000,
+        );
+        let samples = probe.observe_at(
+            &[
+                observation_with_gpu(11, "WebKitWebProces", 10, 5, 2_000_000),
+                observation_with_gpu(12, "WebKitWebProces", 10, 5, 1_500_000),
+                observation(13, "yggterm", 1, 5),
+            ],
+            2_000,
+        );
+        let rolled = roll_up_roles(&samples);
+        let web = rolled
+            .iter()
+            .find(|rollup| rollup.role == RenderRole::WebContent)
+            .unwrap();
+        assert_eq!(web.gpu_ns, Some(2_000_000 + 1_000_000));
+        assert_eq!(web.gpu_ms(), Some(3.0));
+        let gui = rolled
+            .iter()
+            .find(|rollup| rollup.role == RenderRole::Gui)
+            .unwrap();
+        assert_eq!(gui.gpu_ns, None, "unreadable must not roll up as zero");
     }
 
     /// THE anti-regression test for this whole module: the first observation must
@@ -642,7 +1269,7 @@ mod tests {
     #[test]
     fn first_observation_reports_nothing() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 100_000)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 100_000)], 1_000);
         assert!(
             samples.is_empty(),
             "first sample must not report a lifetime average"
@@ -652,9 +1279,9 @@ mod tests {
     #[test]
     fn second_observation_reports_the_delta_only() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 100_000)], 1_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 100_000)], 1_000);
         // 50 ticks (500 CPU ms) burned over a 1000 ms interval = half a core.
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 100_050)], 2_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 100_050)], 2_000);
         assert_eq!(samples.len(), 1);
         let sample = &samples[0];
         assert_eq!(sample.cpu_ms, 500.0);
@@ -663,13 +1290,45 @@ mod tests {
         assert_eq!(sample.role, RenderRole::Gui);
     }
 
+    /// The probe times ITSELF, off a monotonic `Instant`. The GUI's sampling loop used
+    /// to hand it `current_millis()` — a `SystemTime` wall clock — so an NTP step or a
+    /// suspend/resume inflated `interval_ms` by the gap while the CPU tick counters
+    /// stood still, and `core_fraction` read artificially low right after every wake.
+    /// The caller cannot make that mistake any more, because it no longer passes a
+    /// clock at all.
+    #[test]
+    fn the_probe_times_itself_over_a_monotonic_interval() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe(&[observation(10, "yggterm", 1, 0)]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let samples = probe.observe(&[observation(10, "yggterm", 1, 3)]);
+        assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0].interval_ms >= 20.0 && samples[0].interval_ms <= 5_000.0,
+            "interval must be the real elapsed time, got {}",
+            samples[0].interval_ms
+        );
+    }
+
+    /// A clock that steps BACKWARDS must yield no sample rather than a nonsense rate.
+    /// Pinning the saturating degradation as intended behaviour: a signed subtraction
+    /// here would turn one bad clock reading into a negative interval and an infinite
+    /// core fraction.
+    #[test]
+    fn a_clock_that_steps_backwards_reports_no_sample() {
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[observation(10, "yggterm", 1, 0)], 5_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 50)], 1_000);
+        assert!(samples.is_empty());
+    }
+
     /// PID reuse resets the counter downward. That must read as zero work, never as a
     /// huge negative that underflows into an astronomical delta.
     #[test]
     fn tick_counter_going_backwards_reads_as_zero() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 5_000)], 1_000);
-        let samples = probe.observe(&[observation(10, "yggterm", 1, 12)], 2_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 5_000)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "yggterm", 1, 12)], 2_000);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].cpu_ms, 0.0);
     }
@@ -677,12 +1336,12 @@ mod tests {
     #[test]
     fn vanished_process_is_forgotten_and_new_one_waits_a_turn() {
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "yggterm", 1, 100)], 1_000);
+        probe.observe_at(&[observation(10, "yggterm", 1, 100)], 1_000);
         // pid 10 gone, pid 11 new: nothing reportable this turn.
-        let samples = probe.observe(&[observation(11, "WebKitWebProces", 10, 900)], 2_000);
+        let samples = probe.observe_at(&[observation(11, "WebKitWebProces", 10, 900)], 2_000);
         assert!(samples.is_empty());
         // Now pid 11 has a baseline and reports its own delta.
-        let samples = probe.observe(&[observation(11, "WebKitWebProces", 10, 910)], 3_000);
+        let samples = probe.observe_at(&[observation(11, "WebKitWebProces", 10, 910)], 3_000);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].role, RenderRole::WebContent);
         assert_eq!(samples[0].cpu_ms, 100.0);
@@ -696,13 +1355,13 @@ mod tests {
             observation(11, "WebKitWebProces", 10, 0),
             observation(12, "WebKitWebProces", 10, 0),
         ];
-        probe.observe(&first, 1_000);
+        probe.observe_at(&first, 1_000);
         let second = [
             observation(10, "yggterm", 1, 70),
             observation(11, "WebKitWebProces", 10, 30),
             observation(12, "WebKitWebProces", 10, 5),
         ];
-        let samples = probe.observe(&second, 2_000);
+        let samples = probe.observe_at(&second, 2_000);
         let rolled = roll_up_roles(&samples);
         assert_eq!(rolled.len(), 2);
         let web = rolled
@@ -733,10 +1392,8 @@ mod tests {
     /// tree must cost almost nothing: roles with neither CPU nor memory are dropped.
     #[test]
     fn role_events_skip_roles_with_no_cpu_and_no_memory() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-role-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-role-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);
@@ -745,6 +1402,7 @@ mod tests {
             role: RenderRole::WebGpu,
             cpu_ms: 0.0,
             mem_kb: 0,
+            gpu_ns: None,
             procs: 1,
             interval_ms: 60_000.0,
             hot_pid: 99,
@@ -754,6 +1412,7 @@ mod tests {
             role: RenderRole::WebContent,
             cpu_ms: 250.0,
             mem_kb: 4096,
+            gpu_ns: Some(7_000_000),
             procs: 3,
             interval_ms: 60_000.0,
             hot_pid: 42,
@@ -769,6 +1428,11 @@ mod tests {
         assert!(log.contains("\"hot_pid\":42"));
         assert!(log.contains("\"procs\":3"));
         assert!(log.contains("\"web_surfaces\":2"));
+        // The GPU gauge rides in the payload: with hardware GL this is nonzero and
+        // with the software rasterizer it is not, which is the ONE field that
+        // distinguishes "cheap because the GPU did it" from "cheap because nothing
+        // happened".
+        assert!(log.contains("\"gpu_ms\":7.0"));
         assert!(!log.contains("web_gpu"));
         let _ = fs::remove_dir_all(&home);
     }
@@ -777,17 +1441,15 @@ mod tests {
     /// with no aggregator changes: `duration_ms` present, in CPU milliseconds.
     #[test]
     fn emits_events_the_existing_aggregator_can_read() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-probe-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-probe-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);
 
         let mut probe = RenderProbe::new().with_user_hz(100);
-        probe.observe(&[observation(10, "WebKitWebProces", 1, 0)], 1_000);
-        let samples = probe.observe(&[observation(10, "WebKitWebProces", 1, 25)], 2_000);
+        probe.observe_at(&[observation(10, "WebKitWebProces", 1, 0)], 1_000);
+        let samples = probe.observe_at(&[observation(10, "WebKitWebProces", 1, 25)], 2_000);
         emit_render_perf_events(&home, &samples, &json!({ "web_surface_live_count": 3 }));
 
         let summary = crate::perf::summarize_perf_telemetry(&home, None, Some("render"));
@@ -802,6 +1464,66 @@ mod tests {
         let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
         assert!(log.contains("\"web_surface_live_count\":3"));
         assert!(log.contains("\"role\":\"web_content\""));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The wire, not just the helper. `perf_fields` being right is worthless if the
+    /// emitter still spells the fields itself — which is exactly how the fallback's
+    /// zeroes got out in the first place.
+    #[test]
+    fn the_emitted_event_carries_only_the_numbers_the_source_could_read() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-render-probe-memory-source-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        crate::perf::set_perf_profiling_enabled(true);
+
+        let fallback = |pid: i32, ticks: u64| RenderProcObservation {
+            memory: Some(ProcMemory {
+                rss_kb: 543_284,
+                pss_kb: 0,
+                anonymous_kb: 0,
+                source: ProcMemorySource::StatusVmRss,
+            }),
+            ..observation(pid, "WebKitWebProces", 1, ticks)
+        };
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[fallback(11, 0)], 1_000);
+        let samples = probe.observe_at(&[fallback(11, 25)], 2_000);
+        emit_render_perf_events(&home, &samples, &json!({}));
+
+        let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
+        assert!(log.contains("\"rss_kb\":543284"), "log: {log}");
+        assert!(
+            log.contains("\"memory_source\":\"status_vm_rss\""),
+            "log: {log}"
+        );
+        assert!(
+            !log.contains("\"pss_kb\""),
+            "a fallback reading must publish no PSS at all, not a zero: {log}"
+        );
+        assert!(
+            !log.contains("\"anonymous_kb\""),
+            "a fallback reading must publish no anonymous memory at all: {log}"
+        );
+
+        // The rollup source publishes all three, so the absence above is a statement
+        // about the SOURCE and not a field that quietly went missing for everyone.
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let mut probe = RenderProbe::new().with_user_hz(100);
+        probe.observe_at(&[observation(12, "WebKitWebProces", 1, 0)], 1_000);
+        let samples = probe.observe_at(&[observation(12, "WebKitWebProces", 1, 25)], 2_000);
+        emit_render_perf_events(&home, &samples, &json!({}));
+        let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
+        assert!(log.contains("\"pss_kb\":600"), "log: {log}");
+        assert!(log.contains("\"anonymous_kb\":400"), "log: {log}");
+        assert!(
+            log.contains("\"memory_source\":\"smaps_rollup\""),
+            "log: {log}"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 }

@@ -49,9 +49,6 @@ set -euo pipefail
 if [[ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" && -z "${NO_AT_BRIDGE+x}" ]]; then
   export NO_AT_BRIDGE=1
 fi
-if [[ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" && -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]]; then
-  export WEBKIT_DISABLE_COMPOSITING_MODE=1
-fi
 target=/usr/lib/yggterm/yggterm-bin
 use_headless=0
 if [[ "${1:-}" == "server" ]]; then
@@ -74,9 +71,6 @@ cat > "$STAGE_DIR/usr/bin/yggterm-headless" <<'WRAPPER'
 set -euo pipefail
 if [[ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" && -z "${NO_AT_BRIDGE+x}" ]]; then
   export NO_AT_BRIDGE=1
-fi
-if [[ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" && -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]]; then
-  export WEBKIT_DISABLE_COMPOSITING_MODE=1
 fi
 exec /usr/lib/yggterm/yggterm-headless-bin "$@"
 WRAPPER

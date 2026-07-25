@@ -23,18 +23,18 @@ fn main() {
         .unwrap_or(2000);
 
     let mut probe = RenderProbe::new();
-    let start = std::time::Instant::now();
     let first = observe_process_tree(root_pid);
     if first.is_empty() {
         eprintln!("render_top: no such process tree: {root_pid}");
         std::process::exit(1);
     }
-    probe.observe(&first, start.elapsed().as_millis() as u64);
+    // The probe times itself off a monotonic clock; nobody hands it one.
+    probe.observe(&first);
 
     std::thread::sleep(std::time::Duration::from_millis(interval_ms));
 
     let second = observe_process_tree(root_pid);
-    let samples = probe.observe(&second, start.elapsed().as_millis() as u64);
+    let samples = probe.observe(&second);
 
     println!(
         "render_top: root={root_pid} processes={} interval={interval_ms}ms user_hz={}",
@@ -42,8 +42,8 @@ fn main() {
         user_hz()
     );
     println!(
-        "{:<14} {:>6} {:>10} {:>8} {:>12}",
-        "role", "procs", "cpu_ms", "cores", "mem_mb"
+        "{:<14} {:>6} {:>10} {:>8} {:>12} {:>10}",
+        "role", "procs", "cpu_ms", "cores", "mem_mb", "gpu_ms"
     );
     let rolled = roll_up_roles(&samples);
     let mut total_cores = 0.0;
@@ -53,8 +53,14 @@ fn main() {
         let mem_mb = rollup.mem_kb as f64 / 1024.0;
         total_cores += cores;
         total_mem_mb += mem_mb;
+        // `-` is NOT zero: it means the fdinfo counters were unreadable. A zero here
+        // is the finding (the GPU is idle while the CPU burns); a dash is a blind spot.
+        let gpu_ms = rollup
+            .gpu_ms()
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<14} {:>6} {:>10.1} {cores:>8.3} {mem_mb:>12.1}",
+            "{:<14} {:>6} {:>10.1} {cores:>8.3} {mem_mb:>12.1} {gpu_ms:>10}",
             rollup.role.as_str(),
             rollup.procs,
             rollup.cpu_ms
@@ -69,11 +75,23 @@ fn main() {
 
     println!("\ntop processes by cpu_ms:");
     let mut by_cpu = samples;
-    by_cpu.sort_by(|a, b| b.cpu_ms.partial_cmp(&a.cpu_ms).unwrap_or(std::cmp::Ordering::Equal));
+    by_cpu.sort_by(|a, b| {
+        b.cpu_ms
+            .partial_cmp(&a.cpu_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for sample in by_cpu.iter().take(10) {
-        let mem_mb = sample.pss_kb.or(sample.rss_kb).unwrap_or(0) as f64 / 1024.0;
+        let mem_mb = sample
+            .memory
+            .map(|memory| memory.preferred_kb())
+            .unwrap_or(0) as f64
+            / 1024.0;
+        let gpu_ms = sample
+            .gpu_ms()
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "  pid={:<8} {:<16} {:<12} cpu_ms={:>9.1} cores={:>6.3} mem_mb={:>8.1}",
+            "  pid={:<8} {:<16} {:<12} cpu_ms={:>9.1} cores={:>6.3} mem_mb={:>8.1} gpu_ms={gpu_ms:>8}",
             sample.pid,
             sample.comm,
             sample.role.as_str(),

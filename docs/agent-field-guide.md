@@ -87,8 +87,17 @@ emits nothing during the sampling windows.
 
 ## 3. Rendering cost model (software-GL hosts)
 
-A desktop host may deliberately run software GL — see the GL section of the
-campaign notes before "fixing" that. Consequences that drive real bugs:
+⛔ **"A desktop host may deliberately run software GL" is no longer standing
+guidance, and on the live host it was never true.** The GUI used to hard-code
+`LIBGL_ALWAYS_SOFTWARE=1` behind an opt-out nobody set, on a premise (one EACCES
+on `card0` under a GBM probe) that was measured false on the very host it named.
+The binary now PROBES (`yggterm_core::gl_probe`) and publishes its answer as
+`YGGTERM_WEBKIT_GL_POLICY`; read that before assuming anything about a host.
+
+The cost model below still holds **wherever the probe genuinely lands on
+software** (a headless server host, a VM with no render node, a host with
+`YGGTERM_FORCE_SOFTWARE_GL=1`), and the frame-count findings stand on their own
+merits on any host. Consequences that drive real bugs:
 
 - Every repaint costs a full-window CPU blit (`cairo_paint` / `pixman_blt`) on
   the GUI main thread. **Cost tracks the number of presented frames, not the
@@ -103,6 +112,10 @@ campaign notes before "fixing" that. Consequences that drive real bugs:
 - A CSS animation's phase is anchored to when its element was created. You
   cannot phase-lock per-element animations with a computed `animation-delay`:
   changing the delay does not restart the animation, so re-rendered rows drift.
+- **Is the GPU actually rasterizing?** `drm-engine-gfx` in
+  `/proc/<webproc>/fdinfo/*`, nonzero and RISING across two reads. The repo owns
+  that gauge now — `render_top` prints a `gpu_ms` column per role, and a `-`
+  there means the counter was unreadable, which is not the same as a zero.
 
 ## 4. Deploy protocol
 

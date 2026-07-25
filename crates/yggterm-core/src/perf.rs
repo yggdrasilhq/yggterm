@@ -69,6 +69,41 @@ pub fn perf_span_is_high_frequency_noise(category: &str, name: &str) -> bool {
     )
 }
 
+/// Which clock a span's `duration_ms` is measured on.
+///
+/// Almost every span in this system is WALL time between two `Instant`s. The render
+/// probe's are not: its `duration_ms` is CPU milliseconds a process consumed during an
+/// interval, deliberately, so the existing aggregator could report it unchanged. That
+/// works for aggregation and breaks for any rule that assumes elapsed time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfTimeBase {
+    Wall,
+    Cpu,
+}
+
+impl PerfTimeBase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PerfTimeBase::Wall => "wall",
+            PerfTimeBase::Cpu => "cpu",
+        }
+    }
+}
+
+/// THE owner of "which clock is this span on", pure and keyed on the CATEGORY — the
+/// same shape as [`perf_span_is_high_frequency_noise`], and for the same reason: a fact
+/// about a span kind belongs in one predicate, not stamped onto every event where two
+/// copies could disagree. Keying on the category also means it applies retroactively to
+/// the events already on disk, which a wire field could never do.
+pub fn perf_span_time_base(category: &str) -> PerfTimeBase {
+    if category == crate::render_probe::RENDER_PERF_CATEGORY {
+        PerfTimeBase::Cpu
+    } else {
+        PerfTimeBase::Wall
+    }
+}
+
 /// Whether a finished span should be written to the telemetry log. Noisy spans are
 /// kept only when SLOW (>= floor) or on the 1:50 sample; everything else always.
 fn perf_span_should_record(category: &str, name: &str, duration_ms: f64) -> bool {
@@ -226,6 +261,17 @@ impl Drop for PerfGuard {
 pub struct PerfSpanSummary {
     pub category: String,
     pub name: String,
+    /// Which clock the durations below are on, as a WIRE field, so a human (or the
+    /// `--json` consumer) reading a `render` row does not mistake CPU milliseconds for
+    /// elapsed time.
+    ///
+    /// ⚠ It is a projection of `category`, resolved once at construction. It is NOT the
+    /// owner and no rule may read it: [`perf_span_time_base`]'s own note says a fact
+    /// about a span kind belongs in one predicate, "not stamped onto every event where
+    /// two copies could disagree", and this field was exactly such a stamp — read by
+    /// `detect_perf_incident` while the owner sat one field away. Rules call
+    /// [`PerfSpanSummary::time_base`] instead, which re-derives from the category.
+    pub time_base: PerfTimeBase,
     pub count: usize,
     pub p50_ms: f64,
     pub p95_ms: f64,
@@ -233,6 +279,15 @@ pub struct PerfSpanSummary {
     pub max_ms: f64,
     pub mean_ms: f64,
     pub total_ms: f64,
+}
+
+impl PerfSpanSummary {
+    /// Which clock this span is on, DERIVED from its category — the one owner.
+    /// Deliberately not `self.time_base`: a summary that arrived with a stale or
+    /// hand-built copy would otherwise be classified by the copy.
+    pub fn time_base(&self) -> PerfTimeBase {
+        perf_span_time_base(&self.category)
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -299,9 +354,11 @@ pub fn summarize_perf_telemetry(
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let count = values.len();
             let total_ms: f64 = values.iter().sum();
+            let time_base = perf_span_time_base(&category);
             PerfSpanSummary {
                 category,
                 name,
+                time_base,
                 count,
                 p50_ms: percentile(&values, 50.0),
                 p95_ms: percentile(&values, 95.0),
@@ -445,6 +502,11 @@ pub const PERF_INCIDENT_ROTATED_FILENAME: &str = "perf-incidents.previous.jsonl"
 pub const PERF_INCIDENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const PERF_INCIDENT_DEBOUNCE_MS: u64 = 5 * 60 * 1000;
 const PERF_INCIDENT_STALL_MS: f64 = 30_000.0;
+/// The bar for a CPU-time span. Cores, not milliseconds: a `render` span reporting 30
+/// CPU-seconds over a 60 s window is HALF A CORE, i.e. an ordinarily busy GUI, while
+/// the wall rules would have called it a 30-second stall. Past ~1.2 cores a single
+/// render role really is eating the machine and deserves the snapshot.
+const PERF_INCIDENT_CPU_CORES: f64 = 1.2;
 
 /// Decide whether a recent perf-summary window looks like a LOAD INCIDENT worth a
 /// durable snapshot — the random "jojo fan gets angry" moments you can't predict.
@@ -453,7 +515,17 @@ const PERF_INCIDENT_STALL_MS: f64 = 30_000.0;
 ///    title-regen loop, the measured jojo fan driver).
 ///  - `span_busy`: a single span monopolized > 60% of the window.
 ///  - `span_stall`: a span's worst case blew past the stall ceiling.
+///  - `span_cpu_hot`: a CPU-time span held more than [`PERF_INCIDENT_CPU_CORES`].
 /// Returns `None` when the window is calm. Pure, so the policy is unit-tested.
+///
+/// ⚠ **The first three rules are WALL-CLOCK rules and only wall spans are eligible.**
+/// Before that was enforced, the render probe's CPU-millisecond spans were judged by
+/// them, and 35 of the 222 incidents on the live host were that misreading: a
+/// `span_stall render/web_content` means only that one process used 30 CPU-seconds,
+/// which on a 16-core box is unremarkable. It was not merely noise — incidents are
+/// debounced five minutes and this function returns the FIRST match, so a render span
+/// could take the slot a genuine stall would have used and mask it. Hence also the
+/// ordering: the CPU rule is tried LAST, so a real wall-clock stall always wins.
 pub fn detect_perf_incident(summary: &[PerfSpanSummary], window_ms: u64) -> Option<String> {
     let window = window_ms.max(1) as f64;
     let generation_total: f64 = summary
@@ -462,18 +534,38 @@ pub fn detect_perf_incident(summary: &[PerfSpanSummary], window_ms: u64) -> Opti
         .map(|span| span.total_ms)
         .sum();
     if generation_total > window * 0.5 {
-        return Some(format!("copy_generation_busy total_ms={generation_total:.0}"));
+        return Some(format!(
+            "copy_generation_busy total_ms={generation_total:.0}"
+        ));
     }
-    if let Some(span) = summary.iter().find(|span| span.total_ms > window * 0.6) {
+    let wall = || {
+        summary
+            .iter()
+            .filter(|span| span.time_base() == PerfTimeBase::Wall)
+    };
+    if let Some(span) = wall().find(|span| span.total_ms > window * 0.6) {
         return Some(format!(
             "span_busy {}/{} total_ms={:.0}",
             span.category, span.name, span.total_ms
         ));
     }
-    if let Some(span) = summary.iter().find(|span| span.max_ms >= PERF_INCIDENT_STALL_MS) {
+    if let Some(span) = wall().find(|span| span.max_ms >= PERF_INCIDENT_STALL_MS) {
         return Some(format!(
             "span_stall {}/{} max_ms={:.0}",
             span.category, span.name, span.max_ms
+        ));
+    }
+    if let Some((span, cores)) = summary
+        .iter()
+        .filter(|span| span.time_base() == PerfTimeBase::Cpu)
+        .map(|span| (span, span.total_ms / window))
+        .find(|(_, cores)| *cores >= PERF_INCIDENT_CPU_CORES)
+    {
+        // `total_ms=` stays in the string so `summarize_perf_incidents` ranks this
+        // trigger with the others rather than reading it as zero.
+        return Some(format!(
+            "span_cpu_hot {}/{} cores={cores:.2} total_ms={:.0}",
+            span.category, span.name, span.total_ms
         ));
     }
     None
@@ -552,10 +644,61 @@ mod tests {
         dir
     }
 
+    /// ⚠ THE COPY MAY NOT DECIDE ANYTHING. `PerfSpanSummary.time_base` is a wire
+    /// projection of `category`; the owner is `perf_span_time_base`. This builds a
+    /// summary whose stamped copy LIES and asserts the incident rules ignore it —
+    /// which they can only do by re-deriving from the category.
+    ///
+    /// Without this, a hand-built or stale summary would be classified by its stamp:
+    /// a `render` row stamped `Wall` would trip the stall rule at 30 s of CPU time
+    /// (half a core), and a `startup` row stamped `Cpu` would let a genuine 45 s stall
+    /// through as 0.75 cores.
+    #[test]
+    fn the_incident_rules_read_the_category_not_the_stamped_copy() {
+        let window = 60_000u64;
+        let lying =
+            |category: &str, name: &str, total_ms: f64, max_ms: f64, stamp| PerfSpanSummary {
+                time_base: stamp,
+                ..span(category, name, total_ms, max_ms)
+            };
+        // A render span stamped Wall: half a core, not a stall.
+        let render_stamped_wall = vec![lying(
+            "render",
+            "gui",
+            30_000.0,
+            30_000.0,
+            PerfTimeBase::Wall,
+        )];
+        assert_eq!(
+            super::detect_perf_incident(&render_stamped_wall, window),
+            None
+        );
+        // A startup stall stamped Cpu is still a stall.
+        let stall_stamped_cpu = vec![lying(
+            "startup",
+            "initial_server_sync",
+            100.0,
+            45_000.0,
+            PerfTimeBase::Cpu,
+        )];
+        assert!(
+            super::detect_perf_incident(&stall_stamped_cpu, window)
+                .unwrap()
+                .starts_with("span_stall")
+        );
+        // And the derived accessor is the owner's answer, whatever the stamp says.
+        assert_eq!(render_stamped_wall[0].time_base(), PerfTimeBase::Cpu);
+        assert_eq!(stall_stamped_cpu[0].time_base(), PerfTimeBase::Wall);
+    }
+
+    /// Builds a summary the way `summarize_perf_telemetry` would: the time base is
+    /// RESOLVED from the category, never chosen by the test, so these cases exercise
+    /// the same classification the live path takes.
     fn span(category: &str, name: &str, total_ms: f64, max_ms: f64) -> PerfSpanSummary {
         PerfSpanSummary {
             category: category.into(),
             name: name.into(),
+            time_base: perf_span_time_base(category),
             count: 1,
             p50_ms: 0.0,
             p95_ms: 0.0,
@@ -580,25 +723,139 @@ mod tests {
         );
         // A single span monopolizing the window.
         let busy = vec![span("daemon", "runtime_load", 45_000.0, 300.0)];
-        assert!(super::detect_perf_incident(&busy, window).unwrap().starts_with("span_busy"));
+        assert!(
+            super::detect_perf_incident(&busy, window)
+                .unwrap()
+                .starts_with("span_busy")
+        );
         // A stall (worst case past the ceiling) even if total is small.
         let stall = vec![span("startup", "initial_server_sync", 35_000.0, 284_000.0)];
         // total 35k > 36k? no (0.6*60k=36k) → falls through to stall on max_ms.
-        assert!(super::detect_perf_incident(&stall, window).unwrap().starts_with("span_stall"));
+        assert!(
+            super::detect_perf_incident(&stall, window)
+                .unwrap()
+                .starts_with("span_stall")
+        );
+    }
+
+    /// ⚠ THE lock for the incident log's biggest source of noise. `render` spans carry
+    /// CPU milliseconds in `duration_ms` (deliberately — it is what lets the existing
+    /// aggregator report them unchanged), and the busy/stall rules are about WALL
+    /// time. Judging one by the other produced 35 of 222 incidents on the live host,
+    /// every one meaningless: `span_stall render/web_content max_ms=70850` says only
+    /// that a process used 70 CPU-seconds, which over a 60 s window is ~1.2 cores of
+    /// ordinary work, not a stall.
+    ///
+    /// Each assertion below FIRES against the pre-fix code: the same numbers used to
+    /// return `span_busy` / `span_stall`.
+    #[test]
+    fn a_cpu_time_span_is_never_judged_by_the_wall_clock_rules() {
+        let window = 60_000u64;
+        // 30 CPU-seconds in a 60 s window is HALF A CORE. The wall rule called this a
+        // stall (max_ms >= 30_000); in cores it is not remotely an incident.
+        let half_a_core = vec![span("render", "gui", 30_000.0, 30_000.0)];
+        assert_eq!(super::detect_perf_incident(&half_a_core, window), None);
+        // The worst render span actually recorded on the live host: 70.85 CPU-seconds
+        // in a 60 s window. The wall rule called it `span_busy`; it is 1.18 cores.
+        let live_worst = vec![span("render", "web_content", 70_850.0, 70_850.0)];
+        assert_eq!(super::detect_perf_incident(&live_worst, window), None);
+        // Past the bar, a CPU span IS an incident — with a trigger that names the
+        // unit, so nobody has to guess what 90000 means.
+        let genuinely_hot = vec![span("render", "web_content", 90_000.0, 90_000.0)];
+        assert_eq!(
+            super::detect_perf_incident(&genuinely_hot, window).as_deref(),
+            Some("span_cpu_hot render/web_content cores=1.50 total_ms=90000")
+        );
+        // Wall spans are untouched: the SAME numbers still trip the old rules.
+        let wall_busy = vec![span("daemon", "runtime_load", 70_850.0, 70_850.0)];
+        assert!(
+            super::detect_perf_incident(&wall_busy, window)
+                .unwrap()
+                .starts_with("span_busy")
+        );
+        let wall_stall = vec![span("startup", "initial_server_sync", 100.0, 30_000.0)];
+        assert!(
+            super::detect_perf_incident(&wall_stall, window)
+                .unwrap()
+                .starts_with("span_stall")
+        );
+        // And a genuine stall is never MASKED by a hot render span sharing the window:
+        // incidents debounce for five minutes, so whichever trigger fires consumes the
+        // slot. The wall rules run first, so the real one wins.
+        let both = vec![
+            span("render", "web_content", 120_000.0, 120_000.0),
+            span("startup", "initial_server_sync", 100.0, 45_000.0),
+        ];
+        assert!(
+            super::detect_perf_incident(&both, window)
+                .unwrap()
+                .starts_with("span_stall")
+        );
+    }
+
+    /// The time base is a property of the SPAN KIND, resolved in one place, and it
+    /// reaches the read surface so `perf-summary --json` says which clock a row is on.
+    #[test]
+    fn the_time_base_is_owned_by_the_category() {
+        assert_eq!(perf_span_time_base("render"), PerfTimeBase::Cpu);
+        assert_eq!(perf_span_time_base("daemon_request"), PerfTimeBase::Wall);
+        assert_eq!(perf_span_time_base("copy_generation"), PerfTimeBase::Wall);
+        assert_eq!(perf_span_time_base(""), PerfTimeBase::Wall);
+
+        let dir = temp_test_dir("time_base");
+        set_perf_profiling_enabled(true);
+        append_perf_event(
+            &dir,
+            "render",
+            "web_content",
+            json!({ "duration_ms": 250.0 }),
+        );
+        append_perf_event(&dir, "daemon", "persist", json!({ "duration_ms": 250.0 }));
+        let summary = summarize_perf_telemetry(&dir, None, None);
+        let render = summary.iter().find(|s| s.category == "render").unwrap();
+        let daemon = summary.iter().find(|s| s.category == "daemon").unwrap();
+        assert_eq!(render.time_base, PerfTimeBase::Cpu);
+        assert_eq!(daemon.time_base, PerfTimeBase::Wall);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn high_frequency_noise_spans_keep_outliers_and_useful_spans() {
         // Noisy spans: fast ones are floor/sampled, SLOW ones (an outlier worth seeing)
         // are always kept.
-        assert!(super::perf_span_is_high_frequency_noise("daemon_request", "status"));
-        assert!(super::perf_span_is_high_frequency_noise("daemon_request", "terminal_read"));
-        assert!(super::perf_span_should_record("daemon_request", "status", 40.0)); // slow → keep
+        assert!(super::perf_span_is_high_frequency_noise(
+            "daemon_request",
+            "status"
+        ));
+        assert!(super::perf_span_is_high_frequency_noise(
+            "daemon_request",
+            "terminal_read"
+        ));
+        assert!(super::perf_span_should_record(
+            "daemon_request",
+            "status",
+            40.0
+        )); // slow → keep
         // Useful spans are ALWAYS recorded regardless of duration.
-        assert!(!super::perf_span_is_high_frequency_noise("background", "copy_scan"));
-        assert!(super::perf_span_should_record("background", "copy_scan", 0.0));
-        assert!(super::perf_span_should_record("copy_generation", "title", 0.0));
-        assert!(super::perf_span_should_record("daemon", "snapshot_response", 0.0));
+        assert!(!super::perf_span_is_high_frequency_noise(
+            "background",
+            "copy_scan"
+        ));
+        assert!(super::perf_span_should_record(
+            "background",
+            "copy_scan",
+            0.0
+        ));
+        assert!(super::perf_span_should_record(
+            "copy_generation",
+            "title",
+            0.0
+        ));
+        assert!(super::perf_span_should_record(
+            "daemon",
+            "snapshot_response",
+            0.0
+        ));
     }
 
     #[test]
@@ -666,8 +923,14 @@ mod tests {
                 &json!({ "ts_ms": ts_ms, "window_ms": 60_000, "trigger": trigger }),
             );
         };
-        write(1_000, "span_busy remote/resolve_yggterm_binary total_ms=40000");
-        write(2_000, "span_busy remote/resolve_yggterm_binary total_ms=52000");
+        write(
+            1_000,
+            "span_busy remote/resolve_yggterm_binary total_ms=40000",
+        );
+        write(
+            2_000,
+            "span_busy remote/resolve_yggterm_binary total_ms=52000",
+        );
         write(3_000, "span_busy daemon/persist total_ms=39000");
         write(4_000, "copy_generation_busy total_ms=31000");
 
