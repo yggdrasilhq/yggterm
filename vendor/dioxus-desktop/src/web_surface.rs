@@ -425,6 +425,45 @@ thread_local! {
     static INJECTING_EVENT: Cell<bool> = const { Cell::new(false) };
     /// Per-webview count of real seat inputs observed but not yet consumed.
     static SEAT_INPUT_COUNTS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+    /// Injected events handed to GTK for a surface but not yet seen by the
+    /// observer. The backstop for the lexical flag above — see
+    /// [`spend_injection_credit`].
+    static INJECTED_CREDITS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+}
+
+/// Grant one credit per injected event about to be delivered to `surface_id`.
+///
+/// The lexical `INJECTING_EVENT` flag is only exact if GTK emits
+/// `button-press-event` synchronously inside `WidgetExt::event`. If any injected
+/// event is instead observed after that call returns, the flag is already clear
+/// and the observer books OUR OWN injection as the human taking the surface —
+/// which preempts the agent's batch, and (because a batch id is per-GUI-process)
+/// locks that agent out of the surface permanently. That is the single-shot
+/// `do` defect: verb 1 lands, verbs 2..N are all refused `preempted`.
+///
+/// Credits make the suppression count-based rather than dispatch-order-based, so
+/// it holds either way. They are NOT time-based: nothing here expires on a
+/// clock, and any credit still unspent when the verb completes is dropped by
+/// [`take_seat_input_count`] so it can never swallow a later human gesture.
+fn grant_injection_credits(surface_id: u64, count: u64) {
+    INJECTED_CREDITS.with(|credits| {
+        *credits.borrow_mut().entry(surface_id).or_insert(0) += count;
+    });
+}
+
+/// Spend one credit for `surface_id`, returning true when the observed event is
+/// one of ours rather than the seat's.
+fn spend_injection_credit(surface_id: u64) -> bool {
+    INJECTED_CREDITS.with(|credits| {
+        let mut credits = credits.borrow_mut();
+        match credits.get_mut(&surface_id) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Deliver an injected event with the "this is ours" flag set, so the seat-input
@@ -439,6 +478,9 @@ fn note_seat_input(surface_id: u64) {
     if INJECTING_EVENT.with(|flag| flag.get()) {
         return; // our own injection, not the human
     }
+    if spend_injection_credit(surface_id) {
+        return; // our own injection, observed after the lexical scope closed
+    }
     SEAT_INPUT_COUNTS.with(|counts| {
         *counts.borrow_mut().entry(surface_id).or_insert(0) += 1;
     });
@@ -447,6 +489,13 @@ fn note_seat_input(surface_id: u64) {
 /// Consume the count of real seat inputs seen on this surface since the last
 /// call. Non-zero means the human touched it — the agent's batch is preempted.
 pub fn take_seat_input_count(surface_id: u64) -> u64 {
+    // One verb's credits belong to that verb. Anything unspent by now was
+    // suppressed by the lexical flag (synchronous delivery) or never arrived;
+    // carrying it forward would let it swallow a LATER real gesture, turning a
+    // fix for the agent into a bug for the user.
+    INJECTED_CREDITS.with(|credits| {
+        credits.borrow_mut().remove(&surface_id);
+    });
     SEAT_INPUT_COUNTS.with(|counts| counts.borrow_mut().remove(&surface_id).unwrap_or(0))
 }
 
@@ -454,6 +503,9 @@ pub fn take_seat_input_count(surface_id: u64) -> u64 {
 pub fn forget_seat_input(surface_id: u64) {
     SEAT_INPUT_COUNTS.with(|counts| {
         counts.borrow_mut().remove(&surface_id);
+    });
+    INJECTED_CREDITS.with(|credits| {
+        credits.borrow_mut().remove(&surface_id);
     });
 }
 
@@ -1654,6 +1706,9 @@ impl WebSurfaceHost {
     pub fn inject_click(&self, id: u64, x: f64, y: f64, button: u32) -> Result<(), String> {
         let webkit = self.mapped_engine_webview(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        // Only the PRESS is observed as seat input (the observer watches
+        // button-press, key-press and scroll — not release), so one credit.
+        grant_injection_credits(id, 1);
         unsafe {
             synth_button(&webkit, true, wx, wy, button)?;
             synth_button(&webkit, false, wx, wy, button)?;
@@ -1673,6 +1728,7 @@ impl WebSurfaceHost {
     pub fn inject_scroll(&self, id: u64, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), String> {
         let webkit = self.mapped_engine_webview(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        grant_injection_credits(id, 1);
         unsafe { synth_scroll(&webkit, wx, wy, dx, dy) }
     }
 
@@ -1683,6 +1739,10 @@ impl WebSurfaceHost {
         // A key event needs keyboard focus in the target webview; grab it first
         // (widget-local — it does not move the seat's global focus on screen).
         gtk::prelude::WidgetExt::grab_focus(&webkit);
+        // Only presses are observed; a release costs nothing.
+        if press {
+            grant_injection_credits(id, 1);
+        }
         unsafe { synth_key(&webkit, press, keyval, state) }
     }
 }
@@ -2050,6 +2110,63 @@ mod seat_input_tests {
         // A real seat event arrives outside any injection.
         note_seat_input(id);
         assert_eq!(take_seat_input_count(id), 1);
+    }
+
+    /// The regression the credit backstop exists for, and the case the test
+    /// above CANNOT see: an injected event observed AFTER `deliver_injected_event`
+    /// has returned (queued GTK delivery). With only the lexical flag, this
+    /// books our own injection as the human, which preempts the agent's batch —
+    /// and since the batch id is per-GUI-process, that is a permanent lockout.
+    ///
+    /// This drives TWO consecutive verbs, because one verb never reproduced it.
+    #[test]
+    fn a_late_observed_injection_is_still_not_seat_input() {
+        let id = 4244;
+        take_seat_input_count(id);
+
+        // Verb 1: credit granted at inject_*, event observed after the flag
+        // cleared (the flag is NOT set here — that is the whole point).
+        grant_injection_credits(id, 1);
+        note_seat_input(id);
+        assert_eq!(
+            take_seat_input_count(id),
+            0,
+            "verb 1's own injection must not read as the human"
+        );
+
+        // Verb 2 must therefore still be admitted — under the old code this is
+        // where the lane was preempted and the agent locked out for good.
+        grant_injection_credits(id, 1);
+        note_seat_input(id);
+        assert_eq!(
+            take_seat_input_count(id),
+            0,
+            "verb 2 must not see verb 1's injection as a human takeover"
+        );
+    }
+
+    /// The credit must never outlive its verb, or a fix for the agent becomes a
+    /// bug for the user: a real gesture after an unspent credit must still count.
+    #[test]
+    fn an_unspent_credit_cannot_swallow_a_later_human_gesture() {
+        let id = 4245;
+        take_seat_input_count(id);
+
+        // Synchronous delivery: the lexical flag suppressed it, so the credit
+        // granted for that event is never spent.
+        grant_injection_credits(id, 1);
+        INJECTING_EVENT.with(|f| f.set(true));
+        note_seat_input(id);
+        INJECTING_EVENT.with(|f| f.set(false));
+        assert_eq!(take_seat_input_count(id), 0);
+
+        // The human now clicks. It must be counted, not eaten by the leftover.
+        note_seat_input(id);
+        assert_eq!(
+            take_seat_input_count(id),
+            1,
+            "a stale credit must not mask the human taking the surface"
+        );
     }
 
     #[test]

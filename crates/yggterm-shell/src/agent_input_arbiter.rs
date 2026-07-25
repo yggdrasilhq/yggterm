@@ -267,6 +267,49 @@ mod tests {
         assert_eq!(arb.admit(&s, &fresh, 1), AdmitOutcome::Allowed);
     }
 
+    /// ...but the test above only passes because it invents a SECOND id, and
+    /// production never does: `resolve_agent_identity()` reads the GUI process's
+    /// own argv, so every verb that GUI will ever serve carries one id
+    /// (`"anonymous"`). Under that — the real — shape, a preempt was permanent.
+    /// `forget` is the reset `web do --new-batch` reaches, and this pins it.
+    #[test]
+    fn the_same_identity_recovers_only_because_the_lane_can_be_reset() {
+        let s = surface();
+        let mut arb = AgentInputArbiter::new();
+        let only_id = AgentBatch::new("anonymous");
+
+        assert_eq!(arb.admit(&s, &only_id, 1), AdmitOutcome::Allowed);
+        arb.note_human_input(&s);
+
+        // The lockout this fix exists for: same id, refused forever.
+        assert_eq!(arb.admit(&s, &only_id, 1), AdmitOutcome::Preempted);
+        assert_eq!(arb.admit(&s, &only_id, 1), AdmitOutcome::Preempted);
+
+        // `--new-batch` → forget → the identical id drives again.
+        arb.forget(&s);
+        assert_eq!(
+            arb.admit(&s, &only_id, 1),
+            AdmitOutcome::Allowed,
+            "an agent that re-observed must be able to resume with the id it is stuck with"
+        );
+    }
+
+    /// A reset must not grant immunity: seat input arriving AFTER the reset
+    /// preempts the reopened lane exactly as before.
+    #[test]
+    fn a_reset_lane_is_still_preemptible_by_later_human_input() {
+        let s = surface();
+        let mut arb = AgentInputArbiter::new();
+        let id = AgentBatch::new("anonymous");
+        arb.admit(&s, &id, 1);
+        arb.note_human_input(&s);
+        arb.forget(&s);
+        assert_eq!(arb.admit(&s, &id, 1), AdmitOutcome::Allowed);
+
+        arb.note_human_input(&s);
+        assert_eq!(arb.admit(&s, &id, 1), AdmitOutcome::Preempted);
+    }
+
     #[test]
     fn a_recreated_surface_refuses_verbs_aimed_at_the_old_incarnation() {
         let mut arb = AgentInputArbiter::new();
