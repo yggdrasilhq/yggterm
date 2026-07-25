@@ -962,6 +962,14 @@ fn run_app_launch_via_gui_companion(
     };
     let mut command = Command::new(&gui_exe);
     command.args(args);
+    // An agent-launched GUI must take the SAME GL path a desktop-launched one takes.
+    // This process inherits its parent's environment and hands it straight to the GUI,
+    // so a stale v3 launcher still on disk — or an operator's shell — could smuggle in
+    // WEBKIT_DISABLE_COMPOSITING_MODE and make `server app launch` land on software GL
+    // while the desktop entry probes its way to hardware. That is the same class as
+    // the inherited-canvas-flag bug (`linux_canvas_env_is_user_explicit`), where an
+    // agent-launched GUI was locked to the DOM renderer for months.
+    command.env_remove("WEBKIT_DISABLE_COMPOSITING_MODE");
     if let Some(root) = install_context.managed_root.as_ref() {
         command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
     }
@@ -2575,15 +2583,19 @@ fn main() -> Result<()> {
                 yggterm_core::perf_telemetry_path(store.home_dir()).display()
             );
         } else {
+            // The `clock` column is not decoration: a `render` row's milliseconds are
+            // CPU time consumed, not elapsed time, so reading its totalms as wall
+            // duration overstates it by however many cores were busy.
             println!(
-                "{:<24} {:<30} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
-                "category", "name", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
+                "{:<24} {:<30} {:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
+                "category", "name", "clock", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
             );
             for summary in summaries.iter().take(top) {
                 println!(
-                    "{:<24} {:<30} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
+                    "{:<24} {:<30} {:>5} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
                     summary.category,
                     summary.name,
+                    summary.time_base().as_str(),
                     summary.count,
                     summary.p50_ms,
                     summary.p95_ms,

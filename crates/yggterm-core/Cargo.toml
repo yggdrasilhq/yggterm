@@ -21,3 +21,10 @@ semver = "1"
 sha2 = "0.11.0"
 tar = "0.4"
 yggui-contract = { path = "../yggui-contract" }
+
+# `gl_probe` asks libEGL what this host rasterizes with. dlopen rather than link:
+# a terminal must start on a host with no GL at all, and this crate must not grow a
+# gtk/webkit/glutin dependency to answer one question. libloading 0.8 is already in
+# the lockfile via wayland-sys and subsecond, so this adds no crate and no new version.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"

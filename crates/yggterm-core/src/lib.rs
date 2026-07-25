@@ -4,6 +4,7 @@ pub mod agent_scheme;
 pub mod app_registry;
 mod browser;
 pub mod click_grid;
+pub mod gl_probe;
 mod icon;
 mod install;
 mod perf;
@@ -58,10 +59,10 @@ pub use install::{
 };
 pub use perf::{
     PERF_INCIDENT_FILENAME, PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PerfGuard,
-    PerfIncidentSummary, PerfSpan, PerfSpanSummary, append_bounded_jsonl_record, append_perf_event,
-    detect_perf_incident, perf_profiling_enabled, perf_telemetry_path, read_perf_incidents,
-    record_perf_incident_if_hot, set_perf_profiling_enabled, summarize_perf_incidents,
-    summarize_perf_telemetry,
+    PerfIncidentSummary, PerfSpan, PerfSpanSummary, PerfTimeBase, append_bounded_jsonl_record,
+    append_perf_event, detect_perf_incident, perf_profiling_enabled, perf_span_time_base,
+    perf_telemetry_path, read_perf_incidents, record_perf_incident_if_hot,
+    set_perf_profiling_enabled, summarize_perf_incidents, summarize_perf_telemetry,
 };
 pub use retention::{
     DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, append_retained_jsonl_record,

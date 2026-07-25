@@ -16139,6 +16139,20 @@ pub struct ClientInstanceRecord {
     pub xdg_runtime_dir: Option<String>,
     #[serde(default)]
     pub xauthority: Option<String>,
+    /// Which GL path that window is on, as the GUI process itself saw it — the ONE
+    /// answer to "is the GPU switched off in this window".
+    ///
+    /// ⚠⚠ It is published by the client rather than read out of `/proc/<pid>/environ`
+    /// because `/proc` cannot answer it. Every key here is written after exec by
+    /// `configure_linux_webkit_compositing`, and `setenv`/`unsetenv` reallocate the
+    /// environ array onto the heap while the kernel keeps exposing the exec-time stack
+    /// copy. Measured on the dev host 2026-07-25: a `set_var` is invisible in
+    /// `/proc/self/environ`, and a `remove_var` leaves the inherited value in place. So
+    /// a `/proc` reader reports nothing on a fresh launch and the PREDECESSOR's values
+    /// on a hot restart or `server app launch`. Empty = a legacy record or a non-Linux
+    /// client, i.e. "not published" — never "software".
+    #[serde(default)]
+    pub webkit_gl_environment: BTreeMap<String, String>,
 }
 
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
@@ -16529,28 +16543,46 @@ fn desktop_entry_snapshot(path: &Path) -> Value {
     })
 }
 
+/// The EXEC-TIME environment of a GUI process, as `/proc/<pid>/environ` reports it.
+///
+/// ⚠⚠ **This is the environment the process was LAUNCHED with, not the one it is
+/// running on.** `setenv`/`unsetenv` reallocate the environ array onto the heap while
+/// the kernel keeps exposing the exec-time stack region, so anything the process wrote
+/// to its own environment after exec is invisible here and anything it removed still
+/// appears. Measured on the dev host 2026-07-25 with a standalone binary.
+///
+/// So this list may only contain keys that are INHERITED and never rewritten in-process
+/// — which is true of everything below, and is why the five GL keys are NOT here. Those
+/// are all written by `configure_linux_webkit_compositing` after exec; reading them
+/// from `/proc` reported nothing on a fresh launch and the PREDECESSOR's decision after
+/// a hot restart. They are published by the client instead, in
+/// `ClientInstanceRecord::webkit_gl_environment`, and there is deliberately no second
+/// copy here to disagree with it.
+#[cfg(target_os = "linux")]
+const PROCESS_ENVIRONMENT_SNAPSHOT_KEYS: &[&str] = &[
+    "YGGTERM_ALLOW_MULTI_WINDOW",
+    "YGGTERM_REMOTE_SMOKE_TAG",
+    "YGGTERM_DESKTOP_APP_ID_SUFFIX",
+    "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF",
+    "YGGTERM_HOME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_ID",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+    "KDE_FULL_SESSION",
+    "GDK_BACKEND",
+    "WINIT_UNIX_BACKEND",
+    "YGGTERM_ENABLE_XTERM_CANVAS",
+    "YGGTERM_XTERM_CANVAS_POLICY",
+    "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
+];
+
 #[cfg(target_os = "linux")]
 fn process_environment_snapshot(pid: u32) -> BTreeMap<String, String> {
-    const KEYS: &[&str] = &[
-        "YGGTERM_ALLOW_MULTI_WINDOW",
-        "YGGTERM_REMOTE_SMOKE_TAG",
-        "YGGTERM_DESKTOP_APP_ID_SUFFIX",
-        "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF",
-        "YGGTERM_HOME",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "XDG_SESSION_ID",
-        "XDG_RUNTIME_DIR",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_DESKTOP",
-        "DESKTOP_SESSION",
-        "KDE_FULL_SESSION",
-        "GDK_BACKEND",
-        "WINIT_UNIX_BACKEND",
-        "YGGTERM_ENABLE_XTERM_CANVAS",
-        "YGGTERM_XTERM_CANVAS_POLICY",
-        "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
-    ];
+    const KEYS: &[&str] = PROCESS_ENVIRONMENT_SNAPSHOT_KEYS;
     let payload = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
     payload
         .split(|byte| *byte == 0)
@@ -16760,7 +16792,16 @@ pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
             ));
             json!({
                 "record": record,
-                "env": env,
+                // Named for what it is. A reader that took "env" for the process's
+                // CURRENT environment would be reading the exec-time copy — see
+                // PROCESS_ENVIRONMENT_SNAPSHOT_KEYS.
+                "exec_environ": env,
+                "exec_environ_note":
+                    "the environment this process was LAUNCHED with (/proc/<pid>/environ); \
+                     anything the process set or removed after exec is NOT reflected here",
+                // The GL path, from the process's own view. One owner; the exec-time
+                // map above deliberately carries no copy of these keys.
+                "webkit_gl_environment": record.webkit_gl_environment,
                 "latest_linux_desktop_app_id": latest_app_id,
             })
         })
@@ -22815,6 +22856,82 @@ mod tests {
         select_claude_code_storage_candidate,
     };
 
+    /// ⚠⚠ THE INSTRUMENT-LIE LOCK, server half. The `/proc/<pid>/environ` reader may
+    /// never carry a key the process rewrites after exec.
+    ///
+    /// The first version of this test asserted that the five GL keys WERE in this list,
+    /// and it passed green while the surface reported the wrong values — because
+    /// `/proc/<pid>/environ` is the exec-time environment and every one of those keys is
+    /// written by `configure_linux_webkit_compositing` after exec. On a fresh launch the
+    /// policy key was simply absent; on a hot restart or `server app launch` the child
+    /// inherited its parent's mutated environ and the surface reported the
+    /// PREDECESSOR's GL decision. The GL path is published by the client instead
+    /// (`ClientInstanceRecord::webkit_gl_environment`), and this asserts there is no
+    /// second, lying copy to disagree with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_exec_time_environment_never_carries_a_key_the_process_rewrites() {
+        let keys = super::PROCESS_ENVIRONMENT_SNAPSHOT_KEYS;
+        for forbidden in yggterm_core::gl_probe::WEBKIT_GL_ENVIRONMENT_KEYS {
+            assert!(
+                !keys.contains(forbidden),
+                "{forbidden} is written AFTER exec, so /proc/<pid>/environ reports the \
+                 launch-time value — publish it from the client's own view instead \
+                 (ClientInstanceRecord::webkit_gl_environment)"
+            );
+        }
+        // The inherited keys stay: those really are exec-time facts, and the desktop
+        // identity checks below read them.
+        assert!(keys.contains(&"YGGTERM_ALLOW_MULTI_WINDOW"));
+        assert!(keys.contains(&"GDK_BACKEND"));
+        assert!(keys.contains(&"YGGTERM_HOME"));
+    }
+
+    /// The GL path reaches the read surface, and it is the CLIENT's answer.
+    ///
+    /// Serializing the record is what `server app desktop-identity` does, so this fails
+    /// if the field is dropped from the record, renamed on the wire, or stops
+    /// round-tripping — any of which puts the surface back to silence.
+    #[test]
+    fn the_client_record_carries_the_gl_path_it_decided() {
+        let mut published = BTreeMap::new();
+        published.insert(
+            yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY.to_string(),
+            "hardware_gl_probed".to_string(),
+        );
+        published.insert(
+            yggterm_core::gl_probe::ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS.to_string(),
+            "1".to_string(),
+        );
+        let record = super::ClientInstanceRecord {
+            webkit_gl_environment: published.clone(),
+            ..client_record(4242, 1, ":0")
+        };
+        let wire = serde_json::to_value(&record).expect("a record serializes");
+        assert_eq!(
+            wire.get("webkit_gl_environment")
+                .and_then(|value| value.get(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY))
+                .and_then(Value::as_str),
+            Some("hardware_gl_probed"),
+            "the GL decision must survive onto the wire the read surface serves"
+        );
+        // A hardware host CLEARS the software force, so its absence is the answer, not
+        // a gap: nothing may re-insert a zero-ish placeholder for it.
+        assert!(
+            !published.contains_key(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE),
+            "an absent key means the process removed it"
+        );
+        let parsed: super::ClientInstanceRecord =
+            serde_json::from_value(wire).expect("a record round-trips");
+        assert_eq!(parsed.webkit_gl_environment, published);
+        // A legacy record predates the field and must read as "not published".
+        let legacy: super::ClientInstanceRecord = serde_json::from_value(json!({
+            "pid": 1, "started_at_ms": 1u64,
+        }))
+        .expect("a legacy record still parses");
+        assert!(legacy.webkit_gl_environment.is_empty());
+    }
+
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
 
     /// Sites in this crate still allowed to spell a store path by hand. The
@@ -23308,6 +23425,7 @@ mod tests {
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         };
         let trace_events = BTreeMap::<u32, String>::new();
         let app_id = super::desktop_identity_latest_app_id_for_record(&record, &trace_events);
@@ -34355,6 +34473,7 @@ terminal_window_id: None,
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         }
     }
 
@@ -34598,6 +34717,7 @@ terminal_window_id: None,
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize live record");
         fs::write(
@@ -34639,6 +34759,7 @@ terminal_window_id: None,
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize live record");
         fs::write(

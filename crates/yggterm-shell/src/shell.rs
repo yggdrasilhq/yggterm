@@ -725,10 +725,13 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 /// Why the SHAPE is the fix (this is a performance bug, not a style choice).
 /// A CSS animation's phase is anchored to the moment its element was created, so
 /// N dots created at N different times blink at N different phases. On a
-/// software-GL host (guihost — hardware GL is a trap there, see
-/// [[campaign-yggterm-unified]]) every opacity flip costs a FULL-WINDOW
-/// cairo/pixman blit on the GUI main thread, so cost scales with the number of
-/// distinct phases, not with the handful of pixels that changed. Measured live on
+/// software-GL host every opacity flip costs a FULL-WINDOW cairo/pixman blit on
+/// the GUI main thread, so cost scales with the number of distinct phases, not
+/// with the handful of pixels that changed. (⚠ The parenthetical this comment
+/// used to carry — "guihost — hardware GL is a trap there" — was FALSE: that host's
+/// GPU works, and we were forcing llvmpipe on it ourselves. The measurement below
+/// still stands on its own, and the shape is right on a hardware host too; it is
+/// simply no longer paying for a premise that was never true.) Measured live on
 /// guihost with 5 working dots: per-dot animations = 9.4 presented frames/s and
 /// 10.8% GUI CPU; this root-driven variable = 2.1 frames/s and 5.0% GUI CPU —
 /// flat in the number of dots. Isolating the dots (`contain:paint` /
@@ -6410,6 +6413,18 @@ struct ClientInstanceRecord {
     xdg_runtime_dir: Option<String>,
     #[serde(default)]
     xauthority: Option<String>,
+    /// Which GL path THIS window is on, as this process sees it.
+    ///
+    /// ⚠⚠ Published here, from the process's own environment, because
+    /// `/proc/<pid>/environ` CANNOT answer it: every one of these keys is written
+    /// after exec by `configure_linux_webkit_compositing`, and `setenv`/`unsetenv`
+    /// move the environ array to the heap while the kernel keeps exposing the
+    /// exec-time copy. A `/proc` reader therefore reports nothing on a fresh launch
+    /// and the PREDECESSOR's values on a hot restart — the decision and the state
+    /// disagreeing silently, on the very surface built to detect that. Absent
+    /// (legacy record, or a non-Linux host) reads as "not published", never as "off".
+    #[serde(default)]
+    webkit_gl_environment: BTreeMap<String, String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAppMode {
@@ -20839,7 +20854,12 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             else {
                 continue;
             };
-            let samples = probe.observe(&observations, current_millis());
+            // NOT current_millis(): that is a SystemTime wall clock, and feeding it
+            // here inflated interval_ms across a suspend/resume while the CPU tick
+            // counters stood still — under-reporting core_fraction on exactly the
+            // laptop whose fan is the complaint. The probe owns its own monotonic
+            // clock now, and no longer accepts one.
+            let samples = probe.observe(&observations);
             if samples.is_empty() {
                 // First tick after startup: there is no previous observation, so the
                 // only available number would be a lifetime average. Skip it.
@@ -23858,6 +23878,24 @@ fn allocator_trim_can_run(shell: &ShellState) -> bool {
         && shell.title_requests_in_flight.is_empty()
         && shell.summary_requests_in_flight.is_empty()
 }
+/// Whether a memory reading may gate an allocator trim.
+///
+/// ⚠ The source requirement is not decoration. This chore's whole report is the
+/// anonymous-memory delta the trim moved, and `/proc/<pid>/status` cannot see anonymous
+/// memory at all. Before the one-owner collapse, `current_process_memory_sample` read
+/// `smaps_rollup` alone and returned `None` when it was unreadable, so the chore simply
+/// never ran on hosts where that file is absent (hardened kernels). Routing it through
+/// `read_process_memory` silently added a `status` fallback and started firing
+/// `malloc_trim(0)` on exactly those hosts — a behaviour change nobody asked for,
+/// inside what was described as a pure refactor. It is spelled out here rather than
+/// left to drift.
+#[cfg(target_os = "linux")]
+fn allocator_trim_sample_is_actionable(
+    memory: &yggterm_core::render_probe::ProcMemory,
+) -> bool {
+    memory.source.knows_pss_and_anonymous() && memory.rss_kb >= ALLOCATOR_TRIM_RSS_THRESHOLD_KB
+}
+
 #[cfg(target_os = "linux")]
 fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) -> bool {
     let now_ms = current_millis();
@@ -23879,7 +23917,7 @@ fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) 
     let Some(before) = current_process_memory_sample() else {
         return false;
     };
-    if before.rss_kb < ALLOCATOR_TRIM_RSS_THRESHOLD_KB {
+    if !allocator_trim_sample_is_actionable(&before) {
         return false;
     }
     if ALLOCATOR_TRIM_IN_FLIGHT
@@ -23899,16 +23937,10 @@ fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) 
             "trimmed": trimmed,
             "started_at_ms": trim_started_at_ms,
             "finished_at_ms": finished_at_ms,
-            "before": {
-                "rss_kb": before.rss_kb,
-                "pss_kb": before.pss_kb,
-                "anonymous_kb": before.anonymous_kb,
-            },
-            "after": after.map(|sample| json!({
-                "rss_kb": sample.rss_kb,
-                "pss_kb": sample.pss_kb,
-                "anonymous_kb": sample.anonymous_kb,
-            })),
+            // One owner for how a memory reading is published, so a source that
+            // cannot see anonymous memory cannot report a zero for it.
+            "before": before.perf_fields(),
+            "after": after.map(|sample| sample.perf_fields()),
         });
         append_perf_event(&perf_home, "memory", "allocator_trim", payload);
         LAST_ALLOCATOR_TRIM_MS.store(finished_at_ms, Ordering::Relaxed);
@@ -37830,43 +37862,13 @@ fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
+/// This process's own memory, through the ONE owner of "how much memory does pid N
+/// use" (`yggterm_core::render_probe`). The shell used to carry its own smaps_rollup
+/// parser here while the render probe parsed the same file per pid — two encodings of
+/// one concept, free to drift on the next kernel field rename.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, Default)]
-struct ProcessMemorySample {
-    rss_kb: u64,
-    pss_kb: u64,
-    anonymous_kb: u64,
-}
-#[cfg(target_os = "linux")]
-fn process_memory_sample_from_smaps_rollup(text: &str) -> ProcessMemorySample {
-    let mut sample = ProcessMemorySample::default();
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(label) = parts.next() else {
-            continue;
-        };
-        let value = parts
-            .next()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or_default();
-        match label {
-            "Rss:" => sample.rss_kb = value,
-            "Pss:" => sample.pss_kb = value,
-            "Anonymous:" => sample.anonymous_kb = value,
-            _ => {}
-        }
-    }
-    sample
-}
-#[cfg(target_os = "linux")]
-fn current_process_memory_sample() -> Option<ProcessMemorySample> {
-    let text = fs::read_to_string("/proc/self/smaps_rollup").ok()?;
-    let sample = process_memory_sample_from_smaps_rollup(&text);
-    (sample.rss_kb > 0).then_some(sample)
-}
-#[cfg(not(target_os = "linux"))]
-fn current_process_memory_sample() -> Option<()> {
-    None
+fn current_process_memory_sample() -> Option<yggterm_core::render_probe::ProcMemory> {
+    yggterm_core::render_probe::read_process_memory(std::process::id() as i32)
 }
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
     let raw = match endpoint {
@@ -54450,6 +54452,8 @@ fn build_client_instance_record(
         xdg_session_id: env_var("XDG_SESSION_ID"),
         xdg_runtime_dir: env_var("XDG_RUNTIME_DIR"),
         xauthority: env_var("XAUTHORITY"),
+        // In-process, for the reason spelled out on the field.
+        webkit_gl_environment: yggterm_core::gl_probe::webkit_gl_environment_from_process(),
     }
 }
 
@@ -77074,7 +77078,8 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
             return false;
         }
         // Wayland: WebGL (xterm.js 6's GPU renderer). It presents once WebKitGTK
-        // compositing is enabled with a software-GL safety net — see main.rs
+        // compositing is enabled; whether that compositing runs on the GPU or on
+        // llvmpipe is main.rs's probed decision, not a standing fact — see
         // configure_linux_webkit_compositing. Mirrors main.rs's authoritative policy
         // (xterm_webgl_enabled_for_wayland). The earlier "WebGL black" was compositing
         // being disabled, now fixed. See finding-xterm6-webgl-migration.
@@ -77089,8 +77094,8 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
 /// `terminal_xterm_canvas_renderer_enabled_from_env` exactly. NOTE: xterm.js 6 has
 /// two render tiers — DOM (slowest, reliable fallback) and WebGL (fastest, bundled as
 /// addon-webgl); the 2D canvas renderer was REMOVED in xterm 6. On Wayland we use
-/// WebGL: it presents once WebKitGTK accelerated compositing is enabled with a
-/// software-GL safety net (see main.rs configure_linux_webkit_compositing). X11 keeps
+/// WebGL: it presents once WebKitGTK accelerated compositing is enabled, on the GPU
+/// where the host has one (see main.rs configure_linux_webkit_compositing). X11 keeps
 /// DOM (idle-CPU guard). This reason string + the `renderer_decision` trace record the
 /// decision per platform.
 fn terminal_xterm_renderer_policy_reason() -> String {
@@ -101438,6 +101443,87 @@ mod tests {
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
 
+    /// ⚠⚠ THE INSTRUMENT-LIE LOCK, client half. The record a GUI publishes must carry
+    /// the GL decision THIS process made.
+    ///
+    /// The read surface (`server app desktop-identity`) used to answer "which GL path
+    /// is this window on" out of `/proc/<pid>/environ`, which cannot know: those keys
+    /// are written after exec, so `/proc` reported nothing on a fresh launch and the
+    /// PREDECESSOR's decision after a hot restart. The record is the one place the
+    /// answer exists, and this fails if `build_client_instance_record` stops filling it
+    /// or starts filling it from anywhere but this process's own environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_published_record_carries_this_processs_gl_decision() {
+        // Exactly the shape of a hot-restarted GUI: inherit a software force, probe
+        // hardware, clear the force.
+        unsafe {
+            std::env::set_var(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE, "1");
+            std::env::set_var(
+                yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+                "hardware_gl_probed",
+            );
+            std::env::remove_var(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE);
+        }
+        let record = build_client_instance_record(std::process::id(), 7, None);
+        assert_eq!(
+            record
+                .webkit_gl_environment
+                .get(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY)
+                .map(String::as_str),
+            Some("hardware_gl_probed"),
+            "the record must publish the decision this process made"
+        );
+        assert!(
+            !record
+                .webkit_gl_environment
+                .contains_key(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE),
+            "a software force this process CLEARED must not still be published as set"
+        );
+        unsafe {
+            std::env::remove_var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY);
+        }
+    }
+
+    /// The trim chore may only act on a reading that can SEE what the trim moves.
+    ///
+    /// `/proc/<pid>/status` knows `VmRSS` and nothing else, so on that source the
+    /// chore's whole report — the anonymous-memory delta — is two placeholder zeroes.
+    /// Before the one-owner collapse the chore simply never ran on a host whose
+    /// `smaps_rollup` is unreadable; routing it through `read_process_memory` silently
+    /// started firing `malloc_trim(0)` there. This fails if that fallback is admitted
+    /// again, and it fails if the RSS floor is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_trim_chore_refuses_a_reading_that_cannot_see_anonymous_memory() {
+        use yggterm_core::render_probe::{ProcMemory, ProcMemorySource};
+        let over_threshold = ALLOCATOR_TRIM_RSS_THRESHOLD_KB + 1;
+        let rollup = ProcMemory {
+            rss_kb: over_threshold,
+            pss_kb: 1,
+            anonymous_kb: 1,
+            source: ProcMemorySource::SmapsRollup,
+        };
+        assert!(
+            allocator_trim_sample_is_actionable(&rollup),
+            "a big rollup reading is what the chore exists for"
+        );
+        assert!(
+            !allocator_trim_sample_is_actionable(&ProcMemory {
+                source: ProcMemorySource::StatusVmRss,
+                ..rollup
+            }),
+            "the status fallback cannot see anonymous memory, so it cannot gate a trim"
+        );
+        assert!(
+            !allocator_trim_sample_is_actionable(&ProcMemory {
+                rss_kb: ALLOCATOR_TRIM_RSS_THRESHOLD_KB - 1,
+                ..rollup
+            }),
+            "and the RSS floor still holds"
+        );
+    }
+
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
 
     /// Sites in this crate still allowed to spell a store path by hand. The
@@ -111325,8 +111411,8 @@ mod tests {
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None, None, false, true
         ));
-        // Wayland uses the WebGL GPU renderer (presents via compositing + software-GL
-        // safety net configured in main.rs configure_linux_webkit_compositing).
+        // Wayland uses the WebGL GPU renderer (presents via the compositing path
+        // main.rs configure_linux_webkit_compositing selects for this host).
         assert!(terminal_xterm_canvas_renderer_enabled_from_env(
             None,
             Some("wayland"),
@@ -114029,6 +114115,7 @@ mod tests {
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize live record");
         fs::write(&live_path, live_record).expect("write live path");
@@ -114133,6 +114220,7 @@ mod tests {
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize legacy record");
         fs::write(&legacy_path, legacy_record).expect("write legacy client record");
@@ -128098,16 +128186,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.next_background_copy_scan_after_ms = cooldown;
         shell.request_background_copy_scan_if_unscheduled();
         assert_eq!(shell.next_background_copy_scan_after_ms, cooldown);
-    }
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_memory_sample_from_smaps_rollup_parses_rss_pss_and_anonymous() {
-        let sample = process_memory_sample_from_smaps_rollup(
-            "Rss:                123456 kB\nPss:                 98765 kB\nAnonymous:           54321 kB\n",
-        );
-        assert_eq!(sample.rss_kb, 123456);
-        assert_eq!(sample.pss_kb, 98765);
-        assert_eq!(sample.anonymous_kb, 54321);
     }
     fn test_managed_conversation_session(kind: SessionKind) -> ManagedSessionView {
         ManagedSessionView {
