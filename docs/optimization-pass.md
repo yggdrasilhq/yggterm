@@ -72,7 +72,37 @@ Three consequences for this pass:
    what it reports, rather than defaulting to the slowest configuration behind an
    opt-out nobody knew to set.
 
-### ✅ LIVE-PROVEN 2026-07-26 — the GPU is back on
+### ✅ LIVE-PROVEN 2026-07-26 — measured by the product's own instrument
+
+The strongest evidence is not the shell probe below, it is `perf-summary
+--since-ms <swap>` against the lifetime table, because both sides are the same
+measurement taken the same way. GUI-only swap, daemon untouched:
+
+| span | lifetime (pre-fix) | since the swap | |
+|---|---|---|---|
+| `background/copy_scan` p50 | 191.4 ms | **17.1 ms** | 11x |
+| `background/copy_scan` p95 | 424.2 ms | **21.3 ms** | 20x |
+| `background/copy_scan` max | 32,492 ms | **47.7 ms** | 681x |
+| `render/web_content` p50 | 9,870 ms | **550 ms** | 18x |
+| `render/gui` p50 | 7,350 ms | **2,430 ms** | 3x |
+
+`copy_scan` is WS4-1: the shell was deep-cloning a 1.75 MB `RemoteMachineSnapshot`
+once per copy target, ~644 times per scan. The 681x on the MAX is the number that
+matters most — that tail is the "the app hung" the incident log kept catching.
+
+The two `render/*` rows are the GPU fix, in CPU-milliseconds per 60 s tick:
+web content fell from ~16.5% of a core to ~0.9%, the GUI shell from ~12.3% to
+~4.1%. ⚠ Read them with the caveat that the since-swap window was mostly idle
+while the lifetime figure includes busy periods; `copy_scan` does not have that
+problem, because the chore runs on its own schedule regardless of what is on
+screen.
+
+`background/local_tree_scan` now appears at all (p50 900.5 ms, 25 calls) — that
+is WS4-3, and its whole point is that this cost was previously OUTSIDE every
+span and therefore invisible to the instrument that was being used to decide
+what to optimize.
+
+### The shell-probe view of the same swap
 
 GUI-only swap on the GUI host (daemon untouched, no version bump, no PTY handed
 off). Before → after, same host, both idle:
