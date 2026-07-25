@@ -844,6 +844,26 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         output_path: String,
     },
+    /// Run an ASYNC script and return its resolved value — the ONE async
+    /// bridge.
+    ///
+    /// `eval` returns a script's COMPLETION value, and a Promise is not a
+    /// serializable completion value: the engine answers
+    /// `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT`. Every caller that needed
+    /// `fetch`, `await el.decode()`, or any other promise therefore invented
+    /// the same workaround — stash the result on `window` and poll it with a
+    /// second verb. This owns that idiom in ONE place so nobody writes it
+    /// again, and so the two ways it goes wrong (a poll that fails mid-
+    /// navigation, a document replaced under the stash) get honest answers
+    /// instead of a fabricated one.
+    WebSurfaceAwait {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// The body of an async function. `return` its value.
+        script: String,
+        /// How long to wait for the promise to settle.
+        timeout_ms: u64,
+    },
     /// Enumerate the page's frames: url, element counts, and whether each is
     /// reachable from the top document's realm.
     ///
@@ -1239,6 +1259,7 @@ impl AppControlCommand {
             Self::WebSurfaceBatch { .. } => "web_surface_batch",
             Self::WebSurfaceRead { .. } => "web_surface_read",
             Self::WebSurfaceFrames { .. } => "web_surface_frames",
+            Self::WebSurfaceAwait { .. } => "web_surface_await",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",
             Self::EnsureWebSurface { .. } => "ensure_web_surface",
