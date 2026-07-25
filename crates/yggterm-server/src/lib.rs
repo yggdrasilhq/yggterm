@@ -82,7 +82,10 @@ pub use remote_runtime::{
     RemoteRuntimeRegistry, RemoteRuntimeSession, RemoteRuntimeSessionInput,
     RemoteRuntimeSessionState, RemoteWriterLease,
 };
-pub use terminal::{PromptSubmitOutcome, TerminalChunk, TerminalManager, TerminalReadResult};
+pub use terminal::{
+    PromptSubmitOutcome, TerminalChunk, TerminalManager, TerminalReadResult,
+    clip_formatted_screen_to_width, formatted_screen_max_column,
+};
 
 use anyhow::Context;
 use codex_cli::{

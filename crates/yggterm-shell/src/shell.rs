@@ -68837,6 +68837,44 @@ fn TerminalCanvas(
                         match decision {
                         ScreenReconcileDecision::Write => {
                             screen_reconcile_unwritable_retries = 0;
+                            // A daemon screen WIDER than this viewer is not a
+                            // cosmetic overflow — it is the frame-corruption
+                            // class. Each over-long row wraps, every row below
+                            // it shifts, and the payload's later absolute
+                            // `CSI r;cH` jumps then land on that spill, where
+                            // its `CSI nC` blank-runs leave the spilled
+                            // characters showing through: text merged out of two
+                            // frames, which is exactly what the user reports on
+                            // busy CC sessions. Nothing beyond this viewer's
+                            // width can be legitimate — the CLI cannot paint
+                            // wider than the PTY it was handed — so the cells
+                            // out there are ghosts from when the grid was wider.
+                            // Drop them. See
+                            // docs/xterm-bugs.md#screen-model-wider-than-viewer.
+                            let screen_max_column =
+                                yggterm_server::formatted_screen_max_column(&screen_text);
+                            let screen_text = if current_terminal_cols > 0
+                                && screen_max_column > current_terminal_cols
+                            {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "screen_reconcile_clipped_to_viewer_width",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "reason": reconcile_reason,
+                                        "screen_max_column": screen_max_column,
+                                        "viewer_cols": current_terminal_cols,
+                                    }),
+                                );
+                                yggterm_server::clip_formatted_screen_to_width(
+                                    &screen_text,
+                                    current_terminal_cols,
+                                )
+                            } else {
+                                screen_text.clone()
+                            };
                             let _ = eval.send(TerminalJsCommand::Write {
                                 data: screen_text.clone(),
                             });

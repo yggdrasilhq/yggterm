@@ -1140,6 +1140,164 @@ enum TerminalWriteAckMode {
     Flushed,
 }
 
+/// Display width of one character in terminal cells.
+///
+/// East-Asian Wide/Fullwidth count 2; everything else counts 1 — including the
+/// AMBIGUOUS class (box drawing, arrows, the glyphs the agent CLIs draw their
+/// frames with), which is what xterm.js does by default. Combining marks are
+/// rare enough in CLI frames that treating them as 1 only ever over-estimates,
+/// and this measurement is used to DETECT an overflow, so over-estimating is
+/// the safe direction.
+fn formatted_screen_cell_width(ch: char) -> u16 {
+    let code = ch as u32;
+    let wide = (0x1100..=0x115F).contains(&code)
+        || (0x2E80..=0xA4CF).contains(&code) && code != 0x303F
+        || (0xAC00..=0xD7A3).contains(&code)
+        || (0xF900..=0xFAFF).contains(&code)
+        || (0xFE30..=0xFE6F).contains(&code)
+        || (0xFF00..=0xFF60).contains(&code)
+        || (0xFFE0..=0xFFE6).contains(&code)
+        || (0x1F300..=0x1F64F).contains(&code)
+        || (0x1F900..=0x1F9FF).contains(&code)
+        || (0x20000..=0x3FFFD).contains(&code);
+    if wide { 2 } else { 1 }
+}
+
+/// One step of walking a daemon "formatted screen" payload
+/// (`state_formatted`), reported to a caller that wants to measure or rewrite
+/// it. The payload is absolutely positioned (`CSI r;cH`) with `CSI nC` used for
+/// runs of blanks, so a naive `text.len()` says nothing about where a row ends.
+enum FormattedScreenStep<'a> {
+    /// A control sequence: carries state (color, position) but paints nothing.
+    Control(&'a str),
+    /// A printable character landing at `col` (1-based) and `width` cells wide.
+    Print { text: &'a str, col: u16, width: u16 },
+}
+
+/// Walk a formatted screen, tracking the cursor, and hand each step to `step`.
+///
+/// Shared by [`formatted_screen_max_column`] and
+/// [`clip_formatted_screen_to_width`] so the measurement and the rewrite can
+/// never disagree about where a character lands.
+fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreenStep<'_>)) {
+    let bytes = screen_text.as_bytes();
+    let mut col: u16 = 1;
+    let mut i = 0usize;
+    while i < screen_text.len() {
+        if bytes[i] == 0x1b {
+            // CSI: ESC [ params final. OSC: ESC ] ... BEL|ST. Anything else is a
+            // two-byte escape. None of them paint a cell.
+            let end = if screen_text[i..].starts_with("\u{1b}[") {
+                let mut j = i + 2;
+                while j < screen_text.len() && !bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let final_byte = bytes.get(j).copied();
+                let params = &screen_text[i + 2..j.min(screen_text.len())];
+                match final_byte {
+                    // Cursor position: column is the SECOND parameter.
+                    Some(b'H') | Some(b'f') => {
+                        let mut parts = params.split(';');
+                        let _row = parts.next();
+                        col = parts
+                            .next()
+                            .and_then(|value| value.parse::<u16>().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                    }
+                    // Cursor forward — the payload's way of spelling blanks.
+                    Some(b'C') => {
+                        let n = params.parse::<u16>().unwrap_or(1).max(1);
+                        col = col.saturating_add(n);
+                    }
+                    Some(b'G') => {
+                        col = params.parse::<u16>().unwrap_or(1).max(1);
+                    }
+                    Some(b'D') => {
+                        let n = params.parse::<u16>().unwrap_or(1).max(1);
+                        col = col.saturating_sub(n).max(1);
+                    }
+                    _ => {}
+                }
+                (j + 1).min(screen_text.len())
+            } else if screen_text[i..].starts_with("\u{1b}]") {
+                let mut j = i + 2;
+                while j < screen_text.len() && bytes[j] != 0x07 {
+                    j += 1;
+                }
+                (j + 1).min(screen_text.len())
+            } else {
+                (i + 2).min(screen_text.len())
+            };
+            step(FormattedScreenStep::Control(&screen_text[i..end]));
+            i = end;
+            continue;
+        }
+        let ch = screen_text[i..].chars().next().unwrap_or('\0');
+        let len = ch.len_utf8();
+        match ch {
+            '\n' => {
+                col = 1;
+                step(FormattedScreenStep::Control(&screen_text[i..i + len]));
+            }
+            '\r' => {
+                col = 1;
+                step(FormattedScreenStep::Control(&screen_text[i..i + len]));
+            }
+            _ => {
+                let width = formatted_screen_cell_width(ch);
+                step(FormattedScreenStep::Print {
+                    text: &screen_text[i..i + len],
+                    col,
+                    width,
+                });
+                col = col.saturating_add(width);
+            }
+        }
+        i += len;
+    }
+}
+
+/// The rightmost column a formatted screen paints into, in cells.
+///
+/// A screen wider than the terminal it is written into is CORRUPTION, not a
+/// cosmetic overflow: each over-long row wraps, which shifts every row below it,
+/// and the payload's later absolute `CSI r;cH` jumps then land on that spill —
+/// where `CSI nC` (blank runs) leaves the spilled characters showing through.
+/// The result is text merged out of two different frames. Measured live on guihost
+/// 2026-07-25: a screen reaching column 204 painted into a 168-column viewer.
+pub fn formatted_screen_max_column(screen_text: &str) -> u16 {
+    let mut max_col = 0u16;
+    walk_formatted_screen(screen_text, |step| {
+        if let FormattedScreenStep::Print { col, width, .. } = step {
+            max_col = max_col.max(col.saturating_add(width).saturating_sub(1));
+        }
+    });
+    max_col
+}
+
+/// Drop everything a formatted screen paints beyond `cols`.
+///
+/// Control sequences are kept verbatim (color/attribute state must survive), so
+/// only the printable cells past the edge are dropped. Nothing legitimate lives
+/// there: the CLI cannot paint wider than the PTY it was handed, so a cell
+/// beyond the viewer's width is a ghost from when the grid was wider.
+pub fn clip_formatted_screen_to_width(screen_text: &str, cols: u16) -> String {
+    if cols == 0 {
+        return screen_text.to_string();
+    }
+    let mut out = String::with_capacity(screen_text.len());
+    walk_formatted_screen(screen_text, |step| match step {
+        FormattedScreenStep::Control(text) => out.push_str(text),
+        FormattedScreenStep::Print { text, col, width } => {
+            if col.saturating_add(width).saturating_sub(1) <= cols {
+                out.push_str(text);
+            }
+        }
+    });
+    out
+}
+
 struct TerminalScreenState {
     parser: Vt100Parser,
     formatted: String,
@@ -1165,6 +1323,14 @@ impl TerminalScreenState {
     fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
         self.refresh_formatted();
+    }
+
+    /// The model's own grid, `(rows, cols)`. The PTY's size is tracked
+    /// separately (`current_cols`/`current_rows`); they are supposed to agree,
+    /// and `resize` above is the only thing that keeps them agreeing — so the
+    /// resize fast path has to be able to ask.
+    fn size(&self) -> (u16, u16) {
+        self.parser.screen().size()
     }
 
     fn refresh_formatted(&mut self) {
@@ -1832,13 +1998,37 @@ impl PtySessionRuntime {
             .collect::<String>()
     }
 
+    /// The daemon's authoritative visible screen, as a replayable payload.
+    ///
+    /// Clipped to the session's own PTY width, because a screen wider than the
+    /// PTY is not content — the CLI cannot paint wider than the grid it was
+    /// handed, so anything out there is a ghost left over from when the model
+    /// was wider. Serving those ghosts is the frame-corruption bug: the client
+    /// wraps each over-long row, every row below shifts, and the payload's later
+    /// absolute jumps land on the spill with blank-runs that leave it showing
+    /// through. Clipping HERE (the one place the screen is served) covers every
+    /// client path at once, rather than each replay call site remembering to.
     fn screen_snapshot(&self) -> String {
-        self.screen_state
+        let formatted = self
+            .screen_state
             .lock()
             .expect("pty screen state lock poisoned")
             .formatted
             .trim_matches('\0')
-            .to_string()
+            .to_string();
+        let pty_cols = self.current_cols.load(Ordering::SeqCst);
+        if pty_cols == 0 || formatted_screen_max_column(&formatted) <= pty_cols {
+            return formatted;
+        }
+        trace_terminal_event(
+            "screen_snapshot_clipped_to_pty_width",
+            serde_json::json!({
+                "path": self.key,
+                "pty_cols": pty_cols,
+                "screen_max_column": formatted_screen_max_column(&formatted),
+            }),
+        );
+        clip_formatted_screen_to_width(&formatted, pty_cols)
     }
 
     /// The daemon's CLEAN scrolled-off history rows (vt100 scrollback ring),
@@ -2137,15 +2327,47 @@ impl PtySessionRuntime {
         let master = self.master.lock().expect("pty master lock poisoned");
         let observed_before = master.get_size().ok().map(|size| (size.cols, size.rows));
         let cache_matches_request = previous_cols == cols && previous_rows == rows;
+        // The vt100 SCREEN MODEL is the third size in play, and the one the
+        // client actually paints from (`state_formatted`). The old fast path
+        // asked only about the PTY, so a model that had drifted wider stayed
+        // wider FOREVER: every later resize to the same size answered
+        // `resize_noop` and never touched it. That is why "two real SIGWINCHes
+        // did not repair the frame" — the SIGWINCH repaired the PTY and the CLI,
+        // and left the stale model to serve ghost cells past the new right edge.
+        // Live on guihost 2026-07-25: a 168x63 PTY whose model still rendered to
+        // column 204, which is the frame-corruption class in
+        // docs/xterm-bugs.md#screen-model-wider-than-viewer.
+        let screen_model_size = self
+            .screen_state
+            .lock()
+            .ok()
+            .map(|screen_state| screen_state.size());
+        let screen_model_matches_request = screen_model_size == Some((rows, cols));
         if cache_matches_request && observed_before == Some((cols, rows)) {
+            if screen_model_matches_request {
+                trace_terminal_event(
+                    "resize_noop",
+                    serde_json::json!({
+                        "path": self.key,
+                        "cols": cols,
+                        "rows": rows,
+                        "actual_cols": cols,
+                        "actual_rows": rows,
+                    }),
+                );
+                return Ok(());
+            }
+            if let Ok(mut screen_state) = self.screen_state.lock() {
+                screen_state.resize(rows, cols);
+            }
             trace_terminal_event(
-                "resize_noop",
+                "resize_screen_model_repaired",
                 serde_json::json!({
                     "path": self.key,
                     "cols": cols,
                     "rows": rows,
-                    "actual_cols": cols,
-                    "actual_rows": rows,
+                    "stale_model_cols": screen_model_size.map(|(_, model_cols)| model_cols),
+                    "stale_model_rows": screen_model_size.map(|(model_rows, _)| model_rows),
                 }),
             );
             return Ok(());
@@ -3239,6 +3461,65 @@ fn strip_terminal_control_sequences(input: &str) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod screen_width_tests {
+    use super::{clip_formatted_screen_to_width, formatted_screen_max_column};
+
+    /// The exact shape the daemon serves (measured live on guihost 2026-07-25):
+    /// absolute positioning per row, `CSI C` for every run of blanks, and rows
+    /// that reach past the viewer's right edge.
+    const WIDE_SCREEN: &str = "\u{1b}[H\u{1b}[J\u{1b}[1;1Habc\u{1b}[Cdef\u{1b}[2;1Hxy";
+
+    #[test]
+    fn max_column_counts_blank_runs_not_bytes() {
+        // "abc" + one skipped cell + "def" = column 7. Byte length says 30-odd,
+        // which is exactly why `screen_text.len()` could never have caught this.
+        assert_eq!(formatted_screen_max_column(WIDE_SCREEN), 7);
+        assert!(WIDE_SCREEN.len() > 20);
+    }
+
+    #[test]
+    fn a_screen_that_fits_is_returned_unchanged() {
+        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, 7), WIDE_SCREEN);
+        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, 80), WIDE_SCREEN);
+    }
+
+    /// The fix: cells past the viewer's width are dropped, and every control
+    /// sequence survives — colour/attribute state must not be lost with them.
+    #[test]
+    fn clipping_drops_only_the_cells_past_the_edge() {
+        let clipped = clip_formatted_screen_to_width(WIDE_SCREEN, 5);
+        assert_eq!(clipped, "\u{1b}[H\u{1b}[J\u{1b}[1;1Habc\u{1b}[Cd\u{1b}[2;1Hxy");
+        assert_eq!(formatted_screen_max_column(&clipped), 5);
+        // The row that already fit is untouched.
+        assert!(clipped.contains("\u{1b}[2;1Hxy"));
+    }
+
+    #[test]
+    fn colour_state_survives_the_clip() {
+        let text = "\u{1b}[1;1H\u{1b}[31mred\u{1b}[32mgreen\u{1b}[m";
+        let clipped = clip_formatted_screen_to_width(text, 3);
+        assert_eq!(clipped, "\u{1b}[1;1H\u{1b}[31mred\u{1b}[32m\u{1b}[m");
+    }
+
+    #[test]
+    fn wide_glyphs_count_two_cells() {
+        // A fullwidth character straddling the edge is dropped whole, never
+        // half-painted.
+        let text = "\u{1b}[1;1Ha\u{4e00}b";
+        assert_eq!(formatted_screen_max_column(text), 4);
+        assert_eq!(clip_formatted_screen_to_width(text, 2), "\u{1b}[1;1Ha");
+    }
+
+    /// The measurement must survive a payload it does not fully understand:
+    /// an OSC string carries a `;` and digits that would look like CSI params.
+    #[test]
+    fn osc_sequences_do_not_move_the_cursor() {
+        let text = "\u{1b}[1;1H\u{1b}]0;a window title\u{7}ok";
+        assert_eq!(formatted_screen_max_column(text), 2);
+    }
 }
 
 #[cfg(test)]
