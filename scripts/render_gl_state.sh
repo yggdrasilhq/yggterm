@@ -31,13 +31,19 @@ dri_fd_count() {
 	echo "${n:-0}"
 }
 
+# Sum engine time ONCE PER DRM CLIENT, not once per fd. Duplicated fds share one
+# struct file and every one of them reports the SAME cumulative counter, so a
+# naive per-fd sum multiplies by the fd count — measured 5.00x on Xorg and 4.00x
+# on a compositor. `drm-client-id` is the kernel's own dedup key and sits right
+# there in the same file.
 drm_gfx_ns() {
-	local total=0 v
-	for f in "/proc/$1"/fdinfo/*; do
-		v=$(awk '/^drm-engine-gfx:/ {print $2; exit}' "$f" 2>/dev/null)
-		[ -n "${v:-}" ] && total=$((total + v))
-	done
-	echo "$total"
+	local total=0
+	total=$(awk '
+		/^drm-client-id:/ { client = $2 }
+		/^drm-engine-gfx:/ { if (!(client in seen)) { seen[client] = 1; sum += $2 } }
+		END { print sum + 0 }
+	' "/proc/$1"/fdinfo/* 2>/dev/null)
+	echo "${total:-0}"
 }
 
 gui_pid=$(pgrep -x yggterm | while read -r p; do
@@ -63,6 +69,7 @@ sleep "$INTERVAL"
 
 printf '%-8s %-22s %8s %8s %10s %s\n' PID COMM CORES DRI_FDS GPU_MS VERDICT
 gpu_total=0
+total_dri_fds=0
 for p in "${pids[@]}"; do
 	[ -d "/proc/$p" ] || continue
 	comm=$(cat "/proc/$p/comm" 2>/dev/null || echo '?')
@@ -71,22 +78,35 @@ for p in "${pids[@]}"; do
 	fds=$(dri_fd_count "$p")
 	gpu_ms=$(( ($(drm_gfx_ns "$p") - ${g0[$p]}) / 1000000 ))
 	gpu_total=$((gpu_total + gpu_ms))
+	total_dri_fds=$((total_dri_fds + fds))
 
 	if [ "$gpu_ms" -gt 0 ]; then
 		verdict='GPU rasterizing'
 	elif [ "$fds" -eq 0 ]; then
 		verdict='CPU (no DRM node open)'
 	else
-		verdict='DRM open but idle this window'
+		verdict='hardware GL, idle this window'
 	fi
 	printf '%-8s %-22s %8s %8s %10s %s\n' "$p" "$comm" "$cores" "$fds" "$gpu_ms" "$verdict"
 done
 
 echo
-if [ "$gpu_total" -eq 0 ]; then
-	echo "VERDICT: no yggterm process used the GPU in ${INTERVAL}s — software rasterization."
+# Read the two facts in the right order. Holding a DRM render node is the
+# structural answer — llvmpipe never opens one — while GPU engine time is a
+# WORKLOAD answer, and an idle window legitimately reports zero on a perfectly
+# hardware-accelerated process. Judging "software" from engine time alone was
+# wrong in exactly the direction that matters: it reported software on the first
+# window after the GPU was switched back on, because nothing happened to be
+# painting.
+if [ "$total_dri_fds" -eq 0 ]; then
+	echo "VERDICT: no yggterm process holds a DRM render node — software rasterization."
+	echo "llvmpipe needs no DRM node, so this is structural, not a workload artefact."
 	echo "Cross-check that the host itself can: other desktop apps should show nonzero"
 	echo "drm-engine-gfx. If they do and we do not, the premise is ours, not the host's."
+elif [ "$gpu_total" -eq 0 ]; then
+	echo "VERDICT: hardware GL is in use (${total_dri_fds} DRM fds held), but nothing"
+	echo "painted in this ${INTERVAL}s window. Zero engine time here means IDLE, not"
+	echo "software — re-run while the terminal is actually rendering to see it rise."
 else
-	echo "VERDICT: yggterm used ${gpu_total} ms of GPU engine time in ${INTERVAL}s."
+	echo "VERDICT: hardware GL, and the GPU did ${gpu_total} ms of work in ${INTERVAL}s."
 fi

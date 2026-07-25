@@ -72,7 +72,32 @@ Three consequences for this pass:
    what it reports, rather than defaulting to the slowest configuration behind an
    opt-out nobody knew to set.
 
-### What shipped for §1a (2026-07-25, code committed, NOT yet live-proven)
+### ✅ LIVE-PROVEN 2026-07-26 — the GPU is back on
+
+GUI-only swap on the GUI host (daemon untouched, no version bump, no PTY handed
+off). Before → after, same host, both idle:
+
+| | before | after |
+|---|---|---|
+| DRM render-node fds | **0** | **7** (`amdgpu`, `/dev/dri/renderD128`) |
+| GPU engine time | **0 ns** | GUI 335 ms · web content 698 ms |
+| VRAM | — | 268 MB |
+| idle CPU (whole tree) | **0.449 cores** | **0.065 cores** |
+| policy on the read surface | — | `hardware_gl_probed` |
+
+The fd count is the claim that holds: llvmpipe never opens a DRM node, so this
+is structural rather than a workload artefact. The CPU figure is real but
+confounded — the new GUI was minutes old with one terminal host mounted against
+an old one up 5.5 h — so re-measure over hours before quoting a ratio.
+
+Two instrument corrections fell out of proving it, both now in the tooling:
+`drm-engine-*` is per-DRM-CLIENT and duplicated fds each repeat the same
+cumulative value (naive per-fd summing over-counts 4-5x, measured), and **zero
+engine time in a window means idle, not software** — the first post-swap read
+called a freshly hardware-accelerated host "software rasterization" because
+nothing happened to paint. Read the fd count first, engine time second.
+
+### What shipped for §1a (2026-07-25, code committed)
 
 - `crates/yggterm-core/src/gl_probe.rs` — a one-shot EGL capability probe in a child
   process. **Surfaceless platform only** (never GBM, the sole origin of the false
