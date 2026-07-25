@@ -384,22 +384,91 @@ pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
     observations
 }
 
-/// Roll per-process samples up by role: `(role, cpu_ms, pss_kb, process_count)`.
-///
-/// Used for the human-facing read side; the emitted events stay per-process so no
-/// detail is lost.
-pub fn roll_up_by_role(samples: &[RenderProcSample]) -> Vec<(RenderRole, f64, u64, usize)> {
-    let mut by_role: BTreeMap<RenderRole, (f64, u64, usize)> = BTreeMap::new();
-    for sample in samples {
-        let slot = by_role.entry(sample.role).or_insert((0.0, 0, 0));
-        slot.0 += sample.cpu_ms;
-        slot.1 += sample.pss_kb.or(sample.rss_kb).unwrap_or(0);
-        slot.2 += 1;
+/// One role's cost over the interval, summed across the processes filling that role.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderRoleRollup {
+    pub role: RenderRole,
+    pub cpu_ms: f64,
+    /// PSS where available, else RSS, summed across the role's processes.
+    pub mem_kb: u64,
+    pub procs: usize,
+    pub interval_ms: f64,
+    /// The single busiest process in this role, and its share. This is what exposed
+    /// "one web process holds all the CPU while its siblings sit at zero" — a fact
+    /// invisible in a role total alone.
+    pub hot_pid: i32,
+    pub hot_cpu_ms: f64,
+}
+
+impl RenderRoleRollup {
+    pub fn core_fraction(&self) -> f64 {
+        core_fraction(self.cpu_ms, self.interval_ms)
     }
-    by_role
-        .into_iter()
-        .map(|(role, (cpu_ms, mem_kb, count))| (role, cpu_ms, mem_kb, count))
-        .collect()
+}
+
+/// Roll per-process samples up by role.
+pub fn roll_up_roles(samples: &[RenderProcSample]) -> Vec<RenderRoleRollup> {
+    let mut by_role: BTreeMap<RenderRole, RenderRoleRollup> = BTreeMap::new();
+    for sample in samples {
+        let entry = by_role
+            .entry(sample.role)
+            .or_insert_with(|| RenderRoleRollup {
+                role: sample.role,
+                cpu_ms: 0.0,
+                mem_kb: 0,
+                procs: 0,
+                interval_ms: sample.interval_ms,
+                hot_pid: sample.pid,
+                hot_cpu_ms: f64::MIN,
+            });
+        entry.cpu_ms += sample.cpu_ms;
+        entry.mem_kb += sample.pss_kb.or(sample.rss_kb).unwrap_or(0);
+        entry.procs += 1;
+        if sample.cpu_ms > entry.hot_cpu_ms {
+            entry.hot_cpu_ms = sample.cpu_ms;
+            entry.hot_pid = sample.pid;
+        }
+    }
+    by_role.into_values().collect()
+}
+
+/// Write ONE perf event per role, the shape the continuous in-app sampler uses.
+///
+/// Per-role rather than per-process on purpose. A background sampler runs forever, and
+/// the telemetry log is a shared, size-capped resource: emitting every process every
+/// tick would crowd out the daemon spans that share the log. Role totals lose no CPU
+/// accuracy (the sum is the sum) and `hot_pid` preserves the one per-process fact that
+/// actually drove a finding. Use [`emit_render_perf_events`] when full per-process
+/// detail is wanted for a one-shot read.
+///
+/// Roles with no CPU and no memory are skipped entirely, so a quiet tree is nearly free.
+pub fn emit_render_role_events(home: &Path, rollups: &[RenderRoleRollup], context: &Value) {
+    if !crate::perf::perf_profiling_enabled() {
+        return;
+    }
+    for rollup in rollups {
+        if rollup.cpu_ms <= 0.0 && rollup.mem_kb == 0 {
+            continue;
+        }
+        let mut payload = json!({
+            "duration_ms": rollup.cpu_ms,
+            "core_fraction": rollup.core_fraction(),
+            "interval_ms": rollup.interval_ms,
+            "role": rollup.role.as_str(),
+            "procs": rollup.procs,
+            "mem_kb": rollup.mem_kb,
+            "hot_pid": rollup.hot_pid,
+            "hot_cpu_ms": rollup.hot_cpu_ms.max(0.0),
+        });
+        if let Some(extra) = context.as_object()
+            && let Some(object) = payload.as_object_mut()
+        {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        crate::perf::append_perf_event(home, RENDER_PERF_CATEGORY, rollup.role.as_str(), payload);
+    }
 }
 
 /// Write one perf event per sampled process under the `render` category.
@@ -634,20 +703,74 @@ mod tests {
             observation(12, "WebKitWebProces", 10, 5),
         ];
         let samples = probe.observe(&second, 2_000);
-        let rolled = roll_up_by_role(&samples);
+        let rolled = roll_up_roles(&samples);
         assert_eq!(rolled.len(), 2);
         let web = rolled
             .iter()
-            .find(|(role, ..)| *role == RenderRole::WebContent)
+            .find(|rollup| rollup.role == RenderRole::WebContent)
             .unwrap();
-        assert_eq!(web.1, 350.0, "two web processes: 30+5 ticks = 350 CPU ms");
-        assert_eq!(web.2, 1200, "PSS preferred over RSS, summed across the pair");
-        assert_eq!(web.3, 2);
+        assert_eq!(
+            web.cpu_ms, 350.0,
+            "two web processes: 30+5 ticks = 350 CPU ms"
+        );
+        assert_eq!(
+            web.mem_kb, 1200,
+            "PSS preferred over RSS, summed across the pair"
+        );
+        assert_eq!(web.procs, 2);
+        // The asymmetry is the finding, so the hot process must be identified.
+        assert_eq!(web.hot_pid, 11);
+        assert_eq!(web.hot_cpu_ms, 300.0);
         let gui = rolled
             .iter()
-            .find(|(role, ..)| *role == RenderRole::Gui)
+            .find(|rollup| rollup.role == RenderRole::Gui)
             .unwrap();
-        assert_eq!(gui.1, 700.0);
+        assert_eq!(gui.cpu_ms, 700.0);
+        assert_eq!(gui.core_fraction(), 0.7);
+    }
+
+    /// The continuous sampler runs forever into a size-capped shared log, so a quiet
+    /// tree must cost almost nothing: roles with neither CPU nor memory are dropped.
+    #[test]
+    fn role_events_skip_roles_with_no_cpu_and_no_memory() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-render-role-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        crate::perf::set_perf_profiling_enabled(true);
+
+        let idle = RenderRoleRollup {
+            role: RenderRole::WebGpu,
+            cpu_ms: 0.0,
+            mem_kb: 0,
+            procs: 1,
+            interval_ms: 60_000.0,
+            hot_pid: 99,
+            hot_cpu_ms: 0.0,
+        };
+        let busy = RenderRoleRollup {
+            role: RenderRole::WebContent,
+            cpu_ms: 250.0,
+            mem_kb: 4096,
+            procs: 3,
+            interval_ms: 60_000.0,
+            hot_pid: 42,
+            hot_cpu_ms: 250.0,
+        };
+        emit_render_role_events(&home, &[idle, busy], &json!({ "web_surfaces": 2 }));
+
+        let summary = crate::perf::summarize_perf_telemetry(&home, None, Some("render"));
+        assert_eq!(summary.len(), 1, "the idle role must not be written at all");
+        assert_eq!(summary[0].name, "web_content");
+        assert_eq!(summary[0].total_ms, 250.0);
+        let log = fs::read_to_string(crate::perf::perf_telemetry_path(&home)).unwrap();
+        assert!(log.contains("\"hot_pid\":42"));
+        assert!(log.contains("\"procs\":3"));
+        assert!(log.contains("\"web_surfaces\":2"));
+        assert!(!log.contains("web_gpu"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// The emitted event must be shaped so `summarize_perf_telemetry` aggregates it

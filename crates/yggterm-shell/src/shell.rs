@@ -300,6 +300,10 @@ static NEXT_SPLIT_GROUP_SEQ: AtomicU64 = AtomicU64::new(1);
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+/// One render-probe loop per process. A process-global latch rather than a
+/// `ShellState` field because the loop is a property of the PROCESS (it samples the
+/// process tree), not of any shell instance, and a second loop would double-count.
+static RENDER_PROBE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
 // `js_debug` events are pure diagnostics forwarded from the webview. During a
 // reveal/replay the xterm `onData` handler emits hundreds per second
 // (`on_data_burst` / `input_snap_skipped`), and `append_trace_event` does a
@@ -431,6 +435,12 @@ const SNAPSHOT_RENDERED_SECTION_LINE_LIMIT: usize = 10;
 const SNAPSHOT_PREVIEW_BLOCK_LIMIT: usize = 2;
 const SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT: usize = 6;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
+/// Render-probe cadence. 60s is deliberate on two counts. CPU accuracy does not
+/// depend on it (the probe reports ticks CONSUMED over the interval, so a longer
+/// window loses temporal resolution but not a single millisecond of the total), and
+/// the telemetry log is a shared, size-capped resource: at 60s with idle roles
+/// skipped this costs roughly 1 MB a day, leaving the log for everything else.
+const RENDER_PROBE_INTERVAL_MS: u64 = 60_000;
 const ALLOCATOR_TRIM_MIN_INTERVAL_MS: u64 = 10_000;
 const ALLOCATOR_TRIM_CHECK_MIN_INTERVAL_MS: u64 = 60_000;
 const ALLOCATOR_TRIM_STARTUP_DELAY_MS: u64 = 3_500;
@@ -20718,6 +20728,72 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
     });
 }
 
+/// Continuously sample what the GUI and its WebKit children actually burn.
+///
+/// This closes the instrument gap the optimization pass was blocked on: the perf plane
+/// was rich for the Rust side and blind to render, which is the side that spins the
+/// fan. See `docs/optimization-pass.md` and `yggterm_core::render_probe`.
+///
+/// Two properties this loop must keep, both easy to break:
+///
+/// 1. **It never writes the `ShellState` signal.** A `with_mut` dirties the whole
+///    signal and re-renders the root, so a probe that wrote state every tick would
+///    manufacture the very cost it exists to measure. Reads only.
+/// 2. **The `/proc` walk happens off the UI thread** (`spawn_blocking`), because it
+///    opens several files per process in the tree.
+fn spawn_render_probe_loop(state: Signal<ShellState>) {
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
+    spawn(async move {
+        let root_pid = std::process::id() as i32;
+        let mut probe = yggterm_core::render_probe::RenderProbe::new();
+        loop {
+            sleep(Duration::from_millis(RENDER_PROBE_INTERVAL_MS)).await;
+            // Read-only peek: `closing_app` plus the context the kernel cannot know.
+            let Some((closing, web_surfaces, live_sessions)) =
+                safe_shell_read(state, "render_probe_context", |shell| {
+                    (
+                        shell.closing_app,
+                        shell.web_surfaces.len(),
+                        shell.server.live_session_views().len(),
+                    )
+                })
+            else {
+                continue;
+            };
+            if closing {
+                return;
+            }
+            // Cheap atomic; the profiling toggle can flip at runtime and an off
+            // profiler should cost nothing at all.
+            if !yggterm_core::perf_profiling_enabled() {
+                continue;
+            }
+            let Ok(observations) = task::spawn_blocking(move || {
+                yggterm_core::render_probe::observe_process_tree(root_pid)
+            })
+            .await
+            else {
+                continue;
+            };
+            let samples = probe.observe(&observations, current_millis());
+            if samples.is_empty() {
+                // First tick after startup: there is no previous observation, so the
+                // only available number would be a lifetime average. Skip it.
+                continue;
+            }
+            let rollups = yggterm_core::render_probe::roll_up_roles(&samples);
+            yggterm_core::render_probe::emit_render_role_events(
+                &perf_home,
+                &rollups,
+                &json!({
+                    "web_surfaces": web_surfaces,
+                    "live_sessions": live_sessions,
+                }),
+            );
+        }
+    });
+}
+
 fn spawn_initial_server_sync(
     state: Signal<ShellState>,
     schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -20729,6 +20805,9 @@ fn spawn_initial_server_sync(
             shell.working_flags_poll_started = true;
         });
         spawn_working_flags_poll_loop(state);
+    }
+    if !RENDER_PROBE_LOOP_STARTED.swap(true, Ordering::SeqCst) {
+        spawn_render_probe_loop(state);
     }
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let terminal_appearance =
