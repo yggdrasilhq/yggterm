@@ -169,6 +169,15 @@ const ENV_YGGTERM_ALLOW_WAYLAND_BACKEND: &str = "YGGTERM_ALLOW_WAYLAND_BACKEND";
 const ENV_YGGTERM_FORCE_X11_BACKEND: &str = "YGGTERM_FORCE_X11_BACKEND";
 const ENV_YGGTERM_ENABLE_XTERM_CANVAS: &str = "YGGTERM_ENABLE_XTERM_CANVAS";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
+/// Force the software rasterizer regardless of what the host reports. The FORCE half
+/// of the allow/force pair (`ALLOW_WAYLAND_BACKEND` / `FORCE_X11_BACKEND` is the
+/// precedent), and force beats allow: a host whose GPU is genuinely broken, or whose
+/// probe is wrong, gets back to the old behaviour with one env var and no rebuild.
+const ENV_YGGTERM_FORCE_SOFTWARE_GL: &str = "YGGTERM_FORCE_SOFTWARE_GL";
+/// Where the GL decision publishes itself. `configure_linux_webkit_compositing` runs
+/// before tracing exists, so the exported reason is the ONLY way the choice is
+/// observable — the startup trace and `server app state` both read it back.
+const ENV_YGGTERM_WEBKIT_GL_POLICY: &str = "YGGTERM_WEBKIT_GL_POLICY";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
 const ENV_YGGTERM_WEBKIT_CACHE_MODEL: &str = "YGGTERM_WEBKIT_CACHE_MODEL";
@@ -1371,14 +1380,23 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 }
 
 fn main() -> Result<()> {
-    // BEFORE anything else, including the update-relaunch wait: in supervise
-    // mode this process owns no window, no store and no daemon connection — it
-    // forks the real GUI and waits on it, so that when the window dies from a
-    // SIGSEGV the user gets it back. See `supervisor` for why the policy is
-    // on-abnormal and why the daemon could not do this job.
-    let supervise_args = std::env::args().skip(1).collect::<Vec<_>>();
-    if supervisor::should_run_as_supervisor(&supervise_args) {
-        std::process::exit(supervisor::run_supervisor(&supervise_args)?);
+    let entry_args = std::env::args().skip(1).collect::<Vec<_>>();
+    // FIRST, ahead of even the supervisor: this process may have been re-exec'd for
+    // the sole purpose of dlopening libEGL and reporting what this host rasterizes
+    // with. It owns no window, no store, no daemon connection and no threads — which
+    // is the whole point, because a graphics driver that segfaults in here must cost
+    // one line of stdout, not the user's window. Ordering matters: a probe must never
+    // be able to nest inside a supervisor inside a probe.
+    if yggterm_core::gl_probe::should_run_as_gl_probe(&entry_args) {
+        std::process::exit(yggterm_core::gl_probe::run_gl_probe_child());
+    }
+    // Then, before the update-relaunch wait: in supervise mode this process owns no
+    // window, no store and no daemon connection — it forks the real GUI and waits on
+    // it, so that when the window dies from a SIGSEGV the user gets it back. See
+    // `supervisor` for why the policy is on-abnormal and why the daemon could not do
+    // this job.
+    if supervisor::should_run_as_supervisor(&entry_args) {
+        std::process::exit(supervisor::run_supervisor(&entry_args)?);
     }
     maybe_wait_for_update_relaunch_parent_exit();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -3987,9 +4005,20 @@ enum ShmForce {
     Keep,
 }
 
+/// SHM presentation exists for ONE reason: it is the workaround for hosts whose
+/// hardware EGL/DMABuf path crashes. So on a host we have established HAS working
+/// hardware GL it is not a candidate at all, whatever arming decides — and that is
+/// why `hardware_gl` sits alongside `armed` here rather than only feeding it.
+///
+/// Measured on the live host, and the reason this is one decision and not three:
+/// hardware GL + SHM cost 15.82 s where software GL cost 15.33 s (i.e. hardware GL
+/// with SHM buys nothing), and software GL + DMABuf cost 34.14 s — the WORST of the
+/// four, llvmpipe emulating the compositor. Only hardware GL + DMABuf (6.85 s) wins.
+/// Without this argument an explicit `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` on a
+/// probed-hardware host would land in exactly the no-win cell.
 #[cfg(target_os = "linux")]
-fn shm_force_for_arming(armed: bool, already_forced: bool) -> ShmForce {
-    match (armed, already_forced) {
+fn shm_force_for_arming(armed: bool, hardware_gl: bool, already_forced: bool) -> ShmForce {
+    match (armed || hardware_gl, already_forced) {
         (true, _) => ShmForce::Clear,
         (false, false) => ShmForce::Apply,
         (false, true) => ShmForce::Keep,
@@ -3997,21 +4026,134 @@ fn shm_force_for_arming(armed: bool, already_forced: bool) -> ShmForce {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxWebkitGlPolicyInput {
+    /// `WEBKIT_DISABLE_COMPOSITING_MODE` is present: the user force-disabled
+    /// compositing entirely, so there is no GPU path left to choose.
+    compositing_disabled_env: bool,
+    /// `YGGTERM_FORCE_SOFTWARE_GL` — the escape hatch for a host whose GPU is broken
+    /// or whose probe is wrong. Force beats allow, as everywhere else here.
+    force_software_gl: bool,
+    /// `YGGTERM_ENABLE_WEBKIT_COMPOSITING` — the historical opt-in, now one input
+    /// among several rather than the whole decision.
+    enable_compositing: bool,
+    /// What the host itself said. [`yggterm_core::gl_probe::GlClass::Unknown`] when
+    /// nothing was asked or nothing conclusive came back.
+    probe: yggterm_core::gl_probe::GlClass,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxWebkitGlPolicy {
+    hardware_gl: bool,
+    reason: &'static str,
+}
+
+/// The ONE place that decides whether WebKit gets the GPU on this host.
+///
+/// It used to be `std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some()`
+/// — a hard-coded "no" with an opt-out nobody knew to set, justified by a premise
+/// (`this iGPU exposes only llvmpipe`) that was measured false on the very host it
+/// named. The premise is now an observation, and the two overrides are what a wrong
+/// observation costs: one env var, no rebuild.
+///
+/// An INCONCLUSIVE probe stays on software. "We could not tell" must never be
+/// promoted to "probably fine": that generalization, from one EACCES on one node, is
+/// the entire bug this replaces.
+#[cfg(target_os = "linux")]
+fn linux_webkit_gl_policy_from_input(input: LinuxWebkitGlPolicyInput) -> LinuxWebkitGlPolicy {
+    use yggterm_core::gl_probe::GlClass;
+    if input.compositing_disabled_env {
+        return LinuxWebkitGlPolicy {
+            hardware_gl: false,
+            reason: "webkit_compositing_disabled_by_env",
+        };
+    }
+    if input.force_software_gl {
+        return LinuxWebkitGlPolicy {
+            hardware_gl: false,
+            reason: "software_gl_forced",
+        };
+    }
+    if input.enable_compositing {
+        return LinuxWebkitGlPolicy {
+            hardware_gl: true,
+            reason: "hardware_gl_forced",
+        };
+    }
+    match input.probe {
+        GlClass::Hardware => LinuxWebkitGlPolicy {
+            hardware_gl: true,
+            reason: "hardware_gl_probed",
+        },
+        GlClass::Software => LinuxWebkitGlPolicy {
+            hardware_gl: false,
+            reason: "software_gl_probed",
+        },
+        GlClass::Unknown => LinuxWebkitGlPolicy {
+            hardware_gl: false,
+            reason: "software_gl_probe_inconclusive",
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn configure_linux_webkit_compositing() {
+    // WebGL (xterm.js 6's GPU renderer — and therefore the TERMINAL's renderer) can
+    // only present to screen with WebKitGTK accelerated compositing ENABLED. That has
+    // never been in doubt. What was wrong was the next step: we kept compositing on
+    // but forced the software-GL / SHM presentation
+    //   LIBGL_ALWAYS_SOFTWARE=1 / GALLIUM_DRIVER=llvmpipe -> software GL
+    //   WEBKIT_DISABLE_DMABUF_RENDERER=1                  -> SHM presentation
+    // on the premise that this host's GPU compositing path crashed in Mesa/EGL. That
+    // premise was a GBM probe taking EACCES on card0 while the compositor held DRM
+    // master; every other EGL platform on the same machine reported the real GPU. The
+    // bill was 4x to 22x the CPU for every frame, terminal frames included.
+    //
+    // So: ASK, and keep the three settings as ONE decision. The probe answers, the
+    // policy turns that into hardware_gl, and hardware_gl feeds arming (under glass
+    // needs DMABuf) which with hardware_gl feeds the SHM force. See
+    // `linux_webkit_gl_policy_from_input` for the precedence and `shm_force_for_arming`
+    // for why splitting them lands in a measured-worse cell.
+    let compositing_disabled_env = std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some();
+    let force_software_gl = linux_env_flag_truthy(ENV_YGGTERM_FORCE_SOFTWARE_GL);
+    let enable_compositing = linux_env_flag_truthy(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING);
+    // Only ask when nobody has already answered: an override makes the probe's cost
+    // pure waste, and a host with no openable render node has nothing to ask.
+    let probe = if compositing_disabled_env
+        || force_software_gl
+        || enable_compositing
+        || !yggterm_core::gl_probe::render_node_present()
+    {
+        yggterm_core::gl_probe::GlClass::Unknown
+    } else {
+        std::env::current_exe()
+            .ok()
+            .map(|exe| yggterm_core::gl_probe::probe_via_child_once(&exe).class)
+            .unwrap_or(yggterm_core::gl_probe::GlClass::Unknown)
+    };
+    let policy = linux_webkit_gl_policy_from_input(LinuxWebkitGlPolicyInput {
+        compositing_disabled_env,
+        force_software_gl,
+        enable_compositing,
+        probe,
+    });
+    // This function runs before tracing is initialized and before the store exists, so
+    // an exported var is the only way the decision is observable at all. The startup
+    // trace and `server app state` both read it back — same convention as
+    // YGGTERM_LINUX_BACKEND_POLICY / YGGTERM_XTERM_CANVAS_POLICY.
+    unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_GL_POLICY, policy.reason) };
     // Under-glass by DEFAULT: resolve the two env knobs into the ONE arming
     // variable every downstream reader keys on (this fn's DMABuf gate, the
     // vendored disable_dma_buf workaround, the vendored host's opt_in).
     // Writing the var (rather than exporting a flag) keeps the vendored
     // readers untouched and the arming decision in exactly one place.
-    // Resolved BEFORE arming: under glass needs DMABuf, and DMABuf is unsafe on
-    // a software-GL host, so the safety-net decision is an INPUT to arming (see
-    // under_glass_default_armed). Same predicate the net itself uses below —
-    // one source of truth for "this host has no working hardware GL".
-    let use_hardware_gl = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
+    // Resolved AFTER the GL policy: under glass needs DMABuf, and DMABuf is
+    // unsafe on a software-GL host, so the GL decision is an INPUT to arming.
     let armed = under_glass_default_armed(
         std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok().as_deref(),
         std::env::var("YGGTERM_WEB_SURFACE_LEGACY_STACK").ok().as_deref(),
-        !use_hardware_gl,
+        !policy.hardware_gl,
     );
     unsafe {
         std::env::set_var(
@@ -4019,31 +4161,15 @@ fn configure_linux_webkit_compositing() {
             if armed { "1" } else { "0" },
         )
     };
-    // WebGL (xterm.js 6's GPU renderer) can ONLY present to screen with WebKitGTK
-    // accelerated compositing ENABLED. We previously disabled it
-    // (WEBKIT_DISABLE_COMPOSITING_MODE=1) because the GPU compositing path crashed in
-    // Mesa/EGL on hosts with no working hardware GL (jojo: AMD iGPU exposing only
-    // llvmpipe). That left WebGL BLACK — it rendered to its backing buffer (readable
-    // via toDataURL, which fooled the in-process screenshot) but never composited.
-    //
-    // Fix: keep compositing ON, but force the SOFTWARE-GL / non-DMABUF presentation so
-    // the crashing hardware EGL/DMABUF path is never taken:
-    //   LIBGL_ALWAYS_SOFTWARE=1 / GALLIUM_DRIVER=llvmpipe -> software GL (stable)
-    //   WEBKIT_DISABLE_DMABUF_RENDERER=1                  -> SHM presentation path
-    // Verified on jojo via MiniBrowser (same libwebkit2gtk-4.1 as our wry webview): a
-    // WebGL frame composites to screen with zero EGL/Mesa errors and no crash, where
-    // the default (hardware) compositing path goes black/crashes. Hardware GL is a
-    // future optimization — once a host's amdgpu/Mesa GL works, opt back into it with
-    // YGGTERM_ENABLE_WEBKIT_COMPOSITING=1 (skips the software-GL safety net).
-
     // Escape hatch: if the user force-disabled compositing, respect it — WebGL becomes
-    // unavailable and the renderer policy falls back to DOM.
-    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some() {
+    // unavailable and the renderer policy falls back to DOM. Deliberately AFTER the
+    // policy is computed and exported: a short-circuited run must still be able to say
+    // what it decided and why, or the one observable is missing exactly when someone
+    // is asking why the GPU is off.
+    if compositing_disabled_env {
         return;
     }
-    // Default to the software-GL safety net; opt out on hosts with working
-    // hardware GL. (`use_hardware_gl` is resolved above — arming needs it.)
-    if !use_hardware_gl {
+    if !policy.hardware_gl {
         if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
             unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
         }
@@ -4077,7 +4203,7 @@ fn configure_linux_webkit_compositing() {
     // one-owner rule exists to prevent; the runtime self-probe stays the real
     // safety net (it demotes to legacy when compositing genuinely fails).
     let already_forced = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some();
-    match shm_force_for_arming(armed, already_forced) {
+    match shm_force_for_arming(armed, policy.hardware_gl, already_forced) {
         ShmForce::Clear => unsafe { std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER") },
         ShmForce::Apply => unsafe {
             std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
@@ -5096,15 +5222,141 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn arming_owns_the_shm_presentation_force() {
-        assert_eq!(shm_force_for_arming(true, true), ShmForce::Clear);
-        assert_eq!(shm_force_for_arming(true, false), ShmForce::Clear);
-        assert_eq!(shm_force_for_arming(false, false), ShmForce::Apply);
-        assert_eq!(shm_force_for_arming(false, true), ShmForce::Keep);
+        // Software GL, so arming is the whole story — the historical matrix.
+        assert_eq!(shm_force_for_arming(true, false, true), ShmForce::Clear);
+        assert_eq!(shm_force_for_arming(true, false, false), ShmForce::Clear);
+        assert_eq!(shm_force_for_arming(false, false, false), ShmForce::Apply);
+        assert_eq!(shm_force_for_arming(false, false, true), ShmForce::Keep);
+        // Hardware GL removes SHM from the table entirely: it exists ONLY as the
+        // workaround for a broken hardware EGL/DMABuf path. Without this, an explicit
+        // YGGTERM_WEB_SURFACE_UNDER_GLASS=0 on a probed-hardware host would produce
+        // hardware GL + SHM, measured at 15.82 s against software GL's 15.33 s —
+        // paying for the GPU and getting nothing.
+        assert_eq!(shm_force_for_arming(false, true, false), ShmForce::Clear);
+        assert_eq!(shm_force_for_arming(false, true, true), ShmForce::Clear);
+    }
+
+    /// The GL decision's precedence, spelled out. Force beats allow beats observation,
+    /// and an inconclusive probe stays on software: "we could not tell" must never be
+    /// promoted to "probably fine", because that promotion — from one EACCES on one
+    /// DRM node — is the whole bug.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gl_policy_prefers_a_force_then_an_opt_in_then_what_the_host_said() {
+        use yggterm_core::gl_probe::GlClass;
+        let policy = |compositing_disabled_env, force_software_gl, enable_compositing, probe| {
+            linux_webkit_gl_policy_from_input(LinuxWebkitGlPolicyInput {
+                compositing_disabled_env,
+                force_software_gl,
+                enable_compositing,
+                probe,
+            })
+        };
+        // Compositing force-disabled outranks everything: there is no GPU path left.
+        assert_eq!(
+            policy(true, false, true, GlClass::Hardware).reason,
+            "webkit_compositing_disabled_by_env"
+        );
+        // FORCE beats ALLOW, even against a hardware probe.
+        assert_eq!(
+            policy(false, true, true, GlClass::Hardware).reason,
+            "software_gl_forced"
+        );
+        assert!(!policy(false, true, false, GlClass::Hardware).hardware_gl);
+        // The historical opt-in still wins over a probe that says software — a host
+        // whose software GL is known good keeps its escape hatch.
+        assert_eq!(
+            policy(false, false, true, GlClass::Software).reason,
+            "hardware_gl_forced"
+        );
+        // Otherwise the host decides.
+        assert_eq!(
+            policy(false, false, false, GlClass::Hardware).reason,
+            "hardware_gl_probed"
+        );
+        assert_eq!(
+            policy(false, false, false, GlClass::Software).reason,
+            "software_gl_probed"
+        );
+        let inconclusive = policy(false, false, false, GlClass::Unknown);
+        assert!(!inconclusive.hardware_gl);
+        assert_eq!(inconclusive.reason, "software_gl_probe_inconclusive");
+    }
+
+    /// ⚠ THE MATRIX LOCK: GL, arming and the presentation path are ONE decision.
+    ///
+    /// Measured on the live host, same page and duration: hardware GL + DMABuf 6.85 s;
+    /// software GL + SHM 15.33 s; **hardware GL + SHM 15.82 s** (no better than
+    /// software); **software GL + DMABuf 34.14 s** — the worst of the four, llvmpipe
+    /// emulating the compositor. So the only two legal cells are the diagonal, and the
+    /// assertion below says exactly that over the full cross-product of every input.
+    ///
+    /// It fails if anyone clears the DMABuf force without flipping GL, and it fails if
+    /// anyone turns on hardware GL while leaving SHM in place.
+    ///
+    /// The one legal departure from the diagonal is an EXPLICIT
+    /// `YGGTERM_WEB_SURFACE_UNDER_GLASS=1` on a software host. That is a user asking
+    /// for under-glass by name, and under glass without DMABuf is not slow, it is
+    /// BROKEN — the glass punches straight through to the window background. A user
+    /// who names it accepts the 34 s cell; nothing may wander into it by default.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gl_arming_and_presentation_are_one_decision_in_every_cell() {
+        use yggterm_core::gl_probe::GlClass;
+        let mut cells = 0;
+        for probe in [GlClass::Hardware, GlClass::Software, GlClass::Unknown] {
+            for compositing_disabled_env in [false, true] {
+                for force_software_gl in [false, true] {
+                    for enable_compositing in [false, true] {
+                        for under_glass_var in [None, Some("0"), Some("1")] {
+                            for already_forced in [false, true] {
+                                let policy =
+                                    linux_webkit_gl_policy_from_input(LinuxWebkitGlPolicyInput {
+                                        compositing_disabled_env,
+                                        force_software_gl,
+                                        enable_compositing,
+                                        probe,
+                                    });
+                                let armed = under_glass_default_armed(
+                                    under_glass_var,
+                                    None,
+                                    !policy.hardware_gl,
+                                );
+                                let shm =
+                                    shm_force_for_arming(armed, policy.hardware_gl, already_forced);
+                                let explicit_under_glass = under_glass_var == Some("1");
+                                assert_eq!(
+                                    shm == ShmForce::Clear,
+                                    policy.hardware_gl || explicit_under_glass,
+                                    "DMABuf is legal only with hardware GL or an explicit \
+                                     under-glass request (hardware_gl={} probe={:?} \
+                                     disabled={compositing_disabled_env} \
+                                     force_sw={force_software_gl} enable={enable_compositing} \
+                                     glass={under_glass_var:?} forced={already_forced})",
+                                    policy.hardware_gl,
+                                    probe
+                                );
+                                if under_glass_var.is_none() {
+                                    // No user opinion at all: the default must be the
+                                    // diagonal and nothing but the diagonal.
+                                    assert_eq!(policy.hardware_gl, shm == ShmForce::Clear);
+                                    assert_eq!(policy.hardware_gl, armed);
+                                }
+                                cells += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A cross-product that silently collapsed to nothing would pass vacuously.
+        assert_eq!(cells, 3 * 2 * 2 * 2 * 3 * 2);
     }
     #[cfg(target_os = "linux")]
     use super::{
-        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, ShmForce, linux_choose_desktop_environment,
-        linux_environ_bytes_to_map, linux_gui_entry_environment_overrides_from_desktop,
+        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, LinuxWebkitGlPolicyInput, ShmForce,
+        linux_choose_desktop_environment, linux_environ_bytes_to_map,
+        linux_gui_entry_environment_overrides_from_desktop, linux_webkit_gl_policy_from_input,
         shm_force_for_arming,
     };
     #[cfg(target_os = "linux")]
