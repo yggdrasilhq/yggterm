@@ -46998,6 +46998,7 @@ async fn web_surface_do_for(
     session_path: Option<&str>,
     action: &WebSurfaceDoAction,
     expected_generation: Option<u64>,
+    new_batch: bool,
 ) -> Value {
     let (session, handle) = match resolve_live_web_surface_handle(state, session_path) {
         Ok(resolved) => resolved,
@@ -47019,6 +47020,37 @@ async fn web_surface_do_for(
         let batch = agent_input_batch_for_current_agent();
         let surface_key =
             crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
+        // `--new-batch`: the agent asserts it has re-observed the page, so this
+        // surface's lane is reopened before the seat-input read below. This is
+        // the ONLY reset an agent can reach — the batch id is per-GUI-process
+        // (`resolve_agent_identity` reads the GUI's own argv, so it is the same
+        // `"anonymous"` for every verb the GUI will ever serve), and `forget()`
+        // otherwise runs only when the surface closes or is rebuilt. Without it
+        // a single preempt is a permanent lockout rather than a yield, which is
+        // what the refusal's own "start a new batch after re-observing" text has
+        // always promised was possible.
+        //
+        // Ordering matters: the reset happens BEFORE `take_web_surface_seat_input`
+        // so a stale count left by the agent's own previous verb cannot instantly
+        // re-preempt the lane the agent just reopened. Real seat input that lands
+        // AFTER this point still preempts normally — re-observing does not buy
+        // the agent immunity, only a fresh start.
+        if new_batch {
+            agent_input_arbiter_lock().forget(&surface_key);
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "agent_input",
+                    "batch_reset",
+                    json!({
+                        "session_path": session,
+                        "batch_id": batch.batch_id,
+                        "generation": handle.generation,
+                    }),
+                );
+            }
+        }
         // Did the human touch this surface since the last verb? The webview
         // layer counts real seat input (clicks/keys/scrolls) and excludes our
         // own injections, so a non-zero count is unambiguously the user.
@@ -52626,10 +52658,17 @@ async fn process_pending_app_control_requests(
             session_path,
             action,
             generation,
+            new_batch,
         } => {
-            let result =
-                web_surface_do_for(&state, &desktop, session_path.as_deref(), &action, generation)
-                    .await;
+            let result = web_surface_do_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &action,
+                generation,
+                new_batch,
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),

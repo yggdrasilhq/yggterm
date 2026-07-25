@@ -19626,6 +19626,7 @@ pub fn run_app_control_web_surface_do(
     session_path: Option<&str>,
     action: WebSurfaceDoAction,
     generation: Option<u64>,
+    new_batch: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -19635,6 +19636,7 @@ pub fn run_app_control_web_surface_do(
             session_path: session_path.map(str::to_string),
             action,
             generation,
+            new_batch,
         },
         timeout_ms,
     )?;

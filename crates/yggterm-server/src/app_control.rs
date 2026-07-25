@@ -698,6 +698,24 @@ pub enum AppControlCommand {
         /// (the interactive/exploratory case).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation: Option<u64>,
+        /// Open a NEW agent batch on this surface before admitting the verb —
+        /// the reset the `preempted` refusal has always told callers to perform
+        /// ("start a new batch after re-observing") without giving them any way
+        /// to do it.
+        ///
+        /// It is needed because a batch id is NOT per-invocation: it comes from
+        /// `resolve_agent_identity()`, which reads the GUI PROCESS's own argv,
+        /// so every agent verb for the whole life of that GUI shares one id
+        /// (`"anonymous"`, since the GUI is not launched with `--agent`). Once
+        /// that single id lands in a lane's `preempted_batches`, `admit` refuses
+        /// it forever and `forget()` only runs on surface close/recreate — so a
+        /// preempt was an unrecoverable lockout, not a yield.
+        ///
+        /// Deliberately explicit: the agent is asserting it has re-observed the
+        /// page, which is exactly the contract gate 9 wants before an agent
+        /// resumes driving a surface a human may have touched.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        new_batch: bool,
     },
     /// Structured, read-only observation of a session's active web-surface tab —
     /// the agent control plane `read` verb (slice 2b, rung 1). Returns the
@@ -1462,6 +1480,7 @@ mod tests {
                 button: AppControlPointerButton::Primary,
             },
             generation: None,
+            new_batch: false,
         };
         let value = serde_json::to_value(&command).expect("serialize web_surface_do");
         assert_eq!(
@@ -1511,6 +1530,7 @@ mod tests {
                 session_path: None,
                 action: action.clone(),
                 generation: None,
+                new_batch: false,
             };
             let json = serde_json::to_string(&command).expect("serialize");
             let back: AppControlCommand = serde_json::from_str(&json).expect("deserialize");
@@ -1519,10 +1539,12 @@ mod tests {
                     session_path,
                     action: round,
                     generation,
+                    new_batch,
                 } => {
                     assert_eq!(session_path, None);
                     assert_eq!(round, action);
                     assert_eq!(generation, None);
+                    assert!(!new_batch, "the reset is opt-in, never the default");
                 }
                 other => panic!("round-tripped into the wrong variant: {other:?}"),
             }

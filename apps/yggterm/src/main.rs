@@ -2988,10 +2988,15 @@ fn main() -> Result<()> {
                                     .context("--generation needs a number")
                             })
                             .transpose()?;
+                        // `--new-batch` is the documented recovery from a
+                        // `preempted` refusal: the agent asserts it re-observed
+                        // the page, and the surface's batch lane is reopened.
+                        let new_batch = args.iter().any(|arg| arg == "--new-batch");
                         run_app_control_web_surface_do(
                             session_path,
                             action,
                             generation,
+                            new_batch,
                             timeout_ms,
                         )
                     }
