@@ -50,6 +50,7 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_batch,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
+    run_app_control_web_surface_fill_vault,
     run_app_control_web_surface_lease,
     run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_read,
@@ -1112,6 +1113,8 @@ fn print_server_app_help() {
       | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)
       | --selector-set <css,css,…>   (segmented inputs: one box per character)
       | --x <n> --y <n>              (blind coordinates; prefer an addressed target)
+  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]
+  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]
   yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]
     one `do` invocation per line; # comments and blank lines skipped
   yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
@@ -3142,6 +3145,44 @@ fn main() -> Result<()> {
                         let entry = cli_flag_value(&args, "--entry");
                         let user = cli_flag_value(&args, "--user");
                         run_app_control_web_surface_fill(session_path, entry, user, timeout_ms)
+                    }
+                    "fill-vault" | "fill-card" => {
+                        // Type ONE named vault field into ONE addressed
+                        // element, with real keys:
+                        //   web fill-vault --item <name> --field password
+                        //                  (--selector <css>|--role …|--target-text …)
+                        //   web fill-card  --item <name> --field number …
+                        // The secret never reaches this process: the CLI names
+                        // the item and the field, the GUI reads and types it,
+                        // and the answer is a length plus a boolean.
+                        let source = if action == "fill-card" {
+                            yggterm_server::VaultFieldSource::Card
+                        } else {
+                            yggterm_server::VaultFieldSource::Login
+                        };
+                        let target = parse_web_element_ref(&args, false)?.context(
+                            "fill-vault needs a target: --selector <css>, --role <r> --label <s>, \
+                             or --target-text <s>",
+                        )?;
+                        let item = cli_flag_value(&args, "--item")
+                            .context("missing --item (the vault entry NAME) for web fill-vault")?;
+                        let field = cli_flag_value(&args, "--field").unwrap_or(
+                            if action == "fill-card" { "number" } else { "password" },
+                        );
+                        let user = cli_flag_value(&args, "--user");
+                        let generation = cli_flag_value(&args, "--generation")
+                            .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
+                            .transpose()?;
+                        run_app_control_web_surface_fill_vault(
+                            session_path,
+                            target,
+                            item,
+                            field,
+                            user,
+                            source,
+                            generation,
+                            timeout_ms,
+                        )
                     }
                     "totp" | "code" => {
                         let entry = cli_flag_value(&args, "--entry");

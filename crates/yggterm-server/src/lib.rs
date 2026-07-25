@@ -25,8 +25,8 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, WebElementRef, WebSurfaceDoAction,
-    WebSurfaceReadAs, WebSurfaceWaitUntil, app_control_captures_dir,
+    ProbeTerminalViewportInputMode, ScreenshotTarget, VaultFieldSource, WebElementRef,
+    WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, app_control_captures_dir,
     app_control_pending_render_needed_for_worker, app_control_requests_dir,
     app_control_requests_pending, app_control_requests_pending_for_worker,
     app_control_responses_dir,
@@ -19810,6 +19810,39 @@ pub fn run_app_control_web_surface_do(
             action,
             generation,
             new_batch,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// Type one named vault field into one addressed element (`fill-vault`).
+///
+/// Nothing about the secret crosses this boundary: the CLI names the ITEM and
+/// the FIELD, the GUI reads the value in-process and types it, and the response
+/// carries a length plus a page-side boolean.
+pub fn run_app_control_web_surface_fill_vault(
+    session_path: Option<&str>,
+    target: WebElementRef,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+    source: VaultFieldSource,
+    generation: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFillVault {
+            session_path: session_path.map(str::to_string),
+            target,
+            item: item.to_string(),
+            field: field.to_string(),
+            user: user.map(str::to_string),
+            source,
+            generation,
         },
         timeout_ms,
     )?;
