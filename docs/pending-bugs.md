@@ -6,6 +6,53 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ WE FORCE SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL — THE
+  SINGLE LARGEST CPU ITEM IN THE PRODUCT (root-caused 2026-07-25, measured,
+  NOT yet fixed; needs a GUI restart to activate so it was left to the user).**
+  `configure_linux_webkit_compositing()` (`apps/yggterm/src/main.rs:4046-4053`)
+  sets `LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe` +
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` unless `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1`
+  is set. Its comment justifies this as *"guihost: AMD iGPU exposing only
+  llvmpipe."* ⛔ **That premise is FALSE on guihost and has been for some time.**
+  `eglinfo` platform matrix, guihost, 2026-07-25: GBM → `llvmpipe`, but **Wayland →
+  `AMD Radeon 780M (radeonsi, phoenix, ACO)`**, Surfaceless → same, Device →
+  same. Only the **GBM** probe fails, and it fails because it opens `card0` and
+  gets `EACCES` on `DRM_IOCTL_AMDGPU_INFO` — the compositor holds DRM master.
+  Every ioctl on `/dev/dri/renderD128` **succeeds**. One EACCES on the wrong
+  node was read as "this host has no GPU," and hardware GL was disabled product-wide.
+  **MEASURED** (same page, same duration, CPU-seconds from `/proc`, not `ps %CPU`;
+  standalone WebKitGTK 2.52.4, same lib the GUI loads):
+  | workload | soft GL + SHM (today) | hw GL + DMABUF | ratio |
+  |---|---|---|---|
+  | **WebGL glyph grid (= xterm.js 6's renderer)** | **151.56 s / 20 s = 756% of a core** | 6.85 s (34%) | **22x** |
+  | CSS animation | 15.33 s (77%) | 4.12 s (21%) | 3.7x |
+  | DOM/JS-heavy | 11.13 s (45%) | 6.44 s (26%) | 1.7x |
+  | static idle page | 1.36 s (5.4%) | 0.96 s (3.8%) | 1.4x |
+  **★★★ The 22x row is the product-defining one, and it is NOT about browsing.**
+  xterm 6 REMOVED the 2D canvas renderer, so the TERMINAL draws through the WebGL
+  addon (`xterm_webgl_enabled_for_wayland`). Under llvmpipe every keystroke and
+  every line of streaming agent output is software-rasterized across 16 threads.
+  This is why the fan spins with no ychrome open at all.
+  ⚠⚠ **DO NOT "fix" this by clearing the DMABUF flag alone.** The guard's LOGIC
+  is sound; only its premise is wrong. Measured: hardware GL + SHM = 15.82 s (as
+  bad as software), and software GL + DMABUF = **34.14 s, the WORST of the four**
+  (llvmpipe emulating the compositor). The three settings are one decision.
+  ⚠ **The safety net is not buying the stability it was added for.** 26 GUI
+  coredumps in 10 days, still crashing 2026-07-25; **24 of 26 contain zero
+  GL/Mesa/EGL frames**, and the one genuine WebKit SEGV is in JavaScriptCore GC.
+  We are paying 4-22x CPU to prevent crashes that are not GL crashes.
+  **FIX** = set `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` for the GUI. That ONE var
+  unlocks all three gates: the installed launcher stops exporting
+  `WEBKIT_DISABLE_COMPOSITING_MODE=1` (`install.rs:1303`), the GL safety net is
+  skipped, and under-glass arms — which clears the SHM force via
+  `shm_force_for_arming(true, _) == Clear`. Confirmed against this repo's own
+  unit tests (`main.rs:5066`, `:5099`). **The real fix is to stop hard-coding the
+  premise**: probe the Wayland/Surfaceless EGL platform at startup and pick the
+  path from what the host actually reports, instead of defaulting to the slowest
+  configuration and requiring an opt-out. `render_probe` is the natural owner.
+  **VERIFY** with `drm-engine-gfx` in `/proc/<webproc>/fdinfo/*` (nonzero ⇒ the
+  GPU is really rasterizing) plus a CPU-seconds delta — never `ps %CPU`.
+
 - **★★ THE DAEMONS CHAIN, AND ONE IDLE `bash -i` IS WHY (root-caused
   2026-07-25; the RPC half FIXED, the durable half OPEN).**
   ⛔ **First, a correction to this entry's own earlier wording.** I filed the
