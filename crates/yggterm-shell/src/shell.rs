@@ -45503,7 +45503,62 @@ fn resolve_live_web_surface_handle(
         .ok_or_else(|| format!("session has no web surface: {session}"))?;
     let handle = web_surface_handle_for(&session, surface.active_tab)
         .ok_or("web surface not live (session backgrounded or not yet revealed)")?;
+    let active_tab = surface.active_tab;
+    drop(shell);
+    // DRIVING A SURFACE IS A CLAIM ON IT. Every agent verb that resolves a live
+    // surface renews its lease, so a surface being actively driven cannot be
+    // reaped out from under the agent mid-flow.
+    //
+    // This is the fix for a real failure (2026-07-25, the a services portal filing): a
+    // long login-gated SPA wizard outlived the background hold, the reaper took
+    // the surface, and `web ensure` revived it UNMAPPED — which broke `web do`
+    // with `surface_not_mapped` AND reloaded the page, losing an auth bearer the
+    // SPA held only in JS memory. One cause, two failures, and neither was
+    // recoverable mid-wizard.
+    //
+    // Requiring the agent to call `web lease` on a timer is the wrong contract:
+    // forgetting is silent and the punishment arrives ten steps later. Verbs
+    // arriving IS the liveness signal, so the renewal rides them.
+    renew_web_surface_drive_lease(state, &session, active_tab);
     Ok((session, handle))
+}
+
+/// How long a surface stays alive after the last agent verb touched it.
+///
+/// Generous on purpose: it only has to outlast the gap between two steps of an
+/// agent flow (a page load, an OTP arriving by SMS, a slow master-data API),
+/// and the cost of it being too long is a surface that lingers, while the cost
+/// of it being too short is a destroyed session mid-filing.
+const WEB_SURFACE_DRIVE_LEASE_SECS: u64 = 15 * 60;
+
+/// Extend the active tab's lease to cover `WEB_SURFACE_DRIVE_LEASE_SECS` from
+/// now. Never shortens: an explicit `web lease --ttl` that reaches further
+/// stands, matching the reaper's take-the-later rule.
+fn renew_web_surface_drive_lease(state: &Signal<ShellState>, session: &str, tab_id: u64) {
+    let now_ms = current_millis() as u64;
+    let mut state = *state;
+    state.with_mut(|shell| {
+        if let Some(surface) = shell.web_surfaces.get_mut(session)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+            && let Some(renewed) = drive_lease_renewal(tab.lease_until_ms, now_ms)
+        {
+            tab.lease_until_ms = Some(renewed);
+        }
+    });
+}
+
+/// The renewal decision, pure: `Some(deadline)` when driving the surface buys
+/// it more time, `None` when the existing claim already reaches further.
+///
+/// EXTENDS ONLY, mirroring the reaper's take-the-later rule. An explicit
+/// `web lease --ttl 3600` must not be quietly shortened to the drive window
+/// just because a verb arrived — an agent that asked for an hour gets an hour.
+fn drive_lease_renewal(existing: Option<u64>, now_ms: u64) -> Option<u64> {
+    let until = now_ms.saturating_add(WEB_SURFACE_DRIVE_LEASE_SECS.saturating_mul(1000));
+    match existing {
+        Some(existing) if existing >= until => None,
+        _ => Some(until),
+    }
 }
 
 /// Fail closed when a verb was issued against an incarnation that no longer
@@ -47055,6 +47110,49 @@ mod web_do_verb_tests {
         assert_eq!(
             stale.get("expected_generation").and_then(Value::as_u64),
             Some(41)
+        );
+    }
+
+    // ── Driving a surface renews its lease (the a services portal reap, 2026-07-25) ──
+    // A long login-gated wizard outlived the background hold; the reaper took
+    // the surface, and the revive came back unmapped AND reloaded — breaking
+    // `web do` and losing an auth bearer the SPA held only in JS memory. Verbs
+    // arriving is the liveness signal, so the renewal rides them rather than
+    // relying on the agent to re-lease on a timer.
+    #[test]
+    fn driving_a_surface_extends_its_lease_but_never_shortens_it() {
+        let now = 1_000_000_u64;
+        let window = WEB_SURFACE_DRIVE_LEASE_SECS * 1000;
+
+        // Unleased: driving buys the full window.
+        assert_eq!(drive_lease_renewal(None, now), Some(now + window));
+
+        // A lease expiring sooner than the window is pushed out.
+        assert_eq!(
+            drive_lease_renewal(Some(now + 5_000), now),
+            Some(now + window)
+        );
+
+        // An explicit longer lease STANDS — an agent that asked for an hour
+        // must not be cut back to the drive window because a verb arrived.
+        assert_eq!(drive_lease_renewal(Some(now + window + 60_000), now), None);
+
+        // Exactly equal is already sufficient; no write.
+        assert_eq!(drive_lease_renewal(Some(now + window), now), None);
+
+        // An ALREADY-LAPSED lease still renews: the verb resolved, so the
+        // surface is alive and being driven right now.
+        assert_eq!(drive_lease_renewal(Some(now - 1), now), Some(now + window));
+    }
+
+    // The window must outlast the gaps inside a real agent flow — a page load,
+    // an OTP arriving by SMS, a slow master-data API — or this fix just moves
+    // the reap slightly later.
+    #[test]
+    fn the_drive_lease_window_covers_a_human_paced_step() {
+        assert!(
+            WEB_SURFACE_DRIVE_LEASE_SECS >= 300,
+            "a window under five minutes reaps mid-OTP"
         );
     }
 
