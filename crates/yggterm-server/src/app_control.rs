@@ -1135,6 +1135,34 @@ pub enum AppControlCommand {
     /// Enumerate the command registry: every command's id, title, and in-force
     /// KeyTip chord. Read-only; the discovery half of `InvokeCommand`.
     ListCommands,
+    /// A well-formed request whose `kind` this build DOES know, but whose
+    /// FIELDS it cannot read.
+    ///
+    /// `#[serde(other)]` above rescues an unknown *kind* only. It does nothing
+    /// for a known kind whose payload changed shape — and that is the far more
+    /// likely mismatch, because every field added to an existing command is one:
+    /// a GUI predating `WebElementRef` types `selector` as a bare `String`, so
+    /// `do click --text "Proceed to Pay"` sends `{"selector":{"text":"…"}}`, the
+    /// whole request fails with `invalid type: map, expected a string`, and the
+    /// old code DELETED the file — reproducing the exact bare timeout with no
+    /// clue that `Unsupported` was written to kill.
+    ///
+    /// So the honest-refusal property is extended to the payload: the request is
+    /// salvaged from the envelope, delivered, and refused with the serde error
+    /// as the clue. It carries the error text (not the payload — the request
+    /// file is still the one copy of that) because "which field, and what did it
+    /// expect" is precisely what the caller needs and cannot otherwise get.
+    ///
+    /// It is an ordinary variant rather than `#[serde(skip)]` because the GUI
+    /// SERIALIZES the command it is handling into the request trace; a skipped
+    /// variant fails to serialize, and `json!` on a failing value panics. A
+    /// refusal path must not be able to take the window down.
+    Unreadable {
+        /// The `kind` the request asked for. Named `requested_kind` because the
+        /// enum's internal tag already owns `kind` on the wire.
+        requested_kind: String,
+        detail: String,
+    },
     /// A well-formed request whose `kind` this build does not know.
     ///
     /// App-control is a FILESYSTEM DROPBOX, not RPC: a newer CLI writes a
@@ -1180,9 +1208,11 @@ impl AppControlCommand {
                 | Self::WebSurfaceFrames { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
-                // An unknown kind is never executed — it can only be refused,
-                // so it mutates nothing.
+                // An unknown kind, and a kind whose payload could not be read,
+                // are never executed — they can only be refused, so they mutate
+                // nothing.
                 | Self::Unsupported
+                | Self::Unreadable { .. }
         )
     }
 
@@ -1272,6 +1302,7 @@ impl AppControlCommand {
             Self::InvokeCommand { .. } => "invoke_command",
             Self::ListCommands => "list_commands",
             Self::Unsupported => "unsupported",
+            Self::Unreadable { .. } => "unreadable",
         }
     }
 }
@@ -1523,10 +1554,16 @@ pub fn take_next_app_control_request(
         };
         let request = match serde_json::from_slice::<AppControlRequest>(&bytes) {
             Ok(request) => request,
-            Err(_) => {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
+            // A request this build cannot read is ANSWERED when it is
+            // answerable, and only deleted when it is not. See
+            // `salvage_unreadable_request`.
+            Err(error) => match salvage_unreadable_request(&bytes, &error) {
+                Some(request) => request,
+                None => {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            },
         };
         if let Some(preferred_pid) = request.preferred_pid
             && preferred_pid != worker_pid
@@ -1545,6 +1582,61 @@ pub fn take_next_app_control_request(
         return Ok(Some((inflight_path, request)));
     }
     Ok(None)
+}
+
+/// Rescue a request whose ENVELOPE is intact but whose command payload this
+/// build cannot deserialize, so it can be refused with a reason instead of
+/// vanishing.
+///
+/// This is the other half of `AppControlCommand::Unsupported`. That variant
+/// covers an unknown `kind`; this covers a KNOWN kind whose fields changed
+/// shape — the mismatch a `#[serde(default)]` field on an existing command
+/// produces, and the one that reproduced the bare timeout P0 was written to
+/// kill (`do click --text` against a GUI that types `selector` as a string).
+///
+/// It salvages ONLY when the envelope is genuinely a request: an object with a
+/// non-empty string `request_id` and an object `command`. Anything else —
+/// truncated JSON, a stray file, a request with no `command` — is not a version
+/// mismatch and is still deleted, so a corrupt file cannot become a
+/// silently-accepted request. `created_at_ms` falls back to now, which only
+/// affects the stale-target window and is the safe direction (a salvaged
+/// request is not treated as ancient and dropped).
+fn salvage_unreadable_request(
+    bytes: &[u8],
+    error: &serde_json::Error,
+) -> Option<AppControlRequest> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let object = value.as_object()?;
+    let request_id = object.get("request_id")?.as_str()?.trim().to_string();
+    if request_id.is_empty() {
+        return None;
+    }
+    let command = object.get("command")?.as_object()?;
+    let requested_kind = command
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(AppControlRequest {
+        request_id,
+        created_at_ms: object
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(u128::from)
+            .unwrap_or_else(current_millis),
+        preferred_pid: object
+            .get("preferred_pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
+        agent: object
+            .get("agent")
+            .and_then(|agent| agent.as_str())
+            .map(ToOwned::to_owned),
+        command: AppControlCommand::Unreadable {
+            requested_kind,
+            detail: error.to_string(),
+        },
+    })
 }
 
 fn remove_request_if_target_is_stale(path: &Path, request: &AppControlRequest, preferred_pid: u32) {
@@ -1862,6 +1954,111 @@ mod tests {
         assert!(inflight_path.exists());
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    /// P0's honest-refusal property, extended to the PAYLOAD.
+    ///
+    /// `#[serde(other)]` rescues an unknown `kind` only. A KNOWN kind whose
+    /// fields this build cannot read still failed deserialization, and the
+    /// taker DELETED the file — which is the very bare timeout `Unsupported`
+    /// was written to kill, reached by the more likely mismatch: every field
+    /// added to an existing command changes that command's shape. The worked
+    /// case is `do click --text "Proceed to Pay"` against a GUI that types the
+    /// selector as a bare `String`: `invalid type: map, expected a string`.
+    ///
+    /// The payload below is that shape against THIS build — an object where a
+    /// string is expected on a kind it knows.
+    ///
+    /// Restore `Err(_) => { let _ = fs::remove_file(&path); continue; }` in
+    /// `take_next_app_control_request` and this fails.
+    #[test]
+    fn a_known_kind_this_build_cannot_read_is_refused_rather_than_deleted() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000-unreadable.json");
+        fs::write(
+            &path,
+            br#"{"request_id":"unreadable-1","created_at_ms":7,"agent":"agent-2",
+                 "command":{"kind":"open_path","session_path":{"text":"Proceed to Pay"}}}"#,
+        )
+        .unwrap();
+
+        let taken = take_next_app_control_request(&home, worker_pid).unwrap();
+        let Some((inflight_path, request)) = taken else {
+            panic!("a request this build cannot read must be delivered, not deleted");
+        };
+        assert_eq!(request.request_id, "unreadable-1");
+        assert_eq!(request.agent.as_deref(), Some("agent-2"));
+        assert_eq!(request.created_at_ms, 7);
+        let AppControlCommand::Unreadable {
+            requested_kind,
+            detail,
+        } = &request.command
+        else {
+            panic!("expected Unreadable, got {:?}", request.command);
+        };
+        assert_eq!(requested_kind, "open_path");
+        assert!(
+            detail.contains("invalid type: map"),
+            "the serde error names the field and what it expected: {detail}"
+        );
+        // It is delivered for a refusal, so it must mutate nothing…
+        assert!(request.command.is_read_only());
+        assert_eq!(request.command.name(), "unreadable");
+        // …and the file is in flight, not gone.
+        assert!(inflight_path.exists());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// The other half: a file that is NOT a version mismatch is still deleted.
+    /// A salvage that accepted anything would turn corruption into a request.
+    #[test]
+    fn a_corrupt_request_file_is_still_deleted_unread() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let truncated = dir.join("00000000-truncated.json");
+        let no_command = dir.join("00000001-no-command.json");
+        let no_id = dir.join("00000002-no-id.json");
+        fs::write(&truncated, b"{ not json").unwrap();
+        fs::write(&no_command, br#"{"request_id":"r1","created_at_ms":0}"#).unwrap();
+        fs::write(
+            &no_id,
+            br#"{"created_at_ms":0,"command":{"kind":"open_path","session_path":{}}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            take_next_app_control_request(&home, worker_pid)
+                .unwrap()
+                .is_none(),
+            "none of these is an answerable request"
+        );
+        assert!(!truncated.exists());
+        assert!(!no_command.exists());
+        assert!(!no_id.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// The refusal path must not be able to take the window down: the GUI
+    /// serializes the command it is handling into the request trace, and
+    /// `json!` on a value that fails to serialize panics. That is why
+    /// `Unreadable` is an ordinary variant rather than `#[serde(skip)]`.
+    #[test]
+    fn an_unreadable_command_can_be_serialized_for_the_trace() {
+        let command = AppControlCommand::Unreadable {
+            requested_kind: "web_surface_do".to_string(),
+            detail: "invalid type: map, expected a string".to_string(),
+        };
+        let value = serde_json::to_value(&command).expect("the trace must not panic on it");
+        assert_eq!(value["kind"], serde_json::json!("unreadable"));
+        assert_eq!(value["requested_kind"], serde_json::json!("web_surface_do"));
     }
 
     /// WIRE BACK-COMPAT LOCK for `WebElementRef`.
