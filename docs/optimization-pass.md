@@ -97,6 +97,19 @@ while the lifetime figure includes busy periods; `copy_scan` does not have that
 problem, because the chore runs on its own schedule regardless of what is on
 screen.
 
+**And the machine-level corroboration, which has none of the per-process
+confounds**, 25 minutes after the swap with the same sessions attached:
+
+| | before | after |
+|---|---|---|
+| load average (1 min) | 1.16 | **0.10** |
+| Tctl | 49.5 °C | **43.0 °C** |
+| fan | 0 RPM | 0 RPM |
+| coredumps since swap | — | **0** (with under-glass armed) |
+
+That is the user's actual complaint — *"the fan spins and spins"* — answered at
+the level he feels it, rather than in a span table.
+
 `background/local_tree_scan` now appears at all (p50 900.5 ms, 25 calls) — that
 is WS4-3, and its whole point is that this cost was previously OUTSIDE every
 span and therefore invisible to the instrument that was being used to decide
