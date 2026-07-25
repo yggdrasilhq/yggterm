@@ -159,10 +159,36 @@ fix) once the fix is verified live on guihost.
   source so a FIFTH script cannot hide the same way — enumerating these by hand
   is exactly what let this one survive three rounds.
 
-- **★★ WHEN THE GUI DIES, NOTHING BRINGS IT BACK — measured 2026-07-25,
-  DESIGNED, NOT BUILT.** This is the survivable half of the segfault entry
-  below: whatever kills the window, the user is simply left without one while
-  the daemon and every session sit there intact.
+- **★★ WHEN THE GUI DIES, NOTHING BRINGS IT BACK — measured 2026-07-25, then
+  BUILT + LIVE-PROVEN the same day (`supervisor.rs`).** The design below stands
+  as written; this is what shipped and how it was proven.
+  **Shipped:** `yggterm --supervise` forks the real GUI as a CHILD and waits on
+  it, so it learns the exact status and applies `Restart=on-abnormal` itself:
+  restart only on `SIGSEGV`/`SIGABRT`/`SIGBUS`, never on an exit code (a clean
+  quit, a `status=130` SIGINT handler, or an update handoff), never on
+  `SIGTERM`/`SIGINT`/`SIGKILL` (someone asked), never if the child died inside
+  10s (that is a crash-on-startup loop, not a recovery), and at most 5 times an
+  hour. The desktop entry's `Exec=` now carries the flag — `TryExec=` stays a
+  bare path, because the spec defines that as a program to look up — and an
+  entry written before the supervisor is treated as stale so it gets rewritten.
+  `StartupWMClass` still matches: the CHILD owns the window.
+  **Live proof (guihost, 2026-07-25):** launched through the shim (supervisor
+  1031410 → child 1031412, child registered as the active client);
+  `kill -ABRT` the child; the supervisor logged
+  `window died on signal Signalled(6) after 229681ms — restarting (1/5 this
+  hour)`, forked child 1034390, which registered and painted a faithful frame
+  with all 31 rows intact.
+  ⚠ **`kill -SEGV` is NOT a valid test of this** — the process survived it
+  untouched (something in the runtime handles SIGSEGV and returned), so the
+  supervisor correctly saw nothing. Real faults DO kill it (ten core dumps in
+  the measurement below). Use `SIGABRT` to exercise the policy.
+  ⛔ **`server app launch` deliberately does NOT supervise.** That launcher polls
+  for a client record whose pid is the pid it SPAWNED; under a supervisor that
+  pid is the shim's while the record is the child's, so `--wait-visible` would
+  wait forever and report `registered: false`. Supervising the agent path needs
+  the poll to match the child first.
+  The measurement that produced the policy, kept because the numbers are the
+  argument:
   **The measurement (guihost, `systemctl --user` + `coredumpctl`), because the raw
   "42 failed `Yggterm@*` units" number is misleading and I nearly quoted it:**
   - **10 units `Result=core-dump`** — genuine crashes. `coredumpctl` dates them
@@ -203,9 +229,10 @@ fix) once the fix is verified live on guihost.
      ⚠ Check the update/exec-handoff path first: an in-place `exec()` keeps the
      pid (supervisor sees nothing, correct) but a spawn-successor-and-exit-0
      handoff must read as a CLEAN exit, or every update would spawn a duplicate.
-  **Not live-provable without a daemon+GUI swap**, which is why it is recorded
-  rather than half-shipped: the swap re-resumes agent sessions, so it cannot be
-  done from inside a session that is itself riding that daemon.
+     Both are safe under the shipped rule, which restarts on signals ONLY.
+  ⛔ **"Not live-provable without a daemon+GUI swap" was wrong**, and worth
+  keeping as a lesson: it needs a GUI-only swap plus a launch through the shim,
+  and the crash can be delivered on purpose. Proving it cost one `kill -ABRT`.
 
 - **★★ AGENT WEB-SURFACE AUTOMATION HARD-CRASHES THE GUI (WebKitGTK
   segfault) — diagnosed 2026-07-24 on guihost; LAYER 1 (crash surface) FIXED +
