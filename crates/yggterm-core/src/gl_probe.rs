@@ -196,10 +196,29 @@ pub fn render_node_present() -> bool {
 /// Where the GL decision publishes itself, and the reason it has to.
 /// `configure_linux_webkit_compositing` runs before tracing is initialized and before
 /// the store exists, so an exported reason is the only way the choice is observable at
-/// all. Declared here rather than in the GUI binary because the DAEMON's
-/// `process_environment_snapshot` reads it back out of `/proc/<pid>/environ` — two
-/// crates, one string.
+/// all. Declared here rather than in the GUI binary because readers in other crates
+/// name it too — two crates, one string.
 pub const ENV_YGGTERM_WEBKIT_GL_POLICY: &str = "YGGTERM_WEBKIT_GL_POLICY";
+/// Mesa's software-rasterizer force. Owned by the GL decision, not by whatever the
+/// process happened to inherit.
+pub const ENV_LIBGL_ALWAYS_SOFTWARE: &str = "LIBGL_ALWAYS_SOFTWARE";
+/// Mesa's driver override; the twin of [`ENV_LIBGL_ALWAYS_SOFTWARE`].
+pub const ENV_GALLIUM_DRIVER: &str = "GALLIUM_DRIVER";
+/// WebKitGTK's SHM presentation force (DMABuf renderer off).
+pub const ENV_WEBKIT_DISABLE_DMABUF_RENDERER: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+/// The resolved under-glass arming flag every downstream reader keys on.
+pub const ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS: &str = "YGGTERM_WEB_SURFACE_UNDER_GLASS";
+
+/// The five variables that ARE the GL path: the decision plus the four settings it
+/// owns. One list, so a reader publishing "which GL path is this window on" cannot
+/// answer with four of five and look complete.
+pub const WEBKIT_GL_ENVIRONMENT_KEYS: &[&str] = &[
+    ENV_YGGTERM_WEBKIT_GL_POLICY,
+    ENV_LIBGL_ALWAYS_SOFTWARE,
+    ENV_GALLIUM_DRIVER,
+    ENV_WEBKIT_DISABLE_DMABUF_RENDERER,
+    ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS,
+];
 
 /// Hidden argv flag selecting probe mode. Absent from every launcher and desktop
 /// entry, so nothing acquires a probe by accident.
@@ -220,9 +239,9 @@ pub const GL_PROBE_TIMEOUT_MS: u64 = 1_500;
 /// report `llvmpipe` — and the host would stay pinned to software forever, with the
 /// probe manufacturing the evidence for its own premise.
 pub const GL_PROBE_STRIPPED_ENV: &[&str] = &[
-    "LIBGL_ALWAYS_SOFTWARE",
-    "GALLIUM_DRIVER",
-    "WEBKIT_DISABLE_DMABUF_RENDERER",
+    ENV_LIBGL_ALWAYS_SOFTWARE,
+    ENV_GALLIUM_DRIVER,
+    ENV_WEBKIT_DISABLE_DMABUF_RENDERER,
     "WEBKIT_DISABLE_COMPOSITING_MODE",
 ];
 
