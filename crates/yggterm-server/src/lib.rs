@@ -16529,37 +16529,46 @@ fn desktop_entry_snapshot(path: &Path) -> Value {
     })
 }
 
+/// The environment a GUI process publishes through `server app state`.
+///
+/// Hoisted out of the function so it can be asserted: this list is the only reason an
+/// agent can answer "which GL path is this window on" without an ssh into
+/// `/proc/<pid>/environ`, and a key silently dropping off it would restore exactly the
+/// blindness that let the GPU stay switched off for months.
+#[cfg(target_os = "linux")]
+const PROCESS_ENVIRONMENT_SNAPSHOT_KEYS: &[&str] = &[
+    "YGGTERM_ALLOW_MULTI_WINDOW",
+    "YGGTERM_REMOTE_SMOKE_TAG",
+    "YGGTERM_DESKTOP_APP_ID_SUFFIX",
+    "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF",
+    "YGGTERM_HOME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_ID",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+    "KDE_FULL_SESSION",
+    "GDK_BACKEND",
+    "WINIT_UNIX_BACKEND",
+    "YGGTERM_ENABLE_XTERM_CANVAS",
+    "YGGTERM_XTERM_CANVAS_POLICY",
+    "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
+    // Which GL path this GUI is on, and the four variables that ARE that path.
+    // Before these were here, answering "is the GPU switched off in this window"
+    // meant an ssh into /proc/<pid>/environ — which is exactly why nobody noticed
+    // for months that it was.
+    yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+    "LIBGL_ALWAYS_SOFTWARE",
+    "GALLIUM_DRIVER",
+    "WEBKIT_DISABLE_DMABUF_RENDERER",
+    "YGGTERM_WEB_SURFACE_UNDER_GLASS",
+];
+
 #[cfg(target_os = "linux")]
 fn process_environment_snapshot(pid: u32) -> BTreeMap<String, String> {
-    const KEYS: &[&str] = &[
-        "YGGTERM_ALLOW_MULTI_WINDOW",
-        "YGGTERM_REMOTE_SMOKE_TAG",
-        "YGGTERM_DESKTOP_APP_ID_SUFFIX",
-        "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF",
-        "YGGTERM_HOME",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "XDG_SESSION_ID",
-        "XDG_RUNTIME_DIR",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_DESKTOP",
-        "DESKTOP_SESSION",
-        "KDE_FULL_SESSION",
-        "GDK_BACKEND",
-        "WINIT_UNIX_BACKEND",
-        "YGGTERM_ENABLE_XTERM_CANVAS",
-        "YGGTERM_XTERM_CANVAS_POLICY",
-        "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
-        // Which GL path this GUI is on, and the four variables that ARE that path.
-        // Before these were here, answering "is the GPU switched off in this window"
-        // meant an ssh into /proc/<pid>/environ — which is exactly why nobody noticed
-        // for months that it was.
-        yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
-        "LIBGL_ALWAYS_SOFTWARE",
-        "GALLIUM_DRIVER",
-        "WEBKIT_DISABLE_DMABUF_RENDERER",
-        "YGGTERM_WEB_SURFACE_UNDER_GLASS",
-    ];
+    const KEYS: &[&str] = PROCESS_ENVIRONMENT_SNAPSHOT_KEYS;
     let payload = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
     payload
         .split(|byte| *byte == 0)
@@ -22823,6 +22832,33 @@ mod tests {
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
         select_claude_code_storage_candidate,
     };
+
+    /// `server app state` is where an agent finds out which GL path a window is on.
+    /// Before these keys were published, answering that meant an ssh into
+    /// `/proc/<pid>/environ` and knowing which four variables to look for — which is a
+    /// large part of why nobody noticed for months that the GPU was switched off. A key
+    /// dropping off this list restores that blindness silently, so the list is asserted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_app_state_environment_snapshot_publishes_the_gl_path() {
+        let keys = super::PROCESS_ENVIRONMENT_SNAPSHOT_KEYS;
+        for required in [
+            yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+            "LIBGL_ALWAYS_SOFTWARE",
+            "GALLIUM_DRIVER",
+            "WEBKIT_DISABLE_DMABUF_RENDERER",
+            "YGGTERM_WEB_SURFACE_UNDER_GLASS",
+        ] {
+            assert!(
+                keys.contains(&required),
+                "{required} must be published in `server app state`"
+            );
+        }
+        // The keys that were already there stay there: this is an addition, not a
+        // replacement, and the backend/renderer policies are read the same way.
+        assert!(keys.contains(&"YGGTERM_XTERM_CANVAS_POLICY"));
+        assert!(keys.contains(&"GDK_BACKEND"));
+    }
 
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
 
