@@ -220,6 +220,45 @@ pub const WEBKIT_GL_ENVIRONMENT_KEYS: &[&str] = &[
     ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS,
 ];
 
+/// What THIS process decided its GL path is — read from this process's own
+/// environment, which is the only place the answer exists.
+///
+/// ⚠⚠ **`/proc/<pid>/environ` cannot answer this question and never could.**
+/// `setenv`/`unsetenv` (and therefore `std::env::set_var`/`remove_var`) reallocate the
+/// environ array on the heap; the kernel keeps exposing the exec-time copy in the
+/// process's stack region. Measured on the dev host 2026-07-25 with a standalone
+/// binary: a `set_var` is INVISIBLE in `/proc/self/environ`, and a `remove_var` leaves
+/// the inherited value still sitting there. Every one of the five keys above is
+/// written by `configure_linux_webkit_compositing` AFTER exec, so a `/proc` reader
+/// reports:
+///
+/// - **fresh launch** — the policy key simply ABSENT, the decision unobservable;
+/// - **hot restart / `app launch`** — the PREDECESSOR's values, because the child
+///   inherited its parent's mutated environ at exec while re-probing and possibly
+///   deciding differently.
+///
+/// That is the decision and the state disagreeing silently — the exact failure this
+/// whole module exists to end — so the publication path is in-process and there is
+/// deliberately no `/proc`-derived copy of these keys to disagree with it.
+///
+/// Absent keys are absent from the map: "we removed it" and "it is empty" are
+/// different facts and the wire keeps them apart.
+pub fn webkit_gl_environment_from_process() -> std::collections::BTreeMap<String, String> {
+    webkit_gl_environment_from(|key| std::env::var(key).ok())
+}
+
+/// The pure half of [`webkit_gl_environment_from_process`]: which keys get published,
+/// given a lookup. Split out so the key coverage is testable without touching the
+/// process environment.
+pub fn webkit_gl_environment_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    WEBKIT_GL_ENVIRONMENT_KEYS
+        .iter()
+        .filter_map(|key| lookup(key).map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
 /// Hidden argv flag selecting probe mode. Absent from every launcher and desktop
 /// entry, so nothing acquires a probe by accident.
 pub const GL_PROBE_FLAG: &str = "--internal-gl-probe";
@@ -648,6 +687,78 @@ pub fn probe_in_this_process() -> GlProbeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the two tests that mutate the process environment. `set_var` is
+    /// process-global and cargo runs tests on threads, so without this they race each
+    /// other — and a test that passes or fails by timing is worth nothing.
+    static ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// ⚠⚠ THE INSTRUMENT-LIE LOCK. The GL decision must be published from THIS
+    /// process's own view of its environment, never from `/proc/<pid>/environ`.
+    ///
+    /// `set_var`/`remove_var` move the environ array to the heap while the kernel keeps
+    /// exposing the exec-time stack copy, so a `/proc` reader reports the value this
+    /// process was LAUNCHED with — absent on a fresh launch, and the PREDECESSOR's on a
+    /// hot restart, while this process re-probed and may have decided differently.
+    /// Measured on the dev host 2026-07-25 with a standalone binary: a `set_var` was
+    /// invisible in `/proc/self/environ` and a `remove_var` left the inherited value in
+    /// place.
+    ///
+    /// This test fails the moment the publisher starts inferring from `/proc` again:
+    /// the set would not be seen, and the removal would still report its old value.
+    #[test]
+    fn the_gl_decision_is_published_from_this_processs_own_view() {
+        let _guard = ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            std::env::set_var(ENV_LIBGL_ALWAYS_SOFTWARE, "1");
+            std::env::set_var(ENV_GALLIUM_DRIVER, "llvmpipe");
+        }
+        // Exactly what a hot-restarted GUI does after a hardware probe.
+        unsafe {
+            std::env::set_var(ENV_YGGTERM_WEBKIT_GL_POLICY, "hardware_gl_probed");
+            std::env::remove_var(ENV_LIBGL_ALWAYS_SOFTWARE);
+            std::env::remove_var(ENV_GALLIUM_DRIVER);
+        }
+        let published = webkit_gl_environment_from_process();
+        assert_eq!(
+            published
+                .get(ENV_YGGTERM_WEBKIT_GL_POLICY)
+                .map(String::as_str),
+            Some("hardware_gl_probed"),
+            "a decision this process made must be visible to the reader that publishes it"
+        );
+        assert!(
+            !published.contains_key(ENV_LIBGL_ALWAYS_SOFTWARE),
+            "a software force this process CLEARED must not still be reported as set — \
+             that is the decision and the state disagreeing silently, published"
+        );
+        assert!(
+            !published.contains_key(ENV_GALLIUM_DRIVER),
+            "same for the driver override"
+        );
+        unsafe { std::env::remove_var(ENV_YGGTERM_WEBKIT_GL_POLICY) };
+    }
+
+    /// Absent is not empty. A variable nobody set and a variable set to "" are
+    /// different facts, and the map keeps them apart.
+    #[test]
+    fn the_published_gl_environment_omits_only_what_is_unset() {
+        let _guard = ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let published = webkit_gl_environment_from(|key| {
+            (key == ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS).then(|| String::new())
+        });
+        assert_eq!(
+            published.get(ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS),
+            Some(&String::new())
+        );
+        assert_eq!(published.len(), 1);
+        let all = webkit_gl_environment_from(|key| Some(format!("v-{key}")));
+        assert_eq!(all.len(), WEBKIT_GL_ENVIRONMENT_KEYS.len());
+    }
 
     /// The exact strings from the settled EGL matrix on the live host. If a marker is
     /// ever added in a second place instead of `SOFTWARE_RENDERER_MARKERS`, this is

@@ -83,8 +83,10 @@ Three consequences for this pass:
 - `linux_webkit_gl_policy_from_input` (`apps/yggterm/src/main.rs`) — the ONE policy.
   Precedence: `WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
   `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the probe. Its reason is exported as
-  `YGGTERM_WEBKIT_GL_POLICY` and read back by the startup trace and
-  `server app state`.
+  `YGGTERM_WEBKIT_GL_POLICY` and read back by the startup trace and published to
+  `server app desktop-identity` through the client's own `webkit_gl_environment`
+  (NOT through `/proc/<pid>/environ`, which only ever holds the exec-time
+  environment — see `gl_probe::webkit_gl_environment_from_process`).
 - `shm_force_for_arming` now takes `hardware_gl`, so SHM is refused on a probed-hardware
   host whatever arming decides. The cross-product test asserts consequence 2 above in
   every cell rather than trusting it to prose.
