@@ -32894,20 +32894,26 @@ fn create_native_clipboard() -> Result<NativeClipboard> {
         .map_err(|error| anyhow!("failed to initialize native clipboard access: {error}"))
 }
 
+/// Decode a PNG to 8-bit RGBA.
+///
+/// The messages name the PNG, NOT a caller: this decoder serves the clipboard
+/// AND `capture-element --split`, whose `split_error` surfaced them verbatim, so
+/// an agent whose element rasterizer failed was told its clipboard was broken.
+/// Callers add their own context.
 fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
     let mut reader = decoder
         .read_info()
-        .map_err(|error| anyhow!("failed to decode clipboard PNG metadata: {error}"))?;
+        .map_err(|error| anyhow!("failed to decode PNG metadata: {error}"))?;
     let mut buffer = vec![
         0;
         reader
             .output_buffer_size()
-            .context("reading clipboard PNG output buffer size")?
+            .context("reading PNG output buffer size")?
     ];
     let info = reader
         .next_frame(&mut buffer)
-        .map_err(|error| anyhow!("failed to decode clipboard PNG pixels: {error}"))?;
+        .map_err(|error| anyhow!("failed to decode PNG pixels: {error}"))?;
     let width = info.width as usize;
     let height = info.height as usize;
     let pixels = &buffer[..info.buffer_size()];
@@ -32920,7 +32926,7 @@ fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
             }
             Ok((rgba, width, height))
         }
-        _ => Err(anyhow!("clipboard PNG must use 8-bit RGB or RGBA channels")),
+        _ => Err(anyhow!("PNG must use 8-bit RGB or RGBA channels")),
     }
 }
 
@@ -33233,7 +33239,8 @@ fn set_native_clipboard_contents(
             let png_bytes = BASE64_STANDARD
                 .decode(png_base64)
                 .map_err(|error| anyhow!("invalid base64 clipboard PNG payload: {error}"))?;
-            let (rgba_bytes, width, height) = decode_png_rgba(&png_bytes)?;
+            let (rgba_bytes, width, height) =
+                decode_png_rgba(&png_bytes).context("decoding the clipboard PNG payload")?;
             with_owned_native_clipboard(
                 state,
                 NativeClipboardOwnerKind::Image,
@@ -49879,6 +49886,39 @@ mod web_do_verb_tests {
         assert!(js.contains("\"ygg-7\""), "{js}");
     }
 
+    // …but the poll only deletes what it READ, and the one call that leaves an
+    // entry behind is the one that never gets a value: a `fetch` that never
+    // settles times out with its stash entry and its captured closure alive on
+    // `window` for the life of the document. That is the case the poll
+    // script's own header promises cannot happen.
+    //
+    // The decision lives in `AwaitEnd::leaves_stash_entry` rather than in a
+    // remembered cleanup call at each `return` — which is how the leak got in.
+    // Make it return `false` and this fails.
+    #[test]
+    fn only_a_timeout_leaves_a_stash_entry_and_it_is_discarded() {
+        assert!(
+            AwaitEnd::TimedOut.leaves_stash_entry(),
+            "a promise still pending in a live document keeps its entry"
+        );
+        assert!(
+            !AwaitEnd::Settled.leaves_stash_entry(),
+            "the poll deleted it as it read it"
+        );
+        assert!(
+            !AwaitEnd::DocumentReplaced.leaves_stash_entry(),
+            "the stash went with the document"
+        );
+
+        let js = web_await_discard_script("ygg-7");
+        assert!(js.contains("delete bag[rid]"), "{js}");
+        assert!(js.contains("\"ygg-7\""), "{js}");
+        // It must not wait for a value it will never get.
+        assert!(!js.contains("s.done"), "{js}");
+        // It reports whether there was anything to reclaim.
+        assert!(js.contains("hasOwnProperty"), "{js}");
+    }
+
     // THE THREE HONEST ANSWERS. A fabricated result would be
     // indistinguishable from a real one, which is the worst outcome for a verb
     // whose whole job is returning a value.
@@ -50853,6 +50893,48 @@ fn web_await_poll_script(rid: &str) -> String {
     )
 }
 
+/// Drop a stash entry WITHOUT reading it — the cleanup the timeout path owes.
+///
+/// The poll script deletes on read, but only when it read a SETTLED value. A
+/// `fetch` that never settles is exactly the case that times out, so without
+/// this the entry and its captured closure live on `window` for the life of the
+/// document — the accumulation the poll script's own header promises cannot
+/// happen.
+fn web_await_discard_script(rid: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         var bag=window.__yggAwait;if(!bag)return false;\
+         var had=Object.prototype.hasOwnProperty.call(bag,rid);\
+         try{{delete bag[rid];}}catch(e){{}}\
+         return had;}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// How one `web await` call ENDED, and therefore whether the page is still
+/// holding its stash entry.
+///
+/// A decision, not a description: the discard eval is wired to
+/// [`AwaitEnd::leaves_stash_entry`], so "which endings leak" is answered in one
+/// place that a test can drive rather than by remembering to add a cleanup call
+/// to each `return`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwaitEnd {
+    /// The poll read a settled value, and deleted the entry as it read it.
+    Settled,
+    /// The stash itself is gone with the document that held it.
+    DocumentReplaced,
+    /// We stopped waiting. NOTHING deleted the entry — the promise is still
+    /// pending in a document that is still there.
+    TimedOut,
+}
+
+impl AwaitEnd {
+    fn leaves_stash_entry(self) -> bool {
+        matches!(self, AwaitEnd::TimedOut)
+    }
+}
+
 /// What one await poll decided. PURE — the three answers are the whole point.
 #[derive(Debug, Clone, PartialEq)]
 enum AwaitStep {
@@ -50923,47 +51005,74 @@ async fn web_surface_await_for(
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms);
     let mut poll_errors: u64 = 0;
-    loop {
+    // ONE exit. Every ending yields `(AwaitEnd, response)` so the stash cleanup
+    // below is decided by `AwaitEnd::leaves_stash_entry` rather than by
+    // remembering to bolt an eval onto each `return` — which is exactly how the
+    // timeout path came to leak.
+    let (end, mut response) = loop {
         let outcome = web_do_eval(desktop, native_id, &poll).await;
         if outcome.is_err() {
             poll_errors += 1;
         }
         match web_await_poll_outcome(&outcome) {
             AwaitStep::Settled { ok, value, error } => {
-                return json!({
-                    "accepted": ok,
-                    "session_path": session,
-                    "native_id": native_id,
-                    "value": if ok { value } else { Value::Null },
-                    "reason": if ok { Value::Null } else { json!("await_rejected") },
-                    "error": error,
-                    "elapsed_ms": start.elapsed().as_millis() as u64,
-                    "poll_errors": poll_errors,
-                });
+                break (
+                    AwaitEnd::Settled,
+                    json!({
+                        "accepted": ok,
+                        "session_path": session,
+                        "native_id": native_id,
+                        "value": if ok { value } else { Value::Null },
+                        "reason": if ok { Value::Null } else { json!("await_rejected") },
+                        "error": error,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "poll_errors": poll_errors,
+                    }),
+                );
             }
             AwaitStep::DocumentReplaced => {
-                return json!({
-                    "accepted": false,
-                    "session_path": session,
-                    "reason": "document_replaced",
-                    "detail": "the page navigated while the script was running, so its result is gone — this is NOT a result, and no value is invented for it",
-                    "elapsed_ms": start.elapsed().as_millis() as u64,
-                    "poll_errors": poll_errors,
-                });
+                break (
+                    AwaitEnd::DocumentReplaced,
+                    json!({
+                        "accepted": false,
+                        "session_path": session,
+                        "reason": "document_replaced",
+                        "detail": "the page navigated while the script was running, so its result is gone — this is NOT a result, and no value is invented for it",
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "poll_errors": poll_errors,
+                    }),
+                );
             }
             AwaitStep::Pending => {}
         }
         if start.elapsed() >= deadline {
-            return json!({
-                "accepted": false,
-                "session_path": session,
-                "reason": "await_timeout",
-                "elapsed_ms": start.elapsed().as_millis() as u64,
-                "poll_errors": poll_errors,
-            });
+            break (
+                AwaitEnd::TimedOut,
+                json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": "await_timeout",
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "poll_errors": poll_errors,
+                }),
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    if end.leaves_stash_entry() {
+        let discarded = web_do_eval(desktop, native_id, &web_await_discard_script(&rid))
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if let Some(obj) = response.as_object_mut() {
+            // Say whether the never-settling promise's entry was actually
+            // reclaimed; a page that has since navigated answers `false`, and
+            // that is a fact about the page, not a failure of the verb.
+            obj.insert("stash_discarded".to_string(), Value::Bool(discarded));
+        }
     }
+    response
 }
 
 /// JS that finds a frame's `window` from a [`WebFrameRef`].
@@ -51669,7 +51778,10 @@ async fn web_surface_cookies_for(
                     "reason": format!("create {}: {error}", parent.display()),
                 });
             }
-            if let Err(error) = std::fs::write(&path, format_netscape_jar(&specs)) {
+            // 0600: these bytes are live session credentials, not a report.
+            if let Err(error) =
+                crate::netscape_cookie_jar::write_jar_file(&path, &format_netscape_jar(&specs))
+            {
                 return json!({
                     "accepted": false,
                     "session_path": session,
