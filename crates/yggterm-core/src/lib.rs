@@ -26,7 +26,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
-use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
+use titles::settings_ready as litellm_settings_ready;
 pub use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
 
 pub use agent_cli::{
@@ -74,10 +74,12 @@ pub use telemetry::{
     spawn_terminal_telemetry_event, terminal_telemetry_db_path,
 };
 pub use titles::{
-    SessionSummaryTimelineEntry, SessionTitleStore, best_effort_context_from_session_path,
+    LIVE_SUMMARY_REFRESH_HORIZON, SessionSummaryTimelineEntry, SessionTitleResolver,
+    SessionTitleStore, best_effort_context_from_session_path,
     best_effort_precis_from_context, best_effort_summary_from_context,
     best_effort_title_from_context, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, request_generated_short_name,
+    session_title_store_open_count,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
@@ -733,6 +735,17 @@ impl SessionStore {
         resolver.resolve_precis_for_session(&identity.session_id)
     }
 
+    /// One resolver, for callers that read generated copy in a LOOP. Each
+    /// `resolve_*_for_session_id` wrapper below opens its own sqlite
+    /// connection and re-runs the whole schema batch, which is the right
+    /// arity for a one-shot caller and catastrophic inside a scan — the copy
+    /// scan did three of them per target across every scanned session on
+    /// every machine. `SessionTitleResolver` stays the single owner of
+    /// generated copy either way; this just hands the loop the open handle.
+    pub fn generated_copy_resolver(&self) -> Result<SessionTitleResolver> {
+        SessionTitleResolver::new(&self.home)
+    }
+
     pub fn resolve_title_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.resolve_for_session(session_id)
@@ -816,7 +829,7 @@ impl SessionStore {
         resolver.summary_needs_refresh_with_horizon(
             session_id,
             source_updated_at,
-            time::Duration::minutes(30),
+            crate::LIVE_SUMMARY_REFRESH_HORIZON,
         )
     }
 
@@ -1565,17 +1578,28 @@ struct CodexBrowserTreeNode {
 /// injection pass. To add a new CLI: write a `scan_local_<cli>_sessions()`
 /// that returns `Vec<LocalAgentSessionSummary>` and call it here.
 fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionNode> {
+    // This walk reads every agent transcript on the machine and runs on every
+    // daemon chore tick and inside every title generation, but had no span of
+    // its own — so `daemon/background_copy_chore` reported a p50 of 0.0 ms
+    // while this was the bulk of its cost. Nothing can be claimed about the
+    // scanners until their cost has a row of its own.
+    let perf = PerfSpan::start(home, "background", "local_tree_scan");
     let title_resolver = SessionTitleResolver::new(home).ok();
 
     let mut sessions: Vec<LocalAgentSessionSummary> = Vec::new();
     let codex_root = resolve_codex_sessions_root()?;
+    let mut codex_sessions = 0usize;
     if codex_root.exists() {
-        sessions.extend(scan_local_codex_sessions(
-            &codex_root,
-            title_resolver.as_ref(),
-        )?);
+        let scanned = scan_local_codex_sessions(&codex_root, title_resolver.as_ref())?;
+        codex_sessions = scanned.len();
+        sessions.extend(scanned);
     }
-    sessions.extend(scan_local_claude_code_sessions());
+    let claude_code_sessions = {
+        let scanned = scan_local_claude_code_sessions();
+        let count = scanned.len();
+        sessions.extend(scanned);
+        count
+    };
 
     let mut projects = BTreeMap::<String, Vec<LocalAgentSessionSummary>>::new();
     for session in sessions {
@@ -1598,6 +1622,7 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
         });
     }
 
+    let bucket_count = buckets.len();
     let mut root = CodexBrowserTreeNode {
         name: String::from("local [ok]"),
         full_path: String::from("local"),
@@ -1623,6 +1648,11 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     }
     compress_codex_browser_tree(&mut root, false);
 
+    perf.finish(serde_json::json!({
+        "codex_sessions": codex_sessions,
+        "claude_code_sessions": claude_code_sessions,
+        "cwd_buckets": bucket_count,
+    }));
     Ok(codex_browser_tree_to_session_node(&root))
 }
 
@@ -3279,6 +3309,36 @@ mod tests {
         assert_eq!(
             serialize_settings_value(&settings).get("codex_extra_args"),
             Some(&serde_json::json!("-s danger-full-access"))
+        );
+    }
+
+    /// The tree scan cannot be exercised in a unit test — it walks the real
+    /// `~/.codex/sessions` and `~/.claude/projects` (47 GB and 494 MB on the
+    /// machine this was written on), so a test that called it would be neither
+    /// fast nor deterministic. The scan's cost being MEASURED at all is the
+    /// property under test, and the source is where that is decidable.
+    #[test]
+    fn local_cwd_tree_build_carries_its_own_perf_span() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("fn build_local_cwd_tree(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("build_local_cwd_tree should be present");
+        // Coverage floor: a split that matched nothing would make every
+        // assertion below vacuously true.
+        assert!(
+            body.contains("scan_local_claude_code_sessions()") && body.len() > 500,
+            "scanner did not capture the tree-build body ({} bytes)",
+            body.len()
+        );
+        assert!(
+            body.contains("PerfSpan::start(home, \"background\", \"local_tree_scan\")"),
+            "the tree scan needs a row of its own in `perf-summary --category background`"
+        );
+        assert!(
+            body.contains("perf.finish("),
+            "a span that never finishes records nothing"
         );
     }
 }

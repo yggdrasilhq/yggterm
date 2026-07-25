@@ -4,7 +4,8 @@ use crate::codex_cli::{
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     CodexRuntimeProcessIdentity, GhosttyHostSupport, ManagedSessionView, PersistedDaemonState,
-    PersistedLiveSession, PersistedStoredSession, RemoteMachineSnapshot, RemoteRuntimeRegistry,
+    PersistedLiveSession, PersistedStoredSession, RemoteMachineRef, RemoteMachineSnapshot,
+    RemoteRuntimeRegistry,
     ServerUiSnapshot,
     SessionKind, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalManager,
     WorkspaceViewMode, YggtermServer, active_client_instance_records,
@@ -38,7 +39,8 @@ use std::sync::{
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_bounded_jsonl_record,
+    AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode, SessionNodeKind, SessionStore,
+    append_bounded_jsonl_record,
     append_trace_event, local_cc_session_jsonl_path, looks_like_generated_fallback_title,
     read_cc_session_title, resolve_yggterm_home,
 };
@@ -89,7 +91,7 @@ const PERF_INCIDENT_WINDOW_MS: u64 = 60_000;
 fn spawn_explicit_remote_session_shutdown(
     home: &Path,
     path: &str,
-    machine: RemoteMachineSnapshot,
+    machine: RemoteMachineRef,
     session_id: String,
 ) {
     let home = home.to_path_buf();
@@ -142,7 +144,7 @@ fn spawn_explicit_remote_session_shutdown(
 }
 
 fn spawn_remote_generated_copy_persist(
-    machine: RemoteMachineSnapshot,
+    machine: RemoteMachineRef,
     session_id: String,
     cwd: String,
     title: Option<String>,
@@ -2633,7 +2635,7 @@ struct DaemonRuntime {
     /// round-trip to the remote daemon runs on a background thread, never on
     /// the request loop.
     pending_remote_pty_resizes:
-        Arc<Mutex<HashMap<String, (RemoteMachineSnapshot, String, SessionKind, u16, u16)>>>,
+        Arc<Mutex<HashMap<String, (RemoteMachineRef, String, SessionKind, u16, u16)>>>,
     remote_pty_resize_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -2651,7 +2653,7 @@ struct BackgroundCopyCandidate {
     cwd: String,
     title: String,
     source_updated_at: Option<OffsetDateTime>,
-    remote_machine: Option<RemoteMachineSnapshot>,
+    remote_machine: Option<RemoteMachineRef>,
     generation_context: Option<String>,
     storage_path: Option<String>,
     cached_summary: Option<String>,
@@ -7728,16 +7730,10 @@ fn collect_remote_copy_candidates(
 ) -> Vec<BackgroundCopyCandidate> {
     let mut out = Vec::new();
     for machine in remote_machines {
-        let machine_ref = RemoteMachineSnapshot {
-            machine_key: machine.machine_key.clone(),
-            label: machine.label.clone(),
-            ssh_target: machine.ssh_target.clone(),
-            prefix: machine.prefix.clone(),
-            remote_binary_expr: machine.remote_binary_expr.clone(),
-            remote_deploy_state: machine.remote_deploy_state,
-            health: machine.health,
-            sessions: Vec::new(),
-        };
+        // Hoisted above the session loop on purpose: `routing_ref` carries no
+        // session list, so this clone is a handful of small strings rather
+        // than the whole scanned machine, once per candidate.
+        let machine_ref = machine.routing_ref();
         for session in &machine.sessions {
             out.push(BackgroundCopyCandidate {
                 session_path: session.session_path.clone(),
@@ -8097,6 +8093,13 @@ fn build_background_copy_updates(
     collect_live_copy_candidates(store, live_sessions, working_paths, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
+    // ONE sqlite connection for the whole candidate loop. Each
+    // `store.resolve_*_for_session_id` below is a one-shot arity that opens
+    // its own connection and re-runs the schema batch; three of them per
+    // candidate across the per-tick budget is a connection open per read for
+    // no reason. `SessionTitleResolver` is still the one owner of generated
+    // copy — this is the same handle, held open.
+    let resolver = store.generated_copy_resolver()?;
     let mut seen_candidates = HashSet::new();
     // Endpoint pacing: the litellm endpoint 429s under quick successive calls
     // (live-observed 2026-06-11), and each generation can be 2 LLM calls
@@ -8109,8 +8112,8 @@ fn build_background_copy_updates(
         .filter(|candidate| seen_candidates.insert(candidate.session_path.clone()))
         .take(BACKGROUND_COPY_BUDGET_PER_TICK)
     {
-        let stored_title = store
-            .resolve_title_for_session_id(&candidate.session_id)
+        let stored_title = resolver
+            .resolve_for_session(&candidate.session_id)
             .ok()
             .flatten();
         let title_missing = background_copy_title_missing(
@@ -8118,20 +8121,24 @@ fn build_background_copy_updates(
             &candidate.title,
             stored_title.as_deref(),
         );
-        let stored_summary = store
-            .resolve_summary_for_session_id(&candidate.session_id)
+        let stored_summary = resolver
+            .resolve_summary_for_session(&candidate.session_id)
             .ok()
             .flatten();
         let summary_needs_refresh = candidate
             .source_updated_at
             .and_then(|updated_at| {
                 if candidate.live_local_agent {
-                    store
-                        .summary_needs_refresh_for_live_session_id(&candidate.session_id, updated_at)
+                    resolver
+                        .summary_needs_refresh_with_horizon(
+                            &candidate.session_id,
+                            updated_at,
+                            LIVE_SUMMARY_REFRESH_HORIZON,
+                        )
                         .ok()
                 } else {
-                    store
-                        .summary_needs_refresh_for_session_id(&candidate.session_id, updated_at)
+                    resolver
+                        .summary_needs_refresh(&candidate.session_id, updated_at)
                         .ok()
                 }
             })
@@ -8270,12 +8277,11 @@ fn run_background_copy_chore(
     generation_enabled: bool,
     remote_cc_confirmed: &mut HashSet<String>,
 ) -> Result<usize> {
-    let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
+    let (store, settings, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
         let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
         // Eventual propagation of a GUI profiling toggle into the daemon's gate.
         yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
-        let local_root = runtime.store.load_codex_tree(&settings)?;
         // Working-indicator trigger: a live session counts as "working" when
         // its vt100 screen shows the agent working (esc-to-interrupt SSOT) or
         // its PTY produced output within the recent window — generation rides
@@ -8303,7 +8309,6 @@ fn run_background_copy_chore(
         (
             runtime.store.clone(),
             settings,
-            local_root,
             runtime.server.live_sessions().to_vec(),
             runtime.server.remote_machines().to_vec(),
             runtime.server.ssh_targets().to_vec(),
@@ -8312,6 +8317,14 @@ fn run_background_copy_chore(
         )
     };
     let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
+    // The local cwd-tree scan walks every codex + Claude Code transcript on
+    // this machine. It used to run INSIDE the read block above, which held
+    // the daemon runtime lock across a multi-second disk walk and blocked
+    // every concurrent request — and it sat outside this span, so the chore
+    // reported a p50 of 0.0 ms while doing the most expensive thing it does.
+    // `build_local_cwd_tree` now carries its own `background/local_tree_scan`
+    // span; this one measures the chore honestly.
+    let local_root = store.load_codex_tree(&settings)?;
     let mut updates = build_background_copy_updates(
         &store,
         &settings,
@@ -15551,6 +15564,44 @@ mod tests {
     }
 
     #[test]
+    fn background_copy_chore_measures_the_tree_scan_and_never_holds_the_lock_for_it() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn run_background_copy_chore(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("run_background_copy_chore should be present");
+        // Coverage floor: a split that matched nothing passes every assertion
+        // below without reading a line of the function.
+        assert!(
+            body.contains("build_background_copy_updates(") && body.len() > 800,
+            "scanner did not capture the chore body ({} bytes)",
+            body.len()
+        );
+        let read_block = body
+            .split("lock_daemon_runtime(runtime, \"run_background_copy_chore_read\")")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n    };").next())
+            .expect("chore should still take a runtime read lock");
+        assert!(
+            !read_block.contains("load_codex_tree("),
+            "the local tree scan walks every transcript on the machine; holding the \
+             daemon runtime lock across it blocks every concurrent request"
+        );
+        let span_at = body
+            .find("PerfSpan::start(&perf_home, \"daemon\", \"background_copy_chore\")")
+            .expect("chore should still be measured");
+        let scan_at = body
+            .find("load_codex_tree(")
+            .expect("chore should still load the local tree");
+        assert!(
+            span_at < scan_at,
+            "the tree scan must be INSIDE the chore span — outside it the chore \
+             reported a p50 of 0.0 ms while doing its most expensive work"
+        );
+    }
+
+    #[test]
     fn update_session_copy_does_not_block_daemon_on_remote_copy_persist() {
         let source = include_str!("daemon.rs");
         let handler = source
@@ -18836,7 +18887,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_remote_copy_candidates_do_not_clone_machine_session_lists() {
+    fn collect_remote_copy_candidates_carry_routing_only_never_the_machine() {
         let machines = vec![RemoteMachineSnapshot {
             machine_key: "jojo".to_string(),
             label: "jojo".to_string(),
@@ -18888,8 +18939,12 @@ mod tests {
             let machine = candidate
                 .remote_machine
                 .expect("candidate should keep machine routing");
+            // The session list is not "empty here" any more, it is
+            // unrepresentable: `RemoteMachineRef` has no such field. Reverting
+            // the candidate back to a `RemoteMachineSnapshot` stops this
+            // equality compiling, which is the point.
+            assert_eq!(machine, machines[0].routing_ref());
             assert_eq!(machine.machine_key, "jojo");
-            assert!(machine.sessions.is_empty());
             assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
         }
         assert_eq!(machines[0].sessions.len(), 2);
