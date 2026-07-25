@@ -25364,6 +25364,23 @@ fn spawn_focus_live_session_row_retry(
             ),
         );
     }
+    if client_is_shadow_viewer() {
+        // A shadow's active session is CLIENT-LOCAL state — that is the whole
+        // point of a second viewport that does not yank the user's view. Its
+        // switch therefore must not travel through `focus_live`, which mutates
+        // the daemon's SHARED active session (and is denied for exactly that
+        // reason). Routing it there was the bug: the denial meant no snapshot
+        // came back, nothing applied the switch, and `app open --client <shadow>`
+        // timed out reporting the session the viewport was still SHOWING. Do
+        // the local mutation instead — the same one the `--no-activate` create
+        // path already uses to hand a view back.
+        let _ = safe_shell_mut(state, "focus_live_session_row_shadow_local", |shell| {
+            shell.server.restore_active_session(&row.full_path, mode);
+            shell.finish_busy_request_for(&request_meta.request_id);
+            shell.last_action = format!("showing {} (shadow view)", row.label);
+        });
+        return;
+    }
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let request_id = request_meta.request_id.clone();
     let pending_label = format!("focusing {}", row.label);
@@ -54313,6 +54330,31 @@ fn reassert_client_instance_registration(settings_path: &Path) -> bool {
     republished
 }
 
+/// Whether THIS client process is a slice-4 [`ClientRole::Shadow`] — a
+/// **read-only viewer**.
+///
+/// The daemon already refuses a shadow every ownership request (`role_gate`);
+/// this is the client half of the same contract, and it exists because "the
+/// daemon says no" and "the client never asks" are not the same thing. Before
+/// it, a shadow's terminal lane asked anyway and the refusals were fatal: the
+/// mount bailed on `terminal_ensure` -> `shadow_cannot_own` (so the viewport
+/// stayed blank forever) and `app open` bailed on `focus_live` -> the same
+/// (so the shadow's view could never switch to a terminal session at all).
+///
+/// A shadow can still SEE everything: `TerminalRead`/`TerminalSnapshot`/
+/// `TerminalHistory` are all `Allow`, so the read stream alone paints a
+/// faithful frame — as long as the client stops demanding ownership first.
+///
+/// SSOT: `current_client_identity()`, the same value stamped on every outgoing
+/// daemon request and published in this process's `ClientInstanceRecord`. There
+/// is deliberately no second flag to drift from it.
+fn client_is_shadow_viewer() -> bool {
+    matches!(
+        yggterm_server::current_client_identity().role,
+        yggterm_server::ClientRole::Shadow
+    )
+}
+
 /// The registration timestamp encoded in a record's `<pid>-<started_at_ms>.json`
 /// file name. Re-publishing keeps it so the record and its path never disagree.
 fn client_instance_started_at_ms_from_path(path: &Path) -> Option<u64> {
@@ -68315,7 +68357,9 @@ fn TerminalCanvas(
                     "host_id": host_id.clone(),
                 }),
             );
-            let mut eval = terminal_document.eval(terminal_eval_script(
+            let pinned_grid =
+                state.with(|shell| shadow_pinned_terminal_grid(shell, &session_path));
+            let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid(
                 &host_id,
                 &theme,
                 terminal_initial_programmatic_focus(
@@ -68333,6 +68377,7 @@ fn TerminalCanvas(
                     ),
                     snapshot.tree_rename_active,
                 ),
+                pinned_grid,
             ));
             append_trace_event(
                 &trace_home,
@@ -76521,6 +76566,29 @@ async fn terminal_ensure_with_retry_async(
     session_path: String,
     trace_home: &Path,
 ) -> Result<Option<String>> {
+    if client_is_shadow_viewer() {
+        // A shadow never OWNS a PTY, so it must not ask the daemon to make one
+        // exist. `terminal_ensure` can spawn/restart the runtime — that is the
+        // ownership mutation `role_gate` denies, and the denial used to abort
+        // the whole mount before the read stream ever started, which is why a
+        // shadow's terminal viewport was permanently blank. Reporting success
+        // here is honest: the mount's postcondition is "a runtime this client
+        // may READ", and the read path answers that question for itself (a
+        // session with no runtime simply streams nothing). See
+        // [`client_is_shadow_viewer`].
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_mount",
+            "shadow_read_only_attach",
+            json!({
+                "session_path": session_path,
+                "skipped": "terminal_ensure",
+            }),
+        );
+        let _ = endpoint;
+        return Ok(None);
+    }
     let mut delay_ms = 40_u64;
     let mut attempts = 0_u64;
     let mut daemon_checked = false;
@@ -77568,6 +77636,16 @@ async fn terminal_resize_async(
     cols: u16,
     rows: u16,
 ) -> Result<()> {
+    if client_is_shadow_viewer() {
+        // Eng-review D8, enforced on BOTH sides now: a differently-sized shadow
+        // issuing SIGWINCH would reflow the CLI and scramble the USER's live
+        // frame. The daemon denies it; the shadow must not ask either, because
+        // the caller treats a resize error as a mount fault. The shadow keeps
+        // the two grids equal from its OWN side instead — it pins its xterm to
+        // the daemon's PTY grid (`window.__yggtermShadowPinnedGrid`), so the
+        // viewer adapts to the session rather than the session to the viewer.
+        return Ok(());
+    }
     task::spawn_blocking(move || terminal_resize(&endpoint, &session_path, cols, rows))
         .await
         .map_err(|error| anyhow!("joining terminal resize task: {error}"))?
@@ -79348,6 +79426,51 @@ fn terminal_eval_script(
         &terminal_xterm_renderer_policy_reason(),
     )
 }
+
+/// The mount script with the read-only viewer's grid pinned in front of it.
+///
+/// A shadow may not resize the PTY (eng-review D8), so the ONLY way its frame
+/// can be faithful is for its xterm to adopt the daemon's grid instead of
+/// fitting to its own window: the viewer adapts to the session. Without this a
+/// 167x57 shadow renders a stream the CLI wrote for 168x63 — different wrapping,
+/// a short bottom, exactly the squish class this project keeps fighting, and a
+/// screenshot that LIES.
+///
+/// `pinned_grid` is `None` for the user's own GUI (which owns the PTY and sizes
+/// it by fitting, as before), so this prepends nothing on that path.
+fn terminal_eval_script_with_pinned_grid(
+    host_id: &str,
+    theme: &TerminalTheme,
+    initial_input_enabled: bool,
+    pinned_grid: Option<(u64, u64)>,
+) -> String {
+    let script = terminal_eval_script(host_id, theme, initial_input_enabled);
+    let Some((cols, rows)) = pinned_grid else {
+        return script;
+    };
+    format!("window.__yggtermShadowPinnedGrid = {{ cols: {cols}, rows: {rows} }};\n{script}")
+}
+
+/// The grid a read-only viewer should pin its xterm to for `session_path`:
+/// the daemon's PTY grid, which reaches the client only as the "PTY size"
+/// metadata string (same SSOT the session/view contract check reads back).
+/// `None` for any non-shadow client, and for a session whose grid is unknown or
+/// unusable — pinning to a degenerate grid would be worse than fitting.
+fn shadow_pinned_terminal_grid(shell: &ShellState, session_path: &str) -> Option<(u64, u64)> {
+    if !client_is_shadow_viewer() {
+        return None;
+    }
+    let session = shell.server.session_for_path(session_path)?;
+    let (cols, rows) = parse_pty_size_cells(&metadata_value(session, "PTY size"))?;
+    terminal_grid_is_usable_cells(cols, rows).then_some((cols, rows))
+}
+
+/// The Rust twin of the script's `terminalGridIsUsable` — 20x4 is the floor
+/// below which a grid is treated as measurement noise rather than a real
+/// terminal. Kept in one place so the two sides cannot drift.
+fn terminal_grid_is_usable_cells(cols: u64, rows: u64) -> bool {
+    cols >= 20 && rows >= 4
+}
 fn terminal_eval_script_with_canvas_renderer(
     host_id: &str,
     theme: &TerminalTheme,
@@ -80761,6 +80884,20 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             return 8;
         }};
+        // A READ-ONLY viewer (slice-4 shadow) may not resize the PTY, so it must
+        // adopt the daemon's grid instead of proposing its own: the viewer
+        // adapts to the session. `window.__yggtermShadowPinnedGrid` is set by
+        // Rust from the session's "PTY size" at mount; absent on the user's own
+        // GUI, which owns the PTY and keeps fitting to its window.
+        const shadowPinnedGrid = () => {{
+            const pinned = window.__yggtermShadowPinnedGrid;
+            if (!pinned) {{
+                return null;
+            }}
+            const cols = Number(pinned.cols || 0);
+            const rows = Number(pinned.rows || 0);
+            return terminalGridIsUsable(cols, rows) ? {{ cols, rows }} : null;
+        }};
         const proposedTerminalFitDimensions = () => {{
             const content = terminalHostContentMetrics();
             const cellWidth = Math.max(1, terminalCssCellWidth());
@@ -80768,6 +80905,18 @@ fn terminal_eval_script_with_canvas_renderer(
             const bottomGuardPx = Math.max(0, Number(window.__yggtermXtermFitBottomGuardPx || 2));
             const availableWidth = Math.max(0, Number(content.width || 0));
             const availableHeight = Math.max(0, Number(content.height || 0) - bottomGuardPx);
+            const pinned = shadowPinnedGrid();
+            if (pinned) {{
+                return {{
+                    cols: pinned.cols,
+                    rows: pinned.rows,
+                    pinned: true,
+                    available_width_px: Number(availableWidth.toFixed(2)),
+                    available_height_px: Number(availableHeight.toFixed(2)),
+                    cell_width_px: Number(cellWidth.toFixed(3)),
+                    cell_height_px: Number(cellHeight.toFixed(3)),
+                }};
+            }}
             return {{
                 cols: Math.max(2, Math.floor(availableWidth / cellWidth)),
                 rows: Math.max(1, Math.floor(availableHeight / cellHeight)),
@@ -80946,6 +81095,16 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const applyTerminalRowFitGuard = (reason) => {{
             try {{
+                // The guard trims a row when the grid overflows the container.
+                // On a PINNED (read-only viewer) grid that is exactly wrong: the
+                // grid is the daemon's truth and the container is just a window
+                // onto it, so trimming would re-introduce the divergence the pin
+                // exists to remove. Let it clip instead — a short window over a
+                // correct grid stays faithful for the rows it does show; a
+                // resized grid is wrong everywhere.
+                if (shadowPinnedGrid()) {{
+                    return false;
+                }}
                 const diagnostics = terminalFitDiagnostics();
                 if (
                     diagnostics.rows <= 1
@@ -105158,6 +105317,83 @@ mod tests {
         assert!(script.contains("cursorInactiveStyle: 'block'"));
         assert!(script.contains("if (!nextInputEnabled) {"));
         assert!(script.contains("helperTextarea.blur();"));
+    }
+    // ---- read-only viewer (slice-4 shadow) grid pin ----
+    //
+    // These lock the SHADOW half of the terminal lane. The bug they close: a
+    // shadow could never show a terminal at all (its mount died on
+    // `terminal_ensure` -> shadow_cannot_own), and once it could, a shadow that
+    // FIT to its own window would render a stream written for the daemon's grid
+    // — wrong wrapping, short bottom, a screenshot that lies. Each assert below
+    // fails if the pin is dropped, inverted, or silently applied to the user's
+    // own GUI.
+    #[test]
+    fn pinned_grid_script_prepends_only_for_a_read_only_viewer() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let unpinned =
+            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None);
+        assert!(
+            !unpinned.contains("__yggtermShadowPinnedGrid ="),
+            "the user's own GUI owns the PTY and must keep fitting to its window"
+        );
+        assert_eq!(
+            unpinned,
+            terminal_eval_script("yggterm-terminal-test", &theme, true),
+            "an unpinned mount must be byte-identical to the pre-existing script"
+        );
+        let pinned = terminal_eval_script_with_pinned_grid(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            Some((168, 63)),
+        );
+        assert!(pinned.contains("window.__yggtermShadowPinnedGrid = { cols: 168, rows: 63 };"));
+        assert!(
+            pinned.ends_with(&terminal_eval_script("yggterm-terminal-test", &theme, true)),
+            "the pin must be a prefix so the mount script itself is unchanged"
+        );
+    }
+    #[test]
+    fn pinned_grid_overrides_the_fit_proposal_and_disarms_the_row_trim() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const pinned = shadowPinnedGrid();"),
+            "the fit proposal must consult the pin before measuring the container"
+        );
+        assert!(
+            script.contains("pinned: true,"),
+            "a pinned proposal must be self-identifying in the fit telemetry"
+        );
+        // The row-fit guard trims a row when the grid overflows its container.
+        // On a pinned grid that would undo the pin every frame, so the bypass
+        // has to sit BEFORE the guard reads its diagnostics.
+        let guard = script
+            .split_once("const applyTerminalRowFitGuard = (reason) => {")
+            .expect("row fit guard present")
+            .1;
+        let bypass = guard
+            .find("if (shadowPinnedGrid()) {")
+            .expect("row fit guard must bypass on a pinned grid");
+        let diagnostics = guard
+            .find("const diagnostics = terminalFitDiagnostics();")
+            .expect("row fit guard reads diagnostics");
+        assert!(
+            bypass < diagnostics,
+            "the pinned bypass must come before the guard computes a trim"
+        );
+    }
+    #[test]
+    fn usable_grid_floor_matches_the_script_that_enforces_it() {
+        // One floor, two languages. If either side moves, a shadow either pins
+        // to a degenerate grid or refuses a legitimate one.
+        assert!(!terminal_grid_is_usable_cells(19, 24));
+        assert!(!terminal_grid_is_usable_cells(80, 3));
+        assert!(terminal_grid_is_usable_cells(20, 4));
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("&& safeCols >= 20"));
+        assert!(script.contains("&& safeRows >= 4;"));
     }
     // BORING REVEAL ghost (spec-boring-session-loads): a retained reveal rebuilds
     // the Terminal through this eval; the blank/intermediate frames of that churn
