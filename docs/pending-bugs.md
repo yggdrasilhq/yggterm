@@ -6,61 +6,37 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
-- **★★ A HOT RESTART STILL KILLS LIVE PTYs, AND THE DAEMONS PILE UP INTO A
-  CHAIN (measured 2026-07-25 across the 2.12.11 swap on jojo).** The
-  keep-alive spec is explicit that an update restart must not kill sessions:
-  *"All sessions like this restart from testing or updating are to be treated
-  as keep alive."* It does. Snapshot diff across the swap, same host, same
-  session set:
-  - live **rows** 24 → 26, **none vanished** — the row-preservation fix from the
-    2.11.6 regression still holds, so this is NOT that bug;
-  - live **PTYs** 13 Running → 9. **Seven sessions lost their terminal**
-    (5 `remote-cc://dev/...`, `remote-session://oc/...`,
-    `remote-session://charts-webapp/...`).
-  Severity is bounded and should not be overstated: **click = resume still
-  recovers them** (verified — re-opening one returned it Running at 168x63 with
-  zero contract violations and its real scrollback), and an agent CLI's own
-  history lives in its JSONL, so no user work is lost. What is lost is the LIVE
-  attach that "keep alive" promises across an update.
-  **The structural half — likely the same root cause.** Each swap leaves its
-  predecessor alive and still owning PTYs, so jojo now runs a CHAIN:
-  `3489946 (Jul 24 05:06, ppid=1) → 3535306 (Jul 24 06:37) → 773597 (Jul 25
-  13:14, v2.12.11)`, with real `bash` children under ALL THREE. The current
-  daemon reports `owned_terminal_session_count: 5` plus four keys under
-  `preserved_terminal_owner_keys` — and 5+4 = exactly the 9 survivors, so
-  "preserved" means *still owned by an ancestor*, not *safely carried over*.
-  This is the same pile-up as the parked dev-daemon item below, now reproduced
-  on jojo and getting one daemon worse per deploy.
-  ⚠ It is also the ROOT CAUSE of the stranded-declare entry below: a session on
-  an ancestor daemon is absent from the current daemon's declare store, so the
-  rail rebuild finds nothing and fails silently.
-  **Diagnose** by diffing `owned_terminal_session_keys` against
-  `preserved_terminal_owner_keys`, and by PTY ancestry (`ppid` of the `bash`
-  children) — never by row count, which stays healthy through this.
-
-- **⚠ TRAP: A VERSION BUMP LOCKS THE NEW CLI OUT OF THE RUNNING DAEMON — drive
-  the hot-restart from the OLD binary (hit 2026-07-25 deploying 2.12.11).** The
-  daemon socket path is version-keyed (`~/.yggterm/server-2-12-11.sock`).
-  `server status` has fallback discovery and will happily answer from the
-  2.12.10 daemon, which makes everything look fine; `server monitor --scenario
-  hot-restart` does NOT — it dials the version-derived path, finds nothing, and
-  fails with `connecting to …/server-2-12-11.sock`. The deploy then silently
-  does nothing while `status` still reports a healthy daemon.
-  **Recipe:** keep the displaced binary (`mv yggterm-headless
-  yggterm-headless.prev-<old>`) and run the hot-restart from *it*, pointing
-  `--daemon-exe` at the new one — the old CLI reaches the old socket, and the
-  daemon spawns the new exe. Two more things that bite in the same minute:
-  a running binary cannot be `cp`'d over (`ETXTBSY`) but CAN be displaced with
-  `mv` (the live process keeps the unlinked inode); and `--expected-version`
-  equal to the running version makes hot-restart a no-op ("target daemon already
-  matches"), so a same-version rebuild never deploys — bump the version or the
-  swap is a lie.
-  ⚠ **Handoff is DEFERRED, by design:** the new daemon comes up owning **0**
-  sessions with every live PTY under `preserved_terminal_owner_keys`, held by
-  the old daemon (`hot_update_handoff_preserved_owner`). Sessions survive and
-  the GUI shows them all, but the old daemon does not retire until its sessions
-  end — so a fleet mid-deploy legitimately runs 3 daemons, and those sessions
-  keep talking to the OLD one (see the `preserved`-owner declare entry below).
+- **★★ THE DAEMONS CHAIN, AND ONE IDLE `bash -i` IS WHY (root-caused
+  2026-07-25; the RPC half FIXED, the durable half OPEN).**
+  ⛔ **First, a correction to this entry's own earlier wording.** I filed the
+  observed "13 Running -> 9" across the 2.12.11 swap as *"a hot restart kills
+  live PTYs, violating keep-alive."* That is WRONG. The trace shows those seven
+  are `progressive_migration_session_released` events — the **designed**
+  kill-and-re-resume by which an agent session is handed to the successor. That
+  is exactly why click = resume recovered one at 168x63 with real scrollback.
+  Rows never dropped (24 -> 26). Nothing is violated by the release itself.
+  **What IS wrong:** the drain that performs those releases had exactly one
+  call site — the `disk_binary_replaced` self-retire branch — so an explicit
+  `HotRestart` RPC (what a deploy sends) preserved its PTYs and started no
+  drain at all. jojo only appeared to migrate because the middle daemon still
+  had a thread alive from an earlier self-retire. **FIXED** — the accept loop
+  now starts the drain on a preserving handoff, locked both directions.
+  **STILL OPEN — the durable half.** `session_kind_is_migratable_agent`
+  (`daemon.rs`) admits only `Codex | CodexLiteLlm | ClaudeCode`: a plain shell
+  is not re-resumable, and there is **no fd passing anywhere in the tree**
+  (`SCM_RIGHTS`/`sendmsg` -> zero hits), so the only way to move a PTY is
+  kill-and-re-resume. Therefore **one idle `bash -i` pins its daemon at its
+  birth version forever**, and the daemon can never reach empty hands:
+  `daemon_should_idle_shutdown` refuses while any terminal session remains, and
+  the stale-daemon sweep refuses a local shell. Live on jojo: three of the four
+  stranded keys are `bash -i`. Fixing this needs lossless fd-handoff
+  (`SCM_RIGHTS`) — that is the real work. A cheaper MITIGATION, and a policy
+  call not an obvious win: let a **non-keep-alive** shell on a lingering
+  predecessor be reaped so the daemon can drain, trading that shell's live
+  scrollback for convergence. It must never touch a keep-alive shell.
+  **Diagnose** by `~/.yggterm/hot-update-terminal-owners.json` (runtime key ->
+  owner socket + pid) and PTY ancestry — never by row count, which stays
+  healthy throughout.
 
 - **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT (found
   2026-07-25). One blocker is PROVEN; a second, first filed here as proven, is
@@ -108,13 +84,31 @@ fix) once the fix is verified live on jojo.
   jojo: `right-panel pane:notes` on a shadow dispatched
   `terminal_app_declares`, completed in ~860 ms, applied nothing, and emitted
   no `daemon_declare_*` reason. The rail simply never appeared.
+  ⛔ **CORRECTION to this entry's own fix list.** It proposed "have the
+  surviving daemon proxy declares for the sessions it lists as preserved."
+  **That proxy already exists** and shipped with the feature (`cb4eff9`):
+  `ServerRequest::TerminalAppDeclares` resolves
+  `preserved_owner_endpoint_for_request` and forwards to the owning daemon. So
+  the design was never missing. Two other things were, both now proven from the
+  live trace:
+  1. **The owner could not answer.** `TerminalAppDeclares` shipped in 2.12.10,
+     and the stranded session's owner was **2.12.9** — it cannot deserialize the
+     request, so it writes nothing. The proxy dutifully reported
+     `preserved_owner_request_failed {error: "parsing daemon response: \"\""}`.
+  2. **The client threw that away.** Both rebuild paths ended in
+     `.unwrap_or_default()`, collapsing "the fetch FAILED" into "there are no
+     declares" — which is the whole of "no error, no trace." **FIXED**: they now
+     branch, and trace `daemon_declare_unavailable` (with the error) separately
+     from `daemon_declare_absent` (reached the owner, genuinely nothing there).
+  So the remaining gap is only that a pre-2.12.10 owner is unanswerable, which
+  the daemon could detect up front from the recorded
+  `PreservedTerminalOwnerEntry.owner_server_version` instead of issuing a
+  request it knows will fail. Once the daemon chain converges (entry above),
+  this stops arising at all.
   **Diagnose** by comparing the two key lists in `server status` — a session in
   `preserved_terminal_owner_keys` is on the old owner. **Unblock** with a fresh
   session on the current daemon (proven: same yedit, fresh session, full rail
-  rebuilt on a shadow that never saw the declare). **Fix** is one of: have the
-  rebuild trace an explicit "no declare for this session" reason so the failure
-  is legible, and/or have the surviving daemon proxy declares for the sessions
-  it lists as preserved.
+  rebuilt on a shadow that never saw the declare).
 
 
 - **★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
