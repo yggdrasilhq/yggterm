@@ -36,6 +36,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
@@ -2637,6 +2638,10 @@ struct DaemonRuntime {
     pending_remote_pty_resizes:
         Arc<Mutex<HashMap<String, (RemoteMachineRef, String, SessionKind, u16, u16)>>>,
     remote_pty_resize_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// Content gate for the routine persist paths — see
+    /// [`write_persisted_state_if_changed`]. `None` until this daemon has
+    /// written the file once, so the first persist of a process always writes.
+    last_persisted_state: Option<PersistedStateFingerprint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2760,6 +2765,7 @@ impl DaemonRuntime {
             superseded_routine_persist_muted: false,
             pending_remote_pty_resizes: Arc::new(Mutex::new(HashMap::new())),
             remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            last_persisted_state: None,
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -5298,7 +5304,11 @@ impl DaemonRuntime {
         // order flows through here, so the shared-scope ledger observes the
         // order exactly once per mutation, with no per-handler bookkeeping.
         self.record_row_order_ledger(None);
-        write_persisted_state(&self.state_path, &self.server.persisted_state())
+        write_persisted_state_if_changed(
+            &self.state_path,
+            &self.server.persisted_state(),
+            &mut self.last_persisted_state,
+        )
     }
 
     /// Record the current live order into the shared row-order ledger scope
@@ -5364,11 +5374,15 @@ impl DaemonRuntime {
     /// The grid flush only needs the grid on disk, so skip the identity refresh here.
     /// Genuine lifecycle events still call the full `persist()`. See campaign D1 / the
     /// born-at-correct-size synchronous flush.
-    fn persist_state_only(&self) -> Result<()> {
+    fn persist_state_only(&mut self) -> Result<()> {
         if self.routine_persist_muted() {
             return Ok(());
         }
-        write_persisted_state(&self.state_path, &self.server.persisted_state())
+        write_persisted_state_if_changed(
+            &self.state_path,
+            &self.server.persisted_state(),
+            &mut self.last_persisted_state,
+        )
     }
 
     fn persisted_state_for_update_restart(&mut self) -> PersistedDaemonState {
@@ -13118,12 +13132,80 @@ fn load_persisted_state(path: &Path) -> Result<Option<PersistedDaemonState>> {
     Ok(Some(state))
 }
 
+/// What the last successful write put on disk: the hash of the bytes written,
+/// plus the file identity observed straight afterwards. The content half
+/// answers "would this write change anything"; the file-identity half is what
+/// stops a stale in-process hash from suppressing a NEEDED write after
+/// anything else touched the file — the update-restart snapshot writes a
+/// different document through the unconditional primitive, and a successor
+/// daemon owns the file outright during a handover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedStateFingerprint {
+    content_hash: u64,
+    file_len: u64,
+    file_modified: Option<SystemTime>,
+}
+
+fn persisted_state_content_hash(json: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(json, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+fn persisted_state_file_identity(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+/// Write the state only when the bytes would differ from what the last write
+/// left on disk. Every persist serialized the whole document (2.2 MB on the
+/// live host), copied the old file to `.previous.json`, wrote a temp and
+/// renamed it — ~6.7 MB of IO for a document that is usually byte-identical to
+/// the one already there. The backup is also worth more this way: it now holds
+/// the last DIFFERENT state instead of a copy of the current one.
+///
+/// The hash must be taken over the bytes actually written and nothing less. A
+/// gate keyed on a field subset silently stops persisting the first field it
+/// does not cover, and this is the file that holds the user's sessions.
+fn write_persisted_state_if_changed(
+    path: &Path,
+    state: &PersistedDaemonState,
+    fingerprint: &mut Option<PersistedStateFingerprint>,
+) -> Result<()> {
+    let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
+    let content_hash = persisted_state_content_hash(&json);
+    if let Some(previous) = *fingerprint
+        && previous.content_hash == content_hash
+        && let Some((file_len, file_modified)) = persisted_state_file_identity(path)
+        && previous.file_len == file_len
+        && previous.file_modified == file_modified
+    {
+        return Ok(());
+    }
+    write_persisted_state_json(path, &json)?;
+    *fingerprint =
+        persisted_state_file_identity(path).map(|(file_len, file_modified)| {
+            PersistedStateFingerprint {
+                content_hash,
+                file_len,
+                file_modified,
+            }
+        });
+    Ok(())
+}
+
+/// The unconditional primitive. `PrepareUpdateRestart` and the handover paths
+/// write through here and MUST always write.
 fn write_persisted_state(path: &Path, state: &PersistedDaemonState) -> Result<()> {
+    let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
+    write_persisted_state_json(path, &json)
+}
+
+fn write_persisted_state_json(path: &Path, json: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating daemon state dir {}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
     if path.exists() {
         let backup_path = path.with_file_name(format!(
             "{}.previous.json",
@@ -14094,11 +14176,12 @@ mod tests {
         MigratableSignals, MigrationCandidateRow, RemoteMachineRefreshQueueStatus,
         SERVER_PROTOCOL_VERSION, apply_terminal_runtime_truth_to_snapshot,
         daemon_background_copy_chore_enabled_from_env, mark_remote_machine_refresh_queued,
-        parse_daemon_version_triple, preserved_owner_candidate_for_runtime_key,
+        parse_daemon_version_triple, persisted_state_content_hash,
+        preserved_owner_candidate_for_runtime_key,
         preserved_owner_saved_session_mismatch_should_detach,
         remove_session_should_detach_keep_alive_runtime, select_next_migration_candidate,
         session_is_migratable, session_kind_is_migratable_agent, terminal_reuse_needs_restart,
-        terminal_sidebar_snapshot_from_screen,
+        terminal_sidebar_snapshot_from_screen, write_persisted_state_if_changed,
     };
     use crate::TerminalManager;
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18755,6 +18838,128 @@ mod tests {
         assert_eq!(loaded.active_session_path, expected.active_session_path);
         assert_eq!(loaded.live_sessions, expected.live_sessions);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn persist_gate_test_state(active: &str) -> PersistedDaemonState {
+        PersistedDaemonState {
+            active_session_path: Some(active.to_string()),
+            active_view_mode: super::WorkspaceViewMode::Terminal,
+            ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
+            stored_sessions: Vec::new(),
+            live_sessions: Vec::new(),
+            session_pty_grids: Vec::new(),
+        }
+    }
+
+    fn persist_gate_test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-persist-gate-{name}-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    #[test]
+    fn an_unchanged_persist_writes_nothing_and_a_changed_one_writes() {
+        let root = persist_gate_test_root("unchanged");
+        let state_path = root.join("server-state.json");
+        let backup_path = root.join("server-state.previous.json");
+        let mut gate = None;
+
+        let state = persist_gate_test_state("remote-session://dev/first");
+        write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("first write");
+        let after_first = fs::metadata(&state_path).expect("state file").modified().ok();
+        assert!(!backup_path.exists(), "nothing to back up on the first write");
+
+        // Same logical state, so the same bytes: nothing on disk may move, and
+        // no backup may be taken (a backup of an identical file is worthless
+        // and costs a full copy of the document).
+        write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("second write");
+        assert_eq!(
+            fs::metadata(&state_path).expect("state file").modified().ok(),
+            after_first,
+            "an unchanged persist must not rewrite the state file"
+        );
+        assert!(
+            !backup_path.exists(),
+            "an unchanged persist must not copy 2.2 MB into the backup"
+        );
+        assert!(
+            !root.join("server-state.json.tmp").exists(),
+            "an unchanged persist must not leave a temp file"
+        );
+
+        let changed = persist_gate_test_state("remote-session://dev/second");
+        write_persisted_state_if_changed(&state_path, &changed, &mut gate).expect("third write");
+        let loaded = load_persisted_state(&state_path)
+            .expect("load state")
+            .expect("state");
+        assert_eq!(
+            loaded.active_session_path.as_deref(),
+            Some("remote-session://dev/second"),
+            "a changed state must still be written"
+        );
+        assert!(
+            backup_path.exists(),
+            "a changed state must still take the backup"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The anti-staleness half. Without the file re-stat, an in-process hash
+    /// that happens to match suppresses the write forever and the user's
+    /// sessions never come back.
+    #[test]
+    fn a_state_file_that_changed_underneath_us_is_rewritten_even_when_unchanged() {
+        let root = persist_gate_test_root("external");
+        let state_path = root.join("server-state.json");
+        let mut gate = None;
+
+        let state = persist_gate_test_state("remote-session://dev/first");
+        write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("first write");
+        fs::write(&state_path, "{}").expect("truncate state file externally");
+
+        write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("second write");
+
+        let loaded = load_persisted_state(&state_path)
+            .expect("load state")
+            .expect("state");
+        assert_eq!(
+            loaded.active_session_path.as_deref(),
+            Some("remote-session://dev/first"),
+            "an externally overwritten state file must be rewritten"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The gate is only worth anything if identical logical state serializes to
+    /// identical bytes. `session_pty_grids` comes from a HashMap and is sorted
+    /// on the way out for exactly this reason; if any other field ever grows an
+    /// unordered source the gate stops firing and this test is the notice.
+    #[test]
+    fn identical_logical_state_serializes_to_identical_bytes() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        // Twelve keys through the one HashMap-sourced field, so an unsorted
+        // iteration would show up as different bytes on the second call.
+        for index in 0..12 {
+            server.record_session_pty_grid(&format!("local://session-{index}"), 120, 36);
+        }
+        let first = serde_json::to_string_pretty(&server.persisted_state()).expect("serialize");
+        let second = serde_json::to_string_pretty(&server.persisted_state()).expect("serialize");
+        assert_eq!(first, second);
+        assert_eq!(
+            persisted_state_content_hash(&first),
+            persisted_state_content_hash(&second)
+        );
     }
 
     #[test]
