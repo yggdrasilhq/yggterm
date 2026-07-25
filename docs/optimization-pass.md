@@ -308,13 +308,32 @@ Independent of the render work, so it can run in parallel.
   entry it just used and revalidates on a background thread; a changed
   `local_build_id` still resolves in the foreground, and staleness is bounded at
   six hours.
-- `copy_scan`: incremental off mtime, skip unchanged stores, back off when nothing
-  changed.
-- `daemon/persist`: dirty-flag or debounce; the state is re-serialized far more often
-  than it changes.
-- `snapshot_response`: memoize by generation.
+- ~~`copy_scan`: incremental off mtime, skip unchanged stores, back off when nothing
+  changed.~~ ✅ **BUILT 2026-07-25, NOT DEPLOYED.** It was not a caching problem at
+  all. `shell.rs` put a whole `RemoteMachineSnapshot` on every copy target — 644
+  targets × a 1.75 MB machine ≈ 1.1 GB of allocation per scan — and each target then
+  opened three sqlite connections (~2151 per scan) through the store's one-shot
+  resolver wrappers. Targets now carry a session-list-free `RemoteMachineRef` and the
+  sweep holds ONE open `SessionTitleResolver`. The mtime-incremental idea is still
+  open, and is now measurable: `build_local_cwd_tree` has its own
+  `background/local_tree_scan` span, and the daemon chore no longer runs it inside the
+  runtime read lock (which is also why `daemon/background_copy_chore`'s p50 will RISE
+  from 0.0 — the span finally contains the work).
+- ~~`daemon/persist`: dirty-flag or debounce; the state is re-serialized far more often
+  than it changes.~~ ✅ **BUILT 2026-07-25, NOT DEPLOYED.** Content-hash gate plus a
+  file re-stat: an unchanged persist writes nothing and takes no backup. The
+  unconditional primitive is kept for `PrepareUpdateRestart` and the handover paths.
+- `snapshot_response`: memoize by generation. **Half done.** The per-session screen
+  work under it is memoized on `(output seq, resize seq, PTY width, model size)` —
+  built 2026-07-25, not deployed. The remaining cost is the 2.1 MB
+  `remote_machines` deep copy in `snapshot()` itself; the fix there is `Arc` +
+  copy-on-write, NOT a generation counter (there are 15+ mutation sites and a
+  hand-bumped counter that one of them forgets serves a stale session list to the
+  sidebar). **Still open.**
 - `copy_generation/title` + `summary`: cache by content hash, never regenerate for an
-  unchanged transcript.
+  unchanged transcript. **Still open**, and the 429 rule governs it: the negative row
+  may only be written on an outcome that came back from the MODEL, never on a 429 and
+  never on a heuristic returned after a transport failure.
 - The GUI's 0.220-core idle floor: hunt full-window blits in the Dioxus shell.
 
 ## 5. Constraints that outrank being fast
