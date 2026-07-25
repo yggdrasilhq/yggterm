@@ -57965,6 +57965,31 @@ async fn process_pending_app_control_requests(
                     .to_string(),
             ),
         },
+        // A kind this GUI KNOWS, whose payload it cannot read — a field of an
+        // existing command changed shape (e.g. `selector` became an object when
+        // text/role addressing landed). Same dropbox, same failure mode, same
+        // answer: refuse with the reason rather than let the file be deleted and
+        // the caller time out. The serde message names the field and what it
+        // expected, which is the whole clue.
+        AppControlCommand::Unreadable {
+            requested_kind,
+            detail,
+        } => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(json!({
+                "accepted": false,
+                "reason": "unreadable_command_payload",
+                "kind": requested_kind,
+                "detail": detail,
+                "gui_version": env!("CARGO_PKG_VERSION"),
+            })),
+            error: Some(format!(
+                "this GUI build cannot read that app-control command's payload ({requested_kind}): {detail}; swap the GUI binary (server app clients shows its pid/started_at)"
+            )),
+        },
         AppControlCommand::ListCommands => {
             let keymap = state.read().keymap.clone();
             let commands: Vec<Value> = command_registry::SHELL_COMMANDS

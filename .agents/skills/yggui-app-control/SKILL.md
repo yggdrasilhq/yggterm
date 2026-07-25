@@ -142,19 +142,28 @@ change how you work:
 yggterm server app web do click --text "Proceed to Pay" --exact --session <path>
 yggterm server app web do click --role button --label "Continue" --session <path>
 
-# N verbs behind ONE gate. The human still wins mid-batch: real seat input
-# aborts the remainder with `preempted` + `remaining: n`.
+# N verbs behind ONE gate. The human still wins — at the batch's START as well
+# as mid-run: a click waiting when the batch opens refuses it (`preempted`),
+# and real seat input mid-run aborts the remainder with `remaining: n`. That
+# refusal consumes the count, so simply re-issuing the batch opens it.
+#   ⚠ READ THE ENVELOPE, not just `accepted`: `{requested, attempted,
+#   succeeded, failed}`. `accepted` is TRUE only when the batch ran to the end
+#   AND every action succeeded — a 31-field fill where every selector missed is
+#   `accepted:false, succeeded:0, failed:31`, never "the form filled".
 yggterm server app web batch --script fill-form.txt --session <path>
 
 # Split the flow: script it on curl, hand the session over, hand it back.
 yggterm server app web cookies --import login.jar --session <path>
 #   ⚠ the jar is per-PROFILE; an unqualified surface is `default`, the USER'S
 #   OWN browsing jar. Check the `profile` field in the response.
+#   An EXPORTED jar is written 0600 — it is a live credential, not a report.
 
 # Pixels of ONE element, in-page — works on a surface nobody has ever seen.
 yggterm server app web capture-element --selector img#captcha out.png --split 6
 
 # See into iframes. `read` with NO --frame searches every reachable frame.
+#   `result` is still the TOP DOCUMENT's answer (the old shape, unchanged);
+#   `frames[]` is added beside it. Nothing that read `.result` broke.
 yggterm server app web frames --session <path>
 yggterm server app web read --as forms --frame billdesk --session <path>
 
