@@ -32,6 +32,12 @@ ENV_SUBSET_KEYS = {
     "YGGTERM_ENABLE_XTERM_CANVAS",
     "YGGTERM_HOME",
     "YGGTERM_XTERM_CANVAS_POLICY",
+    # Which GL path this sample was taken under. Without it the before/after CPU
+    # numbers are uninterpretable: software vs hardware GL is a 4x to 22x difference
+    # in the very quantity this smoke measures.
+    "YGGTERM_WEBKIT_GL_POLICY",
+    "LIBGL_ALWAYS_SOFTWARE",
+    "GALLIUM_DRIVER",
 }
 
 
@@ -558,8 +564,6 @@ def launch_env_from_session(session_info: dict, backend: str, remote_home: str) 
         env["DISPLAY"] = display
         env["XAUTHORITY"] = xauthority
         env["GDK_BACKEND"] = "x11"
-        if not env.get("YGGTERM_ENABLE_WEBKIT_COMPOSITING"):
-            env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
     return env
 
 

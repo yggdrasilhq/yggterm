@@ -15,7 +15,6 @@ const INSTALL_STATE_FILENAME: &str = "install-state.json";
 pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
-pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 // Set to 1 to keep the desktop's native input method (ibus/fcitx) for the GUI.
 // By default the launcher forces GTK's simple IM module: on desktops with an
 // active IME, WebKitGTK delivers keystrokes through the IME's Wayland/XIM
@@ -25,7 +24,13 @@ pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_C
 // The simple module still supports compose/dead keys; only full IME engines
 // (e.g. CJK) need the opt-out. See finding-ibus-cumulative-input.
 pub const ENV_YGGTERM_ENABLE_NATIVE_IME: &str = "YGGTERM_ENABLE_NATIVE_IME";
-const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v3";
+// v4 (2026-07-25): the WEBKIT_DISABLE_COMPOSITING_MODE guard is GONE. A launcher
+// cannot probe the host, so anything it decided about GL was a guess — and because
+// the binary treats that variable as a user force-disable and returns early, the
+// guess PRE-EMPTED the binary's own decision on every installed system. Bumping the
+// marker is what makes `launcher_file_looks_stale` rewrite the launchers already on
+// disk; without the bump the fix reaches nobody who has already installed.
+const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v4";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
@@ -1300,10 +1305,6 @@ fn linux_launcher_script(
         "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{NO_AT_BRIDGE+x}}\" ]; then\n  export NO_AT_BRIDGE=1\nfi\n",
         env_enable = ENV_YGGTERM_ENABLE_ACCESSIBILITY,
     );
-    let webkit_guard = format!(
-        "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{WEBKIT_DISABLE_COMPOSITING_MODE+x}}\" ]; then\n  export WEBKIT_DISABLE_COMPOSITING_MODE=1\nfi\n",
-        env_enable = ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING,
-    );
     // Force GTK's simple IM module unless the user opts back into the native IME.
     // Without this, an active ibus/fcitx makes WebKitGTK re-emit the cumulative
     // textarea buffer on every keystroke (the "s -> s, t -> sst" bug). See
@@ -1321,7 +1322,7 @@ fn linux_launcher_script(
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ]; then\n  use_headless=0\n  if [ \"${{1:-}}\" = 'server' ]; then\n    use_headless=1\n    if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n      use_headless=0\n    fi\n  fi\n  if [ \"${{1:-}}\" = '--version' ] || [ \"${{1:-}}\" = '-V' ] || [ \"${{1:-}}\" = 'version' ]; then\n    use_headless=1\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{im_module_guard}{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ]; then\n  use_headless=0\n  if [ \"${{1:-}}\" = 'server' ]; then\n    use_headless=1\n    if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n      use_headless=0\n    fi\n  fi\n  if [ \"${{1:-}}\" = '--version' ] || [ \"${{1:-}}\" = '-V' ] || [ \"${{1:-}}\" = 'version' ]; then\n    use_headless=1\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{im_module_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
@@ -1329,7 +1330,6 @@ fn linux_launcher_script(
         fallback = fallback_quoted,
         launcher_name = launcher_quoted,
         accessibility_guard = accessibility_guard,
-        webkit_guard = webkit_guard,
         im_module_guard = im_module_guard,
         export_root = export_root,
     )
@@ -1521,7 +1521,17 @@ mod tests {
             Path::new("/home/user/.local/share/yggterm/direct/versions/2.1.52/yggterm"),
             "yggterm launcher",
         );
-        assert!(script.contains("yggterm-direct-launcher-v3"));
+        assert!(script.contains("yggterm-direct-launcher-v4"));
+        // ⚠ The launcher must NOT decide the GL path. It cannot probe the host, and
+        // the binary reads WEBKIT_DISABLE_COMPOSITING_MODE as a deliberate user
+        // force-disable and returns early — so a launcher that exports it silently
+        // overrode the probe on every installed system, leaving hardware GL libraries
+        // with compositing off: a fifth combination outside the measured matrix, in
+        // which WebGL renders and never presents.
+        assert!(
+            !script.contains("WEBKIT_DISABLE_COMPOSITING_MODE"),
+            "the launcher must not pre-empt the binary's GL decision"
+        );
         // The IME guard forces GTK's simple input module unless the user opts back
         // into the native IME — without it ibus/fcitx makes WebKitGTK re-emit the
         // cumulative input buffer on every keystroke (the "s -> s, t -> sst" bug).
@@ -1532,6 +1542,84 @@ mod tests {
         assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
         assert!(script.contains("[ \"${1:-}\" = '--version' ]"));
         assert!(script.contains("target=\"$target_dir/yggterm-headless\""));
+    }
+
+    /// Whether a shipped script decides the WebKit GL path for the binary.
+    ///
+    /// `WEBKIT_DISABLE_COMPOSITING_MODE` is the one variable that PRE-EMPTS the
+    /// binary's own decision: the GUI treats it as a deliberate user force-disable and
+    /// returns before it ever asks the host. A launcher or smoke script that exports it
+    /// is therefore not "being safe", it is silently overriding the probe.
+    #[cfg(target_os = "linux")]
+    fn script_declares_the_webkit_gl_path(text: &str) -> bool {
+        text.contains("WEBKIT_DISABLE_COMPOSITING_MODE")
+    }
+
+    /// The scanner must be able to FIRE. A lock that can only pass is worth nothing —
+    /// this repo has been burned by a source scanner that silently skipped 90k of
+    /// 137k lines and still reported green.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gl_path_scanner_detects_an_offending_script() {
+        assert!(script_declares_the_webkit_gl_path(
+            "if [ -z \"${WEBKIT_DISABLE_COMPOSITING_MODE+x}\" ]; then\n  export WEBKIT_DISABLE_COMPOSITING_MODE=1\nfi\n"
+        ));
+        assert!(script_declares_the_webkit_gl_path(
+            "env[\"WEBKIT_DISABLE_COMPOSITING_MODE\"] = \"1\"\n"
+        ));
+        assert!(!script_declares_the_webkit_gl_path(
+            "export GDK_BACKEND=x11\nexport NO_AT_BRIDGE=1\n"
+        ));
+    }
+
+    /// Five shell launchers and three python smokes used to re-encode the software-GL
+    /// premise, in three languages, on a host none of them could probe. The binary is
+    /// the one owner of that decision now; nothing in `scripts/` may answer it again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_shipped_script_decides_the_webkit_gl_path() {
+        let scripts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files_scanned = 0usize;
+        let mut lines_scanned = 0usize;
+        for entry in fs::read_dir(&scripts)
+            .expect("scripts/ must be readable")
+            .flatten()
+        {
+            let path = entry.path();
+            let is_script = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "sh" | "py" | "ps1"));
+            if !is_script {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            files_scanned += 1;
+            lines_scanned += text.lines().count();
+            if script_declares_the_webkit_gl_path(&text) {
+                offenders.push(path.display().to_string());
+            }
+        }
+        // The coverage floor is the point: a scanner that read nothing would otherwise
+        // report a clean bill of health forever.
+        assert!(
+            files_scanned >= 40,
+            "the scanner only read {files_scanned} scripts — it has gone blind"
+        );
+        assert!(
+            lines_scanned >= 20_000,
+            "the scanner only read {lines_scanned} lines — it has gone blind"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these scripts still decide the GL path the binary now probes for: {offenders:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

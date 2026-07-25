@@ -1465,7 +1465,6 @@ def main() -> int:
             launch_env["XAUTHORITY"] = x11_xauthority
             launch_env["GDK_BACKEND"] = "x11"
             launch_env["YGGTERM_FORCE_X11_BACKEND"] = "1"
-            launch_env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
         metadata["effective_backend"] = effective_backend
         metadata["launch_env"] = launch_env
         desktop_markers = " ".join(
