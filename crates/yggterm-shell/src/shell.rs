@@ -116874,7 +116874,15 @@ mod tests {
             )));
         }
 
+        // Prove the counter is alive before trusting a zero from it: a delta of
+        // 0 means nothing if the instrument never counts anything.
+        let before_open = yggterm_core::session_title_store_open_count();
         let resolver = SessionTitleResolver::new(&home).expect("open resolver");
+        assert_eq!(
+            yggterm_core::session_title_store_open_count() - before_open,
+            1,
+            "the store-open counter must observe an open, or the assertion below is vacuous"
+        );
         let opens_before = yggterm_core::session_title_store_open_count();
         for target in &targets {
             let _ = background_copy_job_for_target(
