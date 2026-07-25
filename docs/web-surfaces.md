@@ -656,8 +656,11 @@ the whole cost of yielding.
 
 `web read` with no `--frame` searches EVERY reachable frame and returns
 `frames: [{frame:{path,url,accessible}, result, error}]`, top document first
-(frame `[]`). A frame it cannot read is REPORTED with `accessible:false`, not
-omitted — "there is a frame here I cannot read" and "there is no frame here" are
+(frame `[]`), **and keeps answering `result`** — the top document's answer,
+which is exactly the pre-frames shape. `frames` is additive; dropping `result`
+would have handed every existing caller a silent `null`, which is the failure
+class this verb family exists to kill. A frame it cannot read is REPORTED with
+`accessible:false`, not omitted — "there is a frame here I cannot read" and "there is no frame here" are
 different facts, and a silent `[]` from the top document reads as "the site does
 not offer this". `web frames` gives per-frame element and interactable counts.
 
