@@ -345,6 +345,28 @@ pub enum WebSurfaceDoAction {
     },
 }
 
+/// Which frame of a page a verb addresses.
+///
+/// Why it exists: a top-document query against a page whose content lives in an
+/// iframe returns `[]` SILENTLY, and that silence reads as "the site does not
+/// offer this". The BillDesk case is the measurement — its iframe held 107
+/// elements while the top document had 17.
+///
+/// The top document is the frame at path `[]`, so "no frame" and "a frame" have
+/// the same shape and a caller never has to branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebFrameRef {
+    /// `window.frames[i]` of the top document.
+    Index(usize),
+    /// The first frame whose url contains this substring.
+    UrlContains(String),
+    /// An explicit descent, e.g. `[0, 2]` = the third frame of the first frame.
+    /// This is the form `web frames` reports, so its output feeds straight back
+    /// in.
+    Path(Vec<usize>),
+}
+
 /// What structured view a `read` verb returns (agent control plane, rung 1 —
 /// the cheapest, default observation an agent reaches for; docs/agent-control-
 /// plane.md). Never mutates, never moves a pointer.
@@ -805,6 +827,15 @@ pub enum AppControlCommand {
         #[serde(default)]
         session_path: Option<String>,
         script: String,
+        /// Run in this frame instead of the top document.
+        ///
+        /// ⚠ A `#[serde(default)]` field is DROPPED without complaint by an
+        /// older GUI, which would put `--frame` right back to querying the top
+        /// document silently — the exact failure this exists to kill. So the
+        /// response ECHOES `frame_resolved`, and the CLI hard-fails when the
+        /// echo is missing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<WebFrameRef>,
     },
     /// Capture a session's active web-surface tab: the FULL DOCUMENT (whole
     /// page, beyond the visible viewport) rendered to a PNG by the engine.
@@ -812,6 +843,17 @@ pub enum AppControlCommand {
         #[serde(default)]
         session_path: Option<String>,
         output_path: String,
+    },
+    /// Enumerate the page's frames: url, element counts, and whether each is
+    /// reachable from the top document's realm.
+    ///
+    /// The instrument the records run lacked. A cross-origin frame is REPORTED
+    /// (with `accessible: false` and the reason) rather than omitted — knowing
+    /// a frame exists and cannot be read is a completely different fact from
+    /// there being no frame.
+    WebSurfaceFrames {
+        #[serde(default)]
+        session_path: Option<String>,
     },
     /// Move a session's web-surface cookie jar to or from a Netscape file.
     ///
@@ -999,6 +1041,12 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         #[serde(default, rename = "as")]
         mode: WebSurfaceReadAs,
+        /// Read only this frame. OMITTED = read EVERY accessible frame,
+        /// including the top document — because a silent `[]` from the top
+        /// document is the failure mode, and searching everything by default is
+        /// what stops an agent concluding "the site does not offer this".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<WebFrameRef>,
     },
     /// Block until a condition holds on a session's active web-surface tab — the
     /// agent control plane `wait` verb (slice 2b, rung 2). The engine polls the
@@ -1109,6 +1157,7 @@ impl AppControlCommand {
                 | Self::WebSurfaceScreenshot { .. }
                 | Self::WebSurfaceCaptureElement { .. }
                 | Self::WebSurfaceRead { .. }
+                | Self::WebSurfaceFrames { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
                 // An unknown kind is never executed — it can only be refused,
@@ -1189,6 +1238,7 @@ impl AppControlCommand {
             Self::WebSurfaceDo { .. } => "web_surface_do",
             Self::WebSurfaceBatch { .. } => "web_surface_batch",
             Self::WebSurfaceRead { .. } => "web_surface_read",
+            Self::WebSurfaceFrames { .. } => "web_surface_frames",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",
             Self::EnsureWebSurface { .. } => "ensure_web_surface",
@@ -2052,6 +2102,7 @@ mod tests {
         let command = AppControlCommand::WebSurfaceRead {
             session_path: None,
             mode: WebSurfaceReadAs::Snapshot,
+            frame: None,
         };
         // Pure observation → read-only (skips the forced re-render).
         assert!(command.is_read_only());
@@ -2069,7 +2120,36 @@ mod tests {
             (r#"{"kind":"web_surface_read"}"#, WebSurfaceReadAs::Snapshot),
         ] {
             match serde_json::from_str::<AppControlCommand>(json).expect("deserialize") {
-                AppControlCommand::WebSurfaceRead { mode, .. } => assert_eq!(mode, expect),
+                AppControlCommand::WebSurfaceRead { mode, frame, .. } => {
+                    assert_eq!(mode, expect);
+                    // No `frame` on the wire = the top document, which is what
+                    // every previously-written request means.
+                    assert_eq!(frame, None);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // The three frame spellings survive the wire, and `frame` is omitted
+        // when absent so an OLDER GUI reading a new request is unaffected.
+        assert!(!serde_json::to_string(&command).unwrap().contains("frame"));
+        for (json, expect) in [
+            (
+                r#"{"kind":"web_surface_read","frame":{"index":2}}"#,
+                WebFrameRef::Index(2),
+            ),
+            (
+                r#"{"kind":"web_surface_read","frame":{"path":[0,2]}}"#,
+                WebFrameRef::Path(vec![0, 2]),
+            ),
+            (
+                r#"{"kind":"web_surface_read","frame":{"url_contains":"billdesk"}}"#,
+                WebFrameRef::UrlContains("billdesk".into()),
+            ),
+        ] {
+            match serde_json::from_str::<AppControlCommand>(json).expect("deserialize frame") {
+                AppControlCommand::WebSurfaceRead { frame, .. } => {
+                    assert_eq!(frame, Some(expect));
+                }
                 other => panic!("wrong variant: {other:?}"),
             }
         }

@@ -184,7 +184,8 @@ use yggterm_server::{
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
-    WebElementRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
+    WebElementRef, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
+    WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -46754,7 +46755,7 @@ async fn app_pane_run_action_with_order(
         });
     }
     if let Some(script) = reply.eval {
-        let outcome = web_surface_eval_for(&state, &desktop, None, &script).await;
+        let outcome = web_surface_eval_for(&state, &desktop, None, &script, None).await;
         if !outcome
             .get("accepted")
             .and_then(Value::as_bool)
@@ -46863,11 +46864,23 @@ async fn web_surface_eval_for(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
     script: &str,
+    frame: Option<&WebFrameRef>,
 ) -> Value {
     let (session, native_id) = match resolve_live_web_surface(state, session_path) {
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
+    // `--frame` wraps the caller's script so it evaluates in the FRAME's realm;
+    // the script itself is unchanged, which is what keeps one meaning of `eval`.
+    let wrapped;
+    let script = match frame {
+        Some(frame) => {
+            wrapped = web_frame_scoped_script(frame, script);
+            wrapped.as_str()
+        }
+        None => script,
+    };
+    let framed = frame.is_some();
     let (tx, rx) =
         tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, script, move |outcome| {
@@ -46879,11 +46892,28 @@ async fn web_surface_eval_for(
         Ok(Ok(Ok(value_json))) => {
             let value: Value = serde_json::from_str(&value_json)
                 .unwrap_or_else(|_| Value::String(value_json.clone()));
+            if !framed {
+                return json!({
+                    "accepted": true,
+                    "session_path": session,
+                    "native_id": native_id,
+                    "value": value,
+                    "frame_resolved": Value::Null,
+                });
+            }
+            // The wrapper's own answer, unwrapped — and `frame_resolved` is
+            // echoed either way, because a caller that passed `--frame` must be
+            // able to tell "this GUI ran it in the frame" from "this GUI does
+            // not know about frames and silently ran it on the top document".
+            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
             json!({
-                "accepted": true,
+                "accepted": ok,
                 "session_path": session,
                 "native_id": native_id,
-                "value": value,
+                "value": value.get("result").cloned().unwrap_or(Value::Null),
+                "frame_resolved": value.get("frame").cloned().unwrap_or(Value::Null),
+                "reason": value.get("reason").cloned().unwrap_or(Value::Null),
+                "detail": value.get("detail").cloned().unwrap_or(Value::Null),
             })
         }
         // C8: a script that returned a Promise and a webview whose content
@@ -49332,6 +49362,74 @@ mod web_do_verb_tests {
         assert!(agent_lease_refusal(&[], false).is_none());
     }
 
+    // C3a: the three ways of naming a frame each compile to a resolver, and all
+    // three answer with a PATH — which is the form `web frames` reports, so its
+    // output feeds straight back in.
+    #[test]
+    fn every_frame_ref_compiles_to_a_resolver_that_reports_its_path() {
+        let by_index = web_frame_resolver_js(&WebFrameRef::Index(2));
+        assert!(by_index.contains("var path=[2]"), "{by_index}");
+        let by_path = web_frame_resolver_js(&WebFrameRef::Path(vec![0, 2]));
+        assert!(by_path.contains("var path=[0,2]"), "{by_path}");
+        let by_url = web_frame_resolver_js(&WebFrameRef::UrlContains("billdesk".into()));
+        assert!(by_url.contains("\"billdesk\""), "{by_url}");
+        // A url search must skip the TOP document (path length 0), or every
+        // query would "match" the page it started from.
+        assert!(by_url.contains("path.length&&"), "{by_url}");
+        // All three distinguish "not there" from "there but cross-origin".
+        assert!(by_index.contains("cross:true"), "{by_index}");
+        assert!(by_path.contains("cross:true"), "{by_path}");
+    }
+
+    // The wrapper must run the caller's script in the FRAME's realm without
+    // altering it — that is what keeps ONE extractor per read mode instead of a
+    // second copy threading a document handle.
+    #[test]
+    fn a_frame_scoped_script_evaluates_the_original_source_untouched() {
+        let inner = "(function(){return document.title;})()";
+        let js = web_frame_scoped_script(&WebFrameRef::Index(1), inner);
+        // The inner script is passed as a STRING to the frame's own eval, so it
+        // is never rewritten.
+        assert!(js.contains("f.w.eval("), "{js}");
+        assert!(js.contains(&serde_json::to_string(inner).unwrap()), "{js}");
+        // Three honest refusals, not one.
+        for reason in ["frame_not_found", "frame_cross_origin", "frame_eval_failed"] {
+            assert!(js.contains(reason), "wrapper never reports {reason}");
+        }
+        // …and the frame it resolved is echoed, which is what a CLI checks to
+        // prove the GUI understood --frame at all.
+        assert!(js.contains("frame:{path:f.path,url:f.url}"), "{js}");
+    }
+
+    // A no-frame `read` searches EVERYTHING, and reports a frame it could not
+    // read rather than omitting it — "there is a frame here I cannot read" and
+    // "there is no frame here" are different facts, and reporting only the
+    // second is how a top-document [] came to read as "the site does not offer
+    // this".
+    #[test]
+    fn the_all_frames_walk_reports_unreadable_frames_instead_of_dropping_them() {
+        let js = web_all_frames_script("(function(){return 1;})()");
+        assert!(js.contains("accessible:false"), "{js}");
+        assert!(js.contains("'frame_cross_origin'"), "{js}");
+        // Bounded depth: a pathological nesting must not make the answer
+        // unbounded.
+        assert!(js.contains("path.length>=4"), "{js}");
+        // The top document is walked first and is frame [].
+        assert!(js.contains("walk(window,[])"), "{js}");
+    }
+
+    // The enumeration must carry the COUNTS. A top-document read returning []
+    // next to a frame reporting 107 elements is a legible answer; the [] alone
+    // was not.
+    #[test]
+    fn frame_enumeration_reports_how_much_is_in_each_frame() {
+        assert!(WEB_FRAMES_ENUM_JS.contains("elements:elements"));
+        assert!(WEB_FRAMES_ENUM_JS.contains("interactables:interactables"));
+        // A cross-origin frame is listed with a REASON, not skipped.
+        assert!(WEB_FRAMES_ENUM_JS.contains("reason:'cross_origin'"));
+        assert!(WEB_FRAMES_ENUM_JS.contains("accessible:false"));
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -50222,6 +50320,152 @@ async fn web_surface_wait_for(
     }
 }
 
+/// JS that finds a frame's `window` from a [`WebFrameRef`].
+///
+/// Returns `{w, path, url}` for a reachable frame, `{cross:true, path}` for a
+/// frame that exists but belongs to another origin, or `null` when nothing
+/// matches — three answers, because "not there" and "there but not readable"
+/// need different responses from the caller.
+fn web_frame_resolver_js(frame: &WebFrameRef) -> String {
+    let quote = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    match frame {
+        WebFrameRef::Index(index) => web_frame_path_resolver_js(&[*index]),
+        WebFrameRef::Path(path) => web_frame_path_resolver_js(path),
+        WebFrameRef::UrlContains(needle) => format!(
+            "(function(){{var want={want},found=null;\
+             function walk(w,path){{if(found)return;var url=null;\
+             try{{url=w.location.href;}}catch(e){{return;}}\
+             if(path.length&&url.indexOf(want)!==-1){{found={{w:w,path:path,url:url}};return;}}\
+             for(var i=0;i<w.frames.length;i++){{try{{walk(w.frames[i],path.concat([i]));}}catch(e){{}}}}}}\
+             walk(window,[]);return found;}})()",
+            want = quote(needle),
+        ),
+    }
+}
+
+fn web_frame_path_resolver_js(path: &[usize]) -> String {
+    format!(
+        "(function(){{var path={path};var w=window;\
+         for(var i=0;i<path.length;i++){{\
+         if(!w.frames||path[i]>=w.frames.length)return null;w=w.frames[path[i]];}}\
+         var url=null;try{{url=w.location.href;}}catch(e){{return{{cross:true,path:path}};}}\
+         return{{w:w,path:path,url:url}};}})()",
+        path = serde_json::to_string(path).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+/// Run `inner` inside a frame's own realm.
+///
+/// The trick that keeps ONE extractor per read mode: `otherWindow.eval(src)`
+/// evaluates in that window's global scope, so a script written against bare
+/// `document` runs against the FRAME's document without a single character of
+/// it changing. Rewriting every extractor to thread a `D`/`W` pair would be a
+/// second copy of each one, waiting to drift.
+fn web_frame_scoped_script(frame: &WebFrameRef, inner: &str) -> String {
+    format!(
+        "(function(){{var f={resolver};\
+         if(!f)return{{ok:false,reason:'frame_not_found'}};\
+         if(f.cross)return{{ok:false,reason:'frame_cross_origin',frame:{{path:f.path,url:null}}}};\
+         var out;try{{out=f.w.eval({src});}}\
+         catch(e){{return{{ok:false,reason:'frame_eval_failed',\
+         frame:{{path:f.path,url:f.url}},detail:String(e&&e.message||e)}};}}\
+         return{{ok:true,frame:{{path:f.path,url:f.url}},result:out}};}})()",
+        resolver = web_frame_resolver_js(frame),
+        src = serde_json::to_string(inner).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// Run `inner` in EVERY reachable frame, top document first.
+///
+/// This is what `read` does by default. A cross-origin frame is still REPORTED
+/// — with `accessible:false` and a reason — because "there is a frame here I
+/// cannot read" and "there is no frame here" are different facts, and reporting
+/// only the second is how a top-document `[]` came to read as "the site does
+/// not offer this".
+fn web_all_frames_script(inner: &str) -> String {
+    format!(
+        "(function(){{var src={src},out=[];\
+         function walk(w,path){{\
+         var url=null,accessible=true;\
+         try{{url=w.location.href;}}catch(e){{accessible=false;}}\
+         if(!accessible){{out.push({{frame:{{path:path,url:null,accessible:false}},\
+         result:null,error:'frame_cross_origin'}});return;}}\
+         var r=null,err=null;\
+         try{{r=w.eval(src);}}catch(e){{err=String(e&&e.message||e);}}\
+         out.push({{frame:{{path:path,url:url,accessible:true}},result:r,error:err}});\
+         if(path.length>=4)return;\
+         for(var i=0;i<w.frames.length;i++){{\
+         try{{walk(w.frames[i],path.concat([i]));}}catch(e){{\
+         out.push({{frame:{{path:path.concat([i]),url:null,accessible:false}},\
+         result:null,error:'frame_cross_origin'}});}}}}}}\
+         walk(window,[]);return out;}})()",
+        src = serde_json::to_string(inner).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// Enumerate every frame: path, url, reachability, and how much is IN it.
+///
+/// The element counts are the point. A top-document `read` returning `[]` next
+/// to a frame reporting 107 elements is a legible answer; the `[]` alone was
+/// not. Depth is capped at 4 so a pathological nesting cannot make the answer
+/// unbounded.
+const WEB_FRAMES_ENUM_JS: &str = "(function(){var out=[];\
+    function walk(w,path){\
+    var url=null,accessible=true;\
+    try{url=w.location.href;}catch(e){accessible=false;}\
+    if(!accessible){out.push({path:path,url:null,accessible:false,\
+    reason:'cross_origin',elements:null,interactables:null});return;}\
+    var d=w.document;\
+    var elements=d?d.querySelectorAll('*').length:null;\
+    var interactables=d?d.querySelectorAll(\
+    'a,button,input,select,textarea,[role],[onclick],[contenteditable]').length:null;\
+    out.push({path:path,url:url,accessible:true,title:d?d.title:null,\
+    elements:elements,interactables:interactables});\
+    if(path.length>=4)return;\
+    for(var i=0;i<w.frames.length;i++){\
+    try{walk(w.frames[i],path.concat([i]));}\
+    catch(e){out.push({path:path.concat([i]),url:null,accessible:false,\
+    reason:'cross_origin',elements:null,interactables:null});}}}\
+    walk(window,[]);return out;})()";
+
+/// App-control `frames`: what frames this page has, and how much is in each.
+async fn web_surface_frames_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    match web_do_eval(desktop, native_id, WEB_FRAMES_ENUM_JS).await {
+        Ok(frames) => {
+            let list = frames.as_array().cloned().unwrap_or_default();
+            let inaccessible = list
+                .iter()
+                .filter(|frame| {
+                    !frame
+                        .get("accessible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .count();
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "frames": list,
+                "cross_origin_frames": inaccessible,
+                // Say what this build can and cannot do with what it just
+                // listed, so a caller does not have to discover the split by
+                // trying it.
+                "detail": "a cross-origin frame is listed but not addressable by --frame; read it via the top document's own API, or click through the iframe element's rect",
+            })
+        }
+        Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
+    }
+}
+
 /// App-control: structured, read-only observation of a session's active
 /// web-surface tab — the agent control plane `read` verb (slice 2b, rung 1, the
 /// cheapest observation). Resolves the live surface (reaches a soft-stashed one
@@ -50232,19 +50476,61 @@ async fn web_surface_read_for(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
     mode: WebSurfaceReadAs,
+    frame: Option<&WebFrameRef>,
 ) -> Value {
     let (session, native_id) = match resolve_live_web_surface(state, session_path) {
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
-    match web_do_eval(desktop, native_id, web_read_script(mode)).await {
-        Ok(result) => json!({
-            "accepted": true,
-            "session_path": session,
-            "native_id": native_id,
-            "as": web_read_mode_name(mode),
-            "result": result,
-        }),
+    let extractor = web_read_script(mode);
+    let Some(frame) = frame else {
+        // NO --frame = EVERY reachable frame, top document first. A silent `[]`
+        // from the top document is the failure this verb family had; searching
+        // everything by default is what stops it recurring.
+        let script = web_all_frames_script(extractor);
+        return match web_do_eval(desktop, native_id, &script).await {
+            Ok(frames) => {
+                let list = frames.as_array().cloned().unwrap_or_default();
+                json!({
+                    "accepted": true,
+                    "session_path": session,
+                    "native_id": native_id,
+                    "as": web_read_mode_name(mode),
+                    // The top document is frame `[]`, so a caller reading
+                    // `frames[0].result` gets exactly what the old shape gave
+                    // it — and now also learns what else is on the page.
+                    "frames": list,
+                    "frame_resolved": Value::Null,
+                    "searched_all_frames": true,
+                })
+            }
+            Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
+        };
+    };
+    let script = web_frame_scoped_script(frame, extractor);
+    match web_do_eval(desktop, native_id, &script).await {
+        Ok(info) => {
+            if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "as": web_read_mode_name(mode),
+                    "reason": info.get("reason").and_then(Value::as_str).unwrap_or("frame_failed"),
+                    "detail": info.get("detail"),
+                    // ECHOED EVEN ON FAILURE: its ABSENCE is what tells a CLI
+                    // it is talking to a GUI that dropped the field entirely.
+                    "frame_resolved": info.get("frame").cloned().unwrap_or(Value::Null),
+                });
+            }
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "as": web_read_mode_name(mode),
+                "result": info.get("result").cloned().unwrap_or(Value::Null),
+                "frame_resolved": info.get("frame").cloned().unwrap_or(Value::Null),
+            })
+        }
         Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
 }
@@ -54423,6 +54709,7 @@ async fn process_pending_app_control_requests(
                     &desktop,
                     params.session_path.as_deref(),
                     &script,
+                    None,
                 )
                 .await;
                 let error = result
@@ -55549,9 +55836,16 @@ async fn process_pending_app_control_requests(
         AppControlCommand::WebSurfaceEval {
             session_path,
             script,
+            frame,
         } => {
-            let result =
-                web_surface_eval_for(&state, &desktop, session_path.as_deref(), &script).await;
+            let result = web_surface_eval_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &script,
+                frame.as_ref(),
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -55594,6 +55888,26 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceFrames { session_path } => {
+            let data = web_surface_frames_for(&state, &desktop, session_path.as_deref()).await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("frames verb failed")
+                        .to_string()
+                }),
+                data: Some(data),
             }
         }
         AppControlCommand::WebSurfaceCookies {
@@ -55842,9 +56156,19 @@ async fn process_pending_app_control_requests(
                 error,
             }
         }
-        AppControlCommand::WebSurfaceRead { session_path, mode } => {
-            let result =
-                web_surface_read_for(&state, &desktop, session_path.as_deref(), mode).await;
+        AppControlCommand::WebSurfaceRead {
+            session_path,
+            mode,
+            frame,
+        } => {
+            let result = web_surface_read_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                mode,
+                frame.as_ref(),
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
