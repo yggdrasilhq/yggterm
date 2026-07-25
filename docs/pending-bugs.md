@@ -62,31 +62,40 @@ fix) once the fix is verified live on jojo.
   end — so a fleet mid-deploy legitimately runs 3 daemons, and those sessions
   keep talking to the OLD one (see the `preserved`-owner declare entry below).
 
-- **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT — it waits
-  for a condition the role gate forbids (found 2026-07-25).** `app open`
-  settles only on `interactive` = `terminal_rendered && terminal_input_enabled`
-  (`terminal_observe.rs:591`). A shadow may never hold terminal focus (slice-4.0
-  role gate, deliberate), so it lands in the `visible` arm — `rendered=true,
-  interactive=false, reason "terminal rendered but focus is outside the
-  terminal"` — and `app open` times out **even though its own payload says
-  `"ready": true`**. Live on jojo: `app open <fresh session> --client agent-r17`
-  → `Error: timed out waiting for app open to settle … "ready":true`.
-  A second, independent blocker sits in front of it: a session spawned with
+- **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT (found
+  2026-07-25). One blocker is PROVEN; a second, first filed here as proven, is
+  WITHDRAWN — read both before spending a round.**
+  **PROVEN — the unsized-PTY grid divergence.** A session spawned with
   `terminal new --no-activate` is never sized by any client, so its PTY keeps
   the spawn default (`pty_cols: 120, pty_rows: 36`) while the shadow's viewport
-  is 167×57 — and `app open` refuses on the session/view contract
-  ("diverges from daemon PTY grid … broken-bottom risk"). The shadow cannot fix
-  this itself either: driving PTY winsize is denied to it by the same gate.
-  **Why it matters:** these two together mean the prescribed agent flow
-  (`terminal new --no-activate` → open on the shadow) cannot open a TERMINAL
-  lane at all, which collides head-on with
-  [[feedback-agentic-surface-is-the-default]]. Document surfaces are unaffected
-  — they replace the viewport, so the yedit rail work was provable via
-  `right-panel` while `app open` on the same session failed.
-  **Fix direction:** `app open` should settle on `ready`/`visible` for a client
-  that is role-denied focus, instead of waiting for an interactivity it can
-  never reach; and a no-activate spawn needs a grid (inherit the requesting
-  client's, or let the opening client's viewport size an unsized PTY).
+  is 167×57. `app open` then refuses outright:
+  `session/view contract violation: Client viewport 167×57 diverges from daemon
+  PTY grid 120×36 (broken-bottom risk)`. The shadow cannot resolve this itself:
+  driving PTY winsize is denied to it by the slice-4.0 role gate, deliberately.
+  This alone breaks the prescribed agent flow (`terminal new --no-activate` →
+  open on the shadow), which collides with
+  [[feedback-agentic-surface-is-the-default]].
+  ⛔ **WITHDRAWN — "it waits for an interactivity the role gate forbids."** I
+  filed that from the timeout's summary line
+  (`"ready":true, reason:"terminal rendered but focus is outside the terminal"`)
+  and it does not survive reading the code. `app_control_open_path_ready`
+  (`crates/yggterm-server/src/lib.rs:17612`) only requires `interactive` when
+  **`!ready && !terminal_open_attempt_ready`** — and that payload said
+  `ready: true`, so the interactive gate was never the thing that failed. The
+  real reason it returned false is the check ~40 lines earlier: `viewport
+  .active_session_path` still pointed at the shadow's PREVIOUS session, not the
+  target, so the shadow's viewport never switched at all. **`reason` describes
+  whatever session the viewport is currently showing, not the one being opened**
+  — reading it as a verdict on the target is the misread that produced this
+  entry. Why the switch never happened is NOT yet established; that is the open
+  question, and it may simply be the proven blocker above firing first.
+  **Fix direction:** give a no-activate spawn a grid (inherit the requesting
+  client's, or let the opening client's viewport size a never-sized PTY) and
+  re-test. Only if `app open` still hangs afterwards is there a second bug —
+  and then diagnose it from `active_session_path`, not from `reason`.
+  Document surfaces are unaffected either way: they replace the viewport, which
+  is why the yedit rail work was provable via `right-panel` on the same session
+  whose `app open` failed.
 
 - **★★ A SESSION STRANDED ON A `preserved` OWNER HAS NO DECLARES, AND THE RAIL
   REBUILD FAILS SILENTLY (found 2026-07-25).** The declare-rebuild
