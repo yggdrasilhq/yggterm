@@ -626,6 +626,9 @@ fn regenerate_remote_machine_copy(
         }
     };
 
+    // Routing only: the persist path never reads the session list, and hoisting
+    // it out of the loop keeps it from copying the machine per session.
+    let machine_ref = machine.routing_ref();
     for scanned in sessions {
         report.scanned += 1;
         let context = match fetch_remote_generation_context(&target, &scanned.storage_path) {
@@ -772,7 +775,7 @@ fn regenerate_remote_machine_copy(
             scanned.cached_summary.clone()
         };
         if let Err(error) = persist_remote_generated_copy_with_options(
-            &machine,
+            &machine_ref,
             &scanned.session_id,
             &scanned.cwd,
             title.as_deref(),
