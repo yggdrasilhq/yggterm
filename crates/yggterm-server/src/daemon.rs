@@ -13510,7 +13510,55 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
     // carries its role on EVERY request without each call site remembering to.
     // Unset = anonymous = Active, and an anonymous envelope serializes
     // byte-identical to the bare request, so the GUI's wire is unchanged.
-    send_request_as(endpoint, request, &current_client_identity())
+    let identity = current_client_identity();
+    if let Some(refusal) = shadow_client_refusal(request, &identity) {
+        return Ok(refusal);
+    }
+    send_request_as(endpoint, request, &identity)
+}
+
+/// The CLIENT half of the slice-4.0 role contract: a Shadow does not ASK for
+/// what the daemon will refuse.
+///
+/// The daemon's gate was never wrong — the client was wrong to ask. Round 20
+/// proved that at the mount (`terminal_ensure` was denied, the mount treated the
+/// denial as fatal, and the shadow's terminal viewport came up blank BY
+/// CONSTRUCTION) and fixed those three call sites by hand. The live trace then
+/// showed the class was wider: `refresh_remote_machine` (76 refusals),
+/// `sync_terminal_identity` (28) and `refresh_managed_cli` (16) are background
+/// work no shadow can ever complete, each paying a round trip to be told so.
+///
+/// This is the one chokepoint every client request already passes through, and
+/// it is keyed on the daemon's own [`role_gate`] — so client and daemon cannot
+/// drift, and a newly added Deny variant is covered the day it is added. The
+/// refusal is byte-identical to the daemon's (`SHADOW_CANNOT_OWN`), so call
+/// sites see exactly what they saw before, minus the round trip.
+///
+/// ⚠ Deliberately NOT a replacement for the skip-and-continue call sites: an
+/// error is still an error to a caller that treats it as fatal. Code that must
+/// carry on without the request (the read-only mount) skips it explicitly.
+fn shadow_client_refusal(
+    request: &ServerRequest,
+    identity: &ClientIdentity,
+) -> Option<ServerResponse> {
+    if identity.role != ClientRole::Shadow || role_gate(request) != ShadowAccess::Deny {
+        return None;
+    }
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "client",
+            "role_gate",
+            "shadow_not_asked",
+            shadow_refused_trace_fields(
+                server_request_name(request),
+                identity.client_id.as_deref(),
+            ),
+        );
+    }
+    Some(ServerResponse::Error {
+        message: SHADOW_CANNOT_OWN.to_string(),
+    })
 }
 
 /// Send a request declaring this client's slice-4.0 identity/role.
@@ -14879,6 +14927,50 @@ mod tests {
                 "shadow must be refused ownership/mutation: {req:?}"
             );
         }
+    }
+
+    /// The CLIENT half of the role contract (round 21). A Shadow must not even
+    /// ASK for a Deny request: the daemon refuses it anyway, so the round trip
+    /// buys nothing and the caller still has to handle a failure it could have
+    /// predicted. `refresh_remote_machine` (76 refusals in the live journal),
+    /// `sync_terminal_identity` (28) and `refresh_managed_cli` (16) were all
+    /// paying that toll on a loop.
+    ///
+    /// The refusal must be byte-identical to the daemon's, or call sites that
+    /// already handle `shadow_cannot_own` would see a second, different failure.
+    #[test]
+    fn a_shadow_client_refuses_its_own_deny_requests_before_the_wire() {
+        use super::{
+            ClientIdentity, ClientRole, SHADOW_CANNOT_OWN, ServerRequest, ServerResponse,
+            ShadowAccess, role_gate, shadow_client_refusal,
+        };
+        let shadow = ClientIdentity {
+            role: ClientRole::Shadow,
+            client_id: Some("agent-r21".into()),
+        };
+        let denied = ServerRequest::RefreshRemoteMachine {
+            machine_key: "dev".into(),
+        };
+        assert_eq!(role_gate(&denied), ShadowAccess::Deny);
+        match shadow_client_refusal(&denied, &shadow) {
+            Some(ServerResponse::Error { message }) => assert_eq!(message, SHADOW_CANNOT_OWN),
+            other => panic!("a shadow must refuse its own deny request locally: {other:?}"),
+        }
+
+        // Reads still go to the wire — the shadow's whole purpose is observing.
+        let allowed = ServerRequest::TerminalSnapshot { path: "p".into() };
+        assert_eq!(role_gate(&allowed), ShadowAccess::Allow);
+        assert!(
+            shadow_client_refusal(&allowed, &shadow).is_none(),
+            "a shadow must still be able to observe"
+        );
+
+        // The user's GUI is untouched: an Active/anonymous client sends whatever
+        // it likes, exactly as before.
+        assert!(
+            shadow_client_refusal(&denied, &ClientIdentity::anonymous()).is_none(),
+            "the gate must never fire for the user's own client"
+        );
     }
 
     #[test]
