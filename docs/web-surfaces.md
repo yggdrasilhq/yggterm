@@ -584,11 +584,17 @@ Two consequences an implementer will otherwise rediscover the hard way:
 
 - **CLI and GUI must be swapped together.** A newer CLI's verb reaching an older
   GUI is a version mismatch, not a bug.
-- **It answers honestly now.** A well-formed request with an unknown `kind`
-  deserializes into `AppControlCommand::Unsupported` and is REFUSED with
-  `unsupported_command_kind`. Before that it was deleted unread and the caller
-  saw a bare timeout. Malformed JSON is still deleted — a corrupt file is not a
-  version mismatch.
+- **It answers honestly now, for the kind AND for the payload.** A well-formed
+  request with an unknown `kind` deserializes into
+  `AppControlCommand::Unsupported` and is REFUSED with
+  `unsupported_command_kind`. A KNOWN kind whose FIELDS this build cannot read
+  is salvaged from the envelope into `AppControlCommand::Unreadable` and refused
+  with `unreadable_command_payload` plus the serde error (`invalid type: map,
+  expected a string`) as the clue — that is the mismatch a changed field shape
+  produces, e.g. `do click --text` against a GUI that types `selector` as a bare
+  string. Before that, both were deleted unread and the caller saw a bare
+  timeout. Malformed JSON, and any file whose envelope is not a request, is
+  still deleted — a corrupt file is not a version mismatch.
 - **A `#[serde(default)]` field added to an EXISTING command is silently
   DROPPED by an older GUI**, which is worse than a timeout: the verb succeeds
   and does the wrong thing. Every such field must be ECHOED in the response and
