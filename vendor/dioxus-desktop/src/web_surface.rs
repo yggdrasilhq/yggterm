@@ -445,7 +445,14 @@ thread_local! {
 /// it holds either way. They are NOT time-based: nothing here expires on a
 /// clock, and any credit still unspent when the verb completes is dropped by
 /// [`take_seat_input_count`] so it can never swallow a later human gesture.
-fn grant_injection_credits(surface_id: u64, count: u64) {
+///
+/// `pub` because the seat-input accounting is only HALF of the human-preempt
+/// gate: the other half is the shell's `web_do_gate` / batch loop, which
+/// consumes the count this produces. A lock that drives the shell half with a
+/// literal count is not a lock at all (it synthesizes the defect away), so the
+/// shell's tests drive the REAL accounting through these three entry points.
+/// They are pure thread-local bookkeeping — no GTK, no webview.
+pub fn grant_injection_credits(surface_id: u64, count: u64) {
     INJECTED_CREDITS.with(|credits| {
         *credits.borrow_mut().entry(surface_id).or_insert(0) += count;
     });
@@ -474,7 +481,11 @@ fn deliver_injected_event(webview: &webkit2gtk::WebView, event: &gdk::Event) {
     INJECTING_EVENT.with(|flag| flag.set(false));
 }
 
-fn note_seat_input(surface_id: u64) {
+/// The seat-input observer's entry point: an input event was seen on this
+/// surface. Books it as the human unless it is one of our own injections.
+///
+/// `pub` for the same reason as [`grant_injection_credits`] — see its note.
+pub fn note_seat_input(surface_id: u64) {
     if INJECTING_EVENT.with(|flag| flag.get()) {
         return; // our own injection, not the human
     }
