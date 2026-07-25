@@ -33,6 +33,13 @@ ENV_SUBSET_KEYS = {
     "YGGTERM_HOME",
     "YGGTERM_XTERM_CANVAS_POLICY",
 }
+# ⚠⚠ read_env_subset() reads /proc/<pid>/environ, which is the EXEC-TIME environment:
+# setenv/unsetenv move the environ array to the heap while the kernel keeps exposing
+# the copy the process was launched with. So a variable the app writes to its own
+# environment after start is NOT visible here, and one it removes still appears.
+# That is why the GL keys are not in the set above — they are all written after exec.
+# The GL path is read from the client-instance record instead (read_webkit_gl below),
+# which the GUI publishes from its own view.
 
 
 def read_total_jiffies():
@@ -77,6 +84,24 @@ def read_environ(pid):
 def read_env_subset(pid):
     env = read_environ(pid)
     return {key: env[key] for key in sorted(ENV_SUBSET_KEYS) if key in env}
+
+
+# Which GL path this pid is on, as the GUI itself published it. Without this the
+# before/after CPU numbers are uninterpretable: software vs hardware GL is a 4x to 22x
+# difference in the very quantity this smoke measures. It comes from the client-instance
+# record and NOT from /proc/<pid>/environ, because /proc cannot answer it (see the note
+# on ENV_SUBSET_KEYS). Empty = this pid published no record, never "software".
+def read_webkit_gl(pid):
+    root = pathlib.Path(YGGTERM_HOME) / "client-instances"
+    for path in sorted(root.glob("*/{}-*.json".format(pid))):
+        try:
+            record = json.loads(path.read_text())
+        except Exception:
+            continue
+        published = record.get("webkit_gl_environment")
+        if isinstance(published, dict):
+            return published
+    return {}
 
 
 def read_stat(pid):
@@ -171,6 +196,7 @@ def snapshot():
             "comm": comm,
             "cmdline": cmdline,
             "env": read_env_subset(pid),
+            "webkit_gl": read_webkit_gl(pid),
             "jiffies": stat["jiffies"],
         }
         task_dir = pathlib.Path("/proc") / str(pid) / "task"
@@ -558,8 +584,6 @@ def launch_env_from_session(session_info: dict, backend: str, remote_home: str) 
         env["DISPLAY"] = display
         env["XAUTHORITY"] = xauthority
         env["GDK_BACKEND"] = "x11"
-        if not env.get("YGGTERM_ENABLE_WEBKIT_COMPOSITING"):
-            env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
     return env
 
 
