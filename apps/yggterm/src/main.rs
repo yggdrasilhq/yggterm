@@ -570,6 +570,23 @@ fn parse_web_element_ref(
     Ok(None)
 }
 
+/// Escape a literal so it matches itself as a regex.
+///
+/// `--until url:contains:<s>` is SUGAR, not a second predicate: it compiles to
+/// the same `UrlMatches` the regex form does, so there is exactly one url rule
+/// in the GUI. Escaping happens here, where the user's literal is, rather than
+/// by teaching the matcher a second mode.
+fn regex_escape_literal(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len() * 2);
+    for c in literal.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 /// Split one batch-script line into argv tokens, honouring `'`/`"` quoting and
 /// backslash escapes.
 ///
@@ -1117,7 +1134,11 @@ fn print_server_app_help() {
   yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]
   yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]
     one `do` invocation per line; # comments and blank lines skipped
-  yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
+  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]
+    cond: load:committed | load:finished | idle:<ms> | settled:<ms>
+        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>
+    url:* and settled:* are read from the ENGINE, so they survive a navigation
+    that makes every page-side predicate unavailable
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
   yggterm server app web devtools [--close] [--session <path>]
@@ -3322,11 +3343,29 @@ fn main() -> Result<()> {
                             Some(("js", expr)) => WebSurfaceWaitUntil::Js {
                                 expr: expr.to_string(),
                             },
+                            // `url:matches:<re>` and its sugar `url:contains:<s>`
+                            // compile to ONE predicate: the sugar is escaped
+                            // into a regex here rather than becoming a second
+                            // matching rule in the GUI.
+                            Some(("url", rest)) => match rest.split_once(':') {
+                                Some(("matches", pattern)) => WebSurfaceWaitUntil::UrlMatches {
+                                    pattern: pattern.to_string(),
+                                },
+                                Some(("contains", needle)) => WebSurfaceWaitUntil::UrlMatches {
+                                    pattern: regex_escape_literal(needle),
+                                },
+                                _ => anyhow::bail!(
+                                    "bad --until url:… ({rest}) — use url:matches:<regex> or url:contains:<substring>"
+                                ),
+                            },
+                            Some(("settled", ms)) => WebSurfaceWaitUntil::Settled {
+                                ms: ms.parse().context("--until settled:<ms> needs a number")?,
+                            },
                             _ => match raw {
                                 "committed" => WebSurfaceWaitUntil::LoadCommitted,
                                 "finished" | "load" | "loaded" => WebSurfaceWaitUntil::LoadFinished,
                                 other => anyhow::bail!(
-                                    "bad --until: {other} (load:committed|load:finished|idle:<ms>|selector:<css>|js:<expr>)"
+                                    "bad --until: {other} (load:committed|load:finished|idle:<ms>|settled:<ms>|selector:<css>|js:<expr>|url:matches:<re>|url:contains:<s>)"
                                 ),
                             },
                         };

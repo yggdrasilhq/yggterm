@@ -48663,6 +48663,121 @@ mod web_do_verb_tests {
         assert_eq!(vault_secret_is_unusable("hunter2"), None);
     }
 
+    // THE C5 BUG, pinned. The poll loop used to RETURN on any eval error, so a
+    // navigation commit — which tears down and rebuilds the content process —
+    // killed the wait. That is precisely the situation `wait` exists for.
+    #[test]
+    fn an_eval_failure_is_not_yet_rather_than_the_end_of_the_wait() {
+        let failure: Result<Value, String> =
+            Err("eval callback dropped (surface destroyed mid-do?)".to_string());
+        assert_eq!(
+            wait_poll_outcome(&failure, None),
+            WaitStep::NotYet { eval_error: true },
+            "a navigation must not abort a wait"
+        );
+        // …and it is counted, so a wait that spent its whole budget failing is
+        // legible rather than looking like a quiet timeout.
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(false)), None),
+            WaitStep::NotYet { eval_error: false }
+        );
+        assert_eq!(wait_poll_outcome(&Ok(json!(true)), None), WaitStep::Met);
+        // `idle` returns a duration, not a boolean.
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(300.0)), Some(500)),
+            WaitStep::NotYet { eval_error: false }
+        );
+        assert_eq!(wait_poll_outcome(&Ok(json!(500.0)), Some(500)), WaitStep::Met);
+        // A non-numeric answer to an idle probe is not-yet, never "met".
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(true)), Some(500)),
+            WaitStep::NotYet { eval_error: false }
+        );
+    }
+
+    // `url:matches` against the recorded 4-hop chain: the predicate must be
+    // able to name the hop the caller is waiting for, and must NOT match the
+    // hops before it. Plain strings, no browser.
+    #[test]
+    fn url_matches_names_a_hop_of_the_recorded_redirect_chain() {
+        let chain = [
+            "https://rtionline.gov.in/request/request.php",
+            "https://merchant.sbi.bank.in/merchant/initpay",
+            "https://www.billdesk.com/pgidsk/pgmerc/sbiepay",
+            "https://pay.billdesk.com/web/v1_2/payments",
+            "https://auth.examplebank.test/netbanking/login",
+        ];
+        let probe = web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+            pattern: r"^https://auth\.examplebank\.bank\.in/".to_string(),
+        })
+        .expect("a valid pattern compiles");
+        let WaitProbe::Url { pattern } = probe else {
+            panic!("url:matches must be observed host-side, with no page eval");
+        };
+        for hop in &chain[..4] {
+            assert!(!pattern.is_match(hop), "matched too early on {hop}");
+        }
+        assert!(pattern.is_match(chain[4]));
+    }
+
+    // A bad pattern is refused UP FRONT, once — not rediscovered on every 100ms
+    // tick and finally reported as a timeout.
+    #[test]
+    fn a_bad_regex_is_refused_before_the_poll_loop_starts() {
+        let err = web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+            pattern: "[unclosed".to_string(),
+        })
+        .expect_err("an invalid pattern must refuse");
+        assert!(err.starts_with("bad_regex"), "{err}");
+    }
+
+    // `settled` is two observers and one rule. Each observer alone can veto.
+    #[test]
+    fn settled_requires_a_still_url_a_finished_load_and_a_quiet_page() {
+        // Everything quiet for long enough.
+        assert!(wait_settled_met(false, false, Some(900.0), 500));
+        // The url moved under us: a page bouncing through redirects is never
+        // settled, however quiet each hop looks.
+        assert!(!wait_settled_met(true, false, Some(900.0), 500));
+        // Committed but still fetching.
+        assert!(!wait_settled_met(false, true, Some(900.0), 500));
+        // Loaded, but still rewriting itself.
+        assert!(!wait_settled_met(false, false, Some(100.0), 500));
+        // The page half is unavailable mid-navigation: not-yet, never a
+        // fabricated success from the host half alone.
+        assert!(!wait_settled_met(false, false, None, 500));
+    }
+
+    // Each predicate must be observed where it can actually be answered: the
+    // two that exist to survive a navigation must not carry a page script as
+    // their only observer.
+    #[test]
+    fn each_wait_predicate_is_observed_where_it_can_be_answered() {
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::LoadFinished).unwrap(),
+            WaitProbe::Page { .. }
+        ));
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
+                pattern: "billdesk".into()
+            })
+            .unwrap(),
+            WaitProbe::Url { .. }
+        ));
+        assert!(matches!(
+            web_wait_probe(&WebSurfaceWaitUntil::Settled { ms: 800 }).unwrap(),
+            WaitProbe::Settled { ms: 800, .. }
+        ));
+        // `idle` and the page half of `settled` share ONE mutation observer.
+        let (WaitProbe::Page { script: idle, .. }, WaitProbe::Settled { script: settled, .. }) = (
+            web_wait_probe(&WebSurfaceWaitUntil::Idle { ms: 300 }).unwrap(),
+            web_wait_probe(&WebSurfaceWaitUntil::Settled { ms: 300 }).unwrap(),
+        ) else {
+            panic!("unexpected probe shapes");
+        };
+        assert_eq!(idle, settled, "two mutation clocks would answer differently");
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -49137,10 +49252,18 @@ mod web_do_verb_tests {
 
     #[test]
     fn wait_scripts_are_iifes_and_only_idle_carries_a_threshold() {
-        // Boolean conditions → no threshold; Idle → the ms threshold + observer.
+        fn page_parts(until: WebSurfaceWaitUntil) -> (String, Option<u64>) {
+            match web_wait_probe(&until).expect("valid predicate") {
+                WaitProbe::Page {
+                    script,
+                    idle_threshold_ms,
+                } => (script, idle_threshold_ms),
+                other => panic!("{until:?} is not a page-side predicate: {other:?}"),
+            }
+        }
         for (until, wants_threshold) in [
-            (WebSurfaceWaitUntil::LoadFinished, false),
             (WebSurfaceWaitUntil::LoadCommitted, false),
+            (WebSurfaceWaitUntil::LoadFinished, false),
             (
                 WebSurfaceWaitUntil::Selector {
                     css: "#x".into(),
@@ -49156,27 +49279,28 @@ mod web_do_verb_tests {
             ),
             (WebSurfaceWaitUntil::Idle { ms: 500 }, true),
         ] {
-            let (script, threshold) = web_wait_script(&until);
-            assert!(script.starts_with("(function(){"), "{until:?} not an IIFE");
-            assert_eq!(threshold.is_some(), wants_threshold, "{until:?} threshold");
+            let label = format!("{until:?}");
+            let (script, threshold) = page_parts(until);
+            assert!(script.starts_with("(function(){"), "{label} not an IIFE");
+            assert_eq!(threshold.is_some(), wants_threshold, "{label} threshold");
         }
         // Idle carries its ms and installs the one-time observer.
-        let (idle_script, threshold) = web_wait_script(&WebSurfaceWaitUntil::Idle { ms: 750 });
+        let (idle_script, threshold) = page_parts(WebSurfaceWaitUntil::Idle { ms: 750 });
         assert_eq!(threshold, Some(750));
         assert!(idle_script.contains("MutationObserver"));
         // A visible-selector wait checks the rect; a plain one does not.
-        let (vis, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+        let (vis, _) = page_parts(WebSurfaceWaitUntil::Selector {
             css: "#x".into(),
             visible: true,
         });
         assert!(vis.contains("getBoundingClientRect"));
-        let (plain, _) = web_wait_script(&WebSurfaceWaitUntil::Selector {
+        let (plain, _) = page_parts(WebSurfaceWaitUntil::Selector {
             css: "#x".into(),
             visible: false,
         });
         assert!(!plain.contains("getBoundingClientRect"));
         // The Js condition swallows exceptions (never aborts the wait).
-        let (js, _) = web_wait_script(&WebSurfaceWaitUntil::Js {
+        let (js, _) = page_parts(WebSurfaceWaitUntil::Js {
             expr: "a.b.c".into(),
         });
         assert!(js.contains("catch"));
@@ -49311,43 +49435,128 @@ fn web_read_mode_name(mode: WebSurfaceReadAs) -> &'static str {
     }
 }
 
-/// The JS that evaluates a `wait` condition. Returns a value the handler
-/// interprets: for `Idle` it is the ms-since-last-mutation number (met when
-/// `>= ms`); for every other condition it is a boolean (met when true). The
-/// `Idle` script installs a one-time MutationObserver on first call.
-fn web_wait_script(until: &WebSurfaceWaitUntil) -> (String, Option<u64>) {
-    match until {
-        WebSurfaceWaitUntil::LoadCommitted => (
-            "(function(){return document.readyState!=='loading';})()".to_string(),
-            None,
-        ),
-        WebSurfaceWaitUntil::LoadFinished => (
-            "(function(){return document.readyState==='complete';})()".to_string(),
-            None,
-        ),
+/// The page-side mutation clock, shared by `idle` and the page half of
+/// `settled`. ONE observer: a second `MutationObserver` under a different
+/// window key would answer a slightly different question every time the page
+/// re-ran one of the two scripts.
+const WEB_WAIT_IDLE_JS: &str =
+    "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
+     var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
+     o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
+     window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()";
+
+/// How one `wait` predicate is observed: in the page, on the host, or both.
+///
+/// The distinction is the whole point of C5. A page-side predicate is
+/// unavailable exactly when a navigation is in flight — which is when a caller
+/// waiting through a redirect chain most needs an answer — so the predicates
+/// that matter during navigation read the UI process's OWN page state instead.
+#[derive(Debug)]
+enum WaitProbe {
+    /// Page-side script. `idle_threshold_ms` is set only for `idle`, whose
+    /// script returns a duration rather than a boolean.
+    Page {
+        script: String,
+        idle_threshold_ms: Option<u64>,
+    },
+    /// Host-side only: the engine's current url. No eval, so a torn-down
+    /// content process cannot make this predicate unanswerable.
+    Url { pattern: regex::Regex },
+    /// Host-side url/loading PLUS the page's mutation clock.
+    Settled { script: String, ms: u64 },
+}
+
+fn web_wait_probe(until: &WebSurfaceWaitUntil) -> Result<WaitProbe, String> {
+    let page = |script: String| WaitProbe::Page {
+        script,
+        idle_threshold_ms: None,
+    };
+    Ok(match until {
+        WebSurfaceWaitUntil::LoadCommitted => {
+            page("(function(){return document.readyState!=='loading';})()".to_string())
+        }
+        WebSurfaceWaitUntil::LoadFinished => {
+            page("(function(){return document.readyState==='complete';})()".to_string())
+        }
         WebSurfaceWaitUntil::Selector { css, visible } => {
             let sel = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".to_string());
-            let script = if *visible {
+            page(if *visible {
                 format!("(function(){{var e=document.querySelector({sel});if(!e)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()")
             } else {
                 format!("(function(){{return !!document.querySelector({sel});}})()")
-            };
-            (script, None)
+            })
         }
-        WebSurfaceWaitUntil::Js { expr } => (
+        WebSurfaceWaitUntil::Js { expr } => page(format!(
             // Exceptions count as not-yet (return false), never abort the wait.
-            format!("(function(){{try{{return !!({expr});}}catch(e){{return false;}}}})()"),
-            None,
-        ),
-        WebSurfaceWaitUntil::Idle { ms } => (
-            "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
-             var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
-             o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
-             window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()"
-                .to_string(),
-            Some(*ms),
-        ),
+            "(function(){{try{{return !!({expr});}}catch(e){{return false;}}}})()"
+        )),
+        WebSurfaceWaitUntil::Idle { ms } => WaitProbe::Page {
+            script: WEB_WAIT_IDLE_JS.to_string(),
+            idle_threshold_ms: Some(*ms),
+        },
+        WebSurfaceWaitUntil::UrlMatches { pattern } => WaitProbe::Url {
+            // Compiled ONCE, before the loop, and refused up front — a bad
+            // pattern is a caller error, not something to rediscover on every
+            // 100 ms tick and report as a timeout.
+            pattern: regex::Regex::new(pattern)
+                .map_err(|error| format!("bad_regex: {error}"))?,
+        },
+        WebSurfaceWaitUntil::Settled { ms } => WaitProbe::Settled {
+            script: WEB_WAIT_IDLE_JS.to_string(),
+            ms: *ms,
+        },
+    })
+}
+
+/// What one poll tick decided. PURE, and `NotYet` is deliberately the answer to
+/// an eval FAILURE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitStep {
+    Met,
+    NotYet { eval_error: bool },
+}
+
+/// THE BUG THIS FIXES: the poll loop used to RETURN on any eval error.
+///
+/// During a multi-origin auto-submit chain the content process is repeatedly
+/// torn down and rebuilt, so every navigation commit failed the eval and killed
+/// the wait — which is why the records expedition could not wait through the chain
+/// at all and fell back to polling screenshots. An eval failure is NOT-YET: the
+/// page is simply unavailable this tick. Only a surface-resolution failure
+/// aborts, and the count of failed evals is reported so a wait that spent its
+/// whole budget failing is still legible instead of looking like a quiet
+/// timeout.
+fn wait_poll_outcome(eval: &Result<Value, String>, idle_threshold_ms: Option<u64>) -> WaitStep {
+    match eval {
+        Ok(value) => {
+            let met = match idle_threshold_ms {
+                Some(ms) => value.as_f64().map(|idle| idle >= ms as f64).unwrap_or(false),
+                None => value.as_bool().unwrap_or(false),
+            };
+            if met {
+                WaitStep::Met
+            } else {
+                WaitStep::NotYet { eval_error: false }
+            }
+        }
+        Err(_) => WaitStep::NotYet { eval_error: true },
     }
+}
+
+/// PURE `settled` rule: two observers, one predicate.
+///
+/// A url change resets it, so a page quietly bouncing through redirects can
+/// never be reported as settled; `is_loading` covers the case where the engine
+/// has committed a url but is still fetching; and the page's mutation clock
+/// covers a loaded page still rewriting itself. An unavailable page clock
+/// (mid-navigation) is not-yet, never a fabricated success.
+fn wait_settled_met(
+    url_changed: bool,
+    is_loading: bool,
+    page_idle_ms: Option<f64>,
+    want_ms: u64,
+) -> bool {
+    !url_changed && !is_loading && page_idle_ms.is_some_and(|idle| idle >= want_ms as f64)
 }
 
 /// App-control: block until a condition holds on a session's active web-surface
@@ -49366,29 +49575,79 @@ async fn web_surface_wait_for(
         Ok(resolved) => resolved,
         Err(reason) => return json!({ "accepted": false, "met": false, "reason": reason }),
     };
-    let (script, idle_ms) = web_wait_script(until);
+    let probe = match web_wait_probe(until) {
+        Ok(probe) => probe,
+        Err(reason) => {
+            return json!({
+                "accepted": false,
+                "met": false,
+                "session_path": session,
+                "reason": reason,
+            });
+        }
+    };
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms);
+    let mut eval_errors: u64 = 0;
+    let mut last_url: Option<String> = None;
+    let mut current_url: Option<String> = None;
     loop {
-        match web_do_eval(desktop, native_id, &script).await {
-            Ok(value) => {
-                let met = match idle_ms {
-                    Some(ms) => value.as_f64().map(|e| e >= ms as f64).unwrap_or(false),
-                    None => value.as_bool().unwrap_or(false),
-                };
-                if met {
-                    return json!({
-                        "accepted": true,
-                        "met": true,
-                        "elapsed_ms": start.elapsed().as_millis() as u64,
-                        "session_path": session,
-                        "native_id": native_id,
-                    });
+        let met = match &probe {
+            WaitProbe::Page {
+                script,
+                idle_threshold_ms,
+            } => {
+                let outcome = web_do_eval(desktop, native_id, script).await;
+                match wait_poll_outcome(&outcome, *idle_threshold_ms) {
+                    WaitStep::Met => true,
+                    WaitStep::NotYet { eval_error } => {
+                        if eval_error {
+                            eval_errors += 1;
+                        }
+                        false
+                    }
                 }
             }
-            Err(reason) => {
-                return json!({ "accepted": false, "met": false, "session_path": session, "reason": reason });
+            WaitProbe::Url { pattern } => {
+                let url = desktop
+                    .web_surface_page_state(native_id)
+                    .map(|(uri, _, _)| uri);
+                current_url = url.clone();
+                url.as_deref().is_some_and(|url| pattern.is_match(url))
             }
+            WaitProbe::Settled { script, ms } => {
+                let page_state = desktop.web_surface_page_state(native_id);
+                let url = page_state.as_ref().map(|(uri, _, _)| uri.clone());
+                // A missing page state means the engine cannot answer yet —
+                // treat it as loading rather than as settled.
+                let is_loading = page_state
+                    .as_ref()
+                    .map(|(_, _, loading)| *loading)
+                    .unwrap_or(true);
+                let url_changed = last_url.is_some() && last_url != url;
+                last_url = url.clone();
+                current_url = url;
+                let outcome = web_do_eval(desktop, native_id, script).await;
+                let page_idle_ms = match &outcome {
+                    Ok(value) => value.as_f64(),
+                    Err(_) => {
+                        eval_errors += 1;
+                        None
+                    }
+                };
+                wait_settled_met(url_changed, is_loading, page_idle_ms, *ms)
+            }
+        };
+        if met {
+            return json!({
+                "accepted": true,
+                "met": true,
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "session_path": session,
+                "native_id": native_id,
+                "eval_errors": eval_errors,
+                "url": current_url,
+            });
         }
         if start.elapsed() >= deadline {
             return json!({
@@ -49397,6 +49656,12 @@ async fn web_surface_wait_for(
                 "reason": "timeout",
                 "elapsed_ms": start.elapsed().as_millis() as u64,
                 "session_path": session,
+                // A wait that spent its whole budget failing to evaluate is a
+                // DIFFERENT failure from one that evaluated cleanly and never
+                // matched; reporting the count is what lets a caller tell them
+                // apart instead of guessing.
+                "eval_errors": eval_errors,
+                "url": current_url,
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
