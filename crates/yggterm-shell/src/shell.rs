@@ -6413,6 +6413,18 @@ struct ClientInstanceRecord {
     xdg_runtime_dir: Option<String>,
     #[serde(default)]
     xauthority: Option<String>,
+    /// Which GL path THIS window is on, as this process sees it.
+    ///
+    /// ⚠⚠ Published here, from the process's own environment, because
+    /// `/proc/<pid>/environ` CANNOT answer it: every one of these keys is written
+    /// after exec by `configure_linux_webkit_compositing`, and `setenv`/`unsetenv`
+    /// move the environ array to the heap while the kernel keeps exposing the
+    /// exec-time copy. A `/proc` reader therefore reports nothing on a fresh launch
+    /// and the PREDECESSOR's values on a hot restart — the decision and the state
+    /// disagreeing silently, on the very surface built to detect that. Absent
+    /// (legacy record, or a non-Linux host) reads as "not published", never as "off".
+    #[serde(default)]
+    webkit_gl_environment: BTreeMap<String, String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAppMode {
@@ -54428,6 +54440,8 @@ fn build_client_instance_record(
         xdg_session_id: env_var("XDG_SESSION_ID"),
         xdg_runtime_dir: env_var("XDG_RUNTIME_DIR"),
         xauthority: env_var("XAUTHORITY"),
+        // In-process, for the reason spelled out on the field.
+        webkit_gl_environment: yggterm_core::gl_probe::webkit_gl_environment_from_process(),
     }
 }
 
@@ -101417,6 +101431,48 @@ mod tests {
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
 
+    /// ⚠⚠ THE INSTRUMENT-LIE LOCK, client half. The record a GUI publishes must carry
+    /// the GL decision THIS process made.
+    ///
+    /// The read surface (`server app desktop-identity`) used to answer "which GL path
+    /// is this window on" out of `/proc/<pid>/environ`, which cannot know: those keys
+    /// are written after exec, so `/proc` reported nothing on a fresh launch and the
+    /// PREDECESSOR's decision after a hot restart. The record is the one place the
+    /// answer exists, and this fails if `build_client_instance_record` stops filling it
+    /// or starts filling it from anywhere but this process's own environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_published_record_carries_this_processs_gl_decision() {
+        // Exactly the shape of a hot-restarted GUI: inherit a software force, probe
+        // hardware, clear the force.
+        unsafe {
+            std::env::set_var(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE, "1");
+            std::env::set_var(
+                yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+                "hardware_gl_probed",
+            );
+            std::env::remove_var(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE);
+        }
+        let record = build_client_instance_record(std::process::id(), 7, None);
+        assert_eq!(
+            record
+                .webkit_gl_environment
+                .get(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY)
+                .map(String::as_str),
+            Some("hardware_gl_probed"),
+            "the record must publish the decision this process made"
+        );
+        assert!(
+            !record
+                .webkit_gl_environment
+                .contains_key(yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE),
+            "a software force this process CLEARED must not still be published as set"
+        );
+        unsafe {
+            std::env::remove_var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY);
+        }
+    }
+
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
 
     /// Sites in this crate still allowed to spell a store path by hand. The
@@ -114008,6 +114064,7 @@ mod tests {
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize live record");
         fs::write(&live_path, live_record).expect("write live path");
@@ -114112,6 +114169,7 @@ mod tests {
             xdg_session_id: Some("test-session".to_string()),
             xdg_runtime_dir: None,
             xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
         })
         .expect("serialize legacy record");
         fs::write(&legacy_path, legacy_record).expect("write legacy client record");
