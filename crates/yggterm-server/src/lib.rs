@@ -2529,12 +2529,17 @@ impl YggtermServer {
         }
     }
 
-    pub fn active_session(&self) -> Option<&ManagedSessionView> {
-        let key = self
-            .active_session_path
-            .as_deref()
-            .and_then(|path| self.resolve_session_storage_key(path))?;
+    /// The session a path resolves to, through the same storage-key resolution
+    /// [`Self::active_session`] uses. One derivation, so "look up this path" and
+    /// "look up the active path" cannot disagree about which session they mean.
+    pub fn session_for_path(&self, path: &str) -> Option<&ManagedSessionView> {
+        let key = self.resolve_session_storage_key(path)?;
         self.sessions.get(key)
+    }
+
+    pub fn active_session(&self) -> Option<&ManagedSessionView> {
+        let path = self.active_session_path.as_deref()?;
+        self.session_for_path(path)
     }
 
     pub fn active_session_path(&self) -> Option<&str> {
@@ -4137,6 +4142,23 @@ impl YggtermServer {
         )
     }
 
+    /// Whether a snapshot must LEAVE the viewport alone because this client, not
+    /// the daemon, chose it.
+    ///
+    /// True only for a slice-4 `Shadow` that has already picked a session. A
+    /// shadow with no choice yet still takes the daemon's, so it opens on
+    /// something rather than nothing; the user's own GUI always takes the
+    /// daemon's, because there its focus and the daemon's active session are the
+    /// same fact. Split out from [`YggtermServer::apply_snapshot`] so the rule can
+    /// be tested against both roles without writing the process-global identity
+    /// that every other test in this binary shares.
+    fn viewport_is_client_owned_for_role(
+        role: crate::daemon::ClientRole,
+        active_session_path: Option<&str>,
+    ) -> bool {
+        matches!(role, crate::daemon::ClientRole::Shadow) && active_session_path.is_some()
+    }
+
     pub fn apply_snapshot(&mut self, mut snapshot: ServerUiSnapshot) {
         for target in &self.ssh_targets {
             let target_key = (
@@ -4164,8 +4186,28 @@ impl YggtermServer {
                 snapshot.remote_machines.push(machine.clone());
             }
         }
-        self.active_view_mode = snapshot.active_view_mode;
-        self.active_session_path = snapshot.active_session_path.clone();
+        // ONE OWNER PER CONCEPT. The daemon owns the session INVENTORY; each
+        // view client owns its OWN viewport. For the user's GUI those coincide
+        // (its focus IS the daemon's active session), so it keeps taking the
+        // daemon's value. A slice-4 Shadow is the case where they do not: the
+        // whole reason it exists is to look at a session WITHOUT moving the
+        // user's view, so inheriting the daemon's active path here would drag
+        // the shadow back to whatever the user is doing on the very next
+        // refresh — and would silently undo an `app open --client <shadow>`
+        // seconds after it landed. Keep the shadow's own choice, but only while
+        // it still resolves to a session the daemon still knows about; a stale
+        // pin would be a second source of truth, which is worse. (The "still
+        // resolves" half is already enforced at the end of this function, which
+        // falls back to the first live session when the active path is gone —
+        // so keeping the local value here cannot strand the viewport.)
+        let viewport_is_client_owned = Self::viewport_is_client_owned_for_role(
+            crate::daemon::current_client_identity().role,
+            self.active_session_path.as_deref(),
+        );
+        if !viewport_is_client_owned {
+            self.active_view_mode = snapshot.active_view_mode;
+            self.active_session_path = snapshot.active_session_path.clone();
+        }
         self.remote_machines = snapshot.remote_machines;
         self.ssh_targets = snapshot.ssh_targets;
         self.apps = snapshot.apps;
@@ -31860,6 +31902,37 @@ terminal_window_id: None,
                 .ends_with("&& codex"),
             "{}",
             restored_live.launch_command
+        );
+    }
+
+    // A shadow exists to look at a session WITHOUT moving the user's view. If a
+    // snapshot re-imposed the daemon's active path on it, `app open --client
+    // <shadow>` would land and then silently unwind on the next refresh — the
+    // shadow would follow the user around, which is the one thing it must never
+    // do. The user's own GUI must keep taking the daemon's value, so both arms
+    // are asserted here.
+    #[test]
+    fn only_a_shadow_that_already_chose_keeps_its_viewport_across_a_snapshot() {
+        assert!(
+            YggtermServer::viewport_is_client_owned_for_role(
+                crate::daemon::ClientRole::Shadow,
+                Some("local://chosen"),
+            ),
+            "a shadow that picked a session owns its viewport"
+        );
+        assert!(
+            !YggtermServer::viewport_is_client_owned_for_role(
+                crate::daemon::ClientRole::Shadow,
+                None,
+            ),
+            "a shadow with no choice yet must adopt the daemon's, or it opens on nothing"
+        );
+        assert!(
+            !YggtermServer::viewport_is_client_owned_for_role(
+                crate::daemon::ClientRole::Active,
+                Some("local://chosen"),
+            ),
+            "the user's GUI focus IS the daemon's active session; it must keep following it"
         );
     }
 

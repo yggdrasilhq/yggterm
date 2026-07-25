@@ -39,7 +39,12 @@
 set -euo pipefail
 
 NAME="shadow-1"
-SIZE="1920x1080"
+# Deliberately LARGER than the user's screen. A shadow may not resize the PTY
+# (D8), so its xterm pins to the daemon's grid instead — and a window smaller
+# than that grid CLIPS the bottom rows out of every screenshot. 1920x1080 gave
+# 167x57 against a live 168x63 session and lost six rows. Headroom here costs
+# nothing (a headless output has no physical panel) and buys a complete frame.
+SIZE="2560x1440"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift || true
 
