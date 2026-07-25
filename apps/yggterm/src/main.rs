@@ -517,6 +517,57 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     None
 }
 
+/// Parse the element-addressing flags shared by every `do` verb into ONE
+/// [`WebElementRef`] (C4). One parser, so `click`, `type`, `key` and `fill`
+/// can never disagree about how an element is named.
+///
+/// Precedence is fixed and documented rather than "most specific wins":
+/// `--selector` (CSS) > `--role`+`--label` > text. A fixed order is what keeps
+/// a script's meaning stable when someone adds a stray flag.
+///
+/// `text_addresses` is true only for verbs that carry NO text payload
+/// (`click`), where `--text "Proceed to Pay"` is the natural spelling. For
+/// `type`/`fill`, `--text` is the value being typed, so text addressing spells
+/// itself `--target-text` — which is also accepted everywhere, so a script can
+/// always use the unambiguous form.
+fn parse_web_element_ref(
+    args: &[String],
+    text_addresses: bool,
+) -> anyhow::Result<Option<yggterm_server::WebElementRef>> {
+    use yggterm_server::WebElementRef;
+    let nth = cli_flag_value(args, "--nth")
+        .map(|raw| raw.parse::<usize>().context("--nth needs a number"))
+        .transpose()?;
+    if let Some(selector) = cli_flag_value(args, "--selector") {
+        return Ok(Some(WebElementRef::Css(selector.to_string())));
+    }
+    if let Some(role) = cli_flag_value(args, "--role") {
+        let label = cli_flag_value(args, "--label")
+            .context("--role needs --label (the element's accessible name)")?;
+        return Ok(Some(WebElementRef::Role {
+            role: role.to_string(),
+            label: label.to_string(),
+            nth,
+        }));
+    }
+    let text = cli_flag_value(args, "--target-text").or_else(|| {
+        if text_addresses {
+            cli_flag_value(args, "--text")
+        } else {
+            None
+        }
+    });
+    if let Some(text) = text {
+        return Ok(Some(WebElementRef::Text {
+            text: text.to_string(),
+            exact: args.iter().any(|arg| arg == "--exact"),
+            tag: cli_flag_value(args, "--tag").map(str::to_string),
+            nth,
+        }));
+    }
+    Ok(None)
+}
+
 /// Parse a `server app web do <verb> …` invocation into a typed
 /// `WebSurfaceDoAction` (agent control plane `do` verb, slice 2b). Coordinates
 /// are document-space CSS pixels; the GUI resolves selectors + maps to widget
@@ -543,9 +594,13 @@ fn parse_web_surface_do_action(
     let opt_f64 = |flag: &str| cli_flag_value(args, flag).and_then(|v| v.parse::<f64>().ok());
     let action = match verb {
         "click" | "tap" => {
-            if let Some(selector) = cli_flag_value(args, "--selector") {
+            // Addressed click (CSS / text / role+label) when any addressing flag
+            // is present; blind coordinates only when none is. The addressed
+            // path resolves in the page immediately before injection, which is
+            // both safer (it hit-tests) and stale-proof.
+            if let Some(target) = parse_web_element_ref(args, true)? {
                 WebSurfaceDoAction::ClickSelector {
-                    selector: selector.to_string(),
+                    selector: target,
                     button,
                 }
             } else {
@@ -577,7 +632,7 @@ fn parse_web_surface_do_action(
             text: cli_flag_value(args, "--text")
                 .context("missing --text for server app web do type")?
                 .to_string(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
         },
         // `fill` REPLACES a field's contents; `type` appends. Use it whenever the
         // field may already hold something — see the merge failure documented on
@@ -588,13 +643,13 @@ fn parse_web_surface_do_action(
             text: cli_flag_value(args, "--text")
                 .context("missing --text for server app web do fill")?
                 .to_string(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
             selectors: cli_flag_value(args, "--selector-set")
                 .map(|raw| {
                     raw.split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(str::to_string)
+                        .map(|css| yggterm_server::WebElementRef::Css(css.to_string()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -606,7 +661,7 @@ fn parse_web_surface_do_action(
             mods: cli_flag_value(args, "--mods")
                 .map(|raw| raw.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
         },
         other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|fill|key)"),
     };
@@ -970,7 +1025,12 @@ fn print_server_app_help() {
   yggterm server app command <list|invoke <id>>
   yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
   yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
-  yggterm server app web do <click|move|scroll|type|fill|key> [--selector <css>|--selector-set <css,css,…>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
+  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
+    target (resolved in the page at click time, precedence in this order):
+      --selector <css> | --role <r> --label <s> [--nth <n>]
+      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)
+      | --selector-set <css,css,…>   (segmented inputs: one box per character)
+      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)
   yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
