@@ -2575,15 +2575,19 @@ fn main() -> Result<()> {
                 yggterm_core::perf_telemetry_path(store.home_dir()).display()
             );
         } else {
+            // The `clock` column is not decoration: a `render` row's milliseconds are
+            // CPU time consumed, not elapsed time, so reading its totalms as wall
+            // duration overstates it by however many cores were busy.
             println!(
-                "{:<24} {:<30} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
-                "category", "name", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
+                "{:<24} {:<30} {:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
+                "category", "name", "clock", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
             );
             for summary in summaries.iter().take(top) {
                 println!(
-                    "{:<24} {:<30} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
+                    "{:<24} {:<30} {:>5} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
                     summary.category,
                     summary.name,
+                    summary.time_base.as_str(),
                     summary.count,
                     summary.p50_ms,
                     summary.p95_ms,
