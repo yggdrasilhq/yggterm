@@ -151,7 +151,8 @@ container, and treat identical uptime across two "hosts" as the tell that they a
 
 ### 3a. The render side (new, from `render_probe`)
 
-guihost GUI pid 776144, 15-second window, `cargo run -p yggterm-core --example render_top`:
+guihost GUI pid 776144, 15-second window. Taken with the prototype example; the same
+read is now `yggterm-headless server render-top --interval-ms 15000` (§7):
 
 | role | procs | cores | PSS |
 |---|---|---|---|
@@ -282,8 +283,20 @@ Remaining in WS1:
   the tick: the CONTEXT. It passes `{web_surfaces, live_sessions}` where `web_surfaces`
   counts SESSIONS, not realized webviews, with no stashed/visible split and no window
   visibility — which is what §4 WS1 actually asked for.
-- **`server render-top`**, promoting `examples/render_top.rs` into a real command.
-  Until then the example is the only reader and §7's recipe still names it.
+- ~~**`server render-top`**, promoting `examples/render_top.rs` into a real command.~~
+  ✅ **BUILT 2026-07-25 — LANDED, NOT SHIPPED: the arm has never executed once.**
+  `--pid` names any process tree; with no `--pid` the registered-client registry picks
+  the GUI, through the same `choose_app_control_pid` the `server app` verbs use.
+  `--json` prints the same report the table is built from. The example is deleted: one
+  read path, not two. It reads /proc in-process and is in the no-handoff carve-out.
+  What is actually under test, so nobody has to re-derive it: the rollup and ranking
+  (`render_probe::tests::render_top_report_rolls_up_roles_and_ranks_processes_by_cpu`,
+  `render_top_ranking_is_stable_for_equal_cost_processes`), the untargeted GUI choice
+  including the read-vs-mutation split (`choose_app_control_pid` tests in
+  `yggterm-server`), and the carve-out
+  (`local_state_readers_never_hand_off_to_the_installed_binary`).
+  What is NOT: the flag parsing and its defaults (`--interval-ms` 5000, `--top` 10),
+  which live inline in the CLI arm and are only reachable by running it.
 - ~~**`server perf-incidents`**, a reader for the 183 records already on disk.~~
   ✅ **SHIPPED 2026-07-25** and run live — see the update box in §3c. Groups by
   trigger, ranked by count, `--list`/`--json` for raw records.
@@ -354,13 +367,38 @@ Independent of the render work, so it can run in parallel.
   entry it just used and revalidates on a background thread; a changed
   `local_build_id` still resolves in the foreground, and staleness is bounded at
   six hours.
-- `copy_scan`: incremental off mtime, skip unchanged stores, back off when nothing
-  changed.
-- `daemon/persist`: dirty-flag or debounce; the state is re-serialized far more often
-  than it changes.
-- `snapshot_response`: memoize by generation.
+- ~~`copy_scan`: incremental off mtime, skip unchanged stores, back off when nothing
+  changed.~~ ✅ **BUILT 2026-07-25, NOT DEPLOYED.** It was not a caching problem at
+  all. `shell.rs` put a whole `RemoteMachineSnapshot` on every copy target — 644
+  targets × a 1.75 MB machine ≈ 1.1 GB of allocation per scan — and each target then
+  opened three sqlite connections (~2151 per scan) through the store's one-shot
+  resolver wrappers. Targets now carry a session-list-free `RemoteMachineRef` and the
+  sweep holds ONE open `SessionTitleResolver`. The mtime-incremental idea is still
+  open, and is now measurable: `build_local_cwd_tree` has its own
+  `background/local_tree_scan` span, and the daemon chore no longer runs it inside the
+  runtime read lock (which is also why `daemon/background_copy_chore`'s p50 will RISE
+  from 0.0 — the span finally contains the work).
+- ~~`daemon/persist`: dirty-flag or debounce; the state is re-serialized far more often
+  than it changes.~~ ✅ **BUILT 2026-07-25, NOT DEPLOYED.** Content-hash gate plus a
+  file re-stat: an unchanged persist writes nothing and takes no backup. The
+  unconditional primitive is kept for `PrepareUpdateRestart` and the handover paths.
+- `snapshot_response`: memoize by generation. **Half done.** The per-session screen
+  work under it is memoized on `(output seq, resize seq, PTY width, model size)` —
+  built 2026-07-25, not deployed. Precisely what the memo removes on a hit: the
+  `screen_state` lock, the `formatted_screen_max_column` walk and the clip
+  rewrite. It does **not** remove the clone — the hit path still hands back an
+  owned `String` copy of the formatted screen, so the allocation is unchanged.
+  (Commit `aaf3906`'s opening line reads as if the clone went away; it did not.
+  Killing it means handing callers the `Arc<str>` the memo already holds, which
+  is a separate change with its own caller ripple.) The remaining cost is the 2.1 MB
+  `remote_machines` deep copy in `snapshot()` itself; the fix there is `Arc` +
+  copy-on-write, NOT a generation counter (there are 15+ mutation sites and a
+  hand-bumped counter that one of them forgets serves a stale session list to the
+  sidebar). **Still open.**
 - `copy_generation/title` + `summary`: cache by content hash, never regenerate for an
-  unchanged transcript.
+  unchanged transcript. **Still open**, and the 429 rule governs it: the negative row
+  may only be written on an outcome that came back from the MODEL, never on a 429 and
+  never on a heuristic returned after a transport failure.
 - The GUI's 0.220-core idle floor: hunt full-window blits in the Dioxus shell.
 
 ## 5. Constraints that outrank being fast
@@ -392,13 +430,16 @@ and whatever sets active-session after a birth.
 Re-run, and quote, both instruments:
 
 ```sh
+<<<<<<< HEAD
 # render side, on the GUI host — cores AND gpu_ms, both deltas
-GUI=$(pgrep -x yggterm | head -1)
-cargo run -p yggterm-core --example render_top -- "$GUI" 15000
+# render side, on the GUI host (no --pid: the client registry picks the GUI).
+# The gpu_ms column is the GPU gauge; a `-` means unreadable, never zero.
+yggterm-headless server render-top --interval-ms 15000
 # is the GPU actually rasterizing? nonzero and RISING across two reads
 grep -H drm-engine /proc/<webproc>/fdinfo/*
-# which GL path is this window even on?
-yggterm-headless server app state | grep -E 'WEBKIT_GL_POLICY|LIBGL|GALLIUM|DMABUF'
+# which GL path is this window even on? (the client's own view, NOT /proc environ,
+# which only ever holds the exec-time environment)
+yggterm-headless server app desktop-identity | grep -A8 webkit_gl_environment
 # Rust side (the `clock` column says whether a row is wall or CPU time)
 yggterm-headless server perf-summary --category render
 yggterm-headless server perf-summary
