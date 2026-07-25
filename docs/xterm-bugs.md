@@ -2052,6 +2052,38 @@ Three layers, each independently sufficient for the case it covers:
    attached to an OLDER daemon — which is the live case, since a session
    stranded on a preserved owner is served by whatever daemon still holds it.
 
+### Live proof of layer 3 (2026-07-25 evening, guihost, before the 2.12.13 deploy)
+
+Layer 3 was written for the mixed-version case and has now fired on it, against
+a real stale payload, with the user's GUI untouched.
+
+Walking every session on the live 2.12.12 daemon (the socket instrument below)
+found a **plain `bash -i` shell**, not an agent session, whose PTY was
+**120x36** while its screen model still painted to **column 295**. So this class
+is not CC-specific: any session that outlives a window resize can carry it.
+
+Revealing that session on a read-only shadow running the 2.12.13 client (which
+pins its xterm to the daemon's grid, i.e. 120) produced:
+
+```
+ui/terminal_mount/screen_reconcile_clipped_to_viewer_width
+  {"reason":"reveal_screen_reconcile","screen_max_column":295,"viewer_cols":120,
+   "session_path":"local://5220ce5d-…"}
+```
+
+and a faithful frame (`xterm_canvas_composite_over_dom`, `capture_faithful:
+true`) showing clean, unmerged text — cross-checked against grim on the same
+client, since a faithful frame can itself lie (see the field guide). The
+metadata rail read `Client 2.12.13 · daemon is on 2.12.12`, which is exactly the
+older-daemon case layer 3 exists for.
+
+**The instrument** (reusable, ~10 lines): `server snapshot` cannot see this — it
+answers the stale stored launch seed for a session on a preserved owner. Talk to
+`~/.yggterm/server-<ver>.sock` with `{"kind":"terminal_snapshot","path":…}`,
+walk the payload tracking the cursor (`CSI r;cH` sets the column, `CSI nC` skips
+cells), and compare the widest column reached against `pty_cols` from
+`server snapshot`'s `live_sessions`. `screen_text.len()` can never see it.
+
 ### Code locations
 
 - `crates/yggterm-server/src/terminal.rs` — `walk_formatted_screen`,
