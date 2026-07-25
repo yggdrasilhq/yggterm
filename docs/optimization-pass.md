@@ -124,7 +124,8 @@ container, and treat identical uptime across two "hosts" as the tell that they a
 
 ### 3a. The render side (new, from `render_probe`)
 
-guihost GUI pid 776144, 15-second window, `cargo run -p yggterm-core --example render_top`:
+guihost GUI pid 776144, 15-second window. Taken with the prototype example; the same
+read is now `yggterm-headless server render-top --interval-ms 15000` (§7):
 
 | role | procs | cores | PSS |
 |---|---|---|---|
@@ -246,7 +247,12 @@ Remaining in WS1:
 - **Wire continuous sampling.** Today it is a one-shot example. It needs a tick in the
   GUI (the allocator-trim chore near `shell.rs:23753` is the pattern to copy) passing
   live/stashed surface counts and window visibility as context.
-- **`server render-top`**, promoting `examples/render_top.rs` into a real command.
+- ~~**`server render-top`**, promoting `examples/render_top.rs` into a real command.~~
+  ✅ **BUILT 2026-07-25** (not yet run on the live host). `--pid` names any process
+  tree; with no `--pid` the registered-client registry picks the GUI, through the same
+  `choose_app_control_pid` the `server app` verbs use. `--json` prints the same report
+  the table is built from. The example is deleted: one read path, not two. It reads
+  /proc in-process and is in the no-handoff carve-out, which now has a test.
 - ~~**`server perf-incidents`**, a reader for the 183 records already on disk.~~
   ✅ **SHIPPED 2026-07-25** and run live — see the update box in §3c. Groups by
   trigger, ranked by count, `--list`/`--json` for raw records.
@@ -340,8 +346,8 @@ and whatever sets active-session after a birth.
 Re-run, and quote, both instruments:
 
 ```sh
-# render side, on the GUI host
-GUI=$(pgrep -x yggterm | head -1); render_top "$GUI" 15000
+# render side, on the GUI host (no --pid: the client registry picks the GUI)
+yggterm-headless server render-top --interval-ms 15000
 # Rust side
 yggterm-headless server perf-summary --category render
 yggterm-headless server perf-summary

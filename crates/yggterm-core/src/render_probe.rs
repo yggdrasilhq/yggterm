@@ -38,6 +38,7 @@
 //! Memory gauges ride along in the payload, where the duration aggregator ignores
 //! them.
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -90,7 +91,10 @@ impl RenderRole {
         if comm.starts_with("WebKitGPU") {
             return RenderRole::WebGpu;
         }
-        if matches!(comm, "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire") {
+        if matches!(
+            comm,
+            "sway" | "cage" | "Xvfb" | "labwc" | "weston" | "wayfire"
+        ) {
             return RenderRole::Compositor;
         }
         if comm == "yggterm" || comm.starts_with("yggterm-gui") {
@@ -218,7 +222,11 @@ pub fn user_hz() -> u64 {
 
 /// Convert a tick delta into CPU milliseconds. Pure so the arithmetic is testable.
 pub fn cpu_ms_from_ticks(delta_ticks: u64, user_hz: u64) -> f64 {
-    let hz = if user_hz == 0 { DEFAULT_USER_HZ } else { user_hz };
+    let hz = if user_hz == 0 {
+        DEFAULT_USER_HZ
+    } else {
+        user_hz
+    };
     (delta_ticks as f64) * 1000.0 / (hz as f64)
 }
 
@@ -508,6 +516,140 @@ pub fn emit_render_perf_events(home: &Path, samples: &[RenderProcSample], contex
     }
 }
 
+/// One `render-top` read: the whole tree's cost over one interval, rolled up by
+/// role plus the busiest processes.
+///
+/// Serializable because `server render-top --json` is the machine-readable
+/// half of the same read — one report type, so the table and the JSON can
+/// never disagree about a number.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RenderTopReport {
+    pub root_pid: i32,
+    pub interval_ms: f64,
+    pub user_hz: u64,
+    pub process_count: usize,
+    pub roles: Vec<RenderRoleRollupReport>,
+    pub top_processes: Vec<RenderProcSampleReport>,
+    pub total_cpu_ms: f64,
+    pub total_core_fraction: f64,
+    pub total_mem_kb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RenderRoleRollupReport {
+    pub role: &'static str,
+    pub cpu_ms: f64,
+    pub core_fraction: f64,
+    pub mem_kb: u64,
+    pub procs: usize,
+    pub hot_pid: i32,
+    pub hot_cpu_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RenderProcSampleReport {
+    pub pid: i32,
+    pub ppid: i32,
+    pub comm: String,
+    pub role: &'static str,
+    pub cpu_ms: f64,
+    pub core_fraction: f64,
+    pub mem_kb: u64,
+}
+
+impl RenderTopReport {
+    /// Pure: no `/proc`, no sleep. Everything the command prints is decided
+    /// here, so the ranking and the totals are testable against a synthetic
+    /// tree.
+    pub fn from_samples(
+        root_pid: i32,
+        interval_ms: f64,
+        user_hz: u64,
+        process_count: usize,
+        samples: &[RenderProcSample],
+        top: usize,
+    ) -> Self {
+        let roles: Vec<RenderRoleRollupReport> = roll_up_roles(samples)
+            .into_iter()
+            .map(|rollup| RenderRoleRollupReport {
+                role: rollup.role.as_str(),
+                cpu_ms: rollup.cpu_ms,
+                core_fraction: rollup.core_fraction(),
+                mem_kb: rollup.mem_kb,
+                procs: rollup.procs,
+                hot_pid: rollup.hot_pid,
+                hot_cpu_ms: rollup.hot_cpu_ms,
+            })
+            .collect();
+        let mut ranked: Vec<&RenderProcSample> = samples.iter().collect();
+        // Descending by cpu_ms, then by pid so equal costs order the same way
+        // on every run — a "top processes" list that reshuffles between reads
+        // is unreadable as a before/after.
+        ranked.sort_by(|left, right| {
+            right
+                .cpu_ms
+                .partial_cmp(&left.cpu_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.pid.cmp(&right.pid))
+        });
+        let top_processes = ranked
+            .into_iter()
+            .take(top)
+            .map(|sample| RenderProcSampleReport {
+                pid: sample.pid,
+                ppid: sample.ppid,
+                comm: sample.comm.clone(),
+                role: sample.role.as_str(),
+                cpu_ms: sample.cpu_ms,
+                core_fraction: sample.core_fraction(),
+                mem_kb: sample.pss_kb.or(sample.rss_kb).unwrap_or(0),
+            })
+            .collect();
+        Self {
+            root_pid,
+            interval_ms,
+            user_hz,
+            process_count,
+            total_cpu_ms: roles.iter().map(|role| role.cpu_ms).sum(),
+            total_core_fraction: roles.iter().map(|role| role.core_fraction).sum(),
+            total_mem_kb: roles.iter().map(|role| role.mem_kb).sum(),
+            roles,
+            top_processes,
+        }
+    }
+}
+
+/// Observe a process tree, wait, observe again, and report the delta.
+///
+/// Deliberately does NOT emit perf events. The GUI's continuous tick owns the
+/// `render` category; a CLI-triggered write into it would make that series
+/// depend on how often an agent ran the command, and `perf-summary --category
+/// render` would silently be mixing two samplers with different intervals.
+pub fn render_top_sample(root_pid: i32, interval_ms: u64, top: usize) -> Option<RenderTopReport> {
+    let mut probe = RenderProbe::new();
+    let started = std::time::Instant::now();
+    let first = observe_process_tree(root_pid);
+    if first.is_empty() {
+        return None;
+    }
+    probe.observe(&first, started.elapsed().as_millis() as u64);
+    std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    let second = observe_process_tree(root_pid);
+    let samples = probe.observe(&second, started.elapsed().as_millis() as u64);
+    let measured_interval_ms = samples
+        .first()
+        .map(|sample| sample.interval_ms)
+        .unwrap_or(interval_ms as f64);
+    Some(RenderTopReport::from_samples(
+        root_pid,
+        measured_interval_ms,
+        user_hz(),
+        second.len(),
+        &samples,
+        top,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +674,75 @@ mod tests {
         ];
         fields.extend((0..10).map(|_| "0".to_string()));
         format!("{pid} ({comm}) S {}", fields.join(" "))
+    }
+
+    fn proc_sample(pid: i32, comm: &str, cpu_ms: f64, mem_kb: u64) -> RenderProcSample {
+        RenderProcSample {
+            pid,
+            ppid: 1,
+            role: RenderRole::classify(comm),
+            comm: comm.to_string(),
+            cpu_ms,
+            interval_ms: 5_000.0,
+            rss_kb: Some(mem_kb),
+            pss_kb: None,
+        }
+    }
+
+    /// The whole report is decided by `from_samples`, so it can be asserted
+    /// against a synthetic tree — no `/proc`, no sleep, no live GUI.
+    #[test]
+    fn render_top_report_rolls_up_roles_and_ranks_processes_by_cpu() {
+        let samples = vec![
+            proc_sample(10, "yggterm", 220.0, 300_000),
+            proc_sample(11, "WebKitWebProces", 1_360.0, 700_000),
+            proc_sample(12, "WebKitWebProces", 4.0, 120_000),
+            proc_sample(13, "WebKitNetworkPr", 8.0, 40_000),
+        ];
+
+        let report = RenderTopReport::from_samples(9, 5_000.0, 100, 4, &samples, 2);
+
+        let web = report
+            .roles
+            .iter()
+            .find(|role| role.role == "web_content")
+            .expect("web_content rollup");
+        assert_eq!(web.procs, 2, "both web processes roll into one role");
+        assert_eq!(web.cpu_ms, 1_364.0);
+        assert_eq!(
+            web.hot_pid, 11,
+            "one web process holding all the CPU is the fact a role total hides"
+        );
+        assert!((web.core_fraction - 0.2728).abs() < 1e-6);
+
+        assert_eq!(report.top_processes.len(), 2, "--top is respected");
+        assert_eq!(report.top_processes[0].pid, 11);
+        assert_eq!(report.top_processes[1].pid, 10);
+        assert_eq!(report.top_processes[0].role, "web_content");
+
+        assert_eq!(report.total_cpu_ms, 1_592.0);
+        assert_eq!(report.total_mem_kb, 1_160_000);
+        assert!((report.total_core_fraction - 0.3184).abs() < 1e-6);
+    }
+
+    /// Two processes with identical cost must not reshuffle between reads —
+    /// a "top processes" list that reorders on its own is unreadable as a
+    /// before/after.
+    #[test]
+    fn render_top_ranking_is_stable_for_equal_cost_processes() {
+        let samples = vec![
+            proc_sample(30, "WebKitWebProces", 100.0, 1),
+            proc_sample(20, "WebKitWebProces", 100.0, 1),
+        ];
+        let report = RenderTopReport::from_samples(1, 5_000.0, 100, 2, &samples, 10);
+        assert_eq!(
+            report
+                .top_processes
+                .iter()
+                .map(|sample| sample.pid)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
     }
 
     #[test]
@@ -583,7 +794,8 @@ mod tests {
 
     #[test]
     fn parses_memory_gauges() {
-        let rollup = "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
+        let rollup =
+            "Rss:              123456 kB\nPss:               65432 kB\nShared_Clean: 1 kB\n";
         assert_eq!(parse_smaps_rollup_pss_kb(rollup), Some(65432));
         let status = "Name:\tyggterm\nVmPeak:\t 900 kB\nVmRSS:\t  543284 kB\nThreads:\t42\n";
         assert_eq!(parse_status_rss_kb(status), Some(543284));
@@ -733,10 +945,8 @@ mod tests {
     /// tree must cost almost nothing: roles with neither CPU nor memory are dropped.
     #[test]
     fn role_events_skip_roles_with_no_cpu_and_no_memory() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-role-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-role-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);
@@ -777,10 +987,8 @@ mod tests {
     /// with no aggregator changes: `duration_ms` present, in CPU milliseconds.
     #[test]
     fn emits_events_the_existing_aggregator_can_read() {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-render-probe-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-render-probe-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         crate::perf::set_perf_profiling_enabled(true);

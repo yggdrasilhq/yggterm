@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
@@ -171,6 +171,7 @@ fn print_server_help() {
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
   yggterm-headless server perf-incidents [--since-ms <ms>] [--top <n>] [--list] [--json]
+  yggterm-headless server render-top [--pid <pid>] [--client <name>] [--interval-ms <ms>] [--top <n>] [--json]
   yggterm-headless server trace <tail|follow|bundle|transitions>
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
@@ -981,6 +982,23 @@ fn run_app_launch_via_gui_companion(
     Ok(())
 }
 
+/// Commands that read LOCAL state in-process and never talk to the daemon, so
+/// they must run in THIS (newest) binary.
+///
+/// Handing one off to a stale active-executable — a dev deploy that overwrote
+/// `~/.local/bin` but not `install-state.json` — runs a binary that predates
+/// the command, which is precisely how `perf-incidents` answered "unsupported
+/// server command" on the very host whose incidents you were reading. It was a
+/// bare `matches!` inline in the handoff with no test, so `render-top` would
+/// have re-learned the lesson the same way.
+fn command_reads_local_state_in_process(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("server"))
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("perf-summary") | Some("perf-incidents") | Some("render-top")
+        )
+}
+
 fn maybe_handoff_to_preferred_headless_executable(
     current_exe: &Path,
     args: &[String],
@@ -992,18 +1010,7 @@ fn maybe_handoff_to_preferred_headless_executable(
     if classify_builtin_cli_command(args).is_some_and(builtin_cli_command_is_pure) {
         return Ok(());
     }
-    // `perf-summary` / `perf-incidents` read the LOCAL profiling logs in-process and
-    // never talk to the daemon, so they must run in THIS (newest) binary. Handing them
-    // off to a stale active-executable (e.g. a dev deploy that overwrote ~/.local/bin
-    // but not install-state) would hit a binary that predates the command and fail —
-    // which is precisely how `perf-incidents` would answer "unsupported server command"
-    // on the very host whose incidents you are trying to read.
-    if matches!(args.first().map(String::as_str), Some("server"))
-        && matches!(
-            args.get(1).map(String::as_str),
-            Some("perf-summary") | Some("perf-incidents")
-        )
-    {
+    if command_reads_local_state_in_process(args) {
         return Ok(());
     }
     let Some(preferred) = preferred_headless_executable(install_context) else {
@@ -2660,6 +2667,95 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("server")
+        && args.get(1).map(String::as_str) == Some("render-top")
+    {
+        // The read side of the render probe. Every number is a DELTA over the
+        // interval, which is the whole point: `ps %CPU` is a lifetime average,
+        // and reading it as current load is what produced the phantom "105% of
+        // a core" the optimization pass started from.
+        //
+        // Reads /proc only — no daemon round-trip, hence no
+        // `ensure_local_server_ready_for_cli`.
+        let interval_ms = cli_flag_value(&args, "--interval-ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5_000);
+        let top = cli_flag_value(&args, "--top")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+        let json = args.iter().any(|arg| arg == "--json");
+        // `--pid` here names any process-tree root, deliberately unlike
+        // `server app --pid` where it must name a REGISTERED client. Only the
+        // untargeted default goes through the client registry.
+        let requested_pid = cli_flag_value(&args, "--pid").and_then(|value| value.parse::<u32>().ok());
+        let requested_client = cli_flag_value(&args, "--client");
+        let root_pid = match requested_pid {
+            Some(pid) => Some(pid),
+            None => yggterm_server::choose_registered_gui_pid(
+                store.home_dir(),
+                None,
+                requested_client,
+            )?,
+        };
+        let Some(root_pid) = root_pid else {
+            bail!(
+                "no registered yggterm GUI to measure — pass --pid <pid> to name a \
+                 process tree, or --client <name> to pick one"
+            );
+        };
+        let Some(report) = yggterm_core::render_probe::render_top_sample(
+            root_pid as i32,
+            interval_ms,
+            top,
+        ) else {
+            bail!("no such process tree: {root_pid}");
+        };
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        println!(
+            "render-top: root={} processes={} interval={:.0}ms user_hz={}",
+            report.root_pid, report.process_count, report.interval_ms, report.user_hz
+        );
+        println!(
+            "{:<14} {:>6} {:>10} {:>8} {:>12} {:>10}",
+            "role", "procs", "cpu_ms", "cores", "mem_mb", "hot_pid"
+        );
+        for role in &report.roles {
+            println!(
+                "{:<14} {:>6} {:>10.1} {:>8.3} {:>12.1} {:>10}",
+                role.role,
+                role.procs,
+                role.cpu_ms,
+                role.core_fraction,
+                role.mem_kb as f64 / 1024.0,
+                role.hot_pid
+            );
+        }
+        println!(
+            "{:<14} {:>6} {:>10.1} {:>8.3} {:>12.1} {:>10}",
+            "TOTAL",
+            report.process_count,
+            report.total_cpu_ms,
+            report.total_core_fraction,
+            report.total_mem_kb as f64 / 1024.0,
+            ""
+        );
+        println!("\ntop processes by cpu_ms:");
+        for sample in &report.top_processes {
+            println!(
+                "  pid={:<8} {:<16} {:<12} cpu_ms={:>9.1} cores={:>6.3} mem_mb={:>8.1}",
+                sample.pid,
+                sample.comm,
+                sample.role,
+                sample.cpu_ms,
+                sample.core_fraction,
+                sample.mem_kb as f64 / 1024.0
+            );
+        }
+        return Ok(());
+    }
     if args.as_slice() == ["server", "ping"] {
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = cli_server_endpoint(store.home_dir());
@@ -2695,12 +2791,39 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         BuiltinCliCommand, builtin_cli_command_is_pure, cached_copy_hint_is_usable,
-        classify_builtin_cli_command, cli_positional_args, gui_companion_executable_from_headless,
-        normalize_monitor_args, preferred_headless_executable, remote_session_title_fallback,
+        classify_builtin_cli_command, cli_positional_args, command_reads_local_state_in_process,
+        gui_companion_executable_from_headless, normalize_monitor_args,
+        preferred_headless_executable, remote_session_title_fallback,
     };
     use std::path::PathBuf;
     use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
     use yggterm_server::RemoteScannedSession;
+
+    /// The carve-out that keeps a local-log reader in THIS binary. It was an
+    /// inline `matches!` with no test, and without `render-top` in it the new
+    /// command would exec a stale installed binary and answer "unsupported
+    /// server command" on the very host it was measuring — exactly what
+    /// `perf-incidents` shipped to fix.
+    #[test]
+    fn local_state_readers_never_hand_off_to_the_installed_binary() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        for command in ["perf-summary", "perf-incidents", "render-top"] {
+            assert!(
+                command_reads_local_state_in_process(&argv(&["server", command])),
+                "`server {command}` reads local state in-process and must not hand off"
+            );
+        }
+        // Anything that goes through the daemon SHOULD hand off to the
+        // preferred executable — the carve-out is an exception list, not a
+        // blanket opt-out.
+        assert!(!command_reads_local_state_in_process(&argv(&[
+            "server", "snapshot"
+        ])));
+        assert!(!command_reads_local_state_in_process(&argv(&[
+            "server", "status"
+        ])));
+        assert!(!command_reads_local_state_in_process(&argv(&["render-top"])));
+    }
 
     #[test]
     fn classify_builtin_cli_command_detects_server_app_help_without_mutating() {
