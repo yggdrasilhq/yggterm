@@ -1106,6 +1106,9 @@ struct PtySessionRuntime {
     current_cols: Arc<AtomicU16>,
     current_rows: Arc<AtomicU16>,
     screen_state: Arc<Mutex<TerminalScreenState>>,
+    /// Memo for [`PtySessionRuntime::screen_snapshot`], keyed by
+    /// [`ScreenSnapshotKey`] — every input the snapshot is a function of.
+    screen_snapshot_memo: Arc<Mutex<Option<(ScreenSnapshotKey, Arc<str>)>>>,
     /// The latest libyggterm OSC 7717 declare per verb, lifted off this
     /// session's stream by the daemon itself. The GUI's xterm parser reads the
     /// same bytes, but only while a client host is mounted — this copy is what
@@ -1256,6 +1259,30 @@ fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreen
         }
         i += len;
     }
+}
+
+/// Everything [`PtySessionRuntime::screen_snapshot`] is a function of.
+///
+/// `output_seq` is bumped at exactly the points where
+/// `screen_state.process(bytes)` runs (reader thread and `seed_snapshot`,
+/// under the same chunk lock), so an unchanged seq means the vt100 model was
+/// not fed anything — the one generation counter here that cannot go stale.
+///
+/// It is NOT the whole key, and that is the dangerous part. `resize` mutates
+/// the model without touching seq, through two branches: the ordinary path,
+/// and the `resize_screen_model_repaired` branch that fixes a model painting
+/// wider than its PTY. And the snapshot is CLIPPED to the PTY width. A memo
+/// keyed on seq alone would serve a screen clipped to the OLD width across a
+/// resize — precisely the frame-corruption class the clip was added to fix
+/// (docs/xterm-bugs.md#screen-model-wider-than-viewer), and it would read as a
+/// regression of that fix rather than of this cache. So the key carries the
+/// clip width and the model's own size, and both resize branches change one
+/// of them by construction — nothing has to remember to invalidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenSnapshotKey {
+    output_seq: u64,
+    pty_cols: u16,
+    model_size: Option<(u16, u16)>,
 }
 
 /// The rightmost column a formatted screen paints into, in cells.
@@ -1884,6 +1911,7 @@ impl PtySessionRuntime {
             current_cols,
             current_rows,
             screen_state,
+            screen_snapshot_memo: Arc::new(Mutex::new(None)),
             app_declares,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
@@ -2009,6 +2037,38 @@ impl PtySessionRuntime {
     /// through. Clipping HERE (the one place the screen is served) covers every
     /// client path at once, rather than each replay call site remembering to.
     fn screen_snapshot(&self) -> String {
+        // Three hot callers ask for this on every snapshot response, every
+        // working-flags poll and every chore tick, and between two asks the
+        // answer is usually byte-identical: the format walk plus the clip
+        // rewrite run over the whole screen each time for nothing.
+        let key = self.screen_snapshot_key();
+        if let Some((memo_key, memo)) = self
+            .screen_snapshot_memo
+            .lock()
+            .expect("pty screen snapshot memo lock poisoned")
+            .as_ref()
+            && *memo_key == key
+        {
+            return memo.to_string();
+        }
+        let snapshot = self.render_screen_snapshot(key.pty_cols);
+        *self
+            .screen_snapshot_memo
+            .lock()
+            .expect("pty screen snapshot memo lock poisoned") =
+            Some((key, Arc::from(snapshot.as_str())));
+        snapshot
+    }
+
+    fn screen_snapshot_key(&self) -> ScreenSnapshotKey {
+        ScreenSnapshotKey {
+            output_seq: self.seq.load(Ordering::SeqCst),
+            pty_cols: self.current_cols.load(Ordering::SeqCst),
+            model_size: self.screen_state.lock().ok().map(|state| state.size()),
+        }
+    }
+
+    fn render_screen_snapshot(&self, pty_cols: u16) -> String {
         let formatted = self
             .screen_state
             .lock()
@@ -2016,7 +2076,6 @@ impl PtySessionRuntime {
             .formatted
             .trim_matches('\0')
             .to_string();
-        let pty_cols = self.current_cols.load(Ordering::SeqCst);
         if pty_cols == 0 || formatted_screen_max_column(&formatted) <= pty_cols {
             return formatted;
         }
@@ -3753,6 +3812,58 @@ PY"#;
         let c = next_runtime_spawn_id(now);
         assert!(a != 0 && b != 0 && c != 0, "spawn ids must be non-zero");
         assert!(a != b && b != c && a != c, "same-millisecond spawns must still differ");
+    }
+
+    /// The memo may only return a snapshot when EVERY input is unchanged. The
+    /// resize cases are the load-bearing ones: `resize` mutates the vt100 model
+    /// without touching `seq`, and the snapshot is clipped to the PTY width, so
+    /// a seq-only key would serve a screen clipped to the old width across a
+    /// resize — reopening the frame-corruption class Round 21/22 closed.
+    #[test]
+    fn screen_snapshot_memo_key_changes_on_output_and_on_either_resize_branch() {
+        let base = ScreenSnapshotKey {
+            output_seq: 7,
+            pty_cols: 168,
+            model_size: Some((63, 168)),
+        };
+
+        assert_eq!(base, base, "an untouched session reuses the memo");
+
+        let after_output = ScreenSnapshotKey {
+            output_seq: 8,
+            ..base
+        };
+        assert_ne!(base, after_output, "new PTY output must invalidate");
+
+        let after_width_resize = ScreenSnapshotKey {
+            pty_cols: 120,
+            model_size: Some((63, 120)),
+            ..base
+        };
+        assert_ne!(
+            base, after_width_resize,
+            "a narrower PTY clips differently; serving the old clip IS the corruption"
+        );
+
+        let after_rows_only_resize = ScreenSnapshotKey {
+            model_size: Some((40, 168)),
+            ..base
+        };
+        assert_ne!(
+            base, after_rows_only_resize,
+            "a rows-only resize changes the model but neither seq nor the clip width"
+        );
+
+        // The `resize_screen_model_repaired` branch: the PTY was already the
+        // requested size, so `pty_cols` does not move — only the model does.
+        let repaired_model = ScreenSnapshotKey {
+            model_size: Some((63, 204)),
+            ..base
+        };
+        assert_ne!(
+            base, repaired_model,
+            "repairing a model that painted wider than its PTY must invalidate"
+        );
     }
 
     #[test]
