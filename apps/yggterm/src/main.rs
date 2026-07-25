@@ -48,7 +48,13 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
+    run_app_control_web_surface_await, run_app_control_web_surface_batch,
+    run_app_control_web_surface_capture_element,
+    run_app_control_web_surface_close, run_app_control_web_surface_cookies,
+    run_app_control_web_surface_frames,
+    run_app_control_web_surface_reload,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
+    run_app_control_web_surface_fill_vault,
     run_app_control_web_surface_lease,
     run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_read,
@@ -522,6 +528,182 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     None
 }
 
+/// Parse the element-addressing flags shared by every `do` verb into ONE
+/// [`WebElementRef`] (C4). One parser, so `click`, `type`, `key` and `fill`
+/// can never disagree about how an element is named.
+///
+/// Precedence is fixed and documented rather than "most specific wins":
+/// `--selector` (CSS) > `--role`+`--label` > text. A fixed order is what keeps
+/// a script's meaning stable when someone adds a stray flag.
+///
+/// `text_addresses` is true only for verbs that carry NO text payload
+/// (`click`), where `--text "Proceed to Pay"` is the natural spelling. For
+/// `type`/`fill`, `--text` is the value being typed, so text addressing spells
+/// itself `--target-text` — which is also accepted everywhere, so a script can
+/// always use the unambiguous form.
+fn parse_web_element_ref(
+    args: &[String],
+    text_addresses: bool,
+) -> anyhow::Result<Option<yggterm_server::WebElementRef>> {
+    use yggterm_server::WebElementRef;
+    let nth = cli_flag_value(args, "--nth")
+        .map(|raw| raw.parse::<usize>().context("--nth needs a number"))
+        .transpose()?;
+    if let Some(selector) = cli_flag_value(args, "--selector") {
+        return Ok(Some(WebElementRef::Css(selector.to_string())));
+    }
+    if let Some(role) = cli_flag_value(args, "--role") {
+        let label = cli_flag_value(args, "--label")
+            .context("--role needs --label (the element's accessible name)")?;
+        return Ok(Some(WebElementRef::Role {
+            role: role.to_string(),
+            label: label.to_string(),
+            nth,
+        }));
+    }
+    let text = cli_flag_value(args, "--target-text").or_else(|| {
+        if text_addresses {
+            cli_flag_value(args, "--text")
+        } else {
+            None
+        }
+    });
+    if let Some(text) = text {
+        return Ok(Some(WebElementRef::Text {
+            text: text.to_string(),
+            exact: args.iter().any(|arg| arg == "--exact"),
+            tag: cli_flag_value(args, "--tag").map(str::to_string),
+            nth,
+        }));
+    }
+    Ok(None)
+}
+
+/// Escape a literal so it matches itself as a regex.
+///
+/// `--until url:contains:<s>` is SUGAR, not a second predicate: it compiles to
+/// the same `UrlMatches` the regex form does, so there is exactly one url rule
+/// in the GUI. Escaping happens here, where the user's literal is, rather than
+/// by teaching the matcher a second mode.
+fn regex_escape_literal(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len() * 2);
+    for c in literal.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Parse `--frame <index|path|url-substring>` into a [`WebFrameRef`].
+///
+/// Three spellings, one meaning: a bare number is `window.frames[n]`, a
+/// dotted/comma path (`0.2`) is a descent — the form `web frames` reports, so
+/// its output feeds straight back in — and anything else is a url substring.
+fn parse_web_frame_ref(args: &[String]) -> anyhow::Result<Option<yggterm_server::WebFrameRef>> {
+    use yggterm_server::WebFrameRef;
+    let Some(raw) = cli_flag_value(args, "--frame") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("--frame needs an index, a path like 0.2, or a url substring");
+    }
+    if let Ok(index) = raw.parse::<usize>() {
+        return Ok(Some(WebFrameRef::Index(index)));
+    }
+    let separators: &[char] = &['.', ','];
+    if raw.contains(separators) && raw.split(separators).all(|part| part.trim().parse::<usize>().is_ok()) {
+        let path = raw
+            .split(separators)
+            .map(|part| part.trim().parse::<usize>().unwrap_or(0))
+            .collect();
+        return Ok(Some(WebFrameRef::Path(path)));
+    }
+    Ok(Some(WebFrameRef::UrlContains(raw.to_string())))
+}
+
+/// Split one batch-script line into argv tokens, honouring `'`/`"` quoting and
+/// backslash escapes.
+///
+/// A batch line IS a `do` invocation, so it has to tokenize the way a shell
+/// would or `--text "Proceed to Pay"` would arrive as three arguments. Kept
+/// deliberately small: quotes and backslashes, no expansion, no globbing, no
+/// variables — a batch script is a list of verbs, not a shell.
+fn tokenize_argv_line(line: &str) -> anyhow::Result<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let escaped = chars.next().context("trailing backslash in batch line")?;
+                current.push(escaped);
+                has_token = true;
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(c);
+                has_token = true;
+            }
+            c if Some(c) == quote => quote = None,
+            c if c.is_whitespace() && quote.is_none() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        anyhow::bail!("unterminated quote in batch line");
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+/// Parse a batch script — one `do`-style invocation per line — into actions.
+///
+/// Blank lines and `#` comments are skipped. Every line goes through the SAME
+/// `parse_web_surface_do_action` a CLI verb goes through, so a batched action
+/// and a typed one can never mean different things; that shared parser is the
+/// single source of truth for what a `do` verb IS.
+fn parse_web_do_batch_script(script: &str) -> anyhow::Result<Vec<yggterm_server::WebSurfaceDoAction>> {
+    let mut actions = Vec::new();
+    for (index, line) in script.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let tokens = tokenize_argv_line(trimmed)
+            .with_context(|| format!("batch line {}", index + 1))?;
+        // `parse_web_surface_do_action` reads the verb at args[4] — the shape a
+        // real `server app web do …` invocation has — so the line is spliced
+        // onto that prefix rather than parsed by a second, parallel reader.
+        let mut argv: Vec<String> = ["server", "app", "web", "do"]
+            .iter()
+            .map(|part| (*part).to_string())
+            .collect();
+        argv.extend(tokens);
+        actions.push(
+            parse_web_surface_do_action(&argv)
+                .with_context(|| format!("batch line {}: {trimmed}", index + 1))?,
+        );
+    }
+    if actions.is_empty() {
+        anyhow::bail!("batch script contained no actions");
+    }
+    Ok(actions)
+}
+
 /// Parse a `server app web do <verb> …` invocation into a typed
 /// `WebSurfaceDoAction` (agent control plane `do` verb, slice 2b). Coordinates
 /// are document-space CSS pixels; the GUI resolves selectors + maps to widget
@@ -548,9 +730,13 @@ fn parse_web_surface_do_action(
     let opt_f64 = |flag: &str| cli_flag_value(args, flag).and_then(|v| v.parse::<f64>().ok());
     let action = match verb {
         "click" | "tap" => {
-            if let Some(selector) = cli_flag_value(args, "--selector") {
+            // Addressed click (CSS / text / role+label) when any addressing flag
+            // is present; blind coordinates only when none is. The addressed
+            // path resolves in the page immediately before injection, which is
+            // both safer (it hit-tests) and stale-proof.
+            if let Some(target) = parse_web_element_ref(args, true)? {
                 WebSurfaceDoAction::ClickSelector {
-                    selector: selector.to_string(),
+                    selector: target,
                     button,
                 }
             } else {
@@ -582,7 +768,7 @@ fn parse_web_surface_do_action(
             text: cli_flag_value(args, "--text")
                 .context("missing --text for server app web do type")?
                 .to_string(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
         },
         // `fill` REPLACES a field's contents; `type` appends. Use it whenever the
         // field may already hold something — see the merge failure documented on
@@ -593,13 +779,13 @@ fn parse_web_surface_do_action(
             text: cli_flag_value(args, "--text")
                 .context("missing --text for server app web do fill")?
                 .to_string(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
             selectors: cli_flag_value(args, "--selector-set")
                 .map(|raw| {
                     raw.split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(str::to_string)
+                        .map(|css| yggterm_server::WebElementRef::Css(css.to_string()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -611,7 +797,7 @@ fn parse_web_surface_do_action(
             mods: cli_flag_value(args, "--mods")
                 .map(|raw| raw.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
-            selector: cli_flag_value(args, "--selector").map(str::to_string),
+            selector: parse_web_element_ref(args, false)?,
         },
         other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|fill|key)"),
     };
@@ -954,6 +1140,46 @@ fn print_server_help() {
     );
 }
 
+/// EVERY `server app web` action, with its usage.
+///
+/// This exists because a hand-maintained usage string is exactly the thing that
+/// drifts: `ensure`, `fill` and `totp` were implemented and undocumented, and a
+/// stale usage block is what produced a "not deployed" misdiagnosis in the
+/// field on 2026-07-22 (docs/agent-control-plane.md). An agent reading `--help`
+/// and concluding a verb does not exist is a failure mode of the DOCS.
+///
+/// One list, rendered into the usage text, and a test that fails when the
+/// dispatcher's own match arms disagree with it. An alias carries an empty
+/// usage string — it is named in its primary's line.
+const WEB_ACTIONS: &[(&str, &str)] = &[
+    ("eval", "  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]\n"),
+    ("read", "  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]\n    read with NO --frame searches EVERY reachable frame and returns\n    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []\n"),
+    ("await", "  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]\n    the script is the BODY of an async function; `return` its value.\n    `eval` cannot return a Promise — this is the one verb that can.\n"),
+    ("frames", "  yggterm server app web frames [--session <path>]\n    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)\n"),
+    ("do", "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n"),
+    ("fill-vault", "  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]\n"),
+    ("fill-card", "  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]\n"),
+    ("fill", "  yggterm server app web fill [--entry <name>] [--user <u>] [--session <path>]\n    auto-match the page host against the vault and fill the login form.\n    For ONE named field into ONE addressed element, use fill-vault.\n"),
+    ("totp", "  yggterm server app web totp [--entry <name>] [--user <u>] [--session <path>]  (alias: code)\n    put the entry's current TOTP code into the page's one-time-code field\n"),
+    ("batch", "  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]\n    one `do` invocation per line; # comments and blank lines skipped\n"),
+    ("wait", "  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]\n    cond: load:committed | load:finished | idle:<ms> | settled:<ms>\n        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>\n    url:* and settled:* are read from the ENGINE, so they survive a navigation\n    that makes every page-side predicate unavailable\n"),
+    ("ensure", "  yggterm server app web ensure --session <path> [--ttl <secs>]\n    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,\n    and reports generation_before/generation_after + healed so a caller can tell\n    a new page from the same one. Refusals name WHICH fact failed (no_declare,\n    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).\n"),
+    ("reload", "  yggterm server app web reload --session <path>\n"),
+    ("close", "  yggterm server app web close --session <path>\n"),
+    ("lease", "  yggterm server app web lease --ttl <secs> [--session <path>]\n"),
+    ("screenshot", "  yggterm server app web screenshot [output.png] [--session <path>]\n"),
+    ("cookies", "  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]\n    Netscape format, both ways (what `curl -c`/`-b` writes and reads).\n    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the\n    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers\n    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to\n    the engine API and are reported as export_scope=root_path_per_domain.\n"),
+    ("capture-element", "  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]\n    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface\n"),
+    ("devtools", "  yggterm server app web devtools [--close] [--session <path>]\n"),
+    ("code", ""),
+    ("capture", ""),
+];
+
+/// Render the `server app web` usage block from [`WEB_ACTIONS`].
+fn web_usage_block() -> String {
+    WEB_ACTIONS.iter().map(|(_, usage)| *usage).collect()
+}
+
 fn print_server_app_help() {
     println!(
         "usage:
@@ -962,6 +1188,9 @@ fn print_server_app_help() {
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
+  yggterm server app update <check|restart> [--force]
+    restart REFUSES while an agent web-surface lease is live (agent_lease_active);
+    pre-flight with `server app state | jq .agent_leases`
   yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
@@ -973,18 +1202,12 @@ fn print_server_app_help() {
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app keytips audit
   yggterm server app command <list|invoke <id>>
-  yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
-  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--session <path>]
-  yggterm server app web do <click|move|scroll|type|fill|key> [--selector <css>|--selector-set <css,css,…>|--x <n> --y <n>] [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]
-  yggterm server app web wait --until load:finished|load:committed|idle:<ms>|selector:<css>|js:<expr> [--visible] [--wait-timeout <ms>] [--session <path>]
-  yggterm server app web lease --ttl <secs> [--session <path>]
-  yggterm server app web screenshot [output.png] [--session <path>]
-  yggterm server app web devtools [--close] [--session <path>]
-
+{web_usage}
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
-  with one GUI and no target it routes there automatically."
+  with one GUI and no target it routes there automatically.",
+        web_usage = web_usage_block()
     );
 }
 
@@ -2236,6 +2459,7 @@ fn main() -> Result<()> {
                     run_app_control_close_window_preserving_sessions(
                         timeout_ms,
                         Some("manual-preserve-close".to_string()),
+                        args.iter().any(|arg| arg == "--force"),
                     )
                 } else {
                     run_app_control_close_window(timeout_ms)
@@ -2391,7 +2615,13 @@ fn main() -> Result<()> {
                     .unwrap_or("check");
                 match action {
                     "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
-                    "restart" => run_app_control_restart_pending_update(timeout_ms),
+                    // N5: refuses while an agent holds a live web-surface
+                    // lease — a deploy that lands mid-flow kills the flow.
+                    // `--force` says you mean it.
+                    "restart" => run_app_control_restart_pending_update(
+                        args.iter().any(|arg| arg == "--force"),
+                        timeout_ms,
+                    ),
                     other => anyhow::bail!("unsupported app update action: {other}"),
                 }
             }
@@ -3017,7 +3247,12 @@ fn main() -> Result<()> {
                                 })
                                 .context("missing script (positional, --script or --stdin) for server app web eval")?
                         };
-                        run_app_control_web_surface_eval(session_path, &script, timeout_ms)
+                        run_app_control_web_surface_eval(
+                            session_path,
+                            &script,
+                            parse_web_frame_ref(&args)?,
+                            timeout_ms,
+                        )
                     }
                     "screenshot" => {
                         let output = cli_positional_args(&args, 4)
@@ -3025,6 +3260,110 @@ fn main() -> Result<()> {
                             .next()
                             .unwrap_or("web-surface.png");
                         run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "await" => {
+                        // The ONE async bridge:
+                        //   web await (--script <file>|--stdin) [--await-timeout <ms>]
+                        // The script is the BODY of an async function; `return`
+                        // its value. `eval` cannot return a Promise, and this
+                        // is the verb that means nobody has to hand-roll a
+                        // stash-and-poll around that fact again.
+                        let script = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app web await stdin")?;
+                            value
+                        } else if let Some(path) = cli_flag_value(&args, "--script") {
+                            // A FILE by default, unlike `eval`'s `--script`,
+                            // because an async body is rarely a one-liner. A
+                            // path that does not exist is read as the script
+                            // itself rather than failing silently.
+                            std::fs::read_to_string(path)
+                                .unwrap_or_else(|_| path.to_string())
+                        } else {
+                            cli_positional_args(&args, 4)
+                                .into_iter()
+                                .next()
+                                .map(str::to_string)
+                                .context("missing script (positional, --script <file> or --stdin) for server app web await")?
+                        };
+                        let await_timeout_ms = cli_flag_value(&args, "--await-timeout")
+                            .map(|raw| raw.parse::<u64>().context("--await-timeout needs ms"))
+                            .transpose()?
+                            .unwrap_or(15_000);
+                        run_app_control_web_surface_await(
+                            session_path,
+                            &script,
+                            await_timeout_ms,
+                        )
+                    }
+                    "frames" => {
+                        // What frames this page has, and how much is IN each:
+                        //   web frames [--session <path>]
+                        // A top-document `read` returning [] next to a frame
+                        // reporting 107 elements is a legible answer; the []
+                        // alone was not.
+                        run_app_control_web_surface_frames(session_path, timeout_ms)
+                    }
+                    "cookies" => {
+                        // Move the surface's cookie jar to or from a Netscape
+                        // file — the format `curl -c`/`-b` speaks:
+                        //   web cookies --import <jar> | --export <jar>
+                        // This is what makes a flow SPLITTABLE: script the
+                        // mechanical parts on curl, hand the session to a
+                        // surface for the one interactive step, hand it back.
+                        //
+                        // ⚠ The jar is per-PROFILE and an unqualified surface
+                        // is `default` — the user's own browsing jar. Drive
+                        // agent work on a `--profile agent-<n>` surface before
+                        // importing. The response reports which profile was
+                        // written; check it.
+                        use yggterm_server::WebCookieDirection;
+                        let (direction, jar) = match (
+                            cli_flag_value(&args, "--import"),
+                            cli_flag_value(&args, "--export"),
+                        ) {
+                            (Some(jar), None) => (WebCookieDirection::Import, jar),
+                            (None, Some(jar)) => (WebCookieDirection::Export, jar),
+                            (Some(_), Some(_)) => anyhow::bail!(
+                                "web cookies takes --import <jar> OR --export <jar>, not both"
+                            ),
+                            (None, None) => anyhow::bail!(
+                                "web cookies needs --import <jar> or --export <jar> (Netscape format)"
+                            ),
+                        };
+                        run_app_control_web_surface_cookies(
+                            session_path,
+                            direction,
+                            jar,
+                            timeout_ms,
+                        )
+                    }
+                    "capture-element" | "capture" => {
+                        // Rasterize ONE addressed element to a PNG, in the page:
+                        //   web capture-element <target> [out.png] [--split <n>]
+                        // Compositor-independent, so it works on an unmapped
+                        // surface — <img>/<canvas>/<video> only, and every other
+                        // element gets a named refusal rather than a blank file.
+                        let target = parse_web_element_ref(&args, true)?.context(
+                            "capture-element needs a target: --selector <css>, --role <r> --label <s>, \
+                             or --text <s>",
+                        )?;
+                        let output = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .unwrap_or("web-element.png");
+                        let split = cli_flag_value(&args, "--split")
+                            .map(|raw| raw.parse::<usize>().context("--split needs a number"))
+                            .transpose()?;
+                        run_app_control_web_surface_capture_element(
+                            session_path,
+                            target,
+                            output,
+                            split,
+                            timeout_ms,
+                        )
                     }
                     "devtools" => {
                         let open = !args.iter().any(|arg| arg == "--close");
@@ -3034,6 +3373,44 @@ fn main() -> Result<()> {
                         let entry = cli_flag_value(&args, "--entry");
                         let user = cli_flag_value(&args, "--user");
                         run_app_control_web_surface_fill(session_path, entry, user, timeout_ms)
+                    }
+                    "fill-vault" | "fill-card" => {
+                        // Type ONE named vault field into ONE addressed
+                        // element, with real keys:
+                        //   web fill-vault --item <name> --field password
+                        //                  (--selector <css>|--role …|--target-text …)
+                        //   web fill-card  --item <name> --field number …
+                        // The secret never reaches this process: the CLI names
+                        // the item and the field, the GUI reads and types it,
+                        // and the answer is a length plus a boolean.
+                        let source = if action == "fill-card" {
+                            yggterm_server::VaultFieldSource::Card
+                        } else {
+                            yggterm_server::VaultFieldSource::Login
+                        };
+                        let target = parse_web_element_ref(&args, false)?.context(
+                            "fill-vault needs a target: --selector <css>, --role <r> --label <s>, \
+                             or --target-text <s>",
+                        )?;
+                        let item = cli_flag_value(&args, "--item")
+                            .context("missing --item (the vault entry NAME) for web fill-vault")?;
+                        let field = cli_flag_value(&args, "--field").unwrap_or(
+                            if action == "fill-card" { "number" } else { "password" },
+                        );
+                        let user = cli_flag_value(&args, "--user");
+                        let generation = cli_flag_value(&args, "--generation")
+                            .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
+                            .transpose()?;
+                        run_app_control_web_surface_fill_vault(
+                            session_path,
+                            target,
+                            item,
+                            field,
+                            user,
+                            source,
+                            generation,
+                            timeout_ms,
+                        )
                     }
                     "totp" | "code" => {
                         let entry = cli_flag_value(&args, "--entry");
@@ -3073,6 +3450,38 @@ fn main() -> Result<()> {
                             timeout_ms,
                         )
                     }
+                    "batch" => {
+                        // One explicitly-opened agent batch, N verbs, one gate:
+                        //   web batch --script <file> [--stop-on-error]
+                        //             [--generation <n>] [--session <path>]
+                        // Each line is a `do` invocation; the human still wins
+                        // mid-batch (the GUI re-reads seat input between
+                        // actions and aborts the remainder).
+                        let script = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app web batch stdin")?;
+                            value
+                        } else {
+                            let path = cli_flag_value(&args, "--script").context(
+                                "missing --script <file> (or --stdin) for server app web batch",
+                            )?;
+                            std::fs::read_to_string(path)
+                                .with_context(|| format!("reading batch script {path}"))?
+                        };
+                        let actions = parse_web_do_batch_script(&script)?;
+                        let generation = cli_flag_value(&args, "--generation")
+                            .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
+                            .transpose()?;
+                        let stop_on_error = args.iter().any(|arg| arg == "--stop-on-error");
+                        run_app_control_web_surface_batch(
+                            session_path,
+                            actions,
+                            generation,
+                            stop_on_error,
+                        )
+                    }
                     "ensure" => {
                         // Headless surface-create: materialize a BACKGROUNDED
                         // session's declared web surfaces into the soft stash
@@ -3084,6 +3493,22 @@ fn main() -> Result<()> {
                         let session = session_path
                             .context("web ensure needs --session <path> (a backgrounded surface has no active default)")?;
                         run_app_control_ensure_web_surface(session, ttl_secs, timeout_ms)
+                    }
+                    "reload" | "close" => {
+                        // Recover a surface without destroying its session:
+                        //   web reload --session <path>   (new incarnation)
+                        //   web close  --session <path>
+                        // Both report generation_before; compare it against a
+                        // following `web ensure`'s generation_after to tell a
+                        // HEALED surface from the same corpse.
+                        let session = session_path.context(
+                            "web reload/close needs --session <path>",
+                        )?;
+                        if action == "reload" {
+                            run_app_control_web_surface_reload(session, timeout_ms)
+                        } else {
+                            run_app_control_web_surface_close(session, timeout_ms)
+                        }
                     }
                     "lease" => {
                         // Claim the surface so the background reaper leaves it
@@ -3116,7 +3541,12 @@ fn main() -> Result<()> {
                                 "unknown --as for web read: {other} (snapshot|forms|tables|readable|links|text|html)"
                             ),
                         };
-                        run_app_control_web_surface_read(session_path, mode, timeout_ms)
+                        run_app_control_web_surface_read(
+                            session_path,
+                            mode,
+                            parse_web_frame_ref(&args)?,
+                            timeout_ms,
+                        )
                     }
                     "wait" => {
                         // Event-driven synchronization (agent control plane slice
@@ -3141,11 +3571,29 @@ fn main() -> Result<()> {
                             Some(("js", expr)) => WebSurfaceWaitUntil::Js {
                                 expr: expr.to_string(),
                             },
+                            // `url:matches:<re>` and its sugar `url:contains:<s>`
+                            // compile to ONE predicate: the sugar is escaped
+                            // into a regex here rather than becoming a second
+                            // matching rule in the GUI.
+                            Some(("url", rest)) => match rest.split_once(':') {
+                                Some(("matches", pattern)) => WebSurfaceWaitUntil::UrlMatches {
+                                    pattern: pattern.to_string(),
+                                },
+                                Some(("contains", needle)) => WebSurfaceWaitUntil::UrlMatches {
+                                    pattern: regex_escape_literal(needle),
+                                },
+                                _ => anyhow::bail!(
+                                    "bad --until url:… ({rest}) — use url:matches:<regex> or url:contains:<substring>"
+                                ),
+                            },
+                            Some(("settled", ms)) => WebSurfaceWaitUntil::Settled {
+                                ms: ms.parse().context("--until settled:<ms> needs a number")?,
+                            },
                             _ => match raw {
                                 "committed" => WebSurfaceWaitUntil::LoadCommitted,
                                 "finished" | "load" | "loaded" => WebSurfaceWaitUntil::LoadFinished,
                                 other => anyhow::bail!(
-                                    "bad --until: {other} (load:committed|load:finished|idle:<ms>|selector:<css>|js:<expr>)"
+                                    "bad --until: {other} (load:committed|load:finished|idle:<ms>|settled:<ms>|selector:<css>|js:<expr>|url:matches:<re>|url:contains:<s>)"
                                 ),
                             },
                         };
@@ -4688,6 +5136,9 @@ fn terminate_superseded_client_pid(pid: u32) -> bool {
 fn superseded_client_close_command() -> yggterm_server::AppControlCommand {
     yggterm_server::AppControlCommand::CloseWindowPreservingSessions {
         reason: Some("superseded-client-handoff".to_string()),
+        // A client handoff is not a deploy: the superseding client is already
+        // taking the window, so an agent lease must not block it.
+        force: true,
     }
 }
 
@@ -5309,6 +5760,128 @@ fn run_server_smoke() -> Result<()> {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&temp_home);
     result
+}
+
+#[cfg(test)]
+mod web_usage_tests {
+    use super::*;
+
+    /// Every action name the `server app web` dispatcher accepts, read from the
+    /// dispatcher's own match arms.
+    ///
+    /// This is a SCANNER, and a scanner that silently matches nothing passes
+    /// green while proving nothing — the exact failure a brace-counting lock in
+    /// this repo shipped with. So it returns the arms AND the test asserts a
+    /// coverage floor below.
+    fn dispatcher_web_actions() -> Vec<String> {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("            \"web\" => {")
+            .expect("the web dispatcher block moved; fix this scanner, do not delete it");
+        let end = source[start..]
+            .find("other => anyhow::bail!(\"unsupported app web action")
+            .expect("the web dispatcher's catch-all moved")
+            + start;
+        let mut actions = Vec::new();
+        // The OUTER match's arms sit at exactly this indentation. Matching on
+        // indentation is what keeps the INNER matches out of the answer — the
+        // `--as` modes and `--until` forms are options of a verb, not verbs,
+        // and counting them would make this lock unsatisfiable and then
+        // deleted.
+        const ARM_INDENT: &str = "                    \"";
+        for line in source[start..end].lines() {
+            if !line.starts_with(ARM_INDENT) {
+                continue;
+            }
+            let trimmed = line.trim();
+            // An arm looks like:  "eval" => {   or   "totp" | "code" => {
+            let Some(head) = trimmed.split("=>").next() else {
+                continue;
+            };
+            if !trimmed.contains("=>") || !head.trim_start().starts_with('"') {
+                continue;
+            }
+            for part in head.split('|') {
+                let part = part.trim();
+                if let Some(name) = part
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                {
+                    actions.push(name.to_string());
+                }
+            }
+        }
+        actions
+    }
+
+    /// THE DRIFT LOCK. `ensure`, `fill` and `totp` were implemented and
+    /// undocumented, and a stale usage block is what produced a "not deployed"
+    /// misdiagnosis in the field — an agent read `--help`, did not see the
+    /// verb, and concluded the build lacked it.
+    ///
+    /// Fails today against the pre-D1 usage string, which is the point.
+    #[test]
+    fn every_web_action_appears_in_the_usage_string() {
+        let dispatcher = dispatcher_web_actions();
+        // COVERAGE FLOOR: a scanner that finds nothing must fail, not pass.
+        assert!(
+            dispatcher.len() >= 15,
+            "the arm scanner found only {} actions — it went blind; fix it rather than \
+             lowering this floor",
+            dispatcher.len()
+        );
+        assert!(dispatcher.contains(&"eval".to_string()), "sanity: {dispatcher:?}");
+
+        let documented: std::collections::BTreeSet<&str> =
+            WEB_ACTIONS.iter().map(|(name, _)| *name).collect();
+        let implemented: std::collections::BTreeSet<String> =
+            dispatcher.iter().cloned().collect();
+
+        let undocumented: Vec<&String> = implemented
+            .iter()
+            .filter(|name| !documented.contains(name.as_str()))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "these web actions are implemented and undocumented: {undocumented:?} — add them to \
+             WEB_ACTIONS. An agent that reads --help and does not see a verb concludes the build \
+             lacks it."
+        );
+
+        let phantom: Vec<&&str> = documented
+            .iter()
+            .filter(|name| !implemented.contains(&(**name).to_string()))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "these web actions are documented and NOT implemented: {phantom:?} — worse than an \
+             omission, because it sends a caller after a verb that will never answer."
+        );
+    }
+
+    /// The rendered block must actually contain a line per non-alias action —
+    /// a `WEB_ACTIONS` entry with an empty usage string would satisfy the set
+    /// comparison above while printing nothing.
+    #[test]
+    fn the_rendered_usage_names_every_non_alias_action() {
+        let rendered = web_usage_block();
+        for (name, usage) in WEB_ACTIONS {
+            if usage.is_empty() {
+                // An alias: it must still be findable in its primary's line.
+                assert!(
+                    rendered.contains(name),
+                    "alias {name} is documented nowhere"
+                );
+                continue;
+            }
+            assert!(
+                rendered.contains(&format!("server app web {name} ")),
+                "{name} has a usage entry that does not name it"
+            );
+        }
+        // And the whole block is non-trivial.
+        assert!(rendered.lines().count() > 25, "the usage block collapsed");
+    }
 }
 
 #[cfg(test)]

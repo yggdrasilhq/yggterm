@@ -987,6 +987,25 @@ not a code claim.
    Unit-tested in both directions, the important one being that the agent's own
    injection is never counted as the human (a false positive there would make
    every batch preempt itself on its second verb).
+   **The gate's ORDER is: stale → SEAT INPUT → lane reset → admit.** The seat
+   read comes before the reset because `web batch` sets the reset flag on the
+   agent's own behalf — nobody asserts anything — so reset-first made the
+   highest-privilege verb on the plane the one verb that could never be
+   preempted at its own start: `forget()` removed the lane, `note_human_input`
+   found nothing to cancel, and a click landing between the agent's last verb
+   and its batch was consumed and discarded while all N injections ran. The
+   refusal is keyed on the COUNT, not on what the lane remembered, so a gesture
+   on a surface with no lane yet also refuses. Cost to the agent: exactly one
+   refusal, because that refusal consumes the count.
+   **Both halves are locked against the REAL accounting.** The shell-side lock
+   (`twenty_sequential_verbs_all_admit_under_the_id_production_is_stuck_with`)
+   used to pass a literal `0` seat count to `web_do_gate`, which synthesized the
+   defect away — it passed with `spend_injection_credit` fully reverted. It now
+   drives `grant_injection_credits` → `note_seat_input` →
+   `take_seat_input_count` and feeds the gate what the engine actually produces,
+   and the batch LOOP's per-action abort (previously untested by any C7 test)
+   has its own two locks over the same accounting. Reverting
+   `spend_injection_credit` to `false` turns all three red.
    ⛔ **Still owed: the LIVE proof.** It needs a real seat clicking a real web
    surface while an agent batch runs — a human action, not something the agent
    can synthesize (any event it could generate would go through the injection
@@ -1267,6 +1286,16 @@ surface must be revealed once; (b) `--session` on a backgrounded surface is
 bounded by the ~600s reap hold unless a `lease` extends it — the single `not live`
 seen this run is consistent with hold-expiry, not a missing feature. Lesson for
 the file: never conclude "not deployed" from a usage string.
+
+**Closed 2026-07-25.** The usage string is no longer hand-maintained: it renders
+from `WEB_ACTIONS` in `apps/yggterm/src/main.rs`, and
+`every_web_action_appears_in_the_usage_string` FAILS when the dispatcher's own
+match arms disagree with it (in either direction — an undocumented verb and a
+documented-but-unimplemented one are both errors, the second being worse because
+it sends a caller after something that will never answer). The scanner that reads
+those arms carries a coverage floor, so a scanner that goes blind fails rather
+than passing green. The full verb plane is documented in
+`docs/web-surfaces.md#the-server-app-web-verb-plane-2026-07-25`.
 
 ## Field findings — invisible co-browse maiden run (2026-07-23)
 

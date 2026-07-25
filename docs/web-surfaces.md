@@ -566,3 +566,185 @@ rects"). No app involvement: tabs are GUI chrome by doctrine.
   ids, so a persisted pin has no durable referent: `prune_web_view_panes`
   drops a pin when its tab closes, its surface retires (close/sweep/Ctrl+Z),
   or across a GUI restart, and a group below 2 panes dissolves.
+
+## The `server app web` verb plane (2026-07-25)
+
+The agent-facing surface of a web surface. `yggterm server app web --help`
+renders from `WEB_ACTIONS` in `apps/yggterm/src/main.rs`, and a test
+(`every_web_action_appears_in_the_usage_string`) fails when the dispatcher's own
+match arms disagree with it — because a stale usage block already caused one
+"not deployed" misdiagnosis in the field (docs/agent-control-plane.md:1275). If
+you add a verb and skip the usage entry, the build fails. That is deliberate.
+
+### App-control is a FILESYSTEM DROPBOX, not RPC
+
+The CLI writes `~/.yggterm/app-control-requests/<uuid>.json`; the GUI polls it.
+The daemon is **not** in this path and never deserializes `AppControlCommand`.
+Two consequences an implementer will otherwise rediscover the hard way:
+
+- **CLI and GUI must be swapped together.** A newer CLI's verb reaching an older
+  GUI is a version mismatch, not a bug.
+- **It answers honestly now, for the kind AND for the payload.** A well-formed
+  request with an unknown `kind` deserializes into
+  `AppControlCommand::Unsupported` and is REFUSED with
+  `unsupported_command_kind`. A KNOWN kind whose FIELDS this build cannot read
+  is salvaged from the envelope into `AppControlCommand::Unreadable` and refused
+  with `unreadable_command_payload` plus the serde error (`invalid type: map,
+  expected a string`) as the clue — that is the mismatch a changed field shape
+  produces, e.g. `do click --text` against a GUI that types `selector` as a bare
+  string. Before that, both were deleted unread and the caller saw a bare
+  timeout. Malformed JSON, and any file whose envelope is not a request, is
+  still deleted — a corrupt file is not a version mismatch.
+- **A `#[serde(default)]` field added to an EXISTING command is silently
+  DROPPED by an older GUI**, which is worse than a timeout: the verb succeeds
+  and does the wrong thing. Every such field must be ECHOED in the response and
+  the CLI must hard-fail when the echo is missing. `--frame` is the worked
+  example (`frame_resolved`).
+
+### Which verbs need a MAPPED surface
+
+| Needs a mapped surface | Works on a soft-stashed / never-revealed one |
+|---|---|
+| `do`, `batch`, `fill-vault` (they synthesize GDK events; an unmapped webview drops them, so they fail closed with `surface_not_mapped`) | everything eval-backed: `eval`, `await`, `read`, `frames`, `wait`, `capture-element`, `cookies`, `screenshot`, `lease`, `ensure` |
+
+Explicit JS eval keeps running on a throttled (hidden) view — see
+`WebSurfaceHost::set_throttled`. That is why `capture-element` works on a
+surface the user has never seen.
+
+### Addressing an element
+
+One type, `WebElementRef`, carried by every selector-shaped field of a `do`
+action. A bare string is a CSS selector (so every payload written before this
+existed still parses); an object addresses by visible text or by role+label.
+Resolution happens IN THE PAGE, immediately before injection — a rect resolved
+in an earlier request is never reused.
+
+Ties are broken deterministically: candidates in document order, any candidate
+that CONTAINS another candidate dropped (so a substring match never selects
+`<body>` over the button inside it), then `--nth`. For role, exact label matches
+are preferred over substring ones as a fixed rule.
+
+`do click` reports `resolved: {css_path, tag, rect, on_target, is_connected}`
+next to `delivered`. Keep the three questions apart:
+
+- `accepted` — the injector ran.
+- `resolved.*` — what the DOM said about the node at click time.
+- `delivered` — what the page's own listener observed.
+
+A node that resolves but is not in the document is REFUSED (`detached_node`), because
+a React re-render drops agent-injected ids and an event fired at a detached node
+delivers nothing.
+
+### `batch`: what the envelope means
+
+`web batch` answers `{accepted, requested, attempted, succeeded, failed,
+actions, aborted_at, abort_reason}`. The counts are separate on purpose:
+
+- `requested` — actions asked for.
+- `attempted` — actions that actually ran (`succeeded + failed`). Short of
+  `requested` only when the batch stopped early.
+- `succeeded` / `failed` — what came of them.
+- **`accepted` is strict: the batch ran to the end AND every action it
+  attempted succeeded.** A partial batch is `accepted: false`. This is the one
+  field a caller that does not walk `actions[]` will read, so it must never be
+  true for a run that delivered nothing — with the default
+  `stop_on_error: false`, a 31-field fill in which all 31 selectors miss is
+  `accepted: false, attempted: 31, succeeded: 0, failed: 31`.
+
+The human wins at the batch's START as well as mid-run. Seat input is read
+BEFORE the lane reset, so a click that landed between the agent's last verb and
+its `web batch` refuses the batch (`preempted`) instead of being absorbed by the
+reset the verb performs on the agent's own behalf. That refusal consumes the
+count, so the next `batch` (or `do --new-batch`) opens normally — one refusal is
+the whole cost of yielding.
+
+### Frames
+
+`web read` with no `--frame` searches EVERY reachable frame and returns
+`frames: [{frame:{path,url,accessible}, result, error}]`, top document first
+(frame `[]`), **and keeps answering `result`** — the top document's answer,
+which is exactly the pre-frames shape. `frames` is additive; dropping `result`
+would have handed every existing caller a silent `null`, which is the failure
+class this verb family exists to kill. A frame it cannot read is REPORTED with
+`accessible:false`, not omitted — "there is a frame here I cannot read" and "there is no frame here" are
+different facts, and a silent `[]` from the top document reads as "the site does
+not offer this". `web frames` gives per-frame element and interactable counts.
+
+`--frame` addresses SAME-ORIGIN frames on `eval` and `read`. Cross-origin frames
+are enumerated but not addressable, and `--frame` on `do` is not implemented:
+`do` synthesizes an event at widget coordinates, so a frame-relative rect must be
+composed through every ancestor's `getBoundingClientRect`. Workaround: read the
+frame to find the target, then click the TOP document's coordinates of the
+iframe element offset by the frame-relative rect.
+
+### Cookies: the export is NOT complete, and the import may hit the user's jar
+
+`web cookies --import <jar> | --export <jar>` speaks Netscape format both ways —
+what `curl -c`/`-b` writes and reads. `crates/yggterm-shell/src/netscape_cookie_jar.rs`
+is the one owner of that format. Two things to know:
+
+- **`export_scope: "root_path_per_domain"`.** WebKitGTK 4.x has no
+  dump-the-whole-jar API: `cookies()` is per-URI and libsoup enforces the
+  cookie's path against it. So an export is every root-path cookie of every
+  domain the jar knows, and path-scoped cookies are missing. Do not reach for
+  the on-disk sqlite jar to close the gap — it is a second encoding of the
+  cookie store and blind to unflushed in-memory state.
+- ⚠ **The jar is per-`WebContext` = per-PROFILE, and a surface with no explicit
+  profile is `default` — the user's own browsing jar.** Drive agent work on a
+  `--profile agent-<n>` surface before importing. The response reports which
+  profile was written; check it. The trace records domains and counts and never
+  a name or a value.
+
+### Waiting through a navigation
+
+An eval failure during `wait` is NOT-YET, not the end: a multi-origin
+auto-submit chain tears down and rebuilds the content process at every hop, and
+the old code returned on the first commit. `eval_errors` is reported so a wait
+that spent its whole budget failing is legible.
+
+`--until url:matches:<regex>` and `--until settled:<ms>` are read from the
+ENGINE's own page state, with no page eval at all, which is what makes them
+answerable while the content process is being rebuilt. `url:contains:<s>` is
+sugar compiled into the same regex predicate at the CLI.
+
+### Async
+
+`eval` returns a script's COMPLETION value, and a Promise is not one — the
+engine answers `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT`. `web await` is the ONE
+async bridge; do not re-invent stash-and-poll. A poll failure is not-yet, and a
+stash missing after a document change is `document_replaced`, never a fabricated
+result.
+
+`eval`'s refusals are now distinct: `js_result_unsupported` (the script ran and
+returned something unserializable — the PAGE is fine) versus
+`webview_unreachable` (nobody answered). Those two shared one string, and the
+ambiguity cost a field run ten minutes.
+
+### Recovering a surface
+
+`web ensure` probes LIVENESS, not emptiness: tabs → handle → engine liveness →
+**a bounded eval round trip**. The first three are UI-process facts and stay
+true over a dead content process, which is how `ensure` used to hand back a
+corpse and report success. Compare `generation_before` with `generation_after`
+(and `healed`) to tell a new page from the same one. `web reload` and `web close`
+reach the same recovery directly.
+
+Refusals name which fact failed: `no_declare`, `declare_stale` (the app EXITED —
+relaunch it, do not retry), `declare_url_scheme_refused`,
+`declare_without_url`, `daemon_declare_unavailable` (a failed FETCH is not an
+absent declare).
+
+⛔ **The declare's URL scheme gate is not negotiable.** It guards two
+PTY-authored paths, and any process that can write a session's PTY can emit that
+OSC (see "Renderer and security" above). Allowing `file://` there would let a
+crafted byte stream open a local secret in a webview that `web read --as text`
+then exfiltrates. Serve a fixture over loopback http instead; the allowlist
+already permits it.
+
+### Deploying while an agent is driving
+
+`server app state | jq .agent_leases` answers "is someone mid-flow" in one call,
+from the same field the reaper reads. `server app update restart` and the
+preserving-close door both REFUSE with `agent_lease_active` while a lease is
+live, unless `--force`. Honest limit: this stops the app-control restart door,
+not `pkill yggterm`.

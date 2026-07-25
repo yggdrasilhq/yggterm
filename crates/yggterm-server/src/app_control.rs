@@ -152,6 +152,111 @@ pub enum AppControlKeyCommand {
     Type { text: String },
 }
 
+/// How a `do` verb names the element it wants — the ONE addressing type for
+/// every selector-shaped field on [`WebSurfaceDoAction`].
+///
+/// Why it exists: gateway and bank UIs have no stable ids. BillDesk's bank rows
+/// are anonymous `div`s; IDFC's continue button is an unnamed
+/// `<button type=submit>`. A CSS selector cannot name either, and a *coordinate*
+/// goes stale the moment the page reflows. Text and role/label are how a human
+/// names those controls, so they are how an agent should too.
+///
+/// It is deliberately ONE type carried by the existing `selector` fields rather
+/// than a parallel `ClickText` action: a second action variant would be a second
+/// encoding of "which element", and the four call sites (click, focus-for-type,
+/// focus-for-key, fill) would drift apart.
+///
+/// `#[serde(untagged)]` with `Css(String)` first is what keeps the wire
+/// compatible: every previously-written payload spells the field as a BARE
+/// STRING (`"selector":"#login"`) and still deserializes, into `Css`. That
+/// back-compat is pinned by `a_bare_string_selector_still_parses_as_css`.
+///
+/// Resolution happens AT CLICK TIME, in the page, immediately before injection —
+/// so a match is never carried across a reflow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebElementRef {
+    /// A CSS selector, resolved with `document.querySelector` (first match).
+    Css(String),
+    /// The element whose visible text (or `aria-label`, or an input's `value`)
+    /// matches. Ties are broken deterministically: candidates in document order,
+    /// ancestors of another candidate dropped (so a `contains` match on `<body>`
+    /// never wins over the button inside it), then `nth` (default 0).
+    Text {
+        text: String,
+        /// Exact (trimmed, whitespace-collapsed) equality instead of substring.
+        #[serde(default)]
+        exact: bool,
+        /// Restrict the candidate set to a CSS selector (e.g. `button`).
+        #[serde(default)]
+        tag: Option<String>,
+        /// Which match to take when several remain. Default 0.
+        #[serde(default)]
+        nth: Option<usize>,
+    },
+    /// The element with an explicit or implicit ARIA `role` whose accessible
+    /// label matches. Exact label matches are preferred over substring ones; the
+    /// preference is a fixed rule, not a heuristic that can vary per run.
+    Role {
+        role: String,
+        label: String,
+        #[serde(default)]
+        nth: Option<usize>,
+    },
+}
+
+impl WebElementRef {
+    /// A short, log-safe description of what was asked for. Never a page value.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Css(selector) => format!("css:{selector}"),
+            Self::Text { text, exact, .. } => {
+                if *exact {
+                    format!("text=:{text}")
+                } else {
+                    format!("text~:{text}")
+                }
+            }
+            Self::Role { role, label, .. } => format!("role:{role}[{label}]"),
+        }
+    }
+}
+
+/// Which way a `cookies` verb moves a jar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebCookieDirection {
+    /// Read the surface's jar into a Netscape file. Read-only.
+    Export,
+    /// Write a Netscape file's cookies into the surface's jar.
+    ///
+    /// ⚠ The jar is per-PROFILE, and a surface with no explicit profile is
+    /// `default` — the USER'S OWN browsing jar. Drive agent work on a
+    /// `--profile agent-<n>` surface before importing anything.
+    Import,
+}
+
+/// Which vault record a `fill-vault` verb reads from.
+///
+/// One command with a source, not two commands: the page-origin guard, the
+/// injection path, the redaction rules and the response shape are identical —
+/// only the vault CLI subcommand differs. Two commands would be a second
+/// encoding of all of that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultFieldSource {
+    /// A login item: `password`, `username`, `totp`, `notes`.
+    #[default]
+    Login,
+    /// A card item: `number`, `expiry`, `code`, `holder`.
+    ///
+    /// BLOCKED on `ychrome-vault` growing a `card` op — no agent op reaches
+    /// `cipher.card` today. The verb refuses with `vault_cli_no_card_op` rather
+    /// than a generic failure, so the day that op lands this starts working
+    /// with no yggterm change.
+    Card,
+}
+
 /// One trusted action injected into a web surface's page (agent control plane
 /// `do` verb, slice 2b). Delivered via GTK-level event synthesis into the target
 /// webview — `isTrusted: true`, NO seat pointer moved — so a backgrounded
@@ -173,7 +278,9 @@ pub enum WebSurfaceDoAction {
     /// Click the element matching `selector` (engine resolves its rect + scrolls
     /// it into view, then clicks its center). Sugar over `Click`.
     ClickSelector {
-        selector: String,
+        /// The element to click. A bare string is a CSS selector; an object
+        /// addresses by text or role/label (see [`WebElementRef`]).
+        selector: WebElementRef,
         #[serde(default)]
         button: AppControlPointerButton,
     },
@@ -194,7 +301,7 @@ pub enum WebSurfaceDoAction {
     Type {
         text: String,
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
     },
     /// Press a single named key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`, or
     /// a single character) with optional modifiers (`ctrl`, `shift`, `alt`,
@@ -206,7 +313,7 @@ pub enum WebSurfaceDoAction {
         #[serde(default)]
         mods: Vec<String>,
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
     },
     /// **Set** a field to `text`: clear what is there with real keys, type the
     /// new value with real keys, then read the value back and report whether it
@@ -231,11 +338,33 @@ pub enum WebSurfaceDoAction {
         text: String,
         /// The single field to replace. Ignored when `selectors` is non-empty.
         #[serde(default)]
-        selector: Option<String>,
+        selector: Option<WebElementRef>,
         /// A segmented input's boxes, in visual order.
         #[serde(default)]
-        selectors: Vec<String>,
+        selectors: Vec<WebElementRef>,
     },
+}
+
+/// Which frame of a page a verb addresses.
+///
+/// Why it exists: a top-document query against a page whose content lives in an
+/// iframe returns `[]` SILENTLY, and that silence reads as "the site does not
+/// offer this". The BillDesk case is the measurement — its iframe held 107
+/// elements while the top document had 17.
+///
+/// The top document is the frame at path `[]`, so "no frame" and "a frame" have
+/// the same shape and a caller never has to branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebFrameRef {
+    /// `window.frames[i]` of the top document.
+    Index(usize),
+    /// The first frame whose url contains this substring.
+    UrlContains(String),
+    /// An explicit descent, e.g. `[0, 2]` = the third frame of the first frame.
+    /// This is the form `web frames` reports, so its output feeds straight back
+    /// in.
+    Path(Vec<usize>),
 }
 
 /// What structured view a `read` verb returns (agent control plane, rung 1 —
@@ -286,6 +415,27 @@ pub enum WebSurfaceWaitUntil {
     },
     /// A JS expression evaluates truthy (exceptions count as not-yet).
     Js { expr: String },
+    /// The engine's CURRENT url matches `pattern` (a Rust regex, unanchored).
+    ///
+    /// Evaluated HOST-side from the UI process's own page-state property, with
+    /// no page eval at all — which is what makes it the one predicate that
+    /// survives a navigation. A 4-origin auto-submit chain (rtionline →
+    /// merchant.sbi.bank.in → billdesk.com/pgidsk → pay.billdesk.com →
+    /// auth.idfcfirst.bank.in) tears the content process down and rebuilds it
+    /// at every hop, so any page-side predicate is unavailable exactly when the
+    /// caller most needs to know where it landed.
+    UrlMatches {
+        pattern: String,
+    },
+    /// Nothing has changed for `ms`: the engine url is unchanged since the
+    /// previous tick, the engine is not loading, AND the page's own mutation
+    /// clock reads at least `ms`.
+    ///
+    /// Two observers, one predicate. The host half keeps answering while the
+    /// page half is unavailable mid-navigation, and a url change resets the
+    /// clock — so "settled" cannot be satisfied by a page that is quietly
+    /// bouncing through redirects.
+    Settled { ms: u64 },
 }
 
 fn default_grid_cols() -> u32 {
@@ -395,7 +545,13 @@ pub enum AppControlCommand {
         grain: Option<f32>,
     },
     TriggerUpdateCheck,
-    RestartPendingUpdate,
+    /// Restart into a staged update.
+    ///
+    /// Refuses while an agent holds a live web-surface lease unless `force`.
+    RestartPendingUpdate {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
@@ -456,6 +612,12 @@ pub enum AppControlCommand {
     CloseWindowPreservingSessions {
         #[serde(default)]
         reason: Option<String>,
+        /// Close anyway while an agent lease is live. Same guard as
+        /// `RestartPendingUpdate` — guarding one deploy door and leaving the
+        /// other open would be the surface inconsistency the house rules call
+        /// a spec violation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     Pointer {
         command: AppControlPointerCommand,
@@ -665,6 +827,15 @@ pub enum AppControlCommand {
         #[serde(default)]
         session_path: Option<String>,
         script: String,
+        /// Run in this frame instead of the top document.
+        ///
+        /// ⚠ A `#[serde(default)]` field is DROPPED without complaint by an
+        /// older GUI, which would put `--frame` right back to querying the top
+        /// document silently — the exact failure this exists to kill. So the
+        /// response ECHOES `frame_resolved`, and the CLI hard-fails when the
+        /// echo is missing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<WebFrameRef>,
     },
     /// Capture a session's active web-surface tab: the FULL DOCUMENT (whole
     /// page, beyond the visible viewport) rendered to a PNG by the engine.
@@ -672,6 +843,84 @@ pub enum AppControlCommand {
         #[serde(default)]
         session_path: Option<String>,
         output_path: String,
+    },
+    /// Run an ASYNC script and return its resolved value — the ONE async
+    /// bridge.
+    ///
+    /// `eval` returns a script's COMPLETION value, and a Promise is not a
+    /// serializable completion value: the engine answers
+    /// `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT`. Every caller that needed
+    /// `fetch`, `await el.decode()`, or any other promise therefore invented
+    /// the same workaround — stash the result on `window` and poll it with a
+    /// second verb. This owns that idiom in ONE place so nobody writes it
+    /// again, and so the two ways it goes wrong (a poll that fails mid-
+    /// navigation, a document replaced under the stash) get honest answers
+    /// instead of a fabricated one.
+    WebSurfaceAwait {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// The body of an async function. `return` its value.
+        script: String,
+        /// How long to wait for the promise to settle.
+        timeout_ms: u64,
+    },
+    /// Enumerate the page's frames: url, element counts, and whether each is
+    /// reachable from the top document's realm.
+    ///
+    /// The instrument the records run lacked. A cross-origin frame is REPORTED
+    /// (with `accessible: false` and the reason) rather than omitted — knowing
+    /// a frame exists and cannot be read is a completely different fact from
+    /// there being no frame.
+    WebSurfaceFrames {
+        #[serde(default)]
+        session_path: Option<String>,
+    },
+    /// Move a session's web-surface cookie jar to or from a Netscape file.
+    ///
+    /// This is what makes "script it on curl, hand the session to a surface for
+    /// the one interactive step, hand it back" possible. It was proven both
+    /// necessary AND sufficient in the field: transplanting a single PHPSESSID
+    /// into a browser made rtionline render the applicant's name and the fee.
+    ///
+    /// ⚠ The cookie manager is per-`WebContext` = per-PROFILE, and a surface
+    /// with no explicit profile is `default`, i.e. the user's own browsing jar.
+    /// The response reports which profile was written; the trace records
+    /// domains and counts and NEVER values.
+    WebSurfaceCookies {
+        #[serde(default)]
+        session_path: Option<String>,
+        direction: WebCookieDirection,
+        /// The Netscape jar file to read or write. Absolutized CLI-side.
+        jar_path: String,
+    },
+    /// Rasterize ONE addressed element to a PNG, IN THE PAGE.
+    ///
+    /// `canvas.drawImage(el)` + `toDataURL()` — no compositor, no window
+    /// mapping, no screenshot backend. That is the whole point: it works on an
+    /// unmapped/headless surface today, which retires the "needs an offscreen
+    /// renderer" deferral and unblocks the things an agent actually gets stuck
+    /// on — captchas, QR codes, charts, signature pads.
+    ///
+    /// Both `drawImage` of a decoded image and `toDataURL` are SYNCHRONOUS, so
+    /// the whole capture is one plain completion value and never touches the
+    /// async bridge (`eval` cannot return a Promise).
+    ///
+    /// Only genuinely rasterizable elements work — `<img>`, `<canvas>`,
+    /// `<video>`. There is no in-page rasterizer for arbitrary DOM and this
+    /// verb does not pretend otherwise: a `div` gets
+    /// `element_not_rasterizable`, an undecoded image gets `image_not_decoded`,
+    /// and a cross-origin image without CORS gets `tainted_canvas` — three
+    /// different facts, three different reasons.
+    WebSurfaceCaptureElement {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// What to capture. Same addressing as `do` (see [`WebElementRef`]).
+        target: WebElementRef,
+        output_path: String,
+        /// Also write `<out>-1.png … <out>-n.png`, the image cut into `n` equal
+        /// vertical bands. The per-character captcha case.
+        #[serde(default)]
+        split: Option<usize>,
     },
     /// Open/close the WebKit inspector (devtools) on a session's active
     /// web-surface tab.
@@ -696,6 +945,38 @@ pub enum AppControlCommand {
         /// Username disambiguator when several entries share `entry`'s name.
         #[serde(default)]
         user: Option<String>,
+    },
+    /// Type ONE named vault field into ONE addressed element, with real keys.
+    ///
+    /// The secret never reaches argv, stdout, a log, or the agent's transcript:
+    /// the GUI shells out to `ychrome-vault` IN-PROCESS, holds the value only
+    /// long enough to synthesize keystrokes into the page, and answers with a
+    /// LENGTH and a page-side boolean. The trace event carries the item and
+    /// field NAMES only.
+    ///
+    /// Distinct from `WebSurfaceFill`, which auto-matches a login form by host
+    /// and writes both fields. This one is for the case a form cannot be
+    /// auto-matched — a bank's login page, a gateway's card box — where the
+    /// agent has already read the page and knows exactly which element it
+    /// wants filled.
+    WebSurfaceFillVault {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// The element to type into. Same addressing as `do` (see
+        /// [`WebElementRef`]) — CSS, visible text, or role+label.
+        target: WebElementRef,
+        /// Vault entry NAME.
+        item: String,
+        /// Which field of it.
+        field: String,
+        /// Username disambiguator when several entries share `item`'s name.
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        source: VaultFieldSource,
+        /// Pin the surface incarnation (F3), same meaning as on `WebSurfaceDo`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
     /// Put a vault entry's current TOTP code into the page's one-time-code
     /// field (and onto the clipboard). Same entry/user semantics as fill.
@@ -745,6 +1026,31 @@ pub enum AppControlCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         new_batch: bool,
     },
+    /// Run N `do` actions inside ONE explicitly-opened agent batch (agent
+    /// control plane `batch`).
+    ///
+    /// A `do` verb is one app-control round trip; a 31-field form is 31 of them,
+    /// each paying resolve + gate + arm + read and each a fresh chance for the
+    /// lane to close underneath. A batch resolves the surface and opens the lane
+    /// once, then runs exactly the same per-action unit a single `do` runs.
+    ///
+    /// It buys throughput, NOT immunity: the surface's seat-input counter is
+    /// re-read between actions, and real human input aborts the remainder with
+    /// `preempted` and `remaining: n`. The human wins mid-batch.
+    WebSurfaceBatch {
+        #[serde(default)]
+        session_path: Option<String>,
+        actions: Vec<WebSurfaceDoAction>,
+        /// Pin the surface incarnation the batch was planned against (F3), same
+        /// meaning as on `WebSurfaceDo`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+        /// Stop at the first action that fails. Default false: a form fill
+        /// where one optional field is missing should still deliver the other
+        /// thirty, and the per-action report names what failed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_on_error: bool,
+    },
     /// Structured, read-only observation of a session's active web-surface tab —
     /// the agent control plane `read` verb (slice 2b, rung 1). Returns the
     /// interactable tree / forms / tables / readable / links / text / html as
@@ -755,6 +1061,12 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         #[serde(default, rename = "as")]
         mode: WebSurfaceReadAs,
+        /// Read only this frame. OMITTED = read EVERY accessible frame,
+        /// including the top document — because a silent `[]` from the top
+        /// document is the failure mode, and searching everything by default is
+        /// what stops an agent concluding "the site does not offer this".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<WebFrameRef>,
     },
     /// Block until a condition holds on a session's active web-surface tab — the
     /// agent control plane `wait` verb (slice 2b, rung 2). The engine polls the
@@ -786,6 +1098,23 @@ pub enum AppControlCommand {
         #[serde(default)]
         ttl_secs: Option<u64>,
     },
+    /// Force a session's web surface into a NEW incarnation.
+    ///
+    /// Bumps the active tab's reload nonce; the reconciler's existing
+    /// destroy-and-recreate branch does the work and mints a fresh generation.
+    /// The recovery an agent previously had to reach `session remove` for.
+    WebSurfaceReload {
+        session_path: String,
+    },
+    /// Close a session's web surface.
+    ///
+    /// Also records the deliberate-close mark, which blocks a HEARTBEAT
+    /// resurrection for a grace window but NOT an explicit `web ensure` — a
+    /// heartbeat is liveness, an ensure is intent, and the rebuild path
+    /// deliberately never consults that map.
+    WebSurfaceClose {
+        session_path: String,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -806,6 +1135,54 @@ pub enum AppControlCommand {
     /// Enumerate the command registry: every command's id, title, and in-force
     /// KeyTip chord. Read-only; the discovery half of `InvokeCommand`.
     ListCommands,
+    /// A well-formed request whose `kind` this build DOES know, but whose
+    /// FIELDS it cannot read.
+    ///
+    /// `#[serde(other)]` above rescues an unknown *kind* only. It does nothing
+    /// for a known kind whose payload changed shape — and that is the far more
+    /// likely mismatch, because every field added to an existing command is one:
+    /// a GUI predating `WebElementRef` types `selector` as a bare `String`, so
+    /// `do click --text "Proceed to Pay"` sends `{"selector":{"text":"…"}}`, the
+    /// whole request fails with `invalid type: map, expected a string`, and the
+    /// old code DELETED the file — reproducing the exact bare timeout with no
+    /// clue that `Unsupported` was written to kill.
+    ///
+    /// So the honest-refusal property is extended to the payload: the request is
+    /// salvaged from the envelope, delivered, and refused with the serde error
+    /// as the clue. It carries the error text (not the payload — the request
+    /// file is still the one copy of that) because "which field, and what did it
+    /// expect" is precisely what the caller needs and cannot otherwise get.
+    ///
+    /// It is an ordinary variant rather than `#[serde(skip)]` because the GUI
+    /// SERIALIZES the command it is handling into the request trace; a skipped
+    /// variant fails to serialize, and `json!` on a failing value panics. A
+    /// refusal path must not be able to take the window down.
+    Unreadable {
+        /// The `kind` the request asked for. Named `requested_kind` because the
+        /// enum's internal tag already owns `kind` on the wire.
+        requested_kind: String,
+        detail: String,
+    },
+    /// A well-formed request whose `kind` this build does not know.
+    ///
+    /// App-control is a FILESYSTEM DROPBOX, not RPC: a newer CLI writes a
+    /// request file and an older GUI reads it. Before this variant existed,
+    /// `take_next_app_control_request` failed to deserialize such a file,
+    /// DELETED it, and moved on — so a version mismatch surfaced to the caller
+    /// as a bare TIMEOUT with no clue that the verb simply was not implemented
+    /// by the running window. `#[serde(other)]` turns that into an honest
+    /// refusal: the request still parses (as this variant), the GUI answers,
+    /// and the caller is told to swap the GUI binary.
+    ///
+    /// This is deserialize-only in practice — nothing constructs it — and it
+    /// deliberately does NOT capture the unknown payload: the request file is
+    /// still on disk while it is in flight, and a copy here would be a second
+    /// encoding of it.
+    ///
+    /// Malformed JSON is still deleted; only a well-formed request with an
+    /// unknown `kind` lands here.
+    #[serde(other)]
+    Unsupported,
 }
 
 impl AppControlCommand {
@@ -826,9 +1203,16 @@ impl AppControlCommand {
                 | Self::DescribeState
                 | Self::ReadTerminalBuffer { .. }
                 | Self::WebSurfaceScreenshot { .. }
+                | Self::WebSurfaceCaptureElement { .. }
                 | Self::WebSurfaceRead { .. }
+                | Self::WebSurfaceFrames { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
+                // An unknown kind, and a kind whose payload could not be read,
+                // are never executed — they can only be refused, so they mutate
+                // nothing.
+                | Self::Unsupported
+                | Self::Unreadable { .. }
         )
     }
 
@@ -842,7 +1226,7 @@ impl AppControlCommand {
             Self::ResetThemeEditor => "reset_theme_editor",
             Self::SetThemeEditorValues { .. } => "set_theme_editor_values",
             Self::TriggerUpdateCheck => "trigger_update_check",
-            Self::RestartPendingUpdate => "restart_pending_update",
+            Self::RestartPendingUpdate { .. } => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
             Self::ScrollRightPanel { .. } => "scroll_right_panel",
@@ -895,20 +1279,30 @@ impl AppControlCommand {
             Self::SetTreeSelection { .. } => "set_tree_selection",
             Self::WebSurfaceEval { .. } => "web_surface_eval",
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
+            Self::WebSurfaceCaptureElement { .. } => "web_surface_capture_element",
+            Self::WebSurfaceCookies { .. } => "web_surface_cookies",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
+            Self::WebSurfaceFillVault { .. } => "web_surface_fill_vault",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::WebSurfaceDo { .. } => "web_surface_do",
+            Self::WebSurfaceBatch { .. } => "web_surface_batch",
             Self::WebSurfaceRead { .. } => "web_surface_read",
+            Self::WebSurfaceFrames { .. } => "web_surface_frames",
+            Self::WebSurfaceAwait { .. } => "web_surface_await",
             Self::WebSurfaceWait { .. } => "web_surface_wait",
             Self::WebSurfaceLease { .. } => "web_surface_lease",
             Self::EnsureWebSurface { .. } => "ensure_web_surface",
+            Self::WebSurfaceReload { .. } => "web_surface_reload",
+            Self::WebSurfaceClose { .. } => "web_surface_close",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
             Self::DescribeState => "describe_state",
             Self::InvokeCommand { .. } => "invoke_command",
             Self::ListCommands => "list_commands",
+            Self::Unsupported => "unsupported",
+            Self::Unreadable { .. } => "unreadable",
         }
     }
 }
@@ -1160,10 +1554,16 @@ pub fn take_next_app_control_request(
         };
         let request = match serde_json::from_slice::<AppControlRequest>(&bytes) {
             Ok(request) => request,
-            Err(_) => {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
+            // A request this build cannot read is ANSWERED when it is
+            // answerable, and only deleted when it is not. See
+            // `salvage_unreadable_request`.
+            Err(error) => match salvage_unreadable_request(&bytes, &error) {
+                Some(request) => request,
+                None => {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            },
         };
         if let Some(preferred_pid) = request.preferred_pid
             && preferred_pid != worker_pid
@@ -1182,6 +1582,61 @@ pub fn take_next_app_control_request(
         return Ok(Some((inflight_path, request)));
     }
     Ok(None)
+}
+
+/// Rescue a request whose ENVELOPE is intact but whose command payload this
+/// build cannot deserialize, so it can be refused with a reason instead of
+/// vanishing.
+///
+/// This is the other half of `AppControlCommand::Unsupported`. That variant
+/// covers an unknown `kind`; this covers a KNOWN kind whose fields changed
+/// shape — the mismatch a `#[serde(default)]` field on an existing command
+/// produces, and the one that reproduced the bare timeout P0 was written to
+/// kill (`do click --text` against a GUI that types `selector` as a string).
+///
+/// It salvages ONLY when the envelope is genuinely a request: an object with a
+/// non-empty string `request_id` and an object `command`. Anything else —
+/// truncated JSON, a stray file, a request with no `command` — is not a version
+/// mismatch and is still deleted, so a corrupt file cannot become a
+/// silently-accepted request. `created_at_ms` falls back to now, which only
+/// affects the stale-target window and is the safe direction (a salvaged
+/// request is not treated as ancient and dropped).
+fn salvage_unreadable_request(
+    bytes: &[u8],
+    error: &serde_json::Error,
+) -> Option<AppControlRequest> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let object = value.as_object()?;
+    let request_id = object.get("request_id")?.as_str()?.trim().to_string();
+    if request_id.is_empty() {
+        return None;
+    }
+    let command = object.get("command")?.as_object()?;
+    let requested_kind = command
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(AppControlRequest {
+        request_id,
+        created_at_ms: object
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(u128::from)
+            .unwrap_or_else(current_millis),
+        preferred_pid: object
+            .get("preferred_pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
+        agent: object
+            .get("agent")
+            .and_then(|agent| agent.as_str())
+            .map(ToOwned::to_owned),
+        command: AppControlCommand::Unreadable {
+            requested_kind,
+            detail: error.to_string(),
+        },
+    })
 }
 
 fn remove_request_if_target_is_stale(path: &Path, request: &AppControlRequest, preferred_pid: u32) {
@@ -1436,6 +1891,268 @@ pub fn current_millis() -> u128 {
 mod tests {
     use super::*;
 
+    /// A request carrying a `kind` this build has never heard of must PARSE
+    /// (into `Unsupported`) rather than fail deserialization.
+    ///
+    /// Why it matters: `take_next_app_control_request` deletes a request it
+    /// cannot deserialize and moves on, so before `#[serde(other)]` a newer
+    /// CLI talking to an older GUI produced a bare TIMEOUT — the caller could
+    /// not tell "not implemented here" from "the window is wedged". Every new
+    /// verb inherits that failure mode, which is why this lands first.
+    ///
+    /// This test FAILS without `#[serde(other)] Unsupported`: the payload
+    /// below is a well-formed `AppControlRequest` whose command kind does not
+    /// exist, and serde rejects the whole request with "unknown variant".
+    #[test]
+    fn a_command_kind_this_build_does_not_know_parses_as_unsupported() {
+        let payload = r#"{
+            "request_id": "r1",
+            "created_at_ms": 0,
+            "command": { "kind": "web_surface_from_the_future", "session_path": "x" }
+        }"#;
+        let request: AppControlRequest =
+            serde_json::from_str(payload).expect("an unknown kind must parse, not error");
+        assert_eq!(request.command, AppControlCommand::Unsupported);
+        assert_eq!(request.command.name(), "unsupported");
+        // It can only ever be refused, so it mutates nothing.
+        assert!(request.command.is_read_only());
+    }
+
+    /// The other half of the contract: genuinely malformed JSON must still be
+    /// rejected (and therefore still deleted by the taker). `#[serde(other)]`
+    /// must not turn a corrupt file into a silently-accepted request.
+    #[test]
+    fn malformed_json_still_fails_to_parse() {
+        assert!(serde_json::from_str::<AppControlRequest>("{ not json").is_err());
+        // A request missing the `command` field is malformed, not "unknown kind".
+        assert!(
+            serde_json::from_str::<AppControlRequest>(r#"{"request_id":"r1","created_at_ms":0}"#)
+                .is_err()
+        );
+    }
+
+    /// The taker must hand an unknown kind THROUGH to the dispatcher instead of
+    /// deleting the file — that is the behaviour change a caller feels.
+    #[test]
+    fn take_next_hands_an_unknown_kind_to_the_dispatcher() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("00000000-unknown.json"),
+            br#"{"request_id":"unknown-1","created_at_ms":0,"command":{"kind":"not_a_real_verb"}}"#,
+        )
+        .unwrap();
+
+        let taken = take_next_app_control_request(&home, worker_pid).unwrap();
+        let Some((inflight_path, request)) = taken else {
+            panic!("an unknown kind must be delivered, not deleted");
+        };
+        assert_eq!(request.request_id, "unknown-1");
+        assert_eq!(request.command, AppControlCommand::Unsupported);
+        assert!(inflight_path.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// P0's honest-refusal property, extended to the PAYLOAD.
+    ///
+    /// `#[serde(other)]` rescues an unknown `kind` only. A KNOWN kind whose
+    /// fields this build cannot read still failed deserialization, and the
+    /// taker DELETED the file — which is the very bare timeout `Unsupported`
+    /// was written to kill, reached by the more likely mismatch: every field
+    /// added to an existing command changes that command's shape. The worked
+    /// case is `do click --text "Proceed to Pay"` against a GUI that types the
+    /// selector as a bare `String`: `invalid type: map, expected a string`.
+    ///
+    /// The payload below is that shape against THIS build — an object where a
+    /// string is expected on a kind it knows.
+    ///
+    /// Restore `Err(_) => { let _ = fs::remove_file(&path); continue; }` in
+    /// `take_next_app_control_request` and this fails.
+    #[test]
+    fn a_known_kind_this_build_cannot_read_is_refused_rather_than_deleted() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000-unreadable.json");
+        fs::write(
+            &path,
+            br#"{"request_id":"unreadable-1","created_at_ms":7,"agent":"agent-2",
+                 "command":{"kind":"open_path","session_path":{"text":"Proceed to Pay"}}}"#,
+        )
+        .unwrap();
+
+        let taken = take_next_app_control_request(&home, worker_pid).unwrap();
+        let Some((inflight_path, request)) = taken else {
+            panic!("a request this build cannot read must be delivered, not deleted");
+        };
+        assert_eq!(request.request_id, "unreadable-1");
+        assert_eq!(request.agent.as_deref(), Some("agent-2"));
+        assert_eq!(request.created_at_ms, 7);
+        let AppControlCommand::Unreadable {
+            requested_kind,
+            detail,
+        } = &request.command
+        else {
+            panic!("expected Unreadable, got {:?}", request.command);
+        };
+        assert_eq!(requested_kind, "open_path");
+        assert!(
+            detail.contains("invalid type: map"),
+            "the serde error names the field and what it expected: {detail}"
+        );
+        // It is delivered for a refusal, so it must mutate nothing…
+        assert!(request.command.is_read_only());
+        assert_eq!(request.command.name(), "unreadable");
+        // …and the file is in flight, not gone.
+        assert!(inflight_path.exists());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// The other half: a file that is NOT a version mismatch is still deleted.
+    /// A salvage that accepted anything would turn corruption into a request.
+    #[test]
+    fn a_corrupt_request_file_is_still_deleted_unread() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let dir = app_control_requests_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let truncated = dir.join("00000000-truncated.json");
+        let no_command = dir.join("00000001-no-command.json");
+        let no_id = dir.join("00000002-no-id.json");
+        fs::write(&truncated, b"{ not json").unwrap();
+        fs::write(&no_command, br#"{"request_id":"r1","created_at_ms":0}"#).unwrap();
+        fs::write(
+            &no_id,
+            br#"{"created_at_ms":0,"command":{"kind":"open_path","session_path":{}}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            take_next_app_control_request(&home, worker_pid)
+                .unwrap()
+                .is_none(),
+            "none of these is an answerable request"
+        );
+        assert!(!truncated.exists());
+        assert!(!no_command.exists());
+        assert!(!no_id.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// The refusal path must not be able to take the window down: the GUI
+    /// serializes the command it is handling into the request trace, and
+    /// `json!` on a value that fails to serialize panics. That is why
+    /// `Unreadable` is an ordinary variant rather than `#[serde(skip)]`.
+    #[test]
+    fn an_unreadable_command_can_be_serialized_for_the_trace() {
+        let command = AppControlCommand::Unreadable {
+            requested_kind: "web_surface_do".to_string(),
+            detail: "invalid type: map, expected a string".to_string(),
+        };
+        let value = serde_json::to_value(&command).expect("the trace must not panic on it");
+        assert_eq!(value["kind"], serde_json::json!("unreadable"));
+        assert_eq!(value["requested_kind"], serde_json::json!("web_surface_do"));
+    }
+
+    /// WIRE BACK-COMPAT LOCK for `WebElementRef`.
+    ///
+    /// Every `do` payload written before text/role addressing existed spells
+    /// the target as a BARE STRING. `#[serde(untagged)]` with `Css(String)`
+    /// first is what keeps those parsing; a tagged enum would break every
+    /// in-flight request file and every scripted caller on the day it landed.
+    /// This test fails the moment someone reaches for a tagged representation.
+    #[test]
+    fn a_bare_string_selector_still_parses_as_css() {
+        let old_payload = r##"{"verb":"click_selector","selector":"#login"}"##;
+        let action: WebSurfaceDoAction = serde_json::from_str(old_payload).unwrap();
+        assert_eq!(
+            action,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Css("#login".into()),
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        // …and the optional-selector fields too, which is the other half of the
+        // wire: `type`/`key`/`fill` all carried `Option<String>`.
+        let typed: WebSurfaceDoAction =
+            serde_json::from_str(r##"{"verb":"type","text":"hi","selector":"#user"}"##).unwrap();
+        assert_eq!(
+            typed,
+            WebSurfaceDoAction::Type {
+                text: "hi".into(),
+                selector: Some(WebElementRef::Css("#user".into())),
+            }
+        );
+        let filled: WebSurfaceDoAction = serde_json::from_str(
+            r##"{"verb":"fill","text":"292244","selectors":["#a","#b","#c"]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            filled,
+            WebSurfaceDoAction::Fill {
+                text: "292244".into(),
+                selector: None,
+                selectors: vec![
+                    WebElementRef::Css("#a".into()),
+                    WebElementRef::Css("#b".into()),
+                    WebElementRef::Css("#c".into()),
+                ],
+            }
+        );
+    }
+
+    /// The new addressing shapes must be distinguishable from each other and
+    /// from a bare selector — an untagged enum resolves by SHAPE, so this is
+    /// the test that catches a field rename silently re-routing a payload.
+    #[test]
+    fn text_and_role_refs_parse_into_their_own_shapes() {
+        let by_text: WebSurfaceDoAction = serde_json::from_str(
+            r#"{"verb":"click_selector","selector":{"text":"Proceed to Pay","exact":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_text,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Text {
+                    text: "Proceed to Pay".into(),
+                    exact: true,
+                    tag: None,
+                    nth: None,
+                },
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        let by_role: WebSurfaceDoAction = serde_json::from_str(
+            r#"{"verb":"click_selector","selector":{"role":"button","label":"Continue","nth":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_role,
+            WebSurfaceDoAction::ClickSelector {
+                selector: WebElementRef::Role {
+                    role: "button".into(),
+                    label: "Continue".into(),
+                    nth: Some(1),
+                },
+                button: AppControlPointerButton::Primary,
+            }
+        );
+        // Round-trips: a re-serialized Css ref is still a bare string, so an
+        // old GUI reading a request written by a new CLI still understands the
+        // ordinary case.
+        assert_eq!(
+            serde_json::to_value(WebElementRef::Css("#x".into())).unwrap(),
+            serde_json::json!("#x")
+        );
+    }
+
     #[test]
     fn read_only_commands_are_pure_observation() {
         // Pure-observation: no UI/session mutation → no forced re-render needed.
@@ -1485,6 +2202,7 @@ mod tests {
     fn preserving_close_command_serializes_as_distinct_restart_safe_kind() {
         let command = AppControlCommand::CloseWindowPreservingSessions {
             reason: Some("superseded-client-handoff".to_string()),
+            force: false,
         };
         let value = serde_json::to_value(&command).expect("serialize preserving close");
 
@@ -1497,6 +2215,11 @@ mod tests {
             Some("superseded-client-handoff")
         );
         assert_eq!(command.name(), "close_window_preserving_sessions");
+        // `force` defaults false and is omitted from the wire, so an OLDER GUI
+        // reading a request from a newer CLI still means "do not force".
+        assert!(value.get("force").is_none(), "force must not be serialized when false");
+        let back: AppControlCommand = serde_json::from_value(value).unwrap();
+        assert_eq!(back, command);
     }
 
     #[test]
@@ -1504,7 +2227,7 @@ mod tests {
         let command = AppControlCommand::WebSurfaceDo {
             session_path: Some("local://abc".to_string()),
             action: WebSurfaceDoAction::ClickSelector {
-                selector: "button[type=submit]".to_string(),
+                selector: WebElementRef::Css("button[type=submit]".to_string()),
                 button: AppControlPointerButton::Primary,
             },
             generation: None,
@@ -1556,13 +2279,15 @@ mod tests {
             // `fill` in both shapes: one field, and a segmented box set.
             WebSurfaceDoAction::Fill {
                 text: "292244".to_string(),
-                selector: Some("#otp".to_string()),
+                selector: Some(WebElementRef::Css("#otp".to_string())),
                 selectors: Vec::new(),
             },
             WebSurfaceDoAction::Fill {
                 text: "292244".to_string(),
                 selector: None,
-                selectors: (0..6).map(|i| format!("input.input-otp:nth-child({i})")).collect(),
+                selectors: (0..6)
+                    .map(|i| WebElementRef::Css(format!("input.input-otp:nth-child({i})")))
+                    .collect(),
             },
         ] {
             let command = AppControlCommand::WebSurfaceDo {
@@ -1595,6 +2320,7 @@ mod tests {
         let command = AppControlCommand::WebSurfaceRead {
             session_path: None,
             mode: WebSurfaceReadAs::Snapshot,
+            frame: None,
         };
         // Pure observation → read-only (skips the forced re-render).
         assert!(command.is_read_only());
@@ -1612,7 +2338,36 @@ mod tests {
             (r#"{"kind":"web_surface_read"}"#, WebSurfaceReadAs::Snapshot),
         ] {
             match serde_json::from_str::<AppControlCommand>(json).expect("deserialize") {
-                AppControlCommand::WebSurfaceRead { mode, .. } => assert_eq!(mode, expect),
+                AppControlCommand::WebSurfaceRead { mode, frame, .. } => {
+                    assert_eq!(mode, expect);
+                    // No `frame` on the wire = the top document, which is what
+                    // every previously-written request means.
+                    assert_eq!(frame, None);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // The three frame spellings survive the wire, and `frame` is omitted
+        // when absent so an OLDER GUI reading a new request is unaffected.
+        assert!(!serde_json::to_string(&command).unwrap().contains("frame"));
+        for (json, expect) in [
+            (
+                r#"{"kind":"web_surface_read","frame":{"index":2}}"#,
+                WebFrameRef::Index(2),
+            ),
+            (
+                r#"{"kind":"web_surface_read","frame":{"path":[0,2]}}"#,
+                WebFrameRef::Path(vec![0, 2]),
+            ),
+            (
+                r#"{"kind":"web_surface_read","frame":{"url_contains":"billdesk"}}"#,
+                WebFrameRef::UrlContains("billdesk".into()),
+            ),
+        ] {
+            match serde_json::from_str::<AppControlCommand>(json).expect("deserialize frame") {
+                AppControlCommand::WebSurfaceRead { frame, .. } => {
+                    assert_eq!(frame, Some(expect));
+                }
                 other => panic!("wrong variant: {other:?}"),
             }
         }
