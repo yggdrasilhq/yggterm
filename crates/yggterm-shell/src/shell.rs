@@ -16571,6 +16571,13 @@ impl ShellState {
             terminal_appearance,
             Some(&terminal_profile),
         );
+        // The process-env half above is this client's own business. The DAEMON
+        // half below is not: it decides the colors every future session inherits,
+        // so a shadow pushing its theme would repaint the user's next CLI. The
+        // daemon denies it; a read-only viewer must not ask.
+        if client_is_shadow_viewer() {
+            return;
+        }
         if let Err(error) = yggterm_server::sync_terminal_identity_with_profile(
             &self.bootstrap.server_endpoint,
             terminal_appearance,
@@ -22173,10 +22180,14 @@ pub fn initial_server_sync(
         yggterm_server::sync_terminal_identity_appearance(appearance);
     }
     ensure_daemon_running(&endpoint)?;
-    if let Some(appearance) = terminal_appearance
-        .as_deref()
-        .map(str::trim)
-        .filter(|appearance| !appearance.is_empty())
+    // Startup twin of the theme-change sync: the daemon half is a write, so a
+    // shadow viewer never sends it (see
+    // `sync_terminal_identity_with_effective_terminal_theme`).
+    if !client_is_shadow_viewer()
+        && let Some(appearance) = terminal_appearance
+            .as_deref()
+            .map(str::trim)
+            .filter(|appearance| !appearance.is_empty())
         && let Err(error) = yggterm_server::sync_terminal_identity(&endpoint, appearance)
         && let Some(home) = trace_home.as_ref()
     {
@@ -23547,6 +23558,14 @@ fn filter_pending_refreshes_for_deferral(
         .collect()
 }
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
+    // A shadow is a READ-ONLY VIEWER: `RefreshRemoteMachine` mutates the shared
+    // machine registry, so the daemon denies it (76 refusals in the live
+    // journal). Scheduling it anyway spent a surface request — begin, fail,
+    // finish, re-render — on work that can never land. Machine health reaches a
+    // shadow through the daemon snapshot, which is the one owner of it.
+    if client_is_shadow_viewer() {
+        return;
+    }
     let Some(pending) = safe_shell_read(
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
@@ -23597,6 +23616,11 @@ fn managed_cli_refresh_scope_keys(
     keys
 }
 fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
+    // Same contract as the remote-machine refresh above: `RefreshManagedCli`
+    // provisions binaries on a machine, which a read-only viewer may not do.
+    if client_is_shadow_viewer() {
+        return;
+    }
     if safe_shell_read(
         state,
         "maybe_spawn_missing_managed_cli_refreshes_gate",
