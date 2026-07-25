@@ -174,10 +174,6 @@ const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPO
 /// precedent), and force beats allow: a host whose GPU is genuinely broken, or whose
 /// probe is wrong, gets back to the old behaviour with one env var and no rebuild.
 const ENV_YGGTERM_FORCE_SOFTWARE_GL: &str = "YGGTERM_FORCE_SOFTWARE_GL";
-/// Where the GL decision publishes itself. `configure_linux_webkit_compositing` runs
-/// before tracing exists, so the exported reason is the ONLY way the choice is
-/// observable — the startup trace and `server app state` both read it back.
-const ENV_YGGTERM_WEBKIT_GL_POLICY: &str = "YGGTERM_WEBKIT_GL_POLICY";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
 const ENV_YGGTERM_WEBKIT_CACHE_MODEL: &str = "YGGTERM_WEBKIT_CACHE_MODEL";
@@ -1469,6 +1465,27 @@ fn main() -> Result<()> {
             "xterm_canvas_policy": std::env::var("YGGTERM_XTERM_CANVAS_POLICY").ok(),
             "wayland_display_present": std::env::var_os("WAYLAND_DISPLAY").is_some(),
             "display_present": std::env::var_os("DISPLAY").is_some(),
+            // The GL decision and the three settings it owns. `configure_linux_webkit_compositing`
+            // runs long before this trace exists, so it exports its reason and we read
+            // it back — and the probe's own report is read from its OnceLock rather
+            // than re-probed, so there is exactly one probe per process.
+            "webkit_gl_policy": std::env::var(yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY).ok(),
+            "libgl_always_software": std::env::var("LIBGL_ALWAYS_SOFTWARE").ok(),
+            "gallium_driver": std::env::var("GALLIUM_DRIVER").ok(),
+            "webkit_disable_dmabuf_renderer": std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").ok(),
+            "web_surface_under_glass": std::env::var("YGGTERM_WEB_SURFACE_UNDER_GLASS").ok(),
+            "gl_probe_class": yggterm_core::gl_probe::gl_probe_report()
+                .map(|report| report.class.as_str()),
+            "gl_probe_driver": yggterm_core::gl_probe::gl_probe_report()
+                .and_then(|report| report.driver.clone()),
+            "gl_probe_renderer": yggterm_core::gl_probe::gl_probe_report()
+                .and_then(|report| report.renderer.clone()),
+            "gl_probe_reason": yggterm_core::gl_probe::gl_probe_report()
+                .map(|report| report.reason.clone()),
+            // What the probe COST, so a timeout budget that starts drifting is visible
+            // rather than inferred.
+            "gl_probe_elapsed_ms": yggterm_core::gl_probe::gl_probe_report()
+                .map(|report| report.elapsed_ms),
         }),
     );
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
@@ -4142,7 +4159,12 @@ fn configure_linux_webkit_compositing() {
     // an exported var is the only way the decision is observable at all. The startup
     // trace and `server app state` both read it back — same convention as
     // YGGTERM_LINUX_BACKEND_POLICY / YGGTERM_XTERM_CANVAS_POLICY.
-    unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_GL_POLICY, policy.reason) };
+    unsafe {
+        std::env::set_var(
+            yggterm_core::gl_probe::ENV_YGGTERM_WEBKIT_GL_POLICY,
+            policy.reason,
+        )
+    };
     // Under-glass by DEFAULT: resolve the two env knobs into the ONE arming
     // variable every downstream reader keys on (this fn's DMABuf gate, the
     // vendored disable_dma_buf workaround, the vendored host's opt_in).

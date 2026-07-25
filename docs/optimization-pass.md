@@ -63,18 +63,43 @@ idle floor is not chrome being wasteful — it is the GPU being switched off.
 
 Three consequences for this pass:
 
-1. **The floor has a one-line fix that no workstream here proposed.** Setting
-   `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` unlocks all three gates at once (launcher stops
-   exporting `WEBKIT_DISABLE_COMPOSITING_MODE=1`; the GL net is skipped; under-glass arms,
-   clearing the SHM force). Do this before costing WS2, which is a large architectural
-   move justified partly by a number this changes.
+1. **The floor has a fix no workstream here proposed.** Do it before costing WS2,
+   which is a large architectural move justified partly by a number this changes.
 2. ⚠⚠ **The three settings are ONE decision — do not split them.** Hardware GL + SHM
    measured 15.82 s (no better than software); software GL + DMABUF measured **34.14 s,
    the worst of the four**. The guard's logic was right; only its premise was wrong.
-3. **The real fix is to stop hard-coding the premise.** Probe the Wayland/Surfaceless EGL
-   platform at startup and choose from what the host reports, rather than defaulting to the
-   slowest configuration and requiring an opt-out that nobody knew to set. `render_probe`
-   is the natural owner, and it closes the same instrument gap WS1 exists for.
+3. **The real fix is to stop hard-coding the premise** — probe the host and choose from
+   what it reports, rather than defaulting to the slowest configuration behind an
+   opt-out nobody knew to set.
+
+### What shipped for §1a (2026-07-25, code committed, NOT yet live-proven)
+
+- `crates/yggterm-core/src/gl_probe.rs` — a one-shot EGL capability probe in a child
+  process. **Surfaceless platform only** (never GBM, the sole origin of the false
+  premise), `renderD*` only (never `card0`, the node the EACCES came from), no disk
+  cache (a stale GL belief is the failure mode being fixed), no `eglinfo` dependency.
+  A hang, a crash or an inconclusive answer all report `Unknown`, which stays on
+  software: promoting "we could not tell" to "probably fine" is the original bug.
+- `linux_webkit_gl_policy_from_input` (`apps/yggterm/src/main.rs`) — the ONE policy.
+  Precedence: `WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
+  `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the probe. Its reason is exported as
+  `YGGTERM_WEBKIT_GL_POLICY` and read back by the startup trace and
+  `server app state`.
+- `shm_force_for_arming` now takes `hardware_gl`, so SHM is refused on a probed-hardware
+  host whatever arming decides. The cross-product test asserts consequence 2 above in
+  every cell rather than trusting it to prose.
+- **The launchers stopped deciding.** Five shell + three python re-encodings of the
+  premise are gone, and the launcher marker is `v4` so installed launchers are
+  rewritten. ⚠ Installed users were in a FIFTH combination outside the measured matrix
+  (hardware GL libraries, compositing off, WebGL selected and unable to present), so
+  the 22x figure above does NOT describe their before-state.
+- **The GPU gauge is a repo instrument**: `render_top` prints `gpu_ms` per role from
+  `drm-engine-*` in `/proc/<pid>/fdinfo/*`. A `-` means unreadable, never zero.
+
+⚠ Flipping to hardware GL arms Phase F under-glass for the first time in production on
+the GUI host. `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` is the fallback and now genuinely
+lands on hardware GL + DMABuf; `YGGTERM_FORCE_SOFTWARE_GL=1` restores the old behaviour
+entirely.
 
 ⚠ The safety net is also not buying its stated benefit: 26 GUI coredumps in 10 days (still
 crashing 2026-07-25), **24 with zero GL/Mesa/EGL frames**; the one genuine WebKit SEGV is in
@@ -132,6 +157,12 @@ guihost GUI pid 776144, 15-second window, `cargo run -p yggterm-core --example r
 | `web_content` | 3 | 0.272 | 714 MB |
 | `web_network` | 3 | 0.006 | 82 MB |
 | **total** | **7** | **0.498** | **1364 MB** |
+
+This baseline was taken with the software-GL forcing still active and before the
+probe's `gpu_ms` column existed; the same command at the same 15 s window is
+directly comparable after, and a comparable "after" MUST also show `gpu_ms`
+nonzero. Cores falling with `gpu_ms` still at zero would mean something else got
+quieter, not that the GPU took over.
 
 Two things fall out immediately:
 
@@ -243,17 +274,36 @@ Surface counts ride along as caller-supplied context.
 
 Remaining in WS1:
 
-- **Wire continuous sampling.** Today it is a one-shot example. It needs a tick in the
-  GUI (the allocator-trim chore near `shell.rs:23753` is the pattern to copy) passing
-  live/stashed surface counts and window visibility as context.
+- ~~**Wire continuous sampling.**~~ ✅ **SHIPPED** (`a216eb9`, `spawn_render_probe_loop`):
+  a 60 s tick in the GUI, read-only, `/proc` walk off the UI thread, per-role events.
+  Live-proven on the GUI host — `gui` ~0.220 cores, `web_content` ~0.272. Still owed on
+  the tick: the CONTEXT. It passes `{web_surfaces, live_sessions}` where `web_surfaces`
+  counts SESSIONS, not realized webviews, with no stashed/visible split and no window
+  visibility — which is what §4 WS1 actually asked for.
 - **`server render-top`**, promoting `examples/render_top.rs` into a real command.
+  Until then the example is the only reader and §7's recipe still names it.
 - ~~**`server perf-incidents`**, a reader for the 183 records already on disk.~~
   ✅ **SHIPPED 2026-07-25** and run live — see the update box in §3c. Groups by
   trigger, ranked by count, `--list`/`--json` for raw records.
-- **Collapse the duplicate `/proc` parser.** `shell.rs:37685
-  current_process_memory_sample` / `process_memory_sample_from_smaps_rollup` parses
-  `smaps_rollup` for self only; `render_probe` parses it per pid. Single source of truth
-  says one owner: shell.rs should call into `render_probe`.
+- ~~**Collapse the duplicate `/proc` parser.**~~ ✅ **SHIPPED 2026-07-25.**
+  `render_probe::ProcMemory` / `read_process_memory` is the one owner of "how much
+  memory does pid N use"; the shell's chore calls in for its own pid, and the tree walk
+  reads one file per pid instead of two. The `status` VmRSS fallback is LABELLED in the
+  returned value, so its zeroes cannot pass for a PSS reading nobody took.
+- ~~**The sampler's clock.**~~ ✅ **FIXED 2026-07-25.** The GUI tick fed
+  `current_millis()` — a `SystemTime` wall clock — into a contract that said monotonic,
+  so `interval_ms` inflated across a suspend/resume while CPU ticks stood still and
+  `core_fraction` under-reported after every wake. The probe owns its clock now and
+  `observe` no longer accepts one.
+- ~~**The render probe was polluting the incident log.**~~ ✅ **FIXED 2026-07-25.**
+  `render` spans carry CPU milliseconds in `duration_ms`; `detect_perf_incident` judged
+  them by wall-clock rules, producing 35 of 222 incidents on the live host (worst:
+  `span_stall render/web_content max_ms=70850`, which is 1.18 cores of ordinary work).
+  Because incidents debounce five minutes and the detector returns the FIRST match,
+  those could also MASK a genuine stall. A span's time base is now owned by
+  `perf_span_time_base`, CPU spans are judged in cores (`span_cpu_hot`, ≥1.2), and they
+  are tried last so a real stall always wins the slot. `perf-summary` grows a `clock`
+  column.
 
 ### WS2: move agent rendering to the server
 
@@ -340,9 +390,14 @@ and whatever sets active-session after a birth.
 Re-run, and quote, both instruments:
 
 ```sh
-# render side, on the GUI host
-GUI=$(pgrep -x yggterm | head -1); render_top "$GUI" 15000
-# Rust side
+# render side, on the GUI host — cores AND gpu_ms, both deltas
+GUI=$(pgrep -x yggterm | head -1)
+cargo run -p yggterm-core --example render_top -- "$GUI" 15000
+# is the GPU actually rasterizing? nonzero and RISING across two reads
+grep -H drm-engine /proc/<webproc>/fdinfo/*
+# which GL path is this window even on?
+yggterm-headless server app state | grep -E 'WEBKIT_GL_POLICY|LIBGL|GALLIUM|DMABUF'
+# Rust side (the `clock` column says whether a row is wall or CPU time)
 yggterm-headless server perf-summary --category render
 yggterm-headless server perf-summary
 ```
