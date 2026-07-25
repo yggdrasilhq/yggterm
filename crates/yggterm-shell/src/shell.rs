@@ -47994,13 +47994,27 @@ async fn web_do_doc_to_viewport(
 
 /// Gate 9's DECISION, extracted so it is drivable with no webview.
 ///
-/// The rule, in order: an explicit new batch resets the lane FIRST (so a stale
-/// count left by the agent's own previous verb cannot instantly re-preempt the
-/// lane it just reopened); then real seat input preempts; then the batch is
-/// admitted against the surface's live incarnation.
+/// The rule, in order: a stale incarnation is refused as stale; then REAL SEAT
+/// INPUT WINS — before any reset, whether or not this verb opens a new batch;
+/// only then does a new batch reopen the lane, and only then is the batch
+/// admitted.
+///
+/// The seat read comes first because `web batch` sets `new_batch` on the
+/// agent's OWN behalf (nobody asserts anything), so a reset-first ordering made
+/// the highest-privilege verb on the plane the one verb that could never be
+/// preempted at its own start: `forget` removed the lane, `note_human_input`
+/// then found nothing to cancel, and a click that landed between the agent's
+/// last verb and its batch was consumed and discarded while all N injections
+/// ran. Seat-first costs the agent exactly one refusal — the count is consumed
+/// by that refusal, so the very next `--new-batch` verb reopens the lane — and
+/// it costs the human nothing, which is the trade gate 9 exists to make.
+///
+/// A count arriving on a surface with no lane yet still refuses: the REFUSAL is
+/// keyed on the count itself, not on what the lane happened to remember, so a
+/// human gesture is never silently absorbed by an empty arbiter.
 ///
 /// It is `&mut AgentInputArbiter` and nothing else — no signals, no desktop, no
-/// tracing — which is what lets the 20-verb lock below drive it directly.
+/// tracing — which is what lets the batch locks below drive it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDecision {
     Allowed,
@@ -48018,14 +48032,22 @@ fn web_do_gate(
     batch: &crate::agent_input_arbiter::AgentBatch,
     live_generation: u64,
 ) -> (GateDecision, crate::agent_input_arbiter::PreemptReport) {
+    if arbiter.is_stale(surface, live_generation) {
+        return (
+            GateDecision::StaleSurface,
+            crate::agent_input_arbiter::PreemptReport::default(),
+        );
+    }
+    if seat_input_count > 0 {
+        // The human touched this surface since the last verb. Cancel every
+        // batch driving it and refuse THIS verb too — including a verb that
+        // opens a new batch, which is the whole point (see the note above).
+        return (GateDecision::Preempted, arbiter.note_human_input(surface));
+    }
     if new_batch {
         arbiter.forget(surface);
     }
-    let report = if seat_input_count > 0 {
-        arbiter.note_human_input(surface)
-    } else {
-        crate::agent_input_arbiter::PreemptReport::default()
-    };
+    let report = crate::agent_input_arbiter::PreemptReport::default();
     let decision = match arbiter.admit(surface, batch, live_generation) {
         crate::agent_input_arbiter::AdmitOutcome::Allowed => GateDecision::Allowed,
         crate::agent_input_arbiter::AdmitOutcome::Preempted => GateDecision::Preempted,
@@ -48408,15 +48430,17 @@ async fn web_do_open_lane(
     // app-control pump already drains one request at a time.
     //
     // `--new-batch`: the agent asserts it has re-observed the page, so this
-    // surface's lane is reopened before the seat-input read. This is the ONLY
-    // reset an agent can reach — the batch id is per-GUI-process
-    // (`resolve_agent_identity` reads the GUI's own argv, so it is the same
-    // `"anonymous"` for every verb the GUI will ever serve), and `forget()`
-    // otherwise runs only when the surface closes or is rebuilt. Without it a
-    // single preempt is a permanent lockout rather than a yield.
+    // surface's lane is reopened. This is the ONLY reset an agent can reach —
+    // the batch id is per-GUI-process (`resolve_agent_identity` reads the GUI's
+    // own argv, so it is the same `"anonymous"` for every verb the GUI will
+    // ever serve), and `forget()` otherwise runs only when the surface closes
+    // or is rebuilt. Without it a single preempt is a permanent lockout rather
+    // than a yield.
     //
-    // The ORDER (reset, then seat read, then admit) lives in `web_do_gate`,
-    // which is pure over the arbiter so it can be driven by a test.
+    // A reset is NOT immunity: the seat-input read happens BEFORE it, so a
+    // human gesture waiting when the batch opens refuses the batch. The ORDER
+    // (stale, seat, reset, admit) lives in `web_do_gate`, which is pure over
+    // the arbiter so it can be driven by a test.
     let batch = agent_input_batch_for_current_agent();
     let surface_key =
         crate::agent_input_arbiter::SurfaceKey::new(session.clone(), handle.generation);
@@ -48855,36 +48879,79 @@ mod web_do_verb_tests {
         );
     }
 
-    // THE ORDER inside the gate, pinned: reset FIRST, then the seat read, then
-    // admit. A count arriving with the reset is deliberately absorbed — that is
-    // the agent asserting it has re-observed the page, which is the whole
-    // contract of `--new-batch` — while input arriving AFTER the reset preempts
-    // exactly as before. Re-observing buys a fresh start, never immunity.
+    // THE ORDER inside the gate, pinned: stale, then THE SEAT READ, then the
+    // reset, then admit.
+    //
+    // This test previously asserted the opposite — that a count arriving with a
+    // reset is "absorbed" as the agent's own leftover — and that expectation
+    // was the bug. Nothing absorbs a real gesture: with the injection credits
+    // in place, a non-zero count is unambiguously the human, so there is no
+    // leftover to forgive. And `web batch` sets the reset flag on the agent's
+    // OWN behalf, which made the reset-first order a hole exactly where it
+    // mattered most: the highest-privilege verb on the plane was the one verb
+    // that could never be preempted at its own start. A click landing between
+    // the agent's last verb and its batch was consumed and discarded, and all
+    // N injections ran.
+    //
+    // Revert `web_do_gate` to reset-before-read and this fails.
     #[test]
-    fn a_reset_absorbs_the_count_it_arrives_with_but_not_the_next_one() {
+    fn a_reset_never_absorbs_a_gesture_that_arrived_before_it() {
         use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
         let mut arbiter = AgentInputArbiter::new();
         let surface = SurfaceKey::new("web://session-a", 7);
         let batch = AgentBatch::new("anonymous");
 
+        // The agent has been driving this surface, so its batch is ACTIVE.
         assert_eq!(
             web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
+        // The user clicks, and the agent's very next verb is a `web batch` —
+        // which sets the reset flag on its own behalf. It is REFUSED, and it
+        // says which batch the gesture cancelled.
+        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
         assert_eq!(
-            web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
-            GateDecision::Preempted
+            decision,
+            GateDecision::Preempted,
+            "a batch must not open over the user's click"
         );
-        // Re-observed: the lane reopens even though a stale count is reported
-        // in the same tick (it is the agent's own leftover, not a new gesture).
+        assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
+        // The refusal CONSUMED that count (production reads the counter once
+        // per verb), so re-observing and asking again gets the lane back. One
+        // refusal is the whole cost.
         assert_eq!(
-            web_do_gate(1, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
-        // The very next real gesture still wins.
+        // …and the next real gesture still wins.
         assert_eq!(
             web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Preempted
+        );
+    }
+
+    // The same rule on a surface NO agent has driven yet. `note_human_input`
+    // has no lane to cancel there and reports nothing, so if the refusal were
+    // keyed on the report the gesture would vanish — which is precisely what
+    // `forget()`-before-read did to every `web batch`. It is keyed on the
+    // COUNT.
+    #[test]
+    fn a_gesture_on_a_surface_with_no_lane_yet_still_refuses_the_batch() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://session-a", 7);
+        let batch = AgentBatch::new("anonymous");
+
+        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
+        assert_eq!(decision, GateDecision::Preempted);
+        assert!(
+            report.is_empty(),
+            "nothing was driving the surface, so nothing was cancelled — but the verb is still refused"
+        );
+        // With the count consumed, the batch opens.
+        assert_eq!(
+            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            GateDecision::Allowed
         );
     }
 
