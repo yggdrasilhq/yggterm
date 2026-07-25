@@ -3876,10 +3876,24 @@ PY"#;
     ///   rather than trusted from a comment.
     #[test]
     fn screen_snapshot_memo_follows_output_resize_and_model_drift_on_a_real_pty() {
+        let late_paint_gate = std::env::temp_dir().join(format!(
+            "yggterm-screen-memo-gate-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_file(&late_paint_gate);
         let runtime = PtySessionRuntime::spawn(
             "local://screen-memo",
-            "printf 'BASELINE\\033[3;100HFARCOL'; sleep 2; \
-             printf '\\033[7;1HLATEPAINT'; sleep 600",
+            // The second paint is gated on a file the TEST creates, not on a
+            // sleep: a timing gap would make "the late paint cannot be here
+            // yet" a race under a loaded parallel suite, and a lock that can
+            // flake is a lock nobody trusts.
+            &format!(
+                "printf 'BASELINE\\033[3;100HFARCOL'; \
+                 while [ ! -f '{gate}' ]; do sleep 0.05; done; \
+                 printf '\\033[7;1HLATEPAINT'; sleep 600",
+                gate = late_paint_gate.display()
+            ),
             None,
             Some((120, 24)),
         )
@@ -3891,16 +3905,18 @@ PY"#;
         });
         assert!(
             !early.contains("LATEPAINT"),
-            "precondition: the late paint is 2s out, so it cannot be here yet"
+            "precondition: the late paint is gated and the gate is not open yet"
         );
         assert_eq!(
             early,
             runtime.screen_snapshot(),
             "an untouched session must serve the same screen twice (the memo hit)"
         );
+        std::fs::write(&late_paint_gate, b"go").expect("open the late-paint gate");
         wait_for_screen_snapshot(&runtime, "the late paint", |screen| {
             screen.contains("LATEPAINT")
         });
+        let _ = std::fs::remove_file(&late_paint_gate);
         settle_pty_output(&runtime);
 
         // --- resize_seq: away and back, with no output in between. ---
