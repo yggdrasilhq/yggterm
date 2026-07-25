@@ -839,11 +839,17 @@ fix) once the fix is verified live on guihost.
     layers need a daemon bump.** Until that lands, a session on a preserved
     owner is still SERVED ghosts and only the client's clip stops them reaching
     the screen.
-  - ⚠ **The guard has not yet refused an oversized payload LIVE.** By the time
-    the fixed GUI was up, the model had healed to 168 and the payload fitted, so
-    the guard was correctly silent. The live pair is still worth having as a
-    natural experiment — same session, same code path, model 204 → merged text,
-    model 168 → text byte-matching the transcript.
+  - ✅ **The guard HAS now refused an oversized payload live (2026-07-25
+    evening, before the 2.12.13 deploy).** Walking every session on the live
+    2.12.12 daemon found a **plain `bash -i` shell** — not an agent session —
+    with a **120x36 PTY and a model still painting to column 295**. Revealed on a
+    read-only shadow running the 2.12.13 client (pinned to the daemon's 120-wide
+    grid), it traced `screen_reconcile_clipped_to_viewer_width
+    {"screen_max_column":295,"viewer_cols":120}` and painted clean text — with
+    the user's GUI untouched. Two consequences worth carrying: **this class is
+    not CC-specific** (any session that outlives a window resize can carry it),
+    and the mixed-version case layer 3 was written for is now demonstrated, not
+    argued (the rail read `Client 2.12.13 · daemon is on 2.12.12`).
   - ⚠ **Why it reads as intermittent:** the drift heals on any resize whose grid
     DIFFERS from the cached one; only a resize to the size the PTY already has
     hits the `resize_noop` hole. Same session garbles, "fixes itself" after a
