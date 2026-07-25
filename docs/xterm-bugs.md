@@ -53,6 +53,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PArecordsAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
 | [input-dead-after-window-refocus](#input-dead-after-window-refocus) | Viewport blinks and swallows keystrokes for ~3s, repeatedly; first reported as "cannot type after coming back from another window" | ROOT-CAUSED + FIXED 2026-07-23 (2.12.4) — progressive migration treated ANY reachable daemon as a successor and released the live daemon's own agent PTYs once a tick, re-resuming the CLI under the user's fingers. Successor now means strictly-newer + a returning key stops being released. Contributing: agent sessions born non-keep-alive (hence restart-unprotected), and the passive focus watchdog gated on the Wayland-lying `document.hasFocus()`. Probes kept: `ui/window_focus/transition`, `ui/input_policy/applied`, `input_dead_ms`, `passive_focus_recovery_state` |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
+| [screen-model-wider-than-viewer](#screen-model-wider-than-viewer) | Words on a busy CC/codex session render merged out of two different frames (`of exam manipulation` → `uof examrnmanipulation`), with a gutter of unrelated fragments down the left of the top rows | ROOT-CAUSED + FIXED 2026-07-25 — the daemon's vt100 model had drifted WIDER than its own PTY (204 vs 168) and served the ghost cells past the edge; three fixes, one per layer |
 
 ---
 
@@ -1942,6 +1943,146 @@ used to assert its presence), the presence of the classifier, of the
 
 `[[finding-wayland-focus-gate-squished-viewport]]` (same instrument, two earlier
 sites), `[[spec-xterm-gating-ux]]`.
+
+---
+
+## screen-model-wider-than-viewer
+
+**STATUS:** ROOT-CAUSED 2026-07-25 (measured, with ground truth) + FIXED in
+three layers (below). This is the mechanism behind the long-open "live-path
+frame corruption on busy CC sessions" entry in `pending-bugs.md`, including its
+"two real SIGWINCHes did NOT repair the frame" sub-case.
+
+⚠ **Deployment honesty.** The CLIENT layer is deployed on guihost (GUI-only,
+2.12.12); the two DAEMON layers are on `main` and land with the next daemon
+bump. And the live "after" frame does **not** exercise the client guard: by the
+time it was captured the model had healed to 168 (any resize with a *different*
+grid repairs it — see below), so the payload fitted and the guard was correctly
+silent. What that frame does prove is the causal claim itself, as a natural
+experiment on one session and one code path: **model 204 vs viewer 168 → merged
+text; model 168 vs viewer 168 → byte-correct text matching the transcript.** The
+guard's own behaviour is covered by unit tests, not yet by a live refusal.
+
+⚠ **This is why the bug reads as intermittent.** The drift heals on any resize
+whose grid DIFFERS from the cached one (that path was never broken); only a
+resize to the size the PTY already has hits the `resize_noop` hole and leaves it.
+So the same session garbles, then "fixes itself" after a window resize, then
+garbles again — which is exactly how it has been reported.
+
+### Symptom
+
+Words render merged out of two different frames, with characters where spaces
+belong. Ground truth (the CC transcript) said
+
+    ...evidence of exam manipulation and marks tampering against Avik De...
+
+and the terminal painted
+
+    ...MEevidence"uof examrnmanipulation and marks tampering against Avik De...
+
+Second tell, and the one that names the cause: a gutter of unrelated 5-character
+fragments (`029%`, `y pol`, `= tra`, `#3+#`) down the LEFT of the top rows, with
+the real content starting at column 6.
+
+### Reproduction
+
+1. Have a session whose daemon-side vt100 model has drifted wider than its PTY
+   (below). On guihost this was a `remote-cc` session stranded on a preserved
+   2.12.10 owner: model ~204 columns, PTY 168x63, viewer 168x63.
+2. Mount it (any client — a shadow viewer is the safe way, it never touches the
+   user's screen).
+3. The reveal reconcile writes the daemon screen and the viewport is garbled.
+
+**The instrument that settles it in one pass** — this is the reusable part:
+
+```bash
+# 1. the daemon's authoritative screen, straight off the socket
+python3 probe_snapshot.py ~/.yggterm/server-<ver>.sock '<session-path>' > screen.txt
+# 2. walk it, tracking the cursor: CSI r;cH sets the column, CSI nC skips cells
+#    (the payload spells BLANKS as cursor-forward, so byte length says nothing)
+# 3. compare the widest column reached against the PTY grid
+```
+
+`ServerRequest` is `#[serde(tag = "kind", rename_all = "snake_case")]`, so the
+request is one line: `{"kind":"terminal_snapshot","path":"<session-path>"}`.
+
+### Root cause
+
+Three sizes are in play and only two of them were ever compared:
+
+1. the **PTY** (`current_cols`/`current_rows`),
+2. the **vt100 screen model** the daemon paints into and serves from
+   (`TerminalScreenState`), and
+3. the **viewer's** xterm grid.
+
+`TerminalSession::resize` kept 1 and 3 in step, but its fast path answered
+`resize_noop` on 1 alone. Once the model had drifted wider, EVERY later resize
+to the same size returned early and never touched it — which is exactly why a
+real SIGWINCH did not repair the frame: it repaired the PTY and the CLI, and
+left the model to serve ghost cells past the new right edge.
+
+Those ghosts are then fatal rather than cosmetic, because of how the screen is
+serialized: absolute `CSI r;cH` per row, `CSI nC` for runs of blanks. Written
+into a narrower terminal, each over-long row WRAPS, which shifts every row below
+it; the payload's later absolute jumps then land on that spill, and its
+blank-runs skip over cells instead of clearing them — so the spilled characters
+show through in the gaps. That is the merge. It also explains the left gutter:
+the screen begins `CSI 5C`, five skipped cells that were blank in the daemon's
+model and full of spill in the client's.
+
+The CLI cannot paint wider than the PTY it was handed, so **no cell beyond the
+PTY width can be legitimate content**. That is what makes clipping a repair
+rather than a compromise.
+
+### Workaround / fix
+
+Three layers, each independently sufficient for the case it covers:
+
+1. **Daemon, source:** `TerminalSession::screen_snapshot` clips the served
+   screen to the session's own PTY width and traces
+   `screen_snapshot_clipped_to_pty_width`. One owner — the single place the
+   screen is served — so every client replay path is covered at once, rather
+   than each call site remembering to.
+2. **Daemon, drift:** the `resize` fast path now compares the SCREEN MODEL too,
+   and repairs it in place (`resize_screen_model_repaired`) instead of returning
+   `resize_noop`.
+3. **Client, defence:** the reveal/post-resize reconcile measures the payload
+   before writing it and clips to its own grid, tracing
+   `screen_reconcile_clipped_to_viewer_width`. This is what protects a viewer
+   attached to an OLDER daemon — which is the live case, since a session
+   stranded on a preserved owner is served by whatever daemon still holds it.
+
+### Code locations
+
+- `crates/yggterm-server/src/terminal.rs` — `walk_formatted_screen`,
+  `formatted_screen_max_column`, `clip_formatted_screen_to_width` (the shared
+  walker, so the measurement and the rewrite cannot disagree),
+  `TerminalScreenState::size`, `TerminalSession::resize`,
+  `TerminalSession::screen_snapshot`
+- `crates/yggterm-shell/src/shell.rs` — the `ScreenReconcileDecision::Write` arm
+
+### Tests
+
+`crates/yggterm-server/src/terminal.rs` — `mod screen_width_tests`: blank-runs
+are counted as cells (not bytes), a screen that fits is byte-identical, clipping
+drops only the cells past the edge, colour state survives the clip, a wide glyph
+straddling the edge is dropped whole, and an OSC title string does not move the
+cursor.
+
+### Telemetry
+
+- `terminal/resize_screen_model_repaired` — the model had drifted; carries the
+  stale model grid.
+- `terminal/screen_snapshot_clipped_to_pty_width` — ghosts were served and
+  dropped at the source.
+- `ui/terminal_mount/screen_reconcile_clipped_to_viewer_width` — the client
+  refused an oversized payload; carries `screen_max_column` and `viewer_cols`.
+
+### Related memory
+
+`[[campaign-yggterm-unified]]`, `[[finding-shadow-read-only-terminal-viewer]]`
+(the lane that made this findable without touching the user's screen),
+`[[spec-agent-cli-wrapper-render-parity]]`.
 
 ---
 
