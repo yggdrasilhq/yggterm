@@ -159,6 +159,54 @@ fix) once the fix is verified live on guihost.
   source so a FIFTH script cannot hide the same way — enumerating these by hand
   is exactly what let this one survive three rounds.
 
+- **★★ WHEN THE GUI DIES, NOTHING BRINGS IT BACK — measured 2026-07-25,
+  DESIGNED, NOT BUILT.** This is the survivable half of the segfault entry
+  below: whatever kills the window, the user is simply left without one while
+  the daemon and every session sit there intact.
+  **The measurement (guihost, `systemctl --user` + `coredumpctl`), because the raw
+  "42 failed `Yggterm@*` units" number is misleading and I nearly quoted it:**
+  - **10 units `Result=core-dump`** — genuine crashes. `coredumpctl` dates them
+    across 2026-07-08 .. **2026-07-24 16:11**, several per week, latest the day
+    before this entry. SIGSEGV mostly, three SIGABRT.
+  - 31 `Result=exit-code`, of which **10 are `code=exited; status=130`** — the
+    process's OWN handler exiting on SIGINT. Those are deliberate agent/user
+    kills, NOT crashes. 1 `status=9` (SIGKILL).
+  ⇒ **~10 real crashes, not 42.** Do not cite the failed-unit count as a crash
+  count; sort by `Result` first.
+  **Why nothing restarts:** the unit is a TRANSIENT service the desktop
+  environment creates per launch (`app-dev.yggterm.Yggterm@<uuid>.service`,
+  `Restart=no`, `ExecStart=/home/user/.local/bin/yggterm`). We do not author it,
+  so we cannot set a restart policy on it.
+  **The policy that is exactly right is `Restart=on-abnormal`, NOT
+  `on-failure`.** `on-failure` also restarts on a non-zero *exit code*, which
+  would fight every deliberate shutdown above (`status=130`). `on-abnormal`
+  restarts on signal-death, core dump, timeout and watchdog only — i.e. a
+  segfault comes back and a clean quit stays quit. Whatever mechanism is
+  chosen must reproduce that distinction.
+  **Two implementations, and the second is the one to build:**
+  1. *Daemon-side supervision.* The daemon outlives the GUI and already stores
+     everything a relaunch needs on `ClientInstanceRecord` (`executable_path`,
+     `display`, `wayland_display`, `xdg_runtime_dir`, `xauthority`), and
+     `launch_app_background` already knows how to spawn a GUI from a non-GUI
+     context. ⛔ **But the daemon is not the GUI's parent, so it cannot see the
+     exit status** — it can only tell "the process is gone", which is exactly
+     the distinction that matters. It would have to infer intent from a missing
+     `PrepareClientClose`, and a SIGKILLed GUI (seen once) has none either, so
+     it would race the agent's own relaunch loop and produce two windows.
+  2. **A supervisor shim (preferred).** `Exec=` launches yggterm in supervise
+     mode; it forks the real GUI as a CHILD and `waitpid`s, so it learns the
+     status EXACTLY (`WIFSIGNALED` + `WTERMSIG` in `SIGSEGV|SIGABRT|SIGBUS`)
+     and applies `on-abnormal` semantics itself. No systemd dependency, works
+     on every Unix, and the DE's unit keeps its `StartupWMClass` because the
+     child owns the window. Needs a restart budget (N per hour, and refuse if
+     the child died in under ~10s, so a crash-on-startup cannot loop).
+     ⚠ Check the update/exec-handoff path first: an in-place `exec()` keeps the
+     pid (supervisor sees nothing, correct) but a spawn-successor-and-exit-0
+     handoff must read as a CLEAN exit, or every update would spawn a duplicate.
+  **Not live-provable without a daemon+GUI swap**, which is why it is recorded
+  rather than half-shipped: the swap re-resumes agent sessions, so it cannot be
+  done from inside a session that is itself riding that daemon.
+
 - **★★ AGENT WEB-SURFACE AUTOMATION HARD-CRASHES THE GUI (WebKitGTK
   segfault) — diagnosed 2026-07-24 on guihost; LAYER 1 (crash surface) FIXED +
   LIVE-VERIFIED at 2.12.8 (`c3c7086`), LAYER 2 (routing/isolation) OPEN.**
