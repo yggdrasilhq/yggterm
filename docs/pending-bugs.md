@@ -39,39 +39,58 @@ fix) once the fix is verified live on jojo.
   healthy throughout.
 
 - **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT (found
-  2026-07-25). One blocker is PROVEN; a second, first filed here as proven, is
-  WITHDRAWN — read both before spending a round.**
-  **PROVEN — the unsized-PTY grid divergence.** A session spawned with
-  `terminal new --no-activate` is never sized by any client, so its PTY keeps
-  the spawn default (`pty_cols: 120, pty_rows: 36`) while the shadow's viewport
-  is 167×57. `app open` then refuses outright:
-  `session/view contract violation: Client viewport 167×57 diverges from daemon
-  PTY grid 120×36 (broken-bottom risk)`. The shadow cannot resolve this itself:
-  driving PTY winsize is denied to it by the slice-4.0 role gate, deliberately.
-  This alone breaks the prescribed agent flow (`terminal new --no-activate` →
-  open on the shadow), which collides with
-  [[feedback-agentic-surface-is-the-default]].
-  ⛔ **WITHDRAWN — "it waits for an interactivity the role gate forbids."** I
-  filed that from the timeout's summary line
-  (`"ready":true, reason:"terminal rendered but focus is outside the terminal"`)
-  and it does not survive reading the code. `app_control_open_path_ready`
-  (`crates/yggterm-server/src/lib.rs:17612`) only requires `interactive` when
-  **`!ready && !terminal_open_attempt_ready`** — and that payload said
-  `ready: true`, so the interactive gate was never the thing that failed. The
-  real reason it returned false is the check ~40 lines earlier: `viewport
-  .active_session_path` still pointed at the shadow's PREVIOUS session, not the
-  target, so the shadow's viewport never switched at all. **`reason` describes
-  whatever session the viewport is currently showing, not the one being opened**
-  — reading it as a verdict on the target is the misread that produced this
-  entry. Why the switch never happened is NOT yet established; that is the open
-  question, and it may simply be the proven blocker above firing first.
-  **Fix direction:** give a no-activate spawn a grid (inherit the requesting
-  client's, or let the opening client's viewport size a never-sized PTY) and
-  re-test. Only if `app open` still hangs afterwards is there a second bug —
-  and then diagnose it from `active_session_path`, not from `reason`.
-  Document surfaces are unaffected either way: they replace the viewport, which
-  is why the yedit rail work was provable via `right-panel` on the same session
-  whose `app open` failed.
+  2026-07-25; ROOT-CAUSED and FIXED 2026-07-25, see the four changes below).**
+  ⛔ **This entry's first two diagnoses were BOTH wrong about the mechanism.
+  The trace settles it — read the correction before re-deriving anything.**
+  **What the trace actually shows** (`event-trace.jsonl`, category `role_gate`,
+  live on jojo with a shadow `agent-r20`): the shadow's terminal lane dies on
+  TWO daemon refusals, neither of which is a grid problem.
+  1. `{"category":"role_gate","name":"shadow_refused","payload":{"request":
+     "focus_live"}}` — `app open` routes the shadow's view switch through
+     `spawn_focus_live_session_row`, which calls `focus_live_with_view`, which
+     mutates the **daemon's SHARED active session**. Denied. No snapshot comes
+     back, so nothing applies the switch, and the poll then reports the session
+     the viewport is still SHOWING. **That is why `active_session_path` never
+     moved** — the open question the previous revision left is answered, and it
+     was never the grid.
+  2. `{"request":"terminal_ensure"}` → `shadow_cannot_own`, repeatedly. The
+     mount treats an ensure error as fatal and `return`s before the read stream
+     starts, so **the shadow's terminal viewport was blank BY CONSTRUCTION** —
+     for every session, not just a no-activate one.
+  ⛔ **"The unsized-PTY grid divergence" was real but MIS-SCOPED.** It is not
+  about `--no-activate` at all: the shadow reports the same violation against a
+  fully-sized session the user is actively using (`Client viewport 167×57
+  diverges from daemon PTY grid 168×63`). The invariant the old entry missed is
+  that **the session/view contract assumes ONE viewer per session**; a second
+  viewer with its own window size violates it by construction. So "give a
+  no-activate spawn a grid" would have fixed one instance and left the class.
+  **THE FIX (shipped): the shadow is a READ-ONLY VIEWER, enforced on the CLIENT
+  side too.** The daemon's role gate is unchanged — the ownership boundary was
+  never wrong; the client was wrong to ask. `client_is_shadow_viewer()`
+  (`crates/yggterm-shell/src/shell.rs`) now gates four call sites:
+  - `terminal_ensure_with_retry_async` → skipped, traced
+    `terminal_mount/shadow_read_only_attach`. The mount proceeds to the read
+    stream, which needs only `TerminalRead`/`TerminalSnapshot`/`TerminalHistory`
+    — all already `Allow`.
+  - `terminal_resize_async` → skipped. D8 says a shadow must never drive
+    SIGWINCH; now it never asks, instead of asking and treating the refusal as
+    a mount fault.
+  - `spawn_focus_live_session_row` → client-local `restore_active_session`
+    instead of the daemon's shared `focus_live`.
+  - `YggtermServer::apply_snapshot` → a shadow that has already chosen a session
+    KEEPS it; without this the next refresh re-imposed the daemon's active path
+    and the shadow followed the user around seconds after `app open` landed.
+  **Fidelity: the viewer adapts to the session, not the reverse.** Since the
+  shadow may not resize the PTY, its xterm pins to the daemon's grid
+  (`window.__yggtermShadowPinnedGrid`, set from the session's "PTY size" at
+  mount); `proposedTerminalFitDimensions` returns the pin and the row-fit guard
+  stands down, so the two grids are equal by construction and the contract check
+  stays a real regression detector. `scripts/shadow-client.sh` now defaults to
+  **2560×1440**, because a window smaller than the pinned grid CLIPS rows out of
+  every screenshot (1920×1080 gave 167×57 against a live 168×63 and lost six).
+  **Still true:** document surfaces were never affected — they replace the
+  viewport, which is why the yedit rail work was provable via `right-panel` on
+  the same session whose `app open` failed.
 
 - **★★ A SESSION STRANDED ON A `preserved` OWNER HAS NO DECLARES, AND THE RAIL
   REBUILD FAILS SILENTLY (found 2026-07-25).** The declare-rebuild
