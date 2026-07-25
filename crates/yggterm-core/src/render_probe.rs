@@ -302,8 +302,35 @@ pub fn read_process_memory(pid: i32) -> Option<ProcMemory> {
 /// machine shows tens of milliseconds of `drm-engine-gfx`. "The GPU works for
 /// everything except us" is a fact this number states and a CPU number cannot.
 pub fn parse_fdinfo_drm_engine_ns(text: &str) -> Option<u64> {
-    let mut total: Option<u64> = None;
+    parse_fdinfo_drm_client(text).map(|client| client.engine_ns)
+}
+
+/// One DRM client as a single `fdinfo` file describes it.
+///
+/// `client_id` is the kernel's own de-duplication key. It matters because
+/// **`dup`'d DRM fds share one `struct file`, so every one of them reports the SAME
+/// cumulative counters** — summing across fds multiplies the answer by however many
+/// the process happens to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdinfoDrmClient {
+    /// `drm-client-id`, when the kernel wrote one.
+    pub client_id: Option<u64>,
+    /// Every `drm-engine-*` counter in this file, summed. One file describes one
+    /// client, so summing WITHIN a file is correct; summing ACROSS files is not.
+    pub engine_ns: u64,
+}
+
+/// Parse one `/proc/<pid>/fdinfo/<fd>` file into the DRM client it describes.
+/// `None` when the file names no DRM engine at all, which is how "this fd is not a
+/// GPU fd" stays distinct from "this GPU did no work".
+pub fn parse_fdinfo_drm_client(text: &str) -> Option<FdinfoDrmClient> {
+    let mut engine_ns: Option<u64> = None;
+    let mut client_id: Option<u64> = None;
     for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("drm-client-id:") {
+            client_id = rest.trim().parse::<u64>().ok();
+            continue;
+        }
         let Some(rest) = line.strip_prefix("drm-engine-") else {
             continue;
         };
@@ -318,9 +345,51 @@ pub fn parse_fdinfo_drm_engine_ns(text: &str) -> Option<u64> {
         if fields.next() != Some("ns") {
             continue;
         }
-        total = Some(total.unwrap_or(0).saturating_add(nanos));
+        engine_ns = Some(engine_ns.unwrap_or(0).saturating_add(nanos));
     }
-    total
+    engine_ns.map(|engine_ns| FdinfoDrmClient {
+        client_id,
+        engine_ns,
+    })
+}
+
+/// Sum GPU engine time across one process's fdinfo files, counting each DRM CLIENT
+/// once.
+///
+/// ⚠ Reproduced live on the dev host 2026-07-25, which is why this is not a naive sum:
+/// `Xorg` holds 5 fds all reporting `drm-client-id: 5` and the same 960_695_430_760 ns,
+/// `xfwm4` holds 4 fds on client-id 7 and the same 163_800 ns. Adding them up gave 5x
+/// and 4x the truth. Since the inflation is a constant multiple, the DELTA is inflated
+/// by the same factor — so a gauge whose whole job is to answer "is the GPU really
+/// rasterizing, and how much" was silently reporting several times the real number.
+///
+/// A file the kernel gave no `drm-client-id` cannot be de-duplicated, so each such fd
+/// counts once under its own identity: over-counting is the failure being fixed, but
+/// dropping a real client would be worse.
+fn sum_drm_engine_ns_by_client<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> u64 {
+    let mut by_client: BTreeMap<(Option<u64>, &str), u64> = BTreeMap::new();
+    for (fd_name, text) in files {
+        let Some(client) = parse_fdinfo_drm_client(text) else {
+            continue;
+        };
+        // Identity: the kernel's client id where it exists, else this fd alone.
+        let key = (
+            client.client_id,
+            if client.client_id.is_some() {
+                ""
+            } else {
+                fd_name
+            },
+        );
+        let slot = by_client.entry(key).or_insert(0);
+        // Every fd of one client reports the same cumulative counters; take the
+        // largest rather than the last, so two reads racing mid-interval cannot
+        // make the total go backwards.
+        *slot = (*slot).max(client.engine_ns);
+    }
+    by_client
+        .into_values()
+        .fold(0u64, |total, nanos| total.saturating_add(nanos))
 }
 
 /// Total GPU engine nanoseconds across every fd this process holds.
@@ -331,16 +400,20 @@ pub fn parse_fdinfo_drm_engine_ns(text: &str) -> Option<u64> {
 /// produced the forced-software-GL bug: one EACCES read as "there is no GPU here".
 pub fn drm_engine_ns_for_pid(pid: i32) -> Option<u64> {
     let entries = fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?;
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(text) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if let Some(nanos) = parse_fdinfo_drm_engine_ns(&text) {
-            total = total.saturating_add(nanos);
-        }
-    }
-    Some(total)
+    let files: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            fs::read_to_string(entry.path())
+                .ok()
+                .map(|text| (name, text))
+        })
+        .collect();
+    Some(sum_drm_engine_ns_by_client(
+        files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str())),
+    ))
 }
 
 /// Extract `AT_CLKTCK` from a raw 64-bit `auxv` blob (pairs of little-endian u64
@@ -943,6 +1016,75 @@ drm-engine-compute:\t3434919 ns\n";
         assert_eq!(
             parse_fdinfo_drm_engine_ns("drm-engine-gfx:\t500 us\n"),
             None
+        );
+    }
+
+    /// ⚠⚠ A PROCESS'S DUP'D DRM FDS ARE ONE CLIENT, AND THEY ALL REPORT THE SAME
+    /// CUMULATIVE COUNTERS. Summing over fds multiplies the answer.
+    ///
+    /// Measured on the dev host 2026-07-25, which is where this shape comes from:
+    ///
+    /// ```text
+    /// pid=37057 Xorg   — 5 fds, all drm-client-id 5, each 960_695_430_760 ns
+    /// pid=38801 xfwm4  — 4 fds, all drm-client-id 7, each 163_800 ns
+    /// pid=1991809 betterbird — 5 fds over TWO client ids (9587, 9589)
+    /// ```
+    ///
+    /// The naive sum returned 4_803_477_153_800 for Xorg where the truth is
+    /// 960_695_430_760 — a silent 5x on the one gauge that answers "is the GPU really
+    /// rasterizing". Since the factor is constant, the DELTA is inflated by it too.
+    #[test]
+    fn one_drm_client_counted_once_however_many_fds_it_holds() {
+        fn fdinfo(client_id: u64, gfx_ns: u64, compute_ns: u64) -> String {
+            format!(
+                "pos:\t0\nflags:\t02\ndrm-driver:\tamdgpu\ndrm-client-id:\t{client_id}\n\
+                 drm-memory-vram:\t8192 KiB\ndrm-engine-gfx:\t{gfx_ns} ns\n\
+                 drm-engine-compute:\t{compute_ns} ns\ndrm-engine-capacity-video:\t2\n"
+            )
+        }
+        // xfwm4's exact shape: four fds, one client, identical counters.
+        let one_client = fdinfo(7, 82_108, 81_692);
+        let four_fds = [
+            ("3", one_client.as_str()),
+            ("14", one_client.as_str()),
+            ("16", one_client.as_str()),
+            ("17", one_client.as_str()),
+        ];
+        assert_eq!(
+            parse_fdinfo_drm_engine_ns(&one_client),
+            Some(163_800),
+            "one file describes one client, so summing WITHIN a file is right"
+        );
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client(four_fds),
+            163_800,
+            "four dup'd fds of one client are 163_800 ns, not 655_200"
+        );
+        // betterbird's shape: distinct clients DO add up.
+        let idle_client = fdinfo(9587, 0, 0);
+        let busy_client = fdinfo(9589, 1_487_337_748, 0);
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([
+                ("13", idle_client.as_str()),
+                ("36", busy_client.as_str()),
+                ("37", busy_client.as_str()),
+                ("41", busy_client.as_str()),
+                ("42", busy_client.as_str()),
+            ]),
+            1_487_337_748,
+            "two clients, four fds on the busy one: count each client once"
+        );
+        // A kernel that wrote no client id cannot be de-duplicated; each such fd
+        // counts once under its own identity rather than being dropped.
+        let anonymous = "drm-driver:\tamdgpu\ndrm-engine-gfx:\t100 ns\n";
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([("3", anonymous), ("4", anonymous)]),
+            200
+        );
+        // Non-GPU fds contribute nothing and are not mistaken for a zero-work client.
+        assert_eq!(
+            super::sum_drm_engine_ns_by_client([("0", "pos:\t0\nflags:\t02\n")]),
+            0
         );
     }
 
