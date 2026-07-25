@@ -6,33 +6,50 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
-- **★★ A CONTRIBUTED RAIL DOES NOT SURVIVE A CLIENT THAT DID NOT SEE THE
-  DECLARE (found 2026-07-25).** An app's rail (yedit's notes, ychrome's tabs)
-  is built client-side by parsing OSC 7717 out of the terminal byte stream. Any
-  client that was not rendering that terminal when the app declared has NO
-  contribution and shows Session Metadata instead — with no error. Two real
-  consequences, both hit this day:
-  1. **After a GUI restart the rail is gone** until the app re-declares. I had
-     to re-run `yedit` in the session by hand to get it back.
-  2. **The agentic surface cannot test app rails at all.** A shadow view client
-     never had the byte stream, so `app right-panel pane:<id> --client agent-1`
-     opens nothing. This blocks live verification of anything rail-shaped
-     (the rail drag-reorder and yedit's inline rename are both code-complete
-     and unit-locked but pixel-unproven for exactly this reason) — and it
-     collides with the standing rule that ALL live testing runs on the agentic
-     surface ([[feedback-agentic-surface-is-the-default]]).
-  **The fix already has a precedent.** The daemon ingests every declare
-  (`cb4eff9`), and web surfaces already rebuild from it:
-  `rebuild_web_surface_from_daemon_declare` fetches via
-  `terminal_app_declares_async` and filters `verb == "web-surface"`. yedit's
-  declare is the same records list with `verb == "sidebar"`. What is missing is
-  a sibling that rebuilds a SIDEBAR contribution the same way, called when a
-  session becomes active and has no contribution. The obstacle is only that the
-  declare-application logic (parse panes/control/versions → resolve the control
-  URL → `upsert_sidebar_contribution`) is inline in the OSC match arm and needs
-  extracting so it can be fed a daemon-sourced record too.
-  ⚠ Do NOT "fix" this by having the agent re-run the app to force a declare —
-  that is the workaround I used, and it only works when a terminal lane exists.
+- **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT — it waits
+  for a condition the role gate forbids (found 2026-07-25).** `app open`
+  settles only on `interactive` = `terminal_rendered && terminal_input_enabled`
+  (`terminal_observe.rs:591`). A shadow may never hold terminal focus (slice-4.0
+  role gate, deliberate), so it lands in the `visible` arm — `rendered=true,
+  interactive=false, reason "terminal rendered but focus is outside the
+  terminal"` — and `app open` times out **even though its own payload says
+  `"ready": true`**. Live on jojo: `app open <fresh session> --client agent-r17`
+  → `Error: timed out waiting for app open to settle … "ready":true`.
+  A second, independent blocker sits in front of it: a session spawned with
+  `terminal new --no-activate` is never sized by any client, so its PTY keeps
+  the spawn default (`pty_cols: 120, pty_rows: 36`) while the shadow's viewport
+  is 167×57 — and `app open` refuses on the session/view contract
+  ("diverges from daemon PTY grid … broken-bottom risk"). The shadow cannot fix
+  this itself either: driving PTY winsize is denied to it by the same gate.
+  **Why it matters:** these two together mean the prescribed agent flow
+  (`terminal new --no-activate` → open on the shadow) cannot open a TERMINAL
+  lane at all, which collides head-on with
+  [[feedback-agentic-surface-is-the-default]]. Document surfaces are unaffected
+  — they replace the viewport, so the yedit rail work was provable via
+  `right-panel` while `app open` on the same session failed.
+  **Fix direction:** `app open` should settle on `ready`/`visible` for a client
+  that is role-denied focus, instead of waiting for an interactivity it can
+  never reach; and a no-activate spawn needs a grid (inherit the requesting
+  client's, or let the opening client's viewport size an unsized PTY).
+
+- **★★ A SESSION STRANDED ON A `preserved` OWNER HAS NO DECLARES, AND THE RAIL
+  REBUILD FAILS SILENTLY (found 2026-07-25).** The declare-rebuild
+  (`1c88d4a`) asks the daemon that answers `terminal_app_declares`. But after a
+  hot restart that could not hand over every PTY, the old daemon keeps owning
+  the leftovers: they appear under `preserved_terminal_owner_keys` on the new
+  daemon, NOT `owned_terminal_session_keys`. An app running in such a session
+  declares to the OLD daemon, so the new one answers "no declares" — and
+  because "no declare at all" is not a refusal, **nothing traces**. Observed on
+  jojo: `right-panel pane:notes` on a shadow dispatched
+  `terminal_app_declares`, completed in ~860 ms, applied nothing, and emitted
+  no `daemon_declare_*` reason. The rail simply never appeared.
+  **Diagnose** by comparing the two key lists in `server status` — a session in
+  `preserved_terminal_owner_keys` is on the old owner. **Unblock** with a fresh
+  session on the current daemon (proven: same yedit, fresh session, full rail
+  rebuilt on a shadow that never saw the declare). **Fix** is one of: have the
+  rebuild trace an explicit "no declare for this session" reason so the failure
+  is legible, and/or have the surviving daemon proxy declares for the sessions
+  it lists as preserved.
 
 
 - **★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
