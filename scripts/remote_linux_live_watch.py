@@ -190,7 +190,6 @@ def launch_env_from_session(
         "YGGTERM_ALLOW_MULTI_WINDOW": "1",
         "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF": "1",
         "NO_AT_BRIDGE": "1",
-        "WEBKIT_DISABLE_COMPOSITING_MODE": "1",
     }
     for desktop_key in (
         "DESKTOP_SESSION",
