@@ -6,6 +6,30 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **⚠ TRAP: A VERSION BUMP LOCKS THE NEW CLI OUT OF THE RUNNING DAEMON — drive
+  the hot-restart from the OLD binary (hit 2026-07-25 deploying 2.12.11).** The
+  daemon socket path is version-keyed (`~/.yggterm/server-2-12-11.sock`).
+  `server status` has fallback discovery and will happily answer from the
+  2.12.10 daemon, which makes everything look fine; `server monitor --scenario
+  hot-restart` does NOT — it dials the version-derived path, finds nothing, and
+  fails with `connecting to …/server-2-12-11.sock`. The deploy then silently
+  does nothing while `status` still reports a healthy daemon.
+  **Recipe:** keep the displaced binary (`mv yggterm-headless
+  yggterm-headless.prev-<old>`) and run the hot-restart from *it*, pointing
+  `--daemon-exe` at the new one — the old CLI reaches the old socket, and the
+  daemon spawns the new exe. Two more things that bite in the same minute:
+  a running binary cannot be `cp`'d over (`ETXTBSY`) but CAN be displaced with
+  `mv` (the live process keeps the unlinked inode); and `--expected-version`
+  equal to the running version makes hot-restart a no-op ("target daemon already
+  matches"), so a same-version rebuild never deploys — bump the version or the
+  swap is a lie.
+  ⚠ **Handoff is DEFERRED, by design:** the new daemon comes up owning **0**
+  sessions with every live PTY under `preserved_terminal_owner_keys`, held by
+  the old daemon (`hot_update_handoff_preserved_owner`). Sessions survive and
+  the GUI shows them all, but the old daemon does not retire until its sessions
+  end — so a fleet mid-deploy legitimately runs 3 daemons, and those sessions
+  keep talking to the OLD one (see the `preserved`-owner declare entry below).
+
 - **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT — it waits
   for a condition the role gate forbids (found 2026-07-25).** `app open`
   settles only on `interactive` = `terminal_rendered && terminal_input_enabled`
