@@ -4042,6 +4042,35 @@ fn shm_force_for_arming(armed: bool, hardware_gl: bool, already_forced: bool) ->
     }
 }
 
+/// What the GL policy implies for the software-rasterizer variables — the twin of
+/// [`ShmForce`], and for exactly the same reason.
+///
+/// ⚠ Caught by running the real binary 2026-07-25, not by reading it: this agent's own
+/// shell inherits `LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe` from the GUI
+/// that spawned its terminal, and a hot-restarted GUI inherits the same pair from its
+/// predecessor. `if !hardware_gl { set }` leaves those inherited values in place on a
+/// host the probe just declared HARDWARE — so the startup trace read
+/// `webkit_gl_policy: hardware_gl_probed` next to `libgl_always_software: "1"`, WebKit
+/// stayed on llvmpipe, and the decision and the state disagreed silently. Declining to
+/// set a variable is not the same as owning it.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftwareGlForce {
+    /// Software path: set the pair where nothing has set it.
+    Apply,
+    /// Hardware path: REMOVE the pair, including a value we inherited.
+    Clear,
+}
+
+#[cfg(target_os = "linux")]
+fn software_gl_force_for_policy(hardware_gl: bool) -> SoftwareGlForce {
+    if hardware_gl {
+        SoftwareGlForce::Clear
+    } else {
+        SoftwareGlForce::Apply
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxWebkitGlPolicyInput {
@@ -4191,13 +4220,19 @@ fn configure_linux_webkit_compositing() {
     if compositing_disabled_env {
         return;
     }
-    if !policy.hardware_gl {
-        if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
-            unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
+    match software_gl_force_for_policy(policy.hardware_gl) {
+        SoftwareGlForce::Apply => {
+            if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
+                unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
+            }
+            if std::env::var_os("GALLIUM_DRIVER").is_none() {
+                unsafe { std::env::set_var("GALLIUM_DRIVER", "llvmpipe") };
+            }
         }
-        if std::env::var_os("GALLIUM_DRIVER").is_none() {
-            unsafe { std::env::set_var("GALLIUM_DRIVER", "llvmpipe") };
-        }
+        SoftwareGlForce::Clear => unsafe {
+            std::env::remove_var("LIBGL_ALWAYS_SOFTWARE");
+            std::env::remove_var("GALLIUM_DRIVER");
+        },
     }
     // Phase F under-glass REQUIRES the DMABUF renderer (F.0.1 root cause,
     // sandbox-proven): the SHM presentation path clears a transparent
@@ -5346,7 +5381,19 @@ mod tests {
                                 );
                                 let shm =
                                     shm_force_for_arming(armed, policy.hardware_gl, already_forced);
+                                let software_gl =
+                                    software_gl_force_for_policy(policy.hardware_gl);
                                 let explicit_under_glass = under_glass_var == Some("1");
+                                // ⚠ Live-caught: declining to SET the software-GL pair
+                                // is not the same as owning it. A GUI relaunched by a
+                                // running GUI inherits LIBGL_ALWAYS_SOFTWARE=1 from its
+                                // predecessor, so on a probed-hardware host the policy
+                                // said hardware while WebKit stayed on llvmpipe.
+                                assert_eq!(
+                                    software_gl == SoftwareGlForce::Clear,
+                                    policy.hardware_gl,
+                                    "hardware GL must CLEAR an inherited software force"
+                                );
                                 assert_eq!(
                                     shm == ShmForce::Clear,
                                     policy.hardware_gl || explicit_under_glass,
@@ -5376,10 +5423,10 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     use super::{
-        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, LinuxWebkitGlPolicyInput, ShmForce,
+        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, LinuxWebkitGlPolicyInput, ShmForce, SoftwareGlForce,
         linux_choose_desktop_environment, linux_environ_bytes_to_map,
         linux_gui_entry_environment_overrides_from_desktop, linux_webkit_gl_policy_from_input,
-        shm_force_for_arming,
+        shm_force_for_arming, software_gl_force_for_policy,
     };
     #[cfg(target_os = "linux")]
     use std::collections::BTreeMap;
