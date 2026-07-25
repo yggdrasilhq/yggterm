@@ -19817,6 +19817,39 @@ pub fn run_app_control_web_surface_do(
     Ok(())
 }
 
+/// Rasterize one addressed element to a PNG, in the page (`capture-element`).
+///
+/// The output path is absolutized CLI-side: the GUI has its own cwd, so a
+/// relative path would land somewhere the caller never looks — the same reason
+/// `run_app_control_web_surface_screenshot` does it.
+pub fn run_app_control_web_surface_capture_element(
+    session_path: Option<&str>,
+    target: WebElementRef,
+    output_path: &str,
+    split: Option<usize>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let absolute = std::path::Path::new(output_path);
+    let absolute = if absolute.is_absolute() {
+        absolute.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(absolute)
+    };
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceCaptureElement {
+            session_path: session_path.map(str::to_string),
+            target,
+            output_path: absolute.to_string_lossy().to_string(),
+            split,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 /// Type one named vault field into one addressed element (`fill-vault`).
 ///
 /// Nothing about the secret crosses this boundary: the CLI names the ITEM and

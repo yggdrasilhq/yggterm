@@ -46779,17 +46779,30 @@ async fn web_do_eval(
     native_id: u64,
     script: &str,
 ) -> Result<Value, String> {
+    web_do_eval_with_timeout(desktop, native_id, script, Duration::from_secs(5)).await
+}
+
+/// The same one-shot eval with an explicit budget, for the few verbs whose work
+/// legitimately takes longer than a selector resolve — rasterizing a large
+/// image, for instance. One implementation, one timeout knob: a second copy
+/// with its own duration is how two evals end up reporting failure differently.
+async fn web_do_eval_with_timeout(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    script: &str,
+    budget: Duration,
+) -> Result<Value, String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
     desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     })?;
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    match tokio::time::timeout(budget, rx).await {
         Ok(Ok(Ok(value_json))) => {
             Ok(serde_json::from_str(&value_json).unwrap_or_else(|_| Value::String(value_json)))
         }
         Ok(Ok(Err(js_error))) => Err(format!("js: {js_error}")),
         Ok(Err(_)) => Err("eval callback dropped (surface destroyed mid-do?)".to_string()),
-        Err(_) => Err("resolve eval timed out (5s)".to_string()),
+        Err(_) => Err(format!("eval timed out ({}s)", budget.as_secs())),
     }
 }
 
@@ -48778,6 +48791,76 @@ mod web_do_verb_tests {
         assert_eq!(idle, settled, "two mutation clocks would answer differently");
     }
 
+    // C2: the band arithmetic, testable with no image. Remainder columns go to
+    // the LAST band, so the bands always reassemble to the original width — a
+    // captcha whose width is not a multiple of its character count must not
+    // silently lose a column.
+    #[test]
+    fn split_bands_tile_the_width_exactly() {
+        assert_eq!(
+            split_png_bands(120, 6),
+            vec![(0, 20), (20, 20), (40, 20), (60, 20), (80, 20), (100, 20)]
+        );
+        // 121 / 6 = 20 remainder 1: the last band absorbs it.
+        let uneven = split_png_bands(121, 6);
+        assert_eq!(uneven.last(), Some(&(100, 21)));
+        let covered: usize = uneven.iter().map(|(_, w)| *w).sum();
+        assert_eq!(covered, 121, "bands must tile the whole image");
+        // Degenerate asks answer honestly instead of panicking.
+        assert!(split_png_bands(0, 6).is_empty());
+        assert!(split_png_bands(120, 0).is_empty());
+        // More bands than columns clamps rather than emitting zero-width bands.
+        assert_eq!(split_png_bands(3, 10).len(), 3);
+        assert!(split_png_bands(3, 10).iter().all(|(_, w)| *w > 0));
+    }
+
+    // Each band must carry the RIGHT columns of every row — an off-by-one in
+    // the row stride would produce plausible-looking garbage.
+    #[test]
+    fn split_bands_carry_the_right_columns() {
+        // 4x2 RGBA, each pixel's red channel = its column index.
+        let mut rgba = Vec::new();
+        for _row in 0..2 {
+            for col in 0..4u8 {
+                rgba.extend_from_slice(&[col, 0, 0, 255]);
+            }
+        }
+        let plan = split_png_bands(4, 2);
+        let bands = split_rgba_bands(&rgba, 4, 2, &plan);
+        assert_eq!(bands.len(), 2);
+        // Band 0 holds columns 0,1 on both rows; band 1 holds columns 2,3.
+        assert_eq!(
+            bands[0].iter().step_by(4).copied().collect::<Vec<u8>>(),
+            vec![0, 1, 0, 1]
+        );
+        assert_eq!(
+            bands[1].iter().step_by(4).copied().collect::<Vec<u8>>(),
+            vec![2, 3, 2, 3]
+        );
+    }
+
+    // The capture script must name each failure distinctly: they need different
+    // actions from the caller, and one generic `unsupported` would be a lie
+    // about all three.
+    #[test]
+    fn the_capture_script_names_each_failure_separately() {
+        let js = web_do_script_for_ref(WEB_CAPTURE_ELEMENT_JS, &WebElementRef::Css("img".into()));
+        assert!(!js.contains("__YGG_REF__"), "{js}");
+        for reason in [
+            "not_found",
+            "element_not_rasterizable",
+            "image_not_decoded",
+            "tainted_canvas",
+            "zero_sized_source",
+        ] {
+            assert!(js.contains(reason), "capture script never reports {reason}");
+        }
+        // Synchronous only — a Promise cannot ride an eval return.
+        assert!(!js.contains("await"), "{js}");
+        assert!(!js.contains("Promise"), "{js}");
+        assert!(js.contains("toDataURL"), "{js}");
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -49693,6 +49776,212 @@ async fn web_surface_read_for(
         }),
         Err(reason) => json!({ "accepted": false, "session_path": session, "reason": reason }),
     }
+}
+
+/// In-page element rasterizer. `__YGG_REF__` is the shared matcher (C4).
+///
+/// Every failure gets its OWN reason, because they need different actions from
+/// the caller: an undecoded image means "wait and retry", a tainted canvas
+/// means "this image is cross-origin without CORS and cannot be read at all",
+/// and a non-rasterizable element means "there is no in-page rasterizer for
+/// arbitrary DOM". A single `unsupported` would be a lie about all three.
+const WEB_CAPTURE_ELEMENT_JS: &str = "(function(){var el=__YGG_REF__;\
+    if(!el)return{ok:false,reason:'not_found'};\
+    var tag=el.tagName;\
+    var w=el.naturalWidth||el.videoWidth||el.width||0;\
+    var h=el.naturalHeight||el.videoHeight||el.height||0;\
+    if(tag!=='IMG'&&tag!=='CANVAS'&&tag!=='VIDEO')\
+    return{ok:false,reason:'element_not_rasterizable',tag:tag};\
+    if(tag==='IMG'&&el.complete===false)return{ok:false,reason:'image_not_decoded',src:el.src};\
+    if(!w||!h)return{ok:false,reason:'zero_sized_source',tag:tag};\
+    try{var c=document.createElement('canvas');c.width=w;c.height=h;\
+    c.getContext('2d').drawImage(el,0,0,w,h);\
+    var url=c.toDataURL('image/png');\
+    return{ok:true,width:w,height:h,data:url.slice(url.indexOf(',')+1)};}\
+    catch(e){var name=String(e&&e.name||'');\
+    if(name==='SecurityError')return{ok:false,reason:'tainted_canvas',src:el.src||null};\
+    return{ok:false,reason:'rasterize_failed',detail:String(e&&e.message||e)};}})()";
+
+/// Where each vertical band starts and how wide it is. PURE, so the band
+/// arithmetic is testable with no image at all.
+///
+/// Remainder columns go to the LAST band rather than being dropped, so the
+/// bands always reassemble to the original width — a captcha whose width is not
+/// a multiple of its character count must not silently lose a column.
+fn split_png_bands(width: usize, bands: usize) -> Vec<(usize, usize)> {
+    if bands == 0 || width == 0 {
+        return Vec::new();
+    }
+    let bands = bands.min(width);
+    let each = width / bands;
+    (0..bands)
+        .map(|index| {
+            let x = index * each;
+            let w = if index + 1 == bands { width - x } else { each };
+            (x, w)
+        })
+        .collect()
+}
+
+/// Cut an RGBA buffer into vertical bands. PURE.
+fn split_rgba_bands(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    bands: &[(usize, usize)],
+) -> Vec<Vec<u8>> {
+    bands
+        .iter()
+        .map(|(x, w)| {
+            let mut out = Vec::with_capacity(w * height * 4);
+            for row in 0..height {
+                let start = (row * width + x) * 4;
+                out.extend_from_slice(&rgba[start..start + w * 4]);
+            }
+            out
+        })
+        .collect()
+}
+
+/// App-control `capture-element`: rasterize ONE addressed element to a PNG, in
+/// the page.
+///
+/// Compositor-independent by construction — `drawImage` + `toDataURL` run in
+/// the content process — so this works on an unmapped, never-revealed surface,
+/// which is the claim that retires the offscreen-renderer deferral. Read-only:
+/// it moves no pointer and mutates nothing, so it does not open an agent lane.
+async fn web_surface_capture_element_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    target: &WebElementRef,
+    output_path: &str,
+    split: Option<usize>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let path = std::path::PathBuf::from(output_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("create {}: {error}", parent.display()),
+        });
+    }
+    let script = web_do_script_for_ref(WEB_CAPTURE_ELEMENT_JS, target);
+    // Rasterizing a large image legitimately outruns the 5s selector budget.
+    let info = match web_do_eval_with_timeout(desktop, native_id, &script, Duration::from_secs(20))
+        .await
+    {
+        Ok(info) => info,
+        Err(reason) => return json!({ "accepted": false, "session_path": session, "reason": reason }),
+    };
+    if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let mut refusal = json!({
+            "accepted": false,
+            "session_path": session,
+            "target": target.describe(),
+            "reason": info
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("capture_failed"),
+        });
+        // Carry the page's own detail through verbatim — `src` on a tainted
+        // canvas is what tells the caller WHICH image it cannot read.
+        if let (Some(obj), Some(source)) = (refusal.as_object_mut(), info.as_object()) {
+            for key in ["src", "tag", "detail"] {
+                if let Some(value) = source.get(key) {
+                    obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        return refusal;
+    }
+    let Some(encoded) = info.get("data").and_then(Value::as_str) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "capture returned no data",
+        });
+    };
+    let bytes = match BASE64_STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": format!("capture data was not base64: {error}"),
+            });
+        }
+    };
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("write {}: {error}", path.display()),
+        });
+    }
+    let width = info.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = info.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let mut answer = json!({
+        "accepted": true,
+        "session_path": session,
+        "native_id": native_id,
+        "target": target.describe(),
+        "output_path": path.to_string_lossy(),
+        "bytes": bytes.len(),
+        "width": width,
+        "height": height,
+        // Named so a reader can tell this apart from the compositor paths at a
+        // glance: it is the PAGE's own pixels, and it does not need the window.
+        "capture_backend": "page_canvas_data_url",
+        "capture_faithful": true,
+        "mapped": false,
+    });
+    if let Some(bands) = split.filter(|bands| *bands > 1) {
+        let split_result = (|| -> Result<Vec<String>, String> {
+            let (rgba, w, h) = decode_png_rgba(&bytes).map_err(|error| error.to_string())?;
+            let plan = split_png_bands(w, bands);
+            let mut written = Vec::with_capacity(plan.len());
+            for (index, (band, pixels)) in plan
+                .iter()
+                .zip(split_rgba_bands(&rgba, w, h, &plan))
+                .enumerate()
+            {
+                let encoded = encode_rgba_png(band.1, h, &pixels)
+                    .map_err(|error| error.to_string())?;
+                let band_path = path.with_file_name(format!(
+                    "{}-{}.png",
+                    path.file_stem().unwrap_or_default().to_string_lossy(),
+                    index + 1
+                ));
+                std::fs::write(&band_path, encoded)
+                    .map_err(|error| format!("write {}: {error}", band_path.display()))?;
+                written.push(band_path.to_string_lossy().to_string());
+            }
+            Ok(written)
+        })();
+        if let Some(obj) = answer.as_object_mut() {
+            match split_result {
+                Ok(paths) => {
+                    obj.insert("split".to_string(), json!(paths.len()));
+                    obj.insert("split_paths".to_string(), json!(paths));
+                }
+                // The capture itself SUCCEEDED; only the post-step failed, and
+                // saying so beats discarding a good PNG.
+                Err(reason) => {
+                    obj.insert("split".to_string(), json!(0));
+                    obj.insert("split_error".to_string(), json!(reason));
+                }
+            }
+        }
+    }
+    answer
 }
 
 /// App-control: full-document PNG capture of a session's active web-surface
@@ -54502,6 +54791,39 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceCaptureElement {
+            session_path,
+            target,
+            output_path,
+            split,
+        } => {
+            let data = web_surface_capture_element_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &target,
+                &output_path,
+                split,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: accepted.then(|| output_path.clone()),
+                data: Some(data.clone()),
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capture-element failed")
+                        .to_string()
+                }),
             }
         }
         AppControlCommand::WebSurfaceDevtools { session_path, open } => {

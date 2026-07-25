@@ -48,7 +48,7 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
-    run_app_control_web_surface_batch,
+    run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_fill_vault,
     run_app_control_web_surface_lease,
@@ -1141,6 +1141,8 @@ fn print_server_app_help() {
     that makes every page-side predicate unavailable
   yggterm server app web lease --ttl <secs> [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
+  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]
+    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface
   yggterm server app web devtools [--close] [--session <path>]
 
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
@@ -3157,6 +3159,31 @@ fn main() -> Result<()> {
                             .next()
                             .unwrap_or("web-surface.png");
                         run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "capture-element" | "capture" => {
+                        // Rasterize ONE addressed element to a PNG, in the page:
+                        //   web capture-element <target> [out.png] [--split <n>]
+                        // Compositor-independent, so it works on an unmapped
+                        // surface — <img>/<canvas>/<video> only, and every other
+                        // element gets a named refusal rather than a blank file.
+                        let target = parse_web_element_ref(&args, true)?.context(
+                            "capture-element needs a target: --selector <css>, --role <r> --label <s>, \
+                             or --text <s>",
+                        )?;
+                        let output = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .unwrap_or("web-element.png");
+                        let split = cli_flag_value(&args, "--split")
+                            .map(|raw| raw.parse::<usize>().context("--split needs a number"))
+                            .transpose()?;
+                        run_app_control_web_surface_capture_element(
+                            session_path,
+                            target,
+                            output,
+                            split,
+                            timeout_ms,
+                        )
                     }
                     "devtools" => {
                         let open = !args.iter().any(|arg| arg == "--close");
