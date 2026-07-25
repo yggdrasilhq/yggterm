@@ -23795,7 +23795,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::SetUiTheme { .. }
             | AppControlCommand::SetThemeEditorValues { .. }
             | AppControlCommand::TriggerUpdateCheck
-            | AppControlCommand::RestartPendingUpdate
+            | AppControlCommand::RestartPendingUpdate { .. }
             | AppControlCommand::ShowStartPage
             | AppControlCommand::StartAction { .. }
             | AppControlCommand::CreateTerminal { .. }
@@ -38427,6 +38427,9 @@ fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
 ) -> Value {
+    // Read BEFORE the long-lived `shell` borrow below: the lease report takes
+    // its own peek at the same signal.
+    let agent_leases = live_agent_leases(state, current_millis() as u64);
     let shell = state.read();
     let snapshot = shell.snapshot();
     let search_sidebar_matches = snapshot
@@ -38559,6 +38562,13 @@ fn describe_app_state_snapshot(
         "terminal_font_size": shell.settings.terminal_font_size,
         "terminal_zoom_percent": zoom_percent_f32(shell.settings.terminal_font_size, TERMINAL_ZOOM_BASE),
         "web_surface_zoom_percent": zoom_percent_f32(shell.settings.web_surface_zoom_percent, WEB_SURFACE_ZOOM_BASE),
+        // N5: the deploy pre-flight. `server app state | jq .agent_leases`
+        // answers "is an agent mid-flow" in one call, from the same field the
+        // reaper reads.
+        "agent_leases": {
+            "active_agent_leases": agent_leases.len(),
+            "leases": agent_leases,
+        },
         "web_surface_vertical_tabs": shell.settings.web_surface_vertical_tabs,
         "terminal_light_theme_name": shell.terminal_theme_name_for(UiTheme::ZedLight),
         "terminal_dark_theme_name": shell.terminal_theme_name_for(UiTheme::ZedDark),
@@ -47660,6 +47670,78 @@ fn web_do_delivery_from_readback(armed_doc: Option<&str>, readback: Option<&Valu
     }
 }
 
+/// Every LIVE agent lease on a web surface, right now.
+///
+/// N5: `server app web lease` already exists for the reaper, so a deploy can
+/// simply CHECK it. Read from the SAME field `web_surface_reap_due` consults
+/// (`WebSurfaceTab::lease_until_ms`), so the report and the reaper can never
+/// disagree — a copy anywhere else would be a second encoding of "is this
+/// surface claimed".
+///
+/// Deliberately GUI-side only. The daemon has no knowledge of these leases and
+/// giving it one would be exactly that second encoding; the deploy pre-flight
+/// is `server app state | jq .agent_leases`, one call, beside the `server app
+/// clients` check.
+fn live_agent_leases(state: &Signal<ShellState>, now_ms: u64) -> Vec<Value> {
+    let shell = state.peek();
+    let mut leases: Vec<Value> = shell
+        .web_surfaces
+        .iter()
+        .flat_map(|(session_path, surface)| {
+            surface.tabs.iter().filter_map(move |tab| {
+                let until = tab.lease_until_ms?;
+                (until > now_ms).then(|| {
+                    json!({
+                        "session_path": session_path,
+                        "tab_id": tab.id,
+                        "lease_until_ms": until,
+                        "seconds_remaining": (until - now_ms) / 1000,
+                    })
+                })
+            })
+        })
+        .collect();
+    // Deterministic order, so a pre-flight diff is stable.
+    leases.sort_by(|a, b| {
+        (
+            a.get("session_path").and_then(Value::as_str),
+            a.get("tab_id").and_then(Value::as_u64),
+        )
+            .cmp(&(
+                b.get("session_path").and_then(Value::as_str),
+                b.get("tab_id").and_then(Value::as_u64),
+            ))
+    });
+    leases
+}
+
+/// The refusal a deploy door returns while an agent is driving. `None` = go
+/// ahead. PURE over the lease list, so the decision is testable.
+///
+/// The HONEST LIMIT of this lock, so nobody oversells it: it stops the
+/// app-control restart door, not `pkill yggterm`. The field finding that a
+/// flow and a deploy are mutually exclusive is about surface HAND-OFF across a
+/// GUI generation, which this does not solve and does not claim to.
+fn agent_lease_refusal(leases: &[Value], force: bool) -> Option<Value> {
+    if force || leases.is_empty() {
+        return None;
+    }
+    let sessions: Vec<&str> = leases
+        .iter()
+        .filter_map(|lease| lease.get("session_path").and_then(Value::as_str))
+        .collect();
+    Some(json!({
+        "accepted": false,
+        "reason": "agent_lease_active",
+        "detail": format!(
+            "{} agent lease(s) are live on {} — someone is driving. Re-run with --force to restart anyway.",
+            leases.len(),
+            sessions.join(", ")
+        ),
+        "leases": leases,
+    }))
+}
+
 /// App-control `lease`: claim a session's active web-surface tab for `ttl_secs`
 /// so the background reaper leaves it alone while unattended work runs.
 ///
@@ -49222,6 +49304,32 @@ mod web_do_verb_tests {
             .detail("s")
             .contains("NOT the same")
         );
+    }
+
+    // N5: an advisory lane lock. A deploy that lands mid-flow kills the flow,
+    // and the lease is already the surface's own claim — so the deploy door
+    // simply CHECKS it.
+    #[test]
+    fn a_live_agent_lease_refuses_the_deploy_door_unless_forced() {
+        let leases = vec![
+            json!({"session_path": "local://a", "tab_id": 1, "seconds_remaining": 240}),
+            json!({"session_path": "local://b", "tab_id": 2, "seconds_remaining": 30}),
+        ];
+        let refusal = agent_lease_refusal(&leases, false).expect("a live lease must refuse");
+        assert_eq!(refusal["reason"], json!("agent_lease_active"));
+        assert_eq!(refusal["accepted"], json!(false));
+        // The message NAMES who is driving — a bare refusal would just move the
+        // confusion somewhere else.
+        let detail = refusal["detail"].as_str().unwrap();
+        assert!(detail.contains("local://a"), "{detail}");
+        assert!(detail.contains("local://b"), "{detail}");
+        assert!(detail.contains("--force"), "{detail}");
+        assert_eq!(refusal["leases"].as_array().map(Vec::len), Some(2));
+
+        // `--force` is an override, not a second policy.
+        assert!(agent_lease_refusal(&leases, true).is_none());
+        // No lease, no refusal — the ordinary deploy is unaffected.
+        assert!(agent_lease_refusal(&[], false).is_none());
     }
 
     // C4: every addressing shape must produce a matcher, and the CSS shape must
@@ -53583,20 +53691,40 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
-        AppControlCommand::RestartPendingUpdate => {
-            restart_into_pending_update(state);
-            sleep(Duration::from_millis(40)).await;
-            AppControlResponse {
-                request_id: request.request_id.clone(),
-                handled_by_pid: std::process::id(),
-                completed_at_ms: current_millis() as u128,
-                output_path: None,
-                data: Some(json!({
-                    "command": "restart_pending_update",
-                    "window": describe_window(&desktop),
-                    "state": describe_app_state_snapshot(&state, &desktop),
-                })),
-                error: None,
+        AppControlCommand::RestartPendingUpdate { force } => {
+            // N5: a deploy that lands mid-flow kills the flow. The lease is
+            // already the surface's own claim, so this door simply CHECKS it.
+            let refusal = agent_lease_refusal(
+                &live_agent_leases(&state, current_millis() as u64),
+                force,
+            );
+            if let Some(refusal) = refusal {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    error: refusal
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    data: Some(refusal),
+                }
+            } else {
+                restart_into_pending_update(state);
+                sleep(Duration::from_millis(40)).await;
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "command": "restart_pending_update",
+                        "window": describe_window(&desktop),
+                        "state": describe_app_state_snapshot(&state, &desktop),
+                    })),
+                    error: None,
+                }
             }
         }
         AppControlCommand::CaptureScreenshot {
@@ -54096,28 +54224,49 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
-        AppControlCommand::CloseWindowPreservingSessions { reason } => {
-            let maximized = desktop.is_maximized();
-            state.with_mut(|shell| shell.remember_window_maximized(maximized));
-            let data = json!({
-                "close_requested": true,
-                "preserve_live_sessions": true,
-                "reason": reason,
-                "window": describe_window(&desktop),
-            });
-            let close_state = state;
-            let reason_for_task = reason.clone();
-            spawn(async move {
-                sleep(Duration::from_millis(80)).await;
-                close_window_preserving_live_sessions(close_state, reason_for_task);
-            });
-            AppControlResponse {
-                request_id: request.request_id.clone(),
-                handled_by_pid: std::process::id(),
-                completed_at_ms: current_millis() as u128,
-                output_path: None,
-                data: Some(data),
-                error: None,
+        AppControlCommand::CloseWindowPreservingSessions { reason, force } => {
+            // The OTHER deploy door. Guarding one and leaving this open would
+            // be exactly the surface inconsistency the house rules call a spec
+            // violation.
+            let refusal = agent_lease_refusal(
+                &live_agent_leases(&state, current_millis() as u64),
+                force,
+            );
+            if let Some(refusal) = refusal {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    error: refusal
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    data: Some(refusal),
+                }
+            } else {
+                let maximized = desktop.is_maximized();
+                state.with_mut(|shell| shell.remember_window_maximized(maximized));
+                let data = json!({
+                    "close_requested": true,
+                    "preserve_live_sessions": true,
+                    "reason": reason,
+                    "window": describe_window(&desktop),
+                });
+                let close_state = state;
+                let reason_for_task = reason.clone();
+                spawn(async move {
+                    sleep(Duration::from_millis(80)).await;
+                    close_window_preserving_live_sessions(close_state, reason_for_task);
+                });
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(data),
+                    error: None,
+                }
             }
         }
         AppControlCommand::Pointer { command } => {

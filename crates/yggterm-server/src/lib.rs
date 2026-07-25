@@ -17518,9 +17518,16 @@ pub fn run_app_control_trigger_update_check(timeout_ms: u64) -> anyhow::Result<(
     Ok(())
 }
 
-pub fn run_app_control_restart_pending_update(timeout_ms: u64) -> anyhow::Result<()> {
+/// `force` overrides the agent-lease guard: a deploy that lands mid-flow kills
+/// the flow, so the GUI refuses while a lease is live unless the caller says it
+/// means it.
+pub fn run_app_control_restart_pending_update(force: bool, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
-    let response = request_app_control(&home, AppControlCommand::RestartPendingUpdate, timeout_ms)?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::RestartPendingUpdate { force },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -17623,11 +17630,12 @@ pub fn run_app_control_close_window(timeout_ms: u64) -> anyhow::Result<()> {
 pub fn run_app_control_close_window_preserving_sessions(
     timeout_ms: u64,
     reason: Option<String>,
+    force: bool,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
-        AppControlCommand::CloseWindowPreservingSessions { reason },
+        AppControlCommand::CloseWindowPreservingSessions { reason, force },
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
