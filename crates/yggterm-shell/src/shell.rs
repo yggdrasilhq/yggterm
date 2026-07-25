@@ -49430,6 +49430,72 @@ mod web_do_verb_tests {
         assert!(WEB_FRAMES_ENUM_JS.contains("accessible:false"));
     }
 
+    // C9: the kickoff must return the call id SYNCHRONOUSLY. If it returned the
+    // promise, the eval's completion value would be a Promise — the exact
+    // `WEBKIT_JAVASCRIPT_ERROR_INVALID_RESULT` this verb exists to route
+    // around, and the verb would fail on its own first step.
+    #[test]
+    fn the_await_kickoff_returns_an_id_not_a_promise() {
+        let js = web_await_kickoff_script("ygg-7", "return await fetch('/x').then(r=>r.status);");
+        assert!(js.trim_end().ends_with("return rid;})()"), "{js}");
+        assert!(js.contains("Promise.resolve("), "{js}");
+        // A synchronous throw must land in the SAME store as a rejected
+        // promise, or the two failure modes would answer differently.
+        assert_eq!(js.matches("store.ok=false").count(), 2, "{js}");
+        assert!(js.contains("async function()"), "{js}");
+    }
+
+    // The poll deletes its entry on read, so a page cannot accumulate stashes.
+    #[test]
+    fn the_await_poll_cleans_up_after_itself() {
+        let js = web_await_poll_script("ygg-7");
+        assert!(js.contains("delete bag[rid]"), "{js}");
+        assert!(js.contains("\"ygg-7\""), "{js}");
+    }
+
+    // THE THREE HONEST ANSWERS. A fabricated result would be
+    // indistinguishable from a real one, which is the worst outcome for a verb
+    // whose whole job is returning a value.
+    #[test]
+    fn an_await_poll_has_three_answers_and_never_invents_a_result() {
+        // Settled, resolved.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": false, "done": true, "ok": true, "value": 200}))),
+            AwaitStep::Settled {
+                ok: true,
+                value: json!(200),
+                error: None
+            }
+        );
+        // Settled, rejected — still a real answer, and the message survives.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(
+                json!({"missing": false, "done": true, "ok": false, "error": "NetworkError"})
+            )),
+            AwaitStep::Settled {
+                ok: false,
+                value: Value::Null,
+                error: Some("NetworkError".into())
+            }
+        );
+        // Not yet.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": false, "done": false}))),
+            AwaitStep::Pending
+        );
+        // A poll EVAL FAILURE is not-yet, not the end — a navigation mid-await
+        // must not abort, exactly as in `web wait`.
+        assert_eq!(
+            web_await_poll_outcome(&Err("eval callback dropped".to_string())),
+            AwaitStep::Pending
+        );
+        // The stash is gone: the document was replaced. NOT a result.
+        assert_eq!(
+            web_await_poll_outcome(&Ok(json!({"missing": true}))),
+            AwaitStep::DocumentReplaced
+        );
+    }
+
     // C4: every addressing shape must produce a matcher, and the CSS shape must
     // still be the plain `querySelector` it always was — the two new shapes are
     // additions to ONE matcher, not a second resolution path.
@@ -50314,6 +50380,160 @@ async fn web_surface_wait_for(
                 // apart instead of guessing.
                 "eval_errors": eval_errors,
                 "url": current_url,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Monotonic, process-wide id for one async call. A counter rather than a
+/// timestamp: two calls in the same millisecond must not share a stash slot.
+static WEB_AWAIT_CALL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The kickoff script: start the async work and return the call id
+/// SYNCHRONOUSLY, so the eval's completion value is a plain string and never a
+/// Promise.
+///
+/// A synchronous throw inside the user's script must land in the same store as
+/// a rejected promise, or the two failure modes would answer differently —
+/// hence the outer try/catch writing the identical shape.
+fn web_await_kickoff_script(rid: &str, script: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         if(!window.__yggAwait)window.__yggAwait={{}};\
+         var store={{done:false}};window.__yggAwait[rid]=store;\
+         try{{Promise.resolve((async function(){{{script}\n}})())\
+         .then(function(v){{store.done=true;store.ok=true;store.value=v;}})\
+         .catch(function(e){{store.done=true;store.ok=false;\
+         store.error=String(e&&e.message||e);}});}}\
+         catch(e){{store.done=true;store.ok=false;\
+         store.error=String(e&&e.message||e);}}\
+         return rid;}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// The poll script: read the stash, and DELETE the entry on read so a page
+/// cannot accumulate them.
+fn web_await_poll_script(rid: &str) -> String {
+    format!(
+        "(function(){{var rid={rid};\
+         var bag=window.__yggAwait;var s=bag&&bag[rid];\
+         if(!s)return{{missing:true}};\
+         if(!s.done)return{{missing:false,done:false}};\
+         try{{delete bag[rid];}}catch(e){{}}\
+         return{{missing:false,done:true,ok:!!s.ok,value:s.value,error:s.error||null}};}})()",
+        rid = serde_json::to_string(rid).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// What one await poll decided. PURE — the three answers are the whole point.
+#[derive(Debug, Clone, PartialEq)]
+enum AwaitStep {
+    /// The promise settled.
+    Settled { ok: bool, value: Value, error: Option<String> },
+    /// Not yet. A poll EVAL FAILURE lands here too: a navigation mid-await must
+    /// not abort the wait, same rule as `web wait`.
+    Pending,
+    /// The stash entry is gone, so the document that held it was replaced. This
+    /// is NEVER reported as a result — a fabricated answer here would be
+    /// indistinguishable from a real one, which is the worst possible outcome
+    /// for a verb whose whole job is returning a value.
+    DocumentReplaced,
+}
+
+fn web_await_poll_outcome(poll: &Result<Value, String>) -> AwaitStep {
+    let Ok(info) = poll else {
+        return AwaitStep::Pending;
+    };
+    if info.get("missing").and_then(Value::as_bool).unwrap_or(false) {
+        return AwaitStep::DocumentReplaced;
+    }
+    if !info.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        return AwaitStep::Pending;
+    }
+    AwaitStep::Settled {
+        ok: info.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        value: info.get("value").cloned().unwrap_or(Value::Null),
+        error: info
+            .get("error")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+/// App-control `await`: run an async script and return its resolved value.
+///
+/// THE ONE ASYNC BRIDGE. `eval` returns a completion value and a Promise is not
+/// one, so every caller that needed `fetch` or `await` invented the same
+/// stash-and-poll workaround. This owns it here, once, with the two ways it
+/// goes wrong answered honestly rather than papered over.
+async fn web_surface_await_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    script: &str,
+    timeout_ms: u64,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let rid = format!(
+        "ygg-{}",
+        WEB_AWAIT_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    if let Err(reason) = web_do_eval(desktop, native_id, &web_await_kickoff_script(&rid, script))
+        .await
+    {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "await_kickoff_failed",
+            "detail": reason,
+        });
+    }
+    let poll = web_await_poll_script(&rid);
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_millis(timeout_ms);
+    let mut poll_errors: u64 = 0;
+    loop {
+        let outcome = web_do_eval(desktop, native_id, &poll).await;
+        if outcome.is_err() {
+            poll_errors += 1;
+        }
+        match web_await_poll_outcome(&outcome) {
+            AwaitStep::Settled { ok, value, error } => {
+                return json!({
+                    "accepted": ok,
+                    "session_path": session,
+                    "native_id": native_id,
+                    "value": if ok { value } else { Value::Null },
+                    "reason": if ok { Value::Null } else { json!("await_rejected") },
+                    "error": error,
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "poll_errors": poll_errors,
+                });
+            }
+            AwaitStep::DocumentReplaced => {
+                return json!({
+                    "accepted": false,
+                    "session_path": session,
+                    "reason": "document_replaced",
+                    "detail": "the page navigated while the script was running, so its result is gone — this is NOT a result, and no value is invented for it",
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "poll_errors": poll_errors,
+                });
+            }
+            AwaitStep::Pending => {}
+        }
+        if start.elapsed() >= deadline {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": "await_timeout",
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "poll_errors": poll_errors,
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -55888,6 +56108,37 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceAwait {
+            session_path,
+            script,
+            timeout_ms,
+        } => {
+            let data = web_surface_await_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &script,
+                timeout_ms,
+            )
+            .await;
+            let accepted = data
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: (!accepted).then(|| {
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("await failed")
+                        .to_string()
+                }),
+                data: Some(data),
             }
         }
         AppControlCommand::WebSurfaceFrames { session_path } => {
