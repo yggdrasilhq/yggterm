@@ -1275,12 +1275,20 @@ fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreen
 /// keyed on seq alone would serve a screen clipped to the OLD width across a
 /// resize — precisely the frame-corruption class the clip was added to fix
 /// (docs/xterm-bugs.md#screen-model-wider-than-viewer), and it would read as a
-/// regression of that fix rather than of this cache. So the key carries the
-/// clip width and the model's own size, and both resize branches change one
-/// of them by construction — nothing has to remember to invalidate.
+/// regression of that fix rather than of this cache.
+///
+/// So the key also carries the clip width, the model's own size, and the
+/// resize counter. The counter closes the one hole the sizes leave: a resize
+/// AWAY and back to the same grid with no output in between returns every size
+/// to its old value while the model has been re-laid-out (columns dropped at
+/// the narrow step do not come back), so a size-only key would serve cells the
+/// model no longer holds. The counter does not cover the repair branch, which
+/// returns before incrementing it — that one is caught by `model_size`. Between
+/// them nothing has to remember to invalidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScreenSnapshotKey {
     output_seq: u64,
+    resize_seq: u64,
     pty_cols: u16,
     model_size: Option<(u16, u16)>,
 }
@@ -2063,6 +2071,7 @@ impl PtySessionRuntime {
     fn screen_snapshot_key(&self) -> ScreenSnapshotKey {
         ScreenSnapshotKey {
             output_seq: self.seq.load(Ordering::SeqCst),
+            resize_seq: self.resize_count.load(Ordering::SeqCst),
             pty_cols: self.current_cols.load(Ordering::SeqCst),
             model_size: self.screen_state.lock().ok().map(|state| state.size()),
         }
@@ -3823,6 +3832,7 @@ PY"#;
     fn screen_snapshot_memo_key_changes_on_output_and_on_either_resize_branch() {
         let base = ScreenSnapshotKey {
             output_seq: 7,
+            resize_seq: 2,
             pty_cols: 168,
             model_size: Some((63, 168)),
         };
@@ -3836,6 +3846,7 @@ PY"#;
         assert_ne!(base, after_output, "new PTY output must invalidate");
 
         let after_width_resize = ScreenSnapshotKey {
+            resize_seq: 3,
             pty_cols: 120,
             model_size: Some((63, 120)),
             ..base
@@ -3846,6 +3857,7 @@ PY"#;
         );
 
         let after_rows_only_resize = ScreenSnapshotKey {
+            resize_seq: 3,
             model_size: Some((40, 168)),
             ..base
         };
@@ -3864,6 +3876,16 @@ PY"#;
             base, repaired_model,
             "repairing a model that painted wider than its PTY must invalidate"
         );
+
+        // Resized away and back to the same grid with no output in between:
+        // every size is back to its old value, but the narrow step dropped
+        // columns the model will never get back, so the old snapshot holds
+        // cells that no longer exist.
+        let after_resize_round_trip = ScreenSnapshotKey {
+            resize_seq: 4,
+            ..base
+        };
+        assert_ne!(base, after_resize_round_trip);
     }
 
     #[test]
