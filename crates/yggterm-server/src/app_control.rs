@@ -379,6 +379,27 @@ pub enum WebSurfaceWaitUntil {
     },
     /// A JS expression evaluates truthy (exceptions count as not-yet).
     Js { expr: String },
+    /// The engine's CURRENT url matches `pattern` (a Rust regex, unanchored).
+    ///
+    /// Evaluated HOST-side from the UI process's own page-state property, with
+    /// no page eval at all — which is what makes it the one predicate that
+    /// survives a navigation. A 4-origin auto-submit chain (rtionline →
+    /// merchant.sbi.bank.in → billdesk.com/pgidsk → pay.billdesk.com →
+    /// auth.examplebank.test) tears the content process down and rebuilds it
+    /// at every hop, so any page-side predicate is unavailable exactly when the
+    /// caller most needs to know where it landed.
+    UrlMatches {
+        pattern: String,
+    },
+    /// Nothing has changed for `ms`: the engine url is unchanged since the
+    /// previous tick, the engine is not loading, AND the page's own mutation
+    /// clock reads at least `ms`.
+    ///
+    /// Two observers, one predicate. The host half keeps answering while the
+    /// page half is unavailable mid-navigation, and a url change resets the
+    /// clock — so "settled" cannot be satisfied by a page that is quietly
+    /// bouncing through redirects.
+    Settled { ms: u64 },
 }
 
 fn default_grid_cols() -> u32 {
