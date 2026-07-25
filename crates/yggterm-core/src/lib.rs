@@ -1583,7 +1583,12 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     // its own — so `daemon/background_copy_chore` reported a p50 of 0.0 ms
     // while this was the bulk of its cost. Nothing can be claimed about the
     // scanners until their cost has a row of its own.
-    let perf = PerfSpan::start(home, "background", "local_tree_scan");
+    //
+    // A `PerfGuard`, not a `PerfSpan`: the two `?` below are the scanners
+    // themselves, so an unreadable sessions root or a mid-walk IO error is
+    // exactly the run worth having a duration for — and an explicit
+    // `finish` at the bottom is the one that never runs on those.
+    let mut perf = PerfGuard::new(home, "background", "local_tree_scan");
     let title_resolver = SessionTitleResolver::new(home).ok();
 
     let mut sessions: Vec<LocalAgentSessionSummary> = Vec::new();
@@ -1648,7 +1653,7 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     }
     compress_codex_browser_tree(&mut root, false);
 
-    perf.finish(serde_json::json!({
+    perf.annotate(serde_json::json!({
         "codex_sessions": codex_sessions,
         "claude_code_sessions": claude_code_sessions,
         "cwd_buckets": bucket_count,
@@ -3314,9 +3319,13 @@ mod tests {
 
     /// The tree scan cannot be exercised in a unit test — it walks the real
     /// `~/.codex/sessions` and `~/.claude/projects` (47 GB and 494 MB on the
-    /// machine this was written on), so a test that called it would be neither
-    /// fast nor deterministic. The scan's cost being MEASURED at all is the
-    /// property under test, and the source is where that is decidable.
+    /// machine this was written on), and its two `?` branches are reached only
+    /// through the process-global codex-home env, so a test that called it
+    /// would be neither fast, deterministic, nor thread-safe. The scan's cost
+    /// being MEASURED at all is the property under test, and the source is
+    /// where that is decidable. That the RAII guard really does record on an
+    /// early return is measured separately, in
+    /// `perf::tests::a_perf_guard_records_the_early_return_a_finish_at_the_bottom_loses`.
     #[test]
     fn local_cwd_tree_build_carries_its_own_perf_span() {
         let source = include_str!("lib.rs");
@@ -3333,12 +3342,19 @@ mod tests {
             body.len()
         );
         assert!(
-            body.contains("PerfSpan::start(home, \"background\", \"local_tree_scan\")"),
+            body.contains("PerfGuard::new(home, \"background\", \"local_tree_scan\")"),
             "the tree scan needs a row of its own in `perf-summary --category background`"
         );
+        // The body's `?`s ARE the scanners, so a failed scan is the run most
+        // worth a duration — and an explicit `finish` at the bottom is exactly
+        // the one those `?`s skip. Drop-recorded or not measured at all.
         assert!(
-            body.contains("perf.finish("),
-            "a span that never finishes records nothing"
+            !body.contains("PerfSpan::start("),
+            "a span finished by hand records nothing on the `?` branches below it"
+        );
+        assert!(
+            body.contains("perf.annotate("),
+            "the guard still has to carry the scan counts"
         );
     }
 }
