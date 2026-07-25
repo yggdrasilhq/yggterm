@@ -42,8 +42,8 @@ fn main() {
         user_hz()
     );
     println!(
-        "{:<14} {:>6} {:>10} {:>8} {:>12}",
-        "role", "procs", "cpu_ms", "cores", "mem_mb"
+        "{:<14} {:>6} {:>10} {:>8} {:>12} {:>10}",
+        "role", "procs", "cpu_ms", "cores", "mem_mb", "gpu_ms"
     );
     let rolled = roll_up_roles(&samples);
     let mut total_cores = 0.0;
@@ -53,8 +53,14 @@ fn main() {
         let mem_mb = rollup.mem_kb as f64 / 1024.0;
         total_cores += cores;
         total_mem_mb += mem_mb;
+        // `-` is NOT zero: it means the fdinfo counters were unreadable. A zero here
+        // is the finding (the GPU is idle while the CPU burns); a dash is a blind spot.
+        let gpu_ms = rollup
+            .gpu_ms()
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<14} {:>6} {:>10.1} {cores:>8.3} {mem_mb:>12.1}",
+            "{:<14} {:>6} {:>10.1} {cores:>8.3} {mem_mb:>12.1} {gpu_ms:>10}",
             rollup.role.as_str(),
             rollup.procs,
             rollup.cpu_ms
@@ -72,8 +78,12 @@ fn main() {
     by_cpu.sort_by(|a, b| b.cpu_ms.partial_cmp(&a.cpu_ms).unwrap_or(std::cmp::Ordering::Equal));
     for sample in by_cpu.iter().take(10) {
         let mem_mb = sample.pss_kb.or(sample.rss_kb).unwrap_or(0) as f64 / 1024.0;
+        let gpu_ms = sample
+            .gpu_ms()
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "  pid={:<8} {:<16} {:<12} cpu_ms={:>9.1} cores={:>6.3} mem_mb={:>8.1}",
+            "  pid={:<8} {:<16} {:<12} cpu_ms={:>9.1} cores={:>6.3} mem_mb={:>8.1} gpu_ms={gpu_ms:>8}",
             sample.pid,
             sample.comm,
             sample.role.as_str(),
