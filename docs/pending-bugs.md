@@ -187,6 +187,16 @@ fix) once the fix is verified live on jojo.
   pid is the shim's while the record is the child's, so `--wait-visible` would
   wait forever and report `registered: false`. Supervising the agent path needs
   the poll to match the child first.
+  ⚠⚠ **DO NOT run `yggterm install integrate` on the live host to pick up the
+  new desktop entry.** `refresh_linux_integration` also OVERWRITES
+  `~/.local/bin/yggterm` (and `-headless`) with a launcher SCRIPT pointing at
+  `preferred_executable_for(context, ...)` — on jojo that is the direct-install
+  channel's recorded `active_version`, **2.9.48**, so a one-line desktop fix
+  would silently replace the deployed 2.12.12 binaries with a script pointing at
+  a months-old build. On a dev-deployed host, edit the `Exec=` line of
+  `~/.local/share/applications/dev.yggterm.Yggterm.desktop` directly (done on
+  jojo 2026-07-25) and leave the launcher alone. The generated entry is correct
+  for a real install; it is the launcher-rewrite half that fights a hand deploy.
   The measurement that produced the policy, kept because the numbers are the
   argument:
   **The measurement (jojo, `systemctl --user` + `coredumpctl`), because the raw
