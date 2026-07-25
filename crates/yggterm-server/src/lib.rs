@@ -16458,6 +16458,23 @@ fn ensure_live_app_control_pid(
     }
 }
 
+/// The GUI process tree a read like `server render-top` should measure when
+/// the caller did not name one.
+///
+/// Goes through `choose_app_control_pid`, the same private owner of "which GUI
+/// do I mean" that the `server app` verbs use, so a read and a verb can never
+/// disagree about the default target. `require_explicit_target` is false here:
+/// unlike a verb, a read with exactly one registered client should just answer.
+pub fn choose_registered_gui_pid(
+    home: &Path,
+    requested_pid: Option<u32>,
+    requested_client: Option<&str>,
+) -> anyhow::Result<Option<u32>> {
+    let endpoint = crate::daemon::default_endpoint(home);
+    let records = active_client_instance_records(home, &endpoint)?;
+    choose_app_control_pid(&records, requested_pid, requested_client, false)
+}
+
 pub fn active_client_instance_records(
     home: &Path,
     endpoint: &ServerEndpoint,
