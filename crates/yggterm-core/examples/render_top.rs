@@ -23,18 +23,18 @@ fn main() {
         .unwrap_or(2000);
 
     let mut probe = RenderProbe::new();
-    let start = std::time::Instant::now();
     let first = observe_process_tree(root_pid);
     if first.is_empty() {
         eprintln!("render_top: no such process tree: {root_pid}");
         std::process::exit(1);
     }
-    probe.observe(&first, start.elapsed().as_millis() as u64);
+    // The probe times itself off a monotonic clock; nobody hands it one.
+    probe.observe(&first);
 
     std::thread::sleep(std::time::Duration::from_millis(interval_ms));
 
     let second = observe_process_tree(root_pid);
-    let samples = probe.observe(&second, start.elapsed().as_millis() as u64);
+    let samples = probe.observe(&second);
 
     println!(
         "render_top: root={root_pid} processes={} interval={interval_ms}ms user_hz={}",
@@ -75,7 +75,11 @@ fn main() {
 
     println!("\ntop processes by cpu_ms:");
     let mut by_cpu = samples;
-    by_cpu.sort_by(|a, b| b.cpu_ms.partial_cmp(&a.cpu_ms).unwrap_or(std::cmp::Ordering::Equal));
+    by_cpu.sort_by(|a, b| {
+        b.cpu_ms
+            .partial_cmp(&a.cpu_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for sample in by_cpu.iter().take(10) {
         let mem_mb = sample.pss_kb.or(sample.rss_kb).unwrap_or(0) as f64 / 1024.0;
         let gpu_ms = sample

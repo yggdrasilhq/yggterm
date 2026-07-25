@@ -20839,7 +20839,12 @@ fn spawn_render_probe_loop(state: Signal<ShellState>) {
             else {
                 continue;
             };
-            let samples = probe.observe(&observations, current_millis());
+            // NOT current_millis(): that is a SystemTime wall clock, and feeding it
+            // here inflated interval_ms across a suspend/resume while the CPU tick
+            // counters stood still — under-reporting core_fraction on exactly the
+            // laptop whose fan is the complaint. The probe owns its own monotonic
+            // clock now, and no longer accepts one.
+            let samples = probe.observe(&observations);
             if samples.is_empty() {
                 // First tick after startup: there is no previous observation, so the
                 // only available number would be a lifetime average. Skip it.
