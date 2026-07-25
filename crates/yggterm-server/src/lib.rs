@@ -14,6 +14,12 @@ pub mod transcript_view;
 mod row_order_ledger;
 mod terminal;
 
+// The arm matrix is a TEST artifact (harness spec §8 phase 2): it locks every
+// agent CLI × locality against one table, so a change that touches one arm
+// cannot pass while quietly changing another.
+#[cfg(test)]
+mod agent_arm_matrix;
+
 pub use app_control::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlGridCommand,
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
