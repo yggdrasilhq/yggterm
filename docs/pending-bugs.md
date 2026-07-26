@@ -30,6 +30,43 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★ AGENT-SPAWNED TENANTS INSIDE DAEMON-OWNED ROWS ARE IMMORTAL — the leak
+  class behind recurring "mystery heat" (convicted 2026-07-27, user-spotted).**
+  Seven aged `ssh <fleet-host>` clients (oldest ~5 days) were found hanging
+  under `bash -i` shell rows on the integrator host, one of them holding a
+  13.6-hour remote `htop` at 0.16 cores on the GUI host — the user's fan paid
+  for a probe an agent abandoned days earlier. **Mechanism, and why it is
+  structural:** an agent uses a shell row for an interactive probe
+  (`ssh <host>` → a TUI), then abandons the row. Daemon-owned PTYs are
+  deliberately immortal — the row surviving IS the feature (the GTA-5 model)
+  — so everything RUNNING INSIDE the row becomes an immortal tenant that no
+  surface accounts for. The session-start ritual now sweeps this class, but a
+  sweep repeated every session is an unfixed bug by definition. Product fix,
+  three pieces, each respecting the settled row doctrine (rows themselves are
+  never touched):
+  1. **Per-row tenant cost visibility (instrumentation, no policy).** The
+     daemon already reaches each PTY's process tree
+     (`foreground_process_group_leader` / `tcgetpgrp`); expose an on-demand
+     app-control verb reporting, per row: the foreground command, process-tree
+     CPU time, and tenant age. A hot or aged tenant becomes one probe away
+     instead of an ad-hoc `ps` archaeology dig. On-demand only — no background
+     walk, no idle cost.
+  2. **Ownership stamping on headless creates.** The teardown-honesty work
+     already gives agent-created sessions identity-carrying titles; also stamp
+     the creator (pid + host + purpose) into session metadata so provenance is
+     queryable after the creator is long gone.
+  3. **Pre-declared ephemerality, opt-in at creation.** `terminal new
+     --ephemeral` (with an optional idle TTL) = the agent explicitly declares
+     AT CREATION "reap this session when my owner is gone / after N idle
+     seconds". The reap is graceful (tombstone + trace event), and it is
+     consistent with the requirement-3 ruling because the close is
+     agent-declared up front — an explicit close, scheduled early. The DEFAULT
+     is unchanged: leave the row up, visibility beats tidiness; unmarked and
+     user-created rows are untouchable (the no-reap ruling stands).
+  Non-product half already done: the ritual sweep gained the aged-ssh probe,
+  and the twin duty (an interactive probe is exited by the task that opened
+  it) is recorded in the fleet memory.
+
 - **★★★ NOTIFICATION AUDIO IS SILENT IN THE WEBVIEW — PROVEN BY A/B ON THE
   LIVE HOST, AND THE FIX IS TO LEAVE WEBKIT (2026-07-26, user-reported
   regression: "I used to hear the double chime when copying or when the agent
