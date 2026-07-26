@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **New: a session an assistant opens for itself now says so in its name.**
+  Until now a scratch session an assistant created was named after the folder
+  it opened in, which is exactly how your own terminal in that folder is named
+  — so a leftover row was impossible to tell apart from one of yours by its
+  name alone. Such a row is now called after the assistant that opened it and
+  what it was opened for. A session you open yourself is unchanged, and an
+  assistant that supplies its own name still gets that name.
+- **Fixed: closing a session from the command line now checks that it really
+  closed.** It used to answer "removed" as soon as the request went through,
+  which was true of the request and not of the session — a row could still be
+  in your sidebar, and a program the session had been running could still be
+  running, hours later. The answer now reports whether the row is actually gone
+  and whether everything the session was running has stopped, and when it has
+  not, it says which programs are still alive and why it could not confirm.
+  It reports them; it does not kill them for you.
 - **Fixed: a plain shell no longer disappears from the sidebar when yggterm
   updates itself.** An agent session survives a version change because the agent
   keeps its own transcript, so yggterm can re-open it. A plain shell has no such

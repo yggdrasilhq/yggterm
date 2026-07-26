@@ -154,6 +154,58 @@ mod tests {
         ));
     }
 
+    /// The reported defect, stated as a property of the two title producers.
+    ///
+    /// A human's shell in a directory called `workspace` is labelled
+    /// "Workspace Shell" — that string is generated HERE, from the cwd leaf,
+    /// and it is what an agent's scratch row also wore, which is why every
+    /// title-based search for the agent's row missed it. An agent-plane title
+    /// must therefore differ from it AND survive this module's low-signal
+    /// demotion, or `resolved_session_title` falls straight back to the
+    /// humanized cwd leaf and the row is anonymous again.
+    #[test]
+    fn an_agent_plane_title_is_not_the_label_a_humans_shell_in_the_same_cwd_wears() {
+        let cwd = "/home/operator/workspace";
+        let human = humanized_terminal_title(SessionKind::Shell, cwd, Some("host"))
+            .expect("a human's shell in this cwd has a label");
+        assert_eq!(
+            human, "Workspace Shell",
+            "this is the ambiguous label the incident was about"
+        );
+
+        // Both forms, because the purpose is optional and the form WITHOUT one
+        // is exactly the case that used to collide with the human label.
+        for purpose in [None, Some("reap leftover app processes")] {
+            let agent = yggterm_server::agent_plane_session_title(
+                Some("probe-7"),
+                purpose,
+                SessionKind::Shell,
+            );
+            assert_ne!(
+                agent, human,
+                "an agent's row must not wear the label a human's shell in the same \
+                 directory wears (purpose {purpose:?})"
+            );
+            assert!(
+                !agent.starts_with(&human),
+                "{agent:?} is the human label with a suffix, so the row still reads \
+                 as a shell in that directory"
+            );
+            assert!(
+                !title_is_low_signal_for_copy(&agent, cwd),
+                "the copy layer would demote {agent:?} and rename the row after its cwd"
+            );
+            assert!(
+                !title_looks_like_abbreviated_shell_label(&agent),
+                "{agent:?} reads as a short UI label, which the row treats as junk"
+            );
+            assert!(
+                !title_needs_generation_from_visible_titles(Some(&agent), cwd, &human),
+                "an agent-named row must not be queued for title regeneration"
+            );
+        }
+    }
+
     #[test]
     fn humanized_terminal_title_uses_cwd_before_host_label() {
         assert_eq!(

@@ -1307,9 +1307,14 @@ fn print_server_app_help() {
   yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
+    answers verified:true only when the row left the live order AND every
+    process the session owned is gone; otherwise verified:false with a named
+    refusal and the surviving pids in live_processes
   yggterm server app session rename <session-path> <title> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
+    with no --title the row is named for the driving agent and its purpose
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)
@@ -3098,6 +3103,13 @@ fn main() -> Result<()> {
                                 None
                             }
                         });
+                        let purpose = args.windows(2).find_map(|window| {
+                            if window[0] == "--purpose" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
                         let kind = args.windows(2).find_map(|window| {
                             if window[0] == "--kind" {
                                 Some(window[1].as_str())
@@ -3110,6 +3122,7 @@ fn main() -> Result<()> {
                             machine_key,
                             cwd,
                             title_hint,
+                            purpose,
                             kind,
                             activate,
                             timeout_ms,

@@ -377,6 +377,36 @@ presence dialog.
   automation run touches the user's viewport zero times. Dream §2 (OSC
   surface-create must not defer while the WINDOW is backgrounded) is the
   remaining sibling; on the farm plane this is just `/open`.
+- **An agent-plane row NAMES ITS DRIVER.** `terminal new` with no `--title`
+  used to fall back to the daemon's default, which for a shell is the cwd —
+  and the copy layer humanizes that into `<Leaf> Shell`, the identical label a
+  human's shell in the same directory wears. An agent's scratch row was
+  therefore invisible to every title search while being perfectly visible to
+  the user's eye. Creation through this plane now synthesizes
+  `Agent <identity> <kind>[: <purpose>]` from the request's own `agent` field
+  (`--agent`/`$YGGTERM_AGENT`, absent = `unnamed`) plus the new
+  `--purpose <what-for>` flag. An explicit `--title` still wins, and human
+  creation is structurally untouched — every human door goes through
+  `start_local_session_placed` and never reaches app-control. The synthesizer
+  asks `looks_like_generated_fallback_title` about its own output and drops the
+  purpose rather than ship a title the copy layer would discard: a title that
+  gets demoted falls back to the humanized cwd leaf, which is the bug.
+- **`session remove` VERIFIES; it does not assert.** The old handler answered
+  `accepted: true` on any successful round trip — true even when the daemon's
+  own message said there was no live session for the path, and true while the
+  app the session hosted was still running (the PTY teardown signals only the
+  direct child, never its descendants). The verb now answers `verified` from
+  evidence: the row must be absent from the snapshot the daemon just returned,
+  every process in a pre-removal census of the PTY child's tree must be gone
+  from `/proc`, and there must have been a runtime pid to check against at all.
+  Anything short of that is `verified: false` with a named refusal —
+  `row_still_listed`, `processes_survived`, `runtime_pid_unobservable` — plus
+  `live_processes` (pid + command) and `reaped_processes`. The daemon's prose
+  is never parsed. `runtime_pid_unobservable` is the cross-version case: a row
+  whose runtime belongs to an older, preserved owner reports no local pid, and
+  that is unverifiable rather than clean. **Reporting only — the verb does not
+  kill survivors.** Escalating from "name the survivors" to "kill them" changes
+  what a removal does to a human's shell and is a separate, deliberate call.
 
 ## Action & lifecycle correctness (slice 2b — normative, F3)
 
