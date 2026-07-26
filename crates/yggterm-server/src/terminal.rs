@@ -5191,6 +5191,82 @@ line-two on the real screen\r\n\
             .expect("shutdown sized restart session");
     }
 
+    /// End-to-end proof, on a real PTY, that `remove_session` returning `true`
+    /// is not evidence that the session's processes are gone — and that the
+    /// census-plus-liveness pair the removal verb reports with catches it.
+    ///
+    /// `PtySessionRuntime::shutdown` signals only the DIRECT PTY child, so a
+    /// process that child forked and that ignores the hangup outlives the
+    /// teardown. That is the reported incident in miniature: the terminal
+    /// "closed", the app under it kept running, and the caller was told the
+    /// work session had been removed.
+    ///
+    /// If the teardown ever grows a process-tree kill, this lock goes red —
+    /// deliberately. That would be a change in what `session remove` DOES to a
+    /// user's shell, and it must be decided, not absorbed.
+    #[test]
+    fn a_process_the_pty_child_forked_outlives_remove_session_and_the_census_says_so() {
+        use yggterm_core::render_probe::{observe_process_tree_stats, process_still_running};
+
+        let mut manager = TerminalManager::new();
+        let key = "local://teardown-census";
+        // `trap "" HUP` sets SIGHUP to SIG_IGN, and an ignored disposition
+        // survives both fork and exec — so the forked child keeps running when
+        // the PTY master closes, exactly like a backgrounded app does.
+        manager
+            .ensure_session(key, "sh -c 'trap \"\" HUP; sleep 30 & wait'", None)
+            .expect("spawn a runtime that forks");
+        let pty_pid = manager
+            .session_process_id(key)
+            .expect("a running runtime reports its PTY child") as i32;
+
+        // Wait for the forked worker by NAME. Waiting for "more than one
+        // process" catches whatever transient the shell startup happens to be
+        // running and then asserts against something already exiting.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut census = Vec::new();
+        let mut forked = None;
+        while Instant::now() < deadline {
+            census = observe_process_tree_stats(pty_pid);
+            forked = census
+                .iter()
+                .find(|stat| stat.pid != pty_pid && stat.comm == "sleep")
+                .cloned();
+            if forked.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let forked =
+            forked.expect("the PTY child must fork the worker for this lock to mean anything");
+
+        assert!(
+            manager.remove_session(key, None).expect("remove session"),
+            "the runtime was present, so the removal reports true — which is the \
+             claim under examination, not the evidence"
+        );
+
+        let survivors = census
+            .iter()
+            .filter(|stat| process_still_running(stat.pid, &stat.comm))
+            .collect::<Vec<_>>();
+        assert!(
+            survivors.iter().any(|stat| stat.pid == forked.pid),
+            "the forked process should have outlived the teardown: census {census:?}"
+        );
+        assert!(
+            !survivors.iter().any(|stat| stat.pid == pty_pid),
+            "the PTY child itself must be gone: census {census:?}"
+        );
+
+        // SAFETY: `forked` is a process this test spawned and just proved is
+        // still running; a failed kill (already reaped) is ignored.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(forked.pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
     #[test]
     fn terminal_manager_session_keys_exclude_exited_runtime() {
         let mut manager = TerminalManager::new();
