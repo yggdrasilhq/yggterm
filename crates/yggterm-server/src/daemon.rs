@@ -3872,7 +3872,7 @@ impl DaemonRuntime {
                         &owned,
                         tombstones,
                         now,
-                        PeerRowAdmission::OwnedOrAgentStore,
+        PeerRowAdmission::OwnedOrAgentStore,
                     )
                 });
             if !adopted.is_empty() {
@@ -14128,6 +14128,7 @@ mod tests {
                 &owned(&[]),
                 &none,
                 1_000,
+super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "an ownerless loopback shell is a husk and must not be adopted"
         );
@@ -14140,6 +14141,7 @@ mod tests {
                 &owned(&["local://3803a7ed"]),
                 &none,
                 1_000,
+super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "a shell whose PTY the peer still owns must be rescued"
         );
@@ -14157,6 +14159,7 @@ mod tests {
                     &owned(&[]),
                     &none,
                     1_000,
+                    super::PeerRowAdmission::OwnedOrAgentStore,
                 ),
                 "{kind:?}: an ownerless agent row is B4's reason to exist"
             );
@@ -14170,6 +14173,7 @@ mod tests {
                 &owned(&["codex-runtime://dcb70bd5"]),
                 &none,
                 1_000,
+super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "owned-runtime matching must fold equivalent local runtime keys"
         );
@@ -14207,6 +14211,7 @@ mod tests {
                     &owned(&owner),
                     &tombstones,
                     1_000,
+                    super::PeerRowAdmission::OwnedOrAgentStore,
                 ),
                 "{key} ({kind:?}) was closed by the user; no peer may hand it back"
             );
@@ -14219,6 +14224,7 @@ mod tests {
             &owned(&[]),
             &tombstones,
             1_000 + crate::live_row_tombstones::TOMBSTONE_TTL_SECS,
+            super::PeerRowAdmission::OwnedOrAgentStore,
         ));
     }
 
