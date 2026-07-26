@@ -338,6 +338,31 @@ LIVE_HOST=$(cat .agents/config/live-host)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | python3 -m json.tool 2>/dev/null || true
 ```
 
+### Drag gestures — TWO independent ones, and they read differently
+
+The cwd tree and the contributed app rail (yedit's file list, ychrome's tabs)
+run separate gesture machines, so a stuck drag shows up in a different field
+depending on which surface it started on:
+
+- **cwd tree** — `drag_paths` (empty ⇒ no drag), `drag_hover_target`,
+  `drag_pointer`.
+- **contributed rail** — `app_pane_row_drag` (2026-07-26; before that the rail
+  gesture was invisible here) and `app_pane_row_drop_target`:
+
+```json
+"app_pane_row_drag": { "pane": "notes", "row": "7f3a…",
+                       "armed": false, "dragging": true }
+```
+
+`armed: true` = the button is down but the pointer has not travelled the 6px
+threshold, so this is still a CLICK: it paints no dim and accepts no drop
+target. `dragging: true` = the live gesture, and it is exactly the flag that
+draws the row's dim. **A non-null `app_pane_row_drag` with no mouse button held
+is a bug** — the gesture must not outlive the button. That was the "rail rows
+look lighter for no reason, and then reorder themselves" report: nothing ended
+a drag released outside a row, so the row stayed dimmed and the next pointer
+move re-armed a drop target.
+
 ## Session recovery — reconnect stranded sessions, fix row order (v2.9.63+)
 
 These are **daemon-direct** commands (`server …`, not `server app …`): they need no
