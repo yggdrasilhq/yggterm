@@ -102,15 +102,33 @@ so the decision is readable after the fact.
 ## The egress rule
 
 **A surface's network egress is the invoking host's network — for ALL URLs.**
-Each tab of a remote session's surface gets its own `ssh -N -D <port>` SOCKS
-tunnel to the session's machine, and the tab's webview (private `WebContext`)
-proxies every request through it via `ProxyConfig::Socks5`. The *remote sshd*
+A remote session's surface gets ONE `ssh -N -D <port>` SOCKS tunnel to the
+session's machine, shared by every tab of that session, and the tabs' webviews
+proxy every request through it via `ProxyConfig::Socks5`. The *remote sshd*
 resolves every hostname and originates every connection on that machine —
-loopback URLs reach the REMOTE loopback. The tunnel dies with the tab. If the
-SOCKS tunnel cannot be established, loopback URLs fall back to the older
-`ssh -N -L` per-URL forward, and anything else falls back to direct load from
-the GUI host — a traced egress gap (`egress_gap` in the `open`/`tab_navigate`
-trace events), not a silent one. Local sessions load directly, no proxy.
+loopback URLs reach the REMOTE loopback. If the SOCKS tunnel cannot be
+established, loopback URLs fall back to the older `ssh -N -L` per-URL forward,
+and anything else falls back to direct load from the GUI host — a traced egress
+gap (`egress_gap` in the `open`/`tab_navigate` trace events), not a silent one.
+Local sessions load directly, no proxy.
+
+**The tunnel is the SESSION's, and it dies with its LAST tab** (2026-07-26). It
+used to be per-TAB: `web_surface_new_tab` mints `socks_port: None` and reuse was
+keyed on the tab, so every new tab of a remote session spawned another
+`ssh -N -D` — another child here, another handshake, another sshd on the remote,
+another listening loopback port, and the remote's `MaxStartups` reached well
+before any tab count a user would call "a lot". A tab with no tunnel now adopts
+the session's (`adopt_web_surface_session_socks`, donor chosen by lowest tab id
+so the answer does not follow a user-reorderable strip), and the `Arc` on the
+child is the refcount: `kill_forward` tears the tunnel down only when its handle
+is the last one (`web_surface_forward_is_last_holder`). A tab that already has
+the tunnel keeps it untouched, which is the older and still-necessary property —
+re-spawning would churn the port and force a webview destroy+recreate, dropping a
+just-set login cookie before it flushed.
+
+Sharing the tunnel is also what lets tabs of a remote session share one
+`WebContext`: the SOCKS port is part of `web_context_key`, so a per-tab tunnel
+forced a per-tab context.
 
 ## Browser chrome: tabs + address bar
 
