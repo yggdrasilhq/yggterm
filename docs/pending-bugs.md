@@ -21,6 +21,41 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ `web do` FIDELITY ON RE-RENDERING DOMs — three reproducible defects,
+  one family (a services portal filing run, 2026-07-26 ~15:30-16:00 IST, guihost 2.12.15,
+  session `local://b556fb1b`, all self-reported SUCCESS while wrong):**
+  1. **`do fill` DROPS and INVENTS characters on React controlled inputs.**
+     `fill --selector '#street' --text "Example Fixture Road"` → response
+     `chars:19, delivered:true, is_trusted:true, cleared_verified:[true]`, field
+     held **"Ja"**. Earlier `#username` fill reported chars:10, field ended
+     **"0000000000hg"** — two stray chars never passed in any `--text`, which
+     then poisoned the portal API call (404). ⚠ The strays coincided with the
+     live focus-theft window (entry below) — possible seat/agent input
+     cross-contamination; the focus investigation owns that half.
+  2. **Clear-verification false-negative:** batch fill on an EMPTY `#Landmark`
+     aborted `clear_failed (box(es) [0] of 1 still hold text)` — the field was
+     empty; likely verifying the previously-focused element, not the target.
+  3. **`--role option --label X` resolves a STALE RECT in a scrolled MUI
+     listbox:** `--label PASSPORT` → `accepted:true, delivered:true,
+     is_trusted:true`, nothing happened. Working recipe: tag the `li` by id via
+     eval + `scrollIntoView({block:'center'})` + `do click --selector`.
+  **Common shape: the verb resolves/verifies against DOM state that has moved
+  (framework re-render, scroll, focus change) and its self-report cannot go
+  red.** Fix direction: verify-by-readback of the TARGET's final value against
+  the requested text (honest failure when mismatched), clear-verify the
+  resolved target element only, re-resolve rects after scroll before injecting.
+  Falsified the other way (keep): MUI async Autocompletes ARE drivable via
+  `do click` + `--role option`; headless file upload via DataTransfer works
+  (379 KB PDF through one `web eval --stdin`, no GTK chooser).
+
+- **★★ THERE IS NO CLIENT TO RENDER AGENT SURFACES INTO ON dev (2026-07-26).**
+  The data-fabric default "co-browse on a SHADOW surface on dev" is currently
+  unusable: `server app clients` on dev → count 0 (no GUI, no shadow client),
+  so the filing agent had to fall back to the user's live GUI host. Fresh
+  evidence for settled call #6 (drive shadow surfaces with the GUI closed /
+  server-side rendering, docs/optimization-pass.md WS2): today agent browsing
+  physically requires the user's GUI host.
+
 - **★★★ USER-SETTLED CALLS + FEATURE REQUESTS (2026-07-26, verbatim intent).**
   These answer questions an agent asked; do NOT re-litigate them.
   1. **PLAIN SHELLS ARE FIRST-CLASS AND MUST SURVIVE A DAEMON BUMP.** Settled by
