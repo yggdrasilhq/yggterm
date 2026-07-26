@@ -814,7 +814,29 @@ reach the same recovery directly.
 Refusals name which fact failed: `no_declare`, `declare_stale` (the app EXITED —
 relaunch it, do not retry), `declare_url_scheme_refused`,
 `declare_without_url`, `daemon_declare_unavailable` (a failed FETCH is not an
-absent declare).
+absent declare), and `session_closed`.
+
+⛔ **`session_closed` is not retryable.** `ensure` refuses when the session's
+runtime is gone AND the user's close of its row is remembered. Reviving a
+surface there produces the one state that must not exist — a live, leased page
+with no row anywhere reflecting it — which happened: an agent drove a real page
+for an hour on the user's profile with zero rows showing that session. Create
+your OWN session (`server app terminal new`) and drive its surface; a closed row
+is never resurrected, and the refusal carries both facts
+(`runtime_running`, `row_close_remembered`) so you can see which one applied.
+The check is CONJUNCTIVE, so the two legitimate revivals still work: a live but
+backgrounded session whose surface the reaper collected, and a session that
+never mounted a terminal host. An unreachable owner reports neither — a failed
+declare fetch is not a dead runtime, and refusing on it would take `ensure` away
+from every session owned by a predecessor daemon.
+
+**Closing a session ends its surfaces.** A live-session close now tears down
+every web surface declared under that session (any equivalent spelling of the
+path), which ends the surface's lease and drops its headless-create claim. An
+agent whose surface disappears can tell why: the trace carries
+`web_surface/closed_with_session`. Only an EXPLICIT close does this — surfaces
+are never pruned against a daemon snapshot, because a row owned by a preserved
+predecessor daemon drops out of that snapshot while its session is fine.
 
 ⛔ **The declare's URL scheme gate is not negotiable.** It guards two
 PTY-authored paths, and any process that can write a session's PTY can emit that

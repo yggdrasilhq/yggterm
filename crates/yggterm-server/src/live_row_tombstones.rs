@@ -417,6 +417,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The read-only door the GUI asks "did the user close this row?" through,
+    /// so `web ensure` cannot revive a surface under a closed session.
+    ///
+    /// Two things it must get right, both of which fail silently:
+    ///   - it FOLDS the key. A local runtime row is addressed by several
+    ///     equivalent spellings over its life, and asking about the raw key
+    ///     walks straight past the row's own tombstone. Drop
+    ///     `normalized_live_row_identity` from
+    ///     `live_row_close_is_remembered` and the `codex://` read goes false.
+    ///   - it WRITES NOTHING. `removed-rows.json` is shared by every daemon on
+    ///     the machine, so a reader that published its own copy would erase
+    ///     peers' closes — the exact bug one layer down.
+    #[test]
+    fn the_read_only_close_query_folds_the_key_and_leaves_the_file_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-tombstone-read-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // The close, written the way the daemon writes it.
+        let mut tombstones = LiveRowTombstones::default();
+        tombstones
+            .record_close(
+                &dir,
+                &crate::normalized_live_row_identity("local://5f2a"),
+                now_secs(),
+            )
+            .expect("record the close");
+        let path = LiveRowTombstones::tombstone_path(&dir);
+        let before = std::fs::read(&path).expect("the close was published");
+
+        // Every spelling of that one row answers the same way.
+        for spelling in [
+            "local://5f2a",
+            "codex://5f2a",
+            "codex-runtime://5f2a",
+            "codex-litellm://5f2a",
+        ] {
+            assert!(
+                crate::live_row_close_is_remembered(&dir, spelling),
+                "{spelling} slipped past its own tombstone"
+            );
+        }
+        assert!(!crate::live_row_close_is_remembered(
+            &dir,
+            "local://never-closed"
+        ));
+
+        // …and asking changed nothing on disk.
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            before,
+            "the read-only query rewrote the shared deny-list"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_deny_list_is_capped_oldest_first() {
         let mut tombstones = LiveRowTombstones::default();

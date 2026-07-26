@@ -18,7 +18,7 @@
 )))]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::rc::Rc;
 
@@ -486,9 +486,9 @@ thread_local! {
     /// Per-webview count of real seat inputs observed but not yet consumed.
     static SEAT_INPUT_COUNTS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
     /// Injected events handed to GTK for a surface but not yet seen by the
-    /// observer. The backstop for the lexical flag above — see
-    /// [`spend_injection_credit`].
-    static INJECTED_CREDITS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+    /// observer, as the MILLISECOND each credit was granted (oldest first). The
+    /// backstop for the lexical flag above — see [`spend_injection_credit_at`].
+    static INJECTED_CREDITS: RefCell<HashMap<u64, VecDeque<u64>>> = RefCell::new(HashMap::new());
     /// Who owned the toplevel's KEYBOARD focus before an agent injection
     /// borrowed it. See [`note_focus_owner_before_injection`].
     static BORROWED_FOCUS: RefCell<Option<BorrowedFocus>> = const { RefCell::new(None) };
@@ -611,34 +611,78 @@ fn schedule_focus_giveback() {
 /// `do` defect: verb 1 lands, verbs 2..N are all refused `preempted`.
 ///
 /// Credits make the suppression count-based rather than dispatch-order-based, so
-/// it holds either way. They are NOT time-based: nothing here expires on a
-/// clock, and any credit still unspent when the verb completes is dropped by
-/// [`take_seat_input_count`] so it can never swallow a later human gesture.
+/// it holds either way.
+///
+/// # Why a credit EXPIRES ([`INJECTION_CREDIT_TTL_MS`])
+///
+/// The credit was originally held until the next [`take_seat_input_count`], and
+/// the shell only reads that counter at the START of the next verb — never at
+/// the end of the verb that granted the credits. So a fill that granted a dozen
+/// credits (select-all, delete, ten characters), every one of them already
+/// suppressed by the lexical flag because delivery is synchronous, left a dozen
+/// unspent credits sitting in the INTER-VERB GAP. The user's next real
+/// keystrokes were then spent against them: their characters landed in the page
+/// with no preempt and no journal, and the arbiter — the whole mechanism that
+/// exists to let the human take a surface back — saw nothing at all.
+///
+/// A credit exists to cover ONE injected event that GTK may deliver to the
+/// observer after `WidgetExt::event` returns. That is a queue hop, not a wait:
+/// anything still unspent [`INJECTION_CREDIT_TTL_MS`] after its grant cannot
+/// belong to that dispatch any more, so it is dropped before it can be spent
+/// against a human gesture. The TTL is a SECOND, tighter bound — the
+/// end-of-verb drop in [`take_seat_input_count`] stays exactly as it was.
+///
+/// Determinism: the clock is a parameter (`now_ms`), never read inside the
+/// bookkeeping, so tests drive expiry exactly rather than sleeping. The `pub`
+/// wrappers are the only things that read a clock.
 ///
 /// `pub` because the seat-input accounting is only HALF of the human-preempt
 /// gate: the other half is the shell's `web_do_gate` / batch loop, which
 /// consumes the count this produces. A lock that drives the shell half with a
 /// literal count is not a lock at all (it synthesizes the defect away), so the
-/// shell's tests drive the REAL accounting through these three entry points.
-/// They are pure thread-local bookkeeping — no GTK, no webview.
+/// shell's tests drive the REAL accounting through these entry points. They are
+/// pure thread-local bookkeeping — no GTK, no webview.
 pub fn grant_injection_credits(surface_id: u64, count: u64) {
+    grant_injection_credits_at(surface_id, count, monotonic_millis());
+}
+
+/// [`grant_injection_credits`] with the grant instant supplied — the entry point
+/// a test drives so credit expiry is exercised without sleeping.
+pub fn grant_injection_credits_at(surface_id: u64, count: u64, now_ms: u64) {
     INJECTED_CREDITS.with(|credits| {
-        *credits.borrow_mut().entry(surface_id).or_insert(0) += count;
+        let mut credits = credits.borrow_mut();
+        let granted = credits.entry(surface_id).or_default();
+        for _ in 0..count {
+            granted.push_back(now_ms);
+        }
     });
 }
 
+/// How long an unspent injection credit can still be OURS.
+///
+/// An injected event is handed to GTK synchronously; the credit covers only the
+/// case where the observer sees it after the delivery call returned. A quarter
+/// of a second is orders of magnitude more than that queue hop and far less than
+/// the gap between two agent verbs, which is the window the user types in.
+pub const INJECTION_CREDIT_TTL_MS: u64 = 250;
+
 /// Spend one credit for `surface_id`, returning true when the observed event is
-/// one of ours rather than the seat's.
-fn spend_injection_credit(surface_id: u64) -> bool {
+/// one of ours rather than the seat's. Credits older than
+/// [`INJECTION_CREDIT_TTL_MS`] are dropped first and can never be spent.
+fn spend_injection_credit_at(surface_id: u64, now_ms: u64) -> bool {
     INJECTED_CREDITS.with(|credits| {
         let mut credits = credits.borrow_mut();
-        match credits.get_mut(&surface_id) {
-            Some(remaining) if *remaining > 0 => {
-                *remaining -= 1;
-                true
-            }
-            _ => false,
+        let Some(granted) = credits.get_mut(&surface_id) else {
+            return false;
+        };
+        // Grants are pushed in time order, so the expired ones are a prefix.
+        while granted
+            .front()
+            .is_some_and(|granted_at| now_ms.saturating_sub(*granted_at) >= INJECTION_CREDIT_TTL_MS)
+        {
+            granted.pop_front();
         }
+        granted.pop_front().is_some()
     })
 }
 
@@ -655,15 +699,32 @@ fn deliver_injected_event(webview: &webkit2gtk::WebView, event: &gdk::Event) {
 ///
 /// `pub` for the same reason as [`grant_injection_credits`] — see its note.
 pub fn note_seat_input(surface_id: u64) {
+    note_seat_input_at(surface_id, monotonic_millis());
+}
+
+/// [`note_seat_input`] with the observation instant supplied — the entry point a
+/// test drives so credit expiry is exercised without sleeping.
+pub fn note_seat_input_at(surface_id: u64, now_ms: u64) {
     if INJECTING_EVENT.with(|flag| flag.get()) {
         return; // our own injection, not the human
     }
-    if spend_injection_credit(surface_id) {
+    if spend_injection_credit_at(surface_id, now_ms) {
         return; // our own injection, observed after the lexical scope closed
     }
     SEAT_INPUT_COUNTS.with(|counts| {
         *counts.borrow_mut().entry(surface_id).or_insert(0) += 1;
     });
+}
+
+/// Milliseconds since this process first asked. Monotonic (`Instant`), so a
+/// wall-clock step never makes a credit look fresh — and read ONLY by the two
+/// `pub` wrappers above, never by the bookkeeping they call.
+fn monotonic_millis() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Consume the count of real seat inputs seen on this surface since the last
@@ -2924,6 +2985,90 @@ mod seat_input_tests {
         // the user the surface.
         note_seat_input(id);
         assert_eq!(take_seat_input_count(id), 1);
+    }
+
+    /// THE INTER-VERB GAP LOCK. The end-of-verb drop in
+    /// [`take_seat_input_count`] only runs when the shell reads the counter,
+    /// which it does at the START of the next verb — so between two verbs a
+    /// burst's unspent credits used to sit there and eat the user's keystrokes.
+    ///
+    /// Same surface, no `take_seat_input_count` in between (that is the gap):
+    /// a dozen credits granted and suppressed by the lexical flag, then the
+    /// human types [`INJECTION_CREDIT_TTL_MS`] later. Every one of those
+    /// keystrokes must be counted. Drop the expiry from
+    /// `spend_injection_credit_at` and this reads 0 — the stray-characters
+    /// incident, reproduced.
+    #[test]
+    fn credits_do_not_outlive_their_burst_into_the_gap_the_user_types_in() {
+        let id = 4248;
+        take_seat_input_count(id); // clear
+
+        // A `fill` burst: select-all + delete + ten characters, all delivered
+        // synchronously, so the lexical flag suppresses every observation and
+        // not one of the twelve credits is spent.
+        let burst_at = 10_000;
+        for _ in 0..12 {
+            grant_injection_credits_at(id, 1, burst_at);
+            INJECTING_EVENT.with(|f| f.set(true));
+            note_seat_input_at(id, burst_at);
+            INJECTING_EVENT.with(|f| f.set(false));
+        }
+
+        // The verb ends. The shell will not read the counter until the NEXT
+        // verb, and the user types now.
+        let types_at = burst_at + INJECTION_CREDIT_TTL_MS;
+        for offset in 0..12 {
+            note_seat_input_at(id, types_at + offset);
+        }
+
+        assert_eq!(
+            take_seat_input_count(id),
+            12,
+            "the user's keystrokes in the inter-verb gap were booked as agent injections"
+        );
+    }
+
+    /// ...and the expiry must not cost the agent the thing credits exist for:
+    /// an injection observed a queue hop after its delivery is still ours.
+    #[test]
+    fn a_credit_still_covers_its_own_late_delivery_inside_the_ttl() {
+        let id = 4249;
+        take_seat_input_count(id);
+
+        let granted_at = 20_000;
+        grant_injection_credits_at(id, 1, granted_at);
+        note_seat_input_at(id, granted_at + INJECTION_CREDIT_TTL_MS - 1);
+        assert_eq!(
+            take_seat_input_count(id),
+            0,
+            "a late-delivered injection inside the TTL must still read as ours"
+        );
+    }
+
+    /// Expiry walks the OLDEST grants first, so a stale credit can never shield
+    /// a fresh injection's own late delivery — the queue is time-ordered and the
+    /// drop is a prefix, not a scan.
+    #[test]
+    fn an_expired_credit_is_dropped_rather_than_spent_by_a_later_injection() {
+        let id = 4250;
+        take_seat_input_count(id);
+
+        grant_injection_credits_at(id, 1, 30_000); // verb 1, never spent
+        grant_injection_credits_at(id, 1, 30_000 + INJECTION_CREDIT_TTL_MS); // verb 2
+
+        // Verb 2's own late delivery spends verb 2's credit; verb 1's expired
+        // one is discarded on the way past. No `take_seat_input_count` in
+        // between — that call drops the whole ledger, which would make this
+        // pass whatever the spend order is.
+        note_seat_input_at(id, 30_000 + INJECTION_CREDIT_TTL_MS);
+        // The human, one millisecond later: nothing is left to swallow them.
+        note_seat_input_at(id, 30_000 + INJECTION_CREDIT_TTL_MS + 1);
+        assert_eq!(
+            take_seat_input_count(id),
+            1,
+            "verb 1's stale credit was spent instead of dropped, so the human's \
+             gesture went to the agent's ledger"
+        );
     }
 
     #[test]

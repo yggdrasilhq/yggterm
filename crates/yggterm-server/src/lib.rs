@@ -482,6 +482,31 @@ pub(crate) fn normalized_live_row_identity(key: &str) -> String {
     }
 }
 
+/// **Did the user CLOSE this row?** — the tombstone plane, asked from outside
+/// the daemon, READ ONLY.
+///
+/// The GUI needs the answer for one thing: a session whose row the user closed
+/// and whose runtime is gone must not have a web surface revived under it, or an
+/// agent ends up driving a real page that no row anywhere reflects. That is a
+/// question about a remembered close, and the only honest place to ask it is the
+/// deny-list the close wrote.
+///
+/// Read-only on purpose, and the ONLY door out of that module: `record` /
+/// `clear` / `gc` / `save` are the in-memory primitives of a read-modify-write
+/// over a file EVERY daemon on this machine shares, so a caller outside
+/// `live_row_tombstones` that reaches for them is publishing a private snapshot
+/// and un-remembering other daemons' closes. [`LiveRowTombstones::load`] expires
+/// in memory and writes nothing.
+///
+/// The identity fold is [`normalized_live_row_identity`], applied here so no
+/// caller re-spells it — a row must not slip past its own tombstone by being
+/// asked about under an equivalent runtime key.
+pub fn live_row_close_is_remembered(home_dir: &std::path::Path, session_path: &str) -> bool {
+    let now = crate::live_row_tombstones::now_secs();
+    crate::live_row_tombstones::LiveRowTombstones::load(home_dir, now)
+        .blocks(&normalized_live_row_identity(session_path), now)
+}
+
 /// Does [`YggtermServer::restore_live_session`] re-key this row onto a local
 /// runtime key (`local://<id>`)? One owner of the question — restore asks it of
 /// both the key and the id, and [`restored_live_row_key`] must agree with it or

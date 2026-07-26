@@ -1162,6 +1162,15 @@ pub enum AppControlCommand {
     /// into the soft stash (demoted, never revealed, no page hole) and leased
     /// for `ttl_secs`, so an agent can drive them without the user's view
     /// ever changing.
+    ///
+    /// REFUSES `session_closed` when the session's runtime is gone AND the
+    /// user's close of its row is remembered. Reviving there produces the one
+    /// state that must not be representable — a live, leased page with no row
+    /// the user can see or click into — and it happened. The remedy is the
+    /// agent's OWN session; a closed row is never resurrected. Conjunctive on
+    /// purpose, so the legitimate revivals (a live backgrounded session whose
+    /// surface the reaper took; a session that never mounted a terminal host)
+    /// still pass, and an unreachable owner counts as unknown, not dead.
     EnsureWebSurface {
         session_path: String,
         #[serde(default)]
@@ -1180,7 +1189,9 @@ pub enum AppControlCommand {
     /// Also records the deliberate-close mark, which blocks a HEARTBEAT
     /// resurrection for a grace window but NOT an explicit `web ensure` — a
     /// heartbeat is liveness, an ensure is intent, and the rebuild path
-    /// deliberately never consults that map.
+    /// deliberately never consults that map. (Closing the SESSION is different
+    /// and stronger: it destroys the surfaces outright and `ensure` then refuses
+    /// `session_closed`.)
     WebSurfaceClose {
         session_path: String,
     },

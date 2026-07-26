@@ -44,6 +44,26 @@ This file tracks user-visible changes in `yggterm`.
   reporting the full list back, which read exactly like success. It now reorders
   every row, reports `applied` and `skipped` lists, refuses to invent a row that
   does not exist, and exits non-zero when anything was skipped.
+- **Fixed: a web page an agent is driving can no longer exist without a row you
+  can see.** Closing a session left its web page alive, and an agent could then
+  attach to that leftover and browse with your profile for an hour with nothing
+  in Live Sessions to show for it — you could not see it, click into it, or take
+  it back. Closing a session now ends its pages, and asking for a page under a
+  session you closed is refused outright, with the reason and the remedy
+  (the agent makes its own session, which gives you a row).
+- **Fixed: yggterm stopped blaming you for touching a page you were never
+  shown.** An agent's work was being cancelled with "the user took this surface"
+  on pages that had never appeared on screen, and once it happened that page was
+  unusable until it was rebuilt. Real input on an invisible page still stops the
+  agent — that can genuinely happen and is worth stopping for — but it is
+  reported as what it is, and nothing is held against you or against the agent's
+  run.
+- **Fixed: characters you typed while an agent was working sometimes went into
+  the page and were counted as the agent's.** After the agent typed into a form,
+  the next few keys you pressed were treated as part of its own typing, so they
+  landed in the field with no warning and without handing control back to you.
+  The agent's typing is now only ever credited for a quarter of a second, so
+  anything you type after that is unmistakably yours and takes the page back.
 
 ## 2.12.14
 
