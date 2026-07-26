@@ -25,6 +25,20 @@
 //! reproduce, so the day phase 3 fixes one, this test goes red until its row is
 //! deleted. A ledger that can only pass is worth nothing.
 //!
+//! **What each cell is asserted against: the DECISION, never a restatement.**
+//! Every axis below calls the function the PRODUCT calls at the moment it
+//! decides — `terminal_mount_takes_remote_resume_readiness` (the mount's
+//! readiness fork), `terminal_reveal_seed_allows_authoritative_screen` (the
+//! retained-rehydrate seed), `codex_like_session` (the family predicate the seed
+//! gate reads). That is deliberate and was a review finding: an earlier cut
+//! asserted the `codex_like` cell against a test-local
+//! `matches!(kind, Codex | CodexLiteLlm)`, which is a tautology — it reads no
+//! production code, so widening the product's own `codex_like_session`, or
+//! handing the seed policy a CC-inclusive bool at the call site, left this whole
+//! file GREEN while the ledger rows below went stale. A lock that can only pass
+//! is worth nothing; a lock that restates the code it is guarding is the same
+//! thing wearing an assertion.
+//!
 //! **Scope honesty.** The axes here are the ones reachable as pure functions.
 //! `resolve_active_open_mount_epoch` (the anti-churn epoch machinery, §7.10) is
 //! a `&mut ShellState` method whose inputs are five live maps plus a clock; it
@@ -43,13 +57,12 @@ use yggterm_server::{
 };
 
 use crate::shell::{
-    is_remote_resume_agent_session, is_remote_scanned_sidebar_row, remote_session_starts_new_codex,
+    codex_like_session, is_remote_scanned_sidebar_row, remote_session_starts_new_codex,
     session_path_names_remote_runtime_by_scheme, terminal_host_id_belongs_to_session,
-    terminal_mount_host_id,
+    terminal_mount_host_id, terminal_mount_takes_remote_resume_readiness,
+    terminal_reveal_seed_allows_authoritative_screen,
 };
-use crate::terminal_retained_replay_policy::{
-    RetainedRehydrateMode, retained_rehydrate_allow_screen_fallback,
-};
+use crate::terminal_retained_replay_policy::RetainedRehydrateMode;
 
 /// Where a session's PTY lives relative to the machine holding the row.
 /// Mirrors the server matrix's enum deliberately: the two tables must be read
@@ -94,8 +107,10 @@ struct ShellArm {
     /// AUTHORITATIVE screen snapshot? Gated on `codex_like`, so CC is excluded
     /// — the `remote-cc-replay-codex-only` / snapshot-poison axis.
     replay_screen_fallback_on_initial_read: bool,
-    /// The `codex_like_session` mount local (shell.rs) that feeds the gate
-    /// above. Recorded so the two cannot drift apart silently.
+    /// What shell.rs `codex_like_session(kind)` — the family predicate the gate
+    /// above reads — answers for this arm. Asserted against that FUNCTION, not
+    /// against a `matches!` retyped here, so widening the product's own answer
+    /// cannot leave this table green.
     codex_like: bool,
 }
 
@@ -201,6 +216,11 @@ const SHELL_ARMS: &[ShellArm] = &[
 /// outlive the hole.
 struct RecordedShellArmHole {
     /// What forks, in the vocabulary of the spec's §7 inventory.
+    ///
+    /// FORMAT, and it is load-bearing: `<axis name>: <what is wrong>`. The
+    /// prefix before the first `:` must be the [`ShellArm`] field this hole is
+    /// about — `readiness_axes_…` READS it to check that the deviating cells and
+    /// the ledger are the same set.
     concern: &'static str,
     /// The spec section that inventories it.
     spec: &'static str,
@@ -395,8 +415,10 @@ fn every_registered_cli_has_both_shell_arms() {
 fn every_arm_gets_the_remote_resume_readiness_its_matrix_declares() {
     for arm in SHELL_ARMS {
         let session = arm.session_view(None);
+        // The MOUNT's decision, not the predicate under it: a fix applied at the
+        // TerminalCanvas call site must fail here too.
         assert_eq!(
-            is_remote_resume_agent_session(&session),
+            terminal_mount_takes_remote_resume_readiness(&session),
             arm.remote_resume_readiness,
             "{}: remote-resume readiness drifted from the matrix. This gate drives ~8 downstream \
              signals (attach_ready, stalled_remote_resume, overlay dismissal, read-poll cadence) \
@@ -450,21 +472,27 @@ fn every_arm_cold_launch_is_discriminated_as_its_matrix_says() {
 #[test]
 fn every_arm_seeds_its_attach_the_way_its_matrix_says() {
     for arm in SHELL_ARMS {
+        // Asked by SessionKind, exactly as the retained-rehydrate task asks it.
+        // Passing `arm.codex_like` to the policy function instead would lock the
+        // policy while leaving the seed DECISION free to change under it.
         assert_eq!(
-            retained_rehydrate_allow_screen_fallback(
+            terminal_reveal_seed_allows_authoritative_screen(
                 RetainedRehydrateMode::InitialRead,
-                arm.codex_like,
+                arm.kind,
             ),
             arm.replay_screen_fallback_on_initial_read,
             "{}: the InitialRead seed policy drifted from the matrix — this is the \
              snapshot-poison / remote-cc-replay-codex-only axis (spec §7.6)",
             arm.name(),
         );
+        // The family predicate the gate above reads, asserted against the
+        // PRODUCT's own function. Restating its `matches!` here would be a
+        // tautology: widening `codex_like_session` would leave this green.
         assert_eq!(
+            codex_like_session(arm.kind),
             arm.codex_like,
-            matches!(arm.kind, SessionKind::Codex | SessionKind::CodexLiteLlm),
-            "{}: the matrix's codex_like cell must equal the mount local it mirrors \
-             (shell.rs `codex_like_session`), or the two drift apart silently",
+            "{}: the matrix's codex_like cell must equal shell.rs `codex_like_session`, or the \
+             two drift apart silently",
             arm.name(),
         );
     }
@@ -478,9 +506,9 @@ fn collapsed_scrollback_recovery_offers_the_screen_to_every_arm() {
     // what makes the CC hole above a DEGRADED path rather than a dead one.
     for arm in SHELL_ARMS {
         assert!(
-            retained_rehydrate_allow_screen_fallback(
+            terminal_reveal_seed_allows_authoritative_screen(
                 RetainedRehydrateMode::CollapsedScrollbackRecovery,
-                arm.codex_like,
+                arm.kind,
             ),
             "{}: a collapsed-scrollback RECOVERY reveal must be offered the daemon screen on \
              every arm — this is the only path by which a CC session recovers a clipped \
@@ -538,9 +566,20 @@ fn every_arm_mount_identity_is_distinct_and_belongs_to_its_own_session() {
 fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() {
     // THE invariant, stated once. Every §7.3 axis is a property of where the
     // PTY lives. Any arm whose cell disagrees with its locality is a hole, and
-    // the count of such holes must equal the ledger — so a NEW hole fails here
-    // for being unrecorded, and a FIXED one fails for being stale.
+    // that set must match the ledger — so a NEW hole fails here for being
+    // unrecorded, and a FIXED one fails for being stale.
+    //
+    // ⚠ SCOPE, stated plainly because it was over-claimed once: this test makes
+    // ZERO production calls. It reads the TABLE and the LEDGER, so it cannot be
+    // turned red by mutating production, and it is NOT what makes holes 1-4
+    // both-directions locks. That property comes from the per-axis tests above
+    // (table cell vs the product's own decision function) plus
+    // `recorded_holes_still_reproduce_and_none_is_unrecorded` (the hole vs its
+    // locality twin). What THIS test adds is table/ledger integrity: it is the
+    // only place that says a deviating cell without a ledger row — or a ledger
+    // row without a deviating cell — is a bug.
     let mut deviations = Vec::new();
+    let mut deviating_axes: Vec<&str> = Vec::new();
     for arm in SHELL_ARMS {
         let remote = arm.locality == Locality::Remote;
         for (axis, actual) in [
@@ -551,6 +590,9 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
         ] {
             if actual != remote {
                 deviations.push(format!("{} {axis}", arm.name()));
+                if !deviating_axes.contains(&axis) {
+                    deviating_axes.push(axis);
+                }
             }
         }
     }
@@ -567,6 +609,31 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
          a RECORDED_SHELL_ARM_HOLES row; a new one here is an unrecorded regression, and a \
          missing one means the hole was FIXED — delete its ledger row in the same commit \
          (spec §7.3, phase 3)",
+    );
+
+    // …and the ledger is READ, not just referred to in prose. Each recorded
+    // hole names its axis as the prefix of `concern`, so the §7.3 rows must be
+    // exactly the axes that deviated above.
+    let mut recorded_axes: Vec<&str> = RECORDED_SHELL_ARM_HOLES
+        .iter()
+        .filter(|hole| hole.spec.contains("§7.3"))
+        .map(|hole| {
+            hole.concern
+                .split(':')
+                .next()
+                .expect("a concern always has a prefix")
+                .trim()
+        })
+        .collect();
+    recorded_axes.sort_unstable();
+    let mut deviating_axes = deviating_axes;
+    deviating_axes.sort_unstable();
+    assert_eq!(
+        deviating_axes, recorded_axes,
+        "the §7.3 axes that deviate from locality and the §7.3 rows of \
+         RECORDED_SHELL_ARM_HOLES have to be the SAME SET. A deviating axis with no ledger row is \
+         an unrecorded hole (no symptom, no owner); a ledger row for an axis that no longer \
+         deviates is a row that outlived its hole (spec §7.3, phase 3)",
     );
 }
 
@@ -588,8 +655,8 @@ fn recorded_holes_still_reproduce_and_none_is_unrecorded() {
     // axes. Asserting the TWIN's answer in the same breath is what makes this a
     // hole rather than a global "nothing is ready yet".
     assert!(
-        is_remote_resume_agent_session(&codex_remote.session_view(None))
-            && !is_remote_resume_agent_session(&cc_remote.session_view(None)),
+        terminal_mount_takes_remote_resume_readiness(&codex_remote.session_view(None))
+            && !terminal_mount_takes_remote_resume_readiness(&cc_remote.session_view(None)),
         "hole 1 (§7.3 readiness) no longer reproduces — delete its RECORDED_SHELL_ARM_HOLES row \
          and flip the matrix cell in the same commit",
     );
@@ -614,10 +681,17 @@ fn recorded_holes_still_reproduce_and_none_is_unrecorded() {
     );
 
     // Hole 5: the seed gate excludes CC on BOTH localities, so it is asserted
-    // against the mode axis rather than against a locality twin.
+    // against the CLI axis (CC vs its codex twin) rather than a locality twin.
+    // Asked through the seed DECISION, so widening `codex_like_session` and
+    // widening the decision itself both land here.
     assert!(
-        !retained_rehydrate_allow_screen_fallback(RetainedRehydrateMode::InitialRead, false)
-            && retained_rehydrate_allow_screen_fallback(RetainedRehydrateMode::InitialRead, true),
+        !terminal_reveal_seed_allows_authoritative_screen(
+            RetainedRehydrateMode::InitialRead,
+            SessionKind::ClaudeCode,
+        ) && terminal_reveal_seed_allows_authoritative_screen(
+            RetainedRehydrateMode::InitialRead,
+            SessionKind::Codex,
+        ),
         "hole 5 (§7.6 codex-only screen fallback) no longer reproduces — delete its ledger row",
     );
 
