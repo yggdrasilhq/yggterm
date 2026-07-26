@@ -30,6 +30,17 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ `web fill-card` ADVErecordsSES WHAT THE CREDENTIAL PLANE FORBIDS (found
+  live 2026-07-26 at a real payment gateway's card form).** The verb's help
+  offers `--field number|expiry|code|holder`, but every agent call is refused
+  `vault_cli_no_card_op` — the vault deliberately serves PAN/CVV only through
+  the human-driven sidebar injector. The agent burned a staged application and
+  an OTP discovering this at the last step. Fix either way, but honestly:
+  (a) make the verb refuse AT PARSE TIME with the policy reason and a pointer
+  to the sidebar path, or (b) build the audited agent injection path as a
+  deliberate user decision (see ychrome docs/vault.md "card-first" TODO).
+  Until then the help text is a lie.
+
 - **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
   pixel proof, 2026-07-26 ~17:55 IST).** `terminal new --no-activate` keeps the
   VIEWPORT on the user's session (activation contract holds; metadata rail and
