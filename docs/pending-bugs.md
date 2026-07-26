@@ -30,6 +30,28 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ AN AGENT'S TEARDOWN CAN REPORT SUCCESS AND LEAVE BOTH THE ROW AND THE
+  APP PROCESS ALIVE (user-reported 2026-07-26 ~23:50, third variant of the
+  same class tonight).** A background agent's final report said "work session
+  removed"; the user still saw the row hours later. Ground truth: the row was
+  live, and the app process it hosted was still running under its `bash -i`,
+  parented by the daemon. Two things made it invisible to search:
+  1. **`terminal new --kind shell` names every session "Workspace Shell"**, so
+     an agent's scratch row is indistinguishable by title from a human's shell
+     — and the campaign record separately flags "Workspace Shell" as a name a
+     HUMAN debugging session has used, which makes blind cleanup dangerous.
+     ⇒ Give agent-created sessions a title carrying the agent identity and
+     purpose (the chip already carries the app profile — the TITLE should too).
+  2. The row's only records marker was the small profile chip, so every
+     title-based probe missed it while the user's eyes found it instantly.
+  **Also wanted:** a teardown verb that is verified, not asserted — `session
+  remove` should confirm the runtime is gone (and report the app processes it
+  reaped) so an agent cannot truthfully-but-wrongly claim a clean exit. Pairs
+  with the leased-surface-with-no-row entry: the two failure modes are
+  opposites (invisible surface vs invisible-to-search row), and both are
+  fixed by making agent-owned artifacts NAME themselves.
+
+
 - **★★★ AN UNREVEALED AGENT SURFACE REPORTS `visibilityState: "visible"`, SO
   ITS PAGE ANIMATES AT FULL RATE AND THE GUI COMPOSITES IT — measured
   2026-07-26 night, and this is very likely THE mechanism behind every
