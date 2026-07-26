@@ -1,11 +1,11 @@
 use crate::app_declare::{AppDeclareLog, AppDeclareRecord, AppDeclareScanner};
-use crate::pty_adoption::PtyChildHandle;
 use crate::codex_cli::{
     TerminalIdentityColorProfile, normalize_terminal_identity_color,
     terminal_identity_appearance_from_environment,
     terminal_identity_color_profile_from_environment, terminal_identity_env_pairs,
     terminal_identity_env_removals,
 };
+use crate::pty_adoption::PtyChildHandle;
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
@@ -1950,7 +1950,14 @@ impl PtySessionRuntime {
 
     fn is_running(&self) -> bool {
         let mut child = self.child.lock().expect("pty child lock poisoned");
-        child.is_running()
+        // A probe error reads as "not running" HERE and only here, which is
+        // exactly what the pre-split `match child.try_wait() { … Err(_) => false }`
+        // did: this accessor answers a yes/no display question for callers that
+        // have no channel for an error. The TEARDOWN paths below deliberately do
+        // NOT use it — they take the `Result` and either propagate it or trace
+        // it, because there a swallowed probe error becomes a false "it exited"
+        // and a shutdown that reports success over a live process.
+        child.is_running().unwrap_or(false)
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -2518,8 +2525,11 @@ impl PtySessionRuntime {
             }
             for _ in 0..20 {
                 // "Has it finished" — NOT "what was its status". An adopted
-                // child can answer the first and never the second.
-                if !child.is_running() {
+                // child can answer the first and never the second. The `?` is
+                // the pre-split behaviour, kept: a probe that FAILED is not a
+                // process that exited, and reporting it as one here would end
+                // the shutdown early over something still running.
+                if !child.is_running().context("checking terminal exit state")? {
                     return Ok(true);
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -2541,7 +2551,7 @@ impl PtySessionRuntime {
             // prompt is closed by signal — see `signal_child_to_exit`.
             let _ = self.write(command);
             for _ in 0..2 {
-                if !child.is_running() {
+                if !child.is_running().context("checking terminal exit state")? {
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -2584,14 +2594,14 @@ impl PtySessionRuntime {
                 {
                     let mut child = self.child.lock().expect("pty child lock poisoned");
                     match child.is_running() {
-                        false => {
+                        Ok(false) => {
                             trace_terminal_event(
                                 "graceful_shutdown_completed",
                                 serde_json::json!({ "path": key }),
                             );
                             return;
                         }
-                        true if started.elapsed() >= force_after => {
+                        Ok(true) if started.elapsed() >= force_after => {
                             let _ = child.kill();
                             child.wait_for_exit();
                             trace_terminal_event(
@@ -2604,14 +2614,22 @@ impl PtySessionRuntime {
                             return;
                         }
                         // Still running, not yet past the force deadline.
-                        //
-                        // The old `Err(error) => graceful_shutdown_probe_failed`
-                        // arm is GONE because it can no longer occur: it existed
-                        // for `try_wait`'s io::Error, and `is_running()` answers
-                        // a boolean by construction — an owned child from
-                        // `try_wait`, an adopted one from /proc + start time.
-                        // A liveness probe that cannot fail has no failure trace.
-                        true => {}
+                        Ok(true) => {}
+                        // A probe that FAILED is not a process that exited. An
+                        // owned child is probed with `waitpid`, which really can
+                        // fail, so folding the error into `false` would trace
+                        // `graceful_shutdown_completed` over a process nobody
+                        // has any evidence about — the teardown-lies bug class.
+                        Err(error) => {
+                            trace_terminal_event(
+                                "graceful_shutdown_probe_failed",
+                                serde_json::json!({
+                                    "path": key,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                            return;
+                        }
                     }
                 }
                 thread::sleep(Duration::from_secs(5));
