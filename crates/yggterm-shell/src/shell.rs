@@ -6485,27 +6485,32 @@ async fn web_surface_native_reconcile_loop(
         }
     }
 }
-fn web_surface_url_is_loopback(url: &str) -> bool {
-    let host = url
+/// A page URL's bare host: no scheme, no userinfo, no port, no brackets.
+///
+/// ONE owner. The origin guard below and the card fill's audit host are the same
+/// question asked twice, and a URL parser that disagreed with itself between
+/// them would be a security bug in one direction and a mislabelled audit line in
+/// the other.
+fn web_surface_url_host(url: &str) -> &str {
+    let authority = url
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)
         .split(['/', '?', '#'])
         .next()
-        .unwrap_or("")
+        .unwrap_or("");
+    // `user:pass@host` — the LAST `@` wins, since userinfo may contain one.
+    let host = authority
         .rsplit_once('@')
         .map(|(_, host)| host)
-        .unwrap_or_else(|| {
-            url.split_once("://")
-                .map(|(_, rest)| rest)
-                .unwrap_or(url)
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("")
-        });
+        .unwrap_or(authority);
     let host = host.strip_prefix('[').unwrap_or(host);
     let bare = host.split(']').next().unwrap_or(host);
-    let bare = bare.split(':').next().unwrap_or(bare);
+    bare.split(':').next().unwrap_or(bare)
+}
+
+fn web_surface_url_is_loopback(url: &str) -> bool {
+    let bare = web_surface_url_host(url);
     bare.eq_ignore_ascii_case("localhost") || bare.starts_with("127.") || bare == "::1"
 }
 /// True when an ssh target's host is loopback — i.e. the daemon's stand-in for
@@ -52595,26 +52600,22 @@ mod web_do_verb_tests {
     #[test]
     fn vault_field_args_map_each_named_field_to_one_cli_call() {
         assert_eq!(
-            vault_field_args(VaultFieldSource::Login, "sbi", "password", None).unwrap(),
+            vault_field_args("sbi", "password", None).unwrap(),
             vec!["get", "sbi", "--field", "password"]
         );
         assert_eq!(
-            vault_field_args(VaultFieldSource::Login, "sbi", "PassWord", Some("avi")).unwrap(),
+            vault_field_args("sbi", "PassWord", Some("avi")).unwrap(),
             vec!["get", "sbi", "--field", "password", "avi"],
             "field names are normalised, and --user is a positional disambiguator"
         );
         assert_eq!(
-            vault_field_args(VaultFieldSource::Login, "sbi", "totp", None).unwrap(),
+            vault_field_args("sbi", "totp", None).unwrap(),
             vec!["totp", "sbi"],
             "totp is a subcommand, not a field of get"
         );
-        assert_eq!(
-            vault_field_args(VaultFieldSource::Card, "hdfc", "number", None).unwrap(),
-            vec!["card", "hdfc", "--field", "number"]
-        );
         // An empty --user must not become a positional argument.
         assert_eq!(
-            vault_field_args(VaultFieldSource::Login, "sbi", "password", Some("")).unwrap(),
+            vault_field_args("sbi", "password", Some("")).unwrap(),
             vec!["get", "sbi", "--field", "password"]
         );
     }
@@ -52624,31 +52625,222 @@ mod web_do_verb_tests {
     // opaque vault CLI error blamed on the page.
     #[test]
     fn an_unknown_vault_field_is_refused_with_the_allowed_set() {
-        let err = vault_field_args(VaultFieldSource::Login, "sbi", "cvv", None).unwrap_err();
+        let err = vault_fetch_plan(VaultFieldSource::Login, "sbi", "cvv", None).unwrap_err();
         assert!(err.contains("cvv"), "{err}");
         assert!(err.contains("password"), "{err}");
+        let err = vault_fetch_plan(VaultFieldSource::Card, "hdfc", "cvv", None).unwrap_err();
+        assert!(err.contains("cvv"), "{err}");
+        assert!(err.contains("code"), "the card set is named too: {err}");
         // Card fields are not login fields and vice versa.
-        assert!(vault_field_args(VaultFieldSource::Card, "hdfc", "password", None).is_err());
-        assert!(vault_field_args(VaultFieldSource::Login, "sbi", "number", None).is_err());
+        assert!(vault_fetch_plan(VaultFieldSource::Card, "hdfc", "password", None).is_err());
+        assert!(vault_fetch_plan(VaultFieldSource::Login, "sbi", "number", None).is_err());
     }
 
-    // `fill-card` is blocked on ychrome-vault growing a `card` op. The
-    // classifier must recognise "that subcommand does not exist" and NOTHING
-    // else: mislabelling a locked vault as `vault_cli_no_card_op` would send an
-    // agent off debugging a CLI that is working fine.
+    // ★ THE FIX for `vault_cli_no_card_op`. A card field must resolve to the
+    // SOCKET, never to a CLI call, because `ychrome-vault` deliberately has no
+    // verb that prints a PAN and never will — that was the whole bug: yggterm
+    // asked the CLI for a card op the CLI is designed not to have, and an agent
+    // discovered it at a real gateway's card form after burning an OTP.
+    //
+    // This is the decision the async fill path makes on the way to the vault, so
+    // reverting that call site's `source` argument changes what this observes.
     #[test]
-    fn a_missing_card_op_is_distinguished_from_a_real_vault_failure() {
-        assert!(vault_failure_is_missing_subcommand(
-            "ychrome-vault card: error: unrecognized subcommand 'card'"
-        ));
-        assert!(vault_failure_is_missing_subcommand(
-            "error: unexpected argument 'card' found"
-        ));
-        assert!(!vault_failure_is_missing_subcommand(
-            "vault locked: run `ychrome-vault unlock` in a terminal first"
-        ));
-        assert!(!vault_failure_is_missing_subcommand(
-            "ychrome-vault card: no item named hdfc"
+    fn a_card_field_resolves_to_the_socket_and_a_login_field_to_the_cli() {
+        assert_eq!(
+            vault_fetch_plan(VaultFieldSource::Card, "hdfc", "number", None).unwrap(),
+            VaultFetch::Card(CardField::Number),
+            "a PAN must never be routed through a CLI that prints to stdout"
+        );
+        assert_eq!(
+            vault_fetch_plan(VaultFieldSource::Login, "sbi", "password", None).unwrap(),
+            VaultFetch::Cli(vec![
+                "get".into(),
+                "sbi".into(),
+                "--field".into(),
+                "password".into()
+            ]),
+            "the login path is unchanged — netbanking still reads from the CLI"
+        );
+    }
+
+    // Every card field the help text advertises resolves, including the two
+    // spellings the old (never-working) verb offered, and each maps to the reply
+    // key the vault actually sends. A form is four boxes and one round trip
+    // fills all of them; a field that silently resolved to the wrong key would
+    // type a CVV into a PAN box.
+    #[test]
+    fn each_advertised_card_field_maps_to_the_key_the_vault_sends() {
+        // An obviously fake card: 4111… is the reserved Visa test prefix and
+        // …4242 the Stripe test tail. No real PAN appears anywhere in this repo.
+        let reply = json!({
+            "name": "HDFC Regalia",
+            "number": "4111111111114242",
+            "code": "737",
+            "cardholder": "A KUNDU",
+            "exp_month": "11",
+            "exp_year": "2029",
+        });
+        let filled = |field: &str| {
+            card_field_value(&reply, card_field(field).unwrap_or_else(|e| panic!("{e}"))).unwrap()
+        };
+        assert_eq!(filled("number"), "4111111111114242");
+        assert_eq!(filled("code"), "737");
+        assert_eq!(filled("holder"), "A KUNDU");
+        assert_eq!(filled("exp-month"), "11");
+        assert_eq!(filled("exp-year"), "2029");
+        // The one composite, for the single `MM / YY` box most gateways draw.
+        assert_eq!(filled("expiry"), "11/29");
+        // Spelling is normalised the way the login fields' is.
+        assert_eq!(card_field("EXP_MONTH").unwrap(), CardField::ExpMonth);
+
+        // A field the item does not store is an ERROR naming the field. An empty
+        // string typed into a gateway box is a failed payment blamed on the page
+        // rather than on the vault — the same absent-vs-empty rule the login
+        // path learned the hard way.
+        let holderless = json!({"number": "4111111111114242", "exp_month": "", "exp_year": ""});
+        let err = card_field_value(&holderless, CardField::Holder).unwrap_err();
+        assert!(err.contains("Holder"), "{err}");
+        assert!(
+            card_field_value(&holderless, CardField::Expiry).is_err(),
+            "a half-composed expiry must never be typed"
+        );
+        // ...and the error carries no value.
+        assert!(!err.contains("4111111111114242"), "{err}");
+    }
+
+    // `MM/YY` from whatever the item stored. Vaults hold the year both ways and
+    // a four-digit year in a two-digit box is a rejected form.
+    #[test]
+    fn the_composite_expiry_is_two_digit_year_and_zero_padded_month() {
+        assert_eq!(card_expiry_mm_yy("11", "2029").unwrap(), "11/29");
+        assert_eq!(card_expiry_mm_yy("1", "29").unwrap(), "01/29");
+        assert_eq!(card_expiry_mm_yy(" 7 ", " 2031 ").unwrap(), "07/31");
+        assert_eq!(card_expiry_mm_yy("", "2029"), None);
+        assert_eq!(card_expiry_mm_yy("11", ""), None);
+    }
+
+    // The card path's ONE policy refusal is the lock, and the reason NAMES the
+    // remedy — an agent mid-checkout cannot afford to go and diagnose. Narrow on
+    // purpose, exactly as the missing-subcommand classifier it replaces was:
+    // rewriting "is not a card" as "vault locked" would send an agent to unlock
+    // a vault that is already open.
+    #[test]
+    fn only_a_locked_vault_is_rewritten_and_it_names_the_unlock_verb() {
+        for locked in [
+            "vault locked: run `ychrome-vault unlock` first",
+            "no vault agent on /home/x/.yggterm/vault/agent.sock: run `ychrome-vault unlock` \
+             on this host first (No such file or directory)",
+            "vault locked: run `ychrome-vault unlock` in a terminal first",
+        ] {
+            let reason = vault_agent_refusal_reason(locked);
+            assert!(reason.starts_with("vault_locked:"), "{reason}");
+            assert!(reason.contains("ychrome-vault unlock"), "{reason}");
+        }
+        // Everything else survives verbatim.
+        for verbatim in [
+            "HDFC Regalia is not a card",
+            "no vault entry named \"hdfc\"",
+            "\"IDFC\" matches 2 accounts — name one: avi, personal",
+        ] {
+            assert_eq!(vault_agent_refusal_reason(verbatim), verbatim);
+        }
+    }
+
+    // §7.1 RESIDUAL SEAM. `web_surface_fill_vault_for` is an async fn holding a
+    // live `DesktopContext`, so nothing can call it — and the defect class here
+    // is precisely a CALL SITE one: `fill-card` answered `vault_cli_no_card_op`
+    // because a card was routed at a CLI that is designed never to serve one.
+    // The decision function above is testable; that the call site USES it, with
+    // the caller's own `source`, is not. So it is scanned.
+    //
+    // Scanned over PRODUCT lines only (`yggterm_core::agent_cli::product_lines`,
+    // the workspace's ONE test-module skip rule) so this module's own text —
+    // which quotes every needle below — cannot satisfy the scan. The coverage
+    // assertions are there because this workspace has already shipped a source
+    // scan that went blind and passed green.
+    #[test]
+    fn the_card_fill_call_site_reads_the_socket_and_never_the_cli() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("async fn web_surface_fill_vault_for(")),
+            "the scan cannot see the fill path's own definition, so it is not \
+             reading the source it claims to police",
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_do_verb_tests")),
+            "the scan is reading this test module, so every needle below would \
+             be satisfied by the assertions that name them",
+        );
+
+        // The door is chosen from the CALLER's source, not hard-coded.
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("vault_fetch_plan(source, item, field, user)")),
+            "the fill path no longer decides its door from the caller's item kind",
+        );
+        // ...and the card door is the socket reader.
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("VaultFetch::Card(field) => vault_card_field(")),
+            "a card field is being routed somewhere other than the vault agent \
+             socket — that is the bug that burned an OTP at a gateway",
+        );
+        // The old refusal is GONE, not merely unreachable. A dead branch that
+        // still exists is a branch something can be wired back to.
+        //
+        // The needle is the QUOTED string literal, so the prose above the fill
+        // path — which names the old refusal in backticks so a future reader can
+        // still grep the history — does not satisfy it. Emitting that reason
+        // again means writing it as a Rust string, and that is what this
+        // forbids.
+        let refusal_literal = format!("{q}vault_cli_no_card_op{q}", q = '"');
+        assert!(
+            !product.iter().any(|line| line.contains(&refusal_literal)),
+            "the CLI card refusal is back in the product source as a literal",
+        );
+    }
+
+    // The page host that rides along on a card fill, for the vault's audit line.
+    // ONE parser answers this and the https/loopback origin guard, because a URL
+    // they disagreed about would be a security bug in one direction and a
+    // mislabelled audit line in the other.
+    #[test]
+    fn the_page_host_is_read_by_the_same_parser_the_origin_guard_uses() {
+        assert_eq!(
+            web_surface_url_host("https://areionsbi.wibmo.com/cardcapture/?x=1"),
+            "areionsbi.wibmo.com"
+        );
+        assert_eq!(
+            web_surface_url_host("https://user:pass@checkout.example.com:8443/pay"),
+            "checkout.example.com"
+        );
+        assert_eq!(
+            web_surface_url_host("http://127.0.0.1:9000/fixture"),
+            "127.0.0.1"
+        );
+        assert!(web_surface_url_is_loopback("http://localhost:8080/x"));
+        assert!(!web_surface_url_is_loopback(
+            "https://areionsbi.wibmo.com/cardcapture/"
         ));
     }
 
@@ -55987,6 +56179,124 @@ fn vault_cli_output(args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
+
+/// How long a vault-agent round trip may take before yggterm gives up. The
+/// agent answers from memory, so this is a hang guard, not a budget — but the
+/// caller is a GUI thread pool and a socket that never answers must not own one
+/// of its threads forever.
+const VAULT_AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where ychrome's vault agent is listening, according to ychrome.
+///
+/// **ychrome owns this path** (`ychrome/docs/vault.md`: `~/.yggterm/vault/`,
+/// directory `0700`, socket `0600`). yggterm asks the binary that owns the
+/// layout rather than re-deriving it, because `--dir` can move it and because
+/// `resolve_yggterm_home()` is the WRONG answer by construction: `YGGTERM_HOME`
+/// moves yggterm's state, not ychrome's vault, and following it would look for
+/// a socket that was never there.
+///
+/// Blocking; call from spawn_blocking.
+fn vault_agent_socket() -> Result<std::path::PathBuf, String> {
+    let status: Value = serde_json::from_str(&vault_cli_output(&["status"])?)
+        .map_err(|error| format!("ychrome-vault status returned malformed JSON: {error}"))?;
+    let socket = status["socket"].as_str().unwrap_or_default();
+    if socket.is_empty() {
+        // Named, not guessed. yggterm could derive `~/.yggterm/vault/agent.sock`
+        // here and be right today — and that second copy of ychrome's layout is
+        // exactly the thing that goes quietly wrong later, on the day it moves.
+        // A version too old to answer is a DEPLOY, and it is a cheap one:
+        // `handover` keeps the unlock.
+        return Err(
+            "vault_agent_socket_unknown: this ychrome-vault's `status` does not report \
+             `socket`. Install one that does, then `ychrome-vault handover` (which keeps \
+             the vault unlocked)"
+                .to_string(),
+        );
+    }
+    Ok(std::path::PathBuf::from(socket))
+}
+
+/// One request/response on ychrome's vault agent socket: one JSON object per
+/// line, in and out.
+///
+/// yggterm cannot link `ychrome-vault-proto` (a different repo's workspace), so
+/// the wire is re-encoded here — the seam every cross-repo protocol has. It is
+/// three lines of it, and `ychrome/docs/vault.md` is the contract.
+///
+/// Blocking; call from spawn_blocking.
+fn vault_agent_request(request: &Value) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let socket = vault_agent_socket()?;
+    let stream = std::os::unix::net::UnixStream::connect(&socket).map_err(|error| {
+        format!(
+            "no vault agent on {}: run `ychrome-vault unlock` on this host first ({error})",
+            socket.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(VAULT_AGENT_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(VAULT_AGENT_TIMEOUT)).ok();
+    let mut writer = stream
+        .try_clone()
+        .map_err(|error| format!("vault agent socket: {error}"))?;
+    writeln!(writer, "{request}").map_err(|error| format!("vault agent write: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("vault agent flush: {error}"))?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("vault agent read: {error}"))?;
+    if line.trim().is_empty() {
+        // EOF with nothing on it. An agent that was killed mid-request looks
+        // exactly like this, and "malformed JSON" would send the reader to the
+        // wrong place entirely.
+        return Err(
+            "the vault agent closed the connection without answering — it may have been \
+             stopped mid-request; `ychrome-vault status` will say"
+                .to_string(),
+        );
+    }
+    let reply: Value = serde_json::from_str(line.trim())
+        .map_err(|error| format!("vault agent returned malformed JSON: {error}"))?;
+    if reply["ok"].as_bool() != Some(true) {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("the vault agent refused without a reason")
+            .to_string());
+    }
+    Ok(reply)
+}
+
+/// ONE field of a card, read off the vault agent's `card-secret` op.
+///
+/// This is the whole reason `fill-card` exists and the whole reason it does not
+/// use the CLI: `ychrome-vault` deliberately has NO verb that prints a PAN,
+/// because a number in a scrollback or an agent CLI's JSONL is durable and,
+/// unlike a password, cannot be rotated. The socket hands the value to this
+/// process, one field is taken out of it, and the reply — which carries the
+/// whole form — drops at the end of this function.
+///
+/// `host` and `client` travel for the agent's audit line and nothing else; no
+/// decision anywhere is taken on either.
+///
+/// Blocking; call from spawn_blocking.
+fn vault_card_field(
+    item: &str,
+    user: Option<&str>,
+    field: CardField,
+    host: Option<&str>,
+) -> Result<String, String> {
+    let reply = vault_agent_request(&json!({
+        "op": "card-secret",
+        "name": item,
+        "user": user.filter(|user| !user.is_empty()),
+        "host": host,
+        "client": "yggterm web fill-card",
+    }))
+    .map_err(|error| vault_agent_refusal_reason(&error))?;
+    card_field_value(&reply, field)
+}
+
 /// List the unlocked vault's entries (name/user/folder — no secrets).
 /// Blocking; call from spawn_blocking.
 fn vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
@@ -56322,34 +56632,28 @@ fn web_surface_fill_script(host: &str, credential: &WebLoginCredential) -> Strin
 /// from the local vault. The ENGINE's current page URI is the origin truth
 /// (the shell nav model may lag in-page navigation) — the page cannot lie
 /// about it, so a credential can only ever land on its own origin.
-/// The vault CLI arguments for one named field. PURE, so the whitelist and the
-/// subcommand mapping are testable without a vault.
+/// The vault CLI arguments for one named LOGIN field. PURE, so the whitelist and
+/// the subcommand mapping are testable without a vault.
 ///
 /// `ychrome-vault` prints only the field asked for, and its `get --field` is
-/// whitelisted client-side to the login fields. Card fields go through a `card`
-/// op that does not exist yet — see [`VaultFieldSource::Card`].
-fn vault_field_args(
-    source: VaultFieldSource,
-    item: &str,
-    field: &str,
-    user: Option<&str>,
-) -> Result<Vec<String>, String> {
+/// whitelisted client-side to the login fields. A CARD does not come this way at
+/// all — see [`CardField`] and [`vault_card_field`]: there is deliberately no
+/// CLI verb that prints a PAN, so the number is read off the agent socket and
+/// injected without ever being printed.
+fn vault_field_args(item: &str, field: &str, user: Option<&str>) -> Result<Vec<String>, String> {
     let field = field.trim().to_ascii_lowercase();
-    let (subcommand, allowed): (&str, &[&str]) = match source {
-        VaultFieldSource::Login => ("get", &["password", "username", "totp", "notes"]),
-        VaultFieldSource::Card => ("card", &["number", "expiry", "code", "holder"]),
-    };
+    let allowed: &[&str] = &["password", "username", "totp", "notes"];
     if !allowed.contains(&field.as_str()) {
         return Err(format!(
             "unknown vault field {field:?} for this item kind (expected one of {allowed:?})"
         ));
     }
     // `totp` is its own subcommand, not a field of `get` — one mapping, here.
-    let mut args: Vec<String> = if source == VaultFieldSource::Login && field == "totp" {
+    let mut args: Vec<String> = if field == "totp" {
         vec!["totp".to_string(), item.to_string()]
     } else {
         vec![
-            subcommand.to_string(),
+            "get".to_string(),
             item.to_string(),
             "--field".to_string(),
             field,
@@ -56361,17 +56665,155 @@ fn vault_field_args(
     Ok(args)
 }
 
-/// Is this vault CLI failure "that subcommand does not exist"?
+/// One field of a payment card, and the reply key it is read from.
 ///
-/// PURE so it is testable, and narrow on purpose: it must not swallow a real
-/// failure (a locked vault, a missing item) as "not implemented yet", because
-/// that would send an agent off relaunching a CLI that is working fine.
-fn vault_failure_is_missing_subcommand(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("unrecognized subcommand")
-        || error.contains("unknown subcommand")
-        || error.contains("invalid subcommand")
-        || error.contains("unexpected argument")
+/// The vault stores month and year separately, and so does ychrome's own
+/// injector (`cc-exp-month` / `cc-exp-year`) — so those are the primitives here
+/// too, and `Expiry` is the one composite, for the single `MM / YY` box most
+/// gateways draw. Each variant's format is stated in the verb's help text
+/// because a caller typing into a real payment form cannot afford to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardField {
+    /// The full PAN.
+    Number,
+    /// The CVV/CVC.
+    Code,
+    /// The cardholder name.
+    Holder,
+    /// The expiry month, zero-padded: `11`.
+    ExpMonth,
+    /// The expiry year as stored, usually four digits: `2029`.
+    ExpYear,
+    /// `MM/YY` — month and stored year composed for a single-box field.
+    Expiry,
+}
+
+/// The card fields this verb accepts. PURE.
+///
+/// The old spelling (`number|expiry|code|holder`) still resolves, because it is
+/// what the help text advertised for months; `exp-month`/`exp-year` are the
+/// additions that let a split expiry form be filled without composing a string
+/// the page will reject.
+fn card_field(field: &str) -> Result<CardField, String> {
+    let normalized = field.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "number" => Ok(CardField::Number),
+        "code" => Ok(CardField::Code),
+        "holder" => Ok(CardField::Holder),
+        "exp-month" => Ok(CardField::ExpMonth),
+        "exp-year" => Ok(CardField::ExpYear),
+        "expiry" => Ok(CardField::Expiry),
+        _ => Err(format!(
+            "unknown vault field {field:?} for this item kind (expected one of \
+             [\"number\", \"code\", \"holder\", \"exp-month\", \"exp-year\", \"expiry\"])"
+        )),
+    }
+}
+
+/// `MM/YY` from the two stored parts. PURE.
+///
+/// The month is zero-padded and the year is taken from its LAST two digits, so
+/// a vault storing `2029` and one storing `29` both yield `29` — the stored
+/// shape varies per item and a form that wanted two digits must not receive
+/// four. Returns `None` when either part is missing, because a half-composed
+/// expiry (`11/`) typed into a gateway is worse than a refusal.
+fn card_expiry_mm_yy(month: &str, year: &str) -> Option<String> {
+    let (month, year) = (month.trim(), year.trim());
+    if month.is_empty() || year.is_empty() {
+        return None;
+    }
+    let mm = if month.chars().count() == 1 {
+        format!("0{month}")
+    } else {
+        month.to_string()
+    };
+    let digits: Vec<char> = year.chars().collect();
+    let yy: String = digits[digits.len().saturating_sub(2)..].iter().collect();
+    Some(format!("{mm}/{yy}"))
+}
+
+/// Pull ONE field out of a `card-secret` reply. PURE.
+///
+/// The reply carries the whole form (one round trip fills four boxes), and this
+/// is the only place a value is taken out of it — everything else drops with the
+/// reply. A field the item does not store is an ERROR naming the field, never an
+/// empty string: an empty string typed into a gateway's PAN box is a failed
+/// payment attributed to the wrong thing.
+fn card_field_value(reply: &Value, field: CardField) -> Result<String, String> {
+    let text = |key: &str| reply[key].as_str().unwrap_or_default().trim().to_string();
+    let value = match field {
+        CardField::Number => text("number"),
+        CardField::Code => text("code"),
+        CardField::Holder => text("cardholder"),
+        CardField::ExpMonth => text("exp_month"),
+        CardField::ExpYear => text("exp_year"),
+        CardField::Expiry => {
+            card_expiry_mm_yy(&text("exp_month"), &text("exp_year")).unwrap_or_default()
+        }
+    };
+    if value.is_empty() {
+        return Err(format!(
+            "the vault item stores no {field:?} for this card (nothing was typed)"
+        ));
+    }
+    Ok(value)
+}
+
+/// Map a vault-agent refusal onto the reason `fill-card` reports. PURE.
+///
+/// The only policy refusal on this path is the LOCK. ychrome's vault serves a
+/// card secret to whoever reaches its socket once it is unlocked — every
+/// Bitwarden client can read a card cipher and it is one (the user's ruling,
+/// 2026-07-26) — so an agent that is refused needs the remedy, not a diagnosis.
+///
+/// Narrow on purpose, exactly as the old missing-subcommand classifier was: an
+/// item that is not a card, or a name that matches nothing, must come back
+/// VERBATIM. Rewriting those as "vault locked" would send an agent to unlock a
+/// vault that is already open.
+fn vault_agent_refusal_reason(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let locked = lower.contains("vault locked")
+        || lower.contains("no vault agent")
+        || lower.contains("no agent");
+    if locked {
+        return "vault_locked: run `ychrome-vault unlock` on this host first".to_string();
+    }
+    error.to_string()
+}
+
+/// WHERE a `fill-vault`/`fill-card` reads its secret from, decided once, before
+/// the surface is touched.
+///
+/// The two doors are not interchangeable and the difference is the point of this
+/// type. A login field is a CLI read (`ychrome-vault get --field …`), whose
+/// value is printed to a pipe. A card field is a SOCKET read, because
+/// `ychrome-vault` deliberately has no verb that prints a PAN — a number in a
+/// scrollback or an agent CLI's JSONL is durable and, unlike a password, cannot
+/// be rotated on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VaultFetch {
+    /// `ychrome-vault <args…>`, stdout captured.
+    Cli(Vec<String>),
+    /// `{"op":"card-secret"}` on the vault agent socket.
+    Card(CardField),
+}
+
+/// Resolve `(source, field)` to the door it reads from, or refuse naming the
+/// allowed set. PURE.
+///
+/// This is the decision the async fill path makes and cannot itself be called
+/// from a test — so it lives here, where reverting the call site's `source`
+/// changes an observable answer instead of nothing.
+fn vault_fetch_plan(
+    source: VaultFieldSource,
+    item: &str,
+    field: &str,
+    user: Option<&str>,
+) -> Result<VaultFetch, String> {
+    match source {
+        VaultFieldSource::Login => vault_field_args(item, field, user).map(VaultFetch::Cli),
+        VaultFieldSource::Card => card_field(field).map(VaultFetch::Card),
+    }
 }
 
 /// A secret the vault CLI would not vouch for. `ychrome-vault` prints its ERRORS
@@ -56407,6 +56849,12 @@ fn vault_secret_is_unusable(secret: &str) -> Option<&'static str> {
 /// answer is `{item, field, chars, matched}` — a length and a page-side boolean
 /// — mirroring the field note's "injected password of <item> (15 chars, not
 /// shown)".
+///
+/// Which DOOR the secret comes from is [`vault_fetch_plan`]'s decision, and the
+/// two are not interchangeable: a login field is read from the `ychrome-vault`
+/// CLI, a card field from the vault AGENT SOCKET, because no CLI verb prints a
+/// PAN and none ever will. Aiming a card at the CLI is exactly the bug that
+/// answered `vault_cli_no_card_op` at a live gateway's card form.
 async fn web_surface_fill_vault_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -56418,8 +56866,11 @@ async fn web_surface_fill_vault_for(
     source: VaultFieldSource,
     expected_generation: Option<u64>,
 ) -> Value {
-    let args = match vault_field_args(source, item, field, user) {
-        Ok(args) => args,
+    // Resolve the field against its ITEM KIND before the surface is touched, so
+    // a typo is a parse-time refusal naming the allowed set rather than an
+    // opaque vault error blamed on the page.
+    let plan = match vault_fetch_plan(source, item, field, user) {
+        Ok(plan) => plan,
         Err(reason) => return json!({ "accepted": false, "reason": reason }),
     };
     let (session, handle) =
@@ -56444,26 +56895,34 @@ async fn web_surface_fill_vault_for(
             "reason": format!("refusing to fill a non-https page: {page_url}"),
         });
     }
-    let owned: Vec<String> = args;
-    let secret = match task::spawn_blocking(move || {
-        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
-        vault_cli_output(&borrowed)
+    // The page host, for the vault agent's audit line. That line is the only
+    // durable record a card fill leaves anywhere — this verb's own answer and
+    // trace carry a length, never a value — and one that could not say WHERE the
+    // number went would be half a record.
+    let audit_host = Some(web_surface_url_host(&page_url))
+        .filter(|host| !host.is_empty())
+        .map(str::to_string);
+    let (item_owned, user_owned) = (item.to_string(), user.map(str::to_string));
+    let secret = match task::spawn_blocking(move || match plan {
+        VaultFetch::Cli(args) => {
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            vault_cli_output(&borrowed)
+        }
+        // A card NEVER goes through the CLI: there is no verb that prints a PAN
+        // and there deliberately never will be. Straight to the agent socket,
+        // the same door ychrome's own sidebar injector uses.
+        VaultFetch::Card(field) => vault_card_field(
+            &item_owned,
+            user_owned.as_deref(),
+            field,
+            audit_host.as_deref(),
+        ),
     })
     .await
     .unwrap_or_else(|join| Err(format!("vault task failed: {join}")))
     {
         Ok(secret) => secret,
         Err(reason) => {
-            // The card op does not exist yet. Say exactly that instead of a
-            // generic failure, so the day it lands this verb starts working
-            // with no yggterm change — and so nobody debugs the wrong thing.
-            let reason = if source == VaultFieldSource::Card
-                && vault_failure_is_missing_subcommand(&reason)
-            {
-                "vault_cli_no_card_op".to_string()
-            } else {
-                reason
-            };
             return json!({ "accepted": false, "session_path": session, "reason": reason });
         }
     };

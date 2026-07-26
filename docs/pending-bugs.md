@@ -30,16 +30,32 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
-- **★★ `web fill-card` ADVErecordsSES WHAT THE CREDENTIAL PLANE FORBIDS (found
-  live 2026-07-26 at a real payment gateway's card form).** The verb's help
-  offers `--field number|expiry|code|holder`, but every agent call is refused
-  `vault_cli_no_card_op` — the vault deliberately serves PAN/CVV only through
-  the human-driven sidebar injector. The agent burned a staged application and
-  an OTP discovering this at the last step. Fix either way, but honestly:
-  (a) make the verb refuse AT PARSE TIME with the policy reason and a pointer
-  to the sidebar path, or (b) build the audited agent injection path as a
-  deliberate user decision (see ychrome docs/vault.md audited-card TODO).
-  Until then the help text is a lie.
+- **★★ `web fill-card` ADVErecordsSED WHAT THE CREDENTIAL PLANE FORBADE (found live
+  2026-07-26 at a real payment gateway's card form — FIXED IN-TREE, LIVE
+  VERIFICATION AND A DEPLOY PENDING).** The verb's help offered `--field
+  number|expiry|code|holder` while every agent call came back
+  `vault_cli_no_card_op`: yggterm reached the vault through the **CLI**, which
+  deliberately has no card op, while `card-secret` existed all along as an
+  **agent-socket** op the ychrome sidebar was already using. The agent burned a
+  staged application and an OTP discovering this at the last step.
+  **Route (b) was taken and then simplified by the user's ruling:** every
+  Bitwarden client can read a card cipher, ychrome-vault is one, so the UNLOCK
+  is the boundary and the only one — no grant, no per-use consent. `fill-card`
+  now speaks the agent socket directly, the field set is
+  `number|code|holder|exp-month|exp-year|expiry`, the only policy refusal is
+  `vault_locked` (which names `ychrome-vault unlock`), and every release leaves
+  one line in `~/.yggterm/vault/audit.log` naming field names, never values.
+  ychrome branch `agent-card-path`, commit `13a3bfe`.
+  **What is still owed:** neither repo is pushed or deployed, and no PAN has
+  crossed the path into a real form. The yggterm half works against the ALREADY
+  RUNNING vault agent (it only uses `card-secret`, which ships today) except for
+  the socket-path lookup, which reads `socket` from `ychrome-vault status` — a
+  field the deployed ychrome-vault does not yet report. **So a live run needs
+  the new `ychrome-vault` installed + `ychrome-vault handover` first** (cheap:
+  handover keeps the unlock), or the verb refuses with
+  `vault_agent_socket_unknown` naming exactly that. yggterm deliberately does
+  NOT fall back to a hard-coded `~/.yggterm/vault/agent.sock`: ychrome owns that
+  path, and a second copy of it is what goes quietly wrong the day it moves.
 
 - **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
   pixel proof, 2026-07-26 ~17:55 IST — FIXED IN-TREE, LIVE VERIFICATION
