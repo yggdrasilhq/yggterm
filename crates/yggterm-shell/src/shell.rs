@@ -17858,6 +17858,60 @@ impl ShellState {
             self.browser.select_path(selected_path);
         }
     }
+    /// Read the user's view — active session + view mode + selected-row truth —
+    /// as one value, so a mutation that must not disturb it can hand it back.
+    fn capture_user_view(&self) -> PreservedUserView {
+        PreservedUserView {
+            active: self
+                .server
+                .active_session_path()
+                .map(|path| (path.to_string(), self.server.active_view_mode())),
+            selection: SidebarSelection {
+                anchor: self.selection_anchor.clone(),
+                tree_paths: self.selected_tree_paths.clone(),
+                browser_path: self.browser.selected_path().map(ToOwned::to_owned),
+            },
+        }
+    }
+    /// Put back exactly what `capture_user_view` read. The browser's selection
+    /// is cleared before it is re-applied because `select_path` silently
+    /// no-ops on a path that is no longer a row — without the clear, a row that
+    /// vanished during the mutation would leave the INTRUDING selection
+    /// standing instead of falling back to none.
+    fn restore_user_view(&mut self, preserved: PreservedUserView) {
+        if let Some((path, view_mode)) = preserved.active {
+            self.server.restore_active_session(&path, view_mode);
+        }
+        self.selection_anchor = preserved.selection.anchor;
+        self.selected_tree_paths = preserved.selection.tree_paths;
+        self.browser.clear_selection();
+        if let Some(path) = preserved.selection.browser_path {
+            self.browser.select_path(path);
+        }
+        // `settings.selected_browser_path` is a persisted consumer of the same
+        // truth; the apply above already wrote the intruder into it.
+        self.sync_browser_settings();
+    }
+    /// Apply a create's snapshot, then hand back whatever the create promised
+    /// not to move.
+    ///
+    /// ONE owner for both create call sites (local and remote): they differed
+    /// only in transport, and the selection half was missing from both. The
+    /// apply necessarily marks the NEW session active — that is what the daemon
+    /// returned — and `sync_active_session_selection` +
+    /// `ensure_active_session_visible` follow it, so the hand-back must land in
+    /// the SAME mutation window; both are applied before the next render, so
+    /// nothing flashes.
+    fn apply_created_terminal_snapshot(
+        &mut self,
+        result: Result<(ServerUiSnapshot, Option<String>)>,
+        preserved: Option<PreservedUserView>,
+    ) {
+        self.apply_interactive_snapshot_result(result);
+        if let Some(preserved) = preserved {
+            self.restore_user_view(preserved);
+        }
+    }
     fn preserve_tree_rename_selection(&mut self) -> bool {
         let Some(rename_path) = self.tree_rename_path.clone() else {
             return false;
@@ -40406,6 +40460,44 @@ fn preview_layout_mode_label(mode: PreviewLayoutMode) -> &'static str {
         PreviewLayoutMode::Graph => "graph",
     }
 }
+/// Selected-row truth, captured as ONE value.
+///
+/// The highlight is resolved by `selected_sidebar_row_from_rows` out of exactly
+/// three fields — the anchor, the multi-select set, and the browser's own
+/// `selected_path` — so "the selection" is those three together and nothing
+/// less. Anything that must leave the user's highlight alone captures them as a
+/// unit and hands them back as a unit; restoring two of the three leaves the
+/// resolver reading a row nobody selected.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SidebarSelection {
+    anchor: Option<String>,
+    tree_paths: HashSet<String>,
+    browser_path: Option<String>,
+}
+/// The user's view as it stood before a create that promised not to move it.
+///
+/// **Activation and selection are separate state.** `--no-activate` used to
+/// hand back only the first, which is why an agent's headless spawn kept the
+/// viewport on the user's session and still stole the Live Sessions highlight —
+/// and the sidebar's autoscroll with it, since the autoscroll target is the
+/// selected path, not the active one.
+#[derive(Clone, Debug, PartialEq)]
+struct PreservedUserView {
+    active: Option<(String, WorkspaceViewMode)>,
+    selection: SidebarSelection,
+}
+/// What a create must hand back once its snapshot lands, or `None` when the
+/// create is the user's own and the selection SHOULD follow it.
+///
+/// Selection follows ACTIVATION, never creation: `activate == Some(false)` is
+/// the agent-driven spawn (`terminal new --no-activate`), and selected-row
+/// truth is part of the view that spawn promised to leave alone.
+fn preserved_user_view_for_create(
+    shell: &ShellState,
+    activate: Option<bool>,
+) -> Option<PreservedUserView> {
+    (activate == Some(false)).then(|| shell.capture_user_view())
+}
 fn selected_sidebar_row_from_rows(
     rows: &[BrowserRow],
     selected_tree_paths: &HashSet<String>,
@@ -59769,15 +59861,12 @@ async fn process_pending_app_control_requests(
             // BEFORE the create; the snapshot apply below will mark the new
             // session active and we hand the view straight back — both
             // mutations land before the next render, so nothing flashes.
-            let preserved_view = (activate == Some(false))
-                .then(|| {
-                    let shell = state.read();
-                    shell
-                        .server
-                        .active_session_path()
-                        .map(|path| (path.to_string(), shell.server.active_view_mode()))
-                })
-                .flatten();
+            // The view is the ACTIVE session AND the selected row: a spawn that
+            // kept the viewport but moved the Live Sessions highlight was the
+            // user-reported bug, because selection was following creation
+            // instead of activation.
+            let preserved_view =
+                state.with(|shell| preserved_user_view_for_create(shell, activate));
             let terminal_appearance =
                 state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
             match machine_key.clone().map(|key| {
@@ -59858,13 +59947,10 @@ async fn process_pending_app_control_requests(
                             let created_path =
                                 app_control_created_session_path(&snapshot, message.as_deref());
                             state.with_mut(|shell| {
-                                shell.apply_interactive_snapshot_result(Ok((
-                                    snapshot,
-                                    message.clone(),
-                                )));
-                                if let Some((prev_path, prev_view)) = preserved_view.clone() {
-                                    shell.server.restore_active_session(&prev_path, prev_view);
-                                }
+                                shell.apply_created_terminal_snapshot(
+                                    Ok((snapshot, message.clone())),
+                                    preserved_view.clone(),
+                                );
                             });
                             if let Some(created_path) = created_path.clone()
                                 && created_remote_terminal_should_prewarm(&created_path)
@@ -59888,7 +59974,11 @@ async fn process_pending_app_control_requests(
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
                                     "active_session_path": if activate == Some(false) {
-                                        preserved_view.as_ref().map(|(p, _)| json!(p)).unwrap_or(Value::Null)
+                                        preserved_view
+                                            .as_ref()
+                                            .and_then(|view| view.active.as_ref())
+                                            .map(|(path, _)| json!(path))
+                                            .unwrap_or(Value::Null)
                                     } else {
                                         json!(created_path)
                                     },
@@ -59932,13 +60022,10 @@ async fn process_pending_app_control_requests(
                             let created_path =
                                 app_control_created_session_path(&snapshot, message.as_deref());
                             state.with_mut(|shell| {
-                                shell.apply_interactive_snapshot_result(Ok((
-                                    snapshot,
-                                    message.clone(),
-                                )));
-                                if let Some((prev_path, prev_view)) = preserved_view.clone() {
-                                    shell.server.restore_active_session(&prev_path, prev_view);
-                                }
+                                shell.apply_created_terminal_snapshot(
+                                    Ok((snapshot, message.clone())),
+                                    preserved_view.clone(),
+                                );
                             });
                             AppControlResponse {
                                 request_id: request.request_id.clone(),
@@ -59953,7 +60040,11 @@ async fn process_pending_app_control_requests(
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
                                     "active_session_path": if activate == Some(false) {
-                                        preserved_view.as_ref().map(|(p, _)| json!(p)).unwrap_or(Value::Null)
+                                        preserved_view
+                                            .as_ref()
+                                            .and_then(|view| view.active.as_ref())
+                                            .map(|(path, _)| json!(path))
+                                            .unwrap_or(Value::Null)
                                     } else {
                                         json!(created_path)
                                     },
@@ -139827,6 +139918,163 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             shell.selected_tree_paths,
             HashSet::from([active_session_path.to_string()])
+        );
+    }
+
+    /// The shell a `terminal new` lands on: the user's session live, active and
+    /// selected, exactly as the pixel-proven report described it.
+    fn shell_with_user_session_selected(user_path: &str) -> (ShellState, ManagedSessionView) {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(user_path));
+        let mut user_session = test_live_shell_session(user_path);
+        user_session.id = "user-session-id".to_string();
+        user_session.title = "User Session".to_string();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(user_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(user_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(user_session.clone())],
+            apps: Vec::new(),
+        });
+        shell.needs_initial_server_sync = false;
+        shell.sync_active_session_selection();
+        (shell, user_session)
+    }
+    /// What the daemon answers a create with: the NEW session is active, and
+    /// both rows are live.
+    fn created_terminal_snapshot(
+        user_session: &ManagedSessionView,
+        agent_session: &ManagedSessionView,
+    ) -> ServerUiSnapshot {
+        ServerUiSnapshot {
+            active_session_path: Some(agent_session.session_path.clone()),
+            active_session: Some(snapshot_session_view_for_ui(agent_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(user_session.clone()),
+                snapshot_session_view_for_ui(agent_session.clone()),
+            ],
+            apps: Vec::new(),
+        }
+    }
+    fn agent_spawned_session(agent_path: &str) -> ManagedSessionView {
+        let mut agent_session = test_live_shell_session(agent_path);
+        agent_session.id = "agent-session-id".to_string();
+        agent_session.title = "Northgate records request".to_string();
+        agent_session
+    }
+    #[test]
+    fn no_activate_create_leaves_the_users_selected_row_alone() {
+        // The user-reported defect: `terminal new --no-activate` kept the
+        // viewport but moved the Live Sessions HIGHLIGHT to the agent's row.
+        let user_path = "remote-cc://dev/user-session";
+        let agent_path = "local://agent-ychrome";
+        let (mut shell, user_session) = shell_with_user_session_selected(user_path);
+        let agent_session = agent_spawned_session(agent_path);
+        assert_eq!(shell.selection_anchor.as_deref(), Some(user_path));
+        assert_eq!(
+            current_selected_sidebar_row(&shell).map(|row| row.full_path),
+            Some(user_path.to_string()),
+            "precondition: the user's row is the selected row"
+        );
+
+        // Exactly what the app-control arm does: capture through the SAME
+        // function, with the SAME flag value `--no-activate` parses to.
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        assert!(
+            preserved.is_some(),
+            "--no-activate must preserve the user's view"
+        );
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                created_terminal_snapshot(&user_session, &agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+
+        // Activation was already honoured before this fix; selection was not.
+        assert_eq!(shell.server.active_session_path(), Some(user_path));
+        assert_eq!(
+            shell.selection_anchor.as_deref(),
+            Some(user_path),
+            "an agent-created row must not take the selection anchor"
+        );
+        assert_eq!(
+            shell.selected_tree_paths,
+            HashSet::from([user_path.to_string()])
+        );
+        assert_eq!(
+            current_selected_sidebar_row(&shell).map(|row| row.full_path),
+            Some(user_path.to_string()),
+            "the sidebar highlight must stay on the user's row"
+        );
+        // The sidebar autoscroll target is the SELECTED path, not the active
+        // one, so a preserved selection is also what keeps the list from
+        // scrolling to the agent's row.
+        assert!(!shell.selected_tree_paths.contains(agent_path));
+    }
+    #[test]
+    fn user_initiated_create_still_takes_the_selection() {
+        // Control: the same production path with the flag ABSENT (a user's own
+        // new terminal) must keep today's behaviour — selection follows
+        // activation onto the new row.
+        let user_path = "remote-cc://dev/user-session";
+        let created_path = "local://user-new-terminal";
+        let (mut shell, user_session) = shell_with_user_session_selected(user_path);
+        let created_session = agent_spawned_session(created_path);
+
+        let preserved = preserved_user_view_for_create(&shell, None);
+        assert!(
+            preserved.is_none(),
+            "an activating create preserves nothing"
+        );
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                created_terminal_snapshot(&user_session, &created_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+
+        assert_eq!(shell.server.active_session_path(), Some(created_path));
+        assert_eq!(shell.selection_anchor.as_deref(), Some(created_path));
+        assert_eq!(
+            current_selected_sidebar_row(&shell).map(|row| row.full_path),
+            Some(created_path.to_string()),
+            "a user-initiated create still takes the highlight"
+        );
+    }
+    #[test]
+    fn no_activate_create_leaves_a_folder_selection_alone() {
+        // Selected-row truth is not always the active session's row. A folder
+        // selection is what the start page scope and "here" read, so it has to
+        // survive an agent spawn too.
+        let user_path = "remote-cc://dev/user-session";
+        let agent_path = "local://agent-ychrome";
+        let folder_path = "/home/user/gh";
+        let (mut shell, user_session) = shell_with_user_session_selected(user_path);
+        let agent_session = agent_spawned_session(agent_path);
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(folder_path.to_string());
+        shell.selection_anchor = Some(folder_path.to_string());
+
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                created_terminal_snapshot(&user_session, &agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+
+        assert_eq!(shell.selection_anchor.as_deref(), Some(folder_path));
+        assert_eq!(
+            shell.selected_tree_paths,
+            HashSet::from([folder_path.to_string()])
         );
     }
 
