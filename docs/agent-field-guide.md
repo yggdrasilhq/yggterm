@@ -389,6 +389,41 @@ The deployed `yedit` binary's features existed **only** as untracked files on
 the build host — no git repo, no remote, no copy anywhere. Before editing any
 fleet tool, confirm its source is in version control and pushed.
 
+### 7.10 The row ledger is the authoritative record of what existed — consult it FIRST
+
+`~/.yggterm/row-order-ledger.json` records which live-session rows existed and
+in what order, and `~/.yggterm/removed-rows.json` records closes. It exists
+precisely because ghost rows are a recurring problem here.
+
+**It was not consulted, and the user lost seven rows.** Asked to remove ghost
+sessions, I went to `server-state.json` plus agent-transcript mtimes and built a
+"untouched for ≥3 days" heuristic — while the ledger sat there holding every
+row's identity and position. Two of the seven removed were real work
+("Commit and continue v3 parity", "Fileables campaign"), and the user had to ask
+for them back.
+
+**The trap that made a bad method look verified.** The user said the list should
+be "20-21". The ≥3.0-day cut left exactly 21, and that coincidence read as
+confirmation. It was not evidence — it was a threshold fitted to a target the
+user had supplied, then quoted back as if it had been derived. **A heuristic that
+agrees with the number you were given is not corroborated; it is circular.**
+
+Same failure at the other end: after a daemon restart the sidebar showed 28 rows
+and that count was reported as a sign the restart went well, without ever
+comparing it against the ledger's recorded set — which is the only thing that
+can say whether those 28 are the RIGHT 28. The user had to point out twice that
+the number itself was the bug.
+
+**Rules:**
+- Before adding, removing, or judging any row, read the ledger. It is the record;
+  `server-state.json` is the current belief, and the whole ghost class is the two
+  disagreeing.
+- Restoring a removed row means clearing its tombstone in `removed-rows.json`
+  first, then re-opening the session — otherwise the veto silently wins.
+- Never delete a user's session on a heuristic. Show the list, name the evidence
+  per row, and let the user choose. Removal is recoverable (the CLI transcript
+  survives), but their attention is not.
+
 ## 6. Where the deep material lives
 
 - `docs/pending-bugs.md` — open, user-confirmed bugs. The work queue.
