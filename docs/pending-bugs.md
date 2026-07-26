@@ -79,7 +79,7 @@ fix) once the fix is verified live on guihost.
   one family (a live portal filing run, 2026-07-26 ~15:30-16:00 IST, guihost 2.12.15,
   session `local://b556fb1b`, all self-reported SUCCESS while wrong):**
   1. **`do fill` DROPS and INVENTS characters on React controlled inputs.**
-     `fill --selector '#street' --text "Example Fixture Road"` → response
+     `fill --selector '#street' --text "Sample Fixture Road"` → response
      `chars:19, delivered:true, is_trusted:true, cleared_verified:[true]`, field
      held **"Ja"**. Earlier `#username` fill reported chars:10, field ended
      **"0000000000hg"** — two stray chars never passed in any `--text`, which
@@ -812,7 +812,7 @@ fix) once the fix is verified live on guihost.
   instead of holding it until the next verb reads the counter. NOT done here —
   the ledger is what stops the single-shot `do` defect, and it should not be
   changed without a live loop to prove the replacement.
-  The other reported corruption — `fill --text "Example Fixture Road"` reporting
+  The other reported corruption — `fill --text "Sample Fixture Road"` reporting
   `chars:19 delivered:true` while the field held `Ja` — is **not explained by
   either of the above** (17 characters lost, not 2 gained) and stays open; look
   at the page's controlled-input re-render, not at focus.
