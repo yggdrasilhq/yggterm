@@ -153,6 +153,7 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::agent_presence::{AGENT_CURSOR_TTL_MS, AgentPointer, AgentPresence};
+use yggterm_core::notification_audio;
 use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
@@ -87493,13 +87494,21 @@ fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: Notificati
 }
 /// Bluetooth A2DP links power down between streams and clip roughly the first
 /// ~300 ms of the next one while the link wakes, which swallows the attack of
-/// every notification chime. 400 ms of pre-roll covers that with margin.
-const NOTIFICATION_PREROLL_SECONDS: f32 = 0.4;
-/// The pre-roll is NOISE, not silence. Several A2DP stacks discard pure digital
-/// silence (or never prime the link on it), so the pre-roll has to carry real
+/// every notification chime. The pre-roll covers that with margin.
+/// Owned by `yggterm_core::notification_audio` so the native CLI player and
+/// this script cannot drift into two different pre-rolls.
+const NOTIFICATION_PREROLL_SECONDS: f32 = yggterm_core::notification_audio::PREROLL_SECONDS;
+/// The keepalive is NOISE, not silence. Several A2DP stacks discard pure
+/// digital silence (or never prime the link on it), so it has to carry real
 /// energy. ~-57 dBFS peak (10^(-57/20) ≈ 0.0014 linear) is a dither-level noise
 /// floor: enough for a stack to treat as audio, far below anything audible.
-const NOTIFICATION_PREROLL_PEAK_AMPLITUDE: f32 = 0.0014;
+const NOTIFICATION_DITHER_PEAK_AMPLITUDE: f32 =
+    yggterm_core::notification_audio::DITHER_PEAK_AMPLITUDE;
+/// No pre-roll: the A2DP link is already awake, so the chime starts at once.
+/// Named rather than written inline so `notification_chime_script` contains NO
+/// number of its own — see
+/// `the_chime_script_template_spells_no_tune_numbers_in_its_source`.
+const NOTIFICATION_NO_PREROLL_SECONDS: f32 = 0.0;
 /// When a chime played within this window the A2DP link is still awake, so the
 /// pre-roll would only add latency to the alert. 10 s sits above the fastest
 /// headset idle timeouts we care about (~5 s) while still collapsing the common
@@ -87538,7 +87547,7 @@ enum NotificationPrerollReason {
     /// A chime played inside the awake window — the link is still up.
     LinkStillAwake,
     /// The clock moved backwards (suspend/NTP step) so the elapsed time is not
-    /// knowable. A wasted 400 ms is harmless; a clipped alert is the bug.
+    /// knowable. A wasted pre-roll is harmless; a clipped alert is the bug.
     ClockWentBackwards,
 }
 
@@ -87631,6 +87640,19 @@ fn notification_tone_label(tone: NotificationTone) -> &'static str {
     }
 }
 
+/// Map the GUI's toast tone onto the tune registry's tone. Two enums exist
+/// because the tune lives in `yggterm-core` (which the CLI player also uses)
+/// while `ToastTone` is a `yggui` presentation concern; this is the ONE place
+/// they meet.
+fn notification_chime_tone(tone: NotificationTone) -> notification_audio::ChimeTone {
+    match tone {
+        NotificationTone::Info => notification_audio::ChimeTone::Info,
+        NotificationTone::Success => notification_audio::ChimeTone::Success,
+        NotificationTone::Warning => notification_audio::ChimeTone::Warning,
+        NotificationTone::Error => notification_audio::ChimeTone::Error,
+    }
+}
+
 struct NotificationChimePlan {
     script: String,
     preroll: NotificationPrerollDecision,
@@ -87645,64 +87667,95 @@ fn notification_chime_script(
     tone: NotificationTone,
     preroll: NotificationPrerollDecision,
 ) -> String {
-    // Airplane cabin "bong": a high note falling to a low note, sine timbre with
-    // a soft attack and a long mellow exponential tail — "soothing + alertful"
-    // (user choice 2026-05-30). Single ding-dong for info/attention, double for
-    // completion. Each note is [startSeconds, frequencyHz, peakGain]; tones
-    // differ by interval and repetition so they're still distinguishable by ear.
-    let notes: &str = match tone {
-        // Completion: double ding-dong (boarding-complete feel)
-        NotificationTone::Success => {
-            "[[0.0,587.33,0.075],[0.18,440.0,0.075],[0.62,587.33,0.07],[0.80,440.0,0.07]]"
-        }
-        // Info / attention ping: single ding-dong
-        NotificationTone::Info => "[[0.0,587.33,0.07],[0.18,440.0,0.07]]",
-        // Warning: single ding-dong, brighter and a touch louder
-        NotificationTone::Warning => "[[0.0,659.25,0.08],[0.16,523.25,0.08]]",
-        // Error: single low descending bong, somber
-        NotificationTone::Error => "[[0.0,440.0,0.075],[0.20,329.63,0.075]]",
-    };
+    // The tune is NOT written here any more. `yggterm_core::notification_audio`
+    // owns it, because there are now two players — this script and the native
+    // CLI renderer — and a tune with two owners becomes two chimes. That
+    // includes the ENVELOPE: it is a measured table with a sustain shoulder,
+    // which two Web Audio ramps cannot express, so the script walks the
+    // registry's breakpoints instead of spelling a decay of its own.
+    let chime_tone = notification_chime_tone(tone);
+    let ring = notification_audio::tone_ring(chime_tone);
+    let tail_cut = notification_audio::tone_tail_cut(chime_tone);
+    let notes: String = notification_audio::notes_json(notification_audio::tone_notes(chime_tone));
+    let envelope: String = notification_audio::envelope_json(ring, tail_cut);
     let preroll_seconds = if preroll.applied {
         NOTIFICATION_PREROLL_SECONDS
     } else {
-        0.0
+        NOTIFICATION_NO_PREROLL_SECONDS
     };
-    let preroll_block = if preroll.applied {
-        format!(
-            r#"
-            // Bluetooth A2DP wake-up pre-roll: dither-level TPDF noise (NOT
-            // silence — several stacks drop silent frames and never prime the
-            // link), scheduled on the same context so the chime joins gapless.
-            const prerollFrames = Math.max(1, Math.round(ctx.sampleRate * preroll));
-            const prerollBuffer = ctx.createBuffer(1, prerollFrames, ctx.sampleRate);
-            const prerollData = prerollBuffer.getChannelData(0);
-            for (let i = 0; i < prerollFrames; i += 1) {{
-              // TPDF (triangular) dither: two uniform draws summed, zero-centred.
-              prerollData[i] = (Math.random() + Math.random() - 1) * {peak};
-            }}
-            const prerollSource = ctx.createBufferSource();
-            const prerollGain = ctx.createGain();
-            prerollSource.buffer = prerollBuffer;
-            prerollGain.gain.setValueAtTime(1, now);
-            prerollSource.connect(prerollGain);
-            prerollGain.connect(ctx.destination);
-            prerollSource.start(now);
-            prerollSource.stop(now + preroll);
-"#,
-            peak = NOTIFICATION_PREROLL_PEAK_AMPLITUDE,
-        )
-    } else {
-        String::new()
-    };
+    let tone_label = notification_tone_label(tone);
+    let attack = notification_audio::ATTACK_SECONDS;
+    let chime_seconds = notification_audio::notes_duration_seconds(
+        notification_audio::tone_notes(chime_tone),
+        ring,
+        tail_cut,
+    );
+    let flush_tail = notification_audio::FLUSH_TAIL_SECONDS;
+    let dither = NOTIFICATION_DITHER_PEAK_AMPLITUDE;
     format!(
         r#"
-        (() => {{
+        (async () => {{
+          const w = window;
           try {{
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            // DEFECT FIX (2026-07-26): the context used to be created per chime
+            // and CLOSED 80 ms after the last note, while a Bluetooth sink still
+            // held 100-300 ms of buffered audio — that is the clipped ENDING the
+            // user reported. One long-lived context is reused instead, which
+            // also keeps the A2DP link warm and makes a skipped pre-roll free.
+            let ctx = w.__yggtermAudioCtx;
+            if (!ctx || ctx.state === "closed") {{
+              ctx = new (w.AudioContext || w.webkitAudioContext)();
+              w.__yggtermAudioCtx = ctx;
+              w.__yggtermAudioCtxCreatedAt = Date.now();
+            }}
+            // DEFECT FIX (2026-07-26): WebKitGTK starts an AudioContext
+            // SUSPENDED until a real user gesture, and nothing here ever called
+            // resume(). Every chime scheduled while the user was away was
+            // therefore dropped SILENTLY — the call succeeded and nothing was
+            // heard. Scheduling waits for the resume so `ctx.currentTime` is
+            // anchored on a running clock.
+            const stateBefore = ctx.state;
+            let resumeOutcome = "not-needed";
+            if (ctx.state === "suspended") {{
+              try {{
+                await ctx.resume();
+                resumeOutcome = "resumed:" + ctx.state;
+              }} catch (e) {{
+                resumeOutcome = "resume-failed:" + ((e && e.name) || "unknown");
+              }}
+            }}
             const now = ctx.currentTime;
             const preroll = {preroll_seconds:.3};
-{preroll_block}
+            // Bluetooth A2DP keepalive: dither-level TPDF noise (NOT silence —
+            // several stacks drop silent frames and never prime the link),
+            // spanning the WHOLE chime rather than only its front. This tune is
+            // mostly silence by duration (a second inside the pair, longer
+            // between pairs), so a front-only pre-roll primes the radio and
+            // then lets it sleep again before the later notes, which clips
+            // every one of them. Same context, one timeline, so the chime joins
+            // it gapless.
+            const keepaliveSeconds = preroll + {chime_seconds} + {flush_tail};
+            const keepaliveFrames = Math.max(1, Math.round(ctx.sampleRate * keepaliveSeconds));
+            const keepaliveBuffer = ctx.createBuffer(1, keepaliveFrames, ctx.sampleRate);
+            const keepaliveData = keepaliveBuffer.getChannelData(0);
+            for (let i = 0; i < keepaliveFrames; i += 1) {{
+              // TPDF (triangular) dither: two uniform draws summed, zero-centred.
+              keepaliveData[i] = (Math.random() + Math.random() - 1) * {dither};
+            }}
+            const keepaliveSource = ctx.createBufferSource();
+            const keepaliveGain = ctx.createGain();
+            keepaliveSource.buffer = keepaliveBuffer;
+            keepaliveGain.gain.setValueAtTime(1, now);
+            keepaliveSource.connect(keepaliveGain);
+            keepaliveGain.connect(ctx.destination);
+            keepaliveSource.start(now);
+            keepaliveSource.stop(now + keepaliveSeconds);
             const notes = {notes};
+            // The MEASURED envelope, as breakpoints from the registry. Web
+            // Audio cannot express a sustain shoulder as an exponential ramp,
+            // and the shoulder is the whole difference between a cabin chime
+            // and a beep — so the curve is walked, not approximated.
+            const env = {envelope};
             let endAt = now;
             notes.forEach(([t, freq, peak]) => {{
               const osc = ctx.createOscillator();
@@ -87711,17 +87764,49 @@ fn notification_chime_script(
               osc.frequency.value = freq;
               const start = now + preroll + t;
               g.gain.setValueAtTime(0, start);
-              g.gain.linearRampToValueAtTime(peak, start + 0.025);
-              g.gain.exponentialRampToValueAtTime(0.0008, start + 1.15);
+              g.gain.linearRampToValueAtTime(peak, start + {attack});
+              const body = start + {attack};
+              for (let i = 1; i < env.length; i += 1) {{
+                g.gain.linearRampToValueAtTime(peak * env[i][1], body + env[i][0]);
+              }}
               osc.connect(g);
               g.connect(ctx.destination);
               osc.start(start);
-              const stop = start + 1.2;
+              const stop = body + env[env.length - 1][0];
               osc.stop(stop);
               if (stop > endAt) endAt = stop;
             }});
-            setTimeout(() => {{ try {{ ctx.close(); }} catch (_e) {{}} }}, Math.ceil((endAt - now) * 1000) + 80);
-          }} catch (_error) {{}}
+            // The instrument that was missing: `server app audio state` reads
+            // this back, so "did the chime actually get a running context"
+            // stops being unanswerable from outside the webview.
+            w.__yggtermChimeAudio = {{
+              at: Date.now(),
+              tone: "{tone_label}",
+              ok: true,
+              stateBefore: stateBefore,
+              state: ctx.state,
+              resume: resumeOutcome,
+              sampleRate: ctx.sampleRate,
+              prerollSeconds: preroll,
+              playsForMs: Math.ceil((endAt - now) * 1000),
+              contextCreatedAt: w.__yggtermAudioCtxCreatedAt || null
+            }};
+          }} catch (chimeError) {{
+            // DEFECT FIX: the diagnostic used to be the LAST statement of the
+            // try, so it was written exactly when the chime worked and missing
+            // exactly when it failed — the one case worth diagnosing left no
+            // record at all, and the reader could not tell "never ran" from
+            // "threw". A failure writes its own record.
+            try {{
+              w.__yggtermChimeAudio = {{
+                at: Date.now(),
+                tone: "{tone_label}",
+                ok: false,
+                error: (chimeError && chimeError.name) || "unknown",
+                message: (chimeError && chimeError.message) || ""
+              }};
+            }} catch (_unreportable) {{}}
+          }}
         }})();
         "#
     )
@@ -135507,14 +135592,17 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
 
         // (2) Fresh boot: nothing has played, so the A2DP link is assumed cold
-        // and the chime gets its 400 ms wake-up pre-roll.
+        // and the chime gets its full wake-up pre-roll.
         let base = 1_700_000_000_000u64;
         let cold = advance_notification_chime(NotificationTone::Success, base);
         assert!(cold.preroll.applied, "a cold link must get the pre-roll");
         assert_eq!(cold.preroll.reason, NotificationPrerollReason::ColdLink);
         assert_eq!(cold.preroll.since_last_ms, None);
-        assert!(cold.script.contains("prerollBuffer"));
-        assert!(cold.script.contains("const preroll = 0.400;"));
+        assert!(cold.script.contains("keepaliveBuffer"));
+        assert!(cold.script.contains(&format!(
+            "const preroll = {:.3};",
+            notification_audio::PREROLL_SECONDS
+        )));
 
         // (3) Two seconds later the link is still awake — skip the pre-roll so
         // the alert is not delayed for nothing.
@@ -135528,8 +135616,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             NotificationPrerollReason::LinkStillAwake
         );
         assert_eq!(warm.preroll.since_last_ms, Some(2_000));
-        assert!(!warm.script.contains("prerollBuffer"));
         assert!(warm.script.contains("const preroll = 0.000;"));
+        // The keepalive noise is NOT the pre-roll and does not go away with it:
+        // it spans the whole chime because the link can fall asleep between two
+        // notes of the same chime, awake link or not.
+        assert!(warm.script.contains("keepaliveBuffer"));
 
         // (4) 11 s after the COLD chime but only 9 s after the warm one. This
         // is still a skip — and it is only a skip if a SKIPPED chime also
@@ -135552,7 +135643,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             NotificationPrerollReason::LinkLikelyAsleep
         );
         assert_eq!(slept.preroll.since_last_ms, Some(11_000));
-        assert!(slept.script.contains("prerollBuffer"));
+        assert!(slept.script.contains("keepaliveBuffer"));
 
         reset_notification_chime_last_played();
     }
@@ -135570,7 +135661,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!inside.applied);
         assert_eq!(inside.reason, NotificationPrerollReason::LinkStillAwake);
         // A backwards clock step (suspend / NTP) must not read as "just played"
-        // and swallow the pre-roll — a wasted 400 ms beats a clipped alert.
+        // and swallow the pre-roll — a wasted pre-roll beats a clipped alert.
         let stepped = notification_preroll_decision(1_000, Some(5_000));
         assert!(stepped.applied);
         assert_eq!(
@@ -135581,20 +135672,40 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn the_preroll_is_inaudible_noise_on_the_chime_context_and_traces_its_decision() {
+    fn the_keepalive_is_inaudible_noise_on_the_chime_context_and_traces_its_decision() {
         let applied = notification_preroll_decision(0, None);
         let script = notification_chime_script(NotificationTone::Success, applied);
-        // ONE AudioContext, ONE timeline: the pre-roll cannot race the chime.
-        assert_eq!(script.matches("new (window.AudioContext").count(), 1);
+        // ONE AudioContext, ONE timeline: the keepalive cannot race the chime.
+        // (The context is now REUSED across chimes rather than built per chime,
+        // so there is still exactly one construction site — see
+        // `the_chime_resumes_a_suspended_context_and_never_closes_it`.)
+        assert_eq!(script.matches("new (w.AudioContext").count(), 1);
         assert!(script.contains("const start = now + preroll + t;"));
         // Noise, NOT silence — several A2DP stacks never prime on digital silence.
         assert!(script.contains("Math.random() + Math.random() - 1"));
-        assert!(script.contains(&format!("* {NOTIFICATION_PREROLL_PEAK_AMPLITUDE}")));
+        assert!(script.contains(&format!("* {NOTIFICATION_DITHER_PEAK_AMPLITUDE}")));
         // Dither-level: real energy for the stack, inaudible to the user (~-57 dBFS).
         assert!(
-            NOTIFICATION_PREROLL_PEAK_AMPLITUDE > 0.0
-                && NOTIFICATION_PREROLL_PEAK_AMPLITUDE < 0.002,
-            "the pre-roll must stay at a dither-level noise floor"
+            NOTIFICATION_DITHER_PEAK_AMPLITUDE > 0.0 && NOTIFICATION_DITHER_PEAK_AMPLITUDE < 0.002,
+            "the keepalive must stay at a dither-level noise floor"
+        );
+        // …and it spans the WHOLE chime, pre-roll to flush tail. A front-only
+        // pre-roll leaves every note after the first exposed: the tune is
+        // mostly silence by duration, and an aggressive A2DP sink sleeps on
+        // digital silence and then clips whatever wakes it.
+        let whole_span = format!(
+            "const keepaliveSeconds = preroll + {} + {};",
+            notification_audio::notes_duration_seconds(
+                notification_audio::tone_notes(notification_audio::ChimeTone::Success),
+                notification_audio::tone_ring(notification_audio::ChimeTone::Success),
+                notification_audio::tone_tail_cut(notification_audio::ChimeTone::Success),
+            ),
+            notification_audio::FLUSH_TAIL_SECONDS,
+        );
+        assert!(
+            script.contains(&whole_span),
+            "the keepalive must span pre-roll + chime + flush tail ({whole_span}); a \
+             front-only pre-roll lets the link sleep again before the later notes",
         );
 
         let (event, payload) = notification_preroll_telemetry(NotificationTone::Success, applied);
@@ -135602,16 +135713,242 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(payload["applied"], json!(true));
         assert_eq!(payload["reason"], json!("cold_link"));
         assert_eq!(payload["tone"], json!("success"));
-        assert_eq!(payload["preroll_ms"], json!(400));
+        assert_eq!(
+            payload["preroll_ms"],
+            json!((notification_audio::PREROLL_SECONDS * 1000.0).round() as u64),
+        );
+        assert_eq!(payload["preroll_ms"], json!(700));
 
         let skipped = notification_preroll_decision(1_000, Some(900));
         let skipped_script = notification_chime_script(NotificationTone::Info, skipped);
-        assert!(!skipped_script.contains("prerollBuffer"));
+        assert!(skipped_script.contains("const preroll = 0.000;"));
         let (_, skipped_payload) = notification_preroll_telemetry(NotificationTone::Info, skipped);
         assert_eq!(skipped_payload["applied"], json!(false));
         assert_eq!(skipped_payload["reason"], json!("link_still_awake"));
         assert_eq!(skipped_payload["preroll_ms"], json!(0));
         assert_eq!(skipped_payload["since_last_ms"], json!(100));
+    }
+
+    /// The two defects found by hand on the live host 2026-07-26, each locked so
+    /// it cannot come back. BOTH were invisible from outside the webview, which
+    /// is why `server app audio state` reads the record this script leaves.
+    #[test]
+    fn the_chime_resumes_a_suspended_context_and_never_closes_it() {
+        for tone in [
+            NotificationTone::Info,
+            NotificationTone::Success,
+            NotificationTone::Warning,
+            NotificationTone::Error,
+        ] {
+            let script = notification_chime_script(tone, notification_preroll_decision(0, None));
+
+            // DEFECT 1 — silently dropped chimes. WebKitGTK starts an
+            // AudioContext SUSPENDED until a real user gesture. Nothing called
+            // resume(), so every chime played while the user was away was
+            // scheduled onto a stopped clock and never heard: the call
+            // succeeded and there was no sound.
+            assert!(
+                script.contains(r#"if (ctx.state === "suspended")"#),
+                "the chime must notice a suspended context",
+            );
+            assert!(
+                script.contains("await ctx.resume()"),
+                "the chime must resume a suspended context, and WAIT for it — \
+                 scheduling against ctx.currentTime before the resume lands \
+                 anchors the whole timeline on a stopped clock",
+            );
+            assert!(
+                script.contains("resumeOutcome"),
+                "the resume outcome must be reported, or this is undiagnosable \
+                 from outside the webview all over again",
+            );
+            // The resume has to happen BEFORE the timeline is anchored.
+            let resume_at = script.find("await ctx.resume()").expect("resume present");
+            let anchor_at = script
+                .find("const now = ctx.currentTime;")
+                .expect("timeline anchor present");
+            assert!(
+                resume_at < anchor_at,
+                "the timeline must be anchored AFTER the resume, not before",
+            );
+
+            // DEFECT 2 — clipped ending. The context used to be closed 80 ms
+            // after the last note while a Bluetooth sink still held 100-300 ms
+            // of buffered audio, so the tail was cut off mid-chime.
+            assert!(
+                !script.contains("ctx.close()"),
+                "the chime must NOT close its context — a Bluetooth sink holds \
+                 100-300 ms of buffered audio after the last note, and closing \
+                 at +80 ms is exactly the clipped ending the user reported",
+            );
+            assert!(
+                script.contains("w.__yggtermAudioCtx"),
+                "the context must be long-lived and reused, which also keeps the \
+                 A2DP link warm",
+            );
+        }
+    }
+
+    /// The diagnostic must exist EXACTLY when the chime fails, not only when it
+    /// works. It used to be the last statement of the try, with an empty catch:
+    /// a chime that threw left no record at all, so the one case worth
+    /// diagnosing was indistinguishable from "the script never ran" — in a lane
+    /// whose whole thesis is "never a silent failure".
+    #[test]
+    fn a_chime_that_throws_still_leaves_a_record_naming_the_error() {
+        for tone in [
+            NotificationTone::Info,
+            NotificationTone::Success,
+            NotificationTone::Warning,
+            NotificationTone::Error,
+        ] {
+            let script = notification_chime_script(tone, notification_preroll_decision(0, None));
+            let (before, after) = script
+                .split_once("} catch (chimeError) {")
+                .expect("the chime's outer catch must be findable to be checked");
+            assert!(
+                before.contains("w.__yggtermChimeAudio"),
+                "{tone:?}: a chime that WORKS must still record its outcome",
+            );
+            assert!(
+                after.contains("w.__yggtermChimeAudio"),
+                "{tone:?}: the catch is empty — a chime that FAILS leaves no record, \
+                 which is exactly the case worth diagnosing",
+            );
+            assert!(
+                after.contains("chimeError.name"),
+                "{tone:?}: the failure record must name the error, or it says only \
+                 'something went wrong'",
+            );
+            assert!(
+                before.contains("ok: true") && after.contains("ok: false"),
+                "{tone:?}: the reader must be able to tell a success record from a \
+                 failure record without guessing",
+            );
+        }
+    }
+
+    /// The tune has exactly ONE owner. Two players exist now (this script and
+    /// the native CLI renderer); if the script could spell its own notes they
+    /// would drift into two different chimes.
+    #[test]
+    fn the_chime_script_plays_the_registry_tune_and_spells_no_notes_of_its_own() {
+        for (tone, chime_tone) in [
+            (NotificationTone::Info, notification_audio::ChimeTone::Info),
+            (
+                NotificationTone::Success,
+                notification_audio::ChimeTone::Success,
+            ),
+            (
+                NotificationTone::Warning,
+                notification_audio::ChimeTone::Warning,
+            ),
+            (
+                NotificationTone::Error,
+                notification_audio::ChimeTone::Error,
+            ),
+        ] {
+            assert_eq!(notification_chime_tone(tone), chime_tone);
+            let script = notification_chime_script(tone, notification_preroll_decision(0, None));
+            let expected =
+                notification_audio::notes_json(notification_audio::tone_notes(chime_tone));
+            assert!(
+                script.contains(&expected),
+                "{tone:?}: the script must embed the registry's notes ({expected})",
+            );
+            // The ENVELOPE is the registry's too, not a second set of numbers.
+            // It is a measured table with a sustain shoulder — two Web Audio
+            // ramps cannot express it, so the script walks the registry's
+            // breakpoints.
+            let ring = notification_audio::tone_ring(chime_tone);
+            let cut = notification_audio::tone_tail_cut(chime_tone);
+            let envelope = notification_audio::envelope_json(ring, cut);
+            assert!(
+                script.contains(&envelope),
+                "{tone:?}: the script must embed the registry's envelope",
+            );
+            assert!(
+                script.contains(&format!("start + {}", notification_audio::ATTACK_SECONDS)),
+                "{tone:?}: attack must come from the registry",
+            );
+            assert!(
+                !script.contains("exponentialRampToValueAtTime"),
+                "{tone:?}: an exponential ramp cannot reproduce the measured \
+                 sustain shoulder — that shoulder is the difference between a \
+                 cabin chime and a beep",
+            );
+        }
+    }
+
+    /// ⚠ THE LOCK ABOVE IS NOT ENOUGH ON ITS OWN, and finding that out is why
+    /// this exists: a byte-identical second copy of the tune pasted into the
+    /// template satisfies every `script.contains(…)` assertion, because the
+    /// copy renders the same bytes the registry would have. Agreement on the
+    /// OUTPUT cannot distinguish "read the registry" from "duplicated it".
+    ///
+    /// So this reads the SOURCE. `notification_chime_script` must contain no
+    /// number of its own ANYWHERE in its body — not in the JS it emits and not
+    /// in the Rust that feeds it, because a duplicate pasted on either side
+    /// renders the same bytes. Every tune value has to arrive through a
+    /// `notification_audio::` call, which is a property only the source shows.
+    #[test]
+    fn the_chime_script_template_spells_no_tune_numbers_in_its_source() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shell.rs"))
+            .expect("the chime script's own source must be readable");
+        let start = source
+            .find("fn notification_chime_script(")
+            .expect("notification_chime_script must exist — a lock that cannot fail is worthless");
+        let tail = &source[start..];
+        // A top-level item always starts at column 0, so the next one ends this
+        // function. Take whichever marker comes first.
+        let end = ["\nfn ", "\n/// "]
+            .iter()
+            .filter_map(|marker| tail[1..].find(marker).map(|at| at + 1))
+            .min()
+            .expect("notification_chime_script must be followed by another item");
+        let body: Vec<char> = tail[..end].chars().collect();
+        assert!(
+            body.len() > 1_000,
+            "the chime template shrank to {} chars — this lock would pass vacuously",
+            body.len(),
+        );
+
+        for index in 1..body.len().saturating_sub(1) {
+            if body[index] == '.'
+                && body[index - 1].is_ascii_digit()
+                && body[index + 1].is_ascii_digit()
+            {
+                let from = index.saturating_sub(60);
+                let to = (index + 60).min(body.len());
+                let context: String = body[from..to].iter().collect();
+                panic!(
+                    "the chime template spells a number of its own — every tune value must \
+                     arrive from notification_audio, or the tune has two owners again: …{context}…",
+                );
+            }
+        }
+
+        // …and the values that DO arrive must be the tune's, so the scan above
+        // cannot pass by the template simply not playing anything.
+        let body: String = body.into_iter().collect();
+        for placeholder in ["{notes}", "{envelope}", "{attack}", "{dither}"] {
+            assert!(
+                body.contains(placeholder),
+                "the chime template must take {placeholder} from the registry",
+            );
+        }
+        for owner_call in [
+            "notification_audio::notes_json",
+            "notification_audio::envelope_json",
+            "notification_audio::ATTACK_SECONDS",
+            "notification_audio::tone_ring",
+            "notification_audio::tone_tail_cut",
+        ] {
+            assert!(
+                body.contains(owner_call),
+                "the chime template must read {owner_call} rather than restate it",
+            );
+        }
     }
 
     #[test]
