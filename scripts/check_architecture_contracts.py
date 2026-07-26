@@ -299,9 +299,8 @@ def check_ui_telemetry_contract() -> None:
     telemetry = read("crates/yggterm-shell/src/ui_telemetry.rs")
     for needle in [
         "const UI_TELEMETRY_FILENAME",
-        "const UI_TELEMETRY_ROTATED_FILENAME",
-        "const UI_TELEMETRY_MAX_BYTES",
-        "append_bounded_jsonl_record",
+        "const UI_TELEMETRY_RETENTION",
+        "append_retained_jsonl_record",
     ]:
         if needle in shell:
             fail(
