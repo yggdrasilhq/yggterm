@@ -338,6 +338,36 @@ LIVE_HOST=$(cat .agents/config/live-host)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | python3 -m json.tool 2>/dev/null || true
 ```
 
+### `handover_paint` — is the terminal deliberately not drawing? (2026-07-26)
+
+A daemon handover re-resumes every session on a fresh PTY, and that repaint
+storm is the GUI host's most expensive minute. The client now DETECTS the
+handover from the daemon's own report and stops painting for its duration, so a
+frozen-looking viewport during a swap may be correct behaviour rather than a
+bug. Check before investigating:
+
+```json
+"handover_paint": { "paint_suspended": true, "suspended_for_ms": 4200,
+                    "suspend_ceiling_ms": 90000, "handoff_in_flight": true,
+                    "client_sessions_awaiting_adoption": true,
+                    "fingerprint": "pid=…:2.12.17|local://…",
+                    "suspend_count": 1, "last_transition": "suspended" }
+```
+
+- `paint_suspended: true` ⇒ **no PTY read, no `term.write`, no render-health
+  sampling, no visible paint**, and a static veil over the viewport. A
+  screenshot taken now shows the veil, not the terminal — it is not a capture
+  failure and not a blank-frame bug.
+- The predicate is the DAEMON'S own `preserved_terminal_owner_keys` intersected
+  with the runtime keys this client has mounted. Another agent's session
+  migrating on a lingering older daemon reads `handoff_in_flight: true` with
+  `client_sessions_awaiting_adoption: false` and veils nothing.
+- It resumes when the successor adopts our keys, when the status goes
+  unreadable, or at `suspend_ceiling_ms`. A suspension that hit the ceiling
+  latches its `fingerprint` into `resolved_fingerprint` and cannot re-arm.
+- Trace: component `daemon_handover`, events `handover_paint_suspended` /
+  `handover_paint_resumed` (one pair from `ShellState`, one per mounted bridge).
+
 ### Drag gestures — TWO independent ones, and they read differently
 
 The cwd tree and the contributed app rail (yedit's file list, ychrome's tabs)
