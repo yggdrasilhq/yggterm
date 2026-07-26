@@ -3445,9 +3445,13 @@ enum WebSurfaceBackgroundAction {
     /// Destroy it now: hold and lease have both lapsed and nothing vetoes.
     Reap,
     /// First backgrounded pass: stash it. `detach` unmaps it from the overlay
-    /// (hard stash); otherwise it stays attached below the glass and `throttle`
-    /// hides the inner webview so the page stops painting.
-    Stash { detach: bool, throttle: bool },
+    /// (hard stash); otherwise it stays attached below the glass and the inner
+    /// webview is hidden so the page stops painting. Either way the surface
+    /// ends the pass UNMAPPED, which is the only thing that makes its page
+    /// report `document.visibilityState: 'hidden'` and throttle itself — so
+    /// there is no second flag here: a surface being stashed is a surface
+    /// nobody is being shown, and hiding it is not optional.
+    Stash { detach: bool },
     /// Already stashed and not due: nothing to do this pass.
     Wait,
 }
@@ -3522,13 +3526,21 @@ fn web_surface_background_plan(
             ) {
                 WebSurfaceBackgroundAction::Reap
             } else if surface.stashed_at_ms.is_none() {
-                // A LEASED surface is an agent co-browsing in the background:
-                // leave it live rather than hiding its webview.
-                let leased = surface.lease_until_ms.is_some_and(|until| until > now_ms);
-                WebSurfaceBackgroundAction::Stash {
-                    detach,
-                    throttle: !leased,
-                }
+                // NOT conditional on the lease, and that inversion is the fix
+                // for the "agents make the host hot" family. A LEASE IS NOT A
+                // REVEAL: it is an agent's claim that the surface must keep
+                // EXISTING, and it says nothing about anyone LOOKING at it. The
+                // surfaces this pass is given are exactly the ones whose session
+                // is not active-visible on this client, so every one of them is
+                // a page nobody is being shown, and every one of them must be
+                // told so. The measured 0.85-core spinner was on a leased
+                // surface, which the old `throttle: !leased` exempted by
+                // construction — `web ensure` takes a lease unconditionally.
+                //
+                // The agent loses nothing: eval and capture run on a hidden
+                // view, and the drive path wakes it for the burst (see
+                // `WebSurfaceHost::engine_webview_for_injection`).
+                WebSurfaceBackgroundAction::Stash { detach }
             } else {
                 WebSurfaceBackgroundAction::Wait
             };
@@ -3653,7 +3665,7 @@ fn web_surface_reclaim_background_pass(
                     );
                 }
             }
-            WebSurfaceBackgroundAction::Stash { detach, throttle } => {
+            WebSurfaceBackgroundAction::Stash { detach } => {
                 let Some(entry) = applied.get_mut(key) else {
                     continue;
                 };
@@ -3670,10 +3682,9 @@ fn web_surface_reclaim_background_pass(
                     // background page burns a whole core (the "angry fan").
                     // Hide the inner webview so the page throttles
                     // (document.hidden) while the container stays attached for
-                    // an instant raise-reveal.
-                    if throttle {
-                        host.throttle_surface(native_id, true);
-                    }
+                    // an instant raise-reveal. UNCONDITIONAL: see the plan's
+                    // note on why a lease is not a reveal.
+                    host.throttle_surface(native_id, true);
                 }
                 entry.stashed_at_ms = Some(now_ms);
                 entry.visible = false;
@@ -4121,13 +4132,24 @@ mod web_surface_reclaim_locks {
         );
     }
 
-    /// The apply half. A soft stash is DEMOTE plus THROTTLE — demote alone
-    /// leaves a mapped WebKitGTK view burning a core on rAF, and a hard detach
-    /// throws away the instant switch-back the soft stash exists for. A LEASED
-    /// surface (an agent co-browsing in the background) is demoted but never
-    /// throttled: it is being watched.
+    /// The apply half. A soft stash is DEMOTE plus THROTTLE — demote alone is a
+    /// Z-ORDER move and leaves a mapped WebKitGTK view reporting
+    /// `visibilityState: 'visible'` to its page, which then keeps its rAF and
+    /// its CSS animations running at the compositor frame rate; a hard detach
+    /// throws away the instant switch-back the soft stash exists for.
+    ///
+    /// A LEASED surface is throttled TOO, and this assertion was deliberately
+    /// inverted from what it said before. The old rule ("the leased one is
+    /// being watched") read a lease as evidence of a VIEWER. It is not: a lease
+    /// is an agent's claim that the surface must keep EXISTING, `web ensure`
+    /// takes one unconditionally, and the surface that was measured burning
+    /// 0.85 cores on a single spinner — on a page nobody could even see a row
+    /// for — was leased, so the exemption covered exactly the case it needed to
+    /// catch. Hiding costs the agent nothing (eval and capture run on a hidden
+    /// view; injection wakes it for the burst), so there is no reason left to
+    /// exempt anything the user is not looking at.
     #[test]
-    fn a_soft_stash_demotes_and_throttles_while_a_leased_one_keeps_painting() {
+    fn a_soft_stash_demotes_and_throttles_every_unrevealed_surface_leased_or_not() {
         let mut applied = HashMap::new();
         applied.insert(
             ("live::y4-plain".to_string(), 0_u64),
@@ -4154,10 +4176,14 @@ mod web_surface_reclaim_locks {
         demoted.sort();
         assert_eq!(demoted, vec![31, 32], "both stay attached below the glass");
         assert!(host.stashed.is_empty(), "no headroom pressure, no detach");
+        let mut throttled = host.throttled.clone();
+        throttled.sort();
         assert_eq!(
-            host.throttled,
-            vec![(31, true)],
-            "the unleased page stops painting; the leased one is being watched"
+            throttled,
+            vec![(31, true), (32, true)],
+            "every surface this pass stashes is one nobody is being shown, so every \
+             one of them must be told so — a lease is a claim on EXISTENCE, never \
+             evidence of a viewer"
         );
         for key in [
             ("live::y4-plain".to_string(), 0_u64),
@@ -4449,6 +4475,109 @@ mod web_surface_reclaim_locks {
             media_impl.contains("self.desktop.web_surface_is_playing_audio(native_id)"),
             "the audio veto is reading something other than the engine:\n{media_impl}",
         );
+
+        // WHICH surfaces the pass is handed. Every surface it stashes is now
+        // hidden to its engine unconditionally, so the ONLY thing standing
+        // between the throttle and a page the user is looking at is this
+        // filter. Widen it and the pass blanks the active session.
+        let set_start = product
+            .iter()
+            .position(|line| line.trim() == "let mut backgrounded: Vec<(String, u64)> = applied")
+            .expect("the reconcile loop no longer builds its backgrounded set here");
+        let set = product[set_start..set_start + 5].join("\n");
+        assert!(
+            set.contains("!active_visible_sessions.contains(session.as_str())"),
+            "the reclaim pass is being handed surfaces that are NOT filtered by \
+             active-visibility — it hides everything it stashes, so this filter is \
+             the only thing keeping it off the revealed session:\n{set}",
+        );
+    }
+
+    /// THE OTHER RESIDUAL SEAM, and the one that had no lock at all. A surface
+    /// created for a session nobody is looking at is marked stashed in the same
+    /// breath, so the reclaim pass classifies it `Wait` on every later tick and
+    /// the throttle wired there can never reach it. A never-revealed surface
+    /// therefore has exactly ONE chance to be told it is off screen: its own
+    /// create. A fix that only edits the reclaim policy looks green here and
+    /// changes nothing on the live host for precisely the surface class the bug
+    /// is about.
+    ///
+    /// Same scan discipline as the lock above: PRODUCT lines only, so this
+    /// module's own text cannot satisfy the needles it names.
+    #[test]
+    fn the_headless_create_tells_the_engine_its_page_is_off_screen() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_surface_reclaim_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertions that name them",
+        );
+
+        // The create is TOLD whether anyone is being shown this surface. Passing
+        // a constant here is how a headless surface came up focused and
+        // painting; the engine decides page visibility from that same flag.
+        let open_start = product
+            .iter()
+            .position(|line| line.contains("match desktop.open_web_surface("))
+            .expect("the reconciler no longer opens surfaces through open_web_surface");
+        let open_end = product[open_start..]
+            .iter()
+            .position(|line| line.trim() == ") {")
+            .map(|offset| open_start + offset)
+            .expect("unterminated open_web_surface call");
+        let open_call = product[open_start..=open_end].join("\n");
+        assert!(
+            open_call.lines().any(|line| line.trim() == "want_visible,"),
+            "the create is no longer told whether this surface is being revealed, \
+             so it cannot be born hidden:\n{open_call}",
+        );
+
+        // ...and the headless branch applies it to the ENGINE, not just to the
+        // Z-order. `demote` is a reorder; only hiding the inner webview makes
+        // WebKitGTK report the page hidden.
+        let anchor = product
+            .iter()
+            .position(|line| line.contains("\"native_open_headless\","))
+            .expect("the headless-create trace is gone — if the create moved, move this lock");
+        let branch_start = product[..anchor]
+            .iter()
+            .rposition(|line| line.trim() == "if !want_visible {")
+            .expect("the headless-create trace is no longer inside the !want_visible branch");
+        let branch_end = product[anchor..]
+            .iter()
+            .position(|line| line.trim() == "}")
+            .map(|offset| anchor + offset)
+            .expect("unterminated headless-create branch");
+        let branch = product[branch_start..=branch_end].join("\n");
+        assert!(
+            branch_end - branch_start > 6,
+            "the captured headless-create branch is too short to be the real one:\n{branch}",
+        );
+        for needle in [
+            // Z-order: never over the user's view.
+            "desktop.demote_web_surface(native_id)",
+            // Page visibility: the page is told it is off screen, so its rAF
+            // and its timers stop. Without this the surface reports
+            // `visibilityState: 'visible'` for its whole life.
+            "desktop.throttle_web_surface(native_id, true)",
+            // ...and the trace says which, so the fix is answerable from
+            // telemetry instead of inferred.
+            "\"engine_visible\": false,",
+        ] {
+            assert!(
+                branch.contains(needle),
+                "the headless create no longer does `{needle}`:\n{branch}",
+            );
+        }
     }
 }
 
@@ -4965,7 +5094,12 @@ fn web_surface_internal_page_label(url: &str) -> Option<&'static str> {
 struct WebSurfaceHandle {
     native_id: u64,
     generation: u64,
-    /// Shown in the overlay right now.
+    /// Shown in the overlay right now — and, since the engine derives page
+    /// visibility from widget mapping, also what the PAGE believes:
+    /// `visible: false` means `document.visibilityState === 'hidden'`, rAF
+    /// paused, timers throttled. There is no second flag for the engine's
+    /// opinion, because a second flag could disagree with this one.
+    /// `total - visible` is therefore the count of pages nobody is being shown.
     visible: bool,
     /// Soft-stashed: alive and addressable, detached from the overlay while
     /// its session is backgrounded. Sharpens the note below — a PRESENT entry
@@ -5033,8 +5167,19 @@ fn next_web_surface_generation() -> u64 {
 ///
 /// A missing entry means the surface is CLOSED or its background hold expired.
 /// It does NOT mean "backgrounded": under-glass soft stash keeps backgrounded
-/// surfaces attached, mapped and addressable for the whole hold — that is what
-/// makes shadow reach (acting on a session the user is not looking at) work.
+/// surfaces attached and ADDRESSABLE for the whole hold — that is what makes
+/// shadow reach (acting on a session the user is not looking at) work.
+///
+/// "Addressable" is not "mapped", and the difference matters. A surface nobody
+/// is being shown is deliberately UNMAPPED so its page reports
+/// `document.visibilityState: 'hidden'` and stops painting; that is the Page
+/// Visibility contract and it is the only thing that makes a background page
+/// cheap. Eval, page-state polling and element capture all run on an unmapped
+/// view unchanged. Injected input does not — an unmapped view silently drops
+/// synthesized events — so the engine host wakes a view IT hid for the length
+/// of an injection burst and re-hides it after
+/// (`WebSurfaceHost::engine_webview_for_injection`). Visibility gates
+/// RENDERING, never the drive path.
 static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<(String, u64), WebSurfaceHandle>>,
 > = std::sync::OnceLock::new();
@@ -6221,6 +6366,18 @@ async fn web_surface_native_reconcile_loop(
                                 // agent verbs reach it, but no pixel and no input
                                 // hole ever appear over the user's view.
                                 let _ = desktop.demote_web_surface(native_id);
+                                // Demote is a Z-ORDER move, not a visibility
+                                // one, and a never-revealed surface is marked
+                                // stashed right below — so the reclaim pass
+                                // classifies it `Wait` on every later tick and
+                                // the throttle wired there can NEVER reach it.
+                                // Without this line a surface nobody has ever
+                                // seen reports `visibilityState: 'visible'` for
+                                // its whole life and paints forever: one spinner
+                                // measured 0.85 cores that way. The engine is
+                                // told the truth here, at birth, by the same
+                                // owner that decided nobody is being shown it.
+                                let _ = desktop.throttle_web_surface(native_id, true);
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -6230,6 +6387,10 @@ async fn web_surface_native_reconcile_loop(
                                         "session_path": session_path,
                                         "tab_id": tab_id,
                                         "native_id": native_id,
+                                        // What the PAGE was told, so "is the
+                                        // surface throttled" is answerable from
+                                        // the trace instead of inferred.
+                                        "engine_visible": false,
                                     }),
                                 );
                             }
@@ -23115,6 +23276,12 @@ fn render_probe_shell_context(shell: &ShellState) -> RenderProbeShellContext {
 /// already carries them and the §3a baseline is read against them. The realized
 /// counts are ADDED alongside — a session with three tabs is one `web_surfaces`
 /// entry and three `web_surface_views`, and the CPU belongs to the three.
+///
+/// `web_surface_views_visible` is the page-visibility denominator: every view
+/// outside it has been told it is off screen, so its `rAF` is paused and its
+/// timers are throttled. A sample where it equals `web_surface_views` while the
+/// window shows one session is the shape of the bug this pair exists to make
+/// visible — pages painting for nobody.
 fn render_probe_context(
     shell: &RenderProbeShellContext,
     surfaces: WebSurfaceAppliedCounts,
@@ -50857,8 +51024,14 @@ fn web_do_mods_to_state(mods: &[String]) -> u32 {
 /// (reaches a soft-stashed/demoted one by `--session`), resolves selectors +
 /// maps document-space CSS coords to viewport CSS (the vendored layer applies
 /// page zoom → widget px), then delivers the event via GTK-level synthesis:
-/// `isTrusted: true`, NO seat pointer moved. Fails closed with
-/// `surface_not_mapped` on a fully-hidden surface (soft-stash keeps it mapped).
+/// `isTrusted: true`, NO seat pointer moved. A surface nobody is being shown is
+/// deliberately UNMAPPED (that is what makes its page report
+/// `visibilityState: 'hidden'` and stop painting), and those are most of the
+/// surfaces agents drive — so the engine host WAKES a view it hid for the length
+/// of an injection burst and re-hides it afterwards; visibility gates rendering,
+/// never the drive path. It still fails closed with `surface_not_mapped` for a
+/// surface the host did NOT hide — a detached hard stash, whose child cannot be
+/// mapped by showing it.
 /// The DOM event types whose arrival proves an action actually reached the page.
 /// One row per verb — the injector's own "I sent it" is not evidence.
 fn web_do_observed_event_types(action: &WebSurfaceDoAction) -> &'static [&'static str] {
