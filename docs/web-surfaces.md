@@ -97,9 +97,33 @@ destroyed five seconds after a switch, on a machine sitting on 45% free RAM —
 `detached:true swap_pressured:true hold_ms:5000`, alongside 53
 `background_hold_expired` closes, so the 600 s soft-stash hold has no recorded
 execution at all. The reclaim predicate reads current headroom (`MemAvailable`
-under 15% of `MemTotal`) or the kernel's PSI `some avg60` stall accounting. The
+under 15% of `MemTotal`) or the kernel's PSI **`full avg60`** stall accounting at
+or above 10% *while* headroom is already under 30% — `full` (every non-idle task
+stalled), never `some` (at least one task stalled, which a large build produces
+on a machine with gigabytes free), and headroom VETOES the PSI route because PSI
+is system-wide and says nothing about whose memory is short. An ABSENT snapshot
+reads FALSE: the action here is destroying the user's pages, and ignorance is not
+a licence to do that. The
 `native_stash` trace event now publishes `reclaim_pressured` and `media_active`
 so the decision is readable after the fact.
+
+#### Where the decision lives, and why it is one function
+
+`web_surface_reclaim_background_pass` is the ONE owner of a reclaim pass. The
+reconcile loop reads `/proc`, reads the configured hold, names its backgrounded
+surfaces and calls it; the pass gathers each surface's reap history and lease,
+asks `web_surface_background_plan`, and applies the answer through a
+`WebSurfaceBackgroundHost` (destroy / stash / demote / throttle / clear-loading /
+trace).
+
+That shape is not an aesthetic preference. Round 24 shipped the headroom
+predicate, the treadmill guard and the audio veto with tests that called the new
+helpers directly, and an adversarial review reverted all four production call
+sites with the suite still green — the wiring was the defect and no test could
+see the wiring, because the loop is `async` and holds a live `DesktopContext`.
+Anything that can hold a decision belongs in the pass; the live host impl is four
+one-line methods and is locked structurally by
+`the_reclaim_pass_call_site_is_wired_to_the_live_machine`. See field guide §7.1.
 
 ## The egress rule
 
