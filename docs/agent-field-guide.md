@@ -459,6 +459,15 @@ and by the incoming daemon before it imports a single row. Newest 32 kept;
 hand-made `pre-gui-restart-*` snapshots share the directory and are never swept.
 
 **Rules:**
+- **Report the number the USER can see: the LIVE SESSIONS count.** `server app
+  rows` returns a TREE, and a naive walk over every node carrying a `path`
+  also counts the `__live_sessions__` group header, each
+  `__remote_machine__/<name>` node, and the `local` node — six extras on the
+  live host as of 2026-07-26. That is how a single removal got reported as
+  "24 → 23" while the user's sidebar plainly said "18 → 17" (both true, same
+  event, different denominators; the user's is the product truth). Filter to
+  session paths, and if a count is going into a user-facing sentence, say
+  what it is a count OF.
 - Before adding, removing, or judging any row, read the ledger. It is the record;
   `server-state.json` is the current belief, and the whole ghost class is the two
   disagreeing.
