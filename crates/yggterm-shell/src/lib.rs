@@ -3,6 +3,10 @@
 mod agent_input_arbiter;
 mod app_capture;
 mod command_registry;
+// The ONE client-side owner of "a daemon handover is in progress, stop painting"
+// (user-settled call #7). Pure decision + fail-safes; `shell.rs` feeds it the
+// daemon's own status and honours its verdict.
+mod handover_gate;
 mod hot_update_policy;
 // The ALT+ KeyTips declaration model + assignment resolver (docs/alt-keytips.md).
 // Pure logic, unit-tested in isolation; the shell renders and drives it. Marked
