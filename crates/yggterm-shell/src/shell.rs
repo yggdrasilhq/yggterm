@@ -85404,7 +85404,160 @@ fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: Notificati
         }
     }
 }
-fn emit_notification_chime(tone: NotificationTone) {
+/// Bluetooth A2DP links power down between streams and clip roughly the first
+/// ~300 ms of the next one while the link wakes, which swallows the attack of
+/// every notification chime. 400 ms of pre-roll covers that with margin.
+const NOTIFICATION_PREROLL_SECONDS: f32 = 0.4;
+/// The pre-roll is NOISE, not silence. Several A2DP stacks discard pure digital
+/// silence (or never prime the link on it), so the pre-roll has to carry real
+/// energy. ~-57 dBFS peak (10^(-57/20) ≈ 0.0014 linear) is a dither-level noise
+/// floor: enough for a stack to treat as audio, far below anything audible.
+const NOTIFICATION_PREROLL_PEAK_AMPLITUDE: f32 = 0.0014;
+/// When a chime played within this window the A2DP link is still awake, so the
+/// pre-roll would only add latency to the alert. 10 s sits above the fastest
+/// headset idle timeouts we care about (~5 s) while still collapsing the common
+/// burst-of-notifications case to a single wake-up.
+const NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS: u64 = 10_000;
+
+/// SSOT for "when did a notification chime last reach the speakers".
+/// `emit_notification_chime` is the ONLY audio path in the GUI, so it is the
+/// only thing that can answer the question and the only thing that writes here.
+/// `0` = no chime has played in this process yet (a cold link).
+static NOTIFICATION_CHIME_LAST_PLAYED_MS: AtomicU64 = AtomicU64::new(0);
+
+fn notification_chime_last_played_ms() -> Option<u64> {
+    match NOTIFICATION_CHIME_LAST_PLAYED_MS.load(Ordering::Relaxed) {
+        0 => None,
+        played_at => Some(played_at),
+    }
+}
+
+fn record_notification_chime_played(now_ms: u64) {
+    NOTIFICATION_CHIME_LAST_PLAYED_MS.store(now_ms.max(1), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_notification_chime_last_played() {
+    NOTIFICATION_CHIME_LAST_PLAYED_MS.store(0, Ordering::Relaxed);
+}
+
+/// Why the Bluetooth pre-roll was or was not prepended to a chime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationPrerollReason {
+    /// Nothing has chimed in this GUI process yet — assume the link is cold.
+    ColdLink,
+    /// The last chime is older than the awake window — assume the link slept.
+    LinkLikelyAsleep,
+    /// A chime played inside the awake window — the link is still up.
+    LinkStillAwake,
+    /// The clock moved backwards (suspend/NTP step) so the elapsed time is not
+    /// knowable. A wasted 400 ms is harmless; a clipped alert is the bug.
+    ClockWentBackwards,
+}
+
+impl NotificationPrerollReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotificationPrerollReason::ColdLink => "cold_link",
+            NotificationPrerollReason::LinkLikelyAsleep => "link_likely_asleep",
+            NotificationPrerollReason::LinkStillAwake => "link_still_awake",
+            NotificationPrerollReason::ClockWentBackwards => "clock_went_backwards",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationPrerollDecision {
+    applied: bool,
+    reason: NotificationPrerollReason,
+    /// Milliseconds since the previous chime, when one is known.
+    since_last_ms: Option<u64>,
+}
+
+/// PURE: given the clock and the one recorded last-played stamp, decide whether
+/// this chime needs the Bluetooth wake-up pre-roll. No clock reads, no globals.
+fn notification_preroll_decision(
+    now_ms: u64,
+    last_played_ms: Option<u64>,
+) -> NotificationPrerollDecision {
+    let Some(last_played_ms) = last_played_ms else {
+        return NotificationPrerollDecision {
+            applied: true,
+            reason: NotificationPrerollReason::ColdLink,
+            since_last_ms: None,
+        };
+    };
+    if now_ms < last_played_ms {
+        return NotificationPrerollDecision {
+            applied: true,
+            reason: NotificationPrerollReason::ClockWentBackwards,
+            since_last_ms: None,
+        };
+    }
+    let since_last_ms = now_ms - last_played_ms;
+    if since_last_ms < NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS {
+        NotificationPrerollDecision {
+            applied: false,
+            reason: NotificationPrerollReason::LinkStillAwake,
+            since_last_ms: Some(since_last_ms),
+        }
+    } else {
+        NotificationPrerollDecision {
+            applied: true,
+            reason: NotificationPrerollReason::LinkLikelyAsleep,
+            since_last_ms: Some(since_last_ms),
+        }
+    }
+}
+
+/// The telemetry the pre-roll decision publishes, as `(event, payload)`, so the
+/// trace shape is locked by a test instead of only by the emit call site.
+fn notification_preroll_telemetry(
+    tone: NotificationTone,
+    decision: NotificationPrerollDecision,
+) -> (&'static str, Value) {
+    (
+        "notification_sound_preroll",
+        json!({
+            "applied": decision.applied,
+            "reason": decision.reason.as_str(),
+            "tone": notification_tone_label(tone),
+            "preroll_ms": if decision.applied {
+                (NOTIFICATION_PREROLL_SECONDS * 1000.0).round() as u64
+            } else {
+                0
+            },
+            "since_last_ms": decision.since_last_ms,
+            "awake_window_ms": NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS,
+        }),
+    )
+}
+
+/// Inverse of [`command_toast_tone`] — the same four names, so a trace row and
+/// a command payload always spell a tone the same way.
+fn notification_tone_label(tone: NotificationTone) -> &'static str {
+    match tone {
+        NotificationTone::Success => "success",
+        NotificationTone::Warning => "warning",
+        NotificationTone::Error => "error",
+        NotificationTone::Info => "info",
+    }
+}
+
+struct NotificationChimePlan {
+    script: String,
+    preroll: NotificationPrerollDecision,
+}
+
+/// PURE: the exact script the webview will run for this tone + pre-roll
+/// decision. The pre-roll and the chime share ONE `AudioContext` and one
+/// timeline anchored on a single `ctx.currentTime`, which is what makes the
+/// join gapless — there is no bundled asset and no second player process that
+/// could race the chime.
+fn notification_chime_script(
+    tone: NotificationTone,
+    preroll: NotificationPrerollDecision,
+) -> String {
     // Airplane cabin "bong": a high note falling to a low note, sine timbre with
     // a soft attack and a long mellow exponential tail — "soothing + alertful"
     // (user choice 2026-05-30). Single ding-dong for info/attention, double for
@@ -85422,12 +85575,46 @@ fn emit_notification_chime(tone: NotificationTone) {
         // Error: single low descending bong, somber
         NotificationTone::Error => "[[0.0,440.0,0.075],[0.20,329.63,0.075]]",
     };
-    let script = format!(
+    let preroll_seconds = if preroll.applied {
+        NOTIFICATION_PREROLL_SECONDS
+    } else {
+        0.0
+    };
+    let preroll_block = if preroll.applied {
+        format!(
+            r#"
+            // Bluetooth A2DP wake-up pre-roll: dither-level TPDF noise (NOT
+            // silence — several stacks drop silent frames and never prime the
+            // link), scheduled on the same context so the chime joins gapless.
+            const prerollFrames = Math.max(1, Math.round(ctx.sampleRate * preroll));
+            const prerollBuffer = ctx.createBuffer(1, prerollFrames, ctx.sampleRate);
+            const prerollData = prerollBuffer.getChannelData(0);
+            for (let i = 0; i < prerollFrames; i += 1) {{
+              // TPDF (triangular) dither: two uniform draws summed, zero-centred.
+              prerollData[i] = (Math.random() + Math.random() - 1) * {peak};
+            }}
+            const prerollSource = ctx.createBufferSource();
+            const prerollGain = ctx.createGain();
+            prerollSource.buffer = prerollBuffer;
+            prerollGain.gain.setValueAtTime(1, now);
+            prerollSource.connect(prerollGain);
+            prerollGain.connect(ctx.destination);
+            prerollSource.start(now);
+            prerollSource.stop(now + preroll);
+"#,
+            peak = NOTIFICATION_PREROLL_PEAK_AMPLITUDE,
+        )
+    } else {
+        String::new()
+    };
+    format!(
         r#"
         (() => {{
           try {{
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const now = ctx.currentTime;
+            const preroll = {preroll_seconds:.3};
+{preroll_block}
             const notes = {notes};
             let endAt = now;
             notes.forEach(([t, freq, peak]) => {{
@@ -85435,7 +85622,7 @@ fn emit_notification_chime(tone: NotificationTone) {
               const g = ctx.createGain();
               osc.type = "sine";
               osc.frequency.value = freq;
-              const start = now + t;
+              const start = now + preroll + t;
               g.gain.setValueAtTime(0, start);
               g.gain.linearRampToValueAtTime(peak, start + 0.025);
               g.gain.exponentialRampToValueAtTime(0.0008, start + 1.15);
@@ -85450,8 +85637,40 @@ fn emit_notification_chime(tone: NotificationTone) {
           }} catch (_error) {{}}
         }})();
         "#
-    );
-    let _ = document::eval(&script);
+    )
+}
+
+/// PURE: decision + script for one chime. Split out from the emitter so the
+/// decision→script wiring is observable without a webview.
+fn notification_chime_plan(
+    tone: NotificationTone,
+    now_ms: u64,
+    last_played_ms: Option<u64>,
+) -> NotificationChimePlan {
+    let preroll = notification_preroll_decision(now_ms, last_played_ms);
+    NotificationChimePlan {
+        script: notification_chime_script(tone, preroll),
+        preroll,
+    }
+}
+
+/// The whole emit path minus `document::eval`: read the one last-played owner,
+/// decide, publish the trace, and record that this chime played. Tests drive
+/// THIS so the shared-state wiring is exercised, not just the pure helpers.
+fn advance_notification_chime(tone: NotificationTone, now_ms: u64) -> NotificationChimePlan {
+    let plan = notification_chime_plan(tone, now_ms, notification_chime_last_played_ms());
+    let (event, payload) = notification_preroll_telemetry(tone, plan.preroll);
+    append_ui_telemetry_event(event, payload);
+    record_notification_chime_played(now_ms);
+    plan
+}
+
+/// The GUI's ONLY audio path. Callers gate on the notification-sound settings
+/// before reaching here, so a disabled chime emits no pre-roll either — the
+/// pre-roll lives inside the chime script and cannot exist without it.
+fn emit_notification_chime(tone: NotificationTone) {
+    let plan = advance_notification_chime(tone, current_millis());
+    let _ = document::eval(&plan.script);
 }
 fn emit_system_notification(title: &str, message: &str) {
     let _ = send_user_notification(title, message);
@@ -133085,6 +133304,136 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // A recovered re-ready of the same attempt must NOT log a duplicate.
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again");
         assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    /// The Bluetooth pre-roll lock. Everything that touches the ONE last-played
+    /// owner lives in this single test on purpose: the owner is a process
+    /// global, so splitting these assertions across `#[test]`s would let the
+    /// parallel test runner interleave them and make the lock non-deterministic.
+    #[test]
+    fn notification_preroll_wakes_a_cold_bluetooth_link_and_skips_while_it_is_awake() {
+        reset_notification_chime_last_played();
+
+        // (1) Sound off ⇒ no chime ⇒ no pre-roll. Proven through the real gate
+        // in `push_notification`: a muted notification must not even record a
+        // speaker wake-up, let alone emit noise.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://preroll-muted");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.push_notification(NotificationTone::Info, "Muted", "no sound, no pre-roll");
+        assert!(
+            notification_chime_last_played_ms().is_none(),
+            "a notification with sound off must never reach the audio path"
+        );
+
+        // (2) Fresh boot: nothing has played, so the A2DP link is assumed cold
+        // and the chime gets its 400 ms wake-up pre-roll.
+        let base = 1_700_000_000_000u64;
+        let cold = advance_notification_chime(NotificationTone::Success, base);
+        assert!(cold.preroll.applied, "a cold link must get the pre-roll");
+        assert_eq!(cold.preroll.reason, NotificationPrerollReason::ColdLink);
+        assert_eq!(cold.preroll.since_last_ms, None);
+        assert!(cold.script.contains("prerollBuffer"));
+        assert!(cold.script.contains("const preroll = 0.400;"));
+
+        // (3) Two seconds later the link is still awake — skip the pre-roll so
+        // the alert is not delayed for nothing.
+        let warm = advance_notification_chime(NotificationTone::Info, base + 2_000);
+        assert!(
+            !warm.preroll.applied,
+            "an awake link must skip the pre-roll"
+        );
+        assert_eq!(
+            warm.preroll.reason,
+            NotificationPrerollReason::LinkStillAwake
+        );
+        assert_eq!(warm.preroll.since_last_ms, Some(2_000));
+        assert!(!warm.script.contains("prerollBuffer"));
+        assert!(warm.script.contains("const preroll = 0.000;"));
+
+        // (4) 11 s after the COLD chime but only 9 s after the warm one. This
+        // is still a skip — and it is only a skip if a SKIPPED chime also
+        // updated the last-played owner, which is the wiring under test.
+        let still_warm = advance_notification_chime(NotificationTone::Info, base + 11_000);
+        assert!(
+            !still_warm.preroll.applied,
+            "the window must be measured from the LAST chime, skipped ones included"
+        );
+        assert_eq!(still_warm.preroll.since_last_ms, Some(9_000));
+
+        // (5) Past the window: assume the link slept, pre-roll returns.
+        let slept = advance_notification_chime(NotificationTone::Warning, base + 22_000);
+        assert!(
+            slept.preroll.applied,
+            "a slept link must get the pre-roll again"
+        );
+        assert_eq!(
+            slept.preroll.reason,
+            NotificationPrerollReason::LinkLikelyAsleep
+        );
+        assert_eq!(slept.preroll.since_last_ms, Some(11_000));
+        assert!(slept.script.contains("prerollBuffer"));
+
+        reset_notification_chime_last_played();
+    }
+
+    #[test]
+    fn notification_preroll_decision_holds_at_the_window_edge_and_on_a_backwards_clock() {
+        // Exactly at the edge the link is assumed to have slept.
+        let edge =
+            notification_preroll_decision(NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS, Some(0));
+        assert!(edge.applied);
+        assert_eq!(edge.reason, NotificationPrerollReason::LinkLikelyAsleep);
+        // One millisecond earlier it is still awake.
+        let inside =
+            notification_preroll_decision(NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS - 1, Some(0));
+        assert!(!inside.applied);
+        assert_eq!(inside.reason, NotificationPrerollReason::LinkStillAwake);
+        // A backwards clock step (suspend / NTP) must not read as "just played"
+        // and swallow the pre-roll — a wasted 400 ms beats a clipped alert.
+        let stepped = notification_preroll_decision(1_000, Some(5_000));
+        assert!(stepped.applied);
+        assert_eq!(
+            stepped.reason,
+            NotificationPrerollReason::ClockWentBackwards
+        );
+        assert_eq!(stepped.since_last_ms, None);
+    }
+
+    #[test]
+    fn the_preroll_is_inaudible_noise_on_the_chime_context_and_traces_its_decision() {
+        let applied = notification_preroll_decision(0, None);
+        let script = notification_chime_script(NotificationTone::Success, applied);
+        // ONE AudioContext, ONE timeline: the pre-roll cannot race the chime.
+        assert_eq!(script.matches("new (window.AudioContext").count(), 1);
+        assert!(script.contains("const start = now + preroll + t;"));
+        // Noise, NOT silence — several A2DP stacks never prime on digital silence.
+        assert!(script.contains("Math.random() + Math.random() - 1"));
+        assert!(script.contains(&format!("* {NOTIFICATION_PREROLL_PEAK_AMPLITUDE}")));
+        // Dither-level: real energy for the stack, inaudible to the user (~-57 dBFS).
+        assert!(
+            NOTIFICATION_PREROLL_PEAK_AMPLITUDE > 0.0
+                && NOTIFICATION_PREROLL_PEAK_AMPLITUDE < 0.002,
+            "the pre-roll must stay at a dither-level noise floor"
+        );
+
+        let (event, payload) = notification_preroll_telemetry(NotificationTone::Success, applied);
+        assert_eq!(event, "notification_sound_preroll");
+        assert_eq!(payload["applied"], json!(true));
+        assert_eq!(payload["reason"], json!("cold_link"));
+        assert_eq!(payload["tone"], json!("success"));
+        assert_eq!(payload["preroll_ms"], json!(400));
+
+        let skipped = notification_preroll_decision(1_000, Some(900));
+        let skipped_script = notification_chime_script(NotificationTone::Info, skipped);
+        assert!(!skipped_script.contains("prerollBuffer"));
+        let (_, skipped_payload) = notification_preroll_telemetry(NotificationTone::Info, skipped);
+        assert_eq!(skipped_payload["applied"], json!(false));
+        assert_eq!(skipped_payload["reason"], json!("link_still_awake"));
+        assert_eq!(skipped_payload["preroll_ms"], json!(0));
+        assert_eq!(skipped_payload["since_last_ms"], json!(100));
     }
 
     #[test]
