@@ -18,26 +18,37 @@
 //! CLI instead is a hole — the same class as `terminal_write_strategy_for_path`
 //! matching `remote-session://` only, which cost the user a typable session.
 //!
-//! **Today four of these axes ARE holes, and this table says so out loud.**
-//! They are recorded in [`RECORDED_SHELL_ARM_HOLES`] and locked in BOTH
-//! directions, the same contract as phase 0's `KNOWN_PREDICATE_HOLES` and the
-//! server matrix's `RECORDED_ARM_FORKS`: each hole is asserted to STILL
-//! reproduce, so the day phase 3 fixes one, this test goes red until its row is
-//! deleted. A ledger that can only pass is worth nothing.
+//! **This table shipped RED and is now GREEN — that was the point.** Phase 2b
+//! recorded five real holes here (four on the `remote-cc://` arm alone); phase 3
+//! closed all five by routing the predicates through the scheme registry, and
+//! [`RECORDED_SHELL_ARM_HOLES`] is now EMPTY. The both-directions contract from
+//! phase 0's `KNOWN_PREDICATE_HOLES` still runs, just in the other direction:
+//! each closed hole is asserted against the codex twin that always had the
+//! behaviour, so a regression re-opens as an unrecorded deviation instead of
+//! passing quietly. A ledger that can only pass is worth nothing.
 //!
 //! **What each cell is asserted against: the DECISION, never a restatement.**
 //! Every axis below calls the function the PRODUCT calls at the moment it
 //! decides — `terminal_mount_takes_remote_resume_readiness` (the mount's
 //! readiness fork), `terminal_reveal_seed_allows_authoritative_screen` (the
-//! retained-rehydrate seed), `codex_like_session` (the family predicate the seed
-//! gate reads). That is deliberate and was a review finding: an earlier cut
-//! asserted the `codex_like` cell against a test-local
-//! `matches!(kind, Codex | CodexLiteLlm)`, which is a tautology — it reads no
-//! production code, so widening the product's own `codex_like_session`, or
-//! handing the seed policy a CC-inclusive bool at the call site, left this whole
-//! file GREEN while the ledger rows below went stale. A lock that can only pass
-//! is worth nothing; a lock that restates the code it is guarding is the same
-//! thing wearing an assertion.
+//! retained-rehydrate seed), `codex_like_session` (the narrow family predicate
+//! that gates the codex-only geometry fence and NO LONGER gates the seed). That
+//! is deliberate and was a review finding: an earlier cut asserted the
+//! `codex_like` cell against a test-local `matches!(kind, Codex | CodexLiteLlm)`,
+//! which is a tautology — it reads no production code, so widening the product's
+//! own `codex_like_session`, or handing the seed policy a CC-inclusive bool at
+//! the call site, left this whole file GREEN while the ledger rows below went
+//! stale. A lock that can only pass is worth nothing; a lock that restates the
+//! code it is guarding is the same thing wearing an assertion.
+//!
+//! **Three layers, three locks, because a fix can land at any of them.** The
+//! PREDICATE (`agent_scheme::remote_agent_row_schemes` and friends, read by
+//! `session_path_is_remote_agent_row`), the DECISION (the two functions named
+//! above), and the CALL SITE (which local the mount hands the seed policy). The
+//! per-axis tests below cover the first two by calling the decision; the third
+//! needs a source scan, because reverting only the call site re-opens the hole
+//! with every behavioural test still green — that is exactly what happened on
+//! 2026-07-27 and why `the_screen_fallback_call_site_…` exists.
 //!
 //! **Scope honesty.** The axes here are the ones reachable as pure functions.
 //! `resolve_active_open_mount_epoch` (the anti-churn epoch machinery, §7.10) is
@@ -57,7 +68,7 @@ use yggterm_server::{
 };
 
 use crate::shell::{
-    codex_like_session, is_remote_scanned_sidebar_row, remote_session_starts_new_codex,
+    codex_like_session, is_remote_scanned_sidebar_row, remote_session_starts_new_agent,
     session_path_names_remote_runtime_by_scheme, terminal_host_id_belongs_to_session,
     terminal_mount_host_id, terminal_mount_takes_remote_resume_readiness,
     terminal_reveal_seed_allows_authoritative_screen,
@@ -104,13 +115,18 @@ struct ShellArm {
 
     // ---- §7.6 attach seed ----
     /// On a plain InitialRead reveal, may the seed fall back to the daemon's
-    /// AUTHORITATIVE screen snapshot? Gated on `codex_like`, so CC is excluded
-    /// — the `remote-cc-replay-codex-only` / snapshot-poison axis.
+    /// AUTHORITATIVE screen snapshot? Was gated on `codex_like`, which excluded
+    /// CC — the `remote-cc-replay-codex-only` / snapshot-poison axis. Phase 3
+    /// widened the gate to every agent CLI, so every arm here reads `true`.
     replay_screen_fallback_on_initial_read: bool,
-    /// What shell.rs `codex_like_session(kind)` — the family predicate the gate
-    /// above reads — answers for this arm. Asserted against that FUNCTION, not
-    /// against a `matches!` retyped here, so widening the product's own answer
-    /// cannot leave this table green.
+    /// What shell.rs `codex_like_session(kind)` answers for this arm. It NO
+    /// LONGER feeds the seed gate above (phase 3 widened that to
+    /// `agent_cli_session`); it still gates the codex-specific resize/geometry
+    /// handoff, which must NOT include CC.
+    ///
+    /// Asserted against that FUNCTION, not against a `matches!` retyped here, so
+    /// widening the product's own answer cannot leave this table green — and so
+    /// the two locals cannot blur back into one.
     codex_like: bool,
 }
 
@@ -188,25 +204,22 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: false,
         remote_runtime_by_scheme: false,
         cold_launch_discriminated: false,
-        // ⚠ HOLE: codex_like excludes CC, so a local CC reveal never offers the
-        // authoritative screen. See RECORDED_SHELL_ARM_HOLES.
-        replay_screen_fallback_on_initial_read: false,
+        replay_screen_fallback_on_initial_read: true,
         codex_like: false,
     },
     ShellArm {
         kind: SessionKind::ClaudeCode,
         locality: Locality::Remote,
         row_scheme: "remote-cc://",
-        // ⚠ FOUR HOLES ON ONE ARM. Every cell below SHOULD read `true` — it is
-        // a remote agent session exactly like its codex twin — and every one of
-        // them reads the scheme `remote-session://` instead of asking about
-        // locality. This single arm is why the spec makes 2b a prerequisite for
-        // phase 3. See RECORDED_SHELL_ARM_HOLES.
-        remote_resume_readiness: false,
-        scanned_sidebar_row: false,
-        remote_runtime_by_scheme: false,
-        cold_launch_discriminated: false,
-        replay_screen_fallback_on_initial_read: false,
+        // Phase 3 (2026-07-27): this arm carried FOUR of the five holes — every
+        // cell below read `false` because four predicates hand-listed
+        // `remote-session://`. They now derive from the scheme registry, so a
+        // remote CC row resumes, scans and rehydrates like its codex twin.
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        replay_screen_fallback_on_initial_read: true,
         codex_like: false,
     },
 ];
@@ -231,58 +244,25 @@ struct RecordedShellArmHole {
     symptom: &'static str,
 }
 
-const RECORDED_SHELL_ARM_HOLES: &[RecordedShellArmHole] = &[
-    RecordedShellArmHole {
-        concern: "remote_resume_readiness: is_remote_resume_agent_session matches \
-                  remote-session:// only, so ClaudeCode/Remote gets NO readiness/overlay path",
-        spec: "§7.3",
-        recorded: "2026-07-26",
-        symptom: "a remote-cc session shows none of the ~8 remote-resume readiness signals — no \
-                  attach_ready, no stalled_remote_resume, no overlay dismissal, and the slower \
-                  default read-poll cadence — so a connecting or wedged remote-cc row looks \
-                  identical to a healthy one",
-    },
-    RecordedShellArmHole {
-        concern: "scanned_sidebar_row: is_remote_scanned_sidebar_row matches remote-session:// \
-                  only",
-        spec: "§7.3",
-        recorded: "2026-07-26",
-        symptom: "a remote-cc row shows no remote loading notice while its transport is still \
-                  coming up — the row reads as ready before it is",
-    },
-    RecordedShellArmHole {
-        concern: "remote_runtime_by_scheme: the scheme half of \
-                  terminal_session_uses_remote_runtime knows remote-session:// and ssh://, not \
-                  remote-cc://",
-        spec: "§7.3",
-        recorded: "2026-07-26",
-        symptom: "before a session view exists, a remote-cc path is classified as LOCAL; it only \
-                  becomes remote once a LiveSsh view is found, so every decision taken in that \
-                  window takes the local branch",
-    },
-    RecordedShellArmHole {
-        concern: "cold_launch_discriminated: remote_session_starts_new_codex has no start-cc twin",
-        spec: "§7.3",
-        recorded: "2026-07-26",
-        symptom: "a freshly STARTED remote-cc session is not distinguished from a RESUMED one, so \
-                  it gets the resume-flavoured reveal (which expects prior content) on a session \
-                  that has none",
-    },
-    RecordedShellArmHole {
-        concern: "replay_screen_fallback_on_initial_read: retained_rehydrate_allow_screen_fallback \
-                  is codex_like-gated, and codex_like excludes ClaudeCode on BOTH localities",
-        spec: "§7.6 / §7.10",
-        recorded: "2026-07-26",
-        symptom: "on a plain InitialRead reveal a CC session is never offered the daemon's \
-                  authoritative screen, so it falls back to its own sparse xterm snapshot — the \
-                  clipped / truncated-bottom paint. CC recovers only in \
-                  CollapsedScrollbackRecovery mode",
-    },
-];
+/// ✅ EMPTY as of 2026-07-27 (harness spec §8 phase 3).
+///
+/// All five holes this table recorded are CLOSED. The emptiness is the
+/// acceptance the spec asked for — "phase 3's acceptance is this file going
+/// green" — and the tests below still enforce BOTH directions, so a regression
+/// re-opens as an unrecorded deviation rather than passing quietly.
+const RECORDED_SHELL_ARM_HOLES: &[RecordedShellArmHole] = &[];
 
 impl ShellArm {
     fn name(&self) -> String {
         format!("{:?}/{:?}", self.kind, self.locality)
+    }
+
+    /// Every arm in this matrix is an agent CLI BY CONSTRUCTION — the table is
+    /// derived from `AGENT_CLIS`. Answered by `SessionKind::is_agent()`, which
+    /// phase 1a derives from the descriptor registry, so this cannot drift from
+    /// what the product calls an agent.
+    fn is_agent_cli(&self) -> bool {
+        self.kind.is_agent()
     }
 
     /// The row path this arm produces for the fixture session. Built from the
@@ -421,9 +401,10 @@ fn every_arm_gets_the_remote_resume_readiness_its_matrix_declares() {
             terminal_mount_takes_remote_resume_readiness(&session),
             arm.remote_resume_readiness,
             "{}: remote-resume readiness drifted from the matrix. This gate drives ~8 downstream \
-             signals (attach_ready, stalled_remote_resume, overlay dismissal, read-poll cadence) \
-             — if this arm now gets them, delete its RECORDED_SHELL_ARM_HOLES row in the same \
-             commit (spec §7.3)",
+             signals (attach_ready, stalled_remote_resume, overlay dismissal, read-poll cadence). \
+             Every REMOTE arm must get them — a `false` here on a remote arm is the §7.3 hole \
+             re-opening; a deliberate fork needs a RECORDED_SHELL_ARM_HOLES row with its \
+             user-visible symptom (spec §7.3)",
             arm.name(),
         );
     }
@@ -459,7 +440,7 @@ fn every_arm_cold_launch_is_discriminated_as_its_matrix_says() {
     for arm in SHELL_ARMS {
         let session = arm.session_view(arm.cold_launch_action());
         assert_eq!(
-            remote_session_starts_new_codex(&session),
+            remote_session_starts_new_agent(&session),
             arm.cold_launch_discriminated,
             "{}: the cold-launch (start vs resume) discriminator drifted from the matrix. A \
              STARTED session has no prior content; a RESUMED one does, and the reveal differs \
@@ -472,9 +453,21 @@ fn every_arm_cold_launch_is_discriminated_as_its_matrix_says() {
 #[test]
 fn every_arm_seeds_its_attach_the_way_its_matrix_says() {
     for arm in SHELL_ARMS {
+        // The gate takes "is this an agent CLI", NOT "is this codex-like".
+        // Passing `codex_like` is what denied CC the authoritative screen for as
+        // long as the hole existed, so the derivation is asserted first: every
+        // arm in this table IS an agent CLI, therefore every cell below reads
+        // `true` and a `false` one is the hole re-opening.
+        assert!(
+            arm.is_agent_cli(),
+            "{}: every arm in this matrix must be an agent CLI — the table is derived from \
+             AGENT_CLIS, so a non-agent arm means the derivation broke",
+            arm.name(),
+        );
         // Asked by SessionKind, exactly as the retained-rehydrate task asks it.
-        // Passing `arm.codex_like` to the policy function instead would lock the
-        // policy while leaving the seed DECISION free to change under it.
+        // Passing a bool to the policy function instead would lock the policy
+        // while leaving the seed DECISION free to change under it — which is how
+        // three different real fixes each landed with this file green.
         assert_eq!(
             terminal_reveal_seed_allows_authoritative_screen(
                 RetainedRehydrateMode::InitialRead,
@@ -574,10 +567,12 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
     // turned red by mutating production, and it is NOT what makes holes 1-4
     // both-directions locks. That property comes from the per-axis tests above
     // (table cell vs the product's own decision function) plus
-    // `recorded_holes_still_reproduce_and_none_is_unrecorded` (the hole vs its
-    // locality twin). What THIS test adds is table/ledger integrity: it is the
-    // only place that says a deviating cell without a ledger row — or a ledger
-    // row without a deviating cell — is a bug.
+    // `every_closed_hole_stays_closed_and_the_ledger_is_empty` (the closed hole
+    // vs its locality twin). What THIS test adds is table/ledger integrity: it is
+    // the only place that says a deviating cell without a ledger row — or a
+    // ledger row without a deviating cell — is a bug. Phase 3 emptied the ledger,
+    // so both lists below are expected to be EMPTY, and this test is what makes
+    // that emptiness enforced rather than asserted in prose.
     let mut deviations = Vec::new();
     let mut deviating_axes: Vec<&str> = Vec::new();
     for arm in SHELL_ARMS {
@@ -599,21 +594,17 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
 
     assert_eq!(
         deviations,
-        vec![
-            "ClaudeCode/Remote remote_resume_readiness",
-            "ClaudeCode/Remote scanned_sidebar_row",
-            "ClaudeCode/Remote remote_runtime_by_scheme",
-            "ClaudeCode/Remote cold_launch_discriminated",
-        ],
-        "the set of arms that fork on CLI rather than locality changed. Every deviation must be \
-         a RECORDED_SHELL_ARM_HOLES row; a new one here is an unrecorded regression, and a \
-         missing one means the hole was FIXED — delete its ledger row in the same commit \
-         (spec §7.3, phase 3)",
+        Vec::<String>::new(),
+        "a §7.3 axis forks on CLI rather than locality again. Phase 3 closed all four, so this \
+         list is expected to stay EMPTY: every entry here is a remote agent arm being denied \
+         something its locality twin gets. If a fork is ever deliberate it needs a \
+         RECORDED_SHELL_ARM_HOLES row with its user-visible symptom (spec §7.3)",
     );
 
     // …and the ledger is READ, not just referred to in prose. Each recorded
     // hole names its axis as the prefix of `concern`, so the §7.3 rows must be
-    // exactly the axes that deviated above.
+    // exactly the axes that deviated above — which, phase 3 having closed all
+    // four, means both sides are empty.
     let mut recorded_axes: Vec<&str> = RECORDED_SHELL_ARM_HOLES
         .iter()
         .filter(|hole| hole.spec.contains("§7.3"))
@@ -637,69 +628,181 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
     );
 }
 
+/// Hole 5's CALL-SITE lock, and it exists because the obvious lock was VACUOUS.
+///
+/// Three layers can each re-open hole 5 on their own, and the two above this one
+/// are behavioural: narrowing `agent_cli_session` (the PREDICATE) and
+/// re-narrowing `terminal_reveal_seed_allows_authoritative_screen` (the
+/// DECISION) both turn the per-arm seed assertions red. The third cannot: the
+/// mount can simply BYPASS the decision and call the policy function
+/// `retained_rehydrate_allow_screen_fallback` directly with the codex-only
+/// local, which is precisely what the code did before phase 3. That reverts the
+/// user-visible behaviour completely — a CC reveal goes back to its own sparse
+/// snapshot — while every behavioural test in this file stays GREEN, because
+/// none of them reads the call site (red-prove run 2026-07-27, R5).
+///
+/// So this lock reads the production source: the policy has exactly ONE caller
+/// in shell.rs, it is the seed decision, and the answer it is fed is the
+/// AGENT-CLI one. The two locals stay deliberately distinct —
+/// `codex_like_session_for_task` still gates the codex-specific resize/geometry
+/// fence, which must NOT include Claude Code — so "fed the codex local" is
+/// checked by name, not merely by absence.
 #[test]
-fn recorded_holes_still_reproduce_and_none_is_unrecorded() {
-    // Both directions, per the phase-0 burn-down contract. Each assertion below
-    // reproduces its hole against the PRODUCTION function, not against the
-    // table — the table is what drifts, the function is the truth.
+fn the_screen_fallback_call_site_passes_the_agent_cli_answer_not_the_codex_one() {
+    const POLICY: &str = "retained_rehydrate_allow_screen_fallback(";
+    const DECISION: &str = "terminal_reveal_seed_allows_authoritative_screen(";
+    let shell_src = include_str!("shell.rs");
+
+    let mut policy_call_sites = 0usize;
+    let mut cursor = 0usize;
+    while let Some(at) = shell_src[cursor..].find(POLICY) {
+        let start = cursor + at + POLICY.len();
+        let end = (start + 200).min(shell_src.len());
+        let args = &shell_src[start..end];
+        policy_call_sites += 1;
+        assert!(
+            args.contains("agent_cli_session("),
+            "the retained-rehydrate screen fallback must be fed the AGENT-CLI answer — every \
+             agent CLI repaints in place, so the daemon screen is the only authoritative \
+             content. Feeding it the codex-only answer re-opens harness hole 5 and sends every \
+             Claude Code reveal back to its own sparse snapshot (spec §7.6). Args were: {args}",
+        );
+        assert!(
+            !args.contains("codex_like_session"),
+            "the screen fallback is being fed the codex-only answer again (spec §7.6). Args \
+             were: {args}",
+        );
+        cursor = start;
+    }
+
+    assert_eq!(
+        policy_call_sites, 1,
+        "expected exactly ONE screen-fallback POLICY call site in shell.rs — the seed decision \
+         `terminal_reveal_seed_allows_authoritative_screen`. A second one is the mount bypassing \
+         the decision, which is how hole 5 was open in the first place and is invisible to every \
+         behavioural test in this file (spec §7.6)",
+    );
+
+    // …and the mount reaches that decision by handing it the session's CLI, not
+    // a bool it computed itself. A pre-computed bool is what let the fix be
+    // applied at the call site while the decision stayed narrow.
+    let reveal_call_site = shell_src
+        .match_indices(DECISION)
+        .map(|(at, _)| {
+            let start = at + DECISION.len();
+            &shell_src[start..(start + 200).min(shell_src.len())]
+        })
+        .find(|args| args.contains("retained_rehydrate_mode"))
+        .expect(
+            "the retained-rehydrate task must reach the seed through \
+             terminal_reveal_seed_allows_authoritative_screen(retained_rehydrate_mode, …)",
+        );
+    assert!(
+        reveal_call_site.contains("session_kind_for_task"),
+        "the reveal call site must pass the session's CLI to the seed decision, so that WHICH \
+         CLIs get the authoritative screen has exactly one place to change (spec §7.6). Args \
+         were: {reveal_call_site}",
+    );
+}
+
+#[test]
+fn every_closed_hole_stays_closed_and_the_ledger_is_empty() {
+    // The phase-0 burn-down contract, now running in the other direction. Until
+    // 2026-07-27 this test asserted each hole STILL reproduced, so a fix could
+    // not land silently. The holes are closed, so it now asserts they STAY
+    // closed — each against the codex twin that always had the behaviour, so
+    // this cannot pass by everything being uniformly broken.
     let cc_remote = SHELL_ARMS
         .iter()
         .find(|arm| arm.kind == SessionKind::ClaudeCode && arm.locality == Locality::Remote)
-        .expect("the CC remote arm is where these holes live");
+        .expect("the CC remote arm is where these holes lived");
     let codex_remote = SHELL_ARMS
         .iter()
         .find(|arm| arm.kind == SessionKind::Codex && arm.locality == Locality::Remote)
         .expect("the codex remote arm is the twin these are measured against");
 
-    // Holes 1-4: the CC remote arm is denied what its codex twin gets, on four
-    // axes. Asserting the TWIN's answer in the same breath is what makes this a
-    // hole rather than a global "nothing is ready yet".
+    // Hole 1 (§7.3 readiness) — drives ~8 downstream signals.
     assert!(
         terminal_mount_takes_remote_resume_readiness(&codex_remote.session_view(None))
-            && !terminal_mount_takes_remote_resume_readiness(&cc_remote.session_view(None)),
-        "hole 1 (§7.3 readiness) no longer reproduces — delete its RECORDED_SHELL_ARM_HOLES row \
-         and flip the matrix cell in the same commit",
-    );
-    assert!(
-        is_remote_scanned_sidebar_row(&codex_remote.sidebar_row())
-            && !is_remote_scanned_sidebar_row(&cc_remote.sidebar_row()),
-        "hole 2 (§7.3 scanned sidebar row) no longer reproduces — delete its ledger row",
-    );
-    assert!(
-        session_path_names_remote_runtime_by_scheme(&codex_remote.row_path())
-            && !session_path_names_remote_runtime_by_scheme(&cc_remote.row_path()),
-        "hole 3 (§7.3 remote runtime by scheme) no longer reproduces — delete its ledger row",
-    );
-    assert!(
-        remote_session_starts_new_codex(
-            &codex_remote.session_view(codex_remote.cold_launch_action())
-        ) && !remote_session_starts_new_codex(
-            &cc_remote.session_view(cc_remote.cold_launch_action())
-        ),
-        "hole 4 (§7.3 cold-launch discriminator) no longer reproduces — there is now a start-cc \
-         twin; delete its ledger row",
+            && terminal_mount_takes_remote_resume_readiness(&cc_remote.session_view(None)),
+        "hole 1 re-opened: a remote CC session is denied the remote-resume readiness path its \
+         codex twin gets, so a connecting or wedged remote-cc row looks identical to a healthy \
+         one",
     );
 
-    // Hole 5: the seed gate excludes CC on BOTH localities, so it is asserted
-    // against the CLI axis (CC vs its codex twin) rather than a locality twin.
-    // Asked through the seed DECISION, so widening `codex_like_session` and
-    // widening the decision itself both land here.
+    // Hole 2 (§7.3 scanned sidebar row) — the remote loading notice.
     assert!(
-        !terminal_reveal_seed_allows_authoritative_screen(
+        is_remote_scanned_sidebar_row(&codex_remote.sidebar_row())
+            && is_remote_scanned_sidebar_row(&cc_remote.sidebar_row()),
+        "hole 2 re-opened: a remote CC row shows no loading notice while its transport comes up, \
+         so it reads as ready before it is",
+    );
+
+    // Hole 3 (§7.3 remote runtime by scheme) — the only half that answers
+    // before a session view exists.
+    assert!(
+        session_path_names_remote_runtime_by_scheme(&codex_remote.row_path())
+            && session_path_names_remote_runtime_by_scheme(&cc_remote.row_path()),
+        "hole 3 re-opened: a remote CC path is classified LOCAL until a LiveSsh view is found, so \
+         every decision taken in that window takes the local branch",
+    );
+
+    // Hole 4 (§7.3 cold-launch discriminator) — start vs resume.
+    assert!(
+        remote_session_starts_new_agent(
+            &codex_remote.session_view(codex_remote.cold_launch_action())
+        ) && remote_session_starts_new_agent(
+            &cc_remote.session_view(cc_remote.cold_launch_action())
+        ),
+        "hole 4 re-opened: a freshly STARTED remote CC session is not distinguished from a \
+         resumed one, so it gets the resume-flavoured reveal on a session with no prior content",
+    );
+    // …and the discriminator must still say NO to a resume, or it would be
+    // trivially satisfied by answering `true` for everything.
+    assert!(
+        !remote_session_starts_new_agent(&cc_remote.session_view(Some("resume-cc")))
+            && !remote_session_starts_new_agent(&codex_remote.session_view(Some("resume-codex")))
+            && !remote_session_starts_new_agent(&cc_remote.session_view(None)),
+        "the cold-launch discriminator must distinguish START from RESUME, not answer true for \
+         every remote agent row",
+    );
+
+    // Hole 5 (§7.6 screen fallback) — was codex_like-gated, so CC got no
+    // authoritative screen on a plain InitialRead reveal, on BOTH localities.
+    // Asked through the seed DECISION rather than the policy function under it,
+    // so re-narrowing the decision AND narrowing `agent_cli_session` both land
+    // here; the CALL SITE is the third way in and has its own lock below.
+    assert!(
+        terminal_reveal_seed_allows_authoritative_screen(
             RetainedRehydrateMode::InitialRead,
             SessionKind::ClaudeCode,
         ) && terminal_reveal_seed_allows_authoritative_screen(
             RetainedRehydrateMode::InitialRead,
             SessionKind::Codex,
         ),
-        "hole 5 (§7.6 codex-only screen fallback) no longer reproduces — delete its ledger row",
+        "hole 5 re-opened: an agent CLI reveal is not offered the daemon's authoritative screen \
+         on InitialRead, so it falls back to its own sparse snapshot — the clipped, \
+         truncated-bottom paint",
+    );
+    // A PLAIN SHELL is deliberately unchanged: it streams real scrollback, so
+    // the retained payload is the right seed and the daemon screen is not.
+    // Without this, "widen the gate" would have quietly become "remove it".
+    assert!(
+        !terminal_reveal_seed_allows_authoritative_screen(
+            RetainedRehydrateMode::InitialRead,
+            SessionKind::Shell,
+        ) && !terminal_reveal_seed_allows_authoritative_screen(
+            RetainedRehydrateMode::InitialRead,
+            SessionKind::SshShell,
+        ),
+        "the screen fallback was widened past agent CLIs — a plain shell must still seed from \
+         its retained payload on an InitialRead",
     );
 
-    assert_eq!(
-        RECORDED_SHELL_ARM_HOLES.len(),
-        5,
-        "a hole was added or removed without updating this count — every recorded hole needs a \
-         symptom, and every symptom needs an assertion above that proves it still reproduces",
+    assert!(
+        RECORDED_SHELL_ARM_HOLES.is_empty(),
+        "a hole was recorded without an assertion above proving it still reproduces — the ledger \
+         is empty as of phase 3, and anything added to it needs its own both-directions lock",
     );
     for hole in RECORDED_SHELL_ARM_HOLES {
         assert!(
