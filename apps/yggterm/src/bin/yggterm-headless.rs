@@ -12,46 +12,42 @@ use yggterm_core::{
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-    ScreenshotPostProcess,
-    SessionKind, SshConnectTarget, default_endpoint, detect_ghostty_host,
+    ScreenshotPostProcess, SessionKind, SshConnectTarget, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, fetch_remote_generation_context,
     persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
-    run_app_control_move_window_by, run_app_control_open_path,
-    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_dom_eval, run_app_control_grid, run_app_control_pointer,
+    run_app_control_create_split_group, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
+    run_app_control_dump_state, run_app_control_focus_split_pane, run_app_control_focus_window,
+    run_app_control_grid, run_app_control_invoke_command, run_app_control_key,
+    run_app_control_list_clients, run_app_control_list_commands, run_app_control_move_window_by,
+    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
+    run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
     run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_invoke_command, run_app_control_list_commands,
     run_app_control_reconcile_terminal_from_daemon, run_app_control_redraw_terminal,
-    run_app_control_remove_session,
-    run_app_control_rename_session, run_app_control_restart_session,
+    run_app_control_remove_session, run_app_control_rename_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
-    run_app_control_submit_terminal_prompt,
-    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_force_foreground,
-    run_app_control_set_maximized,
+    run_app_control_restart_pending_update, run_app_control_restart_session,
+    run_app_control_scroll_preview, run_app_control_scroll_right_panel,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_force_foreground,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_create_split_group, run_app_control_split_web_tab,
-    run_app_control_ungroup_split_group,
-    run_app_control_set_split_group_ratio, run_app_control_focus_split_pane,
-    run_app_control_set_theme_editor_open, run_app_control_set_theme_editor_values,
-    run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
-    run_app_control_show_start_page, run_app_control_start_action,
-    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
+    run_app_control_set_split_group_ratio, run_app_control_set_theme_editor_open,
+    run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
+    run_app_control_set_window_chrome_hover, run_app_control_show_start_page,
+    run_app_control_split_web_tab, run_app_control_start_action,
+    run_app_control_submit_terminal_prompt, run_app_control_trigger_update_check,
+    run_app_control_ungroup_split_group, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
     run_trace_follow, run_trace_tail, run_trace_transitions,
     scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_resize,
-    terminal_restart,
-    terminal_write, try_run_remote_server_command,
+    terminal_restart, terminal_write, try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -438,7 +434,11 @@ fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
             &daemon_executable,
             Some(current_version),
             None,
-            Some(if force { "forced_update_all" } else { "update_all" }),
+            Some(if force {
+                "forced_update_all"
+            } else {
+                "update_all"
+            }),
         );
         results.push(match outcome {
             Ok(message) => serde_json::json!({
@@ -1214,7 +1214,12 @@ fn main() -> Result<()> {
         // daemon PTY already matches. See finding-codex-squish-post-restart-pty-size.
         let nudge = args.iter().any(|a| a == "--nudge");
         if nudge {
-            let _ = terminal_resize(&endpoint, &args[3], cols.saturating_sub(1).max(1), rows.saturating_sub(1).max(1));
+            let _ = terminal_resize(
+                &endpoint,
+                &args[3],
+                cols.saturating_sub(1).max(1),
+                rows.saturating_sub(1).max(1),
+            );
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
         let message = terminal_resize(&endpoint, &args[3], cols, rows)?;
@@ -1248,8 +1253,7 @@ fn main() -> Result<()> {
         if ordered_paths.is_empty() {
             anyhow::bail!("{order_path} is empty; refusing to clear the row order");
         }
-        let (snapshot, message) =
-            yggterm_server::reorder_live_sessions(&endpoint, &ordered_paths)?;
+        let (snapshot, message) = yggterm_server::reorder_live_sessions(&endpoint, &ordered_paths)?;
         // The daemon keeps only the rows it actually has, so report what the order
         // BECAME rather than echoing the request back as if it succeeded.
         let applied: Vec<&str> = snapshot
@@ -1306,15 +1310,11 @@ fn main() -> Result<()> {
             .find_map(|window| (window[0] == "--session").then(|| window[1].clone()));
         let last_ms = args
             .windows(2)
-            .find_map(|window| {
-                (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?
-            })
+            .find_map(|window| (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?)
             .unwrap_or(180_000);
         let limit = args
             .windows(2)
-            .find_map(|window| {
-                (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?
-            })
+            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
             .unwrap_or(200);
         return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
@@ -1886,31 +1886,30 @@ fn main() -> Result<()> {
                 // server app split ungroup <group_id>
                 // server app split ratio <group_id> <0.0..1.0>
                 // server app split focus <session_path>
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("missing action for server app split (create|web-tab|ungroup|ratio|focus)"))?;
+                let action = args.get(3).map(String::as_str).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing action for server app split (create|web-tab|ungroup|ratio|focus)"
+                    )
+                })?;
                 match action {
                     "create" => {
-                        let axis = args.windows(2).find_map(|window| {
-                            (window[0] == "--axis").then(|| window[1].clone())
-                        });
+                        let axis = args
+                            .windows(2)
+                            .find_map(|window| (window[0] == "--axis").then(|| window[1].clone()));
                         let members: Vec<String> = cli_positional_args(&args, 4)
                             .into_iter()
                             .filter(|arg| !arg.starts_with("--"))
                             .map(|arg| arg.to_string())
                             .collect();
                         if members.len() < 2 {
-                            anyhow::bail!(
-                                "server app split create needs at least 2 session paths"
-                            );
+                            anyhow::bail!("server app split create needs at least 2 session paths");
                         }
                         run_app_control_create_split_group(members, axis, timeout_ms)
                     }
                     "web-tab" => {
-                        let axis = args.windows(2).find_map(|window| {
-                            (window[0] == "--axis").then(|| window[1].clone())
-                        });
+                        let axis = args
+                            .windows(2)
+                            .find_map(|window| (window[0] == "--axis").then(|| window[1].clone()));
                         let mut positionals = cli_positional_args(&args, 4)
                             .into_iter()
                             .filter(|arg| !arg.starts_with("--"));
@@ -1956,9 +1955,10 @@ fn main() -> Result<()> {
                             anyhow::anyhow!("missing session path for server app split focus")
                         })?;
                         let pane: Option<usize> = match positionals.next() {
-                            Some(raw) => Some(raw.parse().map_err(|_| {
-                                anyhow::anyhow!("pane index must be a number")
-                            })?),
+                            Some(raw) => Some(
+                                raw.parse()
+                                    .map_err(|_| anyhow::anyhow!("pane index must be a number"))?,
+                            ),
                             None => None,
                         };
                         run_app_control_focus_split_pane(&session_path, pane, timeout_ms)
@@ -2543,9 +2543,14 @@ fn main() -> Result<()> {
                         run_app_control_rename_session(session_path, title, timeout_ms)
                     }
                     "restart" => {
-                        let session_path = cli_positional_args(&args, 4).into_iter().next().ok_or_else(|| {
-                            anyhow::anyhow!("missing session path for server app session restart")
-                        })?;
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app session restart"
+                                )
+                            })?;
                         run_app_control_restart_session(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app session action: {other}"),
@@ -2587,7 +2592,8 @@ fn main() -> Result<()> {
         // p50/p95/p99/max/total, ranked by total wall-clock. The switch path is the
         // `attach`/`daemon_request` categories. Honors --category/--since-ms/--top/--json.
         let category = cli_flag_value(&args, "--category");
-        let since_ms = cli_flag_value(&args, "--since-ms").and_then(|value| value.parse::<u64>().ok());
+        let since_ms =
+            cli_flag_value(&args, "--since-ms").and_then(|value| value.parse::<u64>().ok());
         let top = cli_flag_value(&args, "--top")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(40);
@@ -2604,13 +2610,26 @@ fn main() -> Result<()> {
             // The `clock` column is not decoration: a `render` row's milliseconds are
             // CPU time consumed, not elapsed time, so reading its totalms as wall
             // duration overstates it by however many cores were busy.
+            // The `pids` column answers "which process burned this" — three
+            // daemons and a GUI append to ONE perf-telemetry.jsonl per home,
+            // and until 2026-07-26 the records could not say. Empty means the
+            // rows predate the pid stamp.
             println!(
-                "{:<24} {:<30} {:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
-                "category", "name", "clock", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
+                "{:<24} {:<30} {:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}  {}",
+                "category",
+                "name",
+                "clock",
+                "count",
+                "p50ms",
+                "p95ms",
+                "p99ms",
+                "maxms",
+                "totalms",
+                "pids"
             );
             for summary in summaries.iter().take(top) {
                 println!(
-                    "{:<24} {:<30} {:>5} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
+                    "{:<24} {:<30} {:>5} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}  {}",
                     summary.category,
                     summary.name,
                     summary.time_base().as_str(),
@@ -2619,7 +2638,13 @@ fn main() -> Result<()> {
                     summary.p95_ms,
                     summary.p99_ms,
                     summary.max_ms,
-                    summary.total_ms
+                    summary.total_ms,
+                    summary
+                        .pids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<String>>()
+                        .join(",")
                 );
             }
         }
@@ -2707,15 +2732,14 @@ fn main() -> Result<()> {
         // `--pid` here names any process-tree root, deliberately unlike
         // `server app --pid` where it must name a REGISTERED client. Only the
         // untargeted default goes through the client registry.
-        let requested_pid = cli_flag_value(&args, "--pid").and_then(|value| value.parse::<u32>().ok());
+        let requested_pid =
+            cli_flag_value(&args, "--pid").and_then(|value| value.parse::<u32>().ok());
         let requested_client = cli_flag_value(&args, "--client");
         let root_pid = match requested_pid {
             Some(pid) => Some(pid),
-            None => yggterm_server::choose_registered_gui_pid(
-                store.home_dir(),
-                None,
-                requested_client,
-            )?,
+            None => {
+                yggterm_server::choose_registered_gui_pid(store.home_dir(), None, requested_client)?
+            }
         };
         let Some(root_pid) = root_pid else {
             bail!(
@@ -2723,11 +2747,9 @@ fn main() -> Result<()> {
                  process tree, or --client <name> to pick one"
             );
         };
-        let Some(report) = yggterm_core::render_probe::render_top_sample(
-            root_pid as i32,
-            interval_ms,
-            top,
-        ) else {
+        let Some(report) =
+            yggterm_core::render_probe::render_top_sample(root_pid as i32, interval_ms, top)
+        else {
             bail!("no such process tree: {root_pid}");
         };
         if json {
@@ -2754,8 +2776,7 @@ fn main() -> Result<()> {
                 role.procs,
                 role.cpu_ms,
                 role.core_fraction,
-                role
-                    .gpu_ms
+                role.gpu_ms
                     .map(|ms| format!("{ms:.1}"))
                     .unwrap_or_else(|| "-".to_string()),
                 role.mem_kb as f64 / 1024.0,
@@ -2855,7 +2876,9 @@ mod tests {
         assert!(!command_reads_local_state_in_process(&argv(&[
             "server", "status"
         ])));
-        assert!(!command_reads_local_state_in_process(&argv(&["render-top"])));
+        assert!(!command_reads_local_state_in_process(&argv(&[
+            "render-top"
+        ])));
     }
 
     #[test]

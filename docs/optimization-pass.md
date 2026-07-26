@@ -84,6 +84,7 @@ Three consequences for this pass:
 | "the machine runs cooler" | ⛔ **confounded** |
 | DRM fds 0 → 7, GPU genuinely rasterizing | ✅ **holds** |
 | `copy_scan` p50 220.9 → 17.8, max 32,492 → 47.7 ms | ✅ **holds** (its OWN fix) |
+| "a ~2.3x GUI-role CPU **regression** from hardware GL" | ⛔ **WITHDRAWN 2026-07-26** — unfocused vs focused |
 
 **The mechanism of the error, because it is the whole lesson.** The "after"
 window was 8.7 hours overnight; the "before" was an evening of real use. Measured
@@ -98,11 +99,53 @@ being spent, because nothing was painting. Every tick with GPU work is one where
 
 **At matched exposure** (9.22 vs 9.25 terminal_read/min) the render tree went
 **0.297 → 0.264 cores, about 11%** — and that rests on 8 post-side ticks, so
-treat it as a hint, not a result. Worse, the current GUI plateaued eleven minutes
-in with the GPU on and the window focused reads **0.358-0.373 cores against a
-pre-fix evening p50 of 0.297 and pre-fix quiet hours of 0.277-0.286.** On its
-face that is not better. It is unexplained and it needs a proper matched-load
-measurement before anyone claims a win.
+treat it as a hint, not a result.
+
+#### ⛔ AND THE "REGRESSION" IS WITHDRAWN TOO (2026-07-26)
+
+This section used to end by saying the plateaued GUI read **0.358-0.373 cores
+against a pre-fix evening p50 of 0.297**, "on its face not better, unexplained".
+A separate probe turned that into a claimed **~2.3x GUI-role CPU regression from
+hardware GL**. Both are withdrawn: **the two sides differ in `window_focused`,
+and focus moves the number by more than the effect being claimed.**
+
+Bucketing every `render/gui` row in the retained corpus by GUI generation
+(`payload.hot_pid`), from a copy of jojo's own `perf-telemetry*.jsonl`:
+
+| generation | start | n | focused | `gpu_ms`>0 | `render/gui` p50 |
+|---|---|---|---|---|---|
+| 12 pre-fix generations | 07-25 15:12 → 19:03 | **1,131** | **0** | **0** | 0.059–1.015 |
+| 1419187 (hw GL, overnight) | 07-26 00:34 | 532 | 8 | 8 | 0.026 |
+| 1560015 (hw GL, morning) | 07-26 09:28 | 21 | **21** | 21 | 0.179 |
+| 1659308 (hw GL, morning) | 07-26 09:54 | 32 | **32** | 32 | 0.151 |
+
+Corpus totals: **1,256 `render/gui` rows, 1,194 of them unfocused.** Every single
+pre-fix row is `window_focused=false`; every number quoted as "after" comes from a
+focused window.
+
+The focus effect, measured two ways and both larger than the withdrawn claim:
+
+- **Within one generation** — same process, same GL arm, same session set —
+  1419187 reads p50 **0.026 unfocused (n=524)** vs **0.080 focused (n=8)**: 3.1x.
+- **Across generations on the same hardware arm**, 0.026 → **0.179**: 7x.
+
+So the comparison was between two states that differ by a 3–7x variable, and it
+produced a 2.3x "regression". It measures the variable, not the GL flip.
+
+**Focus is not a label — it changes the workload.** `tick_hot_warmer`
+(`shell.rs`) returns empty unless `effective_window_focused()`, so an unfocused
+GUI does no SSH warming at all; `terminal_foreground_should_defer_background_refreshes`
+keys on it too. ⚠ And the render probe emits the PHYSICAL `window_focused`
+(`render_probe_shell_context`), not `effective_window_focused` — so a
+force-foreground app-control run reports `false` while behaving as focused.
+
+**This falsifies the EVIDENCE for a regression, not the regression.** Hardware GL
+may well cost the UI process more: the GUI process now holds DRM render-node fds
+and submits GPU work it never did under llvmpipe, which is a genuinely new path
+inside the role that reads as more expensive. That is unmeasured. Declaring "there
+was no regression" on the strength of this section alone would be the same class
+of error as the original claim, pointing the other way. `scripts/gl_ab_*` is how
+it gets settled.
 
 **`copy_scan` was NOT the clean control I claimed**, for a bigger reason than the
 schedule argument: it was **treated in the same deploy** (`1d174b0`), so its
@@ -114,6 +157,31 @@ its use as a control was wrong.
 **What a real verification needs:** the same terminal_read rate on both sides,
 several hundred render ticks, and `window_focused` held constant. Nothing short
 of that settles it.
+
+### The standing measurement traps
+
+Four confounders have now each produced a confident wrong number on this one
+question. Every render comparison must hold all four, and the analyzer
+(`scripts/gl_ab_analyze.py`) refuses a run that does not.
+
+| # | trap | what it faked | how to hold it |
+|---|---|---|---|
+| 1 | **exposure** — terminal paint rate | an 18x "win" (9.22 vs 0.40 `terminal_read`/min) | drive a deterministic emitter; refuse arms whose median `xterm_write_flush` differs by >20% |
+| 2 | **idle ≠ software** — `gpu_ms==0` | "the GPU is not rasterizing" on a host that had just switched to hardware | read the DRM **fd count** first (structural); a hardware arm with `gpu_ms==0` in >10% of samples is an IDLE window, not a GPU arm |
+| 3 | **a control treated in the same deploy** | `copy_scan` "certifying" a render change while measuring its own fix | a control must be untouched by the deploy AND demonstrably sensitive to the variable |
+| 4 | **`window_focused`** (added 2026-07-26) | a ~2.3x "GUI-role regression" that is a 3–7x focus effect | reconstruct focus as a step function from `ui/window_focus/transition` and drop samples not wholly inside a focused interval — do not average across the boundary |
+
+⚠ Trap 4 is the one that survived a withdrawal: the correction box for traps 1–3
+still quoted "0.358-0.373 against a pre-fix evening p50 of 0.297" as an open
+puzzle, and that puzzle was itself trap 4. A confounder you have not named will
+be re-derived by the next reader.
+
+⚠ There is also a fifth, not on the list because it voids a run rather than
+biasing it: **the env scrub.** `shm_force_for_arming` returns `Keep` on an
+already-set `WEBKIT_DISABLE_DMABUF_RENDERER`, and an agent shell inherits the GL
+keys from the GUI that spawned its terminal — so an unscrubbed "hardware" arm
+reports `hardware_gl_probed` while actually presenting over SHM. Assert the
+ABSENCE of the keys, not just the policy string.
 
 ### The numbers as first recorded (kept so the artifact is auditable)
 
@@ -264,6 +332,52 @@ bursts leaves the battery drain.
 | `daemon/background_copy_chore` | 12829 | 0.0 | 2704.3 | 1,319,684 |
 | `daemon/persist` | 9556 | 93.3 | 576.4 | 1,133,168 |
 | `daemon/snapshot_response` | 19021 | 37.7 | 1309.9 | 781,226 |
+
+### 3b-i. The idle daemons: 100% of their cost was two GLOBAL loops (2026-07-26)
+
+The three chained daemons on the live host burned CPU almost entirely on work
+that has nothing to do with what they own. Measured per THREAD, `rchar` deltas
+over one 90 s window, read from `/proc/<pid>/task/<tid>/io`:
+
+| thread | pid 1152900 | pid 1558420 | pid 3535306 | what it is |
+|---|---|---|---|---|
+| `yggterm-perf-incident-monitor` | **334.7 MB** | **334.7 MB** | **334.7 MB** | re-reads the WHOLE retained telemetry corpus every 30 s |
+| background copy chore | **908.1 MB** | **908.1 MB** | 454.0 MB | `load_codex_tree` over ~4 GB / 621 codex transcripts |
+| whole process | 1242.8 MB | 1242.7 MB | 788.7 MB | |
+
+**3,274 MB of file reads per 90 s — 36 MB/s — across three daemons, and the two
+loops are all of it.** Byte-identical figures across a daemon owning three agent
+sessions and one owning two idle shells is the tell: neither loop is per-session
+work.
+
+- **The monitor**: `summarize_perf_telemetry` read every rotated generation and
+  `serde_json`-parsed every line BEFORE applying `since_ms`, to answer a question
+  about the last **60 seconds**, every 30 s. The corpus is 110.8 MB across seven
+  files against a 144 MiB cap, so 3 ticks x 110.8 = 332.4 MB against a measured
+  334.7 MB — the attribution is arithmetic, and it gets WORSE as telemetry
+  accumulates. Fixed: a generation's filename already carries the instant it
+  closed, so `jsonl_read_paths_since` skips it without a read, and a raw-byte
+  `"ts_ms":` upper bound skips lines inside the straddling file before serde. Replayed
+  against a copy of jojo's actual corpus: **one 60 s window reads 10,156,747 of
+  110,818,506 bytes — 9.2%.**
+- **The chore's tree walk**: its only consumer sits behind the LLM-generation
+  opt-in, and **no daemon on jojo has `YGGTERM_ENABLE_BACKGROUND_COPY_CHORE`
+  set** (checked in `/proc/<pid>/environ`) — so the walk built a 4 GB answer that
+  was dropped, unread, at the top of the function it was passed to. Fixed by
+  `daemon_copy_chore_should_scan_local_tree`, which also refuses on a superseded
+  daemon (a newer one is scanning the same corpus into the same store). The chore
+  TICK is untouched — the CC title sync is the SSOT for CC titles.
+
+⚠ Neither is deployed. The code is on `main`; every daemon on the live host is
+still running the old loops, and the "after" figures above are an offline replay
+plus a gate that provably does not call the walk — not a live delta. Confirm
+after the next daemon bump by re-reading the same per-thread `rchar` and by
+`local_tree_scanned:false` on the `daemon/background_copy_chore` perf span.
+
+⚠ **This is also why `perf` events now carry a `pid`.** They did not, so
+"`daemon/background_copy_chore` ran 12,829 times" in §3b could not be split
+across the three daemons, and the attribution above had to come from a live
+`/proc` walk — an instrument that works only while the process is still alive.
 
 ### 3c. The incident log, which nobody had read
 
@@ -500,20 +614,29 @@ and whatever sets active-session after a birth.
 Re-run, and quote, both instruments:
 
 ```sh
-<<<<<<< HEAD
-# render side, on the GUI host — cores AND gpu_ms, both deltas
 # render side, on the GUI host (no --pid: the client registry picks the GUI).
 # The gpu_ms column is the GPU gauge; a `-` means unreadable, never zero.
+# ⚠ render-top, NOT the in-app render probe: RENDER_PROBE_INTERVAL_MS is fixed
+# at 60_000, so "several hundred ticks" from the in-app sampler is several
+# hundred MINUTES. An A/B drives the interval from outside.
 yggterm-headless server render-top --interval-ms 15000
 # is the GPU actually rasterizing? nonzero and RISING across two reads
 grep -H drm-engine /proc/<webproc>/fdinfo/*
 # which GL path is this window even on? (the client's own view, NOT /proc environ,
 # which only ever holds the exec-time environment)
 yggterm-headless server app desktop-identity | grep -A8 webkit_gl_environment
-# Rust side (the `clock` column says whether a row is wall or CPU time)
+# Rust side (the `clock` column says whether a row is wall or CPU time;
+# the `pids` column says WHICH process burned it — three daemons and a GUI
+# append to one perf-telemetry.jsonl, and until 2026-07-26 they could not say)
 yggterm-headless server perf-summary --category render
 yggterm-headless server perf-summary
 ```
 
 A win is a moved number in the table above, on the same host, over a comparable window,
 with the app doing comparable work. Anything else is an anecdote.
+
+For the GL question specifically, do not hand-roll it: `scripts/gl_ab_experiment.sh`
+runs the S/H/G/S2 arms and `scripts/gl_ab_analyze.py` gates the result on all four
+standing traps plus a drift control. It is built to answer **"this settles nothing"**,
+and that is a valid outcome — three earlier hand-rolled attempts each returned a
+confident number instead.

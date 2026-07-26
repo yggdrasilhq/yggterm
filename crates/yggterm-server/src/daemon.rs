@@ -5,11 +5,9 @@ use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     CodexRuntimeProcessIdentity, GhosttyHostSupport, ManagedSessionView, PersistedDaemonState,
     PersistedLiveSession, PersistedStoredSession, RemoteMachineRef, RemoteMachineSnapshot,
-    RemoteRuntimeRegistry,
-    ServerUiSnapshot,
-    SessionKind, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalManager,
-    WorkspaceViewMode, YggtermServer, active_client_instance_records,
-    active_client_instance_records_for_endpoint_scope,
+    RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SessionSource, SnapshotSessionView,
+    SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
+    active_client_instance_records, active_client_instance_records_for_endpoint_scope,
     claude_code_runtime_process_identity_from_root_pid,
     codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
@@ -40,10 +38,9 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode, SessionNodeKind, SessionStore,
-    append_bounded_jsonl_record,
-    append_trace_event, local_cc_session_jsonl_path, looks_like_generated_fallback_title,
-    read_cc_session_title, resolve_yggterm_home,
+    AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode, SessionNodeKind,
+    SessionStore, append_bounded_jsonl_record, append_trace_event, local_cc_session_jsonl_path,
+    looks_like_generated_fallback_title, read_cc_session_title, resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -2495,9 +2492,7 @@ fn profile_write_lock_acquire_response(
     let writable = outcome.is_writable();
     let (held_by_client_id, held_by_pid) = match &outcome {
         // Refused: name the client that actually holds it.
-        AcquireOutcome::Busy { held_by } => {
-            (Some(held_by.client_id.clone()), Some(held_by.pid))
-        }
+        AcquireOutcome::Busy { held_by } => (Some(held_by.client_id.clone()), Some(held_by.pid)),
         // Held by the requester now (including after an Active-priority
         // preemption of a Shadow, slice 4.1).
         AcquireOutcome::Granted
@@ -2711,11 +2706,12 @@ impl DaemonRuntime {
             // Never resurrect a predecessor's sessions from disk while it is
             // alive and owns their runtimes; it, not this file, is the truth.
             let our_pid = std::process::id();
-            let other_daemons: Vec<(u32, usize)> = reachable_versioned_daemon_statuses(store.home_dir())
-                .into_iter()
-                .filter(|(_, runtime)| runtime.server_pid != our_pid)
-                .map(|(_, runtime)| (runtime.server_pid, runtime.owned_terminal_session_count))
-                .collect();
+            let other_daemons: Vec<(u32, usize)> =
+                reachable_versioned_daemon_statuses(store.home_dir())
+                    .into_iter()
+                    .filter(|(_, runtime)| runtime.server_pid != our_pid)
+                    .map(|(_, runtime)| (runtime.server_pid, runtime.owned_terminal_session_count))
+                    .collect();
             if !may_cold_restore_live_sessions(
                 preserved_terminal_owners.expected_server_version.as_deref(),
                 SERVER_PROTOCOL_VERSION,
@@ -2884,8 +2880,7 @@ impl DaemonRuntime {
         // The SAME predicate the cold-retire loop consults, reported verbatim — so what
         // the user reads is the reason the daemon is actually acting on, not a parallel
         // explanation that can drift from it.
-        let hot_restart_blockers =
-            self.hot_update_idle_gate_blockers(&owned_terminal_session_keys);
+        let hot_restart_blockers = self.hot_update_idle_gate_blockers(&owned_terminal_session_keys);
         let hot_restart_block_reason = hot_restart_block_reason_summary(&hot_restart_blockers);
         let running_build_id = *DAEMON_RUNNING_BUILD_ID;
         let on_disk_build_id = current_build_id();
@@ -2962,7 +2957,10 @@ impl DaemonRuntime {
     /// the panel names a DIFFERENT session — so a swap pinned by three agents read as an
     /// endless unexplained wait. On jojo (2026-07-11) that opacity let a 2.10.3 daemon run
     /// for 19h44m with 2.10.13 on disk. See [[finding-stale-daemon-trap]].
-    fn hot_update_idle_gate_blockers(&self, owned_runtime_keys: &[String]) -> Vec<HotRestartBlocker> {
+    fn hot_update_idle_gate_blockers(
+        &self,
+        owned_runtime_keys: &[String],
+    ) -> Vec<HotRestartBlocker> {
         if hot_update_idle_gate_overridden() {
             return Vec::new();
         }
@@ -3114,7 +3112,9 @@ impl DaemonRuntime {
                 // session leader). `Some(true)` while a command runs (incl.
                 // silent ones), `Some(false)` at a bare prompt, `None` when not
                 // owned (so the GUI must NOT blink a bridged/foreign shell).
-                session.working = self.terminals.session_foreground_process_active(&runtime_path);
+                session.working = self
+                    .terminals
+                    .session_foreground_process_active(&runtime_path);
             }
             if let Some(screen_text) = screen_text.as_deref()
                 && let Some((status_line, terminal_lines)) =
@@ -3214,7 +3214,9 @@ impl DaemonRuntime {
     /// applies the discovered identity to the live row. Closes the same
     /// UUIDv4-vs-real-id drift that the codex rebind handles.
     fn refresh_live_claude_code_runtime_identities_for_persistence(&mut self) -> usize {
-        let keys = self.server.live_claude_code_session_keys_for_runtime_identity();
+        let keys = self
+            .server
+            .live_claude_code_session_keys_for_runtime_identity();
         let mut refreshed = 0usize;
         for key in keys {
             let runtime_path = self.server.terminal_runtime_key_for_path(&key);
@@ -3248,7 +3250,8 @@ impl DaemonRuntime {
     }
 
     fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
-        let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "snapshot_response");
+        let _perf =
+            yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "snapshot_response");
         let mut snapshot = self.server.snapshot();
         let runtime_keys = self
             .terminal_runtime_keys_including_preserved()
@@ -4549,7 +4552,9 @@ impl DaemonRuntime {
     ) -> Result<ServerResponse> {
         match self.terminals.write(runtime_key, data) {
             Ok(()) => Ok(ServerResponse::Ack { message: None }),
-            Err(error) if Self::preserved_owner_error_means_missing_runtime(runtime_key, &error) => {
+            Err(error)
+                if Self::preserved_owner_error_means_missing_runtime(runtime_key, &error) =>
+            {
                 self.recover_terminal_write_lost_runtime(path, runtime_key, data, error)
             }
             Err(error) => Err(error),
@@ -4601,11 +4606,7 @@ impl DaemonRuntime {
             match terminal_write(&owner_endpoint, runtime_key, data) {
                 Ok(_) => return Ok(ServerResponse::Ack { message: None }),
                 Err(error) => {
-                    self.handle_preserved_owner_request_error(
-                        runtime_key,
-                        &owner_endpoint,
-                        &error,
-                    );
+                    self.handle_preserved_owner_request_error(runtime_key, &owner_endpoint, &error);
                 }
             }
         }
@@ -4781,11 +4782,8 @@ impl DaemonRuntime {
         seed_remote_snapshot: bool,
     ) -> Result<Option<String>> {
         let prepare_message = {
-            let _perf = yggterm_core::PerfGuard::new(
-                self.store.home_dir(),
-                "attach",
-                "managed_cli_ensure",
-            );
+            let _perf =
+                yggterm_core::PerfGuard::new(self.store.home_dir(), "attach", "managed_cli_ensure");
             self.server.ensure_managed_cli_for_session_path(path)?
         };
         if path.starts_with("remote-session://")
@@ -5348,19 +5346,15 @@ impl DaemonRuntime {
     /// the ledger only when something changed.
     fn record_row_order_ledger(&mut self, client_scope: Option<&str>) {
         let live_order = self.server.live_session_order_keys().to_vec();
-        let mut changed = self.row_order_ledger.record_live_order(
-            crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE,
-            &live_order,
-        );
-        if let Some(scope) = client_scope
-            .map(str::trim)
-            .filter(|scope| !scope.is_empty() && *scope != crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE)
-        {
+        let mut changed = self
+            .row_order_ledger
+            .record_live_order(crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE, &live_order);
+        if let Some(scope) = client_scope.map(str::trim).filter(|scope| {
+            !scope.is_empty() && *scope != crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE
+        }) {
             changed |= self.row_order_ledger.record_live_order(scope, &live_order);
         }
-        if changed
-            && let Err(error) = self.row_order_ledger.save(self.store.home_dir())
-        {
+        if changed && let Err(error) = self.row_order_ledger.save(self.store.home_dir()) {
             tracing::warn!(%error, "failed to save row-order ledger");
         }
     }
@@ -5500,11 +5494,8 @@ impl DaemonRuntime {
         // `server perf-summary` surfaces the slow ones (the switch path is `terminal_ensure`).
         // Drop-based so `?` early returns and panics still record. No-op when the
         // perf_profiling_enabled setting is off.
-        let _perf_request = yggterm_core::PerfGuard::new(
-            self.store.home_dir(),
-            "daemon_request",
-            request_name,
-        );
+        let _perf_request =
+            yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon_request", request_name);
         let trace_request = daemon_request_trace_enabled(request_name);
         if trace_request {
             append_trace_event(
@@ -5746,9 +5737,8 @@ impl DaemonRuntime {
                     // Best-effort: raw/dev installs return false (nothing to flip).
                     // See [[finding-hot-update-interrupts-remote-sessions]].
                     if let Some(target_version) = expected_version.as_deref() {
-                        let target_gui_executable = daemon_executable.with_file_name(
-                            companion_gui_executable_file_name(&daemon_executable),
-                        );
+                        let target_gui_executable = daemon_executable
+                            .with_file_name(companion_gui_executable_file_name(&daemon_executable));
                         match yggterm_core::promote_direct_install_active_version(
                             target_version,
                             &target_gui_executable,
@@ -5847,7 +5837,9 @@ impl DaemonRuntime {
                     });
                     let spawn_result = match live_successor_version.as_deref() {
                         Some(_) => Ok(()),
-                        None => spawn_hot_restart_daemon_process(&daemon_executable, &owner_endpoint),
+                        None => {
+                            spawn_hot_restart_daemon_process(&daemon_executable, &owner_endpoint)
+                        }
                     };
                     append_trace_event(
                         self.store.home_dir(),
@@ -6460,7 +6452,9 @@ impl DaemonRuntime {
                     identity.role,
                 );
                 let resolved = yggterm_core::web_profile::normalize_web_profile(profile.as_deref());
-                let outcome = self.profile_write_locks.release(profile.as_deref(), &holder);
+                let outcome = self
+                    .profile_write_locks
+                    .release(profile.as_deref(), &holder);
                 append_trace_event(
                     self.store.home_dir(),
                     "daemon",
@@ -7763,9 +7757,7 @@ fn collect_live_copy_candidates(
         // is (recently) WORKING — generation rides real turns instead of
         // scanning idle sessions every tick. Documents have no PTY and keep
         // the old path.
-        if session.kind != SessionKind::Document
-            && !working_paths.contains(&session.session_path)
-        {
+        if session.kind != SessionKind::Document && !working_paths.contains(&session.session_path) {
             continue;
         }
         let generation_context = if session.kind == SessionKind::Document {
@@ -7790,18 +7782,14 @@ fn collect_live_copy_candidates(
             // updated. The rebind poll records the CLI's on-disk JSONL in the
             // "Storage" metadata; once it exists the session can be titled
             // from the real transcript.
-            let storage = if matches!(
-                session.kind,
-                SessionKind::Codex | SessionKind::CodexLiteLlm
-            ) {
+            let storage = if matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+            {
                 session
                     .metadata
                     .iter()
                     .find(|entry| entry.label == "Storage")
                     .map(|entry| entry.value.clone())
-                    .filter(|value| {
-                        value.ends_with(".jsonl") && Path::new(value).exists()
-                    })
+                    .filter(|value| value.ends_with(".jsonl") && Path::new(value).exists())
             } else {
                 None
             };
@@ -8190,7 +8178,7 @@ fn background_copy_error_is_rate_limit(error: &anyhow::Error) -> bool {
 fn build_background_copy_updates(
     store: &SessionStore,
     settings: &AppSettings,
-    local_root: &SessionNode,
+    local_root: Option<&SessionNode>,
     live_sessions: &[ManagedSessionView],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
@@ -8205,7 +8193,12 @@ fn build_background_copy_updates(
         return Ok(updates);
     }
     let mut candidates = Vec::new();
-    collect_local_copy_candidates(local_root, &mut candidates);
+    // `None` means this daemon did not walk the machine's transcripts this tick
+    // — see `daemon_copy_chore_should_scan_local_tree`. The live/remote
+    // candidates below are per-owned-session and always collected.
+    if let Some(local_root) = local_root {
+        collect_local_copy_candidates(local_root, &mut candidates);
+    }
     collect_live_copy_candidates(store, live_sessions, working_paths, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
@@ -8274,7 +8267,9 @@ fn build_background_copy_updates(
             continue;
         }
 
-        if rate_limited_this_tick || llm_generations_this_tick >= BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK {
+        if rate_limited_this_tick
+            || llm_generations_this_tick >= BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK
+        {
             continue;
         }
         llm_generations_this_tick += 1;
@@ -8364,7 +8359,11 @@ fn build_background_copy_updates(
                 None
             };
             let summary = if summary_missing && !rate_limited_this_tick {
-                match store.generate_summary_for_session_path(settings, source_path, summary_force_refresh) {
+                match store.generate_summary_for_session_path(
+                    settings,
+                    source_path,
+                    summary_force_refresh,
+                ) {
                     Ok(summary) => summary,
                     Err(error) => {
                         rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
@@ -8411,9 +8410,7 @@ fn run_background_copy_chore(
                 let screen_working = runtime
                     .terminals
                     .session_screen_snapshot(&runtime_path)
-                    .is_some_and(|screen| {
-                        yggterm_core::screen_text_shows_agent_working(&screen)
-                    });
+                    .is_some_and(|screen| yggterm_core::screen_text_shows_agent_working(&screen));
                 let recently_active = runtime
                     .terminals
                     .session_idle_for_ms(&runtime_path)
@@ -8444,11 +8441,21 @@ fn run_background_copy_chore(
     // reported a p50 of 0.0 ms while doing the most expensive thing it does.
     // `build_local_cwd_tree` now carries its own `background/local_tree_scan`
     // span; this one measures the chore honestly.
-    let local_root = store.load_codex_tree(&settings)?;
+    //
+    // And it is skipped outright unless this daemon has something to do with
+    // the result — see `daemon_copy_chore_should_scan_local_tree`.
+    let is_superseded = daemon_is_superseded_on_this_platform(&perf_home);
+    let scan_local_tree =
+        daemon_copy_chore_should_scan_local_tree(generation_enabled, is_superseded);
+    let local_root = if scan_local_tree {
+        Some(store.load_codex_tree(&settings)?)
+    } else {
+        None
+    };
     let mut updates = build_background_copy_updates(
         &store,
         &settings,
-        &local_root,
+        local_root.as_ref(),
         &live_sessions,
         &remote_machines,
         &ssh_targets,
@@ -8465,6 +8472,12 @@ fn run_background_copy_chore(
         "updates": updates.len(),
         "live_sessions": live_sessions.len(),
         "remote_machines": remote_machines.len(),
+        // Why this tick did or did not pay for the machine-wide transcript
+        // walk. Recorded per tick so the decision is auditable from the log
+        // rather than inferred from a /proc read taken while the daemon lives.
+        "local_tree_scanned": scan_local_tree,
+        "generation_enabled": generation_enabled,
+        "superseded": is_superseded,
     }));
 
     if updates.is_empty() {
@@ -8524,7 +8537,10 @@ fn match_codex_identities_to_targets(
     identities: &[crate::LocalAgentCliIdentity],
 ) -> Vec<(String, CodexRuntimeProcessIdentity)> {
     let mut by_cwd: HashMap<String, Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
-    for identity in identities.iter().filter(|identity| identity.kind == "codex") {
+    for identity in identities
+        .iter()
+        .filter(|identity| identity.kind == "codex")
+    {
         by_cwd
             .entry(normalize_cwd_for_identity_match(&identity.cwd))
             .or_default()
@@ -8608,14 +8624,14 @@ fn run_remote_codex_identity_poll_chore(
         for target in group {
             *attempts.entry(target.key.clone()).or_insert(0) += 1;
         }
-        let identities =
-            match poll_remote_local_codex_identities(ssh_target, ssh_prefix.as_deref()) {
-                Ok(identities) => identities,
-                Err(error) => {
-                    warn!(ssh_target = %ssh_target, error = %error, "remote codex identity poll failed");
-                    continue;
-                }
-            };
+        let identities = match poll_remote_local_codex_identities(ssh_target, ssh_prefix.as_deref())
+        {
+            Ok(identities) => identities,
+            Err(error) => {
+                warn!(ssh_target = %ssh_target, error = %error, "remote codex identity poll failed");
+                continue;
+            }
+        };
         rebinds.extend(match_codex_identities_to_targets(group, &identities));
     }
 
@@ -8756,6 +8772,46 @@ fn daemon_is_superseded(home_dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// [`daemon_is_superseded`] where the concept exists, `false` where it does not.
+/// Supersession is detected through versioned unix sockets; on a platform
+/// without them no daemon can observe a newer sibling, so none is superseded.
+fn daemon_is_superseded_on_this_platform(home_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        daemon_is_superseded(home_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home_dir;
+        false
+    }
+}
+
+/// Whether this chore tick has to walk every codex + Claude Code transcript on
+/// the machine. **The one owner of that decision.**
+///
+/// The walk is not per-session work: it reads the same ~4 GB corpus in every
+/// daemon that happens to be running, which is why the chore thread's rchar
+/// delta measured 866.0 MB per 90 s, byte-identical in a daemon owning two idle
+/// shells and one owning three agent sessions (jojo, 2026-07-26, 0.020 cores
+/// each). Two conditions make that spend useless, and both hold today:
+///
+/// 1. **`generation_enabled == false`.** The tree's ONLY consumer is
+///    `collect_local_copy_candidates`, which sits behind the LLM-generation
+///    early return in `build_background_copy_updates`. With the opt-in env
+///    unset — the default, and the state of all three daemons on the live host
+///    — the chore walked 4 GB per minute to build a value it then dropped
+///    without reading. The per-owned-session halves (the CC title sync, the
+///    live/remote candidates, the preserved-owner revalidation) never touched
+///    it and keep running regardless; only the machine-wide scan is gated.
+/// 2. **This daemon is superseded.** A strictly newer daemon is reachable and
+///    is scanning the same corpus into the same store, so a second walk is a
+///    duplicate — and a superseded daemon exists precisely because it holds
+///    PTYs it cannot hand over, not because it has global work to do.
+fn daemon_copy_chore_should_scan_local_tree(generation_enabled: bool, is_superseded: bool) -> bool {
+    generation_enabled && !is_superseded
 }
 
 fn daemon_should_idle_shutdown(
@@ -9198,15 +9254,9 @@ fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
             .entry(label)
             .or_insert_with(|| status(&endpoint).ok());
         match owner_status {
-            None => dropped.push((
-                entry.runtime_key.clone(),
-                "revalidate_owner_unreachable",
-            )),
+            None => dropped.push((entry.runtime_key.clone(), "revalidate_owner_unreachable")),
             Some(owner_status)
-                if !preserved_owner_status_serves_runtime_key(
-                    owner_status,
-                    &entry.runtime_key,
-                ) =>
+                if !preserved_owner_status_serves_runtime_key(owner_status, &entry.runtime_key) =>
             {
                 dropped.push((
                     entry.runtime_key.clone(),
@@ -9275,9 +9325,7 @@ fn run_duplicate_legacy_owned_runtime_prune(
                 Ok(_message) => {
                     let registry_points_to_owner = registry_owner_endpoints
                         .get(&runtime_key)
-                        .is_some_and(|entry| {
-                            server_endpoints_same_target(entry, &owner_endpoint)
-                        });
+                        .is_some_and(|entry| server_endpoints_same_target(entry, &owner_endpoint));
                     if registry_points_to_owner {
                         let mut pending = pending_preserved_owner_removals
                             .lock()
@@ -9831,10 +9879,7 @@ pub fn reorder_live_sessions(
 }
 
 /// Fetch the row-order ledger report (JSON string) — all scopes or one.
-pub fn row_order_ledger_report(
-    endpoint: &ServerEndpoint,
-    scope: Option<&str>,
-) -> Result<String> {
+pub fn row_order_ledger_report(endpoint: &ServerEndpoint, scope: Option<&str>) -> Result<String> {
     match send_request(
         endpoint,
         &ServerRequest::RowOrderLedgerReport {
@@ -10237,7 +10282,16 @@ pub fn terminal_read(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool)> {
+) -> Result<(
+    u64,
+    Vec<TerminalStreamChunk>,
+    bool,
+    bool,
+    bool,
+    bool,
+    u64,
+    bool,
+)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalRead {
@@ -11169,9 +11223,8 @@ fn spawn_disk_binary_version_poll(
             // new-version successor to ADOPT the streams — no re-resume. The
             // newer_daemon_live split-brain case, the kill-switch, and any handoff
             // failure all fall back to the cold shutdown so we still retire.
-            let handed_off = retire_trigger == "disk_binary_replaced"
-                && !self_retire_handoff_disabled()
-                && {
+            let handed_off =
+                retire_trigger == "disk_binary_replaced" && !self_retire_handoff_disabled() && {
                     let owned = lock_daemon_runtime(&runtime, "disk_binary_replace_handoff")
                         .terminals
                         .session_keys();
@@ -11405,11 +11458,12 @@ fn spawn_progressive_session_migration(
             // the whole point of the handoff (converge ownership onto the newest
             // build). An older or same-version peer means there is nobody to
             // converge onto, and lingering harmlessly is the correct outcome.
-            let successor_reachable = reachable_versioned_daemon_statuses_excluding_endpoint(
-                &home_dir, &endpoint,
-            )
-            .into_iter()
-            .any(|(_endpoint, status)| daemon_version_is_newer_successor(&status.server_version));
+            let successor_reachable =
+                reachable_versioned_daemon_statuses_excluding_endpoint(&home_dir, &endpoint)
+                    .into_iter()
+                    .any(|(_endpoint, status)| {
+                        daemon_version_is_newer_successor(&status.server_version)
+                    });
             if !successor_reachable {
                 continue;
             }
@@ -11474,7 +11528,9 @@ fn spawn_progressive_session_migration(
 #[cfg(target_os = "linux")]
 fn self_retire_handoff_disabled() -> bool {
     parse_self_retire_handoff_disabled(
-        std::env::var("YGGTERM_DISABLE_SELF_RETIRE_HANDOFF").ok().as_deref(),
+        std::env::var("YGGTERM_DISABLE_SELF_RETIRE_HANDOFF")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -12074,8 +12130,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // hold the runtime lock) cannot deafen a client — none is served yet.
         // [[finding-daemon-handoff-drops-live-rows]]
         {
-            let mut rt =
-                lock_daemon_runtime(&runtime, "startup_preserved_owner_deep_reconcile");
+            let mut rt = lock_daemon_runtime(&runtime, "startup_preserved_owner_deep_reconcile");
             rt.run_deferred_preserved_owner_deep_reconcile("startup_post_bind");
         }
         listener
@@ -12546,7 +12601,9 @@ fn daemon_request_response(
     }
     let mut runtime = lock_daemon_runtime(runtime, "handle_request");
     let home_dir = runtime.store.home_dir().to_path_buf();
-    match panic::catch_unwind(AssertUnwindSafe(|| runtime.handle_request(request, identity))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.handle_request(request, identity)
+    })) {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => ServerResponse::Error {
             message: error.to_string(),
@@ -13289,14 +13346,13 @@ fn write_persisted_state_if_changed(
         return Ok(());
     }
     write_persisted_state_json(path, &json)?;
-    *fingerprint =
-        persisted_state_file_identity(path).map(|(file_len, file_modified)| {
-            PersistedStateFingerprint {
-                content_hash,
-                file_len,
-                file_modified,
-            }
-        });
+    *fingerprint = persisted_state_file_identity(path).map(|(file_len, file_modified)| {
+        PersistedStateFingerprint {
+            content_hash,
+            file_len,
+            file_modified,
+        }
+    });
     Ok(())
 }
 
@@ -13449,9 +13505,7 @@ fn routine_persist_should_mute(
     }
     if update_restart_state_written {
         return update_restart_state_written_at_ms
-            .map(|armed_at| {
-                now_ms.saturating_sub(armed_at) < UPDATE_RESTART_PERSIST_MUTE_GRACE_MS
-            })
+            .map(|armed_at| now_ms.saturating_sub(armed_at) < UPDATE_RESTART_PERSIST_MUTE_GRACE_MS)
             .unwrap_or(false);
     }
     false
@@ -14117,7 +14171,10 @@ mod tests {
         let in_scope = |s: &agent_scheme::SchemeDescriptor| {
             s.agent && !s.legacy && s.locality == SchemeLocality::Remote
         };
-        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES
+            .iter()
+            .filter(|s| in_scope(s))
+        {
             let covered = super::uses_runtime_owned_terminal_path(scheme.example);
             let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
             assert!(
@@ -14134,7 +14191,11 @@ mod tests {
         for hole in agent_scheme::predicate_holes_for(name) {
             let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
                 .expect("hole names a registered scheme");
-            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+            assert!(
+                in_scope(scheme),
+                "{name}'s hole row {} out of scope",
+                hole.scheme
+            );
         }
     }
 
@@ -14202,7 +14263,10 @@ mod tests {
         .expect("a working session defers the restart");
         assert!(reason.contains("local://abc"), "{reason}");
         assert!(reason.contains("working"), "{reason}");
-        assert!(!reason.contains("more session"), "one blocker adds no tail: {reason}");
+        assert!(
+            !reason.contains("more session"),
+            "one blocker adds no tail: {reason}"
+        );
     }
 
     #[test]
@@ -14213,8 +14277,14 @@ mod tests {
             Some(42_000),
         )])
         .expect("a recently-active session defers the restart");
-        assert!(reason.contains("42s"), "raw milliseconds tell the user nothing: {reason}");
-        assert!(reason.contains("300s"), "the idle window must be stated: {reason}");
+        assert!(
+            reason.contains("42s"),
+            "raw milliseconds tell the user nothing: {reason}"
+        );
+        assert!(
+            reason.contains("300s"),
+            "the idle window must be stated: {reason}"
+        );
     }
 
     #[test]
@@ -14225,7 +14295,11 @@ mod tests {
         let reason = hot_restart_block_reason_summary(&[
             blocker("local://a", HOT_RESTART_BLOCKER_WORKING, Some(0)),
             blocker("local://b", HOT_RESTART_BLOCKER_WORKING, Some(0)),
-            blocker("local://c", HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, Some(1_000)),
+            blocker(
+                "local://c",
+                HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
+                Some(1_000),
+            ),
         ])
         .expect("three blockers defer the restart");
         assert!(reason.contains("local://a"), "{reason}");
@@ -14285,8 +14359,8 @@ mod tests {
     // (jojo 2026-07-18, [[finding-dead-sessions-revive-permanent-persist-mute]]).
     #[test]
     fn routine_persist_mute_self_heals_after_the_grace_window() {
-        use super::routine_persist_should_mute as mute;
         use super::UPDATE_RESTART_PERSIST_MUTE_GRACE_MS as GRACE;
+        use super::routine_persist_should_mute as mute;
 
         let now = 10_000_000u64;
 
@@ -14389,8 +14463,7 @@ mod tests {
     fn only_a_strictly_newer_daemon_counts_as_a_migration_successor() {
         use super::daemon_version_is_newer_successor as newer;
         let current = super::SERVER_PROTOCOL_VERSION;
-        let triple = super::parse_daemon_version_triple(current)
-            .expect("our own version parses");
+        let triple = super::parse_daemon_version_triple(current).expect("our own version parses");
 
         assert!(
             !newer(current),
@@ -14400,10 +14473,7 @@ mod tests {
             !newer("2.11.4") && !newer("2.11.5"),
             "the two abandoned jojo lingerers must never read as successors"
         );
-        assert!(
-            !newer("0.0.1"),
-            "an ancient peer is not a successor"
-        );
+        assert!(!newer("0.0.1"), "an ancient peer is not a successor");
         for junk in ["", "dev", "2.x.3", "not-a-version"] {
             assert!(
                 !newer(junk),
@@ -14430,8 +14500,7 @@ mod tests {
             let rows = [key]
                 .iter()
                 .filter(|k| {
-                    attempts.get(**k).copied().unwrap_or(0)
-                        < super::MAX_MIGRATION_RELEASES_PER_KEY
+                    attempts.get(**k).copied().unwrap_or(0) < super::MAX_MIGRATION_RELEASES_PER_KEY
                 })
                 .map(|k| MigrationCandidateRow {
                     runtime_key: (*k).to_string(),
@@ -14614,10 +14683,7 @@ mod tests {
         assert!(parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).is_some());
     }
 
-    fn runtime_status_with_keys(
-        owned: &[&str],
-        preserved: &[&str],
-    ) -> super::ServerRuntimeStatus {
+    fn runtime_status_with_keys(owned: &[&str], preserved: &[&str]) -> super::ServerRuntimeStatus {
         let mut terminal: Vec<String> = owned
             .iter()
             .chain(preserved.iter())
@@ -14827,8 +14893,10 @@ mod tests {
     #[test]
     fn uncovered_rows_on_retirement_reports_only_the_difference() {
         let mine = set(&["local://a", "local://b", "local://c"]);
-        let successor: std::collections::HashSet<String> =
-            ["local://a", "local://c"].iter().map(|s| s.to_string()).collect();
+        let successor: std::collections::HashSet<String> = ["local://a", "local://c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             super::uncovered_rows_on_retirement(&mine, &successor),
             vec!["local://b".to_string()]
@@ -14845,8 +14913,7 @@ mod tests {
     #[test]
     fn retire_coverage_clean_when_successor_covers_every_row() {
         // Successor holds all my live rows live, and all my dormant rows as stored.
-        let successor =
-            successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
+        let successor = successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
         let outcome = super::compute_retire_coverage(
             &set(&["local://live1"]),
             &set(&["local://dorm1"]),
@@ -14872,8 +14939,7 @@ mod tests {
     #[test]
     fn retire_coverage_flags_a_dropped_dormant_row_against_b4_successor() {
         // The exact delayed-drop shape: live handed off, a dormant row is not.
-        let successor =
-            successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
+        let successor = successor_status("2.12.1", &["local://live1"], &["local://dorm1"], true);
         let outcome = super::compute_retire_coverage(
             &set(&["local://live1"]),
             &set(&["local://dorm1", "local://dorm2"]),
@@ -14904,11 +14970,8 @@ mod tests {
     fn retire_coverage_dormant_covered_if_successor_promoted_it_live() {
         // A dormant row the successor now owns LIVE (it was re-resumed) is covered.
         let successor = successor_status("2.12.1", &["local://dorm1"], &[], true);
-        let outcome = super::compute_retire_coverage(
-            &set(&[]),
-            &set(&["local://dorm1"]),
-            &[successor],
-        );
+        let outcome =
+            super::compute_retire_coverage(&set(&[]), &set(&["local://dorm1"]), &[successor]);
         assert!(outcome.uncovered_dormant.is_empty());
         assert!(!outcome.dormant_unverifiable);
     }
@@ -14972,8 +15035,14 @@ mod tests {
             "/home/user/proj/",
             "11111111-2222-4333-8444-555555555555",
         )];
-        let identities = vec![codex_identity("019aaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "/home/user/proj")];
-        assert_eq!(match_codex_identities_to_targets(&targets, &identities).len(), 1);
+        let identities = vec![codex_identity(
+            "019aaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "/home/user/proj",
+        )];
+        assert_eq!(
+            match_codex_identities_to_targets(&targets, &identities).len(),
+            1
+        );
     }
 
     #[test]
@@ -14999,8 +15068,15 @@ mod tests {
         ];
         let rebinds = match_codex_identities_to_targets(&targets, &identities);
         assert_eq!(rebinds.len(), 2);
-        let bound: HashSet<String> = rebinds.iter().map(|(_, id)| id.session_id.clone()).collect();
-        assert_eq!(bound.len(), 2, "two rows must bind to two distinct transcripts");
+        let bound: HashSet<String> = rebinds
+            .iter()
+            .map(|(_, id)| id.session_id.clone())
+            .collect();
+        assert_eq!(
+            bound.len(),
+            2,
+            "two rows must bind to two distinct transcripts"
+        );
     }
 
     #[test]
@@ -15010,7 +15086,10 @@ mod tests {
             "/home/user/other",
             "11111111-2222-4333-8444-555555555555",
         )];
-        let identities = vec![codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user")];
+        let identities = vec![codex_identity(
+            "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "/home/user",
+        )];
         assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
     }
 
@@ -15046,10 +15125,9 @@ mod tests {
         cleanup_legacy_unix_daemons, configure_unix_daemon_client_read_timeout,
         daemon_binary_is_legacy, default_endpoint, parse_versioned_server_socket_name,
         read_request, read_unix_request_with_timeout, server_version_is_strictly_newer,
-        unix_socket_path_fits_platform,
-        versioned_server_socket_alias_candidates, versioned_socket_alias_is_legacy,
-        versioned_socket_alias_points_to_current, versioned_socket_candidate_is_symlink,
-        wait_for_unix_daemon_client_request,
+        unix_socket_path_fits_platform, versioned_server_socket_alias_candidates,
+        versioned_socket_alias_is_legacy, versioned_socket_alias_points_to_current,
+        versioned_socket_candidate_is_symlink, wait_for_unix_daemon_client_request,
     };
     use crate::{
         GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, RemoteDeployState,
@@ -15552,7 +15630,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(outcome, crate::profile_write_lock::PROFILE_BUSY);
-                assert!(!writable, "a refused client must never be told it can write");
+                assert!(
+                    !writable,
+                    "a refused client must never be told it can write"
+                );
                 assert_eq!(profile, "work");
                 assert_eq!(held_by_client_id.as_deref(), Some("gui"));
                 assert_eq!(held_by_pid, Some(100));
@@ -15976,6 +16057,135 @@ mod tests {
         assert!(
             !body.contains("PerfSpan::start("),
             "a span finished by hand records nothing on the chore's `?` branches"
+        );
+    }
+
+    /// The chore tick has to walk the machine's transcripts only when something
+    /// will read the result. Both refusals below were live states on jojo on
+    /// 2026-07-26, where the walk cost 866.0 MB of reads per 90 s in EACH of
+    /// three daemons, byte-identical, for nothing.
+    #[test]
+    fn the_copy_chore_only_walks_the_machine_when_something_will_read_it() {
+        // The live daemon with generation on: the one case that scans.
+        assert!(super::daemon_copy_chore_should_scan_local_tree(true, false));
+        // Generation off — the default, and the state of ALL THREE daemons on
+        // the live host. `collect_local_copy_candidates` is the tree's only
+        // consumer and it sits behind the generation gate, so the walk built a
+        // 4 GB answer nobody read.
+        assert!(!super::daemon_copy_chore_should_scan_local_tree(
+            false, false
+        ));
+        // Superseded: a strictly newer daemon is reachable and scanning the
+        // same corpus into the same store. A second walk is a duplicate.
+        assert!(!super::daemon_copy_chore_should_scan_local_tree(true, true));
+        assert!(!super::daemon_copy_chore_should_scan_local_tree(
+            false, true
+        ));
+    }
+
+    /// The scanner used by the two tests below: does this chore body keep the
+    /// machine-wide walk behind the gate? Shared so the fixture test can prove
+    /// the scanner FIRES — a source scanner that can only pass is worth nothing,
+    /// and this repo has already shipped one that silently skipped 90,577 lines.
+    fn tree_scan_gate_violations(body: &str) -> Vec<String> {
+        let mut violations = Vec::new();
+        let occurrences = body.matches("load_codex_tree(").count();
+        if occurrences != 1 {
+            violations.push(format!(
+                "expected exactly one load_codex_tree( call in the chore, found {occurrences}"
+            ));
+        }
+        match body
+            .split("let local_root = if scan_local_tree {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n    };").next())
+        {
+            Some(gated) if gated.contains("load_codex_tree(") => {}
+            Some(_) => violations
+                .push("the scan gate exists but the tree load is not inside it".to_string()),
+            None => violations.push(
+                "the machine-wide transcript walk is not behind \
+                 `if scan_local_tree`"
+                    .to_string(),
+            ),
+        }
+        if !body.contains("daemon_copy_chore_should_scan_local_tree(") {
+            violations.push("the chore does not consult the gate predicate".to_string());
+        }
+        // The per-owned-session halves must NOT be gated: the CC title sync is
+        // the SSOT for CC titles and its previous dead-coding is the recorded
+        // root cause of "CC titles never update".
+        if let Some(gated) = body
+            .split("let local_root = if scan_local_tree {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n    };").next())
+            && gated.contains("collect_remote_cc_title_syncs(")
+        {
+            violations.push("the CC title sync must not be gated on the tree scan".to_string());
+        }
+        violations
+    }
+
+    #[test]
+    fn the_chore_keeps_the_machine_wide_walk_behind_the_gate() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn run_background_copy_chore(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("run_background_copy_chore should be present");
+        // Coverage floor: a split that matched nothing passes vacuously.
+        assert!(
+            body.contains("build_background_copy_updates(") && body.len() > 800,
+            "scanner did not capture the chore body ({} bytes)",
+            body.len()
+        );
+        assert!(
+            body.contains("collect_remote_cc_title_syncs("),
+            "the per-owned-session half must still run every tick"
+        );
+        let violations = tree_scan_gate_violations(body);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// Proof the scanner above can FAIL: the pre-fix shape of the chore, which
+    /// loaded the tree unconditionally, must be rejected by it.
+    #[test]
+    fn the_tree_scan_scanner_rejects_an_ungated_chore() {
+        let ungated = r#"
+    let mut perf = yggterm_core::PerfGuard::new(&perf_home, "daemon", "background_copy_chore");
+    let local_root = store.load_codex_tree(&settings)?;
+    let mut updates = build_background_copy_updates(
+        &store,
+        &settings,
+        &local_root,
+    )?;
+    updates.extend(collect_remote_cc_title_syncs(&live_sessions));
+"#;
+        let violations = tree_scan_gate_violations(ungated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("not behind")),
+            "the scanner must reject an unconditional walk: {violations:?}"
+        );
+        // And a chore that "fixed" it by gating the CC title sync too is also
+        // rejected — that dead-coding is a recorded root cause.
+        let overgated = r#"
+    let local_root = if scan_local_tree {
+        Some(store.load_codex_tree(&settings)?)
+    } else {
+        updates.extend(collect_remote_cc_title_syncs(&live_sessions));
+        None
+    };
+    daemon_copy_chore_should_scan_local_tree(generation_enabled, is_superseded);
+"#;
+        let violations = tree_scan_gate_violations(overgated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("CC title sync")),
+            "the scanner must reject gating the CC title sync: {violations:?}"
         );
     }
 
@@ -16433,9 +16643,10 @@ mod tests {
             "agent rows survive runtime exit; plain shell does not"
         );
         assert!(
-            snapshot.live_sessions.iter().all(|session| {
-                session.launch_phase == TerminalLaunchPhase::RemoteBootstrap
-            }),
+            snapshot
+                .live_sessions
+                .iter()
+                .all(|session| { session.launch_phase == TerminalLaunchPhase::RemoteBootstrap }),
             "surviving agent rows flip to a recoverable launch phase"
         );
         assert_eq!(
@@ -16860,13 +17071,11 @@ mod tests {
                 Some("home/pi claude"),
             );
             let mut session = server.live_sessions()[0].clone();
-            session.session_path =
-                "cc-runtime://00000000-0000-0000-0000-000000000000".to_string();
+            session.session_path = "cc-runtime://00000000-0000-0000-0000-000000000000".to_string();
             session.id = "00000000-0000-0000-0000-000000000000".to_string();
             session
         };
-        let working: std::collections::HashSet<String> =
-            [session.session_path.clone()].into();
+        let working: std::collections::HashSet<String> = [session.session_path.clone()].into();
         // No JSONL exists for the nil UUID → fail open with no update (and no panic).
         let updates = super::collect_live_cc_title_syncs(&[session], &working);
         assert!(updates.is_empty());
@@ -16921,7 +17130,8 @@ mod tests {
         let working: std::collections::HashSet<String> = [key.clone()].into_iter().collect();
         super::collect_live_copy_candidates(&store, &server.live_sessions(), &working, &mut out);
         assert!(
-            out.iter().any(|c| c.session_path == key && c.live_local_agent),
+            out.iter()
+                .any(|c| c.session_path == key && c.live_local_agent),
             "working live agent session must become a title candidate"
         );
         let _ = std::fs::remove_file(&jsonl);
@@ -16970,9 +17180,9 @@ mod tests {
                 "{msg} must classify as transport-shaped"
             );
         }
-        assert!(!super::preserved_owner_error_is_transport_shaped(&anyhow::anyhow!(
-            "terminal session not found: remote-session://dev/x"
-        )));
+        assert!(!super::preserved_owner_error_is_transport_shaped(
+            &anyhow::anyhow!("terminal session not found: remote-session://dev/x")
+        ));
     }
 
     #[test]
@@ -17973,7 +18183,9 @@ mod tests {
             ],
         );
 
-        assert!(server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-samplenotes")));
+        assert!(
+            server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-samplenotes"))
+        );
         assert!(!server.live_session_keep_alive(&unkept_update_runtime));
         assert_eq!(
             stale_runtime_keys,
@@ -18291,7 +18503,9 @@ mod tests {
         // suffix; the un-suffixed path is the NEW on-disk binary to hand off to.
         assert_eq!(
             super::disk_replace_handoff_target("/home/user/.yggterm/bin/yggterm-headless (deleted)"),
-            Some(std::path::PathBuf::from("/home/user/.yggterm/bin/yggterm-headless")),
+            Some(std::path::PathBuf::from(
+                "/home/user/.yggterm/bin/yggterm-headless"
+            )),
         );
         // A live (un-replaced) link must NOT trigger a handoff.
         assert_eq!(
@@ -19166,15 +19380,24 @@ mod tests {
 
         let state = persist_gate_test_state("remote-session://dev/first");
         write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("first write");
-        let after_first = fs::metadata(&state_path).expect("state file").modified().ok();
-        assert!(!backup_path.exists(), "nothing to back up on the first write");
+        let after_first = fs::metadata(&state_path)
+            .expect("state file")
+            .modified()
+            .ok();
+        assert!(
+            !backup_path.exists(),
+            "nothing to back up on the first write"
+        );
 
         // Same logical state, so the same bytes: nothing on disk may move, and
         // no backup may be taken (a backup of an identical file is worthless
         // and costs a full copy of the document).
         write_persisted_state_if_changed(&state_path, &state, &mut gate).expect("second write");
         assert_eq!(
-            fs::metadata(&state_path).expect("state file").modified().ok(),
+            fs::metadata(&state_path)
+                .expect("state file")
+                .modified()
+                .ok(),
             after_first,
             "an unchanged persist must not rewrite the state file"
         );
@@ -19960,8 +20183,7 @@ mod tests {
              STAMPED_SHAPE_HASH to the new version and this hash IN THE SAME COMMIT.",
         );
         let stamped = parse_daemon_version_triple(STAMPED_AT_VERSION).expect("stamp parses");
-        let current =
-            parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).expect("current parses");
+        let current = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).expect("current parses");
         assert!(
             stamped <= current,
             "STAMPED_AT_VERSION {STAMPED_AT_VERSION} is ahead of CARGO_PKG_VERSION \
