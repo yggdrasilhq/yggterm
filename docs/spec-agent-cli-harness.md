@@ -597,6 +597,46 @@ a source-scan lock in each crate now fails the build if you do.
    none vacuous.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a
    by-product) + **attach single-writer** (A1, A2 close here).
+   ✅ **3a SHIPPED 2026-07-27 — the §7.3/§7.6 scheme holes are CLOSED.**
+   Phase 2b's `RECORDED_SHELL_ARM_HOLES` is now **EMPTY**, which is the
+   acceptance 2b named. Five shell-side holes plus **four server-side twins**
+   found while checking:
+   - `is_remote_resume_agent_session`, `is_remote_scanned_sidebar_row`, the
+     scheme half of `terminal_session_uses_remote_runtime` and the cold-launch
+     discriminator each hand-listed `remote-session://`, so **`remote-cc://`
+     failed four §7.3 axes on one arm.** All four now derive from
+     `agent_scheme::remote_agent_row_schemes()` / `remote_row_schemes()` — new
+     registry helpers — so registering a future CLI's remote scheme covers
+     every one of them at once. `remote_session_starts_new_codex` is renamed
+     `remote_session_starts_new_agent` and asks the server whether the launch
+     action is a REGISTERED start subcommand
+     (`agent_start_subcommand_is_registered`) rather than comparing to the
+     literal `"start-codex"`.
+   - `retained_rehydrate_allow_screen_fallback` was `codex_like`-gated, so CC
+     got no authoritative screen on a plain InitialRead reveal (§7.6,
+     snapshot-poison). Its parameter is now `agent_cli_session` and the mount
+     feeds it the broader local. **The codex-only geometry/resize fence is
+     deliberately unchanged** — the two locals stay distinct.
+   - ⚠ **Server twins, found because the brief said to look:**
+     `launch_command_looks_like_remote_resume_attach` matched only
+     `resume-codex`/`start-codex`, so **BOTH halves** of the retained-chunk
+     preservation guards missed remote-cc (the key check AND the launch-command
+     check). Fixed by deriving from the wrapper-subcommand registry, plus
+     `terminal_key_is_remote_agent` replacing three hand-written
+     `remote-session:// || codex-runtime://` lists. **Four rows deleted from
+     phase 0's `KNOWN_PREDICATE_HOLES`** in the same commit, as its
+     both-directions contract requires — those locks caught the stale rows
+     automatically, which is the table working exactly as designed.
+   **All seven fixes red-proven by reverting them in the product.** One lock
+   was VACUOUS on the first pass: the matrix locks the replay POLICY function,
+   so reverting the mount's CALL SITE re-opened the hole with every test green.
+   A call-site lock was added and re-proven red. What a user sees: **remote
+   Claude Code rows now resume, scan and rehydrate the way codex rows always
+   have.**
+   ⚠ **Owed, recorded not guessed:** `is_remote_scanned_live_session_path`
+   (`yggterm-server/src/lib.rs`) is the same shape with six callers spanning
+   persistence/recovery semantics that cannot be validated headlessly. Left
+   alone deliberately.
 4. **Extraction unification** (title/summary/working via descriptor).
 5. **Kimi pilot** (A6): first new CLI lands descriptor-only; then
    antigravity, opencode.
