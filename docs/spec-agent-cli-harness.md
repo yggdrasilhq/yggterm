@@ -301,8 +301,8 @@ usually not `remote-cc://`):
 |---|---|---|
 | `local_runtime_id_from_key` | lib.rs:1634 | cc-runtime keys unrecognized by recoverable/snapshot predicates + restore normalizers (lib.rs:4505/4541/4558 have codex-runtime branches only) |
 | `uses_runtime_owned_terminal_path` | daemon.rs:705 | CC daemon-owned runtimes miss runtime-owned handling |
-| `terminal_key_prefers_initial_screen_snapshot` | terminal.rs:2578 | CC attaches don't get the codex initial-snapshot seed policy |
-| `launch_command_looks_like_remote_resume_attach` | terminal.rs:2554 | matches `resume-codex`/`start-codex` only — `resume-cc`/`start-cc` invisible |
+| ~~`terminal_key_prefers_initial_screen_snapshot`~~ | terminal.rs:2578 | ✅ CLOSED 3a — reads `terminal_key_is_remote_agent` (registry-derived); both ledger rows deleted |
+| ~~`launch_command_looks_like_remote_resume_attach`~~ | terminal.rs:2554 | ✅ CLOSED 3a — derived from the wrapper-subcommand registry, so `resume-cc`/`start-cc` match; ledger row deleted |
 | `bridge_initial_snapshot_should_use_raw_stream` | lib.rs:15185 | codex bridges delay raw stream, CC bridges take a different path |
 | `terminal_line_internal_transport_error_index` | shell.rs:73310 | a real `…not found: cc-runtime://…` transport error is NOT excised |
 | `terminal_line_is_internal_transport_error` (SSOT twin) | terminal_observe.rs:3702 | same hole, second copy |
@@ -311,22 +311,35 @@ usually not `remote-cc://`):
 
 This table is the registry lock's (§2.3, A5) initial work-list.
 
-### 7.3 Remote-resume readiness is codex-only
+### 7.3 Remote-resume readiness was codex-only — ✅ CLOSED (phase 3a)
 
-`is_remote_resume_agent_session` (shell.rs:62581) checks `remote-session://`
-+ LiveSsh **only**. It drives `is_remote_resume_session` (shell.rs:63539)
-which flips ~8 readiness signals (`terminal_has_meaningful_output`,
-`terminal_overlay_dismissed`, `terminal_live_host_connected`,
-`terminal_resume_surface_staged`, `attach_ready`, `connected_for_resume`,
-`stalled_remote_resume`, `transport_error_after_attach`, read-poll cadence).
-**A `remote-cc://` session gets NONE of the remote-resume overlay/readiness
-path.** Same family: `is_remote_scanned_live_session_path` (lib.rs:327),
-`is_remote_scanned_sidebar_row` (shell.rs:25879),
-`terminal_session_uses_remote_runtime` (shell.rs:12987),
-`remote_session_starts_new_codex` cold-launch discriminator (shell.rs:73820
-— no `start-cc` twin). Retained-chunk preservation gates on
-`remote-session://` only: `initial_remote_attach_should_preserve_retained_chunks`
-/ `select_remote_retained_initial_chunks` (terminal.rs:2584/2599).
+**The diagnosis, kept because it names the defect family.**
+`is_remote_resume_agent_session` checked `remote-session://` + LiveSsh
+**only**. It drives `is_remote_resume_session`, which flips ~8 readiness
+signals (`terminal_has_meaningful_output`, `terminal_overlay_dismissed`,
+`terminal_live_host_connected`, `terminal_resume_surface_staged`,
+`attach_ready`, `connected_for_resume`, `stalled_remote_resume`,
+`transport_error_after_attach`, read-poll cadence). **A `remote-cc://` session
+got NONE of the remote-resume overlay/readiness path.** Same family:
+`is_remote_scanned_live_session_path` (lib.rs), `is_remote_scanned_sidebar_row`,
+the scheme half of `terminal_session_uses_remote_runtime`, and the
+`remote_session_starts_new_codex` cold-launch discriminator (no `start-cc`
+twin). Retained-chunk preservation gated on `remote-session://` only:
+`initial_remote_attach_should_preserve_retained_chunks` /
+`select_remote_retained_initial_chunks`.
+
+**State now.** Every predicate above except one derives from the scheme
+registry — `agent_scheme::remote_agent_row_schemes()` (row identity) and
+`remote_row_schemes()` (locality, agent or not) on the shell side,
+`terminal_key_is_remote_agent()` and the wrapper-subcommand registry on the
+server side. The discriminator is `remote_session_starts_new_agent` and asks
+`agent_start_subcommand_is_registered`. `RECORDED_SHELL_ARM_HOLES` is empty and
+the shell arm matrix asserts full locality parity.
+
+⚠ **The one left, recorded not guessed:** `is_remote_scanned_live_session_path`
+(`yggterm-server/src/lib.rs`) is the same shape, with **six callers** spanning
+persistence and recovery semantics that cannot be validated headlessly.
+Deliberately untouched pending live validation.
 
 ### 7.4 Launch/resume construction asymmetries
 
@@ -374,9 +387,13 @@ snapshot vs viewport-reconcile chunk, with codex-specific exclusions
 because their vt100 can be staler than the retained tail). The client-side
 reveal separately picks `daemon_retained_snapshot` vs
 `daemon_screen_snapshot` (shell.rs:65067, 73020), where the authoritative
-screen fallback is `codex_like`-gated (terminal_retained_replay_policy.rs:25
-— CC only gets it in CollapsedScrollbackRecovery mode; this is the
-`remote-cc-replay-codex-only` / snapshot-poison axis). Mid-stream gap
+screen fallback WAS `codex_like`-gated (terminal_retained_replay_policy.rs:25
+— CC only got it in CollapsedScrollbackRecovery mode; this is the
+`remote-cc-replay-codex-only` / snapshot-poison axis). ✅ **CLOSED in phase
+3a:** the gate takes `agent_cli_session`, and the one place that answers it is
+`terminal_reveal_seed_allows_authoritative_screen(mode, kind)`. Plain shells are
+deliberately unchanged — they stream real scrollback, so the retained payload is
+the right seed. Mid-stream gap
 resync is detected but deliberately a no-op (terminal.rs:1855–1864) — the
 seam suspected in the live-path corruption entry (docs/pending-bugs.md).
 **Two writers exist by construction today: daemon seed + client reveal
@@ -427,10 +444,12 @@ not. These phrase lists are descriptor data
 
 ### 7.10 Mount/reveal (GUI): the per-pathway locals that A2 kills
 
-Mount computes pathway-flavored locals: `is_remote_resume_session`
-(remote-session-only, §7.3), `codex_like_session` (excludes CC,
-shell.rs:63585), `remote_starting_codex_session` (shell.rs:63543), and the
-placeholder fork local-prefill vs remote-none (shell.rs:63575). The
+Mount computes pathway-flavored locals: `is_remote_resume_session` (was
+remote-session-only, §7.3 — registry-derived since 3a), `codex_like_session`
+(excludes CC **on purpose**: it gates the codex-only resize/geometry handoff
+fence, and phase 3a moved the attach seed off it onto `agent_cli_session`),
+`remote_starting_agent_session` (renamed from `…codex…` in 3a), and the
+placeholder fork local-prefill vs remote-none. The
 anti-churn mount-epoch machinery (`resolve_active_open_mount_epoch`,
 shell.rs:12926 — reveal-in-place vs cold remount, futile-remount cap) is
 where the cross-pathway double-construct lives; the m1/m2 generation labels
@@ -568,23 +587,28 @@ a source-scan lock in each crate now fails the build if you do.
    and mount identity (§7.10). **The invariant it states once:** every one of
    these axes is a property of WHERE the PTY lives, never of WHICH CLI is
    talking — the same shape as 2a's write-strategy rule.
-   **It ships RED-BY-DESIGN, and that is the deliverable.** Five holes are
-   real today and now recorded in `RECORDED_SHELL_ARM_HOLES` with their
+   **It shipped RED-BY-DESIGN, and that was the deliverable.** Five holes were
+   real at 2b and recorded in `RECORDED_SHELL_ARM_HOLES` with their
    user-visible symptoms, locked in both directions (phase 0's burn-down
    contract): `is_remote_resume_agent_session`, `is_remote_scanned_sidebar_row`,
    the scheme half of `terminal_session_uses_remote_runtime`, and
-   `remote_session_starts_new_codex` ALL match `remote-session://` only, so
-   **`remote-cc://` fails four §7.3 axes on one arm**; and
-   `retained_rehydrate_allow_screen_fallback` is `codex_like`-gated, so CC gets
+   `remote_session_starts_new_codex` ALL matched `remote-session://` only, so
+   **`remote-cc://` failed four §7.3 axes on one arm**; and
+   `retained_rehydrate_allow_screen_fallback` was `codex_like`-gated, so CC got
    no authoritative screen on a plain InitialRead reveal (§7.6, the
    snapshot-poison axis) on BOTH localities.
+   **All five are CLOSED — see 3a below; the ledger is EMPTY.** The
+   burn-down contract turned over with them: the hole test is now
+   `every_closed_hole_stays_closed_and_the_ledger_is_empty`, asserting each
+   closed axis against the codex twin that always had the behaviour, so a
+   regression re-opens as an unrecorded deviation rather than passing quietly.
    ⚠ **Which lock does what — corrected 2026-07-27 after review, because the
    first version of this entry credited the wrong test.** The BOTH-DIRECTIONS
    property for holes 1–4 is delivered by the PER-AXIS tests (each asserts the
    product's own decision function against that arm's cell) together with
-   `recorded_holes_still_reproduce_and_none_is_unrecorded` (each hole
-   reproduced against its locality twin, so "nothing is ready yet" cannot pass
-   for a hole).
+   `every_closed_hole_stays_closed_and_the_ledger_is_empty` (each axis measured
+   against its locality twin, so "nothing is ready yet" — or, post-fix,
+   "everything answers true" — cannot pass for a hole).
    `readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded`
    is NOT that mechanism: it makes **zero production calls**. It is a
    TABLE/LEDGER INTEGRITY lock — it fails when a deviating cell has no ledger
@@ -593,15 +617,17 @@ a source-scan lock in each crate now fails the build if you do.
    against the axes that deviate) so that its name is true of what it does.
    **Phase 3 is unblocked, and its acceptance is this file going green as rows
    are deleted.**
-   ⚠ **Production changes, all EXTRACTIONS, no behaviour change:** the scheme
-   half of `terminal_session_uses_remote_runtime` became
+   ⚠ **Production changes at 2b, all EXTRACTIONS, no behaviour change:** the
+   scheme half of `terminal_session_uses_remote_runtime` became
    `session_path_names_remote_runtime_by_scheme` (behind `&self` it was
-   unlockable); the mount's `codex_like` local became `codex_like_session(kind)`;
-   and the two DECISIONS this table is really about were given names their call
-   sites now use — `terminal_mount_takes_remote_resume_readiness` (the §7.3
-   readiness fork, in `TerminalCanvas`) and
-   `terminal_reveal_seed_allows_authoritative_screen` (the §7.6 seed, in the
-   retained-rehydrate task). Six items are `pub(crate)` for the same reason.
+   unlockable); the mount's `codex_like` local became `codex_like_session(kind)`
+   (and, at 3a, its broader sibling became `agent_cli_session(kind)`, derived
+   from `SessionKind::is_agent()`); and the two DECISIONS this table is really
+   about were given names their call sites now use —
+   `terminal_mount_takes_remote_resume_readiness` (the §7.3 readiness fork, in
+   `TerminalCanvas`) and `terminal_reveal_seed_allows_authoritative_screen` (the
+   §7.6 seed, in the retained-rehydrate task). Six items are `pub(crate)` for the
+   same reason.
    **The last three came out of review and carry the general lesson:** the
    `codex_like` cell was originally asserted against a test-local
    `matches!(kind, Codex | CodexLiteLlm)`, which reads no production code, so
@@ -616,17 +642,80 @@ a source-scan lock in each crate now fails the build if you do.
    matrix locks the mount IDENTITY those epochs feed (`terminal_mount_host_id`,
    the m1/m2 label source) instead of faking a ShellState, which would lock the
    fake rather than the product.
-   **Red-proof status, counted honestly: NINE of the ten locks have been turned
-   RED by mutating production** — the six original mutations (teaching each
-   §7.3 predicate about `remote-cc://`, dropping the `codex_like` gate, dropping
-   the epoch from the mount id), the three review mutations above, plus
-   narrowing the recovery gate and unregistering a shipping CLI. **The tenth,
-   `readiness_axes_…`, is structurally unprovable that way and always will be:
-   it calls nothing from production, so no production edit can move it.** That
-   is not a defect — it is the scope of a table/ledger lock — but it is the
-   reason it must never again be described as the both-directions mechanism.
+   **Red-proof status, counted honestly: TEN of the eleven locks have been
+   turned RED by mutating production** — the six original mutations (teaching
+   each §7.3 predicate about `remote-cc://`, dropping the `codex_like` gate,
+   dropping the epoch from the mount id), the three review mutations above, plus
+   narrowing the recovery gate and unregistering a shipping CLI; and, at 3a, the
+   eleventh lock (the call-site source scan) proven red by bypassing the seed
+   decision in the mount. **The one that stays unproven that way,
+   `readiness_axes_…`, is structurally unprovable and always will be: it calls
+   nothing from production, so no production edit can move it.** That is not a
+   defect — it is the scope of a table/ledger lock — but it is the reason it must
+   never again be described as the both-directions mechanism. Its own
+   both-directions proof is a TABLE or LEDGER mutation: flip a cell without a
+   ledger row, or add a ledger row with no deviating cell, and it goes red.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a
    by-product) + **attach single-writer** (A1, A2 close here).
+   ✅ **3a SHIPPED 2026-07-27 — the §7.3/§7.6 scheme holes are CLOSED.**
+   Phase 2b's `RECORDED_SHELL_ARM_HOLES` is now **EMPTY**, which is the
+   acceptance 2b named. Five shell-side holes plus **four server-side twins**
+   found while checking:
+   - `is_remote_resume_agent_session`, `is_remote_scanned_sidebar_row`, the
+     scheme half of `terminal_session_uses_remote_runtime` and the cold-launch
+     discriminator each hand-listed `remote-session://`, so **`remote-cc://`
+     failed four §7.3 axes on one arm.** All four now derive from
+     `agent_scheme::remote_agent_row_schemes()` / `remote_row_schemes()` — new
+     registry helpers — so registering a future CLI's remote scheme covers
+     every one of them at once. `remote_session_starts_new_codex` is renamed
+     `remote_session_starts_new_agent` and asks the server whether the launch
+     action is a REGISTERED start subcommand
+     (`agent_start_subcommand_is_registered`) rather than comparing to the
+     literal `"start-codex"`.
+   - `retained_rehydrate_allow_screen_fallback` was `codex_like`-gated, so CC
+     got no authoritative screen on a plain InitialRead reveal (§7.6,
+     snapshot-poison). Its parameter is now `agent_cli_session`, and the seed
+     DECISION `terminal_reveal_seed_allows_authoritative_screen(mode, kind)` —
+     which the retained-rehydrate task calls with the session's CLI, not a
+     pre-computed bool — is the single place that answers WHICH CLIs get the
+     authoritative screen. It reads `agent_cli_session(kind)`, itself derived
+     from `SessionKind::is_agent()`. **The codex-only geometry/resize fence is
+     deliberately unchanged** — `codex_like_session` and `agent_cli_session` stay
+     distinct locals, and the matrix asserts both per arm.
+   - ⚠ **Server twins, found because the brief said to look:**
+     `launch_command_looks_like_remote_resume_attach` matched only
+     `resume-codex`/`start-codex`, so **BOTH halves** of the retained-chunk
+     preservation guards missed remote-cc (the key check AND the launch-command
+     check). Fixed by deriving from the wrapper-subcommand registry, plus
+     `terminal_key_is_remote_agent` replacing three hand-written
+     `remote-session:// || codex-runtime://` lists. **Four rows deleted from
+     phase 0's `KNOWN_PREDICATE_HOLES`** in the same commit, as its
+     both-directions contract requires — those locks caught the stale rows
+     automatically, which is the table working exactly as designed.
+   **All seven fixes red-proven by reverting them in the product.** One lock
+   was VACUOUS on the first pass: the matrix locks the replay POLICY function,
+   so reverting the mount's CALL SITE re-opened the hole with every test green.
+   A call-site lock was added and re-proven red. What a user sees: **remote
+   Claude Code rows now resume, scan and rehydrate the way codex rows always
+   have.**
+   ⚠ **THREE LAYERS, THREE LOCKS — the shape the 2b review and the 3a
+   red-proof arrived at from opposite directions, and the reason both survive.**
+   A §7.6-family fix (or regression) can land at the PREDICATE
+   (`agent_scheme::remote_agent_row_schemes` / `agent_cli_session`), at the
+   DECISION (`terminal_mount_takes_remote_resume_readiness`,
+   `terminal_reveal_seed_allows_authoritative_screen`), or at the CALL SITE. The
+   per-axis matrix tests call the DECISION, so they catch the first two. They
+   cannot catch the third: the mount can BYPASS the decision and call the policy
+   function directly with the codex-only local — which is exactly what the code
+   did before 3a — and every behavioural test stays green. So
+   `the_screen_fallback_call_site_passes_the_agent_cli_answer_not_the_codex_one`
+   reads the production source and asserts the policy has exactly ONE caller in
+   `shell.rs`, that it is the seed decision, and that the reveal reaches that
+   decision by handing it the session's CLI.
+   ⚠ **Owed, recorded not guessed:** `is_remote_scanned_live_session_path`
+   (`yggterm-server/src/lib.rs`) is the same shape with six callers spanning
+   persistence/recovery semantics that cannot be validated headlessly. Left
+   alone deliberately.
 4. **Extraction unification** (title/summary/working via descriptor).
 5. **Kimi pilot** (A6): first new CLI lands descriptor-only; then
    antigravity, opencode.
