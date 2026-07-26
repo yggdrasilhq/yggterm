@@ -1644,7 +1644,13 @@ fn run_server_connect(
 /// `yggterm server reorder <path>...`: set the Live Sessions row order. The
 /// daemon places the listed rows first and appends every unlisted live row after
 /// them (see `replace_live_session_order`), so a partial list only promotes the
-/// rows you name and can never drop one.
+/// rows you name and can never drop one. Dormant rows (no runtime) reorder like
+/// any other row.
+///
+/// The report is the DAEMON's account, not an echo of the request: `applied` and
+/// `skipped` come off the wire. The old output printed `requested: N` and the
+/// caller's own list, which read as success even when the daemon had silently
+/// dropped every row (field guide §4.5).
 fn run_server_reorder(
     endpoint: &yggterm_server::ServerEndpoint,
     ordered_paths: &[String],
@@ -1662,16 +1668,36 @@ fn run_server_reorder(
         .iter()
         .map(|session| session.session_path.clone())
         .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "requested": ordered_paths.len(),
-            "live_session_count": after_order.len(),
-            "changed": before_order != after_order,
-            "message": message,
-            "order": after_order,
-        }))?
-    );
+    let update = message
+        .as_deref()
+        .and_then(yggterm_server::LiveSessionOrderUpdate::from_message);
+    let mut report = serde_json::json!({
+        "requested": ordered_paths,
+        "live_session_count": after_order.len(),
+        "changed": before_order != after_order,
+        "order": after_order,
+    });
+    match &update {
+        Some(update) => {
+            report["applied"] = serde_json::json!(update.applied);
+            report["skipped"] = serde_json::json!(update.skipped);
+            report["message"] = serde_json::json!(update.summary());
+        }
+        // An older daemon cannot say what it applied. Report the gap rather
+        // than inventing an `applied` list out of the request.
+        None => {
+            report["applied"] = serde_json::Value::Null;
+            report["skipped"] = serde_json::Value::Null;
+            report["applied_unreported_by_daemon"] = serde_json::json!(true);
+            report["message"] = serde_json::json!(message);
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if let Some(update) = update
+        && !update.skipped.is_empty()
+    {
+        anyhow::bail!("{}", update.summary());
+    }
     Ok(())
 }
 

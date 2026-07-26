@@ -2651,6 +2651,15 @@ struct DaemonRuntime {
     /// every order change through the persist chokepoint and answers "where
     /// does this row go when it comes back?" — see `row_order_ledger.rs`.
     row_order_ledger: crate::row_order_ledger::RowOrderLedger,
+    /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
+    /// user left behind on the daemon we are succeeding.
+    ///
+    /// Not a second source of truth: it is one read of the ledger file, taken
+    /// before we can have written to it. `row_order_ledger` cannot answer this
+    /// question by the time the restore runs, because every `persist()` records
+    /// the CURRENT (freshly rebuilt, still scrambled) order into it — reading it
+    /// then would reconcile the scramble against itself and change nothing.
+    booted_with_row_order: Vec<String>,
     /// Durable memory of Live Sessions rows the user CLOSED. The row-order
     /// ledger remembers where a row goes; this remembers that a row must not
     /// come back at all. Consulted only by the cross-daemon import admission
@@ -2868,6 +2877,11 @@ impl DaemonRuntime {
             server.restore_persisted_state_with_launch_policy(saved, Some(&store), false);
         }
         let store_home_dir_for_ledger = store.home_dir().to_path_buf();
+        let row_order_ledger =
+            crate::row_order_ledger::RowOrderLedger::load(store_home_dir_for_ledger.as_path());
+        let booted_with_row_order = row_order_ledger
+            .scope_rows(crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE)
+            .to_vec();
         let mut runtime = Self {
             support,
             state_path,
@@ -2875,9 +2889,8 @@ impl DaemonRuntime {
             server,
             terminals: TerminalManager::new(),
             preserved_terminal_owners,
-            row_order_ledger: crate::row_order_ledger::RowOrderLedger::load(
-                store_home_dir_for_ledger.as_path(),
-            ),
+            row_order_ledger,
+            booted_with_row_order,
             live_row_tombstones,
             live_row_identities_seen: HashSet::new(),
             profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable::new(),
@@ -3754,6 +3767,13 @@ impl DaemonRuntime {
         self.recover_missing_preserved_owner_live_sessions_from_reachable_daemons(reason);
         self.adopt_missing_dormant_sessions_from_reachable_daemons(reason);
         self.adopt_missing_live_session_rows_from_reachable_daemons(reason);
+        // The rebuild is complete; hand the user their order back before
+        // anything persists the assembled (restored-first, adopted-after)
+        // scramble over the ledger that remembers it.
+        let order_restored = self.restore_row_order_from_boot_ledger(reason);
+        if order_restored {
+            let _ = self.persist();
+        }
         append_trace_event(
             self.store.home_dir(),
             "daemon",
@@ -3763,6 +3783,7 @@ impl DaemonRuntime {
                 "reason": reason,
                 "registered_owner_keys_before": before,
                 "registered_owner_keys_after": self.preserved_terminal_owners.keys().len(),
+                "row_order_restored_from_ledger": order_restored,
             }),
         );
     }
@@ -4276,6 +4297,13 @@ impl DaemonRuntime {
         let mut prepared = Vec::new();
         let mut prepare_errors = Vec::new();
         let mut imported_keys = Vec::new();
+        // One receipt per takeover, taken the moment we know a swap is really
+        // happening and before this pass can move a single row. The predecessor
+        // writes its own on PrepareUpdateRestart; this is the successor's, and
+        // it is the only one that exists when the predecessor is an older binary
+        // with no snapshot writer. Guarded so a daemon that starts with no older
+        // peer — the common case — leaves no file at all.
+        let mut pre_swap_snapshot_written = false;
         for (endpoint, status) in reachable_versioned_daemon_statuses_excluding_endpoint(
             self.store.home_dir(),
             &current_endpoint,
@@ -4292,6 +4320,10 @@ impl DaemonRuntime {
             };
             if !older {
                 continue;
+            }
+            if !pre_swap_snapshot_written {
+                self.write_pre_daemon_swap_row_order_snapshot("superseded_daemon_takeover");
+                pre_swap_snapshot_written = true;
             }
             match prepare_update_restart(&endpoint) {
                 Ok(_) => prepared.push(owner_endpoint_label(&endpoint)),
@@ -4349,7 +4381,11 @@ impl DaemonRuntime {
         if prepared.is_empty() && prepare_errors.is_empty() {
             return;
         }
-        if !imported_keys.is_empty() {
+        // Restore BEFORE the persist: `persist()` records the live order into
+        // the ledger, so persisting the freshly-imported scramble first would
+        // overwrite the very arrangement the restore reads.
+        let order_restored = self.restore_row_order_from_boot_ledger("superseded_daemon_takeover");
+        if !imported_keys.is_empty() || order_restored {
             let _ = self.persist();
         }
         append_trace_event(
@@ -4361,6 +4397,7 @@ impl DaemonRuntime {
                 "prepared": prepared,
                 "prepare_errors": prepare_errors,
                 "imported_keys": imported_keys,
+                "row_order_restored_from_ledger": order_restored,
             }),
         );
     }
@@ -5524,6 +5561,96 @@ impl DaemonRuntime {
         }
     }
 
+    /// THE restore half of the row-order ledger: after a handover rebuild has
+    /// finished assembling the live-row list, put it back in the order the user
+    /// left (`booted_with_row_order`).
+    ///
+    /// Called by each rebuild pass, at its END and BEFORE its persist — the
+    /// ordering decision itself lives in
+    /// [`crate::row_order_ledger::reconcile_order_with_remembered`] and is
+    /// applied through `replace_live_session_order`, so this adds no second
+    /// ordering primitive. Rows the ledger never saw keep exactly the placement
+    /// the anchored import walk chose for them.
+    ///
+    /// It cannot resurrect anything: the reconcile is a permutation of the rows
+    /// this daemon already holds, so a tombstoned row sitting in the ledger
+    /// (the ledger remembers non-live rows by design) stays out.
+    ///
+    /// Returns true when the order moved.
+    fn restore_row_order_from_boot_ledger(&mut self, reason: &'static str) -> bool {
+        if self.booted_with_row_order.is_empty() {
+            return false;
+        }
+        let before = self.server.live_session_order_keys().to_vec();
+        let update = crate::row_order_ledger::restore_live_row_order(
+            &mut self.server,
+            &self.booted_with_row_order,
+        );
+        if !update.changed {
+            return false;
+        }
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "lifecycle",
+            "live_row_order_restored_from_ledger",
+            serde_json::json!({
+                "reason": reason,
+                "remembered_rows": self.booted_with_row_order.len(),
+                "before": before,
+                "after": self.server.live_session_order_keys(),
+            }),
+        );
+        true
+    }
+
+    /// Write the pre-swap row-order snapshot for a daemon bump/handover.
+    ///
+    /// Best-effort in both directions: a failed write must never abort a swap,
+    /// and a swap must never happen without at least trying to leave the receipt
+    /// (the user asked for exactly this after re-curating the sidebar by hand
+    /// twice in one day).
+    fn write_pre_daemon_swap_row_order_snapshot(&self, reason: &str) {
+        let snapshot = crate::row_order_ledger::PreDaemonSwapRowOrderSnapshot {
+            captured_at_unix: crate::live_row_tombstones::now_secs(),
+            reason: reason.to_string(),
+            server_version: SERVER_PROTOCOL_VERSION.to_string(),
+            server_pid: std::process::id(),
+            live_order: self.server.live_session_order_keys().to_vec(),
+            ledger: self.row_order_ledger.clone(),
+        };
+        let row_count = snapshot.live_order.len();
+        match crate::row_order_ledger::write_pre_daemon_swap_row_order_snapshot(
+            self.store.home_dir(),
+            &snapshot,
+        ) {
+            Ok(path) => append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "lifecycle",
+                "pre_daemon_swap_row_order_snapshot_written",
+                serde_json::json!({
+                    "reason": reason,
+                    "path": path.display().to_string(),
+                    "row_count": row_count,
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, reason, "failed to write pre-daemon-swap row order snapshot");
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "pre_daemon_swap_row_order_snapshot_failed",
+                    serde_json::json!({
+                        "reason": reason,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
     /// Remember that the user closed the row currently listed for `path`, so no
     /// peer daemon can hand it back. Call BEFORE the removal — the identity is
     /// read out of the live order, which the removal empties.
@@ -5709,6 +5836,11 @@ impl DaemonRuntime {
                 // regardless, and PrepareClientClose still preserves non-keep-alive
                 // sessions via the staged-version gate even without a fresh
                 // snapshot. Always set the flag so that gate trips, and proceed.
+                //
+                // This is the pre-swap moment on the OUTGOING daemon: its live
+                // order right now IS the arrangement the user curated, so the
+                // receipt is taken here, before the handover can disturb it.
+                self.write_pre_daemon_swap_row_order_snapshot("prepare_update_restart");
                 let state = self.persisted_state_for_update_restart();
                 if let Err(error) = write_persisted_state(&self.state_path, &state) {
                     append_trace_event(
@@ -6556,14 +6688,27 @@ impl DaemonRuntime {
                 ordered_paths,
                 client_scope,
             } => {
-                let changed = self.server.replace_live_session_order(&ordered_paths);
+                let update = self.server.replace_live_session_order(&ordered_paths);
                 self.record_row_order_ledger(client_scope.as_deref());
                 self.persist()?;
-                self.snapshot_response(Some(if changed {
-                    "reordered live sessions".to_string()
-                } else {
-                    "live session order unchanged".to_string()
-                }))
+                if !update.skipped.is_empty() {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "session",
+                        "live_session_reorder_skipped_rows",
+                        serde_json::json!({
+                            "requested": ordered_paths,
+                            "applied": update.applied,
+                            "skipped": update.skipped,
+                            "client_scope": client_scope,
+                        }),
+                    );
+                }
+                // The response carries the honest account, not the echoed
+                // request: `requested: N` plus the caller's own list reads as
+                // success even when every row was dropped (field guide §4.5).
+                self.snapshot_response(Some(update.to_message()))
             }
             ServerRequest::RowOrderLedgerReport { scope } => {
                 let ledger = &self.row_order_ledger;
@@ -16217,6 +16362,104 @@ mod tests {
         assert!(
             after_unix_bind.contains("run_deferred_preserved_owner_deep_reconcile("),
             "run_daemon must run the deferred preserved-owner deep reconcile after binding the socket"
+        );
+    }
+
+    /// Both handover rebuild passes must hand the user's order back, and each
+    /// must do it BEFORE its own persist — `persist()` records the live order
+    /// into the ledger, so persisting the freshly-imported scramble first would
+    /// overwrite the arrangement the restore reads. Drop either call and the
+    /// ledger goes write-only again, which is exactly the 2.12.15 bump: 143
+    /// entries preserved byte-for-byte and nobody reading them.
+    #[test]
+    fn handover_rebuild_passes_restore_row_order_before_persisting() {
+        let source = include_str!("daemon.rs");
+
+        let deep_reconcile = source
+            .split(
+                "fn run_deferred_preserved_owner_deep_reconcile(&mut self, reason: &'static str) {",
+            )
+            .nth(1)
+            .and_then(|body| body.split("\n    }\n").next())
+            .expect("deep reconcile body should be present");
+        assert!(
+            deep_reconcile.contains("adopt_missing_live_session_rows_from_reachable_daemons("),
+            "anchor check: the deep reconcile body must be the one that adopts live rows"
+        );
+        let (adoption, after_adoption) = deep_reconcile
+            .split_once("adopt_missing_live_session_rows_from_reachable_daemons(")
+            .expect("live-row adoption should be present");
+        assert!(
+            !adoption.contains("restore_row_order_from_boot_ledger("),
+            "the restore must run AFTER the rebuild has finished adopting rows"
+        );
+        assert!(
+            after_adoption.contains("restore_row_order_from_boot_ledger("),
+            "the deep reconcile must restore the ledger order once the rebuild is complete"
+        );
+
+        let takeover = source
+            .split("fn takeover_superseded_daemon_state(&mut self) {")
+            .nth(1)
+            .and_then(|body| body.split("\n    }\n").next())
+            .expect("takeover body should be present");
+        assert!(
+            takeover.contains("import_peer_live_rows_in_order("),
+            "anchor check: the takeover body must be the one that imports peer rows"
+        );
+        let (before_restore, after_restore) = takeover
+            .split_once("restore_row_order_from_boot_ledger(")
+            .expect("the takeover must restore the ledger order after importing");
+        assert!(
+            before_restore.contains("import_peer_live_rows_in_order("),
+            "the restore must run AFTER the import walk, not before it"
+        );
+        assert!(
+            !before_restore.contains("self.persist()"),
+            "nothing may persist the imported scramble before the ledger order is restored"
+        );
+        assert!(
+            after_restore.contains("self.persist()"),
+            "the restored order must reach disk"
+        );
+    }
+
+    /// The pre-swap receipt the user asked for by name. Two writers, both
+    /// deliberate: the OUTGOING daemon captures the curated order it still
+    /// holds, and the INCOMING daemon captures one too — because a predecessor
+    /// on an older binary has no snapshot writer at all.
+    #[test]
+    fn daemon_swap_writes_a_pre_swap_row_order_snapshot() {
+        let source = include_str!("daemon.rs");
+
+        let prepare = source
+            .split("ServerRequest::PrepareUpdateRestart => {")
+            .nth(1)
+            .and_then(|body| body.split("ServerRequest::PrepareClientClose").next())
+            .expect("PrepareUpdateRestart branch should be present");
+        assert!(
+            prepare.contains("persisted_state_for_update_restart("),
+            "anchor check: this must be the branch that arms the update-restart snapshot"
+        );
+        let (before_state_write, _) = prepare
+            .split_once("let state = self.persisted_state_for_update_restart();")
+            .expect("update-restart state write should be present");
+        assert!(
+            before_state_write.contains("write_pre_daemon_swap_row_order_snapshot("),
+            "the outgoing daemon must record its row order before the handover disturbs it"
+        );
+
+        let takeover = source
+            .split("fn takeover_superseded_daemon_state(&mut self) {")
+            .nth(1)
+            .and_then(|body| body.split("\n    }\n").next())
+            .expect("takeover body should be present");
+        let (before_import, _) = takeover
+            .split_once("import_peer_live_rows_in_order(")
+            .expect("the takeover must import peer rows");
+        assert!(
+            before_import.contains("write_pre_daemon_swap_row_order_snapshot("),
+            "the incoming daemon must record the pre-swap row order before it moves a single row"
         );
     }
 

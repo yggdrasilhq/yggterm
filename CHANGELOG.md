@@ -23,6 +23,27 @@ This file tracks user-visible changes in `yggterm`.
   sessions up; nothing is lost, because the service keeps every byte and the
   terminal reads them back when it wakes. If the signal ever goes missing the
   app resumes drawing on its own rather than leaving you behind a cover.
+- **Fixed: the sidebar keeps the order you put it in when the daemon is
+  replaced.** The app has always written down the order of your session rows,
+  and it kept writing it down faithfully — but nothing ever read it back. So
+  after an update the rows came back in whatever order the rebuild happened to
+  produce: rows recovered from disk first, rows picked up from the outgoing
+  daemon appended after them, and the two sessions you were actually working in
+  pushed from the top of the list down to sixth and seventh. Rebuilding a
+  session list now ends by putting the rows back in your order. A row the app
+  has never seen before keeps the place the rebuild gave it, and a row you
+  closed cannot come back this way — the restore only rearranges rows that are
+  already there.
+- **New: a daemon replacement leaves a record of your row order beforehand.**
+  It lands in `~/.yggterm/manual-snapshots/` as `pre-daemon-swap-<time>-<pid>.json`
+  and holds the row order plus the whole order ledger, so a bad restart is
+  recoverable by hand as well as automatically. The newest 32 are kept.
+- **Fixed: `yggterm server reorder` now moves rows that have no running
+  program, and says what it actually did.** It used to quietly ignore any row
+  without a live session — nearly half a typical sidebar — while still
+  reporting the full list back, which read exactly like success. It now reorders
+  every row, reports `applied` and `skipped` lists, refuses to invent a row that
+  does not exist, and exits non-zero when anything was skipped.
 
 ## 2.12.14
 
