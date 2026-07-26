@@ -5,8 +5,9 @@ use crate::codex_cli::{
     terminal_identity_color_profile_from_environment, terminal_identity_env_pairs,
     terminal_identity_env_removals,
 };
+use crate::pty_adoption::PtyChildHandle;
 use anyhow::{Context, Result, bail};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -1085,7 +1086,11 @@ struct PtySessionRuntime {
     spawn_id: u64,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer_tx: SyncSender<TerminalWriteRequest>,
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// Owned (we spawned it) or Adopted (we received its master fd and it is
+    /// init's child now). `Child::wait`/`try_wait` cannot answer for a process
+    /// that is not ours, which is why this is an enum rather than a trait
+    /// object — see `crate::pty_adoption`.
+    child: Arc<Mutex<PtyChildHandle>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
@@ -1904,7 +1909,7 @@ impl PtySessionRuntime {
             spawn_id: next_runtime_spawn_id(started_at_ms),
             master: Arc::new(Mutex::new(pair.master)),
             writer_tx,
-            child: Arc::new(Mutex::new(child)),
+            child: Arc::new(Mutex::new(PtyChildHandle::owned(child))),
             chunks,
             retained_bytes,
             seq,
@@ -1945,11 +1950,14 @@ impl PtySessionRuntime {
 
     fn is_running(&self) -> bool {
         let mut child = self.child.lock().expect("pty child lock poisoned");
-        match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
-        }
+        // A probe error reads as "not running" HERE and only here, which is
+        // exactly what the pre-split `match child.try_wait() { … Err(_) => false }`
+        // did: this accessor answers a yes/no display question for callers that
+        // have no channel for an error. The TEARDOWN paths below deliberately do
+        // NOT use it — they take the `Result` and either propagate it or trace
+        // it, because there a swallowed probe error becomes a false "it exited"
+        // and a shutdown that reports success over a live process.
+        child.is_running().unwrap_or(false)
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -2508,22 +2516,20 @@ impl PtySessionRuntime {
     /// agent CLI shuts down that fast, so the injected text was nearly pure
     /// downside. A signal cannot collide with the user's input.
     #[cfg(unix)]
-    fn signal_child_to_exit(&self, child: &mut Box<dyn Child + Send + Sync>) -> Result<bool> {
-        let Some(pid) = child.process_id() else {
-            return Ok(false);
-        };
+    fn signal_child_to_exit(&self, child: &mut PtyChildHandle) -> Result<bool> {
         for signal in [libc::SIGHUP, libc::SIGTERM] {
-            // SAFETY: `pid` names this daemon's own PTY child. A dead pid may be
-            // reaped and refused with ESRCH, which we ignore.
-            unsafe {
-                libc::kill(pid as libc::pid_t, signal);
+            // `signal` identity-checks an ADOPTED pid before firing (start time,
+            // not just the number) and is a plain kill for an owned child.
+            if !child.signal(signal) {
+                return Ok(false);
             }
             for _ in 0..20 {
-                if child
-                    .try_wait()
-                    .context("checking terminal exit state")?
-                    .is_some()
-                {
+                // "Has it finished" — NOT "what was its status". An adopted
+                // child can answer the first and never the second. The `?` is
+                // the pre-split behaviour, kept: a probe that FAILED is not a
+                // process that exited, and reporting it as one here would end
+                // the shutdown early over something still running.
+                if !child.is_running().context("checking terminal exit state")? {
                     return Ok(true);
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -2532,7 +2538,7 @@ impl PtySessionRuntime {
         Ok(false)
     }
     #[cfg(not(unix))]
-    fn signal_child_to_exit(&self, _child: &mut Box<dyn Child + Send + Sync>) -> Result<bool> {
+    fn signal_child_to_exit(&self, _child: &mut PtyChildHandle) -> Result<bool> {
         Ok(false)
     }
 
@@ -2545,11 +2551,7 @@ impl PtySessionRuntime {
             // prompt is closed by signal — see `signal_child_to_exit`.
             let _ = self.write(command);
             for _ in 0..2 {
-                if child
-                    .try_wait()
-                    .context("checking terminal exit state")?
-                    .is_some()
-                {
+                if !child.is_running().context("checking terminal exit state")? {
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -2558,8 +2560,10 @@ impl PtySessionRuntime {
             return Ok(());
         }
 
+        // An ADOPTED child is nobody's: dropping the master fd only SIGHUPs the
+        // foreground group, so this explicit kill is the only thing that ends it.
         let _ = child.kill();
-        let _ = child.wait();
+        child.wait_for_exit();
         Ok(())
     }
 
@@ -2578,13 +2582,9 @@ impl PtySessionRuntime {
             // into the user's draft. The loop below still force-kills on timeout.
             #[cfg(unix)]
             {
-                let child = self.child.lock().expect("pty child lock poisoned");
-                if let Some(pid) = child.process_id() {
-                    // SAFETY: our own PTY child; ESRCH on an already-reaped pid is ignored.
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGHUP);
-                    }
-                }
+                let mut child = self.child.lock().expect("pty child lock poisoned");
+                // Identity-checked for an adopted pid; a plain kill for our own.
+                child.signal(libc::SIGHUP);
             }
         }
         let key = self.key.clone();
@@ -2593,17 +2593,17 @@ impl PtySessionRuntime {
             loop {
                 {
                     let mut child = self.child.lock().expect("pty child lock poisoned");
-                    match child.try_wait() {
-                        Ok(Some(_)) => {
+                    match child.is_running() {
+                        Ok(false) => {
                             trace_terminal_event(
                                 "graceful_shutdown_completed",
                                 serde_json::json!({ "path": key }),
                             );
                             return;
                         }
-                        Ok(None) if started.elapsed() >= force_after => {
+                        Ok(true) if started.elapsed() >= force_after => {
                             let _ = child.kill();
-                            let _ = child.wait();
+                            child.wait_for_exit();
                             trace_terminal_event(
                                 "graceful_shutdown_forced",
                                 serde_json::json!({
@@ -2613,7 +2613,13 @@ impl PtySessionRuntime {
                             );
                             return;
                         }
-                        Ok(None) => {}
+                        // Still running, not yet past the force deadline.
+                        Ok(true) => {}
+                        // A probe that FAILED is not a process that exited. An
+                        // owned child is probed with `waitpid`, which really can
+                        // fail, so folding the error into `false` would trace
+                        // `graceful_shutdown_completed` over a process nobody
+                        // has any evidence about — the teardown-lies bug class.
                         Err(error) => {
                             trace_terminal_event(
                                 "graceful_shutdown_probe_failed",
