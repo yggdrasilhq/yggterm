@@ -38,14 +38,14 @@ fix) once the fix is verified live on guihost.
   an OTP discovering this at the last step. Fix either way, but honestly:
   (a) make the verb refuse AT PARSE TIME with the policy reason and a pointer
   to the sidebar path, or (b) build the audited agent injection path as a
-  deliberate user decision (see ychrome docs/vault.md "card-first" TODO).
+  deliberate user decision (see ychrome docs/vault.md audited-card TODO).
   Until then the help text is a lie.
 
 - **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
   pixel proof, 2026-07-26 ~17:55 IST).** `terminal new --no-activate` keeps the
   VIEWPORT on the user's session (activation contract holds; metadata rail and
   viewport stayed on the user's own row) but the Live Sessions
-  SELECTED-ROW highlight jumped to the agent-spawned ychrome row (the agent's records row, top of the list) while the user's session sat fourth. Selection is a
+  SELECTED-ROW highlight jumped to the agent-spawned ychrome row (the agent's browsing row, top of the list) while the user's session sat fourth. Selection is a
   separate state from activation and the row-creation path moves it
   unconditionally. The `--no-activate` contract must cover selected-row truth
   too: an agent-created row must not take the highlight (nor scroll the list).
@@ -53,7 +53,7 @@ fix) once the fix is verified live on guihost.
   the same day). GUI-only fix expected; no daemon involvement.
 
 - **★★★ `web do` FIDELITY ON RE-RENDERING DOMs — three reproducible defects,
-  one family (a services portal filing run, 2026-07-26 ~15:30-16:00 IST, guihost 2.12.15,
+  one family (a live portal filing run, 2026-07-26 ~15:30-16:00 IST, guihost 2.12.15,
   session `local://b556fb1b`, all self-reported SUCCESS while wrong):**
   1. **`do fill` DROPS and INVENTS characters on React controlled inputs.**
      `fill --selector '#street' --text "Example Fixture Road"` → response
@@ -76,7 +76,7 @@ fix) once the fix is verified live on guihost.
   the requested text (honest failure when mismatched), clear-verify the
   resolved target element only, re-resolve rects after scroll before injecting.
   4. **Duplicate DOM ids across repeated form blocks break `--selector`
-     targeting.** a services portal renders the complainant and OP blocks with the SAME
+     targeting.** The portal renders two party form blocks with the SAME
      ids (`#Name`, `#District`…); `#id` selectors silently hit the FIRST, so
      the agent drove the complainant's field while aiming at the OP's — twice.
      Agent-side workaround: strip injected ids from previous holders before
@@ -118,7 +118,7 @@ fix) once the fix is verified live on guihost.
   - (5) `role=option`/`menuitem` pools are filtered for liveness and scoped to
     the listbox an `aria-expanded` combobox owns (else the last visible one);
     a pool of only stale options refuses `stale_listbox_only`, never a click.
-  ⚠ **Live verification is OWED**: no a services portal re-run, no guihost deploy. The
+  ⚠ **Live verification is OWED**: no live portal re-run, no guihost deploy. The
   daemon/GUI on guihost still runs the old behaviour until the next bump.
   Remaining agent-side: the INVENTED characters in (1) are still attributed to
   the concurrent focus-theft bug — the readback now catches them, it does not
@@ -309,7 +309,7 @@ fix) once the fix is verified live on guihost.
      without a manual reopen, and that `app_surface_restore` appears in the
      trace.
   6. **★★★ AGENTS MUST DRIVE SHADOW SURFACES EVEN WHILE THE USER'S GUI IS
-     CLOSED.** Felt concretely: the a services portal and records agents each drove a ychrome
+     CLOSED.** Felt concretely: two background filing agents each drove a ychrome
      session row and the GUI host burned. This is the same requirement as
      server-side rendering — agent browsing should never have been on the GUI
      host (docs/optimization-pass.md WS2, `ychrome/docs/agent-engine.md`).
@@ -758,7 +758,7 @@ fix) once the fix is verified live on guihost.
   `isTrusted:true` `Escape` presses — 16:09:35.815, 16:09:51.001, 16:23:42.600 —
   with **no agent verb within ±8 s of any of them** (the agent's last verb ran
   at 16:05:46). That is the human, pressing Escape at a terminal that had
-  stopped answering, and landing in an invisible a services portal form instead. The
+  stopped answering, and landing in an invisible the portal form instead. The
   other direction is structurally impossible and stays that way: `synth_key`
   hands the event to the surface widget with `gtk_widget_event`, which never
   traverses the toplevel's focus chain, so an agent's characters can never

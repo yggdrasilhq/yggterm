@@ -209,7 +209,7 @@ pub enum WebElementRef {
     /// matcher (there is one CSS resolution rule, not two). The bare-string form
     /// survives only because every payload ever written spells it that way.
     ///
-    /// Why an index is needed at all: a services portal renders the complainant block
+    /// Why an index is needed at all: some portals render repeated party blocks
     /// and the opposite-party block with the SAME element ids (`#Name`,
     /// `#District`…). `querySelector` silently answers with the first, so an
     /// agent aiming at the second block drove the first — twice, in the measured
