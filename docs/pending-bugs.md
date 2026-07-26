@@ -21,6 +21,37 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ USER REQUIREMENTS FOR THE SESSION-ROW LIFECYCLE (stated 2026-07-26, after
+  curating the list by hand TWICE).** The user's words: *"A daemon bump and
+  restart should not destroy the row order and number of sessions. If destroyed
+  this order is supposed to be snapshotted properly. And lastly all the rows not
+  connected should die (gracefully is recommended)."*
+  1. **A daemon bump must preserve row ORDER and COUNT.** ✅ Verified for a
+     GUI-only restart 2026-07-26: 21 rows, byte-identical order across the swap
+     (snapshot at `~/.yggterm/manual-snapshots/pre-gui-restart-*`). ⚠ **NOT yet
+     verified across a DAEMON bump**, which is the case that actually breaks it —
+     rows are re-imported from peer daemons there. The anchored-placement fix
+     (`import_peer_live_rows_in_order`) is live but has never been exercised by a
+     real daemon swap. **Prove it on the next bump before claiming it.**
+  2. **If order is destroyed it must be recoverable from a snapshot.**
+     `~/.yggterm/row-order-ledger.json` already records order+membership and
+     `removed-rows.json` records closes — but nothing RESTORES from them
+     automatically, and an agent had to reconstruct by hand. Build the restore
+     path, and make a daemon bump write a pre-swap snapshot the way a deploy
+     does.
+  3. **⚠ "All rows not connected should die" NEEDS A DECISION, because as
+     written it contradicts requirement 1 and the product's core promise.**
+     Right now 9 of the user's own curated 21 rows have no runtime — they are
+     agent-CLI rows kept precisely so click = resume works
+     (`snapshot_session_is_agent_store_recoverable`, the first-class-session
+     contract in CLAUDE.md). Reaping every runtime-less row would cut the
+     curated list to 12 and delete the resumable history the whole product is
+     built on. The user is unlikely to mean that. **Ask what "not connected"
+     means to them** — most likely: a row whose CLI transcript is gone, or one
+     the user closed, or a plain shell whose PTY died (which IS a husk and
+     should go) — and then implement exactly that. Do not guess; an agent
+     already deleted seven of their sessions on a guess today.
+
 - **★★★ WE FORCED SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL. The
   premise is fixed and DEPLOYED (2.12.14); ⛔ THE CPU WIN IS NOT ESTABLISHED AND
   THE FIRST NUMBERS WERE AN ArecordsFACT. This entry STAYS until a matched-load
