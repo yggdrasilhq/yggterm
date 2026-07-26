@@ -4,16 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.12.14
 
-- **Fixed: yggterm was drawing everything with the processor while the graphics
-  chip sat idle.** The app had decided, once and for all, that this machine had
-  no usable graphics hardware — and it was wrong. One failed check on the wrong
-  device had been generalised into "there is no GPU here", so every character
-  the terminal painted was drawn in software across sixteen threads. yggterm now
-  asks the machine what it can do at startup and believes the answer. On the
-  laptop this was measured on: the graphics chip is now doing the drawing, the
-  app uses a fraction of the processor it used to, and the machine runs cooler
-  and quieter. If a machine's graphics really are broken, the old behaviour is
-  one setting away (`YGGTERM_FORCE_SOFTWARE_GL=1`).
+- **Changed: yggterm asks the machine whether it has usable graphics hardware
+  instead of assuming it does not.** The app had decided once and for all that
+  this machine had no usable GPU — one failed check on the wrong device,
+  generalised into "there is no GPU here" — so every character the terminal
+  painted was drawn in software. It now probes at startup and believes the
+  answer, and the graphics chip is verifiably doing the drawing again.
+  ⚠ **How much processor this saves is not yet established.** The large
+  improvement first reported was measured against a much busier period and does
+  not survive a like-for-like comparison; at matched load the difference is
+  around a tenth, with low confidence, and the window since has not been busy
+  enough to settle it. It is not a regression, but do not expect the machine to
+  feel different yet. If a machine's graphics really are broken, the old
+  behaviour is one setting away (`YGGTERM_FORCE_SOFTWARE_GL=1`).
 - **Fixed: the app stalling for seconds at a time while it scanned for
   sessions.** The background scan was copying its entire picture of a remote
   machine once for every session on that machine — hundreds of times per pass,
