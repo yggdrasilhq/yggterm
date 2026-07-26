@@ -203,6 +203,22 @@ pub enum WebElementRef {
         #[serde(default)]
         nth: Option<usize>,
     },
+    /// The `nth` match of a CSS selector — `document.querySelectorAll(css)[nth]`.
+    ///
+    /// [`Self::Css`] IS this with `nth: 0`; both arms compile to the SAME
+    /// matcher (there is one CSS resolution rule, not two). The bare-string form
+    /// survives only because every payload ever written spells it that way.
+    ///
+    /// Why an index is needed at all: a services portal renders the complainant block
+    /// and the opposite-party block with the SAME element ids (`#Name`,
+    /// `#District`…). `querySelector` silently answers with the first, so an
+    /// agent aiming at the second block drove the first — twice, in the measured
+    /// filing run, with every response reporting success.
+    CssNth {
+        css: String,
+        #[serde(default)]
+        nth: usize,
+    },
 }
 
 impl WebElementRef {
@@ -218,6 +234,10 @@ impl WebElementRef {
                 }
             }
             Self::Role { role, label, .. } => format!("role:{role}[{label}]"),
+            // `nth: 0` describes exactly like the bare form, because it IS the
+            // bare form.
+            Self::CssNth { css, nth } if *nth == 0 => format!("css:{css}"),
+            Self::CssNth { css, nth } => format!("css:{css}[{nth}]"),
         }
     }
 }
@@ -255,6 +275,34 @@ pub enum VaultFieldSource {
     /// than a generic failure, so the day that op lands this starts working
     /// with no yggterm change.
     Card,
+}
+
+/// HOW a `fill` puts the text into the field.
+///
+/// Two mechanisms exist because two different widget families need opposite
+/// things, and picking the wrong one fails SILENTLY:
+///
+/// - **Real keys** drive a widget that keeps its own internal state (a segmented
+///   OTP whose focus auto-advances, a component that ignores a scripted value
+///   write). Measured on a services portal's `input.input-otp`.
+/// - **The native setter** (`HTMLInputElement.prototype.value` descriptor, then
+///   bubbling `input`/`change`, then blur) is what a REACT CONTROLLED input
+///   needs. Measured on a services portal 2026-07-26: a 19-character per-key fill left
+///   the field holding `Ja` — React re-rendered from state between injected
+///   keystrokes and threw the rest away, while the verb reported `chars: 19`.
+///
+/// `Auto` is the ONE rule that chooses; it is not a per-caller heuristic. See
+/// `web_do_fill_mechanism` in the shell (the single owner of the decision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WebFillMechanism {
+    /// Let the rule decide from what the pinned element actually is.
+    #[default]
+    Auto,
+    /// Force per-key GTK injection (`isTrusted: true`).
+    RealKeys,
+    /// Force the native value-setter + `input`/`change`/blur.
+    NativeSetter,
 }
 
 /// One trusted action injected into a web surface's page (agent control plane
@@ -342,6 +390,20 @@ pub enum WebSurfaceDoAction {
         /// A segmented input's boxes, in visual order.
         #[serde(default)]
         selectors: Vec<WebElementRef>,
+        /// How to put the text in. Defaults to [`WebFillMechanism::Auto`], and
+        /// the response always names the mechanism that actually ran.
+        #[serde(default)]
+        mechanism: WebFillMechanism,
+        /// This text is a SECRET: keep it out of the response, out of any eval
+        /// script it need not enter, and force the real-key mechanism (the
+        /// native setter would put the value inside a script string). Set by
+        /// `fill-vault`; a plain `do fill` may opt in with `--redact`.
+        ///
+        /// With it set the verification reports LENGTHS and a first-mismatch
+        /// index instead of the requested/held strings — the failure is still
+        /// nameable, the value still never crosses back out (F4).
+        #[serde(default)]
+        redact: bool,
     },
 }
 
@@ -2104,8 +2166,47 @@ mod tests {
                     WebElementRef::Css("#b".into()),
                     WebElementRef::Css("#c".into()),
                 ],
+                // The fidelity fields are ADDITIVE: a payload written before
+                // they existed still parses, and still means what it meant.
+                mechanism: WebFillMechanism::Auto,
+                redact: false,
             }
         );
+    }
+
+    /// The fidelity fields must round-trip when they ARE spelled, or the
+    /// vault path's "never the native setter, never echo the value" contract
+    /// would be silently downgraded to the defaults on the wire.
+    #[test]
+    fn fill_mechanism_and_redaction_round_trip() {
+        let secret: WebSurfaceDoAction = serde_json::from_str(
+            r##"{"verb":"fill","text":"s","selector":"#pw","mechanism":"real_keys","redact":true}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            secret,
+            WebSurfaceDoAction::Fill {
+                text: "s".into(),
+                selector: Some(WebElementRef::Css("#pw".into())),
+                selectors: Vec::new(),
+                mechanism: WebFillMechanism::RealKeys,
+                redact: true,
+            }
+        );
+        let back = serde_json::to_string(&secret).unwrap();
+        assert!(back.contains(r#""mechanism":"real_keys""#), "{back}");
+        assert!(back.contains(r#""redact":true"#), "{back}");
+        let native: WebSurfaceDoAction =
+            serde_json::from_str(r##"{"verb":"fill","text":"s","mechanism":"native_setter"}"##)
+                .unwrap();
+        assert!(matches!(
+            native,
+            WebSurfaceDoAction::Fill {
+                mechanism: WebFillMechanism::NativeSetter,
+                redact: false,
+                ..
+            }
+        ));
     }
 
     /// The new addressing shapes must be distinguishable from each other and
@@ -2281,6 +2382,8 @@ mod tests {
                 text: "292244".to_string(),
                 selector: Some(WebElementRef::Css("#otp".to_string())),
                 selectors: Vec::new(),
+                mechanism: WebFillMechanism::Auto,
+                redact: false,
             },
             WebSurfaceDoAction::Fill {
                 text: "292244".to_string(),
@@ -2288,6 +2391,8 @@ mod tests {
                 selectors: (0..6)
                     .map(|i| WebElementRef::Css(format!("input.input-otp:nth-child({i})")))
                     .collect(),
+                mechanism: WebFillMechanism::RealKeys,
+                redact: true,
             },
         ] {
             let command = AppControlCommand::WebSurfaceDo {
