@@ -3426,12 +3426,6 @@ trait WebSurfaceMediaProbe {
     fn is_playing_audio(&self, native_id: u64) -> bool;
 }
 
-impl WebSurfaceMediaProbe for dioxus::desktop::DesktopContext {
-    fn is_playing_audio(&self, native_id: u64) -> bool {
-        self.web_surface_is_playing_audio(native_id)
-    }
-}
-
 /// One backgrounded surface, as the reclaim policy sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSurfaceBackgroundInput {
@@ -3530,9 +3524,7 @@ fn web_surface_background_plan(
             } else if surface.stashed_at_ms.is_none() {
                 // A LEASED surface is an agent co-browsing in the background:
                 // leave it live rather than hiding its webview.
-                let leased = surface
-                    .lease_until_ms
-                    .is_some_and(|until| until > now_ms);
+                let leased = surface.lease_until_ms.is_some_and(|until| until > now_ms);
                 WebSurfaceBackgroundAction::Stash {
                     detach,
                     throttle: !leased,
@@ -3554,6 +3546,912 @@ fn web_surface_background_plan(
         decisions,
     }
 }
+
+/// Everything one reclaim pass does to the world, behind one seam: the engine's
+/// audio truth going in, and the destroy / stash / demote / throttle / trace
+/// going out.
+///
+/// It exists so the APPLY half is lockable, not just the policy half. Round 24
+/// shipped the policy fixes with tests that called the policy directly, and an
+/// adversarial review reverted all four production call sites with the suite
+/// still green at the identical pass count. The wiring is where the defects
+/// were, and the wiring lives here: which surface's audio is probed, whether the
+/// treadmill counter is consulted and RECORDED, and whether a soft stash
+/// actually demotes-and-throttles instead of hard-detaching.
+///
+/// `throttle_surface` is a paint decision, never a mute: an audible page still
+/// stops painting. Nothing in this trait can silence audio.
+trait WebSurfaceBackgroundHost: WebSurfaceMediaProbe {
+    fn close_surface(&mut self, native_id: u64);
+    fn stash_surface(&mut self, native_id: u64);
+    fn demote_surface(&mut self, native_id: u64);
+    fn throttle_surface(&mut self, native_id: u64, throttled: bool);
+    fn clear_tab_loading(&mut self, session_path: &str, tab_id: u64);
+    fn trace(&mut self, name: &'static str, payload: Value);
+}
+
+/// ONE reclaim pass over every backgrounded surface: gather the raw per-surface
+/// readings, ask [`web_surface_background_plan`] what to do, and do it.
+///
+/// The reconcile loop keeps NO policy and NO per-surface bookkeeping — it reads
+/// `/proc`, reads the configured hold, lists its backgrounded keys, and calls
+/// this. That is deliberate and it is the whole point of the lane that wrote it:
+/// an `async` loop holding a live `DesktopContext` is not reachable from a test,
+/// so every decision it made itself was unlocked by construction. Reverting a
+/// call site in here — dropping [`web_surface_recent_reaps`], hardcoding a
+/// `media_active`, skipping [`web_surface_note_reap`], hard-detaching instead of
+/// demoting — now changes what a test can observe.
+///
+/// Returns the plan so the caller can report it; the caller must not re-derive
+/// anything from it, or the trace could describe a decision that was not taken.
+fn web_surface_reclaim_background_pass(
+    now_ms: u64,
+    under_glass: bool,
+    pressure: &crate::terminal_observe::MemoryPressureSnapshot,
+    forced_pressure: bool,
+    configured_hold_ms: u64,
+    backgrounded: &[(String, u64)],
+    applied: &mut HashMap<(String, u64), AppliedWebSurface>,
+    lease_until_ms: &dyn Fn(&(String, u64)) -> Option<u64>,
+    host: &mut dyn WebSurfaceBackgroundHost,
+) -> WebSurfaceBackgroundPlan {
+    let inputs: Vec<WebSurfaceBackgroundInput> = backgrounded
+        .iter()
+        .filter_map(|key| {
+            let entry = applied.get(key)?;
+            Some(WebSurfaceBackgroundInput {
+                key: key.clone(),
+                native_id: entry.native_id,
+                stashed_at_ms: entry.stashed_at_ms,
+                lease_until_ms: lease_until_ms(key),
+                // Per-surface, not per-pass: a surface that keeps being
+                // re-created after each reap is demonstrably wanted, and reaping
+                // it again reclaims nothing while costing a fresh web process.
+                // See web_surface_background_hold_ms_for.
+                recent_reaps: web_surface_recent_reaps(key, now_ms),
+            })
+        })
+        .collect();
+    let plan = web_surface_background_plan(
+        now_ms,
+        under_glass,
+        pressure,
+        forced_pressure,
+        configured_hold_ms,
+        &inputs,
+        &*host,
+    );
+    let reclaim_pressured = plan.reclaim_pressured;
+    for decision in &plan.decisions {
+        let key = &decision.key;
+        let hold_ms = decision.hold_ms;
+        match decision.action {
+            WebSurfaceBackgroundAction::Wait => {}
+            WebSurfaceBackgroundAction::Reap => {
+                // Recorded BEFORE the removal, and recorded whether or not the
+                // entry is still there: the count is what stops the treadmill on
+                // the next pass, so a reap that is not noted is a reap that
+                // teaches the reaper nothing.
+                let reap_count = web_surface_note_reap(key, now_ms);
+                if let Some(entry) = applied.remove(key) {
+                    host.close_surface(entry.native_id);
+                    host.trace(
+                        "native_close",
+                        json!({
+                            "session_path": key.0,
+                            "tab_id": key.1,
+                            "native_id": entry.native_id,
+                            "reason": "background_hold_expired",
+                            // How many times this surface has been reaped inside
+                            // the thrash window. A number that keeps climbing is
+                            // the treadmill: reclaim destroying a page that
+                            // something keeps re-creating.
+                            "reaps_in_window": reap_count,
+                            "reclaim_pressured": reclaim_pressured,
+                            "hold_ms": hold_ms,
+                        }),
+                    );
+                }
+            }
+            WebSurfaceBackgroundAction::Stash { detach, throttle } => {
+                let Some(entry) = applied.get_mut(key) else {
+                    continue;
+                };
+                let native_id = entry.native_id;
+                if detach {
+                    host.stash_surface(native_id);
+                } else {
+                    // Soft stash: stays attached below the glass (the reveal is
+                    // "cut the hole" over live pixels), demoted so it can never
+                    // occlude the active page's hole.
+                    host.demote_surface(native_id);
+                    // ...but a demoted-yet-mapped WebKitGTK view keeps its
+                    // rAF/timers/compositor paint at full CPU — an animating
+                    // background page burns a whole core (the "angry fan").
+                    // Hide the inner webview so the page throttles
+                    // (document.hidden) while the container stays attached for
+                    // an instant raise-reveal.
+                    if throttle {
+                        host.throttle_surface(native_id, true);
+                    }
+                }
+                entry.stashed_at_ms = Some(now_ms);
+                entry.visible = false;
+                // A stashed surface stops being polled for page state, so a load
+                // that finishes in the background would leave the tab's loading
+                // light stuck ON — and the session row blinking — for as long as
+                // the session stays backgrounded. Snuff it at stash time; the
+                // engine's truth resumes on unstash (a page genuinely still
+                // loading re-lights within one poll tick).
+                let was_loading = entry.loading;
+                entry.loading = false;
+                if was_loading {
+                    host.clear_tab_loading(&key.0, key.1);
+                }
+                host.trace(
+                    "native_stash",
+                    json!({
+                        "session_path": key.0,
+                        "tab_id": key.1,
+                        "native_id": decision.native_id,
+                        "hold_ms": hold_ms,
+                        "detached": detach,
+                        "reclaim_pressured": reclaim_pressured,
+                        "media_active": decision.media_active,
+                    }),
+                );
+            }
+        }
+    }
+    plan
+}
+
+/// The live wiring of [`WebSurfaceBackgroundHost`]: the reconcile loop's own
+/// `DesktopContext`, trace home and shell signal. Thin on purpose — every line
+/// in here is un-mockable by construction, so anything that can hold a decision
+/// belongs in the pass above, and what remains is locked structurally by
+/// `the_reclaim_pass_call_site_is_wired_to_the_live_machine`.
+struct LiveWebSurfaceBackgroundHost<'a> {
+    desktop: &'a dioxus::desktop::DesktopContext,
+    trace_home: &'a std::path::Path,
+    state: Signal<ShellState>,
+}
+
+impl WebSurfaceMediaProbe for LiveWebSurfaceBackgroundHost<'_> {
+    fn is_playing_audio(&self, native_id: u64) -> bool {
+        self.desktop.web_surface_is_playing_audio(native_id)
+    }
+}
+
+impl WebSurfaceBackgroundHost for LiveWebSurfaceBackgroundHost<'_> {
+    fn close_surface(&mut self, native_id: u64) {
+        self.desktop.close_web_surface(native_id);
+    }
+    fn stash_surface(&mut self, native_id: u64) {
+        let _ = self.desktop.stash_web_surface(native_id);
+    }
+    fn demote_surface(&mut self, native_id: u64) {
+        let _ = self.desktop.demote_web_surface(native_id);
+    }
+    fn throttle_surface(&mut self, native_id: u64, throttled: bool) {
+        let _ = self.desktop.throttle_web_surface(native_id, throttled);
+    }
+    fn clear_tab_loading(&mut self, session_path: &str, tab_id: u64) {
+        let mut writable = self.state;
+        writable.with_mut(|shell| {
+            shell.set_web_tab_loading(session_path, tab_id, false);
+        });
+    }
+    fn trace(&mut self, name: &'static str, payload: Value) {
+        append_trace_event(self.trace_home, "ui", "web_surface", name, payload);
+    }
+}
+
+/// CALL-SITE LOCKS for the background web-surface reclaim.
+///
+/// Round 24 shipped three real fixes here — the headroom predicate, the
+/// per-surface treadmill guard, and the audio veto — with tests that called the
+/// new helpers directly. An adversarial review then reverted ALL FOUR production
+/// call sites and the suite stayed green at the identical pass count that the
+/// report had cited as proof. Those tests were structurally incapable of failing:
+/// they computed the helpers' arguments themselves, which is precisely the thing
+/// the loop was getting wrong.
+///
+/// So every test in here drives [`web_surface_reclaim_background_pass`] — the
+/// function the reconcile loop calls — through a fake host, and asserts on what
+/// the pass DID: which surface was destroyed, which was demoted, which was
+/// throttled, whose audio was probed, what the trace said. Reverting a call site
+/// inside the pass or inside the plan it calls changes one of those.
+///
+/// The one seam a test cannot reach is the loop's own argument list (a live
+/// `DesktopContext` in an `async` loop); that is locked structurally by
+/// [`the_reclaim_pass_call_site_is_wired_to_the_live_machine`].
+#[cfg(test)]
+mod web_surface_reclaim_locks {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// `/proc/meminfo` as read on the live host the day the reaper was killing
+    /// every background page: 11.5 GB of swap "used" (a HISTORY counter that
+    /// latched after one bad afternoon) while 45% of RAM sat available.
+    /// `swap_pressured` is TRUE here and `reclaim_pressured` is FALSE, which is
+    /// what makes it the fixture that separates them.
+    const LIVE_HOST_DEEP_SWAP_COMFORTABLE: &str = "MemTotal: 15473336 kB\n\
+         MemAvailable: 6976900 kB\n\
+         SwapTotal: 16776512 kB\n\
+         SwapFree: 4691496 kB\n";
+
+    /// The same machine genuinely short of memory: 4% of MemTotal available,
+    /// under the 15% floor, so headroom alone says reclaim.
+    const GENUINELY_SHORT: &str = "MemTotal: 15473336 kB\n\
+         MemAvailable: 618933 kB\n\
+         SwapTotal: 16776512 kB\n\
+         SwapFree: 16776512 kB\n";
+
+    fn comfortable() -> crate::terminal_observe::MemoryPressureSnapshot {
+        let mut snapshot = crate::terminal_observe::parse_meminfo(LIVE_HOST_DEEP_SWAP_COMFORTABLE);
+        snapshot.psi_some_avg60_bp = Some(6);
+        snapshot.psi_full_avg60_bp = Some(6);
+        snapshot
+    }
+
+    fn short() -> crate::terminal_observe::MemoryPressureSnapshot {
+        crate::terminal_observe::parse_meminfo(GENUINELY_SHORT)
+    }
+
+    /// A backgrounded surface as the reconciler holds it. Only the four fields
+    /// the reclaim pass reads matter; the rest are inert.
+    fn applied_surface(native_id: u64, stashed_at_ms: Option<u64>) -> AppliedWebSurface {
+        AppliedWebSurface {
+            native_id,
+            url: "https://example.invalid/".to_string(),
+            bounds: (0, 0, 800, 600),
+            visible: true,
+            reload_nonce: 0,
+            socks_port: None,
+            profile: "default".to_string(),
+            zoom_factor: 1.0,
+            stashed_at_ms,
+            loading: false,
+            page_url: String::new(),
+            page_title: String::new(),
+            generation: 1,
+        }
+    }
+
+    /// The world, faked. Records every effect the pass performs so a reverted
+    /// call site shows up as a MISSING or WRONG effect rather than as nothing.
+    #[derive(Default)]
+    struct FakeHost {
+        audible: std::collections::HashSet<u64>,
+        audio_probes: RefCell<Vec<u64>>,
+        closed: Vec<u64>,
+        stashed: Vec<u64>,
+        demoted: Vec<u64>,
+        throttled: Vec<(u64, bool)>,
+        loading_cleared: Vec<(String, u64)>,
+        traces: Vec<(&'static str, Value)>,
+    }
+
+    impl FakeHost {
+        fn with_audible(ids: &[u64]) -> Self {
+            Self {
+                audible: ids.iter().copied().collect(),
+                ..Self::default()
+            }
+        }
+        fn trace_named(&self, name: &str) -> Vec<&Value> {
+            self.traces
+                .iter()
+                .filter(|(event, _)| *event == name)
+                .map(|(_, payload)| payload)
+                .collect()
+        }
+    }
+
+    impl WebSurfaceMediaProbe for FakeHost {
+        fn is_playing_audio(&self, native_id: u64) -> bool {
+            self.audio_probes.borrow_mut().push(native_id);
+            self.audible.contains(&native_id)
+        }
+    }
+
+    impl WebSurfaceBackgroundHost for FakeHost {
+        fn close_surface(&mut self, native_id: u64) {
+            self.closed.push(native_id);
+        }
+        fn stash_surface(&mut self, native_id: u64) {
+            self.stashed.push(native_id);
+        }
+        fn demote_surface(&mut self, native_id: u64) {
+            self.demoted.push(native_id);
+        }
+        fn throttle_surface(&mut self, native_id: u64, throttled: bool) {
+            self.throttled.push((native_id, throttled));
+        }
+        fn clear_tab_loading(&mut self, session_path: &str, tab_id: u64) {
+            self.loading_cleared
+                .push((session_path.to_string(), tab_id));
+        }
+        fn trace(&mut self, name: &'static str, payload: Value) {
+            self.traces.push((name, payload));
+        }
+    }
+
+    /// One pass, with the boring arguments defaulted. Returns the plan; the
+    /// caller inspects `applied` and the host for what actually happened.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pass(
+        now_ms: u64,
+        under_glass: bool,
+        pressure: &crate::terminal_observe::MemoryPressureSnapshot,
+        configured_hold_ms: u64,
+        applied: &mut HashMap<(String, u64), AppliedWebSurface>,
+        leases: &HashMap<(String, u64), u64>,
+        host: &mut FakeHost,
+    ) -> WebSurfaceBackgroundPlan {
+        let mut backgrounded: Vec<(String, u64)> = applied.keys().cloned().collect();
+        backgrounded.sort();
+        web_surface_reclaim_background_pass(
+            now_ms,
+            under_glass,
+            pressure,
+            false,
+            configured_hold_ms,
+            &backgrounded,
+            applied,
+            &|key| leases.get(key).copied(),
+            host,
+        )
+    }
+
+    fn one_surface(
+        session: &str,
+        native_id: u64,
+        stashed_at_ms: Option<u64>,
+    ) -> HashMap<(String, u64), AppliedWebSurface> {
+        let mut applied = HashMap::new();
+        applied.insert(
+            (session.to_string(), 0_u64),
+            applied_surface(native_id, stashed_at_ms),
+        );
+        applied
+    }
+
+    /// Y1 AT THE CALL SITE. The reclaim pass must decide on CURRENT headroom,
+    /// never on `swap_used`, which is a history counter that latches TRUE after
+    /// one bad afternoon and never clears. Under the latched predicate 19 of 19
+    /// `native_stash` events on the live host carried `detached:true
+    /// hold_ms:5000`, so the ten-minute soft stash never executed once and a
+    /// backgrounded page died five seconds after the user switched away.
+    ///
+    /// Feed the pass the live host's real `/proc/meminfo` — deep swap, 45%
+    /// available — and the soft stash must survive end to end: demoted, not
+    /// detached, on the ten-minute hold. Then genuinely short of RAM, and the
+    /// same surface must hard-detach on the five-second hold.
+    #[test]
+    fn the_reclaim_pass_reads_current_headroom_not_swap_history() {
+        let comfortable = comfortable();
+        assert!(
+            comfortable.swap_pressured(),
+            "fixture must have deep swap, or it cannot separate the two predicates"
+        );
+
+        let mut applied = one_surface("live::y1-comfortable", 7, None);
+        let mut host = FakeHost::default();
+        // 777 s, deliberately NOT the 600 s default: the unpressured hold is the
+        // USER'S configured value arriving from the caller, and a hold that
+        // happens to equal the default cannot tell the two apart.
+        let plan = run_pass(
+            5_000_000,
+            true,
+            &comfortable,
+            777_000,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert!(
+            !plan.reclaim_pressured,
+            "45% of RAM available is not reclaim pressure — the pass read swap history"
+        );
+        assert_eq!(
+            host.demoted,
+            vec![7],
+            "under glass with headroom the stash is SOFT: demote, never detach"
+        );
+        assert!(
+            host.stashed.is_empty(),
+            "a hard detach here is the latched-predicate bug: {:?}",
+            host.stashed
+        );
+        assert_eq!(
+            plan.decisions[0].hold_ms, 777_000,
+            "the CONFIGURED hold must survive the pass, not a hardcoded default"
+        );
+
+        let mut applied = one_surface("live::y1-short", 9, None);
+        let mut host = FakeHost::default();
+        let plan = run_pass(
+            5_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert!(
+            plan.reclaim_pressured,
+            "4% of RAM available IS reclaim pressure — the fast path must still exist"
+        );
+        assert_eq!(host.stashed, vec![9], "genuine shortage detaches");
+        assert!(host.demoted.is_empty());
+        assert_eq!(
+            plan.decisions[0].hold_ms, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "genuine shortage collapses the hold — that is the feature"
+        );
+    }
+
+    /// Y6 AT THE CALL SITE. "Suppose I have a YouTube playlist running in the
+    /// background while I work here." The veto is absolute against every clock,
+    /// it is per surface, and it vetoes DESTROY only — the audible page still
+    /// stops painting.
+    ///
+    /// Two surfaces, both long past their hold: the audible one survives, the
+    /// silent one dies, and the engine was asked about EACH of them by its own
+    /// native id. A pass that probes one surface and applies the answer to
+    /// another is the same defect wearing a different hat.
+    #[test]
+    fn the_reclaim_pass_probes_each_surface_and_never_destroys_an_audible_one() {
+        let mut applied = HashMap::new();
+        applied.insert(
+            ("live::y6-audible".to_string(), 0_u64),
+            applied_surface(11, Some(1_000)),
+        );
+        applied.insert(
+            ("live::y6-silent".to_string(), 0_u64),
+            applied_surface(12, Some(1_000)),
+        );
+        let mut host = FakeHost::with_audible(&[11]);
+        let plan = run_pass(
+            2_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert!(
+            plan.reclaim_pressured,
+            "the veto has to beat the PRESSURED hold, so the fixture must be pressured"
+        );
+
+        let mut probed = host.audio_probes.borrow().clone();
+        probed.sort();
+        assert_eq!(
+            probed,
+            vec![11, 12],
+            "each surface's audio must be probed by its OWN native id"
+        );
+        assert_eq!(
+            host.closed,
+            vec![12],
+            "the silent page reaps and the audible one does not"
+        );
+        assert!(
+            applied.contains_key(&("live::y6-audible".to_string(), 0)),
+            "an audible page must survive the reclaim, whatever the clocks say"
+        );
+
+        let audible = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.native_id == 11)
+            .expect("audible decision");
+        assert!(audible.media_active, "the decision must record the veto");
+        assert_eq!(audible.action, WebSurfaceBackgroundAction::Wait);
+        let silent = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.native_id == 12)
+            .expect("silent decision");
+        assert!(!silent.media_active);
+        assert_eq!(silent.action, WebSurfaceBackgroundAction::Reap);
+    }
+
+    /// Y2 AT THE CALL SITE — THE TREADMILL. Reclaim that destroys a page which
+    /// is immediately re-created reclaims nothing and pays for a fresh WebKit
+    /// process every cycle: 166 `background_hold_expired` closes against 166
+    /// re-opens in fifteen minutes on the live host, one churned process at
+    /// 3.9 GB, while the user could not hold keyboard focus long enough to type.
+    ///
+    /// Driven as the treadmill actually runs: reap, something re-creates the
+    /// surface, reap again — and on the third pass the guard must hold, because
+    /// the pass RECORDED the first two. Both halves are load-bearing: a pass that
+    /// forgets to note a reap, and a pass that never reads the count, both put
+    /// the treadmill straight back.
+    #[test]
+    fn a_surface_that_keeps_coming_back_stops_being_reaped_by_the_pass() {
+        let session = "live::y2-treadmill";
+        let key = (session.to_string(), 0_u64);
+        let base = 900_000_000_u64;
+        let mut closes = Vec::new();
+        let mut holds = Vec::new();
+        for cycle in 0..3_u64 {
+            // Something re-creates it the moment it dies — that IS the treadmill.
+            let now = base + cycle * 6_000;
+            let mut applied = one_surface(session, 21 + cycle, Some(now - 5_500));
+            let mut host = FakeHost::default();
+            let plan = run_pass(
+                now,
+                true,
+                &short(),
+                600_000,
+                &mut applied,
+                &HashMap::new(),
+                &mut host,
+            );
+            assert!(plan.reclaim_pressured, "the fixture must stay pressured");
+            holds.push(plan.decisions[0].hold_ms);
+            closes.push(host.closed.clone());
+        }
+        assert_eq!(
+            holds,
+            vec![
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                600_000
+            ],
+            "the first {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps under pressure are fast \
+             (the feature); after that the surface has demonstrated it is wanted and \
+             keeps the configured hold"
+        );
+        assert_eq!(
+            closes,
+            vec![vec![21], vec![22], vec![]],
+            "the third cycle must NOT destroy the page again — that is the treadmill"
+        );
+        assert_eq!(
+            web_surface_recent_reaps(&key, base + 12_000),
+            2,
+            "the pass must RECORD each reap; a reap it does not note teaches the \
+             reaper nothing and the treadmill runs forever"
+        );
+    }
+
+    /// The apply half. A soft stash is DEMOTE plus THROTTLE — demote alone
+    /// leaves a mapped WebKitGTK view burning a core on rAF, and a hard detach
+    /// throws away the instant switch-back the soft stash exists for. A LEASED
+    /// surface (an agent co-browsing in the background) is demoted but never
+    /// throttled: it is being watched.
+    #[test]
+    fn a_soft_stash_demotes_and_throttles_while_a_leased_one_keeps_painting() {
+        let mut applied = HashMap::new();
+        applied.insert(
+            ("live::y4-plain".to_string(), 0_u64),
+            applied_surface(31, None),
+        );
+        applied.insert(
+            ("live::y4-leased".to_string(), 0_u64),
+            applied_surface(32, None),
+        );
+        let mut leases = HashMap::new();
+        leases.insert(("live::y4-leased".to_string(), 0_u64), 3_000_000_u64);
+
+        let mut host = FakeHost::default();
+        run_pass(
+            2_000_000,
+            true,
+            &comfortable(),
+            600_000,
+            &mut applied,
+            &leases,
+            &mut host,
+        );
+        let mut demoted = host.demoted.clone();
+        demoted.sort();
+        assert_eq!(demoted, vec![31, 32], "both stay attached below the glass");
+        assert!(host.stashed.is_empty(), "no headroom pressure, no detach");
+        assert_eq!(
+            host.throttled,
+            vec![(31, true)],
+            "the unleased page stops painting; the leased one is being watched"
+        );
+        for key in [
+            ("live::y4-plain".to_string(), 0_u64),
+            ("live::y4-leased".to_string(), 0_u64),
+        ] {
+            assert_eq!(
+                applied.get(&key).and_then(|entry| entry.stashed_at_ms),
+                Some(2_000_000),
+                "the pass must mark the surface stashed, or the hold clock never starts"
+            );
+            assert_eq!(applied.get(&key).map(|entry| entry.visible), Some(false));
+        }
+    }
+
+    /// A lease only ever EXTENDS life. The pass has to actually ASK for it: with
+    /// the lease dropped from the surface's input, an agent's co-browsed page is
+    /// destroyed under it the moment the hold lapses.
+    #[test]
+    fn the_pass_reads_the_lease_and_a_live_lease_outlives_the_hold() {
+        let session = "live::y5-leased";
+        let key = (session.to_string(), 0_u64);
+        let mut applied = one_surface(session, 41, Some(1_000));
+        let mut leases = HashMap::new();
+        leases.insert(key.clone(), 9_000_000_u64);
+        let mut host = FakeHost::default();
+        let plan = run_pass(
+            2_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &leases,
+            &mut host,
+        );
+        assert!(
+            host.closed.is_empty(),
+            "the hold lapsed but the lease is live — this page must not be destroyed"
+        );
+        assert_eq!(plan.decisions[0].action, WebSurfaceBackgroundAction::Wait);
+        assert!(applied.contains_key(&key));
+
+        // Lease lapsed: the ordinary clocks resume and it reaps.
+        let mut applied = one_surface("live::y5-lapsed", 42, Some(1_000));
+        let mut leases = HashMap::new();
+        leases.insert(("live::y5-lapsed".to_string(), 0_u64), 1_500_000_u64);
+        let mut host = FakeHost::default();
+        run_pass(
+            2_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &leases,
+            &mut host,
+        );
+        assert_eq!(host.closed, vec![42], "a lapsed lease stops protecting");
+    }
+
+    /// The trace must report the decision that was TAKEN, not a second
+    /// derivation of it. A trace line that disagrees with the action is how the
+    /// live host spent weeks reporting `swap_pressured:true` on every stash while
+    /// nobody could tell which quantity that was.
+    #[test]
+    fn the_pass_traces_the_reading_that_decided_each_surface() {
+        let mut applied = one_surface("live::y7-stash", 51, None);
+        applied
+            .get_mut(&("live::y7-stash".to_string(), 0))
+            .expect("entry")
+            .loading = true;
+        let mut host = FakeHost::default();
+        let plan = run_pass(
+            2_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        let stash = host.trace_named("native_stash");
+        assert_eq!(stash.len(), 1, "one stash, one trace line");
+        assert_eq!(stash[0]["native_id"], json!(51));
+        assert_eq!(stash[0]["detached"], json!(true), "pressured: hard detach");
+        assert_eq!(
+            stash[0]["reclaim_pressured"],
+            json!(plan.reclaim_pressured),
+            "the trace must report the pass's own reading"
+        );
+        assert_eq!(
+            stash[0]["hold_ms"],
+            json!(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+        );
+        assert_eq!(stash[0]["media_active"], json!(false));
+        assert_eq!(
+            host.loading_cleared,
+            vec![("live::y7-stash".to_string(), 0_u64)],
+            "a stashed surface stops being polled, so its loading light must be snuffed"
+        );
+
+        let mut applied = one_surface("live::y7-close", 52, Some(1_000));
+        let mut host = FakeHost::default();
+        run_pass(
+            2_000_000,
+            true,
+            &short(),
+            600_000,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        let close = host.trace_named("native_close");
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0]["reason"], json!("background_hold_expired"));
+        assert_eq!(
+            close[0]["reaps_in_window"],
+            json!(1),
+            "the close event carries the treadmill counter, or the treadmill is \
+             invisible in the trace"
+        );
+        assert_eq!(
+            close[0]["hold_ms"],
+            json!(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+        );
+    }
+
+    /// `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` is the ONLY way to exercise
+    /// pressure reclaim on a healthy machine, so it has to reach the decision. A
+    /// pass that reads the override and drops it makes every future change to
+    /// this family unverifiable without starving the box for real — and
+    /// "starving the box for real" is how the treadmill was discovered, at the
+    /// cost of the user's keyboard focus.
+    #[test]
+    fn the_force_override_decides_pressure_on_a_comfortable_machine() {
+        let mut applied = one_surface("live::y8-forced", 61, None);
+        let mut backgrounded: Vec<(String, u64)> = applied.keys().cloned().collect();
+        backgrounded.sort();
+        let mut host = FakeHost::default();
+        let comfortable = comfortable();
+        assert!(
+            !comfortable.reclaim_pressured(),
+            "the fixture must be comfortable, or the override proves nothing"
+        );
+        let plan = web_surface_reclaim_background_pass(
+            2_000_000,
+            true,
+            &comfortable,
+            true,
+            600_000,
+            &backgrounded,
+            &mut applied,
+            &|_key| None,
+            &mut host,
+        );
+        assert!(
+            plan.reclaim_pressured,
+            "the forced override must decide pressure even on a healthy machine"
+        );
+        assert_eq!(host.stashed, vec![61], "forced pressure hard-detaches");
+        assert_eq!(
+            plan.decisions[0].hold_ms,
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
+    }
+
+    /// THE RESIDUAL SEAM. Everything above drives
+    /// [`web_surface_reclaim_background_pass`]; what no test can reach is the
+    /// reconcile loop's own argument list, because the loop is `async` and holds
+    /// a live `DesktopContext`. That list is exactly where "sample the machine"
+    /// lives, so it is locked structurally instead: the call must hand the pass
+    /// the LIVE readings, and the live host must be wired to the engine.
+    ///
+    /// Scanned over PRODUCT lines only (`yggterm_core::agent_cli::product_lines`,
+    /// the workspace's one skip rule) so this module's own text — which quotes
+    /// every needle below — cannot satisfy the scan. The coverage assertions are
+    /// there because this workspace has already shipped a source scan that went
+    /// blind and passed green.
+    #[test]
+    fn the_reclaim_pass_call_site_is_wired_to_the_live_machine() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("fn web_surface_reclaim_background_pass(")),
+            "the scan cannot see the pass's own definition, so it is not reading \
+             the source it claims to police",
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_surface_reclaim_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertions that name them",
+        );
+
+        // The loop's call, from `web_surface_reclaim_background_pass(` to the
+        // first line that closes it. Indentation is not load-bearing; the close
+        // is the first `);` at or before the call's own indent.
+        let start = product
+            .iter()
+            .position(|line| line.trim() == "web_surface_reclaim_background_pass(")
+            .expect(
+                "the reconcile loop no longer calls web_surface_reclaim_background_pass — \
+                 if the pass moved, move this lock with it",
+            );
+        let end = product[start..]
+            .iter()
+            .position(|line| line.trim() == ");")
+            .map(|offset| start + offset)
+            .expect("unterminated call site");
+        let call_site = product[start..=end].join("\n");
+        assert!(
+            end - start > 6,
+            "the captured call site is too short to be the real one:\n{call_site}"
+        );
+
+        for needle in [
+            // The machine, sampled NOW. A hardcoded or defaulted snapshot turns
+            // pressure reclaim off (or on) forever, and no unit test can see it.
+            "&read_memory_pressure_snapshot(),",
+            // The verification override, which is the only way to exercise
+            // reclaim on a healthy machine.
+            "web_surface_force_background_pressure(),",
+            // The user's configured hold, read from ~/.yggterm/web-surface.json.
+            // `false` here is deliberate: the PASS decides pressure, so the
+            // caller must ask for the UNPRESSURED (configured) value.
+            "web_surface_background_hold_ms(false),",
+            // The reconciler's own mirror, mutated in place — a clone would make
+            // every stash and every destroy a no-op.
+            "&mut applied,",
+            // The agent lease, read from the desired-state owner.
+            "web_surface_lease_until_ms(&state, &key.0, key.1)",
+            "&mut host,",
+        ] {
+            assert!(
+                call_site.contains(needle),
+                "the reclaim call site no longer passes `{needle}`:\n{call_site}",
+            );
+        }
+
+        // The live host is the other half of the seam: thin, but every line of it
+        // is un-mockable, so each engine call is named here.
+        let host_impl_start = product
+            .iter()
+            .position(|line| {
+                line.contains("impl WebSurfaceBackgroundHost for LiveWebSurfaceBackgroundHost")
+            })
+            .expect("the live background host impl is gone");
+        let host_impl_end = product[host_impl_start..]
+            .iter()
+            .position(|line| line == "}")
+            .map(|offset| host_impl_start + offset)
+            .expect("unterminated impl");
+        let host_impl = product[host_impl_start..=host_impl_end].join("\n");
+        for needle in [
+            "self.desktop.close_web_surface(native_id)",
+            "self.desktop.stash_web_surface(native_id)",
+            "self.desktop.demote_web_surface(native_id)",
+            "self.desktop.throttle_web_surface(native_id, throttled)",
+        ] {
+            assert!(
+                host_impl.contains(needle),
+                "the live reclaim host no longer calls `{needle}`:\n{host_impl}",
+            );
+        }
+        // The audio veto's engine call lives in the media-probe impl, which is a
+        // separate block for the same struct.
+        let media_impl_start = product
+            .iter()
+            .position(|line| {
+                line.contains("impl WebSurfaceMediaProbe for LiveWebSurfaceBackgroundHost")
+            })
+            .expect("the live media probe impl is gone");
+        let media_impl = product[media_impl_start..media_impl_start + 6].join("\n");
+        assert!(
+            media_impl.contains("self.desktop.web_surface_is_playing_audio(native_id)"),
+            "the audio veto is reading something other than the engine:\n{media_impl}",
+        );
+    }
+}
+
 /// Read a string key from `~/.yggterm/web-surface.json`. The one config file is
 /// the SSOT for web-surface settings; both this GUI and the standalone `ychrome`
 /// binary read it, so the address-bar omnibox and ychrome's own omnibox agree.
@@ -4799,122 +5697,28 @@ async fn web_surface_native_reconcile_loop(
             // /proc/pressure/memory read, gated on there actually being a
             // backgrounded surface to act on.
             //
-            // This block holds NO policy. It gathers the raw readings, hands them
-            // to `web_surface_background_plan`, and applies what comes back — so
-            // "which pressure reading is consulted" and "which surface's audio is
-            // probed" are decided in a function a test can drive, not in a loop
-            // that no test can reach.
-            let inputs: Vec<WebSurfaceBackgroundInput> = backgrounded
-                .iter()
-                .filter_map(|key| {
-                    let entry = applied.get(key)?;
-                    Some(WebSurfaceBackgroundInput {
-                        key: key.clone(),
-                        native_id: entry.native_id,
-                        stashed_at_ms: entry.stashed_at_ms,
-                        lease_until_ms: web_surface_lease_until_ms(&state, &key.0, key.1),
-                        // Per-surface, not per-pass: a surface that keeps being
-                        // re-created after each reap is demonstrably wanted, and
-                        // reaping it again reclaims nothing while costing a fresh
-                        // web process. See web_surface_background_hold_ms_for.
-                        recent_reaps: web_surface_recent_reaps(key, now_ms),
-                    })
-                })
-                .collect();
-            let plan = web_surface_background_plan(
+            // This block holds NO policy and NO bookkeeping. It reads the
+            // machine, names the surfaces, and hands both to
+            // `web_surface_reclaim_background_pass` — so "which pressure reading
+            // is consulted", "which surface's audio is probed", "is the reap
+            // recorded" and "does a soft stash actually demote" are all decided
+            // in a function a test can drive, not in a loop no test can reach.
+            let mut host = LiveWebSurfaceBackgroundHost {
+                desktop: &desktop,
+                trace_home: trace_home.as_path(),
+                state,
+            };
+            web_surface_reclaim_background_pass(
                 now_ms,
                 under_glass,
                 &read_memory_pressure_snapshot(),
                 web_surface_force_background_pressure(),
                 web_surface_background_hold_ms(false),
-                &inputs,
-                &desktop,
+                &backgrounded,
+                &mut applied,
+                &|key| web_surface_lease_until_ms(&state, &key.0, key.1),
+                &mut host,
             );
-            let reclaim_pressured = plan.reclaim_pressured;
-            for decision in plan.decisions {
-                let key = decision.key;
-                let hold_ms = decision.hold_ms;
-                match decision.action {
-                    WebSurfaceBackgroundAction::Wait => {}
-                    WebSurfaceBackgroundAction::Reap => {
-                        let reap_count = web_surface_note_reap(&key, now_ms);
-                        if let Some(entry) = applied.remove(&key) {
-                            desktop.close_web_surface(entry.native_id);
-                            append_trace_event(
-                                &trace_home,
-                                "ui",
-                                "web_surface",
-                                "native_close",
-                                json!({
-                                    "session_path": key.0,
-                                    "tab_id": key.1,
-                                    "native_id": entry.native_id,
-                                    "reason": "background_hold_expired",
-                                    // How many times this surface has been reaped
-                                    // inside the thrash window. A number that keeps
-                                    // climbing is the treadmill: reclaim destroying
-                                    // a page that something keeps re-creating.
-                                    "reaps_in_window": reap_count,
-                                    "reclaim_pressured": reclaim_pressured,
-                                    "hold_ms": hold_ms,
-                                }),
-                            );
-                        }
-                    }
-                    WebSurfaceBackgroundAction::Stash { detach, throttle } => {
-                        let Some(entry) = applied.get_mut(&key) else {
-                            continue;
-                        };
-                        if detach {
-                            let _ = desktop.stash_web_surface(entry.native_id);
-                        } else {
-                            // Soft stash: stays attached below the glass (the
-                            // reveal is "cut the hole" over live pixels), demoted
-                            // so it can never occlude the active page's hole.
-                            let _ = desktop.demote_web_surface(entry.native_id);
-                            // ...but a demoted-yet-mapped WebKitGTK view keeps its
-                            // rAF/timers/compositor paint at full CPU — an animating
-                            // background page burns a whole core (the "angry fan").
-                            // Hide the inner webview so the page throttles
-                            // (document.hidden) while the container stays attached
-                            // for an instant raise-reveal.
-                            if throttle {
-                                let _ = desktop.throttle_web_surface(entry.native_id, true);
-                            }
-                        }
-                        entry.stashed_at_ms = Some(now_ms);
-                        entry.visible = false;
-                        // A stashed surface stops being polled for page state, so a
-                        // load that finishes in the background would leave the tab's
-                        // loading light stuck ON — and the session row blinking —
-                        // for as long as the session stays backgrounded. Snuff it at
-                        // stash time; the engine's truth resumes on unstash (a page
-                        // genuinely still loading re-lights within one poll tick).
-                        if entry.loading {
-                            entry.loading = false;
-                            let mut writable = state;
-                            writable.with_mut(|shell| {
-                                shell.set_web_tab_loading(&key.0, key.1, false);
-                            });
-                        }
-                        append_trace_event(
-                            &trace_home,
-                            "ui",
-                            "web_surface",
-                            "native_stash",
-                            json!({
-                                "session_path": key.0,
-                                "tab_id": key.1,
-                                "native_id": decision.native_id,
-                                "hold_ms": hold_ms,
-                                "detached": detach,
-                                "reclaim_pressured": reclaim_pressured,
-                                "media_active": decision.media_active,
-                            }),
-                        );
-                    }
-                }
-            }
         }
         if desired.is_empty() && applied.is_empty() {
             // Safety invariant: zero pages ⇒ the glass carries NO input shape
@@ -112965,7 +113769,16 @@ mod tests {
     // session. Legacy stacking MUST keep the detach: a legacy surface
     // draws above all DOM and only unmapping clears its pixels (the
     // stuck-composite / reload-white family).
-    /// THE TREADMILL LOCK. Reclaim that destroys a page which is immediately
+    /// ⚠ A UNIT TEST OF THE HELPER, NOT A CALL-SITE LOCK. It builds
+    /// `web_surface_background_hold_ms_for`'s arguments itself, so it cannot see
+    /// what the reconcile loop passes — which is where the defect was, and why
+    /// reverting all four production call sites once left this suite green. The
+    /// lock lives in `web_surface_reclaim_locks`
+    /// (`a_surface_that_keeps_coming_back_stops_being_reaped_by_the_pass`). This
+    /// stays because the threshold arithmetic is worth stating; do not cite it
+    /// as proof that reclaim is wired.
+    ///
+    /// Reclaim that destroys a page which is immediately
     /// re-created reclaims nothing and costs a fresh WebKit process every cycle.
     /// Measured live before this guard existed: **166 `background_hold_expired`
     /// closes against 166 re-opens in fifteen minutes**, ~11 cycles a minute,
@@ -112976,7 +113789,7 @@ mod tests {
     /// So: pressure alone still reclaims fast (that is the feature), but a
     /// surface that has demonstrated it comes back must stop being a target.
     #[test]
-    fn a_surface_that_keeps_coming_back_stops_being_reaped_on_the_pressure_timer() {
+    fn the_thrash_hold_helper_escalates_at_the_reopen_limit() {
         let pressured_hold = web_surface_background_hold_ms_for(600_000, true, 0);
         assert_eq!(
             pressured_hold, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
@@ -112987,7 +113800,8 @@ mod tests {
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "below the limit it is still an ordinary reclaim candidate"
         );
-        let thrashing = web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
+        let thrashing =
+            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
         assert!(
             thrashing > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "a surface reaped {} times in the window is demonstrably wanted; \
@@ -113029,6 +113843,10 @@ mod tests {
         );
     }
 
+    /// ⚠ Helper unit test, not a call-site lock — `web_surface_background_detach`
+    /// is asked directly here, so it says nothing about which pressure reading
+    /// the loop feeds it. That is
+    /// `web_surface_reclaim_locks::the_reclaim_pass_reads_current_headroom_not_swap_history`.
     #[test]
     fn a_under_glass_backgrounding_never_detaches_the_webview() {
         // Legacy always detaches; under glass with no memory pressure keeps the
@@ -113054,13 +113872,16 @@ mod tests {
         );
     }
 
-    /// The reclaim policy's INPUT, locked at the call site's boundary. Both of
-    /// these functions used to take `swap_pressured`, a latched history counter,
-    /// which is why 19 of 19 `native_stash` events on the live host carried
-    /// `detached:true hold_ms:5000`. Feed them the live host's real reading and
-    /// the soft stash must survive: attached, ten-minute hold.
+    /// ⚠ NOT A CALL-SITE LOCK, despite what it used to claim. It computes
+    /// `live.reclaim_pressured()` itself and hands the RESULT to the policy
+    /// functions, so it can never observe which predicate the reconcile loop
+    /// actually consults — the entire defect. It survived a revert of all four
+    /// production call sites. What it still says honestly is that the two
+    /// predicates DISAGREE on the live host's real `/proc/meminfo`, which is the
+    /// fixture the real lock is built on
+    /// (`web_surface_reclaim_locks::the_reclaim_pass_reads_current_headroom_not_swap_history`).
     #[test]
-    fn background_policy_reads_reclaim_pressure_not_swap_history() {
+    fn the_two_pressure_predicates_disagree_on_the_live_hosts_own_meminfo() {
         let mut live = crate::terminal_observe::parse_meminfo(
             "MemTotal: 15473336 kB\nMemAvailable: 6976900 kB\n\
              SwapTotal: 16776512 kB\nSwapFree: 4691496 kB\n",
@@ -113079,7 +113900,10 @@ mod tests {
         );
         // Under glass with no real pressure: SOFT stash — stay attached, so
         // switch-back is instant and the page is not destroyed.
-        assert!(!web_surface_background_detach(true, live.reclaim_pressured()));
+        assert!(!web_surface_background_detach(
+            true,
+            live.reclaim_pressured()
+        ));
         assert_eq!(
             web_surface_background_hold_ms(true),
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
