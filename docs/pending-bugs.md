@@ -42,15 +42,38 @@ fix) once the fix is verified live on jojo.
   Until then the help text is a lie.
 
 - **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
-  pixel proof, 2026-07-26 ~17:55 IST).** `terminal new --no-activate` keeps the
-  VIEWPORT on the user's session (activation contract holds; metadata rail and
-  viewport stayed on the user's own row) but the Live Sessions
-  SELECTED-ROW highlight jumped to the agent-spawned ychrome row (the agent's browsing row, top of the list) while the user's session sat fourth. Selection is a
-  separate state from activation and the row-creation path moves it
-  unconditionally. The `--no-activate` contract must cover selected-row truth
-  too: an agent-created row must not take the highlight (nor scroll the list).
+  pixel proof, 2026-07-26 ~17:55 IST — FIXED IN-TREE, LIVE VERIFICATION
+  PENDING).** `terminal new --no-activate` keeps the VIEWPORT on the user's
+  session (activation contract holds; metadata rail and viewport stayed on
+  the user's own row) but the Live Sessions SELECTED-ROW highlight
+  jumped to the agent-spawned ychrome row (the agent's browsing row, top of
+  the list) while the user's session sat fourth. Selection is a separate
+  state from activation and the row-creation path moved it unconditionally.
   Related but distinct from the fifth-focus-path keyboard grab (fixed in-tree
-  the same day). GUI-only fix expected; no daemon involvement.
+  the same day).
+  **ROOT CAUSE.** The create's hand-back was half a hand-back. The
+  `AppControlCommand::CreateTerminal` arm captured only
+  `(active_session_path, active_view_mode)` before the create, applied the
+  daemon's snapshot — which necessarily marks the NEW session active, so
+  `apply_interactive_snapshot_result` ran `sync_active_session_selection()` and
+  `ensure_active_session_visible()` onto the new row — and then restored *only*
+  `server.restore_active_session`. Selected-row truth (`selection_anchor`,
+  `selected_tree_paths`, `browser.selected_path`, and the persisted
+  `settings.selected_browser_path`) was left standing on the intruder. The
+  sidebar's autoscroll target is the SELECTED path, not the active one, which is
+  why the list scrolled to the agent's row too.
+  **FIX (GUI-only, `crates/yggterm-shell/src/shell.rs`, no daemon or protocol
+  change).** Selection follows ACTIVATION, never creation. The user's view is
+  now captured as ONE value (`PreservedUserView` = active session + view mode +
+  `SidebarSelection`) by `capture_user_view`, gated by
+  `preserved_user_view_for_create(shell, activate)`, and handed back by
+  `restore_user_view`. Both create call sites (local and remote) now go through
+  one `apply_created_terminal_snapshot`, so the two transports cannot drift.
+  A create WITH activation passes `None` and keeps today's behaviour.
+  **STILL OPEN, adjacent:** a `--no-activate` create made while NO session is
+  active (start page showing) still activates the new session, because the
+  hand-back has no path to restore to. Selection is preserved in that case;
+  activation is not.
 
 - **★★★ `web do` FIDELITY ON RE-RENDERING DOMs — three reproducible defects,
   one family (a live portal filing run, 2026-07-26 ~15:30-16:00 IST, jojo 2.12.15,
