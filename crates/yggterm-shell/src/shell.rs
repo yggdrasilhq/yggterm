@@ -3137,6 +3137,15 @@ struct AppliedWebSurface {
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
     stashed_at_ms: Option<u64>,
+    /// Has this incarnation EVER been shown on a client? `stashed` cannot
+    /// answer that: a headless surface is born stashed and a backgrounded one
+    /// that the user looked at for an hour is stashed too, and telling those
+    /// apart is the difference between "the user took this surface" and "the
+    /// user has never seen this surface". Latched, never cleared — the question
+    /// is about the incarnation's whole life, and a new incarnation starts a new
+    /// life. THE one owner of the reveal fact; do not add a second encoding of
+    /// it (the page-visibility work needs this same bit).
+    ever_revealed: bool,
     /// Last engine-reported `is-loading` — the poll baseline for the tab's
     /// loading light. Only a CHANGE is written through to the tab, so a page
     /// that sits loaded does not re-render the rail every tick.
@@ -3812,6 +3821,7 @@ mod web_surface_reclaim_locks {
             profile: "default".to_string(),
             zoom_factor: 1.0,
             stashed_at_ms,
+            ever_revealed: true,
             loading: false,
             page_url: String::new(),
             page_title: String::new(),
@@ -4973,6 +4983,11 @@ struct WebSurfaceHandle {
     /// difference between "3 surfaces cost this much" and "3 surfaces cost
     /// this much while 2 of them are off-screen".
     stashed: bool,
+    /// Has this incarnation ever been shown on a client? See
+    /// [`AppliedWebSurface::ever_revealed`] — `stashed` cannot answer it,
+    /// because a headless surface and a backgrounded once-watched surface are
+    /// both stashed.
+    ever_revealed: bool,
 }
 
 /// Realized web surfaces, counted by what they are DOING. Distinct from
@@ -5054,6 +5069,7 @@ fn publish_web_surface_native_ids(
                     generation: entry.generation,
                     visible: entry.visible,
                     stashed: entry.stashed_at_ms.is_some(),
+                    ever_revealed: entry.ever_revealed,
                 },
             )
         }));
@@ -5923,6 +5939,12 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
                     }
+                    // THE reveal fact, latched from the SAME field the compositor
+                    // was told, once, after every route that can show this surface
+                    // (a reveal, an unstash re-attach). One owner: gate 9 asks it
+                    // whether a seat-input count can honestly be attributed to the
+                    // human, and the page-visibility work needs the same bit.
+                    entry.ever_revealed |= entry.visible;
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
                     // through the shell's nav model, so poll the engine and
@@ -6245,6 +6267,10 @@ async fn web_surface_native_reconcile_loop(
                                     profile,
                                     zoom_factor: open_zoom,
                                     stashed_at_ms: (!want_visible).then(current_millis),
+                                    // A headless create is never revealed; a
+                                    // create for the active view is revealed the
+                                    // moment it exists.
+                                    ever_revealed: want_visible,
                                     // A surface is created BY a navigation, so it
                                     // is loading from its first frame — start the
                                     // light on rather than waiting a tick to
@@ -6346,6 +6372,7 @@ async fn web_surface_native_reconcile_loop(
                     profile,
                     zoom_factor,
                     stashed_at_ms: None,
+                    ever_revealed: !popup.background,
                     loading: true,
                     page_url: popup.url,
                     page_title: String::new(),
@@ -7268,6 +7295,197 @@ impl DeclareRebuild {
             Self::FetchFailed { error } => format!(
                 "could not ask the daemon for {session_path}'s declares ({error}) — this is NOT the same as having none"
             ),
+        }
+    }
+}
+
+/// What the SOCKET said about a session's runtime — three answers, because two
+/// would be a lie.
+///
+/// `Unknown` is not `Dead`. A declare fetch fails when the owner is a
+/// predecessor daemon that cannot serve the request, when the proxy hop breaks,
+/// and when the endpoint is momentarily gone — none of which mean the session
+/// ended. Collapsing them into "dead" would refuse work on perfectly live
+/// sessions, and mixed-version ownership makes that the COMMON case during a
+/// daemon handover, not a corner one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionRuntimeLiveness {
+    /// The owner answered and the session's runtime is running.
+    Running,
+    /// The owner answered and the runtime is gone.
+    Dead,
+    /// Nobody could be asked. NOT evidence of death.
+    Unknown,
+}
+
+/// The stable reason string `web ensure` refuses a closed session with.
+const WEB_ENSURE_SESSION_CLOSED: &str = "session_closed";
+
+/// **May `web ensure` revive a surface for this session?** — the whole rule,
+/// pure over the two facts, so it cannot be re-spelled at the call site.
+///
+/// The state it forbids is "surface alive, row absent". A run closed its session
+/// (the row is TOMBSTONED and the PTY is gone) and the next run pointed
+/// `web ensure` at that dead path; ensure revived and leased the surface, and an
+/// agent then drove a real page for an hour with no row anywhere reflecting it —
+/// the user could neither see it nor click into it. An agent that needs a
+/// surface must create its OWN session, and therefore its own visible row.
+///
+/// CONJUNCTIVE, deliberately, because two legitimate revivals share half of each
+/// fact and must keep working:
+///   - a LIVE but backgrounded session whose surface the reaper collected (the
+///     mid-wizard recovery `ensure` exists for) — running, so never refused;
+///   - a session that never mounted a terminal host, rebuilt from the daemon's
+///     retained declare — its row was never closed, so never refused.
+///
+/// Absence from a snapshot is not one of the facts on purpose: a row owned by a
+/// preserved predecessor daemon drops out of the current daemon's snapshot while
+/// its session is perfectly alive.
+fn web_ensure_refuses_closed_session(
+    runtime: &SessionRuntimeLiveness,
+    row_close_remembered: bool,
+) -> bool {
+    *runtime == SessionRuntimeLiveness::Dead && row_close_remembered
+}
+
+/// The sentence the refusal carries: name the two facts, then the remedy. An
+/// agent reading this must come away knowing that the fix is its OWN session,
+/// not a retry — the tombstone plane is a locked zero-resurrection baseline and
+/// `ensure` will never lift it.
+fn web_ensure_closed_session_detail(session_path: &str) -> String {
+    format!(
+        "{session_path}'s row was closed by the user and its runtime is gone, so reviving a web \
+         surface under it would give you a live page with no row the user can see or click into. \
+         Create your own session (`yggterm server app terminal new`) and drive its surface \
+         instead; a closed row is never resurrected."
+    )
+}
+
+/// CALL-SITE LOCKS for `web ensure`'s closed-session refusal.
+///
+/// The rule below is pure and trivially testable, which is exactly the shape
+/// that has shipped could-only-pass locks here before: the defect was never in
+/// the rule, it was in what the arm FED the rule. The arm is an `async` match
+/// arm holding a live `DesktopContext`, so nothing can call it — hence the
+/// structural half, which reads the arm's own source and fails if the two facts
+/// stop coming from their owners or the refusal moves after the probe.
+#[cfg(test)]
+mod web_ensure_closed_session_locks {
+    use super::*;
+
+    /// The one state that must be unrepresentable: a closed row whose runtime
+    /// is gone, revived under an agent's lease.
+    #[test]
+    fn a_dead_runtime_under_a_closed_row_is_refused() {
+        assert!(web_ensure_refuses_closed_session(
+            &SessionRuntimeLiveness::Dead,
+            true
+        ));
+    }
+
+    /// …and the three near-misses that must NOT be refused, because each is a
+    /// revival `ensure` exists to perform.
+    #[test]
+    fn the_legitimate_revivals_are_not_refused() {
+        // The mid-flow recovery: a live but backgrounded session whose surface
+        // the background reaper collected.
+        assert!(!web_ensure_refuses_closed_session(
+            &SessionRuntimeLiveness::Running,
+            false
+        ));
+        // A live session whose row carries an OLD close — the runtime is
+        // running, so nothing here is an orphan.
+        assert!(!web_ensure_refuses_closed_session(
+            &SessionRuntimeLiveness::Running,
+            true
+        ));
+        // A dead runtime the user never closed: an app that exited on its own.
+        // Its declare rebuild may still fail, but not with THIS reason.
+        assert!(!web_ensure_refuses_closed_session(
+            &SessionRuntimeLiveness::Dead,
+            false
+        ));
+    }
+
+    /// A FETCH THAT FAILED IS NOT A DEAD RUNTIME. Mixed-version ownership makes
+    /// this the common case during a daemon handover — a declare proxied to a
+    /// predecessor owner has already returned nothing once — and refusing on it
+    /// would take `web ensure` away from every session on an older daemon.
+    #[test]
+    fn an_unreachable_owner_never_counts_as_a_dead_runtime() {
+        assert!(!web_ensure_refuses_closed_session(
+            &SessionRuntimeLiveness::Unknown,
+            true
+        ));
+    }
+
+    /// The remedy has to be in the sentence: an agent that reads "refused" and
+    /// retries has learned nothing, and the tombstone plane will never lift.
+    #[test]
+    fn the_refusal_names_the_session_and_points_at_a_new_one() {
+        let detail = web_ensure_closed_session_detail("local://closed-row");
+        assert!(detail.contains("local://closed-row"));
+        assert!(
+            detail.contains("terminal new"),
+            "the refusal must name the verb that gets the agent a row of its own: {detail}"
+        );
+    }
+
+    /// THE WIRING. `web_ensure_refuses_closed_session` cannot see what the arm
+    /// hands it, so this reads the arm.
+    #[test]
+    fn the_ensure_arm_asks_both_owners_before_it_probes_anything() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_ensure_closed_session_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertions that name them",
+        );
+
+        let start = product
+            .iter()
+            .position(|line| line.trim() == "AppControlCommand::EnsureWebSurface {")
+            .expect("the ensure arm moved — move this lock with it");
+        let probe = product[start..]
+            .iter()
+            .position(|line| line.contains("let probe_before ="))
+            .map(|offset| start + offset)
+            .expect("the ensure arm no longer probes liveness");
+        let preamble = product[start..probe].join("\n");
+
+        for needle in [
+            // The RUNTIME fact from the socket — the owner's own word. A daemon
+            // snapshot cannot be substituted: it drops preserved-owner rows.
+            "Ok((_, true)) => SessionRuntimeLiveness::Running,",
+            "Ok((_, false)) => SessionRuntimeLiveness::Dead,",
+            // …and the third answer, without which a handover looks like death.
+            "Err(_) => SessionRuntimeLiveness::Unknown,",
+            // The CLOSE fact from the plane the close wrote, read-only.
+            "yggterm_server::live_row_close_is_remembered(&home, &session_path)",
+            // The rule over the two, not a re-spelling of it.
+            "if web_ensure_refuses_closed_session(&runtime_liveness, row_close_remembered) {",
+        ] {
+            assert!(
+                preamble.contains(needle),
+                "the ensure arm no longer wires `{needle}` ahead of its liveness probe — \
+                 a closed session can be revived again:\n{preamble}"
+            );
         }
     }
 }
@@ -14440,6 +14658,92 @@ impl ShellState {
             terminal_resume_notification_session_path(job_key).as_deref() != Some(session_path)
         });
     }
+    /// **A CLOSED SESSION MAY NOT KEEP A LIVE WEB SURFACE.** Ends the leases and
+    /// destroys the desired-state entry for every surface declared under a
+    /// session whose row is going away, and returns the surface keys it took.
+    ///
+    /// The state this forbids is "surface alive, row absent": a run closed its
+    /// session (row tombstoned, PTY dead) and the surface simply stayed —
+    /// nothing in the close path touched `web_surfaces`, the reconciler kept
+    /// seeing a desired entry, and every agent verb renewed a 15-minute drive
+    /// lease, so `max(hold, lease)` never came due. A later `web ensure` then
+    /// leased that orphan and an agent drove a real page for an hour with no row
+    /// anywhere showing it. The lease lives on the tab, so removing the surface
+    /// ends the lease with it — which also drops the orphan out of
+    /// `agent_leases` and stops it blocking a deploy.
+    ///
+    /// Only an EXPLICIT close reaches here. Never prune surfaces against a
+    /// daemon snapshot: a row owned by a preserved predecessor daemon can drop
+    /// out of that snapshot while its session is perfectly alive, and reaping on
+    /// absence would destroy another agent's page across a version bump.
+    fn tear_down_web_surfaces_for_closed_session(
+        &mut self,
+        session_path: &str,
+        reason: &'static str,
+    ) -> Vec<String> {
+        // A row path and the path a surface was declared under can be different
+        // spellings of one session (`codex://<id>` vs `local://<id>`), so match
+        // the way every other close-time comparison does rather than by string
+        // equality — the mismatch is silent, and silence here is a live orphan.
+        let normalized = normalize_live_session_path(session_path);
+        let targets: Vec<String> = self
+            .web_surfaces
+            .keys()
+            .filter(|key| normalize_live_session_path(key) == normalized)
+            .cloned()
+            .collect();
+        let trace_home = perf_home_dir(&self.bootstrap.settings_path);
+        for target in &targets {
+            // An agent's claim on a surface cannot outlive the session it was a
+            // claim on; leaving it would re-materialize the surface on the next
+            // reconcile tick.
+            let headless_wanted_until_ms = self.web_surface_headless_wanted.remove(target);
+            // Whatever the arbiter remembered about this surface goes with it:
+            // the lanes are keyed (session_path, generation) and nothing else
+            // forgets them, so a closed session's preempted lanes would
+            // accumulate forever.
+            let generations: Vec<u64> = self
+                .web_surfaces
+                .get(target)
+                .map(|surface| {
+                    surface
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| {
+                            web_surface_handle_for(target, tab.id).map(|handle| handle.generation)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let closed = self.close_web_surface(target);
+            {
+                let mut arbiter = agent_input_arbiter_lock();
+                for generation in &generations {
+                    arbiter.forget(&crate::agent_input_arbiter::SurfaceKey::new(
+                        target.as_str(),
+                        *generation,
+                    ));
+                }
+            }
+            // Its own event, so an agent whose surface vanished can tell "the
+            // user closed my session" from "the page crashed".
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "closed_with_session",
+                json!({
+                    "session_path": target,
+                    "closed_for": session_path,
+                    "reason": reason,
+                    "destroyed": closed,
+                    "generations": generations,
+                    "headless_wanted_until_ms": headless_wanted_until_ms,
+                }),
+            );
+        }
+        targets
+    }
     fn prepare_live_session_close_locally(
         &mut self,
         pending: &PendingDeleteDialog,
@@ -14450,6 +14754,7 @@ impl ShellState {
         }
         for session_path in &pending.session_paths {
             self.drop_terminal_render_state_for_session(session_path, reason);
+            self.tear_down_web_surfaces_for_closed_session(session_path, reason);
         }
     }
     /// Best-effort human label + kind for a reveal-log entry. Resolves the
@@ -51261,6 +51566,16 @@ async fn web_do_doc_to_viewport(
 /// keyed on the count itself, not on what the lane happened to remember, so a
 /// human gesture is never silently absorbed by an empty arbiter.
 ///
+/// **The preempt marker needs a surface the human can actually see.** A count on
+/// a surface no client has ever revealed refuses the verb — the count is real,
+/// and a borrowed keyboard focus genuinely does land the user's keystrokes in an
+/// invisible page — but it does NOT set the marker whose message to the agent is
+/// *"the user took this surface"*. A human cannot take what they have never been
+/// shown, and reporting that they did both slandered them and locked the lane
+/// until a new incarnation. Refusal without attribution:
+/// [`GateDecision::SeatInputOnUnrevealedSurface`]. `surface_ever_revealed` is an
+/// explicit argument, not a lookup, so this stays pure over the arbiter.
+///
 /// It is `&mut AgentInputArbiter` and nothing else — no signals, no desktop, no
 /// tracing — which is what lets the batch locks below drive it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51270,10 +51585,25 @@ enum GateDecision {
     Preempted,
     /// The verb was aimed at an incarnation that no longer exists.
     StaleSurface,
+    /// Seat input landed on a surface NO CLIENT HAS EVER SHOWN. The count is
+    /// real — a borrowed keyboard focus can drop the user's keystrokes into an
+    /// invisible page — so this verb is refused like any other unexplained
+    /// input. But the human cannot have *taken* a surface they have never seen,
+    /// so the preempt marker is NOT set: the batch is not cancelled, the trace
+    /// does not accuse the user, and the lane does not need a new incarnation
+    /// to recover.
+    SeatInputOnUnrevealedSurface,
 }
+
+/// Refusal + journal reason for gate 9's third answer. Named, not folded into
+/// `preempted`, because the two need different actions: `preempted` means yield
+/// to a human who is using the page, while this means the input plane and the
+/// reveal plane disagree about whether anyone can see it.
+const SEAT_INPUT_ON_UNREVEALED_SURFACE: &str = "seat_input_on_unrevealed_surface";
 
 fn web_do_gate(
     seat_input_count: u64,
+    surface_ever_revealed: bool,
     new_batch: bool,
     arbiter: &mut crate::agent_input_arbiter::AgentInputArbiter,
     surface: &crate::agent_input_arbiter::SurfaceKey,
@@ -51283,6 +51613,18 @@ fn web_do_gate(
     if arbiter.is_stale(surface, live_generation) {
         return (
             GateDecision::StaleSurface,
+            crate::agent_input_arbiter::PreemptReport::default(),
+        );
+    }
+    if seat_input_count > 0 && !surface_ever_revealed {
+        // "The user took this surface" was reported for a surface with no row
+        // and no pixel: the human was blamed for touching something invisible
+        // to them, and because the lane is keyed (session, generation) the only
+        // cure was a new incarnation. The COUNT still stands — refuse the verb,
+        // journal it under its own name — but the ATTRIBUTION does not, so the
+        // preempt marker stays off.
+        return (
+            GateDecision::SeatInputOnUnrevealedSurface,
             crate::agent_input_arbiter::PreemptReport::default(),
         );
     }
@@ -51768,6 +52110,10 @@ async fn web_do_open_lane(
     let seat_input = desktop.take_web_surface_seat_input(handle.native_id);
     let (decision, preempt_report) = web_do_gate(
         seat_input,
+        // Whether a client has EVER shown this surface — the fact that decides
+        // if the count can honestly be called "the user took it". Read from the
+        // reconciler's published handle, which is the only thing that knows.
+        handle.ever_revealed,
         new_batch,
         &mut agent_input_arbiter_lock(),
         &surface_key,
@@ -51822,6 +52168,36 @@ async fn web_do_open_lane(
             "reason": crate::agent_input_arbiter::PREEMPTED,
             "session_path": session,
             "detail": "the user took this surface; start a new batch after re-observing",
+        }));
+    }
+    if decision == GateDecision::SeatInputOnUnrevealedSurface {
+        // Journalled, never swallowed: real keystrokes reaching a surface the
+        // user cannot see is a co-browse defect in its own right (a borrowed
+        // window focus is one live route to it), and dropping the count would
+        // turn that defect into a designed-in blind spot.
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "agent_input",
+                SEAT_INPUT_ON_UNREVEALED_SURFACE,
+                json!({
+                    "session_path": session,
+                    "batch_id": batch.batch_id,
+                    "generation": handle.generation,
+                    "seat_input_count": seat_input,
+                }),
+            );
+        }
+        return Err(json!({
+            "accepted": false,
+            "reason": SEAT_INPUT_ON_UNREVEALED_SURFACE,
+            "session_path": session,
+            "seat_input_count": seat_input,
+            "detail": "seat input was observed on a surface no client has ever shown, so it \
+                       cannot be attributed to the user and this verb is refused. The batch is \
+                       NOT preempted. Reveal the session (open its row) before driving it, or \
+                       re-run once the surface is on screen.",
         }));
     }
     if decision == GateDecision::StaleSurface {
@@ -51936,6 +52312,12 @@ enum BatchStep {
     /// The human took the surface; the batch stops HERE and this action does
     /// not run. `remaining` is what the agent planned and will not get.
     AbortPreempted { remaining: usize },
+    /// Seat input arrived on a surface no client has ever shown. The batch
+    /// still stops — an unexplained input on the page mid-run is not something
+    /// to inject over — but nothing is preempted, because the user cannot have
+    /// taken a surface they have never seen. Same rule as
+    /// [`GateDecision::SeatInputOnUnrevealedSurface`], applied per action.
+    AbortSeatInputOnUnrevealedSurface { remaining: usize },
 }
 
 impl WebBatchTally {
@@ -51951,21 +52333,34 @@ impl WebBatchTally {
         }
     }
 
-    /// Called BEFORE each action with the seat-input count consumed for it.
+    /// Called BEFORE each action with the seat-input count consumed for it and
+    /// whether any client has ever shown the surface.
     ///
     /// Index 0 is exempt because the gate that opened the lane already consumed
     /// (and judged) the count for it — asking twice would re-read a counter
-    /// that is by then always zero. From index 1 on, a non-zero count is
-    /// unambiguously the user: the injector's own events are excluded at the
-    /// webview layer by the injection credits.
-    fn step(&mut self, index: usize, seat_input_count: u64) -> BatchStep {
-        if index > 0 && seat_input_count > 0 {
-            let remaining = self.total.saturating_sub(index);
-            self.aborted_at = Some(index);
-            self.abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
-            return BatchStep::AbortPreempted { remaining };
+    /// that is by then always zero. From index 1 on, a non-zero count is real
+    /// seat input: the injector's own events are excluded at the webview layer
+    /// by the injection credits. Whether it is THE USER is a second question,
+    /// and `surface_ever_revealed` is the only thing that can answer it — the
+    /// same rule `web_do_gate` applies when the lane opens, so a batch cannot
+    /// blame the human for a surface a single verb would not have.
+    fn step(
+        &mut self,
+        index: usize,
+        seat_input_count: u64,
+        surface_ever_revealed: bool,
+    ) -> BatchStep {
+        if index == 0 || seat_input_count == 0 {
+            return BatchStep::Run;
         }
-        BatchStep::Run
+        let remaining = self.total.saturating_sub(index);
+        self.aborted_at = Some(index);
+        if !surface_ever_revealed {
+            self.abort_reason = Some(SEAT_INPUT_ON_UNREVEALED_SURFACE);
+            return BatchStep::AbortSeatInputOnUnrevealedSurface { remaining };
+        }
+        self.abort_reason = Some(crate::agent_input_arbiter::PREEMPTED);
+        BatchStep::AbortPreempted { remaining }
     }
 
     fn record_ok(&mut self, index: usize, mut detail: Value) {
@@ -52100,16 +52495,39 @@ async fn web_surface_batch_for(
         } else {
             0
         };
-        if let BatchStep::AbortPreempted { remaining } = tally.step(index, seat_input) {
-            let report = note_human_input_on_web_surface(&session, handle.generation);
-            journal_web_surface_preempt(
-                &session,
-                handle.generation,
-                &report,
-                "human_input",
-                Some(remaining),
-            );
-            break;
+        match tally.step(index, seat_input, handle.ever_revealed) {
+            BatchStep::Run => {}
+            BatchStep::AbortPreempted { remaining } => {
+                let report = note_human_input_on_web_surface(&session, handle.generation);
+                journal_web_surface_preempt(
+                    &session,
+                    handle.generation,
+                    &report,
+                    "human_input",
+                    Some(remaining),
+                );
+                break;
+            }
+            BatchStep::AbortSeatInputOnUnrevealedSurface { remaining } => {
+                // Stop, journal, do NOT preempt: the count is real but nobody
+                // can be shown to have made it. Same reason string the lane
+                // gate uses, so an agent branches on one name.
+                if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "agent_input",
+                        SEAT_INPUT_ON_UNREVEALED_SURFACE,
+                        json!({
+                            "session_path": session,
+                            "generation": handle.generation,
+                            "seat_input_count": seat_input,
+                            "remaining": remaining,
+                        }),
+                    );
+                }
+                break;
+            }
         }
         let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
         match result {
@@ -52281,6 +52699,9 @@ mod web_do_verb_tests {
             let seat_input = take_seat_input_count(native_id);
             let (decision, report) = web_do_gate(
                 seat_input,
+                // A surface the user can see: the ordinary case, where a real
+                // count IS the human.
+                true,
                 iteration == 0,
                 &mut arbiter,
                 &surface,
@@ -52306,6 +52727,7 @@ mod web_do_verb_tests {
         assert_eq!(
             web_do_gate(
                 seat_input,
+                true,
                 false,
                 &mut arbiter,
                 &surface,
@@ -52344,7 +52766,7 @@ mod web_do_verb_tests {
                 0
             };
             assert_eq!(
-                tally.step(index, seat_input),
+                tally.step(index, seat_input, true),
                 BatchStep::Run,
                 "action {index} aborted itself with seat_input={seat_input}"
             );
@@ -52385,7 +52807,7 @@ mod web_do_verb_tests {
             } else {
                 0
             };
-            match tally.step(index, seat_input) {
+            match tally.step(index, seat_input, true) {
                 BatchStep::Run => {
                     grant_injection_credits(native_id, 1);
                     note_seat_input(native_id);
@@ -52395,6 +52817,7 @@ mod web_do_verb_tests {
                     aborted = Some((index, remaining));
                     break;
                 }
+                other => panic!("a revealed surface must abort as preempted, got {other:?}"),
             }
         }
 
@@ -52425,7 +52848,7 @@ mod web_do_verb_tests {
     fn a_batch_reports_succeeded_and_failed_apart_and_is_not_accepted_when_nothing_landed() {
         let mut tally = WebBatchTally::new(31, false);
         for index in 0..31 {
-            assert_eq!(tally.step(index, 0), BatchStep::Run);
+            assert_eq!(tally.step(index, 0, true), BatchStep::Run);
             assert!(
                 tally.record_err(index, json!("no_such_element")),
                 "stop_on_error:false keeps going"
@@ -52447,11 +52870,11 @@ mod web_do_verb_tests {
 
         // A partial batch is also not `accepted`, and says how far it got.
         let mut partial = WebBatchTally::new(3, false);
-        partial.step(0, 0);
+        partial.step(0, 0, true);
         partial.record_ok(0, json!({}));
-        partial.step(1, 0);
+        partial.step(1, 0, true);
         partial.record_err(1, json!("no_such_element"));
-        partial.step(2, 0);
+        partial.step(2, 0, true);
         partial.record_ok(2, json!({}));
         let envelope = partial.envelope("web://session-a".to_string(), 5, 1);
         assert_eq!(envelope["accepted"], json!(false));
@@ -52461,9 +52884,9 @@ mod web_do_verb_tests {
 
         // `stop_on_error: true` still stops, and names why.
         let mut halting = WebBatchTally::new(3, true);
-        halting.step(0, 0);
+        halting.step(0, 0, true);
         halting.record_ok(0, json!({}));
-        halting.step(1, 0);
+        halting.step(1, 0, true);
         assert!(
             !halting.record_err(1, json!("no_such_element")),
             "stop_on_error:true must halt the loop"
@@ -52485,21 +52908,21 @@ mod web_do_verb_tests {
         let batch = AgentBatch::new("anonymous");
 
         assert_eq!(
-            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
         // The user clicks.
-        let (decision, report) = web_do_gate(1, false, &mut arbiter, &surface, &batch, 7);
+        let (decision, report) = web_do_gate(1, true, false, &mut arbiter, &surface, &batch, 7);
         assert_eq!(decision, GateDecision::Preempted);
         assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
         // …and stays preempted until the agent re-observes.
         assert_eq!(
-            web_do_gate(0, false, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, false, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Preempted
         );
         // `--new-batch` (and a batch verb, which always opens one) is the reset.
         assert_eq!(
-            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
     }
@@ -52528,13 +52951,13 @@ mod web_do_verb_tests {
 
         // The agent has been driving this surface, so its batch is ACTIVE.
         assert_eq!(
-            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
         // The user clicks, and the agent's very next verb is a `web batch` —
         // which sets the reset flag on its own behalf. It is REFUSED, and it
         // says which batch the gesture cancelled.
-        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
+        let (decision, report) = web_do_gate(1, true, true, &mut arbiter, &surface, &batch, 7);
         assert_eq!(
             decision,
             GateDecision::Preempted,
@@ -52545,12 +52968,12 @@ mod web_do_verb_tests {
         // per verb), so re-observing and asking again gets the lane back. One
         // refusal is the whole cost.
         assert_eq!(
-            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
         );
         // …and the next real gesture still wins.
         assert_eq!(
-            web_do_gate(1, false, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(1, true, false, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Preempted
         );
     }
@@ -52567,7 +52990,7 @@ mod web_do_verb_tests {
         let surface = SurfaceKey::new("web://session-a", 7);
         let batch = AgentBatch::new("anonymous");
 
-        let (decision, report) = web_do_gate(1, true, &mut arbiter, &surface, &batch, 7);
+        let (decision, report) = web_do_gate(1, true, true, &mut arbiter, &surface, &batch, 7);
         assert_eq!(decision, GateDecision::Preempted);
         assert!(
             report.is_empty(),
@@ -52575,8 +52998,256 @@ mod web_do_verb_tests {
         );
         // With the count consumed, the batch opens.
         assert_eq!(
-            web_do_gate(0, true, &mut arbiter, &surface, &batch, 7).0,
+            web_do_gate(0, true, true, &mut arbiter, &surface, &batch, 7).0,
             GateDecision::Allowed
+        );
+    }
+
+    // THE PREEMPT MARKER NEEDS A SURFACE THE HUMAN CAN SEE.
+    //
+    // A surface with no row and no pixel began refusing every verb with
+    // `preempted` — "the user took this surface" — about a page the user could
+    // not see, click, or have touched. The lane is keyed (session, generation)
+    // and `forget()` runs only on close/recreate, so that verdict was permanent:
+    // the only cure was a new incarnation.
+    //
+    // The count is NOT discarded (a borrowed window focus really can drop the
+    // user's keystrokes into an invisible page — that happened, with three
+    // trusted key presses and no agent verb within eight seconds either side).
+    // The verb is still refused. What changes is the ATTRIBUTION: no preempt
+    // marker, no cancelled batch, and its own reason so the two are never
+    // confused in a trace.
+    #[test]
+    fn a_seat_count_on_a_never_revealed_surface_refuses_without_blaming_the_user() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://headless-orphan", 3);
+        let batch = AgentBatch::new("anonymous");
+
+        // The agent has been driving it.
+        assert_eq!(
+            web_do_gate(0, false, true, &mut arbiter, &surface, &batch, 3).0,
+            GateDecision::Allowed
+        );
+
+        // A count arrives on a surface no client has ever shown.
+        let (decision, report) = web_do_gate(1, false, false, &mut arbiter, &surface, &batch, 3);
+        assert_eq!(
+            decision,
+            GateDecision::SeatInputOnUnrevealedSurface,
+            "an unrevealed surface must not report that the user took it"
+        );
+        assert!(
+            report.is_empty(),
+            "nothing may be cancelled on the strength of input nobody can be shown to have made"
+        );
+        assert!(
+            !arbiter.is_preempted(&surface, "anonymous"),
+            "the preempt marker was set for a surface the user has never seen"
+        );
+
+        // …and the lane is NOT poisoned: the agent's next verb drives again,
+        // with no `--new-batch` and no new incarnation needed.
+        assert_eq!(
+            web_do_gate(0, false, false, &mut arbiter, &surface, &batch, 3).0,
+            GateDecision::Allowed,
+            "an unrevealed-surface refusal must not become a permanent lockout"
+        );
+    }
+
+    // The same count on a REVEALED surface still preempts. Without this the fix
+    // above could be "never preempt" and pass.
+    #[test]
+    fn the_identical_count_on_a_revealed_surface_still_preempts() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://revealed", 3);
+        let batch = AgentBatch::new("anonymous");
+        assert_eq!(
+            web_do_gate(0, false, true, &mut arbiter, &surface, &batch, 3).0,
+            GateDecision::Allowed
+        );
+        let (decision, report) = web_do_gate(1, true, false, &mut arbiter, &surface, &batch, 3);
+        assert_eq!(decision, GateDecision::Preempted);
+        assert_eq!(report.cancelled_batches, vec!["anonymous".to_string()]);
+    }
+
+    // THE WIRING for the two tests above: the reveal fact the gate judges by is
+    // the one the RECONCILER published, not a value a caller invented. Driving
+    // `publish_web_surface_native_ids` (the reconciler's own publication) and
+    // reading it back through `web_surface_handle_for` — the exact pair
+    // `web_do_open_lane` uses — is what makes this a lock: pin `ever_revealed`
+    // to a constant in the publish and the two surfaces stop differing.
+    #[test]
+    fn the_published_handle_carries_the_reveal_fact_the_gate_judges_by() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+
+        fn applied(native_id: u64, ever_revealed: bool) -> AppliedWebSurface {
+            AppliedWebSurface {
+                native_id,
+                url: "https://example.invalid/".to_string(),
+                bounds: (0, 0, 800, 600),
+                visible: false,
+                reload_nonce: 0,
+                socks_port: None,
+                profile: "default".to_string(),
+                zoom_factor: 1.0,
+                // BOTH are stashed: that is the point — `stashed` cannot tell
+                // "never shown" from "shown, then backgrounded".
+                stashed_at_ms: Some(1),
+                ever_revealed,
+                loading: false,
+                page_url: String::new(),
+                page_title: String::new(),
+                generation: native_id,
+            }
+        }
+        let mut published: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
+        published.insert(
+            ("web://publish-shown".to_string(), 0),
+            applied(8_101, true),
+        );
+        published.insert(
+            ("web://publish-never-shown".to_string(), 0),
+            applied(8_102, false),
+        );
+        publish_web_surface_native_ids(&published, 1);
+
+        let shown = web_surface_handle_for("web://publish-shown", 0)
+            .expect("the reconciler published this surface");
+        let never_shown = web_surface_handle_for("web://publish-never-shown", 0)
+            .expect("the reconciler published this surface");
+        assert!(shown.ever_revealed);
+        assert!(!never_shown.ever_revealed);
+
+        // The same count, the same gate, two different verdicts — decided only
+        // by the published fact.
+        let batch = AgentBatch::new("anonymous");
+        let mut arbiter = AgentInputArbiter::new();
+        let shown_key = SurfaceKey::new("web://publish-shown", shown.generation);
+        assert_eq!(
+            web_do_gate(
+                1,
+                shown.ever_revealed,
+                false,
+                &mut arbiter,
+                &shown_key,
+                &batch,
+                shown.generation
+            )
+            .0,
+            GateDecision::Preempted
+        );
+        let never_key = SurfaceKey::new("web://publish-never-shown", never_shown.generation);
+        assert_eq!(
+            web_do_gate(
+                1,
+                never_shown.ever_revealed,
+                false,
+                &mut arbiter,
+                &never_key,
+                &batch,
+                never_shown.generation
+            )
+            .0,
+            GateDecision::SeatInputOnUnrevealedSurface
+        );
+    }
+
+    // The batch loop's half of the same rule: a mid-run count on a surface
+    // nobody has seen stops the batch and says so, without preempting.
+    #[test]
+    fn a_batch_on_an_unrevealed_surface_aborts_without_naming_the_user() {
+        use dioxus_desktop::{note_seat_input, take_seat_input_count};
+
+        let native_id = 91_004;
+        take_seat_input_count(native_id);
+        let mut tally = WebBatchTally::new(20, false);
+        let mut aborted = None;
+
+        for index in 0..20 {
+            if index == 4 {
+                // Something real landed on the page. No credit backs it, so the
+                // engine reports it as seat input — but no client has ever shown
+                // this surface, so it cannot be attributed to the user.
+                note_seat_input(native_id);
+            }
+            let seat_input = if index > 0 {
+                take_seat_input_count(native_id)
+            } else {
+                0
+            };
+            match tally.step(index, seat_input, false) {
+                BatchStep::Run => tally.record_ok(index, json!({"delivered": true})),
+                BatchStep::AbortSeatInputOnUnrevealedSurface { remaining } => {
+                    aborted = Some((index, remaining));
+                    break;
+                }
+                BatchStep::AbortPreempted { .. } => {
+                    panic!("a surface the user has never seen must not be reported as taken")
+                }
+            }
+        }
+
+        assert_eq!(aborted, Some((4, 16)));
+        let envelope = tally.envelope("web://headless-orphan".to_string(), native_id, 3);
+        assert_eq!(envelope["aborted_at"], json!(4));
+        assert_eq!(
+            envelope["abort_reason"],
+            json!("seat_input_on_unrevealed_surface"),
+            "the envelope must not tell the agent the user took a surface they cannot see"
+        );
+    }
+
+    // THE INTER-VERB GAP, shell half. The engine drops a burst's unspent credits
+    // on a clock; this is what that buys the user at the gate they are protected
+    // by. It drives the REAL accounting — a literal count here would synthesize
+    // the whole defect away.
+    #[test]
+    fn keystrokes_between_two_verbs_reach_the_gate_instead_of_the_agents_ledger() {
+        use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
+        use dioxus_desktop::{
+            grant_injection_credits_at, note_seat_input_at, take_seat_input_count,
+            INJECTION_CREDIT_TTL_MS,
+        };
+
+        let native_id = 91_005;
+        take_seat_input_count(native_id);
+        let mut arbiter = AgentInputArbiter::new();
+        let surface = SurfaceKey::new("web://co-browsed", 3);
+        let batch = AgentBatch::new("anonymous");
+
+        // Verb 1: a fill — twelve injected events, every one suppressed by the
+        // lexical flag because delivery is synchronous, so twelve credits are
+        // granted and none are spent. The verb ENDS without the counter being
+        // read: production only reads it when the NEXT verb opens its lane.
+        let fill_at = 500_000;
+        for _ in 0..12 {
+            grant_injection_credits_at(native_id, 1, fill_at);
+        }
+
+        // The user types into the page they are sharing.
+        for offset in 0..2 {
+            note_seat_input_at(native_id, fill_at + INJECTION_CREDIT_TTL_MS + offset);
+        }
+
+        // Verb 2 opens its lane and reads the counter, exactly as
+        // `web_do_open_lane` does.
+        let seat_input = take_seat_input_count(native_id);
+        assert_eq!(
+            seat_input, 2,
+            "the user's keystrokes were absorbed by the previous verb's credits"
+        );
+        let (decision, report) =
+            web_do_gate(seat_input, true, false, &mut arbiter, &surface, &batch, 3);
+        assert_eq!(
+            decision,
+            GateDecision::Preempted,
+            "the human typed and the agent's next verb still landed"
+        );
+        assert!(
+            report.is_empty(),
+            "nothing was driving the surface yet, so nothing was cancelled"
         );
     }
 
@@ -52589,7 +53260,7 @@ mod web_do_verb_tests {
         let surface = SurfaceKey::new("web://session-a", 7);
         let batch = AgentBatch::new("anonymous");
         assert_eq!(
-            web_do_gate(0, false, &mut arbiter, &surface, &batch, 9).0,
+            web_do_gate(0, true, false, &mut arbiter, &surface, &batch, 9).0,
             GateDecision::StaleSurface
         );
     }
@@ -54252,6 +54923,7 @@ mod web_do_verb_tests {
             generation: 42,
             visible: true,
             stashed: false,
+            ever_revealed: true,
         };
         assert!(web_surface_stale_handle(None, handle).is_none());
         assert!(web_surface_stale_handle(Some(42), handle).is_none());
@@ -61535,9 +62207,64 @@ async fn process_pending_app_control_requests(
         AppControlCommand::EnsureWebSurface {
             session_path,
             ttl_secs,
-        } => {
+        } => 'ensure: {
             let ttl = ttl_secs.unwrap_or(600).clamp(30, 3600);
             let until = current_millis() + ttl * 1000;
+            // A CLOSED SESSION IS NOT A SURFACE TO REVIVE — checked BEFORE the
+            // probe, because the probe answering "alive" is exactly how the
+            // orphan got leased: a surface that outlived its row is still a
+            // live webview, and `already_live` reads like success.
+            //
+            // Two facts, from their own owners: the RUNTIME from the socket
+            // (`terminal_app_declares` answers `(records, running)` — the
+            // owner's word, which a daemon snapshot is not for a preserved-owner
+            // row), and the CLOSE from the tombstone plane the close itself
+            // wrote. The rule over them is
+            // `web_ensure_refuses_closed_session`.
+            let runtime_liveness = match terminal_app_declares_async(
+                state.read().bootstrap.server_endpoint.clone(),
+                session_path.clone(),
+                &home,
+            )
+            .await
+            {
+                Ok((_, true)) => SessionRuntimeLiveness::Running,
+                Ok((_, false)) => SessionRuntimeLiveness::Dead,
+                // A FETCH THAT FAILED IS NOT A DEAD RUNTIME. Refusing here would
+                // break every session whose owner is a predecessor daemon.
+                Err(_) => SessionRuntimeLiveness::Unknown,
+            };
+            let row_close_remembered =
+                yggterm_server::live_row_close_is_remembered(&home, &session_path);
+            if web_ensure_refuses_closed_session(&runtime_liveness, row_close_remembered) {
+                let detail = web_ensure_closed_session_detail(&session_path);
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "web_surface",
+                    WEB_ENSURE_SESSION_CLOSED,
+                    json!({
+                        "session_path": session_path,
+                        "runtime": format!("{runtime_liveness:?}"),
+                        "row_close_remembered": row_close_remembered,
+                    }),
+                );
+                break 'ensure AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    error: Some(detail.clone()),
+                    data: Some(json!({
+                        "accepted": false,
+                        "session_path": session_path,
+                        "reason": WEB_ENSURE_SESSION_CLOSED,
+                        "detail": detail,
+                        "runtime_running": false,
+                        "row_close_remembered": row_close_remembered,
+                    })),
+                };
+            }
             // LIVENESS, not emptiness (N1). A dead webview entry is not empty,
             // so the old `tabs.is_empty()` test handed a caller back the same
             // corpse and reported success.
@@ -110937,6 +111664,7 @@ mod tests {
             generation: native_id,
             visible,
             stashed,
+            ever_revealed: visible,
         };
         let mut handles = HashMap::new();
         handles.insert(("local://a".to_string(), 1), handle(1, true, false));
@@ -129657,6 +130385,144 @@ mod tests {
                 .any(|session| session.session_path == session_path),
             "closed live terminals must unmount immediately instead of leaking a hidden xterm host"
         );
+    }
+
+    /// The active tab's agent lease — the same field `web_surface_lease_for`
+    /// writes and `live_agent_leases` reports. A lease lives ON the tab, so a
+    /// session with no surface has no lease to report.
+    fn tab_lease_until_ms(shell: &ShellState, session_path: &str) -> Option<u64> {
+        let surface = shell.web_surfaces.get(session_path)?;
+        surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == surface.active_tab)?
+            .lease_until_ms
+    }
+
+    /// `PendingDeleteDialog` for a live-session close of `session_paths`.
+    fn pending_live_close(session_paths: &[&str]) -> PendingDeleteDialog {
+        PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: session_paths.iter().map(|path| path.to_string()).collect(),
+            ssh_machine_keys: Vec::new(),
+            labels: session_paths.iter().map(|path| path.to_string()).collect(),
+            hard_delete: false,
+            live_session_close: true,
+            live_session_bulk_close: false,
+            live_session_unkept_paths: Vec::new(),
+        }
+    }
+
+    /// **"SURFACE ALIVE, ROW ABSENT" MUST BE UNREPRESENTABLE.**
+    ///
+    /// A run closed its work session and its web surface simply stayed: nothing
+    /// in the close path touched `web_surfaces`, so the reconciler kept a
+    /// desired entry, and because every agent verb renews a 15-minute drive
+    /// lease the reaper's `max(hold, lease)` never came due. A later
+    /// `web ensure` leased that orphan and an agent drove a real page for an
+    /// hour with no row anywhere reflecting it.
+    ///
+    /// Drives the close CHOKEPOINT (`prepare_live_session_close_locally`), not
+    /// the teardown helper: the defect was that the chokepoint never called it.
+    /// Delete that call and this goes red.
+    #[test]
+    fn closing_a_live_session_takes_its_web_surface_lease_and_headless_claim_with_it() {
+        let session_path = "local://closing-with-a-surface";
+        let survivor = "local://someone-elses-session";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        seed_web_surface(&mut shell, session_path);
+        seed_web_surface(&mut shell, survivor);
+        // An agent's drive lease and its re-materialization claim, exactly as
+        // `web ensure` leaves them.
+        for path in [session_path, survivor] {
+            shell
+                .web_surfaces
+                .get_mut(path)
+                .expect("seeded")
+                .tabs[0]
+                .lease_until_ms = Some(9_999_999);
+            shell
+                .web_surface_headless_wanted
+                .insert(path.to_string(), 9_999_999);
+        }
+
+        shell.prepare_live_session_close_locally(&pending_live_close(&[session_path]), "test");
+
+        assert!(
+            !shell.web_surfaces.contains_key(session_path),
+            "a closed session kept a live web surface — the state this fix forbids"
+        );
+        assert!(
+            !shell.web_surface_headless_wanted.contains_key(session_path),
+            "the headless-create claim survived the close, so the reconciler would \
+             rebuild the surface on the next tick"
+        );
+        // The lease lives ON the tab, so it ends with the surface: nothing is
+        // left in `agent_leases` and nothing keeps blocking a deploy.
+        assert!(
+            tab_lease_until_ms(&shell,session_path).is_none(),
+            "the agent lease outlived the row it was a claim on"
+        );
+
+        // …and NOTHING else was touched. A close is not a sweep: another
+        // agent's surface must survive it.
+        assert!(
+            shell.web_surfaces.contains_key(survivor),
+            "closing one session destroyed another session's surface"
+        );
+        assert_eq!(
+            tab_lease_until_ms(&shell,survivor),
+            Some(9_999_999),
+            "another session's lease must survive an unrelated close"
+        );
+        assert!(
+            shell.web_surface_headless_wanted.contains_key(survivor)
+        );
+    }
+
+    /// The same close, with the row and the surface spelled differently.
+    ///
+    /// A live row is addressed by several equivalent keys over its life, and the
+    /// path a surface was declared under need not be the spelling the row wears.
+    /// String equality here fails SILENTLY, and a silent miss is a live orphan —
+    /// which is the whole bug. Compare by `key == session_path` and this goes
+    /// red.
+    #[test]
+    fn a_close_finds_the_surface_under_an_equivalent_session_spelling() {
+        let row_path = "local://5f2a";
+        let surface_path = "codex://5f2a";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(row_path));
+        seed_web_surface(&mut shell, surface_path);
+        shell
+            .web_surfaces
+            .get_mut(surface_path)
+            .expect("seeded")
+            .tabs[0]
+            .lease_until_ms = Some(9_999_999);
+
+        shell.prepare_live_session_close_locally(&pending_live_close(&[row_path]), "test");
+
+        assert!(
+            !shell.web_surfaces.contains_key(surface_path),
+            "the surface was declared under an equivalent spelling of the closed row \
+             and survived the close"
+        );
+    }
+
+    /// A close that is NOT a live-session close (a stored document, say) must
+    /// not reach the surface plane at all.
+    #[test]
+    fn a_non_live_close_leaves_web_surfaces_alone() {
+        let session_path = "local://not-a-live-close";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        seed_web_surface(&mut shell, session_path);
+        let mut pending = pending_live_close(&[session_path]);
+        pending.live_session_close = false;
+
+        shell.prepare_live_session_close_locally(&pending, "test");
+
+        assert!(shell.web_surfaces.contains_key(session_path));
     }
 
     #[test]

@@ -207,7 +207,29 @@ not the same one. `web reload --session` and `web close --session` reach the
 same recovery directly. Refusals now name the fact that failed (`no_declare`,
 `declare_stale` = the app EXITED, relaunch it; `declare_url_scheme_refused`;
 `daemon_declare_unavailable` = the fetch failed, which is NOT an absent
-declare).
+declare; `session_closed` = see below).
+
+⛔ **`session_closed` — do not retry, and do not tear your session down.**
+`ensure` refuses a session whose runtime is gone AND whose row the user closed.
+Reviving one gives you a live page with NO row: the user cannot see it, cannot
+click into it, and cannot take it back. That is not hypothetical — an agent
+drove a real page for an hour that way. The remedy is your own session:
+
+```bash
+yggterm server app terminal new          # your own row, visible to the user
+```
+
+**Create ONE session per run and LEAVE IT UP.** Tearing your session down as a
+courtesy at the end of a run is what left the next run with nothing to attach to
+but an orphan. Visibility beats tidiness: a row the user can see and co-browse
+is the point. Closing a session now also ends its web surfaces, so a torn-down
+run leaves nothing behind to attach to.
+
+**`seat_input_on_unrevealed_surface`.** Input was observed on a surface no
+client has ever shown. Your verb is refused, but you are NOT preempted and your
+batch is not cancelled — the user cannot have taken a page they have never seen,
+and the old code said they did, which locked the lane until a new incarnation.
+Reveal the session (open its row) and re-run.
 
 **Before deploying, check whether someone is driving:**
 
