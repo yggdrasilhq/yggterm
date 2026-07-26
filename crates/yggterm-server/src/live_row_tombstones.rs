@@ -27,14 +27,42 @@
 //! [`MAX_TOMBSTONES`] (oldest evicted first), and any row that legitimately
 //! re-enters the live order clears its own tombstone through the
 //! reconcile chokepoint in `daemon::persist`.
+//!
+//! # The file has N writers, so nothing here may write a private snapshot
+//!
+//! `removed-rows.json` lives in `~/.yggterm`, the home EVERY daemon on this
+//! machine shares — and this host routinely runs three chained daemons. The
+//! first cut of this module loaded the map once at construction and wrote the
+//! whole map back on every change, which is last-writer-wins over a stale
+//! snapshot: daemon A boots, daemon C records the user's close, then A saves
+//! its boot-time copy and the close is GONE — including when A merely expires
+//! one of its own entries. The successor then loads the truncated file and
+//! re-adopts the row the user closed. That is the exact bug this module exists
+//! to prevent, one layer down.
+//!
+//! So every mutation here is a read-modify-write of the SHARED file under an
+//! exclusive `flock`, never a write of this process's copy
+//! ([`LiveRowTombstones::mutate_shared`]), and the in-memory copy is a cache
+//! that is re-read before it is trusted ([`LiveRowTombstones::refresh`]).
+//! `record`/`clear`/`gc`/`save` remain as the in-memory primitives the RMW is
+//! built from; a caller outside this module that reaches for them is writing a
+//! private snapshot again, which `daemon.rs`'s structural lock refuses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const TOMBSTONE_FILE_NAME: &str = "removed-rows.json";
+
+/// How long we are willing to wait for another daemon's read-modify-write
+/// before giving up on the lock. The critical section is a read plus an
+/// atomic-rename write of a file capped at [`MAX_TOMBSTONES`] entries, so a
+/// healthy holder is done in microseconds; this bound exists only so a wedged
+/// process cannot stall the daemon, which calls in under its runtime lock.
+const LOCK_WAIT_BUDGET_MS: u64 = 500;
+const LOCK_RETRY_SLEEP_MS: u64 = 5;
 
 /// How long a close is remembered. Long enough to outlive the daemon chain that
 /// caused the resurrection (peers linger for hours, not days), short enough
@@ -49,6 +77,35 @@ pub fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
+}
+
+/// The identities that ENTERED the live order since the last reconcile.
+///
+/// Clearing a tombstone must be keyed on a row *arriving*, not on a row being
+/// present: a stale peer that has held the row since before the user closed it
+/// reports it live at every single reconcile, so "present ⇒ clear" hands that
+/// peer a veto-eraser and the close never sticks. A row that was absent last
+/// time and is here now got here by a real user action, which is precisely the
+/// signal that the veto has served its purpose.
+///
+/// A newtype rather than a `Vec<String>` parameter on purpose: the whole live
+/// set and the newly-entered subset are both "a list of identities", and
+/// passing the wrong one is silent. Here it does not compile.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EnteredLiveRows(Vec<String>);
+
+impl EnteredLiveRows {
+    /// `live` minus `seen`, sorted — the daemon's live order is walked into a
+    /// `HashSet`, whose iteration order is not ours to depend on.
+    pub fn since(seen: &HashSet<String>, live: &HashSet<String>) -> Self {
+        let mut entered: Vec<String> = live.difference(seen).cloned().collect();
+        entered.sort();
+        Self(entered)
+    }
+
+    pub fn identities(&self) -> &[String] {
+        &self.0
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -66,21 +123,103 @@ impl LiveRowTombstones {
     /// Load and immediately expire. A daemon that has been down longer than the
     /// TTL must not come back holding stale vetoes.
     pub fn load(home_dir: &Path, now: u64) -> Self {
-        let path = Self::tombstone_path(home_dir);
-        let mut loaded: Self = match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
-        };
+        let mut loaded = Self::read_shared(home_dir);
         loaded.gc(now);
         loaded
+    }
+
+    /// Re-read the shared file into this cache. The veto is only as good as its
+    /// freshness: a close recorded by a peer AFTER we booted is invisible to a
+    /// map loaded at construction, so the import admission passes would adopt
+    /// back the very row the user just closed.
+    pub fn refresh(&mut self, home_dir: &Path, now: u64) {
+        *self = Self::load(home_dir, now);
+    }
+
+    /// Read the shared file. A file we cannot parse is NOT silently an empty
+    /// deny-list: it is preserved beside the original and reported, because the
+    /// only other symptom is closed rows quietly coming back.
+    fn read_shared(home_dir: &Path) -> Self {
+        let path = Self::tombstone_path(home_dir);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let corrupt = path.with_extension("json.corrupt");
+                let preserved = std::fs::write(&corrupt, raw.as_bytes()).is_ok();
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    preserved,
+                    "unreadable live-row tombstone file: every remembered close is being \
+                     dropped, so rows the user closed can come back"
+                );
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, home_dir: &Path) -> Result<()> {
         let path = Self::tombstone_path(home_dir);
         let raw = serde_json::to_string_pretty(self).context("serializing live-row tombstones")?;
-        let tmp = path.with_extension("json.tmp");
+        // Per-process tmp name: the publish is atomic only if no other daemon
+        // is writing the same tmp file underneath us.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))
+    }
+
+    /// Apply `mutate` to the SHARED on-disk set under an exclusive lock, publish
+    /// the result, and adopt it as this process's cache. Returns true when the
+    /// file changed.
+    ///
+    /// This is the only write path. `mutate`'s own return value is ignored on
+    /// purpose — whether the set changed is decided by comparing before/after,
+    /// so one owner answers it and a mutator that mis-reports cannot corrupt
+    /// the file or skip a needed write.
+    fn mutate_shared(
+        &mut self,
+        home_dir: &Path,
+        mutate: impl FnOnce(&mut Self),
+    ) -> Result<bool> {
+        let _guard = TombstoneFileLock::acquire(home_dir);
+        let mut shared = Self::read_shared(home_dir);
+        let before = shared.entries.clone();
+        mutate(&mut shared);
+        let changed = shared.entries != before;
+        if changed {
+            shared.save(home_dir)?;
+        }
+        *self = shared;
+        Ok(changed)
+    }
+
+    /// Remember that `identity` was closed, without losing any close a peer
+    /// daemon recorded while we were holding a stale copy.
+    pub fn record_close(&mut self, home_dir: &Path, identity: &str, now: u64) -> Result<bool> {
+        self.mutate_shared(home_dir, |shared| {
+            shared.record(identity, now);
+        })
+    }
+
+    /// Expire old closes and forget the closes of rows that just re-entered the
+    /// live order. Both halves apply to the SHARED set, so a row re-opened on a
+    /// daemon that booted before the close still lifts its own veto — the map
+    /// this daemon loaded is not the only place the close can live.
+    pub fn reconcile(
+        &mut self,
+        home_dir: &Path,
+        now: u64,
+        entered: &EnteredLiveRows,
+    ) -> Result<bool> {
+        self.mutate_shared(home_dir, |shared| {
+            shared.gc(now);
+            for identity in entered.identities() {
+                shared.clear(identity);
+            }
+        })
     }
 
     /// Remember that `identity` was closed here. Returns true when the set
@@ -117,12 +256,20 @@ impl LiveRowTombstones {
         changed | self.evict_over_cap()
     }
 
+    /// The set is asked about ONE identity at a time in production (`blocks`);
+    /// enumerating it is a test affordance, and leaving it un-gated would be a
+    /// standing invitation to walk the deny-list instead of querying it.
+    #[cfg(test)]
     pub fn identities(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     fn expired(recorded: u64, now: u64) -> bool {
@@ -146,6 +293,78 @@ impl LiveRowTombstones {
             self.entries.remove(&identity);
         }
         true
+    }
+}
+
+/// Exclusive advisory lock over the shared tombstone file, held for one
+/// read-modify-write. `flock` is released by the kernel when the fd closes, so
+/// a daemon that dies mid-write cannot wedge its peers.
+struct TombstoneFileLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl TombstoneFileLock {
+    /// Best-effort: on a busy lock we retry within [`LOCK_WAIT_BUDGET_MS`] and
+    /// then proceed WITHOUT it. That is still a read-modify-write of the shared
+    /// file — the worst case degrades from "no lost close" to "at most the one
+    /// close racing inside a microsecond-wide window", never back to the
+    /// whole-map clobber. Blocking the daemon indefinitely on a wedged peer
+    /// would be the worse trade.
+    fn acquire(home_dir: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let path = LiveRowTombstones::tombstone_path(home_dir).with_extension("json.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .ok()?;
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(LOCK_WAIT_BUDGET_MS);
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    return Some(Self { file });
+                }
+                let error = std::io::Error::last_os_error();
+                let busy = matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+                );
+                if !busy || std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "proceeding without the live-row tombstone lock"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_SLEEP_MS));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = home_dir;
+            None
+        }
+    }
+}
+
+impl Drop for TombstoneFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            unsafe {
+                let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
     }
 }
 

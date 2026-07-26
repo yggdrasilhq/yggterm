@@ -1266,26 +1266,42 @@ struct WebSurfaceTab {
     /// the normal hold. `None` = unleased.
     lease_until_ms: Option<u64>,
 }
-/// Whether the holder of a shared egress-tunnel handle is the LAST one, and may
-/// therefore tear the tunnel down.
+/// Whether a teardown that is releasing `held_here` handles to this egress
+/// tunnel is releasing the LAST ones, and may therefore kill the child.
 ///
 /// The `ssh -N -D` child is the SESSION's egress and is shared by every tab of
 /// that session (see `adopt_web_surface_session_socks`), so the `Arc` is the
-/// refcount and "am I allowed to kill this" is exactly "is my handle the only
-/// one left". Without this guard, closing any ONE tab would sever the tunnel
-/// every sibling tab is still browsing through.
+/// refcount and "am I allowed to kill this" is exactly "are the handles I am
+/// dropping all the handles there are". Closing ONE tab releases one handle
+/// (`held_here == 1`) and must not sever the tunnel its siblings are browsing
+/// through; tearing the WHOLE surface down releases every tab's handle at once,
+/// and that teardown MUST kill the child — with `held_here` pinned at 1 it never
+/// could, because each sibling's clone kept the count above 1 for every
+/// iteration. `std::process::Child` has no `Drop`, so the ssh was then neither
+/// killed nor reaped: one orphaned ssh, one held loopback port and one held
+/// remote sshd per surface close.
+///
+/// A count ABOVE `held_here` means something outside this teardown still holds
+/// the tunnel, so we leave it alone — the rule fails safe in the direction of
+/// keeping a tunnel someone may still be using.
 ///
 /// Generic over the payload so the rule is testable without spawning an ssh.
-fn web_surface_forward_is_last_holder<T>(child: &Arc<Mutex<T>>) -> bool {
-    Arc::strong_count(child) == 1
+fn web_surface_forward_is_last_holder<T>(child: &Arc<Mutex<T>>, held_here: usize) -> bool {
+    Arc::strong_count(child) == held_here
 }
 
 impl WebSurfaceTab {
+    /// Release this tab's egress tunnel, killing the child if this tab holds the
+    /// only handle. See [`WebSurfaceTab::kill_forward_sharing`] for the
+    /// whole-surface teardown, which releases several handles at once.
     fn kill_forward(&self) {
+        self.kill_forward_sharing(1);
+    }
+    fn kill_forward_sharing(&self, held_here: usize) {
         let Some(child) = &self.forward_child else {
             return;
         };
-        if !web_surface_forward_is_last_holder(child) {
+        if !web_surface_forward_is_last_holder(child, held_here) {
             return;
         }
         if let Ok(mut child) = child.lock() {
@@ -1293,28 +1309,110 @@ impl WebSurfaceTab {
             let _ = child.wait();
         }
     }
+    /// Whether this tab's egress forward has already EXITED. `Some(true)` only
+    /// when the child is provably gone; a tab with no child handle (a restored
+    /// tab, or a `socks_port` we did not spawn) answers `false`, so this can only
+    /// ever disqualify a tunnel we can prove is dead.
+    fn forward_has_exited(&self) -> bool {
+        let Some(child) = &self.forward_child else {
+            return false;
+        };
+        let Ok(mut child) = child.lock() else {
+            return false;
+        };
+        // `Ok(None)` == still running. `Ok(Some(_))` == exited. `Err` == we
+        // cannot tell, so we do not claim it is dead.
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
 }
 
-/// Which tab's live SOCKS egress a navigation on `tab_id` should adopt.
+/// One tab, as the egress-reuse rule sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebSurfaceEgressTab {
+    id: u64,
+    socks_port: Option<u16>,
+    /// The tab's `ssh -N -D` child has provably exited. A tunnel whose ssh is
+    /// gone is not egress — adopting it would point a fresh tab at a dead SOCKS
+    /// port with no fallback, since the reuse path skips URL resolution entirely.
+    forward_exited: bool,
+}
+
+impl WebSurfaceEgressTab {
+    /// Does this tab offer usable SOCKS egress?
+    fn offers_egress(&self) -> bool {
+        self.socks_port.is_some() && !self.forward_exited
+    }
+}
+
+/// What a navigation on `tab_id` does about egress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceEgressReuse {
+    /// The tab already has a live tunnel: navigate the webview, touch nothing.
+    Own,
+    /// Adopt this sibling's tunnel (an `Arc` clone, refcounted).
+    Adopt(u64),
+    /// Nothing to reuse: resolve the URL and spawn a forward.
+    Resolve,
+}
+
+/// THE egress-reuse decision for one navigation.
 ///
-/// `tabs` is `(id, socks_port)` in the surface's own order. The tab's OWN
-/// tunnel wins (nothing to adopt — it already has one); otherwise the
+/// The tab's OWN live tunnel wins (nothing to adopt — re-spawning would churn
+/// the local port, and a changed `socks_port` forces the reconciler to
+/// destroy+recreate the webview, dropping the WebContext mid-session so a
+/// just-set login cookie never flushes: the "login loop"). Otherwise the
 /// lowest-id sibling that has one. Lowest id rather than "first in the vec"
 /// deliberately: tab order is user-mutable (drag, filing), and a rule that
 /// changes its answer when the user reorders the strip would make egress depend
 /// on chrome layout.
-fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> Option<u64> {
-    if tabs.iter().any(|(id, port)| *id == tab_id && port.is_some()) {
-        return Some(tab_id);
+///
+/// `remote` is part of the rule, not a caller-side gate: a loopback session has
+/// no egress gap, and a loopback `ssh -L` rewrite is per-URL and cannot be
+/// reused. Keeping it here is what makes "does this navigation reuse, and whose
+/// tunnel" one decision with one owner instead of a policy function plus a
+/// filter at the call site that no test can see.
+fn web_surface_egress_reuse(
+    remote: bool,
+    tabs: &[WebSurfaceEgressTab],
+    tab_id: u64,
+) -> WebSurfaceEgressReuse {
+    if !remote {
+        return WebSurfaceEgressReuse::Resolve;
+    }
+    if tabs
+        .iter()
+        .any(|tab| tab.id == tab_id && tab.offers_egress())
+    {
+        return WebSurfaceEgressReuse::Own;
     }
     tabs.iter()
-        .filter(|(_, port)| port.is_some())
-        .map(|(id, _)| *id)
+        .filter(|tab| tab.offers_egress())
+        .map(|tab| tab.id)
         .min()
+        .map_or(WebSurfaceEgressReuse::Resolve, WebSurfaceEgressReuse::Adopt)
 }
 fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
+    // Every tab holds its own `Arc` clone of the SHARED tunnel, so this teardown
+    // is releasing all of them at once. Tell each tab how many handles are going
+    // away with it, or the last-holder guard sees N and no tab ever kills the
+    // child. Counted per distinct tunnel: a surface can legitimately carry more
+    // than one (the app tab is retargeted with a fresh child while siblings keep
+    // the old one).
     for tab in &surface.tabs {
-        tab.kill_forward();
+        let Some(child) = &tab.forward_child else {
+            continue;
+        };
+        let held_here = surface
+            .tabs
+            .iter()
+            .filter(|other| {
+                other
+                    .forward_child
+                    .as_ref()
+                    .is_some_and(|sibling| Arc::ptr_eq(sibling, child))
+            })
+            .count();
+        tab.kill_forward_sharing(held_here);
     }
     if let Some(picker) = &surface.picker
         && let Some(child) = &picker.forward_child
@@ -2900,18 +2998,17 @@ fn navigate_web_surface_tab(
         // `kill_forward`), which is also what makes the tabs share one
         // WebContext: the proxy is part of `web_context_key`.
         //
-        // Peeked before any mutation: with no donor there is nothing to write,
-        // and a `with_mut` on that path would dirty the shell for a render that
-        // changes nothing.
-        let donor = remote
-            .then(|| state.with(|shell| shell.web_surface_socks_donor_for(&session_path, tab_id)))
-            .flatten();
-        let reuse_socks = donor.is_some_and(|donor_id| {
-            donor_id == tab_id
-                || state.with_mut(|shell| {
+        // Peeked before any mutation: with nothing to reuse there is nothing to
+        // write, and a `with_mut` on that path would dirty the shell for a render
+        // that changes nothing.
+        let reuse_socks =
+            match state.with(|shell| shell.web_surface_egress_reuse_for(&session_path, tab_id, remote)) {
+                WebSurfaceEgressReuse::Resolve => false,
+                WebSurfaceEgressReuse::Own => true,
+                WebSurfaceEgressReuse::Adopt(donor_id) => state.with_mut(|shell| {
                     shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
-                })
-        });
+                }),
+            };
         if reuse_socks {
             // SOCKS passes the real URL unchanged, so effective_url == url and
             // socks_port stays put: the reconciler NAVIGATES the live webview
@@ -3237,13 +3334,53 @@ fn web_surface_recent_reaps(key: &(String, u64), now_ms: u64) -> u32 {
 /// unpressured hold so it can settle, and reclaim goes back to targeting
 /// surfaces that actually STAY backgrounded — which is where the memory it was
 /// after has always been.
-fn web_surface_background_hold_ms_for(reclaim_pressured: bool, recent_reaps: u32) -> u64 {
+///
+/// `configured_hold_ms` is the user's configured hold, read ONCE per pass by the
+/// caller — this function is pure so the whole reclaim plan can be driven by a
+/// test without a config file on disk.
+/// Which tab's `ssh -N -D` tunnel a tab should reach the host through.
+///
+/// ONE TUNNEL PER SESSION, NOT PER TAB. Reuse used to be keyed on the TAB, and
+/// `web_surface_new_tab` mints `socks_port: None`, so every new tab spawned its
+/// own: N ssh children on the GUI host, N handshakes, N sshds and N listening
+/// loopback ports on the remote — which trips the remote's MaxStartups long
+/// before anything on this side notices.
+///
+/// Pure and total so the decision can be locked at the CALL SITE: the reconcile
+/// loop passes what it actually holds, and reverting the loop's wiring changes
+/// this function's observed input rather than hiding behind a helper the test
+/// calls directly.
+///
+/// Returns the donor TAB ID, or `None` when there is nothing to adopt (a local
+/// session has no tunnel at all, and the caller must fall through to real
+/// resolution rather than assume one).
+fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> Option<u64> {
+    // The tab's own tunnel always wins: nothing to adopt, and re-spawning would
+    // churn the port and force a webview destroy+recreate.
+    if tabs
+        .iter()
+        .any(|(id, port)| *id == tab_id && port.is_some())
+    {
+        return Some(tab_id);
+    }
+    // Otherwise the lowest tab id holding a live tunnel. Deterministic on the
+    // ID, never on strip order — tab order is user-mutable (drag, filing) and
+    // egress must not follow chrome layout.
+    tabs.iter()
+        .filter(|(_, port)| port.is_some())
+        .map(|(id, _)| *id)
+        .min()
+}
+
+fn web_surface_background_hold_ms_for(
+    configured_hold_ms: u64,
+    reclaim_pressured: bool,
+    recent_reaps: u32,
+) -> u64 {
     if reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
         return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
-    web_surface_background_hold_ms(
-        reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT,
-    )
+    configured_hold_ms
 }
 
 fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
@@ -3263,6 +3400,148 @@ fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
         .and_then(|config| config.get("background_hold_secs").and_then(Value::as_u64))
         .map(|secs| secs.saturating_mul(1000))
         .unwrap_or(default_ms)
+}
+
+/// The engine's live "is this page playing audio" answer, as the reclaim plan
+/// sees it.
+///
+/// A trait rather than a `bool` argument on purpose. The audio veto's defect
+/// class is not "the predicate is wrong" — it is "the loop handed the predicate
+/// the wrong value", and a test that passes a literal cannot see that. Making
+/// the PLAN do the probing moves that decision inside the tested function: the
+/// loop hands over the desktop context and no longer has a media flag it could
+/// get wrong.
+trait WebSurfaceMediaProbe {
+    fn is_playing_audio(&self, native_id: u64) -> bool;
+}
+
+impl WebSurfaceMediaProbe for dioxus::desktop::DesktopContext {
+    fn is_playing_audio(&self, native_id: u64) -> bool {
+        self.web_surface_is_playing_audio(native_id)
+    }
+}
+
+/// One backgrounded surface, as the reclaim policy sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSurfaceBackgroundInput {
+    key: (String, u64),
+    native_id: u64,
+    /// `None` = not yet marked stashed (this is its first backgrounded pass).
+    stashed_at_ms: Option<u64>,
+    /// An agent's claim on the surface; only ever EXTENDS its life.
+    lease_until_ms: Option<u64>,
+    /// Reaps of this same surface inside the thrash window.
+    recent_reaps: u32,
+}
+
+/// What one reclaim pass decides for one backgrounded surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceBackgroundAction {
+    /// Destroy it now: hold and lease have both lapsed and nothing vetoes.
+    Reap,
+    /// First backgrounded pass: stash it. `detach` unmaps it from the overlay
+    /// (hard stash); otherwise it stays attached below the glass and `throttle`
+    /// hides the inner webview so the page stops painting.
+    Stash { detach: bool, throttle: bool },
+    /// Already stashed and not due: nothing to do this pass.
+    Wait,
+}
+
+/// One decided surface, with the readings that decided it (they go straight into
+/// the `native_stash` / `native_close` trace, so the trace cannot disagree with
+/// the decision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSurfaceBackgroundDecision {
+    key: (String, u64),
+    native_id: u64,
+    action: WebSurfaceBackgroundAction,
+    hold_ms: u64,
+    media_active: bool,
+}
+
+/// One pass's decisions plus the per-pass reading that produced them. The trace
+/// reports `reclaim_pressured` from HERE rather than re-deriving it, so a trace
+/// line can never describe a pressure the decision did not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSurfaceBackgroundPlan {
+    reclaim_pressured: bool,
+    decisions: Vec<WebSurfaceBackgroundDecision>,
+}
+
+/// THE reclaim decision for one pass over every backgrounded surface.
+///
+/// This exists as one function taking the RAW readings because the defects this
+/// lane fixed were all wiring, not policy: the loop consulted `swap_pressured`
+/// (a latched history counter) instead of `reclaim_pressured`, and the media
+/// veto's value came from a different place than the predicate that used it.
+/// Neither is observable by a test that calls `web_surface_reap_due` /
+/// `web_surface_background_detach` with hand-built arguments, because such a test
+/// computes the arguments itself.
+///
+/// So the loop keeps no policy: it reads `/proc`, reads the config hold, lists
+/// its backgrounded surfaces, and applies what this returns. Which pressure
+/// reading is consulted and which surface's audio is probed are decided HERE, in
+/// a function a test can drive end to end.
+fn web_surface_background_plan(
+    now_ms: u64,
+    under_glass: bool,
+    pressure: &crate::terminal_observe::MemoryPressureSnapshot,
+    forced_pressure: bool,
+    configured_hold_ms: u64,
+    surfaces: &[WebSurfaceBackgroundInput],
+    media: &dyn WebSurfaceMediaProbe,
+) -> WebSurfaceBackgroundPlan {
+    // CURRENT headroom plus the kernel's own thrash accounting — never
+    // `swap_pressured`, which latches TRUE after one bad afternoon and never
+    // clears. See `MemoryPressureSnapshot::reclaim_pressured`.
+    let reclaim_pressured = pressure.reclaim_pressured() || forced_pressure;
+    let detach = web_surface_background_detach(under_glass, reclaim_pressured);
+    let decisions = surfaces
+        .iter()
+        .map(|surface| {
+            let hold_ms = web_surface_background_hold_ms_for(
+                configured_hold_ms,
+                reclaim_pressured,
+                surface.recent_reaps,
+            );
+            // Engine truth, read at the moment of the decision and for THIS
+            // surface — a stale flag, or one read for a different surface, would
+            // be worse than none.
+            let media_active = media.is_playing_audio(surface.native_id);
+            let action = if web_surface_reap_due(
+                now_ms,
+                surface.stashed_at_ms,
+                hold_ms,
+                surface.lease_until_ms,
+                media_active,
+            ) {
+                WebSurfaceBackgroundAction::Reap
+            } else if surface.stashed_at_ms.is_none() {
+                // A LEASED surface is an agent co-browsing in the background:
+                // leave it live rather than hiding its webview.
+                let leased = surface
+                    .lease_until_ms
+                    .is_some_and(|until| until > now_ms);
+                WebSurfaceBackgroundAction::Stash {
+                    detach,
+                    throttle: !leased,
+                }
+            } else {
+                WebSurfaceBackgroundAction::Wait
+            };
+            WebSurfaceBackgroundDecision {
+                key: surface.key.clone(),
+                native_id: surface.native_id,
+                action,
+                hold_ms,
+                media_active,
+            }
+        })
+        .collect();
+    WebSurfaceBackgroundPlan {
+        reclaim_pressured,
+        decisions,
+    }
 }
 /// Read a string key from `~/.yggterm/web-surface.json`. The one config file is
 /// the SSOT for web-surface settings; both this GUI and the standalone `ychrome`
@@ -4492,11 +4771,14 @@ async fn web_surface_native_reconcile_loop(
         // configurable background hold bounds memory: on expiry the stashed
         // surface is destroyed (recreates lazily against the per-profile jar).
         let now_ms = current_millis();
-        let backgrounded: Vec<(String, u64)> = applied
+        // Sorted: `applied` is a HashMap, and the trace (and the order surfaces
+        // are destroyed in) must not depend on its iteration order.
+        let mut backgrounded: Vec<(String, u64)> = applied
             .keys()
             .filter(|(session, _)| !active_visible_sessions.contains(session.as_str()))
             .cloned()
             .collect();
+        backgrounded.sort();
         if !backgrounded.is_empty() {
             // Pressure-triggered reclaim: sample memory headroom once per pass.
             // Under real memory pressure a backgrounded surface is DETACHED
@@ -4505,108 +4787,121 @@ async fn web_surface_native_reconcile_loop(
             // soft stash (attached, instant switch-back). One /proc/meminfo +
             // /proc/pressure/memory read, gated on there actually being a
             // backgrounded surface to act on.
-            let reclaim_pressured = read_memory_pressure_snapshot().reclaim_pressured()
-                || web_surface_force_background_pressure();
-            let detach = web_surface_background_detach(under_glass, reclaim_pressured);
-            for key in backgrounded {
-                // Per-surface, not per-pass: a surface that keeps being
-                // re-created after each reap is demonstrably wanted, and
-                // reaping it again reclaims nothing while costing a fresh web
-                // process. See web_surface_background_hold_ms_for.
-                let recent_reaps = web_surface_recent_reaps(&key, now_ms);
-                let hold_ms = web_surface_background_hold_ms_for(reclaim_pressured, recent_reaps);
-                // "Suppose I have a YouTube playlist running in the background
-                // while I work here." Engine truth, read at the moment of the
-                // decision — a stale flag would be worse than none. The veto is
-                // on DESTROY only; the throttle below still runs, so the page
-                // stops PAINTING and keeps playing.
-                let media_active = applied
-                    .get(&key)
-                    .is_some_and(|entry| desktop.web_surface_is_playing_audio(entry.native_id));
-                let expired = web_surface_reap_due(
-                    now_ms,
-                    applied.get(&key).and_then(|entry| entry.stashed_at_ms),
-                    hold_ms,
-                    web_surface_lease_until_ms(&state, &key.0, key.1),
-                    media_active,
-                );
-                if expired {
-                    let reap_count = web_surface_note_reap(&key, now_ms);
-                    if let Some(entry) = applied.remove(&key) {
-                        desktop.close_web_surface(entry.native_id);
+            //
+            // This block holds NO policy. It gathers the raw readings, hands them
+            // to `web_surface_background_plan`, and applies what comes back — so
+            // "which pressure reading is consulted" and "which surface's audio is
+            // probed" are decided in a function a test can drive, not in a loop
+            // that no test can reach.
+            let inputs: Vec<WebSurfaceBackgroundInput> = backgrounded
+                .iter()
+                .filter_map(|key| {
+                    let entry = applied.get(key)?;
+                    Some(WebSurfaceBackgroundInput {
+                        key: key.clone(),
+                        native_id: entry.native_id,
+                        stashed_at_ms: entry.stashed_at_ms,
+                        lease_until_ms: web_surface_lease_until_ms(&state, &key.0, key.1),
+                        // Per-surface, not per-pass: a surface that keeps being
+                        // re-created after each reap is demonstrably wanted, and
+                        // reaping it again reclaims nothing while costing a fresh
+                        // web process. See web_surface_background_hold_ms_for.
+                        recent_reaps: web_surface_recent_reaps(key, now_ms),
+                    })
+                })
+                .collect();
+            let plan = web_surface_background_plan(
+                now_ms,
+                under_glass,
+                &read_memory_pressure_snapshot(),
+                web_surface_force_background_pressure(),
+                web_surface_background_hold_ms(false),
+                &inputs,
+                &desktop,
+            );
+            let reclaim_pressured = plan.reclaim_pressured;
+            for decision in plan.decisions {
+                let key = decision.key;
+                let hold_ms = decision.hold_ms;
+                match decision.action {
+                    WebSurfaceBackgroundAction::Wait => {}
+                    WebSurfaceBackgroundAction::Reap => {
+                        let reap_count = web_surface_note_reap(&key, now_ms);
+                        if let Some(entry) = applied.remove(&key) {
+                            desktop.close_web_surface(entry.native_id);
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "web_surface",
+                                "native_close",
+                                json!({
+                                    "session_path": key.0,
+                                    "tab_id": key.1,
+                                    "native_id": entry.native_id,
+                                    "reason": "background_hold_expired",
+                                    // How many times this surface has been reaped
+                                    // inside the thrash window. A number that keeps
+                                    // climbing is the treadmill: reclaim destroying
+                                    // a page that something keeps re-creating.
+                                    "reaps_in_window": reap_count,
+                                    "reclaim_pressured": reclaim_pressured,
+                                    "hold_ms": hold_ms,
+                                }),
+                            );
+                        }
+                    }
+                    WebSurfaceBackgroundAction::Stash { detach, throttle } => {
+                        let Some(entry) = applied.get_mut(&key) else {
+                            continue;
+                        };
+                        if detach {
+                            let _ = desktop.stash_web_surface(entry.native_id);
+                        } else {
+                            // Soft stash: stays attached below the glass (the
+                            // reveal is "cut the hole" over live pixels), demoted
+                            // so it can never occlude the active page's hole.
+                            let _ = desktop.demote_web_surface(entry.native_id);
+                            // ...but a demoted-yet-mapped WebKitGTK view keeps its
+                            // rAF/timers/compositor paint at full CPU — an animating
+                            // background page burns a whole core (the "angry fan").
+                            // Hide the inner webview so the page throttles
+                            // (document.hidden) while the container stays attached
+                            // for an instant raise-reveal.
+                            if throttle {
+                                let _ = desktop.throttle_web_surface(entry.native_id, true);
+                            }
+                        }
+                        entry.stashed_at_ms = Some(now_ms);
+                        entry.visible = false;
+                        // A stashed surface stops being polled for page state, so a
+                        // load that finishes in the background would leave the tab's
+                        // loading light stuck ON — and the session row blinking —
+                        // for as long as the session stays backgrounded. Snuff it at
+                        // stash time; the engine's truth resumes on unstash (a page
+                        // genuinely still loading re-lights within one poll tick).
+                        if entry.loading {
+                            entry.loading = false;
+                            let mut writable = state;
+                            writable.with_mut(|shell| {
+                                shell.set_web_tab_loading(&key.0, key.1, false);
+                            });
+                        }
                         append_trace_event(
                             &trace_home,
                             "ui",
                             "web_surface",
-                            "native_close",
+                            "native_stash",
                             json!({
                                 "session_path": key.0,
                                 "tab_id": key.1,
-                                "native_id": entry.native_id,
-                                "reason": "background_hold_expired",
-                                // How many times this surface has been reaped
-                                // inside the thrash window. A number that keeps
-                                // climbing is the treadmill: reclaim destroying
-                                // a page that something keeps re-creating.
-                                "reaps_in_window": reap_count,
-                                "reclaim_pressured": reclaim_pressured,
+                                "native_id": decision.native_id,
                                 "hold_ms": hold_ms,
+                                "detached": detach,
+                                "reclaim_pressured": reclaim_pressured,
+                                "media_active": decision.media_active,
                             }),
                         );
                     }
-                } else if let Some(entry) = applied.get_mut(&key)
-                    && entry.stashed_at_ms.is_none()
-                {
-                    if detach {
-                        let _ = desktop.stash_web_surface(entry.native_id);
-                    } else {
-                        // Soft stash: stays attached below the glass (the
-                        // reveal is "cut the hole" over live pixels), demoted
-                        // so it can never occlude the active page's hole.
-                        let _ = desktop.demote_web_surface(entry.native_id);
-                        // ...but a demoted-yet-mapped WebKitGTK view keeps its
-                        // rAF/timers/compositor paint at full CPU — an animating
-                        // background page burns a whole core (the "angry fan").
-                        // Hide the inner webview so the page throttles
-                        // (document.hidden) while the container stays attached
-                        // for an instant raise-reveal. A LEASED surface is an
-                        // agent co-browsing in the background: leave it live.
-                        let leased = web_surface_lease_until_ms(&state, &key.0, key.1)
-                            .is_some_and(|until| until > now_ms);
-                        if !leased {
-                            let _ = desktop.throttle_web_surface(entry.native_id, true);
-                        }
-                    }
-                    entry.stashed_at_ms = Some(now_ms);
-                    entry.visible = false;
-                    // A stashed surface stops being polled for page state, so a
-                    // load that finishes in the background would leave the tab's
-                    // loading light stuck ON — and the session row blinking —
-                    // for as long as the session stays backgrounded. Snuff it at
-                    // stash time; the engine's truth resumes on unstash (a page
-                    // genuinely still loading re-lights within one poll tick).
-                    if entry.loading {
-                        entry.loading = false;
-                        let mut writable = state;
-                        writable.with_mut(|shell| {
-                            shell.set_web_tab_loading(&key.0, key.1, false);
-                        });
-                    }
-                    append_trace_event(
-                        &trace_home,
-                        "ui",
-                        "web_surface",
-                        "native_stash",
-                        json!({
-                            "session_path": key.0,
-                            "tab_id": key.1,
-                            "native_id": entry.native_id,
-                            "hold_ms": hold_ms,
-                            "detached": detach,
-                            "reclaim_pressured": reclaim_pressured,
-                            "media_active": media_active,
-                        }),
-                    );
                 }
             }
         }
@@ -11179,14 +11474,26 @@ impl ShellState {
     ///
     /// This is what stops N tabs on a remote session from becoming N ssh
     /// children, N handshakes, N remote sshds and N loopback ports.
-    fn web_surface_socks_donor_for(&self, session_path: &str, tab_id: u64) -> Option<u64> {
-        let surface = self.web_surfaces.get(session_path)?;
-        let ports: Vec<(u64, Option<u16>)> = surface
+    /// This method only GATHERS; [`web_surface_egress_reuse`] decides.
+    fn web_surface_egress_reuse_for(
+        &self,
+        session_path: &str,
+        tab_id: u64,
+        remote: bool,
+    ) -> WebSurfaceEgressReuse {
+        let Some(surface) = self.web_surfaces.get(session_path) else {
+            return WebSurfaceEgressReuse::Resolve;
+        };
+        let tabs: Vec<WebSurfaceEgressTab> = surface
             .tabs
             .iter()
-            .map(|tab| (tab.id, tab.socks_port))
+            .map(|tab| WebSurfaceEgressTab {
+                id: tab.id,
+                socks_port: tab.socks_port,
+                forward_exited: tab.forward_has_exited(),
+            })
             .collect();
-        web_surface_socks_egress_donor(&ports, tab_id)
+        web_surface_egress_reuse(remote, &tabs, tab_id)
     }
     fn adopt_web_surface_session_socks(
         &mut self,
@@ -51122,15 +51429,15 @@ mod web_do_verb_tests {
     fn a_shared_egress_tunnel_dies_only_with_its_last_holder() {
         let tunnel = Arc::new(Mutex::new(1080_u16));
         assert!(
-            web_surface_forward_is_last_holder(&tunnel),
+            web_surface_forward_is_last_holder(&tunnel, 1),
             "a tunnel only one tab holds is that tab's to kill"
         );
         let sibling = tunnel.clone();
-        assert!(!web_surface_forward_is_last_holder(&tunnel));
-        assert!(!web_surface_forward_is_last_holder(&sibling));
+        assert!(!web_surface_forward_is_last_holder(&tunnel, 1));
+        assert!(!web_surface_forward_is_last_holder(&sibling, 1));
         drop(sibling);
         assert!(
-            web_surface_forward_is_last_holder(&tunnel),
+            web_surface_forward_is_last_holder(&tunnel, 1),
             "once the sibling is gone the survivor may reap"
         );
     }
@@ -111939,17 +112246,17 @@ mod tests {
     /// surface that has demonstrated it comes back must stop being a target.
     #[test]
     fn a_surface_that_keeps_coming_back_stops_being_reaped_on_the_pressure_timer() {
-        let pressured_hold = web_surface_background_hold_ms_for(true, 0);
+        let pressured_hold = web_surface_background_hold_ms_for(600_000, true, 0);
         assert_eq!(
             pressured_hold, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "first reap under pressure must still be fast — that is the feature"
         );
         assert_eq!(
-            web_surface_background_hold_ms_for(true, WEB_SURFACE_THRASH_REOPEN_LIMIT - 1),
+            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT - 1),
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "below the limit it is still an ordinary reclaim candidate"
         );
-        let thrashing = web_surface_background_hold_ms_for(true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
+        let thrashing = web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
         assert!(
             thrashing > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "a surface reaped {} times in the window is demonstrably wanted; \
@@ -111960,7 +112267,7 @@ mod tests {
         // surface with no history is still reclaimed promptly, or one busy page
         // would switch reclaim off for everything.
         assert_eq!(
-            web_surface_background_hold_ms_for(true, 0),
+            web_surface_background_hold_ms_for(600_000, true, 0),
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "one thrashing surface must not spare every other surface"
         );

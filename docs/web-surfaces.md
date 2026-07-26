@@ -806,3 +806,49 @@ from the same field the reaper reads. `server app update restart` and the
 preserving-close door both REFUSE with `agent_lease_active` while a lease is
 live, unless `--force`. Honest limit: this stops the app-control restart door,
 not `pkill yggterm`.
+
+## What a tab actually costs, and where the ceiling is (2026-07-26)
+
+Recorded because two sessions have now re-derived it, and one workstream was
+costed on a comment that is false.
+
+**⛔ `render_probe`'s "WebKitGTK runs one web process per profile, serving every
+surface on it" is WRONG.** `WebSurfaceHost::open` calls `WebContext::new(profile_dir)`
+unconditionally, **once per SURFACE**, and a surface is keyed `(session_path, tab_id)`.
+wry's `WebContextImpl::new` builds a fresh context every time, so two tabs of one
+profile get two distinct `WebKitWebContext`s pointing at the same directory: two
+process pools, two web processes, two network processes, and **two in-memory
+cookie jars writing the same file**. Per-process IS per-tab. Profile partitioning
+is therefore not the lever; sharing one context per profile is.
+
+**Tabs live in yggterm, not in ychrome.** ychrome has no concept of a tab — it
+emits OSC 7717, heartbeats, and serves policy/zoom over a loopback endpoint.
+The tab tree, omnibox, webviews, profile jars, egress tunnels and lifecycle are
+all in `crates/yggterm-shell/src/shell.rs` and `vendor/dioxus-desktop`. Any
+"ychrome performance" work is ~95% in this repo.
+
+**One tunnel per session, not per tab.** `ssh -N -D` is the session's egress.
+Reuse used to be keyed on the TAB while `web_surface_new_tab` mints
+`socks_port: None`, so every new tab spawned its own — N ssh children here, N
+sshds and N loopback ports on the remote, tripping the remote's MaxStartups
+before anything on this side notices. `web_surface_socks_egress_donor` picks the
+donor deterministically by tab id (never strip order, which the user can drag),
+and `web_surface_forward_is_last_holder` is the refcount that stops any tab
+tearing down a tunnel its siblings are still using.
+
+**Invisible is not unwanted.** The axis is PAINT, not existence: stop
+compositing and rAF for an unseen surface; leave audio, timers and network
+alone. `webkit_web_view_is_playing_audio` is read at the moment of the decision
+(a cached flag would be worse than none) and vetoes DESTROY only — the throttle
+still runs, so a background playlist stops painting and keeps playing.
+
+**Reclaim needs hysteresis.** See `docs/agent-field-guide.md` §7.5: a surface
+that keeps being re-created after each reap is demonstrably wanted, and
+destroying it again reclaims nothing while paying for a fresh web process.
+
+**Still unbuilt, in value order:** per-tab lifecycle (the governor is keyed on
+SESSIONS, so a foreground session's N tabs live forever); tab discard + restore
+via `WebKitWebViewSessionState` — the only mechanism that changes the order of
+magnitude; a process-model policy that reads the machine (process-per-site is
+harmful on a 14 GB laptop and free on a large-memory server); and an instrument
+that can see a tab at all.
