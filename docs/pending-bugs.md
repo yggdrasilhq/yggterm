@@ -30,6 +30,39 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ A LIVE, LEASED WEB SURFACE CAN EXIST WITH NO ROW — the user cannot see
+  or reach an agent that is browsing with their profile (found live
+  2026-07-26 night by a filing agent; user-reported the same hour as "why is
+  the agent row not in my Live Sessions, I cannot connect to it").**
+  Sequence, all reproducible: a previous run closed its work session (correct
+  hygiene — the row is TOMBSTONED in `removed-rows.json` and its PTY is dead,
+  `running:false, line_count:0`), and the next run called
+  `web ensure --session <that dead path>`, which happily **revived and leased
+  the surface anyway** (`already has a live surface`, generation 1). Result:
+  an agent drove a real payment gateway for an hour, on the user's
+  cookie profile, with **zero rows containing that session id** — nothing in
+  `server app rows` reflected that a surface was alive and being driven.
+  **The state "surface alive, row absent" should not be representable.** Two
+  candidate fixes, one must be chosen: (a) a surface holding a lease KEEPS (or
+  resurrects) a row for as long as the lease lives — which also satisfies the
+  constitution's UX test that the user can SEE an agent's session and click in
+  to co-browse it; or (b) `web ensure` REFUSES a session whose runtime is dead
+  and whose row is tombstoned, naming that reason, so an agent must create its
+  own session (and therefore its own visible row) instead.
+  **⚠ COROLLARY, same incident:** `web fill-card` then began refusing
+  `accepted:false, reason:"preempted"` — *"the user took this surface"* — on a
+  surface the user **cannot see, click, or have touched**. The agent-input
+  arbiter's preempt marker can be set on an unrowed orphan, so the human is
+  blamed for taking something invisible to them; and because the lane is keyed
+  `(session_path, generation)` with `forget()` only on close/recreate, the only
+  cure is a new surface generation. This is the same credit-ledger class as the
+  entry on injection credits leaking across the inter-verb gap — fix them
+  together.
+  **⚠ Practice note that made this worse, now corrected in the agent brief:**
+  every filing run tore its session down as a courtesy, so by the third run the
+  only thing left to attach to was an orphan. Agents should create ONE session
+  per run and LEAVE IT UP; visibility beats tidiness.
+
 - **★★ `web fill-card` ADVErecordsSED WHAT THE CREDENTIAL PLANE FORBADE (found live
   2026-07-26 at a real payment gateway's card form — FIXED IN-TREE, LIVE
   VERIFICATION AND A DEPLOY PENDING).** The verb's help offered `--field
