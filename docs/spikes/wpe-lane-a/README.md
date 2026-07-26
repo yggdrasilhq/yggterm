@@ -137,3 +137,119 @@ lifecycle** — one `WPEWebProcess` per view, plus the network/GPU processes,
 under our supervision rather than GTK's. Recommendation: build the agent
 engine on this route, drop `WPEDisplayHeadless` from the plan, and treat
 CPU readback as the next spike since it is the sole unproven primitive.
+
+
+---
+
+# Spike B — CPU readback of the exported EGLImage (2026-07-27)
+
+Spike A left ONE primitive unproven, and it is the one `capture-element` and
+the lore-anchored pixel rung both need: getting CPU pixels back out of the
+exported frame. **It works.** `src/bin/wpe-readback.rs`.
+
+## Result — two fixtures, two predictable colours
+
+```
+$ wpe-readback http://127.0.0.1:8742/red.html  out --expect-rgb ff0000 --bench 20
+[readback] EGL 1.5 surfaceless: ok
+[readback] ES2 pbuffer EGLConfig: ok
+[readback] GLES2 context current on EGL_NO_SURFACE: ok
+[readback] glEGLImageTargetTexture2DOES resolved: ok
+[readback] frame 1 640x480 blank=true
+[readback] frame 2 640x480 blank=false
+[readback] centre_rgba=255,0,0,255   fnv1a64=7c733d5f51f38325   channel_order=RGBA
+[readback] ACCEPTANCE=PASS
+
+$ wpe-readback http://127.0.0.1:8742/blue.html out --expect-rgb 0000ff --bench 20
+[readback] centre_rgba=0,0,255,255   fnv1a64=9e9a3cb195d70325
+[readback] ACCEPTANCE=PASS
+```
+
+Exact colours, opaque alpha, different checksums. The PNG was validated
+independently by Python's `zlib`: signature good, **every chunk CRC verifies**,
+and the IDAT inflates to exactly `(width*4+1)*height` bytes. Opening it shows a
+solid field of the fixture's colour.
+
+## ⚠ The failure this design caught — "readback succeeded" is not evidence
+
+The first run reported a complete, error-free pipeline: context current,
+extension resolved, framebuffer complete, `glReadPixels` clean, 1.2 MB written,
+timings collected — and **the buffer was 307,200 identical `(0,0,0,0)` pixels.**
+The compositor exports an initial frame BEFORE the page paints, and that blank
+frame was being captured.
+
+Nothing in "did the call succeed" could see this. Only the two-fixture
+*predictable colour* acceptance could, which is why the brief asked for it and
+why "bytes > 0" would have shipped a lie. The binary now skips blank frames and
+accepts the first PAINTED one, and reports `blank_frames` so the skip is
+visible rather than silent.
+
+## Entry points actually needed — 21 new, not "~6"
+
+Spike A sized this at "~6 GL entry points". The real count is **21 new foreign
+declarations** (total 40 with spike A's 19):
+
+| group | n | functions |
+| --- | --- | --- |
+| fdo image accessors | 3 | `wpe_fdo_egl_exported_image_get_egl_image` / `_get_width` / `_get_height` |
+| EGL context | 5 | `eglBindAPI`, `eglChooseConfig`, `eglCreateContext`, `eglMakeCurrent`, `eglGetProcAddress` |
+| GL readback | 12 | `glGenTextures`, `glBindTexture`, `glTexParameteri`, `glDeleteTextures`, `glGenFramebuffers`, `glBindFramebuffer`, `glFramebufferTexture2D`, `glCheckFramebufferStatus`, `glDeleteFramebuffers`, `glReadPixels`, `glFinish`, `glGetError` |
+| resolved at runtime | 1 | `glEGLImageTargetTexture2DOES` |
+
+Three structural facts the sizing missed:
+
+1. **`glEGLImageTargetTexture2DOES` is an EXTENSION** (`GL_OES_EGL_image`), not
+   a link-time symbol. It must come from `eglGetProcAddress`, so the real build
+   needs a proc-address loader, not just a `-l` line.
+2. **Spike A needed no GL context at all** — it never touched a pixel. Readback
+   needs a real GLES2 context, `libGLESv2` linked, and
+   `EGL_KHR_surfaceless_context` to make it current on `EGL_NO_SURFACE`.
+3. **`eglChooseConfig` defaults `EGL_SURFACE_TYPE` to `EGL_WINDOW_BIT`**, and a
+   surfaceless display has no window configs, so the obvious attribute list
+   returns ZERO matches. Ask for `EGL_PBUFFER_BIT` (a
+   `EGL_KHR_no_config_context` fallback is in the code but was not needed here).
+
+Also: GL's origin is bottom-left and PNG's is top-left, so the readback flips
+rows. On a solid-colour fixture that error is invisible — worth knowing before
+someone debugs an upside-down `capture-element`.
+
+## Cost — warm, N=20, `import + FBO attach + glReadPixels + glFinish`
+
+| viewport | megapixels | min | **p50** | max | per megapixel |
+| --- | --- | --- | --- | --- | --- |
+| 640×480 | 0.31 | 1241 µs | **1293 µs** | 2298 µs | 4.2 ms |
+| 1280×720 | 0.92 | 3923 µs | **4235 µs** | 6289 µs | 4.6 ms |
+| 1920×1080 | 2.07 | 9895 µs | **10881 µs** | 14586 µs | 5.2 ms |
+
+Linear in pixel count at roughly **5 ms per megapixel**. This is a synchronous
+`glReadPixels` + `glFinish`, i.e. the naive worst case; a PBO round-trip would
+overlap it.
+
+## Revised Lane-A sizing
+
+Spike B does not change the verdict, it firms it up and moves cost from
+"unknown" to "known and acceptable". The engine binding is now measured at
+**40 hand-written declarations** rather than 19 — still far below the gir
+toolchain it replaces, still no codegen and no new workspace dependency, but
+the readback half needs a GL loader and a small amount of genuine GL state
+management (texture, FBO, row flip) that the invocation half did not. The
+performance answer is the useful one: **~11 ms to get a 1080p frame into host
+memory, ~4 ms at 720p, linear in pixels.** That is comfortably interactive for
+the pixel rung's actual use — one capture per agent click, not per animation
+frame — so the rung is not gated on a PBO pipeline, and `capture-element` crops
+cost proportionally less because they read a sub-rect. The remaining unknown
+for Lane A is no longer pixels; it is input routing
+(`wpe_view_backend_dispatch_*`) and per-view process lifecycle, both of which
+are first-party code the plan already accepts owning.
+
+## Running it
+
+```sh
+cd docs/spikes/wpe-lane-a
+python3 -m http.server 8742 --bind 127.0.0.1 --directory fixture &
+cargo build --release --bin wpe-readback
+env -u DISPLAY -u WAYLAND_DISPLAY ./target/release/wpe-readback \
+    http://127.0.0.1:8742/red.html /tmp/red --expect-rgb ff0000 --bench 20
+```
+
+Exit 0 = PASS. `--size WxH` sets the offscreen viewport.
