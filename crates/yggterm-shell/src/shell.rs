@@ -6878,6 +6878,26 @@ struct ShellState {
     /// rail offers; entries expire when the app's declares stop, exactly like a
     /// web surface. yggterm knows nothing about what a pane MEANS.
     sidebar_contributions: HashMap<String, SidebarContributionState>,
+    /// Which sessions this client has already ASKED the daemon to restore an
+    /// app surface for, and the runtime token they carried at the time
+    /// (`ManagedSessionView::terminal_process_id`).
+    ///
+    /// Both surface tables above are per-CLIENT: they are built by parsing OSC
+    /// 7717 off a MOUNTED terminal host. So a GUI restart comes back with both
+    /// empty while yedit and ychrome are still very much alive in their
+    /// daemon-owned PTYs — the session reappears on the terminal surface and
+    /// the app looks closed (docs/pending-bugs.md, user-settled call #5). The
+    /// OSC heartbeat cannot fix this on its own: it only reaches a session
+    /// whose host is mounted, and a two-tier app like yedit declares exactly
+    /// ONCE and exits, so there is no heartbeat to catch at all.
+    ///
+    /// This is the ledger that makes the repair one-shot rather than a poll:
+    /// a session is asked about once, and asked AGAIN only when its runtime
+    /// token moves — i.e. after a daemon handover re-resumed the PTY, which is
+    /// exactly "first mount after a handover". A session whose app genuinely
+    /// isn't there records the attempt too, so a plain shell costs one daemon
+    /// request per GUI lifetime and never becomes a per-tick poll.
+    app_surface_restore_attempts: HashMap<String, Option<String>>,
     /// The schema currently rendered in `RightPanelMode::AppPane`, plus the
     /// pane it belongs to. Fetched from the app's control endpoint on open and
     /// replaced by whatever an action returns. `None` while a fetch is in
@@ -8829,6 +8849,7 @@ impl ShellState {
             web_surface_headless_wanted: HashMap::new(),
             web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
+            app_surface_restore_attempts: HashMap::new(),
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
             right_panel_mode_before_app_pane: None,
@@ -21746,6 +21767,202 @@ async fn ping_and_apply_contribution(
     }
 }
 
+/// How many sessions one tick may ask the daemon about. Each target costs one
+/// `terminal_app_declares` round trip (plus, on a hit, one control-endpoint
+/// probe), so a 21-row window sweeps in ~7 ticks (~18s) instead of firing 21
+/// blocking requests at once during the startup storm — the same "cap the
+/// batch, never the whole list" shape the chore tick uses.
+const APP_SURFACE_RESTORE_BUDGET_PER_TICK: usize = 3;
+
+/// One live row, as the surface-restore decision sees it.
+///
+/// Plain data on purpose: the decision below is the part that can be wrong, and
+/// it must be assertable without a `Signal`, a daemon, or a webview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppSurfaceRestoreRow {
+    session_path: String,
+    ssh_target: Option<String>,
+    /// Identifies the runtime this row is bound to right now. A daemon handover
+    /// that re-resumes the PTY changes it, which re-arms the attempt; a session
+    /// left on a PRESERVED owner keeps it, so it is asked about exactly once.
+    runtime_token: Option<String>,
+    /// This client already holds the app's rail/document contribution.
+    has_contribution: bool,
+    /// This client already holds a web surface with at least one tab.
+    has_web_surface: bool,
+    /// The row the user is looking at.
+    active: bool,
+}
+
+/// A session this tick will ask the daemon about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppSurfaceRestoreTarget {
+    session_path: String,
+    ssh_target: Option<String>,
+    runtime_token: Option<String>,
+}
+
+/// PURE. Which rows this tick should ask the daemon for a retained declare, in
+/// order.
+///
+/// Three rules, each of which has a way of being got wrong:
+///
+///   1. **A session that already shows its app surface is not a candidate.**
+///      Re-fetching a declare for a session whose rail is already up would
+///      tear down and re-resolve its `ssh -L` forward on every tick.
+///   2. **One attempt per (session, runtime token).** Without the ledger this
+///      becomes a per-tick daemon poll over every row; with the token in the
+///      key it still re-arms after a handover re-resumes the PTY.
+///   3. **The active row goes first.** The user is looking at exactly one
+///      session, and it must not wait behind six background rows for its
+///      surface to come back.
+fn app_surface_restore_targets(
+    rows: &[AppSurfaceRestoreRow],
+    attempted: &HashMap<String, Option<String>>,
+    budget: usize,
+) -> Vec<AppSurfaceRestoreTarget> {
+    let mut candidates: Vec<&AppSurfaceRestoreRow> = rows
+        .iter()
+        .filter(|row| !row.has_contribution && !row.has_web_surface)
+        .filter(|row| {
+            attempted
+                .get(&row.session_path)
+                .is_none_or(|token| token != &row.runtime_token)
+        })
+        .collect();
+    // Stable: the active row first, everything else in the caller's order (the
+    // client's live-session order). `sort_by_key` is stable, so this reorders
+    // nothing else.
+    candidates.sort_by_key(|row| !row.active);
+    candidates
+        .into_iter()
+        .take(budget)
+        .map(|row| AppSurfaceRestoreTarget {
+            session_path: row.session_path.clone(),
+            ssh_target: row.ssh_target.clone(),
+            runtime_token: row.runtime_token.clone(),
+        })
+        .collect()
+}
+
+impl ShellState {
+    /// The live rows, as the surface-restore decision sees them. One reader of
+    /// the two surface tables, so the decision cannot disagree with what the
+    /// viewport is actually showing.
+    fn app_surface_restore_rows(&self) -> Vec<AppSurfaceRestoreRow> {
+        let active = self.server.active_session_path().map(str::to_string);
+        self.server
+            .live_session_views()
+            .iter()
+            .map(|session| AppSurfaceRestoreRow {
+                session_path: session.session_path.clone(),
+                ssh_target: session.ssh_target.clone(),
+                runtime_token: session.terminal_process_id.map(|pid| pid.to_string()),
+                has_contribution: self
+                    .sidebar_contributions
+                    .contains_key(&session.session_path),
+                has_web_surface: self
+                    .web_surfaces
+                    .get(&session.session_path)
+                    .is_some_and(|surface| !surface.tabs.is_empty()),
+                active: active.as_deref() == Some(session.session_path.as_str()),
+            })
+            .collect()
+    }
+
+    /// Record that a session was asked about, so it is not asked again until
+    /// its runtime moves.
+    fn mark_app_surface_restore_attempted(
+        &mut self,
+        session_path: &str,
+        runtime_token: Option<String>,
+    ) {
+        self.app_surface_restore_attempts
+            .insert(session_path.to_string(), runtime_token);
+    }
+}
+
+/// Re-establish app surfaces this client never witnessed being declared.
+///
+/// The user's words (docs/pending-bugs.md, settled call #5): *"yedit AND
+/// ychrome CLOSE ON EVERY RESTART AND MUST NOT. They should stay up and stay on
+/// their libyggterm surface, not fall back to the terminal surface."* The apps
+/// never actually closed — they are still running in daemon-owned PTYs. What
+/// died is this client's memory of their surfaces, because both surface tables
+/// are built by an OSC parser that only exists while a terminal host is
+/// mounted.
+///
+/// So this drives the two EXISTING rebuild paths — the same ones
+/// `right-panel pane:<id>` and `web ensure --session` drive — from the poll
+/// tick instead of only from an agent verb. Nothing here is a second way to
+/// establish a surface; it is the missing TRIGGER for the one that exists.
+///
+/// Deliberately quiet: it never activates a session, never moves focus, and
+/// never opens a rail. It restores the session's surface STATE, which
+/// `document_surface_visible_for` and the web reconciler then render when the
+/// user visits that session.
+async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: std::path::PathBuf) {
+    let targets = state.with(|shell| {
+        app_surface_restore_targets(
+            &shell.app_surface_restore_rows(),
+            &shell.app_surface_restore_attempts,
+            APP_SURFACE_RESTORE_BUDGET_PER_TICK,
+        )
+    });
+    if targets.is_empty() {
+        return;
+    }
+    // Mark BEFORE awaiting. A rebuild takes a daemon round trip plus an
+    // endpoint probe, which is longer than the 2.5s tick — marking afterwards
+    // would let the next tick pick the same session again and fire a second
+    // concurrent probe.
+    state.with_mut(|shell| {
+        for target in &targets {
+            shell.mark_app_surface_restore_attempted(
+                &target.session_path,
+                target.runtime_token.clone(),
+            );
+        }
+    });
+    for target in targets {
+        // The rail/document half. Endpoint-probed liveness lives inside it: a
+        // declare whose control endpoint does not answer traces
+        // `daemon_declare_endpoint_dead` and restores nothing, which leaves the
+        // session on the terminal surface — today's behaviour, with a reason.
+        let rail = rebuild_sidebar_contribution_from_daemon_declare(
+            state,
+            trace_home.clone(),
+            &target.session_path,
+            target.ssh_target.clone(),
+        )
+        .await;
+        // The web half. Independent of the rail: ychrome declares a
+        // `web-surface` and no sidebar pane, yedit the reverse. Its own
+        // staleness ceiling is the right liveness test HERE (unlike the rail's,
+        // where it was wrong) because a browser surface heartbeats every ~4s —
+        // an old web-surface record means the app really did exit.
+        let web = rebuild_web_surface_from_daemon_declare(
+            state,
+            trace_home.clone(),
+            &target.session_path,
+        )
+        .await;
+        if rail || web.rebuilt() {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_surface_restore",
+                "restored",
+                json!({
+                    "session_path": target.session_path,
+                    "rail": rail,
+                    "web": web.reason(),
+                }),
+            );
+        }
+    }
+}
+
 fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let trace_home = resolve_yggterm_home().unwrap_or_default();
@@ -21785,6 +22002,13 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                     shell.sweep_stale_sidebar_contributions(current_millis());
                 });
             }
+            // Surface survival (settled call #5) rides the same tick, BEFORE
+            // the ping sweep: a contribution restored here is in the table by
+            // the next tick, so the ping loop keeps it alive from then on with
+            // no special case. Budgeted and one-shot per (session, runtime), so
+            // on the overwhelming majority of ticks this decides "nothing" off
+            // a read-only pass and spawns no task.
+            spawn(restore_app_surfaces_tick(state, trace_home.clone()));
             // Endpoint-ping liveness rides the same tick (Phase 2): fire and
             // forget — the ping task owns its own short timeout. Phase 5 folds
             // the command drain + background stamp sweep into the same tick.
@@ -108820,6 +109044,201 @@ mod tests {
                 .is_none()
         );
         assert!(shell.sidebar_contributions.is_empty());
+    }
+
+    // ── Surface survival across a restart (settled call #5) ────────────────
+    //
+    // "yedit AND ychrome CLOSE ON EVERY RESTART AND MUST NOT." They do not
+    // actually close — a GUI restart just loses this client's memory of their
+    // surfaces, because both surface tables are built by an OSC parser that
+    // only lives while a terminal host is mounted. These lock the DECISION the
+    // poll tick makes about which sessions to ask the daemon to replay.
+
+    /// A shell holding `paths` as live rows, with `active` selected — the shape
+    /// a freshly relaunched GUI comes up in: rows adopted from the daemon, both
+    /// surface tables empty.
+    fn shell_with_live_rows(paths: &[&str], active: &str) -> ShellState {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active));
+        let sessions: Vec<_> = paths
+            .iter()
+            .map(|path| snapshot_session_view_for_ui(test_live_shell_session(path)))
+            .collect();
+        let active_view = sessions
+            .iter()
+            .find(|session| session.session_path == active)
+            .cloned();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active.to_string()),
+            active_session: active_view,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+            apps: Vec::new(),
+        });
+        shell
+    }
+
+    /// What the poll tick computes, through the production reader and the
+    /// production decision — never hand-built rows, which is exactly how a
+    /// lock ends up unable to fail (field guide §7.1).
+    fn restore_targets(shell: &ShellState, budget: usize) -> Vec<AppSurfaceRestoreTarget> {
+        app_surface_restore_targets(
+            &shell.app_surface_restore_rows(),
+            &shell.app_surface_restore_attempts,
+            budget,
+        )
+    }
+
+    // The whole point of the feature: after a relaunch every live row is a
+    // candidate, because this client witnessed no declare for any of them. And
+    // the row the user is LOOKING at goes first — it must not wait behind
+    // background rows for its document surface to come back.
+    #[test]
+    fn a_relaunched_gui_asks_about_every_live_row_active_first() {
+        let shell = shell_with_live_rows(
+            &["local://alpha", "local://beta", "local://gamma"],
+            "local://beta",
+        );
+        let targets = restore_targets(&shell, 8);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.session_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local://beta", "local://alpha", "local://gamma"],
+            "every live row is a restore candidate, the active one first"
+        );
+    }
+
+    // A session whose rail this client ALREADY holds must never be re-asked:
+    // a rebuild tears down and re-resolves the contribution's `ssh -L`, so
+    // asking on every tick would spawn one ssh per tick forever.
+    #[test]
+    fn a_session_already_showing_its_app_surface_is_never_re_asked() {
+        let mut shell = shell_with_live_rows(&["local://alpha", "local://beta"], "local://alpha");
+        shell.upsert_sidebar_contribution(
+            "local://alpha",
+            Vec::new(),
+            None,
+            Some("yedit".to_string()),
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            Some((
+                "http://127.0.0.1:1/".to_string(),
+                "http://127.0.0.1:1/".to_string(),
+                None,
+            )),
+        );
+        let targets = restore_targets(&shell, 8);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.session_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local://beta"],
+            "the session whose contribution is already up is not a candidate"
+        );
+    }
+
+    // One ask per (session, runtime). Without the ledger this becomes a daemon
+    // poll over every row, every 2.5s, forever — including for plain shells
+    // that will never have a declare.
+    #[test]
+    fn a_session_is_asked_once_and_a_handover_re_arms_it() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let first = restore_targets(&shell, 8);
+        assert_eq!(first.len(), 1, "the first tick asks");
+        let token = first[0].runtime_token.clone();
+        assert_eq!(token.as_deref(), Some("42"), "the PTY's pid IS the token");
+        shell.mark_app_surface_restore_attempted("local://alpha", token);
+        assert!(
+            restore_targets(&shell, 8).is_empty(),
+            "an answered session is not asked again on the next tick"
+        );
+
+        // A daemon handover re-resumes the PTY on a new pid. That is "first
+        // mount after a handover", and it must re-arm the ask.
+        let mut resumed = test_live_shell_session("local://alpha");
+        resumed.terminal_process_id = Some(4242);
+        let resumed = snapshot_session_view_for_ui(resumed);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some("local://alpha".to_string()),
+            active_session: Some(resumed.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![resumed],
+            apps: Vec::new(),
+        });
+        assert_eq!(
+            restore_targets(&shell, 8)
+                .iter()
+                .map(|target| target.runtime_token.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("4242".to_string())],
+            "a re-resumed PTY is a new runtime, so the surface is asked about again"
+        );
+    }
+
+    // Each target costs a daemon round trip plus an endpoint probe. A 21-row
+    // window must sweep over several ticks, not fire 21 blocking requests into
+    // the startup storm.
+    #[test]
+    fn the_restore_sweep_is_budgeted_and_deterministic() {
+        let shell = shell_with_live_rows(
+            &[
+                "local://a",
+                "local://b",
+                "local://c",
+                "local://d",
+                "local://e",
+            ],
+            "local://d",
+        );
+        let targets = restore_targets(&shell, APP_SURFACE_RESTORE_BUDGET_PER_TICK);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.session_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local://d", "local://a", "local://b"],
+            "the budget caps the tick and the order is the client's own, active first"
+        );
+    }
+
+    // The wiring, not the decision. `restore_app_surfaces_tick` is an async
+    // loop over daemon IO and cannot be unit-called, so this locks that the
+    // poll loop still SPAWNS it — the failure mode being a perfectly green
+    // decision that nothing ever asks for (field guide §7.1, and the two-arm
+    // refetch trap in the libyggterm-surfaces skill).
+    #[test]
+    fn the_working_flags_poll_loop_drives_the_surface_restore() {
+        let source = include_str!("shell.rs");
+        let anchor = "fn spawn_working_flags_poll_loop(";
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("the scan lost its anchor {anchor:?}"));
+        // Close on the next column-0 `}` — brace counting went blind on this
+        // file once, swallowing 90k lines of embedded JS.
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor:?} has no column-0 close"));
+        let body = &body[..end];
+        assert!(
+            body.len() > 1_000 && body.len() < 20_000,
+            "the poll-loop slice is {} bytes — the scan lost its bounds",
+            body.len()
+        );
+        assert!(
+            body.contains("spawn(restore_app_surfaces_tick("),
+            "the working-flags poll tick no longer spawns the surface restore, so \
+             yedit/ychrome go back to coming up as bare terminals after a restart"
+        );
     }
 
     // Vertical mode IS the rail. A GUI that starts with the pref already on used
