@@ -31,14 +31,42 @@ fix) once the fix is verified live on jojo.
      not a documented limitation.** Two levels of fix, both wanted: (a) the ROW
      must survive even when the PTY cannot, so the user can restart it with a
      click; (b) properly, lossless fd handoff so the PTY survives too.
-  2. **THE ROW-ORDER LEDGER IS WRITE-ONLY ON RESTORE — BUILD THE RESTORE PATH.**
+  2. **THE ROW-ORDER LEDGER WAS WRITE-ONLY ON RESTORE. ⏳ FIXED IN-TREE
+     2026-07-26, LIVE VERIFICATION ON jojo STILL PENDING — it can only be proven
+     by a real daemon bump, so this entry STAYS until the next one.**
      Verified across the 2.12.15 bump: the ledger was byte-identical before and
      after (143 entries, the user's curated order intact) and *nothing read it
      back*. Restored rows land first, adopted live rows are appended after, so
      the user's two live sessions moved from positions 1-2 to 6-7 and they had
-     to re-curate by hand for the third time in a day. The snapshot half works;
-     only the restore is missing. There is also **no reorder verb**, so an agent
-     cannot hand the order back programmatically — add one.
+     to re-curate by hand for the third time in a day.
+     What now exists (`crates/yggterm-server/src/row_order_ledger.rs`):
+     - **The restore.** `reconcile_order_with_remembered` is the one owner of
+       the rule — rows the ledger knows take the ledger's relative order; rows
+       it has never seen keep the slot the anchored import walk
+       (`import_peer_live_rows_in_order`) gave them, still under the same
+       neighbour. Both handover rebuild passes
+       (`run_deferred_preserved_owner_deep_reconcile` and
+       `takeover_superseded_daemon_state`) end by applying it, **before** their
+       own persist — `persist()` records the live order INTO the ledger, so
+       persisting the freshly-imported scramble first would erase the very
+       arrangement the restore reads. It reconciles against
+       `DaemonRuntime::booted_with_row_order`, the ledger as this daemon booted,
+       for the same reason.
+     - **It cannot resurrect.** The reconcile is a permutation of the rows the
+       daemon already holds, and `replace_live_session_order` separately refuses
+       any path that is not already a row — two independent refusals, each
+       locked by its own test, so a tombstoned row in the ledger stays out.
+     - **The reorder verb exists and is fixed** (it had been added since this
+       entry was written; the defect was that it ignored dormant rows and
+       reported success anyway — field guide §4.5). It now moves dormant rows
+       and answers with `applied` / `skipped` lists.
+     - **The pre-swap receipt** lands at
+       `~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json`,
+       written by the outgoing daemon on `PrepareUpdateRestart` and by the
+       incoming daemon before it imports a row.
+     **To close this entry:** on the next real daemon bump, capture
+     `server app rows` before and after and confirm the order is unchanged, and
+     confirm a `pre-daemon-swap-*` file appeared. Do not close it on unit tests.
   3. ✅ **RESURRECTION IS FIXED, PROVEN ACROSS A REAL VERSION BUMP.** 8 closed
      rows, 8 tombstones kept, **0 resurrected**, 0 orphaned processes, and the
      daemon self-retired gracefully in 40 s. Keep this result; it is the
@@ -84,11 +112,14 @@ fix) once the fix is verified live on jojo.
      (`import_peer_live_rows_in_order`) is live but has never been exercised by a
      real daemon swap. **Prove it on the next bump before claiming it.**
   2. **If order is destroyed it must be recoverable from a snapshot.**
-     `~/.yggterm/row-order-ledger.json` already records order+membership and
-     `removed-rows.json` records closes — but nothing RESTORES from them
-     automatically, and an agent had to reconstruct by hand. Build the restore
-     path, and make a daemon bump write a pre-swap snapshot the way a deploy
-     does.
+     ⏳ **BUILT IN-TREE 2026-07-26; live verification pending.**
+     `~/.yggterm/row-order-ledger.json` records order+membership and
+     `removed-rows.json` records closes; nothing RESTORED from them
+     automatically, and an agent had to reconstruct by hand. Both halves now
+     exist — the automatic restore on every handover rebuild pass, and the
+     pre-swap receipt at
+     `~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json`.
+     See standing-traps item 2 above for the detail and the closing criteria.
   3. **⚠ "All rows not connected should die" NEEDS A DECISION, because as
      written it contradicts requirement 1 and the product's core promise.**
      Right now 9 of the user's own curated 21 rows have no runtime — they are
