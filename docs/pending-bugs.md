@@ -30,6 +30,39 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ NOTIFICATION AUDIO IS SILENT IN THE WEBVIEW — PROVEN BY A/B ON THE
+  LIVE HOST, AND THE FIX IS TO LEAVE WEBKIT (2026-07-26, user-reported
+  regression: "I used to hear the double chime when copying or when the agent
+  ended its turn. That is also absent").**
+  **The A/B, same speaker, same sink, minutes apart:**
+  | path | result |
+  |---|---|
+  | WebKit `AudioContext` (the shipped path), `ctx.resume()` added, gains x6, fired seconds after a real user click | **SILENT** |
+  | native PCM synthesis → platform sink (`pw-play`) | **AUDIBLE**, user confirmed "I heard double chime just now" |
+  **Everything downstream was verified innocent first:** the Bluetooth sink is
+  the default and connected; a system test tone through it was clearly heard;
+  Yggterm's own sink-inputs were present ON that sink, `Mute: no`, volume
+  100%, `Corked: no`; and PipeWire reported the sink SUSPENDED → **RUNNING**
+  for the webview chime. So WebKit opens a real stream and fills it with
+  silence. Cause not isolated further (autoplay/gesture gating is the leading
+  theory and an agent cannot synthesize a qualifying gesture anyway) — and it
+  does not need to be, because the product does not need WebKit for this.
+  **⇒ Move the notification-audio path to native Rust** (queued as oc O4).
+  That simultaneously fixes: chimes silently dropped when the user is away
+  from the keyboard, the reported ending-clip (a native path can hold a
+  flush tail; the webview closed its context 80 ms after the last note while
+  A2DP holds 100-300 ms), and the impossibility of an AGENT ringing the user.
+  ⚠ **Instrument note:** "the eval returned without error" is not evidence of
+  sound, and neither is a RUNNING sink. The only honest instruments here are
+  the user's ears and an A/B against a known-good native player.
+  **Stopgap already live on the GUI host:** `~/.local/bin/ygg-chime`
+  (`--tone/--repeat/--gap/--volume/--notes/--preroll/--tail`) synthesizes the
+  SAME note table natively — it is both the diagnosis tool and the tune-
+  auditioning surface, and it is how an agent can get the user's attention
+  today. Its note table is the tune to port; the user has confirmed it sounds
+  right.
+
+
 - **★★ AN AGENT'S TEARDOWN CAN REPORT SUCCESS AND LEAVE BOTH THE ROW AND THE
   APP PROCESS ALIVE (user-reported 2026-07-26 ~23:50, third variant of the
   same class tonight).** A background agent's final report said "work session
