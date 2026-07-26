@@ -664,6 +664,16 @@ One coherent light vocabulary for session state, used by Live Sessions today and
 
 Rules: color encodes durability class, blink encodes activity, and reserved colors are introduced only with a spec update here. Automated Sessions (experimental/automations) must adopt this vocabulary unchanged so a user reads one signal system across the whole sidebar.
 
+**Durability, not "session-ness".** The vocabulary describes what happens to the *thing* when the app goes away, so it extends to any surface with that question — including a contributed app's rows and a document's save state. For an editor's file list:
+
+- `GREEN` = saved: the content IS the file on disk, and outlives the app.
+- `BLUE` = unsaved: the content lives only inside the app's own store (yedit keeps a full-content row in its sqlite drafts table). Exactly the same meaning as a session that lives only while the GUI does.
+- No dot = nothing to signal yet: a brand-new note never typed into is neither in the store nor on disk. The SLOT is still laid out.
+
+A contributed row names the CLASS (`"durable"` / `"transient"` on `list-row`'s `status`) and yggterm paints it from `live_session_status_dot_style`, the same function the Live Sessions rows use — an app never picks a colour. A token yggterm does not paint (including the reserved amber/red above) renders the empty slot rather than a guess. A save conflict is the natural future `ORANGE` ("pending user decision"), and wiring it means editing this section first.
+
+**Status never lives in the title.** Apps that had no status slot were prefixing the row title with a literal `●`, which paints in the row's text colour (near-black in the light theme, so "the traffic dot is black") and shifts the name sideways relative to rows without it. If a row needs to signal something, it needs a slot — not a glyph in its name. "This row is the one in use" is `selected`, not a dot.
+
 **One clock for every blink.** All blinking indicators — live-session dots, machine dots, group dots, web-tab loading lights — flip on the *same* tick. The app owns exactly ONE blink animation, on `:root`, which publishes the current phase as the inherited custom property `--yggterm-status-dot-blink`; an indicator blinks by reading that phase (`opacity: var(--yggterm-status-dot-blink, 1)`), never by declaring an animation of its own. This is both a design rule (a sidebar of dots pulsing in unison reads as one system; dots blinking at random phases read as noise) and a hard performance constraint: on a software-GL host every opacity flip costs a full-window CPU blit, so N independently-phased indicators cost N times the frames of one. Any new indicator MUST join the shared clock.
 
 ### Stage-curtain loading rule
