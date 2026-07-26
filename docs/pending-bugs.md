@@ -21,6 +21,56 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ USER-SETTLED CALLS + FEATURE REQUESTS (2026-07-26, verbatim intent).**
+  These answer questions an agent asked; do NOT re-litigate them.
+  1. **PLAIN SHELLS ARE FIRST-CLASS AND MUST SURVIVE A DAEMON BUMP.** Settled by
+     the user. The 2.12.15 bump lost `local://b7ccbab4` ("ychrome HTTP Fixture
+     Support") because a plain shell cannot migrate — no `SCM_RIGHTS` fd passing
+     exists anywhere in the tree, so the only way to move a PTY is
+     kill-and-re-resume, and a shell is not re-resumable. **That is now a BUG,
+     not a documented limitation.** Two levels of fix, both wanted: (a) the ROW
+     must survive even when the PTY cannot, so the user can restart it with a
+     click; (b) properly, lossless fd handoff so the PTY survives too.
+  2. **THE ROW-ORDER LEDGER IS WRITE-ONLY ON RESTORE — BUILD THE RESTORE PATH.**
+     Verified across the 2.12.15 bump: the ledger was byte-identical before and
+     after (143 entries, the user's curated order intact) and *nothing read it
+     back*. Restored rows land first, adopted live rows are appended after, so
+     the user's two live sessions moved from positions 1-2 to 6-7 and they had
+     to re-curate by hand for the third time in a day. The snapshot half works;
+     only the restore is missing. There is also **no reorder verb**, so an agent
+     cannot hand the order back programmatically — add one.
+  3. ✅ **RESURRECTION IS FIXED, PROVEN ACROSS A REAL VERSION BUMP.** 8 closed
+     rows, 8 tombstones kept, **0 resurrected**, 0 orphaned processes, and the
+     daemon self-retired gracefully in 40 s. Keep this result; it is the
+     baseline any future change to the import path must not regress.
+  4. **A ROW WITH NO RUNTIME IS CORRECT AND DESIRABLE.** User's words: *"No
+     runtime is none of our business. The user can click to start it."* The
+     model is explicitly GTA 5 vs Crysis — an asset that is not rendered but
+     looks rendered. Do NOT reap runtime-less rows; freeing the runtime while
+     keeping the row IS the feature.
+  5. **yedit AND ychrome CLOSE ON EVERY RESTART AND MUST NOT.** They should stay
+     up and stay on their **libyggterm surface**, not fall back to the terminal
+     surface.
+  6. **★★★ AGENTS MUST DRIVE SHADOW SURFACES EVEN WHILE THE USER'S GUI IS
+     CLOSED.** Felt concretely: the a services portal and records agents each drove a ychrome
+     session row and the GUI host burned. This is the same requirement as
+     server-side rendering — agent browsing should never have been on the GUI
+     host (docs/optimization-pass.md WS2, `ychrome/docs/agent-engine.md`).
+     Wanted as a real feature, not a workaround.
+  7. **DAEMON HANDOVER MUST TELL THE USER AND STOP DRAWING.** On a daemon
+     version change the GUI host burns. Spawn a notification ("daemon is
+     changing, please wait"), **stop drawing the terminal for the duration**, and
+     entertain the user. The render cost during handover is the thing being
+     avoided, so the fix is to stop painting, not to paint a spinner harder.
+  8. **AUDIO NOTIFICATIONS NEED A PRE-ROLL.** Bluetooth speakers clip roughly the
+     first ~300 ms while the link wakes, so the start of every notification is
+     lost. The user suggested ~150 ms and invited a better figure. **Use ~400 ms
+     of very-low-amplitude noise, not silence** — many A2DP stacks drop or fail
+     to prime the link on pure digital silence, so the pre-roll needs a little
+     real energy (a dither-level noise floor is enough to be inaudible). Better
+     still, make it adaptive: skip the pre-roll when another notification played
+     within the last few seconds, since the link is already awake.
+
 - **★★★ USER REQUIREMENTS FOR THE SESSION-ROW LIFECYCLE (stated 2026-07-26, after
   curating the list by hand TWICE).** The user's words: *"A daemon bump and
   restart should not destroy the row order and number of sessions. If destroyed
