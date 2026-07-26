@@ -1704,16 +1704,14 @@ impl WebSurfaceHost {
     /// How many distinct `WebContext`s are alive right now.
     ///
     /// The instrument for the sharing invariant: with N tabs open on one
-    /// session this must read 1, not N. Paired with `surface_count` it is the
-    /// only in-process way to tell "two tabs, one process pool" from "two tabs,
-    /// two of everything" without going to `/proc` and guessing from `comm`.
+    /// session this must read 1, not N. Read against the shell's own
+    /// `web_surface_views` (the reconciler's applied map owns "how many
+    /// surfaces"; this host does not publish a second count of it), the pair is
+    /// the only in-process way to tell "two tabs, one process pool" from "two
+    /// tabs, two of everything" without going to `/proc` and guessing from
+    /// `comm`.
     pub fn web_context_count(&self) -> usize {
         self.contexts.borrow().len()
-    }
-
-    /// How many surfaces (tabs, popups) are open.
-    pub fn surface_count(&self) -> usize {
-        self.surfaces.borrow().len()
     }
 
     pub fn set_bounds(&self, id: u64, x: i32, y: i32, w: i32, h: i32) {
