@@ -195,6 +195,44 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
       leaves the field alone. It never substitutes a heuristic name — a rename
       is an explicit gesture, and a junk name the user must notice and undo is
       worse than an unchanged field they can retry.
+  - **`list-row` STATUS DOT (2026-07-26, yedit's dirty marker was the forcing
+    consumer):** a `list-row` may carry `status: "durable" | "transient" | ""`.
+    yggterm draws the dot in the row's status slot — the slot the native
+    session rows have always had, laid out even when empty so an appearing dot
+    never shifts the title. The APP names a durability CLASS; **yggterm owns the
+    colour**, from the same `live_session_status_dot_style` the Live Sessions
+    rows use (DESIGN.md "Status indicator vocabulary"):
+    - `"durable"` → GREEN: the content outlives the app (yedit: saved to disk).
+    - `"transient"` → BLUE: the content lives only in the app's own store
+      (yedit: an unsaved buffer held in its sqlite drafts row).
+    - `""`, absent, or any token yggterm does not paint (including DESIGN.md's
+      reserved amber/red) → the EMPTY SLOT. Never a guessed colour, never a
+      failed pane.
+    **Do NOT encode status in the title.** Both yedit and ychrome were prefixing
+    the title with a literal `●` because this field did not exist; it painted in
+    the row's text colour (a black dot in the light theme) and shoved the name
+    one character right. "This row is the one in use" is `selected: true`, not a
+    dot.
+  - **`text-input` BUFFER IDENTITY — `value_key` (2026-07-26):** an editor slot
+    that holds different content over its life MUST declare which content is
+    loaded: `{"kind": "text-input", "id": "editor", "value_key": "<note id>",
+    "value": "…"}`. It is opaque to yggterm and owned by the app.
+    - **Why it is not optional for an editor.** The textarea is uncontrolled, so
+      it only reloads when its key changes, and the key used to change only when
+      the declared TEXT changed. Content equality was standing in for buffer
+      identity: two brand-new notes are both empty, compared equal, and the
+      field was never remounted between them — one buffer serving two files.
+    - It rides the action POST as a **sibling of `values`**, `value_keys:
+      {widget id: value key}`, so a late-landing debounced draft names the buffer
+      it was typed in. **Read it in your action handler and apply the draft to
+      THAT buffer**, never to whatever you currently consider active — the draft
+      sync lands ~2.5s after the keystrokes, by which time the user may have
+      switched. An absent key means an older GUI; fall back to your active
+      buffer (that is the pre-identity behaviour, and refusing would mean the
+      user cannot type at all).
+    - Absent/empty `value_key` = no identity declared, and the field behaves
+      exactly as it did before this existed. Settings and password fields need
+      nothing.
   - **Editor draft stability (2026-07-24):** the document channel keeps the
     user's LIVE draft as the source of truth while they type. A schema whose
     declared value merely ECHOES a draft the GUI already sent up (the ~2.5s
@@ -205,11 +243,28 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     the textarea and stole focus (the "spam-click to type" bug). An app need do
     nothing to benefit; do NOT try to "help" by suppressing the editor value in
     a draft reply — the GUI handles it.
-- **Act**: a click `POST`s `{pane, action, values}` to `<control>/action`; the
-  app performs it on its own host and returns `{schema?, toast?, eval?}` — a
-  fresh schema to re-render, a message to toast, and/or a script for the GUI to
-  run in the surface. That is how a host-resident credential reaches a
-  client-rendered page: the app computes, the GUI injects.
+    **Identity beats content (2026-07-26).** Echo suppression applies only
+    WITHIN one `value_key`. A slot that now holds a different buffer always
+    remounts and always adopts the declared value, whatever the text says.
+  - **`list-row` DRAG REORDER — `reorder_action`:** non-empty ⇒ the row can be
+    dragged to reorder it among the pane's other reorderable rows. On drop
+    yggterm POSTs that action with the moved row's id as `values.value` and the
+    pane's **full new row order** under `values.order`; adopt it wholesale. The
+    GUI reorders nothing itself — the rail is a projection of the app's list, so
+    a no-op drop POSTs nothing and the rows only move when the app says they
+    did. A row without `reorder_action` is neither a drag source nor a drop
+    target, so fixed rows cannot be shuffled into a list they do not belong to.
+    The gesture needs no app cooperation: the press becomes a drag only after
+    the pointer travels `yggui::DRAG_BEGIN_THRESHOLD_PX` (so a click stays a
+    click), and releasing anywhere — over a heading, the footer, outside the
+    pane — ends it.
+- **Act**: a click `POST`s `{pane, action, values, value_keys}` to
+  `<control>/action`; `value_keys` names which buffer each draft in `values`
+  came from (see `value_key` above). The app performs it on its own host and
+  returns `{schema?, toast?, eval?}` — a fresh schema to re-render, a message to
+  toast, and/or a script for the GUI to run in the surface. That is how a
+  host-resident credential reaches a client-rendered page: the app computes, the
+  GUI injects.
 - **Page context**: the GUI passes the active surface's host as `?host=` on the
   schema GET and as `values.host` on an action. Non-secret context; the APP
   decides what a host means (which logins apply to it). One owner GUI-side:
