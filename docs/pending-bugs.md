@@ -51,6 +51,34 @@ fix) once the fix is verified live on jojo.
   5. **yedit AND ychrome CLOSE ON EVERY RESTART AND MUST NOT.** They should stay
      up and stay on their **libyggterm surface**, not fall back to the terminal
      surface.
+     **CAUSE (found, and it is not what the symptom says): the apps never
+     closed.** They run in daemon-owned PTYs and survive the GUI fine. What dies
+     is the CLIENT's memory of their surfaces — both `web_surfaces` and
+     `sidebar_contributions` are built by an OSC 7717 parser that only exists
+     while a terminal host is MOUNTED. After a relaunch the tables are empty,
+     so every session paints the terminal surface. The OSC heartbeat cannot
+     repair it: it reaches only a session whose host is mounted (so never a
+     background row), and a two-tier app like yedit declares exactly ONCE and
+     exits, so there is no heartbeat to catch at all. Both daemon-replay rebuild
+     paths already existed — they were just wired to agent verbs only
+     (`right-panel pane:<id>`, `web ensure --session`) and to nothing that runs
+     on its own.
+     **FIX (GUI-side, no daemon change, no version bump): `restore_app_surfaces_tick`**
+     on the 2.5s working-flags poll tick drives those SAME two rebuild paths.
+     Endpoint-probed liveness, never declare age (the rail half already gets
+     this right — see "liveness is the ENDPOINT" below); a dead endpoint or an
+     unanswerable preserved owner degrades to the terminal view with
+     `daemon_declare_endpoint_dead` / `daemon_declare_unavailable` /
+     `daemon_declare_absent` in the trace, never a blank surface. One ask per
+     (session, `terminal_process_id`), so a handover that re-resumes a PTY
+     re-arms it and nothing else becomes a per-tick daemon poll; 3 sessions per
+     tick; active row first. It never activates a session, moves focus, or opens
+     a rail — it restores surface STATE, which the user sees when they visit.
+     ⚠ **NOT yet verified live on jojo.** Unit-locked only (4 decision locks +
+     a wiring scan). The live proof owed: restart the GUI with a yedit and an
+     ychrome session running, then confirm both come back on their own surface
+     without a manual reopen, and that `app_surface_restore` appears in the
+     trace.
   6. **★★★ AGENTS MUST DRIVE SHADOW SURFACES EVEN WHILE THE USER'S GUI IS
      CLOSED.** Felt concretely: the a services portal and records agents each drove a ychrome
      session row and the GUI host burned. This is the same requirement as
