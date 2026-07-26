@@ -1380,6 +1380,17 @@ fn persisted_live_session_from_preserved_owner_snapshot(
         remote_launch_action: snapshot_session_metadata_value(session, "Remote Launch Action"),
         storage_path: snapshot_session_metadata_value(session, "Storage"),
         restore_reason: Some(crate::UPDATE_RESTART_RESTORE_REASON.to_string()),
+        // A row adopted off a peer daemon keeps its provenance and its
+        // ephemerality declaration. Dropping either here would make the row
+        // immortal again at exactly the moment it changed hands.
+        created_by: snapshot_session_metadata_value(
+            session,
+            crate::session_tenancy::CREATED_BY_METADATA_LABEL,
+        ),
+        ephemeral: snapshot_session_metadata_value(
+            session,
+            crate::session_tenancy::EPHEMERAL_METADATA_LABEL,
+        ),
     })
 }
 
@@ -2061,6 +2072,25 @@ pub enum ServerRequest {
     TerminalAppDeclares {
         path: String,
     },
+    /// On-demand tenant accounting: what is RUNNING inside each live row, what
+    /// it has cost, and how long it has been squatting there. Nothing here runs
+    /// on a timer — the idle cost of this feature is zero, and one `/proc`
+    /// reading serves every row in the answer. `path: None` = every live row.
+    /// See [`crate::session_tenancy`].
+    TerminalTenants {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Record who created a row, and (opt-in) that the creator declared it
+    /// ephemeral. Write-once per row — see
+    /// [`crate::YggtermServer::declare_live_session_tenancy`].
+    DeclareSessionTenancy {
+        path: String,
+        #[serde(default)]
+        created_by: Option<String>,
+        #[serde(default)]
+        ephemeral: Option<String>,
+    },
     TerminalWrite {
         path: String,
         data: String,
@@ -2159,6 +2189,14 @@ pub enum ServerResponse {
         #[serde(default)]
         records: Vec<crate::app_declare::AppDeclareRecord>,
         running: bool,
+    },
+    TerminalTenants {
+        #[serde(default)]
+        rows: Vec<crate::session_tenancy::RowTenantReport>,
+        /// Set when the whole reading failed (no `/proc`, unreadable `/proc`).
+        /// Individual rows carry their own reasons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded: Option<String>,
     },
     Ack {
         message: Option<String>,
@@ -2334,7 +2372,12 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::TerminalSnapshot { .. }
         | ServerRequest::TerminalRetainedSnapshot { .. }
         | ServerRequest::TerminalHistory { .. }
-        | ServerRequest::TerminalAppDeclares { .. } => ShadowAccess::Allow,
+        | ServerRequest::TerminalAppDeclares { .. }
+        // Pure accounting: it reads /proc and the row's own metadata and
+        // changes nothing. The shadow client is the agent's default probe
+        // surface, and this verb exists precisely for an agent to audit what
+        // its predecessors left running.
+        | ServerRequest::TerminalTenants { .. } => ShadowAccess::Allow,
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
@@ -2380,8 +2423,129 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::RaiseExternalWindow
         | ServerRequest::SyncTheme { .. }
         | ServerRequest::SyncTerminalIdentity { .. }
-        | ServerRequest::Shutdown => ShadowAccess::Deny,
+        | ServerRequest::Shutdown
+        // Declaring tenancy WRITES a row's metadata and arms the reaper on it.
+        // A shadow view client must not be able to mark the user's row
+        // disposable, so this sits with the other lifecycle mutations.
+        | ServerRequest::DeclareSessionTenancy { .. } => ShadowAccess::Deny,
     }
+}
+
+/// THE answer to a tenancy declaration naming a path this daemon holds no live
+/// row for.
+///
+/// It is an ERROR, not an ack. The caller is the create runner, and the next
+/// thing it does is tell an agent whether it armed a reap rule; an ack over a
+/// row that does not exist here reads as "declared", which is how the first cut
+/// reported `"declared": true` for a stamp that never landed (round-25 review,
+/// finding P2). One function so the daemon's refusal and the round-trip lock
+/// that exercises it cannot drift apart.
+fn declare_session_tenancy_refusal(path: &str) -> ServerResponse {
+    ServerResponse::Error {
+        message: format!("no live session for {path}"),
+    }
+}
+
+/// What [`DaemonRuntime::close_live_session_row`] actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClosedLiveRow {
+    removed_terminal: bool,
+    removed_session: bool,
+}
+
+/// The live world for [`crate::session_tenancy::ephemeral_session_reap_pass`].
+///
+/// This is the only un-mockable code in the reap path, and every method here is
+/// a straight read or a single call into the daemon's own close path — no
+/// policy, no bookkeeping. The decisions all live in the pass and in
+/// [`crate::session_tenancy::ephemeral_reap_reason`], where a test can drive
+/// them (field guide §7.1).
+struct LiveEphemeralReapHost<'a> {
+    runtime: &'a mut DaemonRuntime,
+    local_host: String,
+}
+
+impl crate::session_tenancy::EphemeralReapHost for LiveEphemeralReapHost<'_> {
+    fn candidates(&self) -> Vec<crate::session_tenancy::EphemeralCandidate> {
+        self.runtime
+            .server
+            .ephemeral_live_session_declarations()
+            .into_iter()
+            .map(|(session_path, declaration)| {
+                let runtime_key = self
+                    .runtime
+                    .server
+                    .terminal_runtime_key_for_path(&session_path);
+                crate::session_tenancy::EphemeralCandidate {
+                    idle_secs: self
+                        .runtime
+                        .terminals
+                        .session_idle_for_ms(&runtime_key)
+                        .map(|idle_ms| idle_ms / 1_000),
+                    // A row whose PTY this daemon does not own reads as not
+                    // running here, and the pass leaves it alone: the daemon
+                    // that owns a PTY is the one that may reap it.
+                    running: self.runtime.terminals.session_is_running(&runtime_key),
+                    session_path,
+                    declaration,
+                }
+            })
+            .collect()
+    }
+
+    fn owner_liveness(
+        &self,
+        declaration: &crate::session_tenancy::EphemeralDeclaration,
+    ) -> crate::session_tenancy::OwnerLiveness {
+        crate::session_tenancy::owner_liveness_on_host(declaration, &self.local_host)
+    }
+
+    fn close_row(&mut self, session_path: &str, reason: crate::session_tenancy::EphemeralReapReason) {
+        // The graceful, explicit close — the same tombstone-then-remove the
+        // user's own close takes, and for the same reason: a peer daemon that
+        // never saw the close would hand the row straight back.
+        if let Err(error) = self.runtime.close_live_session_row(session_path) {
+            warn!(
+                path = session_path,
+                reason = reason.trace_name(),
+                error = %error,
+                "ephemeral session reap failed to close the row"
+            );
+        }
+    }
+
+    fn trace(
+        &self,
+        session_path: &str,
+        reason: crate::session_tenancy::EphemeralReapReason,
+        idle_secs: Option<u64>,
+    ) {
+        append_trace_event(
+            self.runtime.store.home_dir(),
+            "daemon",
+            "session",
+            reason.trace_name(),
+            serde_json::json!({
+                "path": session_path,
+                "idle_secs": idle_secs,
+            }),
+        );
+    }
+}
+
+/// One ephemeral-reap pass, run from an EXISTING chore tick. There is no timer
+/// for this feature and there must not be one: a row nobody declared ephemeral
+/// costs this pass a metadata lookup and nothing else.
+fn run_ephemeral_session_reap_pass(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+) -> crate::session_tenancy::EphemeralReapOutcome {
+    let mut runtime = lock_daemon_runtime(runtime, "run_ephemeral_session_reap_pass");
+    let local_host = crate::session_tenancy::local_host_token();
+    let mut host = LiveEphemeralReapHost {
+        runtime: &mut runtime,
+        local_host,
+    };
+    crate::session_tenancy::ephemeral_session_reap_pass(&mut host)
 }
 
 /// The journal payload emitted when a `Shadow` request is refused. Factored out
@@ -4680,6 +4844,160 @@ impl DaemonRuntime {
         }
     }
 
+    /// Per-row tenant accounting, on demand.
+    ///
+    /// ONE `/proc` reading serves every row in the answer, so asking about 30
+    /// rows costs what asking about one costs. Nothing here is cached and
+    /// nothing schedules a repeat: between two calls this feature costs the
+    /// machine exactly nothing.
+    fn terminal_tenants_response(&mut self, path: Option<String>) -> ServerResponse {
+        let paths: Vec<String> = match path {
+            Some(path) => vec![path],
+            None => self.server.live_session_order_keys().to_vec(),
+        };
+        let snapshot = match crate::session_tenancy::read_proc_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(gap) => {
+                // The whole reading failed, so every row degrades for the SAME
+                // named reason rather than being reported as costing nothing.
+                return ServerResponse::TerminalTenants {
+                    rows: paths
+                        .iter()
+                        .map(|path| {
+                            let runtime_key = self.terminal_runtime_key_for_path(path);
+                            crate::session_tenancy::RowTenantReport::unavailable(
+                                path,
+                                &runtime_key,
+                                gap,
+                            )
+                        })
+                        .collect(),
+                    degraded: Some(gap.reason().to_string()),
+                };
+            }
+        };
+        let rows = paths
+            .into_iter()
+            .map(|path| {
+                let mut report = self.row_tenant_report(&snapshot, &path);
+                // This daemon's row metadata is the source of truth for the
+                // stamp; a proxied answer only fills what we do not hold.
+                report.created_by = self
+                    .server
+                    .live_session_creator_stamp(&path)
+                    .or(report.created_by);
+                report.ephemeral = self
+                    .server
+                    .live_session_ephemeral_declaration(&path)
+                    .or(report.ephemeral);
+                report
+            })
+            .collect();
+        ServerResponse::TerminalTenants {
+            rows,
+            degraded: None,
+        }
+    }
+
+    /// Ask the daemon that actually owns this row's PTY what is running in it,
+    /// and answer as if we had walked it ourselves.
+    ///
+    /// THE CONSTITUTION, applied to this verb: "the user must never have to
+    /// know which daemon owns what." The first cut answered
+    /// `preserved_owner_daemon / ask that daemon`, which is exactly the leak —
+    /// it hands the person a topology they never asked to learn and a next step
+    /// they cannot take. The owning endpoint is already in hand here (it is the
+    /// same lookup `TerminalWrite` proxies from), so the row is measured where
+    /// it lives and merged in under OUR row identity: the caller sees a
+    /// measured row, not a referral.
+    ///
+    /// A failure degrades to `runtime_unreachable` — the CONDITION, never the
+    /// topology.
+    ///
+    /// Deliberately WITHOUT `handle_preserved_owner_request_error`, which every
+    /// other proxy site calls: that helper evicts the owner registration on a
+    /// timeout, and this verb is `ShadowAccess::Allow`. An accounting question
+    /// from a read-only client must not be able to drop a live owner's
+    /// registration and send the row looking for a new runtime. The cost is a
+    /// repeated timeout against a dead owner, paid only when someone asks.
+    ///
+    /// RESIDUALS (round-25 review, unbuilt): (a) there is no version gate on
+    /// `TerminalTenants`, so an owner older than 2.12.17 cannot parse the
+    /// request and lands here as unreachable — honest but coarse, and the
+    /// registered owner version is known at this site; (b) the hop is single,
+    /// the same assumption `TerminalWrite`'s proxy already makes. A silent
+    /// empty answer is the failure this must never become: the pre-2.12.10
+    /// declare proxy returned nothing at all and mixed-version rows failed
+    /// quietly for weeks.
+    fn proxied_row_tenant_report(
+        &mut self,
+        path: &str,
+        runtime_key: &str,
+        owner_endpoint: &ServerEndpoint,
+    ) -> crate::session_tenancy::RowTenantReport {
+        use crate::session_tenancy::{RowTenantReport, TenantReportGap};
+        match terminal_tenants(owner_endpoint, Some(runtime_key)) {
+            // The owner keys its rows by the runtime key it owns; the identity
+            // the CALLER asked about is ours, so it is restored here.
+            Ok((rows, _degraded)) => match rows.into_iter().next() {
+                Some(mut row) => {
+                    row.session_path = path.to_string();
+                    row.runtime_key = runtime_key.to_string();
+                    row
+                }
+                None => RowTenantReport::unavailable(
+                    path,
+                    runtime_key,
+                    TenantReportGap::RuntimeUnreachable,
+                ),
+            },
+            Err(_error) => {
+                RowTenantReport::unavailable(path, runtime_key, TenantReportGap::RuntimeUnreachable)
+            }
+        }
+    }
+
+    fn row_tenant_report(
+        &mut self,
+        snapshot: &crate::session_tenancy::ProcSnapshot,
+        path: &str,
+    ) -> crate::session_tenancy::RowTenantReport {
+        use crate::session_tenancy::{RowTenantReport, TenantReportGap};
+        let runtime_key = self.terminal_runtime_key_for_path(path);
+        // A preserved-owner row's PTY lives in another process, so this
+        // daemon's /proc walk would find nothing and reporting "0 tenants"
+        // would be a lie. Ask the owner and merge its answer — see
+        // `proxied_row_tenant_report` for why a referral is not an option.
+        if let Some(owner_endpoint) = self.preserved_owner_endpoint_for_request(&runtime_key) {
+            return self.proxied_row_tenant_report(path, &runtime_key, &owner_endpoint);
+        }
+        if !self.terminals.has_session(&runtime_key) {
+            return RowTenantReport::unavailable(path, &runtime_key, TenantReportGap::NoLocalRuntime);
+        }
+        if !self.terminals.session_is_running(&runtime_key) {
+            return RowTenantReport::unavailable(
+                path,
+                &runtime_key,
+                TenantReportGap::RuntimeNotRunning,
+            );
+        }
+        let Some(root_pid) = self.terminals.session_process_id(&runtime_key) else {
+            return RowTenantReport::unavailable(
+                path,
+                &runtime_key,
+                TenantReportGap::RootPidUnavailable,
+            );
+        };
+        crate::session_tenancy::row_tenant_report(
+            snapshot,
+            path,
+            &runtime_key,
+            root_pid,
+            self.terminals
+                .session_foreground_process_group_leader(&runtime_key),
+        )
+    }
+
     fn preserved_owner_endpoint_for_request(
         &mut self,
         runtime_key: &str,
@@ -5651,6 +5969,54 @@ impl DaemonRuntime {
         }
     }
 
+    /// THE close path for a live row. `RemoveSession` (the user's close, and
+    /// every agent `session remove`) and the ephemeral reaper both come through
+    /// here, because a second close path is a second answer to "was this row
+    /// closed" — which is the whole ghost-row class.
+    ///
+    /// The close must outlive this daemon: a peer that never saw it still holds
+    /// the row and will offer it back at the next swap. The tombstone is
+    /// therefore recorded FIRST, while the live order still holds the identity
+    /// the tombstone is read out of.
+    ///
+    /// Keep-alive is NOT consulted here, and neither caller consults it either.
+    /// Keep-alive governs whether a runtime survives the GUI WINDOW closing —
+    /// `PrepareClientClose` closes `non_keep_alive_live_session_paths` and
+    /// keeps the rest. It has never governed an explicit close:
+    /// `remove_session_should_detach_keep_alive_runtime` returns a constant
+    /// `false`, so the `RemoveSession` detach branch above is unreachable and
+    /// the user's own close destroys a keep-alive row like any other. The
+    /// reaper's close is the same close, so a declared-ephemeral row is taken
+    /// whether or not it is marked keep-alive — not because ephemerality
+    /// overrides anything, but because there is nothing here to override.
+    fn close_live_session_row(&mut self, path: &str) -> Result<ClosedLiveRow> {
+        self.tombstone_live_row(path);
+        let stop_command = self.server.terminal_stop_command(path);
+        let runtime_path = self.server.terminal_runtime_key_for_path(path);
+        let remote_target = self.server.remote_shutdown_target_for_path(path);
+        let removed_terminal = self
+            .terminals
+            .remove_session(&runtime_path, stop_command.as_deref())?;
+        let removed_session = self.server.remove_live_session(path)?;
+        if removed_session || removed_terminal {
+            self.remove_preserved_owner_runtime(&runtime_path, "live_session_removed");
+        }
+        self.prune_unrepresented_preserved_owners("live_session_removed");
+        self.persist()?;
+        if let Some((machine, session_id)) = remote_target {
+            spawn_explicit_remote_session_shutdown(
+                self.store.home_dir(),
+                path,
+                machine,
+                session_id,
+            );
+        }
+        Ok(ClosedLiveRow {
+            removed_terminal,
+            removed_session,
+        })
+    }
+
     /// Remember that the user closed the row currently listed for `path`, so no
     /// peer daemon can hand it back. Call BEFORE the removal — the identity is
     /// read out of the live order, which the removal empties.
@@ -6584,33 +6950,11 @@ impl DaemonRuntime {
                         format!("no live session for {path}")
                     })));
                 }
-                // The close is the user's, and it must outlive this daemon: a
-                // peer that never saw it still holds the row and will offer it
-                // back at the next swap. Recorded BEFORE the removal, while the
-                // row still has an identity to read. (The keep-alive DETACH arm
-                // above returns early on purpose — detaching a viewport is not
-                // closing a row.)
-                self.tombstone_live_row(&path);
-                let stop_command = self.server.terminal_stop_command(&path);
-                let runtime_path = self.server.terminal_runtime_key_for_path(&path);
-                let remote_target = self.server.remote_shutdown_target_for_path(&path);
-                let removed_terminal = self
-                    .terminals
-                    .remove_session(&runtime_path, stop_command.as_deref())?;
-                let removed_session = self.server.remove_live_session(&path)?;
-                if removed_session || removed_terminal {
-                    self.remove_preserved_owner_runtime(&runtime_path, "live_session_removed");
-                }
-                self.prune_unrepresented_preserved_owners("live_session_removed");
-                self.persist()?;
-                if let Some((machine, session_id)) = remote_target {
-                    spawn_explicit_remote_session_shutdown(
-                        self.store.home_dir(),
-                        &path,
-                        machine,
-                        session_id,
-                    );
-                }
+                // (The keep-alive DETACH arm above returns early on purpose —
+                // detaching a viewport is not closing a row.)
+                let closed = self.close_live_session_row(&path)?;
+                let removed_terminal = closed.removed_terminal;
+                let removed_session = closed.removed_session;
                 self.snapshot_response(Some(if removed_terminal {
                     format!("closed terminal runtime for {path}")
                 } else if removed_session {
@@ -7415,6 +7759,62 @@ impl DaemonRuntime {
                         .session_app_declares(&runtime_path)
                         .unwrap_or_default(),
                     running: self.terminals.session_is_running(&runtime_path),
+                }
+            }
+            ServerRequest::TerminalTenants { path } => self.terminal_tenants_response(path),
+            ServerRequest::DeclareSessionTenancy {
+                path,
+                created_by,
+                ephemeral,
+            } => {
+                // Reparsed here on purpose: the canonical string is the wire
+                // form, and a value this daemon cannot read back is refused
+                // rather than stored as an unreadable stamp.
+                let created_by = match created_by
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(raw) => Some(
+                        crate::session_tenancy::CreatorStamp::parse(raw)
+                            .ok_or_else(|| anyhow::anyhow!("unparseable creator stamp"))?,
+                    ),
+                    None => None,
+                };
+                let ephemeral = match ephemeral
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(raw) => Some(
+                        crate::session_tenancy::EphemeralDeclaration::parse(raw).ok_or_else(
+                            || anyhow::anyhow!("unparseable ephemerality declaration"),
+                        )?,
+                    ),
+                    None => None,
+                };
+                let declared = self.server.declare_live_session_tenancy(
+                    &path,
+                    created_by.as_ref(),
+                    ephemeral.as_ref(),
+                )?;
+                if !declared {
+                    return Ok(declare_session_tenancy_refusal(&path));
+                }
+                self.persist()?;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "session",
+                    "session_tenancy_declared",
+                    serde_json::json!({
+                        "path": path,
+                        "created_by": created_by.as_ref().map(|stamp| stamp.encode()),
+                        "ephemeral": ephemeral.as_ref().map(|declared| declared.encode()),
+                    }),
+                );
+                ServerResponse::Ack {
+                    message: Some(format!("recorded tenancy for {path}")),
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
@@ -9277,6 +9677,8 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
+        ServerRequest::TerminalTenants { .. } => "terminal_tenants",
+        ServerRequest::DeclareSessionTenancy { .. } => "declare_session_tenancy",
         ServerRequest::ReorderLiveSessions { .. } => "reorder_live_sessions",
         ServerRequest::RowOrderLedgerReport { .. } => "row_order_ledger_report",
         ServerRequest::AcquireProfileWriteLock { .. } => "acquire_profile_write_lock",
@@ -10784,6 +11186,41 @@ pub fn terminal_app_declares(
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal app declares response: {:?}", other),
     }
+}
+
+/// Per-row tenant accounting. `path: None` asks about every live row.
+pub fn terminal_tenants(
+    endpoint: &ServerEndpoint,
+    path: Option<&str>,
+) -> Result<(Vec<crate::session_tenancy::RowTenantReport>, Option<String>)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalTenants {
+            path: path.map(ToOwned::to_owned),
+        },
+    )? {
+        ServerResponse::TerminalTenants { rows, degraded } => Ok((rows, degraded)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal tenants response: {:?}", other),
+    }
+}
+
+/// Record who created a row, and optionally that they declared it ephemeral.
+/// Both values are the canonical strings from [`crate::session_tenancy`].
+pub fn declare_session_tenancy(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    created_by: Option<&str>,
+    ephemeral: Option<&str>,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::DeclareSessionTenancy {
+            path: path.to_string(),
+            created_by: created_by.map(ToOwned::to_owned),
+            ephemeral: ephemeral.map(ToOwned::to_owned),
+        },
+    )?)
 }
 
 pub fn terminal_write(endpoint: &ServerEndpoint, path: &str, data: &str) -> Result<Option<String>> {
@@ -12335,6 +12772,14 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
+                // Pre-declared ephemerality (docs/pending-bugs.md, the immortal
+                // tenant class): rides this EXISTING tick rather than adding a
+                // timer, so an installation where nothing is ever declared
+                // ephemeral pays nothing for the feature.
+                let reaped = run_ephemeral_session_reap_pass(&runtime);
+                if reaped.did_anything() {
+                    mark_daemon_activity(&last_activity_ms);
+                }
                 // Clipboard staging autoclean (docs/pending-bugs.md design):
                 // interval-gated inside, no runtime lock, per-host dir only.
                 let user_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -14352,6 +14797,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         }
     }
 
@@ -14486,7 +14933,8 @@ mod tests {
     /// full DaemonRuntime; the ordering is the part that silently breaks.
     #[test]
     fn the_close_path_writes_a_tombstone_and_persist_reconciles_them() {
-        let source = include_str!("daemon.rs");
+        let source = daemon_product_source();
+        let source = source.as_str();
         let arm = source
             .split("ServerRequest::RemoveSession { path } => {")
             .nth(1)
@@ -14495,12 +14943,18 @@ mod tests {
             .split("ServerRequest::DropTerminalRuntime")
             .next()
             .expect("the end of the RemoveSession arm");
-        let recorded = arm.find("self.tombstone_live_row(&path);").expect(
+        assert!(
+            arm.contains("self.close_live_session_row(&path)?"),
+            "the user's close must go through the ONE close path, not a copy of it"
+        );
+
+        let close = daemon_fn_body(source, "    fn close_live_session_row(&mut self, path: &str)");
+        let recorded = close.find("self.tombstone_live_row(path);").expect(
             "closing a live row must record a tombstone, or a peer daemon undoes the close",
         );
-        let removed = arm
-            .find("self.server.remove_live_session(&path)")
-            .expect("the RemoveSession arm must still remove the row");
+        let removed = close
+            .find("self.server.remove_live_session(path)")
+            .expect("the close path must still remove the row");
         assert!(
             recorded < removed,
             "the tombstone identity is read out of the live order, so it must be \
@@ -14519,6 +14973,322 @@ mod tests {
             "persist() is the chokepoint that clears a revived row's tombstone and \
              expires the deny-list; without it the veto never lifts"
         );
+    }
+
+    /// This file with its `#[cfg(test)]` module stripped, through the
+    /// workspace's ONE test-module skip rule. Every structural lock below scans
+    /// THIS, so the lock's own text can never satisfy the needles it looks for
+    /// (field guide §7.1, the `unwrap_or(len)` trap).
+    fn daemon_product_source() -> String {
+        yggterm_core::agent_cli::product_lines(include_str!("daemon.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One function body out of this file, from its signature to the next
+    /// `fn` at the same indentation. The residual seam for wiring a test
+    /// cannot call (field guide §7.1) — used only where the alternative is a
+    /// live `DaemonRuntime`.
+    fn daemon_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        source
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{signature} is gone; the lock over it is stale"))
+            .split("\n    fn ")
+            .next()
+            .expect("the end of the function")
+    }
+
+    /// The ephemeral reap must ride an EXISTING chore tick. A timer of its own
+    /// would be a standing idle cost on every host, for a feature most rows
+    /// never opt into — the exact thing the GTA-5 doctrine forbids.
+    #[test]
+    fn the_ephemeral_reap_rides_the_existing_chore_tick_and_adds_no_timer() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let chore = source
+            .split("run_preserved_owner_revalidation_if_due(&runtime);")
+            .nth(1)
+            .expect("the chore tick that already exists")
+            .split("match run_background_copy_chore(")
+            .next()
+            .expect("the end of that tick's preamble");
+        assert!(
+            chore.contains("run_ephemeral_session_reap_pass(&runtime)"),
+            "the reap pass must be CALLED from the existing chore tick, or the \
+             declaration never fires"
+        );
+        // The pass is the only entry point, and nothing may spawn for it.
+        let call_sites = source.matches("run_ephemeral_session_reap_pass(&runtime)").count();
+        assert_eq!(
+            call_sites, 1,
+            "one caller only — a second scheduler for this is a second policy"
+        );
+        let pass = daemon_fn_body(
+            source,
+            "fn run_ephemeral_session_reap_pass(\n    runtime: &Arc<Mutex<DaemonRuntime>>,\n) -> crate::session_tenancy::EphemeralReapOutcome {",
+        );
+        assert!(
+            !pass.contains("std::thread::spawn") && !pass.contains("sleep"),
+            "the pass must do its work on the caller's tick, not start anything"
+        );
+    }
+
+    /// The reap is a GRACEFUL, explicit close: it goes through the daemon's one
+    /// close path (tombstone before removal) rather than reaching for the
+    /// terminal manager directly.
+    ///
+    /// It does NOT assert anything about a keep-alive detach branch. The first
+    /// cut did, and that assertion was inert: the branch it claimed the reaper
+    /// "deliberately skips" is unreachable in production, because
+    /// `remove_session_should_detach_keep_alive_runtime` returns a constant
+    /// `false` (a05abb5). Keep-alive's real mechanism — window-close survival,
+    /// and the fact that it does not shield a row from an explicit close — is
+    /// locked behaviourally in
+    /// `a_keep_alive_row_that_declared_itself_ephemeral_is_still_a_candidate`.
+    #[test]
+    fn the_ephemeral_reap_closes_through_the_one_close_path() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let close_row = daemon_fn_body(
+            source,
+            "    fn close_row(&mut self, session_path: &str, reason: crate::session_tenancy::EphemeralReapReason) {",
+        );
+        assert!(
+            close_row.contains("self.runtime.close_live_session_row(session_path)"),
+            "a reap that does not use the shared close path leaves no tombstone, and \
+             a peer daemon hands the row straight back"
+        );
+        assert!(
+            !close_row.contains("self.runtime.terminals.remove_session("),
+            "closing must not bypass the tombstone by dropping the PTY directly"
+        );
+    }
+
+    /// Tenant accounting must never invent a zero. Every unmeasurable case in
+    /// the per-row walk has to end at a NAMED gap, because a row reported as
+    /// costing nothing is exactly the lie this verb exists to remove.
+    #[test]
+    fn the_tenant_walk_degrades_through_a_named_gap_for_every_unmeasurable_row() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let walk = daemon_fn_body(
+            source,
+            "    fn row_tenant_report(\n        &mut self,\n        snapshot: &crate::session_tenancy::ProcSnapshot,\n        path: &str,\n    ) -> crate::session_tenancy::RowTenantReport {",
+        );
+        for gap in [
+            "TenantReportGap::NoLocalRuntime",
+            "TenantReportGap::RuntimeNotRunning",
+            "TenantReportGap::RootPidUnavailable",
+        ] {
+            assert!(
+                walk.contains(gap),
+                "the per-row walk dropped its {gap} guard; that row would report zeros"
+            );
+        }
+        // A row whose PTY another daemon owns is PROXIED, not referred: the
+        // constitution forbids telling the user that daemons exist, and the
+        // owning endpoint is in hand at this exact site (TerminalWrite proxies
+        // from the same lookup). A referral here is the regression.
+        assert!(
+            walk.contains("self.proxied_row_tenant_report(path, &runtime_key, &owner_endpoint)"),
+            "a preserved-owner row must be measured where it lives, not handed back as \
+             'ask that daemon'"
+        );
+        let proxy = daemon_fn_body(
+            source,
+            "    fn proxied_row_tenant_report(\n        &mut self,\n        path: &str,\n        runtime_key: &str,\n        owner_endpoint: &ServerEndpoint,\n    ) -> crate::session_tenancy::RowTenantReport {",
+        );
+        assert!(
+            proxy.contains("terminal_tenants(owner_endpoint, Some(runtime_key))"),
+            "the proxy must actually ASK the owner; anything else is the referral again"
+        );
+        assert!(
+            proxy.contains("row.session_path = path.to_string();"),
+            "the merged answer must come back under OUR row identity, or the caller \
+             learns the owner's key for a row it asked about by another name"
+        );
+        assert!(
+            proxy.matches("TenantReportGap::RuntimeUnreachable").count() >= 2,
+            "an owner that cannot answer must degrade to the named CONDITION — both \
+             when it errors and when it answers with no row"
+        );
+        assert!(
+            !proxy.contains("tenant_count: Some(0)") && !proxy.contains("Default::default()"),
+            "an unreachable owner must never be reported as a cheap row"
+        );
+        assert!(
+            !proxy.contains("handle_preserved_owner_request_error"),
+            "this verb is ShadowAccess::Allow, so an accounting question must not be able \
+             to evict a live owner's registration on a timeout"
+        );
+        // And the whole-reading failure degrades every row for one named
+        // reason rather than answering with an empty, cheap-looking list.
+        let response = daemon_fn_body(
+            source,
+            "    fn terminal_tenants_response(&mut self, path: Option<String>) -> ServerResponse {",
+        );
+        assert!(
+            response.contains("RowTenantReport::unavailable(")
+                && response.contains("degraded: Some(gap.reason().to_string())"),
+            "a /proc reading that failed must say so, per row and for the request"
+        );
+        assert!(
+            !response.contains("std::thread::spawn"),
+            "the verb is on-demand; it may not start background work"
+        );
+    }
+
+    /// A daemon that answers exactly one request with `response`, over a real
+    /// socket. Returns the request it SAW, so a round-trip lock can assert on
+    /// the wire as well as on the answer. `None` = the client never connected,
+    /// which is itself a finding (a short-circuit before the round trip).
+    #[cfg(unix)]
+    fn fake_daemon_answering_once(
+        socket: &Path,
+        response: super::ServerResponse,
+    ) -> std::thread::JoinHandle<Option<super::ServerRequest>> {
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket).expect("bind fake daemon socket");
+        listener
+            .set_nonblocking(true)
+            .expect("fake daemon listener goes non-blocking so the test cannot hang");
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let reader = stream.try_clone().expect("clone the fake daemon stream");
+                        let (request, _identity) =
+                            super::read_request(reader).expect("the fake daemon parses the request");
+                        super::write_response(&mut stream, &response)
+                            .expect("the fake daemon answers the request");
+                        return Some(request);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fake daemon accept failed: {error}"),
+                }
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn tenancy_round_trip_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp socket dir");
+        root
+    }
+
+    /// THE HONESTY LOCK on `"declared"` (round-25 review, finding P2), driven
+    /// as a real round trip rather than scanned for.
+    ///
+    /// The create runner reports what the agent armed. When the daemon holds no
+    /// row for the path it was handed, NOTHING was armed — and the first cut
+    /// still printed `"declared": true`, because it read "the request
+    /// completed" as "the stamp landed". An agent reading its own create output
+    /// would then believe a reap rule exists on a row that carries none.
+    ///
+    /// Behavioural in both directions over one socket: the same client code,
+    /// against a daemon that refuses and a daemon that accepts.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_path_round_trip_reports_declared_false_with_the_daemons_message() {
+        let root = tenancy_round_trip_dir("tenancy-unknown-path");
+        let socket = root.join("server-fake.sock");
+        // The daemon's OWN refusal, not a hand-copied one: if the daemon ever
+        // starts acking an unknown path again, this fake starts acking too and
+        // the assertions below convict the client for believing it.
+        let refusal = super::declare_session_tenancy_refusal("local://gone");
+        assert!(
+            matches!(refusal, super::ServerResponse::Error { .. }),
+            "a declaration against a path with no live row is a failure, not an ack: {refusal:?}"
+        );
+        let daemon = fake_daemon_answering_once(&socket, refusal);
+        let tenancy = crate::session_tenancy::create_terminal_tenancy_from_args(
+            &[
+                "new".to_string(),
+                "--ephemeral".to_string(),
+                "--ephemeral-idle-ttl-secs=1800".to_string(),
+            ],
+            11,
+            "host-a",
+        )
+        .expect("a TTL-only declaration is valid");
+
+        let outcome = crate::declare_created_terminal_tenancy(
+            &super::ServerEndpoint::UnixSocket(socket.clone()),
+            "local://gone",
+            &tenancy,
+        );
+
+        let seen = daemon
+            .join()
+            .expect("the fake daemon thread finishes")
+            .expect("the client actually made the round trip");
+        match &seen {
+            super::ServerRequest::DeclareSessionTenancy {
+                path,
+                created_by,
+                ephemeral,
+            } => {
+                assert_eq!(path, "local://gone");
+                assert!(created_by.is_some(), "the stamp rides the wire");
+                assert_eq!(ephemeral.as_deref(), Some("owner-host=host-a idle-ttl-secs=1800"));
+            }
+            other => panic!("the runner sent {other:?} instead of a tenancy declaration"),
+        }
+        assert_eq!(
+            outcome.get("declared").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a daemon that holds no row for the path armed NOTHING; reporting declared:true \
+             tells the agent it has a reap rule it does not have"
+        );
+        let error = outcome
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("the daemon's own message is handed back");
+        assert!(
+            error.contains("no live session for local://gone"),
+            "the caller must read the daemon's reason, not a rewritten one: {error}"
+        );
+
+        // The other direction, same code: a daemon that records the stamp.
+        let accepted_socket = root.join("server-fake-ok.sock");
+        let accepting = fake_daemon_answering_once(
+            &accepted_socket,
+            super::ServerResponse::Ack {
+                message: Some("recorded tenancy for local://row".to_string()),
+            },
+        );
+        let accepted = crate::declare_created_terminal_tenancy(
+            &super::ServerEndpoint::UnixSocket(accepted_socket),
+            "local://row",
+            &tenancy,
+        );
+        accepting
+            .join()
+            .expect("the accepting fake daemon finishes")
+            .expect("the client made that round trip too");
+        assert_eq!(
+            accepted.get("declared").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "and a stamp that DID land must still read as declared"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     /// Sites in this file still allowed to spell a store path by hand.
@@ -15718,6 +16488,10 @@ mod tests {
             ServerRequest::TerminalSnapshot { path: "p".into() },
             ServerRequest::TerminalRetainedSnapshot { path: "p".into() },
             ServerRequest::TerminalHistory { path: "p".into() },
+            // Pure accounting, and the shadow client is the agent's default
+            // probe surface — auditing what a predecessor left running is the
+            // whole point of the verb.
+            ServerRequest::TerminalTenants { path: None },
         ];
         for req in &allowed {
             assert_eq!(
@@ -15760,6 +16534,16 @@ mod tests {
                 force: false,
             },
             ServerRequest::Shutdown,
+            // Declaring tenancy WRITES a row's metadata and arms the reaper on
+            // it. Role-gating is one of the only two things standing between
+            // this verb and someone else's long-running row (see
+            // `YggtermServer::declare_live_session_tenancy`), so it is listed
+            // here by hand rather than left to the exhaustive match.
+            ServerRequest::DeclareSessionTenancy {
+                path: "p".into(),
+                created_by: None,
+                ephemeral: None,
+            },
         ];
         for req in &denied {
             assert_eq!(
@@ -16174,12 +16958,15 @@ mod tests {
 
     #[test]
     fn explicit_remove_session_drops_local_runtime_before_remote_shutdown() {
-        let source = include_str!("daemon.rs");
+        // The ordering now lives in the ONE close path the RemoveSession arm
+        // delegates to, so the lock follows it there — same guarantee, and it
+        // now covers the ephemeral reaper's close as well.
+        let source = daemon_product_source();
         let remove_session_block = source
-            .split("ServerRequest::RemoveSession { path } => {")
+            .split("fn close_live_session_row(&mut self, path: &str)")
             .nth(1)
-            .and_then(|suffix| suffix.split("ServerRequest::DropTerminalRuntime").next())
-            .expect("remove session handler should be present");
+            .and_then(|suffix| suffix.split("\n    fn ").next())
+            .expect("the shared close path should be present");
 
         let local_drop = remove_session_block
             .find(".remove_session(&runtime_path, stop_command.as_deref())")
@@ -16195,9 +16982,16 @@ mod tests {
             !remove_session_block.contains("terminate_remote_codex_session(machine, session_id)"),
             "explicit close must not synchronously run remote yggterm termination before local close"
         );
+        // The user-facing MESSAGE stays with the request arm, which is what
+        // bulk Close All counts.
+        let arm = source
+            .split("ServerRequest::RemoveSession { path } => {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::DropTerminalRuntime").next())
+            .expect("remove session handler should be present");
         assert!(
-            remove_session_block.contains("if removed_terminal {")
-                && remove_session_block.contains("format!(\"closed terminal runtime for {path}\")"),
+            arm.contains("if removed_terminal {")
+                && arm.contains("format!(\"closed terminal runtime for {path}\")"),
             "runtime-only closes should report as closed so bulk Close All can count them"
         );
     }
@@ -17362,8 +18156,8 @@ mod tests {
         assert!(
             code_of(
                 source,
-                "ServerRequest::RemoveSession { path } => {",
-                "the explicit-close arm",
+                "fn close_live_session_row(&mut self, path: &str)",
+                "the shared close path",
             )
             .contains("tombstone_live_row"),
             "the close path must still tombstone — if this scan cannot find the one \
@@ -18863,6 +19657,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
@@ -18877,6 +19673,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: None,
             restore_reason: Some("update-restart".to_string()),
+            created_by: None,
+            ephemeral: None,
         });
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
@@ -18995,6 +19793,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         let terminals = TerminalManager::new();
 
@@ -19031,6 +19831,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         let terminals = TerminalManager::new();
 
@@ -19068,6 +19870,8 @@ mod tests {
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
+                created_by: None,
+                ephemeral: None,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -19113,6 +19917,8 @@ mod tests {
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
+                created_by: None,
+                ephemeral: None,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -20049,6 +20855,8 @@ mod tests {
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
+                created_by: None,
+                ephemeral: None,
             }],
             session_pty_grids: Vec::new(),
         };
@@ -20876,12 +21684,12 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 2.12.10: `ServerRequest`/`ServerResponse` gained
-        // `TerminalAppDeclares` — daemon-side ingestion of the OSC 7717 declare
-        // channel, so a never-revealed or reaped web surface can be rebuilt
-        // with no client parser (agent-control-plane finding #2).
-        const STAMPED_AT_VERSION: &str = "2.12.10";
-        const STAMPED_SHAPE_HASH: u64 = 0x14d7960b806d144d;
+        // Re-stamped for 2.12.17: `ServerRequest`/`ServerResponse` gained
+        // `TerminalTenants` (on-demand per-row tenant accounting) and
+        // `DeclareSessionTenancy` (creator stamp + opt-in ephemerality), the
+        // wire half of the immortal-tenant fix.
+        const STAMPED_AT_VERSION: &str = "2.12.17";
+        const STAMPED_SHAPE_HASH: u64 = 0xb8cbc10a04de7f46;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

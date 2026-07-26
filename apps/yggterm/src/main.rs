@@ -34,7 +34,8 @@ use yggterm_server::{
     open_stored_session_with_view, ping, reorder_live_sessions_scoped,
     resolve_client_daemon_endpoint, row_order_ledger_report, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_create_terminal_with_tenancy, run_app_control_describe_rows,
+    run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_ensure_web_surface, run_app_control_focus_window,
     run_app_control_grid, run_app_control_key, run_app_control_list_clients,
@@ -579,20 +580,12 @@ fn apply_client_identity_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// THE argv flag rule, shared with the `yggterm-headless` binary and with the
+/// server-side parsers that read the same argv — one implementation, so
+/// `--flag=value` cannot be honoured on one entry point and silently discarded
+/// on another. See [`yggterm_core::cli_args`].
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let inline_prefix = format!("{flag}=");
-    for (index, value) in args.iter().enumerate() {
-        if value == flag {
-            return args
-                .get(index + 1)
-                .map(String::as_str)
-                .filter(|next| !next.starts_with("--"));
-        }
-        if let Some(inline) = value.strip_prefix(&inline_prefix) {
-            return Some(inline);
-        }
-    }
-    None
+    yggterm_core::cli_flag_value(args, flag)
 }
 
 /// Parse the element-addressing flags shared by every `do` verb into ONE
@@ -1341,9 +1334,25 @@ fn print_server_app_help() {
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)
+  yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+      [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
   yggterm server app keytips audit
   yggterm server app command <list|invoke <id>>
 {web_usage}
+row tenancy (server app terminal new): these flags are parsed by the SAME reader
+  as the headless binary's, so they mean one thing on either. Every create from
+  this CLI records the creating pid, this host and --purpose; read it back with
+  `yggterm-headless server terminal tenants` (that verb lives on the headless
+  binary). --ephemeral OPTS IN to reaping and is REFUSED on its own: name
+  --ephemeral-owner-pid <pid> (a process you KNOW outlives the create, i.e. your
+  own pid — under `bash -c` or `ssh host \"<cli>\"` the parent is a wrapper that
+  dies immediately, which is why there is no default), or
+  --ephemeral-idle-ttl-secs <n> for a TTL-only rule, or both. Keep-alive does not
+  shield a declared row — it governs GUI-window-close survival, not an explicit
+  close. Rows made any other way are never reaped. Every flag takes
+  --flag value or --flag=value.
+
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
@@ -3142,13 +3151,18 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
-                        run_app_control_create_terminal(
+                        run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
                             title_hint,
                             purpose,
                             kind,
                             activate,
+                            // Provenance + opt-in ephemerality, parsed by the
+                            // ONE shared reader both binaries call.
+                            Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
+                                &args,
+                            )?),
                             timeout_ms,
                         )
                     }

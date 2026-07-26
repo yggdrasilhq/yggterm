@@ -16,7 +16,7 @@ use yggterm_server::{
     ensure_local_daemon_running, fetch_remote_generation_context,
     persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_split_group, run_app_control_create_terminal,
+    run_app_control_create_split_group, run_app_control_create_terminal_with_tenancy,
     run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_split_pane, run_app_control_focus_window,
@@ -163,6 +163,7 @@ fn print_server_help() {
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin)
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
+  yggterm-headless server terminal tenants [<session>]
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
@@ -197,6 +198,27 @@ fn print_server_app_help() {
   yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
     with no --title the row is named for the driving agent and its purpose
   yggterm-headless server app terminal send <session> (--data <data>|--stdin)
+  yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+      [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
+
+row tenancy (server app terminal new): every create from this CLI is stamped
+  with the creating pid, this host, and --purpose if given; read it back with
+  `server terminal tenants`. --ephemeral additionally OPTS IN to reaping, and it
+  is REFUSED on its own: it needs --ephemeral-owner-pid <pid> naming a process
+  you KNOW outlives the create (your own pid), or --ephemeral-idle-ttl-secs <n>
+  for a TTL-only rule, or both. There is no default owner — under
+  `bash -c \"<cli>\"` the parent is the wrapper bash and under `ssh host \"<cli>\"`
+  it is sshd-session, both dead within milliseconds, so a defaulted owner would
+  reap the row on the next tick. The row is then closed gracefully (tombstone +
+  trace) once the owner pid leaves /proc, or after n seconds with no output.
+  A TTL-only declaration names no owner and is never owner-reaped. Keep-alive
+  does NOT shield a declared row: keep-alive governs whether a runtime survives
+  the GUI WINDOW closing, and an explicit close — which is what a reap is —
+  takes a keep-alive row like any other. Rows created any other way, and rows
+  with no declaration, are never reaped. The check rides an existing daemon
+  chore tick (12-60 s), so a rule fires within about a minute of becoming true,
+  never instantly. Every flag takes --flag value or --flag=value.
 
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
@@ -323,20 +345,12 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     positional
 }
 
+/// THE argv flag rule, shared with the `yggterm` binary and with the
+/// server-side parsers that read the same argv — one implementation, so
+/// `--flag=value` cannot be honoured on one entry point and silently discarded
+/// on another. See [`yggterm_core::cli_args`].
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let inline_prefix = format!("{flag}=");
-    for (index, value) in args.iter().enumerate() {
-        if value == flag {
-            return args
-                .get(index + 1)
-                .map(String::as_str)
-                .filter(|next| !next.starts_with("--"));
-        }
-        if let Some(inline) = value.strip_prefix(&inline_prefix) {
-            return Some(inline);
-        }
-    }
-    None
+    yggterm_core::cli_flag_value(args, flag)
 }
 
 /// Parse the screenshot post-process flags (`--region <name>`, `--crop x,y,w,h`,
@@ -1179,6 +1193,33 @@ fn main() -> Result<()> {
                 "running": running,
                 "declare_count": records.len(),
                 "declares": records,
+            }))?
+        );
+        return Ok(());
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
+        // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant
+        // class). Read-only and ON DEMAND — nothing polls, so asking costs one
+        // /proc reading and idling costs nothing. Connect directly like the
+        // other read-only diagnostics: no version gate, no daemon spawn.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let session_path = args.get(3).map(String::as_str).filter(|value| {
+            !value.starts_with("--")
+        });
+        let (rows, degraded) = yggterm_server::terminal_tenants(&endpoint, session_path)?;
+        let measured = rows
+            .iter()
+            .filter(|row| row.unavailable_reason.is_none())
+            .count();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_path": session_path,
+                "row_count": rows.len(),
+                "measured_rows": measured,
+                "unmeasured_rows": rows.len() - measured,
+                "degraded": degraded,
+                "rows": rows,
             }))?
         );
         return Ok(());
@@ -2245,13 +2286,18 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
-                        run_app_control_create_terminal(
+                        run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
                             title_hint,
                             purpose,
                             kind,
                             activate,
+                            // Provenance + opt-in ephemerality, parsed by the
+                            // ONE shared reader both binaries call.
+                            Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
+                                &args,
+                            )?),
                             timeout_ms,
                         )
                     }
@@ -3170,7 +3216,7 @@ mod tests {
         // The purpose has to REACH the verb, not just be parsed and dropped.
         for source in [headless, gui] {
             let call = source
-                .find("run_app_control_create_terminal(")
+                .find("run_app_control_create_terminal_with_tenancy(")
                 .map(|start| &source[start..start + 220])
                 .expect("the create verb is still called");
             assert!(
