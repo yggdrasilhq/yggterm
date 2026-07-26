@@ -407,6 +407,36 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// How many distinct engine `WebContext`s currently back the open web
+    /// surfaces. With N tabs on one session this must read 1: the context is the
+    /// unit of process pool, network process and cookie jar, and one per tab is
+    /// what the sharing rule exists to prevent. Published into every render
+    /// sample so the invariant is verifiable from telemetry rather than inferred
+    /// from `/proc` process names.
+    pub fn web_surface_context_count(&self) -> usize {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .map(|host| host.web_context_count())
+                .unwrap_or(0);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        0
+    }
+
     /// Whether an open web surface is PLAYING AUDIO right now (engine truth,
     /// from WebKit's media session). The reaper consults this before destroying
     /// a backgrounded surface: an invisible page is not an unwanted page, and a

@@ -3419,25 +3419,38 @@ struct WebSurfaceAppliedCounts {
     total: usize,
     visible: usize,
     stashed: usize,
+    /// Distinct engine `WebContext`s backing those surfaces. The sharing
+    /// invariant made readable: N tabs of one session must show `total: N` with
+    /// `contexts: 1`. A sample where the two track each other means every tab is
+    /// paying for its own process pool, network process and cookie jar.
+    contexts: usize,
 }
 
 fn web_surface_applied_counts(
     handles: &HashMap<(String, u64), WebSurfaceHandle>,
+    contexts: usize,
 ) -> WebSurfaceAppliedCounts {
     WebSurfaceAppliedCounts {
         total: handles.len(),
         visible: handles.values().filter(|handle| handle.visible).count(),
         stashed: handles.values().filter(|handle| handle.stashed).count(),
+        contexts,
     }
 }
+
+/// Published by the reconciler each tick from the GTK-main-thread host, because
+/// the context map is `Rc`-owned there and the probe loop cannot reach it.
+static WEB_SURFACE_CONTEXT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Counts from the reconciler's own publication — never recomputed from
 /// `ShellState`, which does not know what was actually realized.
 fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
+    let contexts = WEB_SURFACE_CONTEXT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     WEB_SURFACE_NATIVE_IDS
         .get()
         .and_then(|registry| registry.lock().ok())
-        .map(|handles| web_surface_applied_counts(&handles))
+        .map(|handles| web_surface_applied_counts(&handles, contexts))
         .unwrap_or_default()
 }
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
@@ -3460,7 +3473,11 @@ fn next_web_surface_generation() -> u64 {
 static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<(String, u64), WebSurfaceHandle>>,
 > = std::sync::OnceLock::new();
-fn publish_web_surface_native_ids(applied: &HashMap<(String, u64), AppliedWebSurface>) {
+fn publish_web_surface_native_ids(
+    applied: &HashMap<(String, u64), AppliedWebSurface>,
+    web_context_count: usize,
+) {
+    WEB_SURFACE_CONTEXT_COUNT.store(web_context_count, std::sync::atomic::Ordering::Relaxed);
     let registry = WEB_SURFACE_NATIVE_IDS.get_or_init(Default::default);
     if let Ok(mut map) = registry.lock() {
         map.clear();
@@ -4217,7 +4234,7 @@ async fn web_surface_native_reconcile_loop(
                     "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');",
                 );
             }
-            publish_web_surface_native_ids(&applied);
+            publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
         }
@@ -4288,7 +4305,7 @@ async fn web_surface_native_reconcile_loop(
                 // session. The only thing a rect would tell us now is positioning
                 // and lazy-create for the ACTIVE surface — both safe to defer — so
                 // keep the active surface's applied state and retry next tick.
-                publish_web_surface_native_ids(&applied);
+                publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
@@ -4930,7 +4947,7 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
-        publish_web_surface_native_ids(&applied);
+        publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
         // Tick pacing with a SWITCH KICK. Chrome mounts on the FIRST render
         // after a session/view switch (the overlay gate is render-time), but
         // the page hole + reveal ride THIS loop — a plain tick sleep leaves
@@ -21059,6 +21076,7 @@ fn render_probe_context(
         "web_surface_views": surfaces.total,
         "web_surface_views_visible": surfaces.visible,
         "web_surface_views_stashed": surfaces.stashed,
+        "web_surface_contexts": surfaces.contexts,
         "window_focused": shell.window_focused,
         "force_foreground": shell.force_foreground,
         "app_control_backgrounded": shell.app_control_backgrounded,
@@ -106260,7 +106278,7 @@ mod tests {
         handles.insert(("local://a".to_string(), 2), handle(2, false, true));
         handles.insert(("local://b".to_string(), 1), handle(3, false, true));
 
-        let counts = web_surface_applied_counts(&handles);
+        let counts = web_surface_applied_counts(&handles, 1);
 
         assert_eq!(counts.total, 3, "two sessions, three realized webviews");
         assert_eq!(counts.visible, 1);
@@ -106269,7 +106287,11 @@ mod tests {
             "soft-stashed surfaces stay alive and cost CPU; that is the whole point of              counting them apart"
         );
         assert_eq!(
-            web_surface_applied_counts(&HashMap::new()),
+            counts.contexts, 1,
+            "three webviews on ONE engine context is the sharing invariant"
+        );
+        assert_eq!(
+            web_surface_applied_counts(&HashMap::new(), 0),
             WebSurfaceAppliedCounts::default()
         );
     }
@@ -106298,6 +106320,7 @@ mod tests {
                 total: 3,
                 visible: 1,
                 stashed: 2,
+                contexts: 1,
             },
         );
 
@@ -106310,6 +106333,10 @@ mod tests {
         assert_eq!(context.get("web_surface_views"), Some(&json!(3)));
         assert_eq!(context.get("web_surface_views_visible"), Some(&json!(1)));
         assert_eq!(context.get("web_surface_views_stashed"), Some(&json!(2)));
+        // The instrument the optimization pass was missing: three webviews on
+        // ONE engine context. When these two track each other, every tab is
+        // paying for its own process pool, network process and cookie jar.
+        assert_eq!(context.get("web_surface_contexts"), Some(&json!(1)));
         // The physical fact, not `effective_window_focused()` — which would
         // read `true` here purely because app-control holds the override.
         assert_eq!(context.get("window_focused"), Some(&json!(false)));
