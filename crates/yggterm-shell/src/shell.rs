@@ -1265,15 +1265,51 @@ struct WebSurfaceTab {
     /// the normal hold. `None` = unleased.
     lease_until_ms: Option<u64>,
 }
+/// Whether the holder of a shared egress-tunnel handle is the LAST one, and may
+/// therefore tear the tunnel down.
+///
+/// The `ssh -N -D` child is the SESSION's egress and is shared by every tab of
+/// that session (see `adopt_web_surface_session_socks`), so the `Arc` is the
+/// refcount and "am I allowed to kill this" is exactly "is my handle the only
+/// one left". Without this guard, closing any ONE tab would sever the tunnel
+/// every sibling tab is still browsing through.
+///
+/// Generic over the payload so the rule is testable without spawning an ssh.
+fn web_surface_forward_is_last_holder<T>(child: &Arc<Mutex<T>>) -> bool {
+    Arc::strong_count(child) == 1
+}
+
 impl WebSurfaceTab {
     fn kill_forward(&self) {
-        if let Some(child) = &self.forward_child
-            && let Ok(mut child) = child.lock()
-        {
+        let Some(child) = &self.forward_child else {
+            return;
+        };
+        if !web_surface_forward_is_last_holder(child) {
+            return;
+        }
+        if let Ok(mut child) = child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+/// Which tab's live SOCKS egress a navigation on `tab_id` should adopt.
+///
+/// `tabs` is `(id, socks_port)` in the surface's own order. The tab's OWN
+/// tunnel wins (nothing to adopt — it already has one); otherwise the
+/// lowest-id sibling that has one. Lowest id rather than "first in the vec"
+/// deliberately: tab order is user-mutable (drag, filing), and a rule that
+/// changes its answer when the user reorders the strip would make egress depend
+/// on chrome layout.
+fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> Option<u64> {
+    if tabs.iter().any(|(id, port)| *id == tab_id && port.is_some()) {
+        return Some(tab_id);
+    }
+    tabs.iter()
+        .filter(|(_, port)| port.is_some())
+        .map(|(id, _)| *id)
+        .min()
 }
 fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
     for tab in &surface.tabs {
@@ -2595,14 +2631,18 @@ fn navigate_web_surface_tab(
         // general surface instability on every address-bar navigation. A loopback
         // `ssh -L` rewrite (socks_port None, forward present) is per-URL and
         // cannot be reused, so this only reuses a real SOCKS tunnel.
+        // ...and REUSE IT ACROSS TABS. The tunnel is the SESSION's egress, not
+        // the tab's: every tab of this surface egresses through the same host, so
+        // a second tab spawning its own `ssh -N -D` buys nothing and costs a
+        // child process here, an SSH handshake, an sshd on the remote and a
+        // listening loopback port. At any real tab count that trips the remote's
+        // MaxStartups long before the GUI notices. `adopt_session_socks` hands
+        // this tab the session's live tunnel (an Arc clone — the tunnel is
+        // refcounted by its holders and torn down by the LAST one, see
+        // `kill_forward`), which is also what makes the tabs share one
+        // WebContext: the proxy is part of `web_context_key`.
         let reuse_socks = remote
-            && state.with(|shell| {
-                shell
-                    .web_surfaces
-                    .get(&session_path)
-                    .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
-                    .is_some_and(|tab| tab.socks_port.is_some())
-            });
+            && state.with_mut(|shell| shell.adopt_web_surface_session_socks(&session_path, tab_id));
         if reuse_socks {
             // SOCKS passes the real URL unchanged, so effective_url == url and
             // socks_port stays put: the reconciler NAVIGATES the live webview
@@ -10774,6 +10814,54 @@ impl ShellState {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+    /// Give `tab_id` the SESSION's live SOCKS egress, and answer whether it now
+    /// has one.
+    ///
+    /// The `ssh -N -D` tunnel belongs to the session's host, and every tab of a
+    /// surface egresses through that same host — so one tunnel serves all of
+    /// them. A tab that already has the tunnel keeps it untouched (this is the
+    /// original per-tab reuse: no re-spawn on re-navigation, so the webview is
+    /// NAVIGATED rather than destroyed and recreated, and a just-set login
+    /// cookie still flushes). A tab with none adopts a sibling's: the `Arc` is
+    /// cloned, which is the refcount that keeps the tunnel alive until the last
+    /// tab holding it goes away.
+    ///
+    /// This is what stops N tabs on a remote session from becoming N ssh
+    /// children, N handshakes, N remote sshds and N loopback ports.
+    fn adopt_web_surface_session_socks(&mut self, session_path: &str, tab_id: u64) -> bool {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return false;
+        };
+        let ports: Vec<(u64, Option<u16>)> = surface
+            .tabs
+            .iter()
+            .map(|tab| (tab.id, tab.socks_port))
+            .collect();
+        let Some(donor_id) = web_surface_socks_egress_donor(&ports, tab_id) else {
+            return false;
+        };
+        if donor_id == tab_id {
+            return true;
+        }
+        let Some((port, child)) = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == donor_id)
+            .map(|donor| (donor.socks_port, donor.forward_child.clone()))
+        else {
+            return false;
+        };
+        let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        // The adopting tab may itself hold a stale forward (an `ssh -L`
+        // fallback from an earlier navigation). Release it first, honoring the
+        // same last-holder rule.
+        tab.kill_forward();
+        tab.socks_port = port;
+        tab.forward_child = child;
+        true
     }
     /// Navigate a tab that KEEPS its existing SOCKS egress (see
     /// `navigate_web_surface_tab`): update the URL + history but leave
@@ -50480,6 +50568,65 @@ mod web_do_verb_tests {
         // Zero hold still honors a live lease.
         assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000), false));
         assert!(web_surface_reap_due(2_000, None, 0, None, false));
+    }
+
+    /// ONE TUNNEL PER SESSION, NOT PER TAB. `ssh -N -D` is the session's egress:
+    /// every tab of a surface reaches the same host through it. Reuse used to be
+    /// keyed on the TAB, and `web_surface_new_tab` mints `socks_port: None`, so
+    /// each new tab spawned its own — N ssh children on the GUI host, N
+    /// handshakes, N sshds on the remote and N listening loopback ports, which
+    /// trips the remote's MaxStartups long before anything here notices.
+    #[test]
+    fn a_new_tab_adopts_the_sessions_socks_egress() {
+        // The tab's own tunnel always wins: nothing to adopt, and re-spawning
+        // would churn the port and force a webview destroy+recreate.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, Some(1080)), (2, Some(1081))], 2),
+            Some(2)
+        );
+        // A fresh tab (socks_port None) borrows the session's live tunnel
+        // instead of spawning a second one.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, Some(1080)), (7, None)], 7),
+            Some(1)
+        );
+        // Deterministic on the TAB ID, not on strip order — tab order is
+        // user-mutable (drag, filing) and egress must not follow chrome layout.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(9, Some(1090)), (3, Some(1030)), (7, None)], 7),
+            Some(3)
+        );
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(3, Some(1030)), (9, Some(1090)), (7, None)], 7),
+            Some(3)
+        );
+        // A LOCAL session has no tunnel at all: nothing to adopt, and the
+        // caller must fall through to real resolution rather than assume one.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, None), (2, None)], 2),
+            None
+        );
+        assert_eq!(web_surface_socks_egress_donor(&[], 1), None);
+    }
+
+    /// The refcount that makes sharing safe. With one tunnel serving N tabs,
+    /// closing ANY tab used to kill it — severing egress for every sibling still
+    /// browsing through it. Only the last holder may tear it down.
+    #[test]
+    fn a_shared_egress_tunnel_dies_only_with_its_last_holder() {
+        let tunnel = Arc::new(Mutex::new(1080_u16));
+        assert!(
+            web_surface_forward_is_last_holder(&tunnel),
+            "a tunnel only one tab holds is that tab's to kill"
+        );
+        let sibling = tunnel.clone();
+        assert!(!web_surface_forward_is_last_holder(&tunnel));
+        assert!(!web_surface_forward_is_last_holder(&sibling));
+        drop(sibling);
+        assert!(
+            web_surface_forward_is_last_holder(&tunnel),
+            "once the sibling is gone the survivor may reap"
+        );
     }
 
     /// INVISIBLE IS NOT UNWANTED. The user's stated constraint is a background
