@@ -258,7 +258,12 @@ around it; the spike also evaluates WebKitGTK's built-in **automation/WebDriver
 input dispatch** (a Layer-1 path) against raw GDK synthesis. Delivery into an
 **unmapped/minimized** webview is a second, narrower question — a demoted-but-
 attached surface is expected to accept events; a fully unmapped one may need a
-transient off-screen map, or `do` on it defers to the farm plane. On NO-GO,
+transient off-screen map, or `do` on it defers to the farm plane. **Settled
+2026-07-27: the transient map SHIPPED, and it had to** — page-visibility
+throttling now unmaps every surface nobody is being revealed, so "unmapped" is
+the ordinary state of an agent's target rather than an edge case. The engine
+host wakes a view IT hid for the length of an injection burst and re-hides it
+after the last event. On NO-GO,
 `do` moves to the farm plane (slice 4) and 2b still ships read/wait/capture/
 lease without trusted `do`.
 
@@ -1133,9 +1138,9 @@ sub-slice:
 | Risk | Signal | Mitigation / fallback |
 |---|---|---|
 | ~~`isTrusted`-true injection may be impossible in WebKitGTK without the seat (the central gate)~~ **RESOLVED — GO (2026-07-20)** | slice-2a proof (done) | `gdk_event_new` button + webview `GdkWindow`/seat device → `WidgetExt::event` = trusted click, no seat move (`docs/spikes/slice2a-istrusted-inject`). `do` on the GUI plane. Remaining sub-risk: delivery into a *demoted/unmapped* webview (below) |
-| ~~Injection into a not-visible webview may differ from the mapped case~~ **RESOLVED (2026-07-20)** | spike | injection into an **unmapped** webview delivers nothing (`events=[]`); a **mapped** one (incl. the soft-stash demote, which stays mapped) works. So `do` works on soft-stashed surfaces; a hard-stashed/hidden surface needs a transient off-screen map or defers to the farm. read + capture DO work while hidden (capture fresh) |
+| ~~Injection into a not-visible webview may differ from the mapped case~~ **RESOLVED (2026-07-20), REMEDY SHIPPED (2026-07-27)** | spike | injection into an **unmapped** webview delivers nothing (`events=[]`); a **mapped** one works. read + capture DO work while hidden (capture fresh). Since page-visibility throttling unmaps every unrevealed surface, the engine host now **wakes a view it hid** for the injection burst (re-checking `is_mapped` and failing closed with `surface_not_mapped` if the map did not take) and re-hides it after the last event. A surface it did NOT hide — a detached hard stash — still refuses, because showing the child of a parentless container maps nothing |
 | Surface recreated under a queued verb/lease (reused native id) | slice-2b | durable handle `(session, tab, generation)`; verbs fail closed with `stale_handle`; cancellation on recreate (Action & lifecycle) |
-| GTK/WebKit event delivery into an unmapped/minimized webview | slice-2a spike | transient off-screen map for the injection; else defer hidden-surface `do` to the farm plane (same verb) |
+| ~~GTK/WebKit event delivery into an unmapped/minimized webview~~ **CLOSED (2026-07-27)** | slice-2a spike | transient map for the injection, inside the engine host so no call site can forget it: borrow-and-give-back with a per-surface re-arm token, the same shape as the keyboard-focus loan, and a give-back that refuses to re-hide a surface the reconciler has since revealed |
 | `webkit.snapshot` on a truly backgrounded surface returns blank/stale | slice-2 spike | soft-stash keeps it attached+composited; if snapshot still needs a live view, briefly promote-under-lease, capture, demote |
 | Two agents `do` the same surface concurrently | slice-2 | per-surface input serialized **FIFO by arrival**, one in flight at a time, both journaled (deterministic ordering, no timing-dependent interleave); human preempts |
 | Lease outlives a dead agent | always | TTL + journaled; reconciler reaps on expiry exactly like the background hold |
@@ -1544,8 +1549,12 @@ inside a frame, with a session-bound captcha on every POST.
    that actually blocks flows — reading a same-origin `<img>` (captcha, QR, chart) —
    it does not. → **`web capture-element --session <s> --selector <sel> <out.png>`**
    implemented in-page as `canvas.drawImage(el) → toDataURL()`. Compositor-
-   independent, works on an unmapped surface today. Does not replace the full-frame
-   snapshot; removes the reason most flows wanted one.
+   independent, works on an unmapped surface today — and therefore keeps working
+   unchanged now that every unrevealed surface is deliberately unmapped. (A page
+   whose canvas is painted BY a `rAF` loop legitimately stops updating once
+   hidden, so a capture of such a canvas returns its last painted frame: that is
+   the Page Visibility contract working, not a capture regression.) Does not
+   replace the full-frame snapshot; removes the reason most flows wanted one.
 3. **★★ `web do` single-shot is disqualifying, not annoying.** This form has **31
    fields**. Second independent site to hit the preempt-on-own-injection bug. →
    beyond the recorded counter fix, **`web batch --session <s> --agent <id>
