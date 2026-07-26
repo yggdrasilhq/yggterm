@@ -30,6 +30,13 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
+use yggterm_core::cli_flag_value;
+
+/// The host token written when this machine cannot name itself. It is NOT an
+/// identity: two hosts that both fall back both write it, so a declaration
+/// carrying it can never be matched against a local pid — see
+/// [`owner_liveness_on_host`].
+pub const UNKNOWN_HOST_TOKEN: &str = "unknown-host";
 
 /// Metadata label carrying [`CreatorStamp`].
 pub const CREATED_BY_METADATA_LABEL: &str = "Created By";
@@ -169,8 +176,10 @@ impl EphemeralDeclaration {
     }
 
     /// A declaration that can never fire is a declaration the caller did not
-    /// finish making. Kept as a predicate so the CLI can refuse it at the point
-    /// of typing rather than leaving a row marked-but-immortal.
+    /// finish making. THE predicate behind the create-time refusal
+    /// ([`EPHEMERAL_NEEDS_AN_EXPLICIT_RULE`]) — refusing at the point of typing
+    /// rather than leaving a row marked-but-immortal — and read there, not only
+    /// by tests.
     pub fn declares_a_rule(&self) -> bool {
         self.owner_pid.is_some() || self.idle_ttl_secs.is_some()
     }
@@ -188,39 +197,58 @@ pub struct CreateTerminalTenancy {
     pub ephemeral: Option<EphemeralDeclaration>,
 }
 
+/// Why a bare `--ephemeral` is REFUSED rather than defaulted.
+///
+/// Measured on this fleet, not reasoned about: under `bash -c "<cli>"` the
+/// parent this CLI would record is the wrapper `bash`, which exits within
+/// milliseconds of the create; under `ssh <host> "<cli>"` it is the
+/// `sshd-session` process, which dies at disconnect. Either way a defaulted
+/// owner is a process that is ALREADY GONE when the first chore tick runs, so
+/// `--ephemeral` would reap the row inside a minute — the exact opposite of
+/// what the caller asked for, and unrecoverable once the row is closed. The
+/// two honest spellings are named in the message because the refusal has to
+/// teach, not just refuse.
+pub const EPHEMERAL_NEEDS_AN_EXPLICIT_RULE: &str = "--ephemeral needs a rule this daemon can honestly check. Pass \
+     --ephemeral-owner-pid <pid> naming a process you KNOW outlives this create (your own \
+     pid — not the shell that wrapped it), or --ephemeral-idle-ttl-secs <n> for a \
+     TTL-only declaration, or both. There is no default owner: under `bash -c \"<cli>\"` \
+     the recorded parent is the wrapper bash and under `ssh <host> \"<cli>\"` it is \
+     sshd-session, and both are dead within milliseconds of the create, so a defaulted \
+     owner would reap the row on the next chore tick.";
+
 /// Parse the tenancy flags of an agent CLI `terminal new`.
 ///
 /// | flag | effect |
 /// |---|---|
 /// | `--purpose <text>` | recorded on the stamp; always optional |
-/// | `--ephemeral` | opt IN to the reaper |
+/// | `--ephemeral` | opt IN to the reaper; needs one of the two rules below |
 /// | `--ephemeral-owner-pid <pid>` | reap once that pid leaves `/proc` |
 /// | `--ephemeral-idle-ttl-secs <n>` | reap after `n` seconds with no output |
 ///
-/// **`--ephemeral` alone defaults the owner to the CALLER'S PARENT process**,
-/// because that is the process that asked for the row: when it is gone, the
-/// probe it wanted the row for is abandoned by definition. A caller whose row
-/// must outlive its own shell has to say so — pass an explicit owner pid, or an
-/// idle TTL, or both. The declaration is echoed back in the create response so
-/// there is never a hidden policy: what the caller armed is what it reads.
+/// **A bare `--ephemeral` is refused** — see [`EPHEMERAL_NEEDS_AN_EXPLICIT_RULE`]
+/// for the measurement behind that. A TTL-only declaration (`--ephemeral
+/// --ephemeral-idle-ttl-secs <n>`) names no owner at all: `owner_pid` is `None`
+/// and [`ephemeral_reap_reason`] never consults owner liveness for it.
 ///
-/// The ephemeral flags are refused without `--ephemeral`, so a typo cannot
-/// leave a caller believing it armed a rule it did not.
+/// The ephemeral rule flags are refused without `--ephemeral`, so a typo cannot
+/// leave a caller believing it armed a rule it did not. Every flag is read
+/// through the ONE argv rule ([`yggterm_core::cli_flag_value`]), so
+/// `--ephemeral-owner-pid=4242` and `--ephemeral-owner-pid 4242` are the same
+/// declaration; a parser that honoured only the spaced form silently discarded
+/// the inline one and fell back to the default that no longer exists.
 pub fn create_terminal_tenancy_from_args(
     args: &[String],
     creator_pid: u32,
-    default_owner_pid: u32,
     host: &str,
-    purpose: Option<&str>,
 ) -> Result<CreateTerminalTenancy, String> {
     let ephemeral_requested = args.iter().any(|arg| arg == "--ephemeral");
-    let owner_pid = flag_value(args, "--ephemeral-owner-pid")
+    let owner_pid = cli_flag_value(args, "--ephemeral-owner-pid")
         .map(|raw| {
             raw.parse::<u32>()
                 .map_err(|_| format!("--ephemeral-owner-pid expects a pid, got {raw:?}"))
         })
         .transpose()?;
-    let idle_ttl_secs = flag_value(args, "--ephemeral-idle-ttl-secs")
+    let idle_ttl_secs = cli_flag_value(args, "--ephemeral-idle-ttl-secs")
         .map(|raw| {
             raw.parse::<u64>()
                 .map_err(|_| format!("--ephemeral-idle-ttl-secs expects seconds, got {raw:?}"))
@@ -236,33 +264,29 @@ pub fn create_terminal_tenancy_from_args(
             "--ephemeral-owner-pid / --ephemeral-idle-ttl-secs need --ephemeral".to_string(),
         );
     }
+    let ephemeral =
+        ephemeral_requested.then(|| EphemeralDeclaration::new(owner_pid, host, idle_ttl_secs));
+    // A declaration that can never fire is a declaration the caller did not
+    // finish making — read off the ONE predicate that decides that, so the
+    // refusal and the reap decision cannot drift apart.
+    if ephemeral
+        .as_ref()
+        .is_some_and(|declaration| !declaration.declares_a_rule())
+    {
+        return Err(EPHEMERAL_NEEDS_AN_EXPLICIT_RULE.to_string());
+    }
     Ok(CreateTerminalTenancy {
-        created_by: CreatorStamp::new(creator_pid, host, purpose),
-        ephemeral: ephemeral_requested.then(|| {
-            EphemeralDeclaration::new(
-                Some(owner_pid.unwrap_or(default_owner_pid)),
-                host,
-                idle_ttl_secs,
-            )
-        }),
+        created_by: CreatorStamp::new(creator_pid, host, cli_flag_value(args, "--purpose")),
+        ephemeral,
     })
 }
 
-fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2)
-        .find_map(|window| (window[0] == flag).then(|| window[1].as_str()))
-}
-
-/// The process that invoked this CLI's own parent — the default ephemeral
-/// owner. See [`create_terminal_tenancy_from_args`].
-#[cfg(unix)]
-pub fn calling_process_parent_pid() -> u32 {
-    unsafe { libc::getppid() }.max(1) as u32
-}
-
-#[cfg(not(unix))]
-pub fn calling_process_parent_pid() -> u32 {
-    std::process::id()
+/// The ONE place either binary turns its argv into a tenancy declaration.
+/// `yggterm` and `yggterm-headless` are both the agent CLI and the flags must
+/// mean the same thing on either, so neither binary carries a copy of this.
+pub fn agent_cli_create_terminal_tenancy(args: &[String]) -> anyhow::Result<CreateTerminalTenancy> {
+    create_terminal_tenancy_from_args(args, std::process::id(), &local_host_token())
+        .map_err(|message| anyhow::anyhow!(message))
 }
 
 /// What this daemon can honestly say about the declared owner process.
@@ -303,22 +327,26 @@ pub struct EphemeralCandidate {
     /// Whether the row's own runtime is still running. A row whose runtime
     /// already exited is left to the ordinary paths.
     pub running: bool,
-    /// Whether the row is marked keep-alive. See
-    /// [`ephemeral_reap_reason`] for the ruling.
-    pub keep_alive: bool,
 }
 
 /// THE reap decision. Pure, so the ruling is one readable expression and every
 /// clause can be mutated to prove its own lock.
 ///
-/// **Ephemeral beats keep-alive, deliberately.** Keep-alive means "the runtime
-/// survives the VIEWPORT closing" — it is a default that agent CLI kinds are
-/// BORN with, and a user policy when set by hand. `--ephemeral` is neither a
-/// default nor a user policy: it is the same agent, at creation, saying when it
-/// wants its own row back. Two agent declarations about one row, and the later,
-/// more specific one wins. The user is protected by a different rule — the flag
-/// only exists on the agent CLI create path, so a row the user made carries no
-/// declaration and never reaches this function at all.
+/// **Keep-alive is not an input here, and that is not an override.** Read off
+/// the shipped code: keep-alive governs whether a runtime survives the GUI
+/// WINDOW closing (`PrepareClientClose` closes `non_keep_alive_live_session_paths`
+/// and keeps the rest). It has never governed an explicit close —
+/// `remove_session_should_detach_keep_alive_runtime` is a constant `false`, so
+/// `RemoveSession` destroys a keep-alive row exactly like any other. A reap is
+/// an explicit close, so a declared-ephemeral row is reaped whether or not it is
+/// marked keep-alive; there is no keep-alive branch to skip. The user is
+/// protected by a different rule entirely — the flag exists only on the agent
+/// CLI create path, so a row the user made carries no declaration and never
+/// reaches this function at all.
+///
+/// **A declaration that names no owner never asks about one.** A TTL-only
+/// declaration is `owner_pid: None`, and no liveness verdict — not even `Gone`
+/// — may reap it: the caller declared a silence rule and nothing else.
 pub fn ephemeral_reap_reason(
     candidate: &EphemeralCandidate,
     owner: OwnerLiveness,
@@ -326,7 +354,7 @@ pub fn ephemeral_reap_reason(
     if !candidate.running {
         return None;
     }
-    if owner == OwnerLiveness::Gone {
+    if candidate.declaration.owner_pid.is_some() && owner == OwnerLiveness::Gone {
         return Some(EphemeralReapReason::OwnerGone);
     }
     let ttl = candidate.declaration.idle_ttl_secs?;
@@ -445,6 +473,16 @@ impl ProcSnapshot {
     }
 
     /// Strict descendants of `root`, breadth first, cycle-safe.
+    ///
+    /// RESIDUAL (round-25 review, unbuilt): a tenant that REPARENTS away — a
+    /// daemonised child, or anything orphaned to pid 1 — leaves this walk and
+    /// stops being counted, while it is still very much running and still very
+    /// much the row's fault. The honest fix is a second reading keyed on the
+    /// PTY's session id (`/proc/<pid>/stat` field 6, the sid every process
+    /// under the row inherits) unioned with this tree; it is deliberately not
+    /// built here because it widens what the reaper's cost numbers mean, and
+    /// this lane only measures. Until then an under-count is the failure
+    /// direction — the verb never invents a tenant it cannot see.
     fn descendants(&self, root: u32) -> Vec<&ProcEntry> {
         let mut seen: HashSet<u32> = HashSet::from([root]);
         let mut queue: VecDeque<u32> = VecDeque::from([root]);
@@ -487,7 +525,12 @@ pub enum TenantReportGap {
     NotSupportedOnPlatform,
     ProcUnreadable,
     NoLocalRuntime,
-    PreservedOwnerDaemon,
+    /// The row's runtime could not be reached to be measured. **Names the
+    /// CONDITION, never the topology.** The user must never have to learn that
+    /// more than one daemon exists (the constitution), so a row whose PTY lives
+    /// in another daemon is PROXIED to it and merged — this reason is left for
+    /// the case where that owner genuinely cannot answer.
+    RuntimeUnreachable,
     RuntimeNotRunning,
     RootPidUnavailable,
     RootPidNotInProc,
@@ -499,7 +542,7 @@ impl TenantReportGap {
             Self::NotSupportedOnPlatform => "not_supported_on_platform",
             Self::ProcUnreadable => "proc_unreadable",
             Self::NoLocalRuntime => "no_local_runtime",
-            Self::PreservedOwnerDaemon => "preserved_owner_daemon",
+            Self::RuntimeUnreachable => "runtime_unreachable",
             Self::RuntimeNotRunning => "runtime_not_running",
             Self::RootPidUnavailable => "root_pid_unavailable",
             Self::RootPidNotInProc => "root_pid_not_in_proc",
@@ -512,10 +555,8 @@ impl TenantReportGap {
                 "process accounting needs /proc; this platform has none"
             }
             Self::ProcUnreadable => "/proc could not be read on this host",
-            Self::NoLocalRuntime => "this daemon holds no PTY for the row",
-            Self::PreservedOwnerDaemon => {
-                "the PTY belongs to a preserved-owner daemon; ask that daemon"
-            }
+            Self::NoLocalRuntime => "no runtime is registered for this row",
+            Self::RuntimeUnreachable => "the row's runtime did not answer; retry in a moment",
             Self::RuntimeNotRunning => "the row's runtime process has exited",
             Self::RootPidUnavailable => "the runtime reports no process id",
             Self::RootPidNotInProc => "the runtime's process id is no longer in /proc",
@@ -776,6 +817,13 @@ fn clock_ticks_per_sec() -> u64 {
 /// alive, which keeps a row that should have gone; the reverse would destroy a
 /// row whose owner is working. Only a host that matches the declaration answers
 /// at all.
+///
+/// **The unknown-host sentinel is never a match.** [`local_host_token`] falls
+/// back to [`UNKNOWN_HOST_TOKEN`] when this machine cannot name itself, and
+/// [`sanitize_token`] writes the same string for an empty one — so two
+/// different machines can both carry it, and matching them would let daemon A
+/// answer "gone" about a pid that only ever existed on machine B. A row is
+/// worth more than a reap.
 #[cfg(unix)]
 pub fn owner_liveness_on_host(
     declaration: &EphemeralDeclaration,
@@ -784,7 +832,11 @@ pub fn owner_liveness_on_host(
     let Some(owner_pid) = declaration.owner_pid else {
         return OwnerLiveness::Unknown;
     };
-    if declaration.owner_host != sanitize_token(local_host) {
+    let local_host = sanitize_token(local_host);
+    if local_host == UNKNOWN_HOST_TOKEN || declaration.owner_host == UNKNOWN_HOST_TOKEN {
+        return OwnerLiveness::Unknown;
+    }
+    if declaration.owner_host != local_host {
         return OwnerLiveness::Unknown;
     }
     if std::path::Path::new(&format!("/proc/{owner_pid}")).exists() {
@@ -814,7 +866,7 @@ pub fn local_host_token() -> String {
                 .map(|value| value.trim().to_string())
         })
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown-host".to_string());
+        .unwrap_or_else(|| UNKNOWN_HOST_TOKEN.to_string());
     sanitize_token(&raw)
 }
 
@@ -825,7 +877,7 @@ fn sanitize_token(value: &str) -> String {
         .map(|ch| if ch.is_whitespace() { '-' } else { ch })
         .collect();
     if cleaned.is_empty() {
-        "unknown-host".to_string()
+        UNKNOWN_HOST_TOKEN.to_string()
     } else {
         cleaned
     }
@@ -859,14 +911,12 @@ mod tests {
         declaration: EphemeralDeclaration,
         idle_secs: Option<u64>,
         running: bool,
-        keep_alive: bool,
     ) -> EphemeralCandidate {
         EphemeralCandidate {
             session_path: "local://row".to_string(),
             declaration,
             idle_secs,
             running,
-            keep_alive,
         }
     }
 
@@ -912,7 +962,7 @@ mod tests {
 
     #[test]
     fn a_gone_owner_reaps_and_a_live_one_does_not() {
-        let candidate = candidate(declaration(Some(11), None), Some(0), true, false);
+        let candidate = candidate(declaration(Some(11), None), Some(0), true);
         assert_eq!(
             ephemeral_reap_reason(&candidate, OwnerLiveness::Gone),
             Some(EphemeralReapReason::OwnerGone)
@@ -925,11 +975,40 @@ mod tests {
 
     #[test]
     fn an_unknown_owner_never_reaps() {
-        let candidate = candidate(declaration(Some(11), None), Some(999_999), true, false);
+        let candidate = candidate(declaration(Some(11), None), Some(999_999), true);
         assert_eq!(
             ephemeral_reap_reason(&candidate, OwnerLiveness::Unknown),
             None,
             "a daemon that cannot see the owner must not guess it is dead"
+        );
+    }
+
+    /// THE TTL-ONLY LOCK (round-25 review, finding P0). A declaration that
+    /// names no owner must never be reaped by an owner verdict — not even
+    /// `Gone`, which is what a daemon answers about a pid that was never
+    /// declared. This is the shape a caller is left with once a bare
+    /// `--ephemeral` is refused, so if it can be owner-reaped the refusal
+    /// pushed callers from one footgun onto another.
+    #[test]
+    fn a_ttl_only_declaration_is_never_reaped_by_an_owner_verdict() {
+        let ttl_only = declaration(None, Some(3_600));
+        assert_eq!(ttl_only.owner_pid, None);
+        for owner in [
+            OwnerLiveness::Gone,
+            OwnerLiveness::Alive,
+            OwnerLiveness::Unknown,
+        ] {
+            assert_eq!(
+                ephemeral_reap_reason(&candidate(ttl_only.clone(), Some(10), true), owner),
+                None,
+                "a TTL-only row must wait out its TTL, whatever {owner:?} says about an \
+                 owner it never named"
+            );
+        }
+        assert_eq!(
+            ephemeral_reap_reason(&candidate(ttl_only, Some(3_600), true), OwnerLiveness::Gone),
+            Some(EphemeralReapReason::IdleTtl),
+            "and when it does fire, it fires as the rule the caller actually declared"
         );
     }
 
@@ -938,23 +1017,20 @@ mod tests {
         let declared = declaration(None, Some(60));
         assert_eq!(
             ephemeral_reap_reason(
-                &candidate(declared.clone(), Some(59), true, false),
+                &candidate(declared.clone(), Some(59), true),
                 OwnerLiveness::Unknown
             ),
             None
         );
         assert_eq!(
             ephemeral_reap_reason(
-                &candidate(declared.clone(), Some(60), true, false),
+                &candidate(declared.clone(), Some(60), true),
                 OwnerLiveness::Unknown
             ),
             Some(EphemeralReapReason::IdleTtl)
         );
         assert_eq!(
-            ephemeral_reap_reason(
-                &candidate(declared, None, true, false),
-                OwnerLiveness::Unknown
-            ),
+            ephemeral_reap_reason(&candidate(declared, None, true), OwnerLiveness::Unknown),
             None,
             "a row whose idle time is unknown cannot be idle-reaped"
         );
@@ -965,7 +1041,7 @@ mod tests {
         let declared = EphemeralDeclaration::new(None, "host-a", None);
         assert_eq!(
             ephemeral_reap_reason(
-                &candidate(declared, Some(u64::MAX), true, false),
+                &candidate(declared, Some(u64::MAX), true),
                 OwnerLiveness::Unknown
             ),
             None
@@ -976,36 +1052,11 @@ mod tests {
     fn an_already_exited_runtime_is_left_alone() {
         assert_eq!(
             ephemeral_reap_reason(
-                &candidate(declaration(Some(11), Some(1)), Some(9_999), false, false),
+                &candidate(declaration(Some(11), Some(1)), Some(9_999), false),
                 OwnerLiveness::Gone
             ),
             None
         );
-    }
-
-    /// THE RULING, locked: an explicit `--ephemeral` outranks keep-alive.
-    /// Mutating the decision to bail on `keep_alive` turns this red.
-    #[test]
-    fn an_explicit_ephemeral_declaration_outranks_keep_alive() {
-        for reason in [
-            (
-                declaration(Some(11), None),
-                OwnerLiveness::Gone,
-                EphemeralReapReason::OwnerGone,
-            ),
-            (
-                declaration(None, Some(10)),
-                OwnerLiveness::Unknown,
-                EphemeralReapReason::IdleTtl,
-            ),
-        ] {
-            let (declared, owner, expected) = reason;
-            assert_eq!(
-                ephemeral_reap_reason(&candidate(declared, Some(600), true, true), owner),
-                Some(expected),
-                "keep-alive is a default the same agent overrode at creation"
-            );
-        }
     }
 
     #[test]
@@ -1061,7 +1112,6 @@ mod tests {
             declaration: declared,
             idle_secs: idle,
             running: true,
-            keep_alive: false,
         }
     }
 
@@ -1198,7 +1248,7 @@ mod tests {
             TenantReportGap::NotSupportedOnPlatform,
             TenantReportGap::ProcUnreadable,
             TenantReportGap::NoLocalRuntime,
-            TenantReportGap::PreservedOwnerDaemon,
+            TenantReportGap::RuntimeUnreachable,
             TenantReportGap::RuntimeNotRunning,
             TenantReportGap::RootPidUnavailable,
             TenantReportGap::RootPidNotInProc,
@@ -1211,6 +1261,40 @@ mod tests {
             assert_eq!(report.oldest_tenant_age_secs, None);
             assert_eq!(report.root_pid, None);
             assert!(!gap.reason().is_empty());
+        }
+    }
+
+    /// THE CONSTITUTION LOCK on this verb's vocabulary: the user must never
+    /// have to learn that more than one daemon exists, so a gap may name the
+    /// CONDITION ("the runtime did not answer") and never the topology ("ask
+    /// the other daemon"). A row on a preserved owner is proxied and merged;
+    /// what is left is an honest "could not reach it".
+    #[test]
+    fn no_gap_leaks_the_daemon_topology_to_the_person_reading_it() {
+        for gap in [
+            TenantReportGap::NotSupportedOnPlatform,
+            TenantReportGap::ProcUnreadable,
+            TenantReportGap::NoLocalRuntime,
+            TenantReportGap::RuntimeUnreachable,
+            TenantReportGap::RuntimeNotRunning,
+            TenantReportGap::RootPidUnavailable,
+            TenantReportGap::RootPidNotInProc,
+        ] {
+            for text in [gap.reason(), gap.detail()] {
+                let text = text.to_ascii_lowercase();
+                for leak in [
+                    "daemon",
+                    "preserved_owner",
+                    "preserved owner",
+                    "owner daemon",
+                ] {
+                    assert!(
+                        !text.contains(leak),
+                        "{:?} says {text:?}, which tells the user about {leak}",
+                        gap
+                    );
+                }
+            }
         }
     }
 
@@ -1302,9 +1386,7 @@ mod tests {
         let plain = create_terminal_tenancy_from_args(
             &argv(&["new", "--kind", "shell", "--purpose", "probe"]),
             11,
-            22,
             "host-a",
-            Some("probe"),
         )
         .expect("a create with no ephemeral flag is valid");
         assert_eq!(plain.ephemeral, None, "no flag, no reap rule");
@@ -1312,17 +1394,55 @@ mod tests {
         assert_eq!(plain.created_by.purpose.as_deref(), Some("probe"));
 
         let declared = create_terminal_tenancy_from_args(
-            &argv(&["new", "--ephemeral"]),
+            &argv(&["new", "--ephemeral", "--ephemeral-owner-pid", "4242"]),
             11,
-            22,
             "host-a",
-            None,
         )
-        .expect("--ephemeral alone is valid");
+        .expect("an ephemeral create naming its owner is valid");
         assert_eq!(
             declared.ephemeral,
-            Some(EphemeralDeclaration::new(Some(22), "host-a", None)),
-            "--ephemeral alone defaults the owner to the caller's parent"
+            Some(EphemeralDeclaration::new(Some(4242), "host-a", None)),
+        );
+    }
+
+    /// THE OWNER-DEFAULT LOCK (round-25 review, finding P0). A bare
+    /// `--ephemeral` used to default the owner to the caller's PARENT, which
+    /// under `bash -c` is the wrapper shell and under `ssh host "<cli>"` is
+    /// sshd-session — both already dead when the first chore tick runs. Arming
+    /// owner-gone against a corpse reaps the row within the minute, so the
+    /// only honest answer is to refuse and say what the two valid forms are.
+    #[test]
+    fn a_bare_ephemeral_is_refused_and_names_both_valid_forms() {
+        let error = create_terminal_tenancy_from_args(&argv(&["new", "--ephemeral"]), 11, "host-a")
+            .expect_err("a bare --ephemeral must be refused, never defaulted");
+        assert_eq!(error, EPHEMERAL_NEEDS_AN_EXPLICIT_RULE);
+        assert!(
+            error.contains("--ephemeral-owner-pid") && error.contains("--ephemeral-idle-ttl-secs"),
+            "the refusal must name both ways out, or it just blocks the caller"
+        );
+
+        // Both ways out work, and a TTL-only declaration names NO owner.
+        let ttl_only = create_terminal_tenancy_from_args(
+            &argv(&["new", "--ephemeral", "--ephemeral-idle-ttl-secs", "1800"]),
+            11,
+            "host-a",
+        )
+        .expect("a TTL-only declaration is a complete declaration")
+        .ephemeral
+        .expect("it is a declaration");
+        assert_eq!(
+            ttl_only,
+            EphemeralDeclaration::new(None, "host-a", Some(1_800))
+        );
+        assert_eq!(ttl_only.owner_pid, None, "TTL-only names no owner at all");
+        assert!(
+            create_terminal_tenancy_from_args(
+                &argv(&["new", "--ephemeral", "--ephemeral-owner-pid", "4242"]),
+                11,
+                "host-a",
+            )
+            .is_ok(),
+            "an explicitly named owner is the other valid form"
         );
     }
 
@@ -1338,15 +1458,59 @@ mod tests {
                 "1800",
             ]),
             11,
-            22,
             "host-a",
-            None,
         )
         .expect("both rules are valid together");
         assert_eq!(
             declared.ephemeral,
             Some(EphemeralDeclaration::new(Some(4242), "host-a", Some(1_800)))
         );
+    }
+
+    /// THE INLINE-SPELLING LOCK (round-25 review, finding P1). `--flag=value`
+    /// is the costly direction: a `windows(2)` exact-match parser DISCARDED it
+    /// silently and fell back to the default, so an agent that wrote
+    /// `--ephemeral-owner-pid=4242` armed something it never asked for. Both
+    /// spellings go through the one argv rule, on every tenancy flag.
+    #[test]
+    fn the_inline_flag_spelling_is_honoured_on_every_tenancy_flag() {
+        let inline = create_terminal_tenancy_from_args(
+            &argv(&[
+                "new",
+                "--purpose=aged ssh probe",
+                "--ephemeral",
+                "--ephemeral-owner-pid=4242",
+                "--ephemeral-idle-ttl-secs=1800",
+            ]),
+            11,
+            "host-a",
+        )
+        .expect("the inline spelling is a valid declaration");
+        let spaced = create_terminal_tenancy_from_args(
+            &argv(&[
+                "new",
+                "--purpose",
+                "aged ssh probe",
+                "--ephemeral",
+                "--ephemeral-owner-pid",
+                "4242",
+                "--ephemeral-idle-ttl-secs",
+                "1800",
+            ]),
+            11,
+            "host-a",
+        )
+        .expect("the spaced spelling is a valid declaration");
+        assert_eq!(
+            inline, spaced,
+            "one parser: --flag=value and --flag value must declare the same tenancy"
+        );
+        assert_eq!(
+            inline.ephemeral,
+            Some(EphemeralDeclaration::new(Some(4242), "host-a", Some(1_800))),
+            "an inline owner pid must be READ, not discarded"
+        );
+        assert_eq!(inline.created_by.purpose.as_deref(), Some("aged ssh probe"));
     }
 
     /// A typo must refuse, not silently create an unarmed row the caller
@@ -1356,19 +1520,21 @@ mod tests {
         for args in [
             argv(&["new", "--ephemeral-owner-pid", "5"]),
             argv(&["new", "--ephemeral-idle-ttl-secs", "60"]),
+            argv(&["new", "--ephemeral-owner-pid=5"]),
         ] {
             assert!(
-                create_terminal_tenancy_from_args(&args, 11, 22, "host-a", None).is_err(),
+                create_terminal_tenancy_from_args(&args, 11, "host-a").is_err(),
                 "{args:?} names a reap rule with nothing to attach it to"
             );
         }
         for bad in [
             argv(&["new", "--ephemeral", "--ephemeral-owner-pid", "nope"]),
+            argv(&["new", "--ephemeral", "--ephemeral-owner-pid=nope"]),
             argv(&["new", "--ephemeral", "--ephemeral-idle-ttl-secs", "0"]),
             argv(&["new", "--ephemeral", "--ephemeral-idle-ttl-secs", "soon"]),
         ] {
             assert!(
-                create_terminal_tenancy_from_args(&bad, 11, 22, "host-a", None).is_err(),
+                create_terminal_tenancy_from_args(&bad, 11, "host-a").is_err(),
                 "{bad:?} must be refused rather than rounded to a default"
             );
         }
@@ -1380,6 +1546,28 @@ mod tests {
         assert_eq!(
             owner_liveness_on_host(&declared, "host-b"),
             OwnerLiveness::Unknown
+        );
+    }
+
+    /// The unknown-host sentinel is a FALLBACK, not an identity: two machines
+    /// that cannot name themselves both write it, so matching them would let
+    /// this daemon answer "gone" about a pid that only ever existed elsewhere.
+    #[test]
+    fn the_unknown_host_sentinel_never_answers_a_liveness_question() {
+        let declared =
+            EphemeralDeclaration::new(Some(std::process::id()), UNKNOWN_HOST_TOKEN, None);
+        assert_eq!(
+            owner_liveness_on_host(&declared, UNKNOWN_HOST_TOKEN),
+            OwnerLiveness::Unknown,
+            "a sentinel host token is not a machine identity and must not match one"
+        );
+        assert_eq!(
+            owner_liveness_on_host(
+                &EphemeralDeclaration::new(Some(std::process::id()), "host-a", None),
+                UNKNOWN_HOST_TOKEN,
+            ),
+            OwnerLiveness::Unknown,
+            "and a daemon that cannot name ITSELF must not answer either"
         );
     }
 
