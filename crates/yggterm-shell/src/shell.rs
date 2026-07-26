@@ -53446,7 +53446,7 @@ mod web_do_verb_tests {
             },
             verification,
             matched_boxes: None,
-            requested: "Example Fixture Road".to_string(),
+            requested: "Sample Fixture Road".to_string(),
             reveal,
             match_report: web_do_match_report(Some(MatchDiag {
                 matches: 1,
@@ -53468,7 +53468,7 @@ mod web_do_verb_tests {
     #[test]
     fn a_fill_that_dropped_characters_reads_back_as_verified_false() {
         let verification = web_do_fill_verification(
-            "Example Fixture Road",
+            "Sample Fixture Road",
             true,
             Some(&readback_info(
                 json!({"same": false, "len": 2, "firstMismatch": 2, "held": "Ja"}),
@@ -53487,7 +53487,7 @@ mod web_do_verb_tests {
         assert_eq!(detail["chars"], json!(19));
         assert_eq!(detail["verified"], json!(false));
         assert_eq!(detail["verify_reason"], json!("value_mismatch"));
-        assert_eq!(detail["requested"], json!("Example Fixture Road"));
+        assert_eq!(detail["requested"], json!("Sample Fixture Road"));
         assert_eq!(detail["held"], json!("Ja"));
         // The legacy field is an ALIAS, never a second opinion.
         assert_eq!(detail["matched"], detail["verified"]);
@@ -53958,7 +53958,7 @@ mod web_do_verb_tests {
     // controlled input silently discards on its next render.
     #[test]
     fn the_native_setter_script_writes_through_the_prototype_descriptor() {
-        let script = web_do_native_setter_script("Example Fixture Road");
+        let script = web_do_native_setter_script("Sample Fixture Road");
         assert!(script.contains("getOwnPropertyDescriptor"), "{script}");
         assert!(script.contains("HTMLInputElement.prototype"), "{script}");
         assert!(script.contains("HTMLTextAreaElement.prototype"), "{script}");
