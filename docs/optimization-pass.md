@@ -72,48 +72,50 @@ Three consequences for this pass:
    what it reports, rather than defaulting to the slowest configuration behind an
    opt-out nobody knew to set.
 
-### ✅ LIVE-PROVEN 2026-07-26 — measured by the product's own instrument
+### ⛔ CORRECTED 2026-07-26 — the render win was an ArecordsFACT. Read this before quoting any number from this pass.
 
-The strongest evidence is not the shell probe below, it is `perf-summary
---since-ms <swap>` against the lifetime table, because both sides are the same
-measurement taken the same way. GUI-only swap, daemon untouched:
+**What I first reported and what is actually true:**
 
-| span | lifetime (pre-fix) | since the swap | |
-|---|---|---|---|
-| `background/copy_scan` p50 | 191.4 ms | **17.1 ms** | 11x |
-| `background/copy_scan` p95 | 424.2 ms | **21.3 ms** | 20x |
-| `background/copy_scan` max | 32,492 ms | **47.7 ms** | 681x |
-| `render/web_content` p50 | 9,870 ms | **550 ms** | 18x |
-| `render/gui` p50 | 7,350 ms | **2,430 ms** | 3x |
+| claim | status |
+|---|---|
+| `render/web_content` p50 9,870 → 530 ms (18x) | ⛔ **artifact** |
+| `render/gui` p50 7,350 → 1,580 ms (5x) | ⛔ **artifact** |
+| idle CPU 0.449 → 0.065 cores | ⛔ **not idle-vs-idle** |
+| "the machine runs cooler" | ⛔ **confounded** |
+| DRM fds 0 → 7, GPU genuinely rasterizing | ✅ **holds** |
+| `copy_scan` p50 220.9 → 17.8, max 32,492 → 47.7 ms | ✅ **holds** (its OWN fix) |
 
-`copy_scan` is WS4-1: the shell was deep-cloning a 1.75 MB `RemoteMachineSnapshot`
-once per copy target, ~644 times per scan. The 681x on the MAX is the number that
-matters most — that tail is the "the app hung" the incident log kept catching.
+**The mechanism of the error, because it is the whole lesson.** The "after"
+window was 8.7 hours overnight; the "before" was an evening of real use. Measured
+from the daemon's own event rates across the boundary — same daemon on both
+sides, so they are comparable — `daemon_request/terminal_read` ran at **9.22/min
+before and 0.40/min after: 23x less terminal activity.**
 
-The two `render/*` rows are the GPU fix, in CPU-milliseconds per 60 s tick:
-web content fell from ~16.5% of a core to ~0.9%, the GUI shell from ~12.3% to
-~4.1%. ⚠ Read them with the caveat that the since-swap window was mostly idle
-while the lifetime figure includes busy periods; `copy_scan` does not have that
-problem, because the chore runs on its own schedule regardless of what is on
-screen.
+The kill shot is internal to the after-window itself: **`gpu_ms` was zero in 523
+of its 532 render ticks.** The CPU did not move to the GPU. It simply was not
+being spent, because nothing was painting. Every tick with GPU work is one where
+`window_focused=True`, and all of those are from 09:18 onward.
 
-**And the machine-level corroboration, which has none of the per-process
-confounds**, 25 minutes after the swap with the same sessions attached:
+**At matched exposure** (9.22 vs 9.25 terminal_read/min) the render tree went
+**0.297 → 0.264 cores, about 11%** — and that rests on 8 post-side ticks, so
+treat it as a hint, not a result. Worse, the current GUI plateaued eleven minutes
+in with the GPU on and the window focused reads **0.358-0.373 cores against a
+pre-fix evening p50 of 0.297 and pre-fix quiet hours of 0.277-0.286.** On its
+face that is not better. It is unexplained and it needs a proper matched-load
+measurement before anyone claims a win.
 
-| | before | after |
-|---|---|---|
-| load average (1 min) | 1.16 | **0.10** |
-| Tctl | 49.5 °C | **43.0 °C** |
-| fan | 0 RPM | 0 RPM |
-| coredumps since swap | — | **0** (with under-glass armed) |
+**`copy_scan` was NOT the clean control I claimed**, for a bigger reason than the
+schedule argument: it was **treated in the same deploy** (`1d174b0`), so its
+improvement measures its own fix. It also shows near-zero sensitivity to render
+load across three prior days (p50 179-220 ms regardless of busy or quiet), so it
+could never have certified a render change either way. Its own numbers are real;
+its use as a control was wrong.
 
-That is the user's actual complaint — *"the fan spins and spins"* — answered at
-the level he feels it, rather than in a span table.
+**What a real verification needs:** the same terminal_read rate on both sides,
+several hundred render ticks, and `window_focused` held constant. Nothing short
+of that settles it.
 
-`background/local_tree_scan` now appears at all (p50 900.5 ms, 25 calls) — that
-is WS4-3, and its whole point is that this cost was previously OUTSIDE every
-span and therefore invisible to the instrument that was being used to decide
-what to optimize.
+### The numbers as first recorded (kept so the artifact is auditable)
 
 ### The shell-probe view of the same swap
 
