@@ -139,6 +139,12 @@ impl DesktopService {
     /// `url`, optionally egressing through `socks5://127.0.0.1:<port>` (the
     /// invoking host's tunnel). Bounds are logical pixels from the window's
     /// top-left. Errors on backends without the GTK/WebKit overlay path.
+    ///
+    /// `focused` says whether this surface is being created for someone to LOOK
+    /// AT. It must be false for a headless create (`web ensure`, which demotes
+    /// the surface in the same tick): a surface nobody can see may not hold the
+    /// window's keyboard focus, or the user's typing goes into it instead of
+    /// their terminal.
     #[allow(clippy::too_many_arguments)]
     pub fn open_web_surface(
         &self,
@@ -154,6 +160,7 @@ impl DesktopService {
         y: i32,
         w: i32,
         h: i32,
+        focused: bool,
     ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
@@ -176,6 +183,7 @@ impl DesktopService {
                     y,
                     w,
                     h,
+                    focused,
                 ),
                 None => Err("web surface host not installed".to_string()),
             };
@@ -200,6 +208,7 @@ impl DesktopService {
                 y,
                 w,
                 h,
+                focused,
             );
             Err("web surfaces require the GTK/WebKit backend".to_string())
         }

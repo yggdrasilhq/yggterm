@@ -489,6 +489,115 @@ thread_local! {
     /// observer. The backstop for the lexical flag above — see
     /// [`spend_injection_credit`].
     static INJECTED_CREDITS: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+    /// Who owned the toplevel's KEYBOARD focus before an agent injection
+    /// borrowed it. See [`note_focus_owner_before_injection`].
+    static BORROWED_FOCUS: RefCell<Option<BorrowedFocus>> = const { RefCell::new(None) };
+    /// Bumped by every injection; only the give-back timer still holding the
+    /// current value acts, so one burst of injected events gives the focus back
+    /// ONCE, after its last event, instead of per keystroke.
+    static FOCUS_GIVEBACK_TOKEN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How long after the LAST injected event the borrowed keyboard focus goes back.
+/// Long enough that a multi-key fill (select-all, delete, N characters — all
+/// separate `inject_key` calls milliseconds apart) is one loan and therefore one
+/// `blur` for the page; short enough that the human never notices the gap.
+const FOCUS_GIVEBACK_DELAY_MS: u64 = 150;
+
+/// The toplevel keyboard focus an agent injection borrowed, and who to hand it
+/// back to.
+struct BorrowedFocus {
+    window: gtk::Window,
+    /// The widget that owned `window`'s keyboard focus before the injection —
+    /// on the live host that is the SHELL's own webview, i.e. the user's
+    /// terminal.
+    previous: gtk::Widget,
+    /// The surface webview the focus was lent to.
+    borrower: gtk::Widget,
+}
+
+/// Record who owns the toplevel's keyboard focus BEFORE an agent injection takes
+/// it, so [`schedule_focus_giveback`] can hand it straight back.
+///
+/// ⚠ **This is the fifth focus-theft path** (2026-07-26; the first four are in
+/// `docs/pending-bugs.md`). It is the one no JS-side probe could ever see,
+/// because it is not a JS `focus()` at all: `gtk_widget_grab_focus` on a surface
+/// webview sets the **GtkWindow's focus widget**, which takes keyboard focus off
+/// the shell's own webview. The old note on `inject_key` said the grab was
+/// "widget-local — it does not move the seat's global focus on screen". That is
+/// true of the SEAT and false of the toplevel: the window stays active, the
+/// shell's DOM `activeElement` stays on the xterm helper textarea, and yet
+/// `document.hasFocus()` in the shell goes false and every keystroke the user
+/// types lands in the agent's invisible page. Live-caught on guihost with a
+/// simultaneous two-point read: shell `hasFocus:false` while a never-revealed
+/// agent surface reported `hasFocus:true`.
+///
+/// An injected event is the AGENT's, not the human's. It may borrow the focus it
+/// needs; it may not keep it. A surface the human actually clicks still takes
+/// focus the normal way — that is a real seat event and never comes through here.
+fn note_focus_owner_before_injection(webview: &webkit2gtk::WebView) {
+    let borrower: gtk::Widget = webview.clone().upcast();
+    let Some(window) = borrower
+        .toplevel()
+        .and_then(|top| top.downcast::<gtk::Window>().ok())
+    else {
+        return;
+    };
+    let Some(previous) = gtk::prelude::GtkWindowExt::focused_widget(&window) else {
+        return;
+    };
+    if previous == borrower {
+        return; // already ours: mid-burst, or the human handed it over
+    }
+    BORROWED_FOCUS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(BorrowedFocus {
+                window,
+                previous,
+                borrower,
+            });
+        }
+    });
+}
+
+/// Arm (or re-arm) the give-back of a borrowed keyboard focus. Every injection
+/// calls this, so a burst gives back once, [`FOCUS_GIVEBACK_DELAY_MS`] after its
+/// last event.
+fn schedule_focus_giveback() {
+    let token = FOCUS_GIVEBACK_TOKEN.with(|token| {
+        let next = token.get().wrapping_add(1);
+        token.set(next);
+        next
+    });
+    gtk::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(FOCUS_GIVEBACK_DELAY_MS),
+        move || {
+            if FOCUS_GIVEBACK_TOKEN.with(|current| current.get()) != token {
+                return; // a later injection re-armed this; that one gives back
+            }
+            let Some(loan) = BORROWED_FOCUS.with(|slot| slot.borrow_mut().take()) else {
+                return;
+            };
+            // Only ever take focus back OFF the widget it was lent to. If the
+            // human clicked something in the meantime, that is THEIR focus now
+            // and the agent has no business moving it.
+            if gtk::prelude::GtkWindowExt::focused_widget(&loan.window).as_ref()
+                != Some(&loan.borrower)
+            {
+                return;
+            }
+            let previous_still_here = loan
+                .previous
+                .toplevel()
+                .and_then(|top| top.downcast::<gtk::Window>().ok())
+                .is_some_and(|top| top == loan.window);
+            if !previous_still_here || !loan.previous.can_focus() {
+                return; // the lender is gone — leave GTK's own choice alone
+            }
+            gtk::prelude::GtkWindowExt::set_focus(&loan.window, Some(&loan.previous));
+        },
+    );
 }
 
 /// Grant one credit per injected event about to be delivered to `surface_id`.
@@ -1032,6 +1141,11 @@ fn build_popup_webview(
 
     let mut builder = WebViewBuilder::new()
         .with_bounds(rect_logical(w, h))
+        // Same rule as `WebSurfaceHost::open`: never let wry's `focused: true`
+        // default grab the toplevel's keyboard focus for a popup nobody is
+        // looking at. A popup on a stashed surface is exactly as invisible as
+        // its opener.
+        .with_focused(visible)
         .with_devtools(true)
         // NO url: WebKit loads the request that asked for this window into the
         // view we hand back. Loading it ourselves would race that navigation.
@@ -1397,6 +1511,7 @@ impl WebSurfaceHost {
         y: i32,
         w: i32,
         h: i32,
+        focused: bool,
     ) -> Result<(), String> {
         // Replace any existing surface with this id.
         self.close(id);
@@ -1449,6 +1564,15 @@ impl WebSurfaceHost {
         // itself only appears via `set_devtools_open`.)
         let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
             .with_bounds(rect_logical(w, h))
+            // wry's DEFAULT is `focused: true`, and on GTK that means
+            // `grab_focus()` the instant the webview is built — which sets the
+            // TOPLEVEL's focus widget. A headless surface (`web ensure`, created
+            // and demoted in the same tick, never revealed) took the keyboard
+            // focus off the user's terminal at birth and kept it: the user's
+            // "the shadow session spawn took focus away from my viewport",
+            // 2026-07-26. A surface only gets the focus when it is being shown
+            // TO SOMEONE.
+            .with_focused(focused)
             .with_devtools(true)
             // Every surface reports `window.close()`. A normal tab's request is
             // REFUSED by the shell (Chrome's rule), but the shell can only refuse
@@ -2210,6 +2334,10 @@ impl WebSurfaceHost {
     pub fn inject_click(&self, id: u64, x: f64, y: f64, button: u32) -> Result<(), String> {
         let webkit = self.mapped_engine_webview(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        // WebKit focuses the widget itself on a button press, so this path takes
+        // the toplevel's keyboard focus even though nothing here calls
+        // `grab_focus`. Book the lender before the press and give it back after.
+        note_focus_owner_before_injection(&webkit);
         // Only the PRESS is observed as seat input (the observer watches
         // button-press, key-press and scroll — not release), so one credit.
         grant_injection_credits(id, 1);
@@ -2217,6 +2345,7 @@ impl WebSurfaceHost {
             synth_button(&webkit, true, wx, wy, button)?;
             synth_button(&webkit, false, wx, wy, button)?;
         }
+        schedule_focus_giveback();
         Ok(())
     }
 
@@ -2232,22 +2361,32 @@ impl WebSurfaceHost {
     pub fn inject_scroll(&self, id: u64, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), String> {
         let webkit = self.mapped_engine_webview(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
+        note_focus_owner_before_injection(&webkit);
         grant_injection_credits(id, 1);
-        unsafe { synth_scroll(&webkit, wx, wy, dx, dy) }
+        let result = unsafe { synth_scroll(&webkit, wx, wy, dx, dy) };
+        schedule_focus_giveback();
+        result
     }
 
     /// A single key press OR release. `keyval` is the GDK keyval (the shell maps
     /// key names / characters to it); `state` is the GDK modifier bitmask.
     pub fn inject_key(&self, id: u64, press: bool, keyval: u32, state: u32) -> Result<(), String> {
         let webkit = self.mapped_engine_webview(id)?;
-        // A key event needs keyboard focus in the target webview; grab it first
-        // (widget-local — it does not move the seat's global focus on screen).
+        // A key event needs keyboard focus in the target webview, so BORROW it:
+        // note the lender first, grab, and hand it back when the burst ends. The
+        // grab is NOT widget-local — it sets the GtkWindow's focus widget, which
+        // is how an invisible agent surface came to swallow the keystrokes the
+        // user was typing into their terminal (see
+        // `note_focus_owner_before_injection`).
+        note_focus_owner_before_injection(&webkit);
         gtk::prelude::WidgetExt::grab_focus(&webkit);
         // Only presses are observed; a release costs nothing.
         if press {
             grant_injection_credits(id, 1);
         }
-        unsafe { synth_key(&webkit, press, keyval, state) }
+        let result = unsafe { synth_key(&webkit, press, keyval, state) };
+        schedule_focus_giveback();
+        result
     }
 }
 
