@@ -578,23 +578,53 @@ a source-scan lock in each crate now fails the build if you do.
    `retained_rehydrate_allow_screen_fallback` is `codex_like`-gated, so CC gets
    no authoritative screen on a plain InitialRead reveal (§7.6, the
    snapshot-poison axis) on BOTH localities.
+   ⚠ **Which lock does what — corrected 2026-07-27 after review, because the
+   first version of this entry credited the wrong test.** The BOTH-DIRECTIONS
+   property for holes 1–4 is delivered by the PER-AXIS tests (each asserts the
+   product's own decision function against that arm's cell) together with
+   `recorded_holes_still_reproduce_and_none_is_unrecorded` (each hole
+   reproduced against its locality twin, so "nothing is ready yet" cannot pass
+   for a hole).
    `readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded`
-   asserts the deviation SET exactly: a new hole fails as unrecorded, a fixed
-   one fails until its ledger row is deleted. **Phase 3 is now unblocked, and
-   its acceptance is this file going green as rows are deleted.**
-   ⚠ **One production change, no behaviour change:** the scheme half of
-   `terminal_session_uses_remote_runtime` was extracted to
-   `session_path_names_remote_runtime_by_scheme`, because behind `&self` it was
-   unlockable. Six items became `pub(crate)` for the same reason.
+   is NOT that mechanism: it makes **zero production calls**. It is a
+   TABLE/LEDGER INTEGRITY lock — it fails when a deviating cell has no ledger
+   row, or a ledger row has no deviating cell — and it now READS
+   `RECORDED_SHELL_ARM_HOLES` (matching each row's axis-name `concern` prefix
+   against the axes that deviate) so that its name is true of what it does.
+   **Phase 3 is unblocked, and its acceptance is this file going green as rows
+   are deleted.**
+   ⚠ **Production changes, all EXTRACTIONS, no behaviour change:** the scheme
+   half of `terminal_session_uses_remote_runtime` became
+   `session_path_names_remote_runtime_by_scheme` (behind `&self` it was
+   unlockable); the mount's `codex_like` local became `codex_like_session(kind)`;
+   and the two DECISIONS this table is really about were given names their call
+   sites now use — `terminal_mount_takes_remote_resume_readiness` (the §7.3
+   readiness fork, in `TerminalCanvas`) and
+   `terminal_reveal_seed_allows_authoritative_screen` (the §7.6 seed, in the
+   retained-rehydrate task). Six items are `pub(crate)` for the same reason.
+   **The last three came out of review and carry the general lesson:** the
+   `codex_like` cell was originally asserted against a test-local
+   `matches!(kind, Codex | CodexLiteLlm)`, which reads no production code, so
+   THREE different ways of closing a recorded hole — widening
+   `codex_like_session`, handing the seed policy a CC-inclusive bool at its call
+   site, or fixing the readiness fork at the GUI decision site — each left the
+   whole 1405-test suite GREEN with the ledger rows silently stale. **Lock the
+   DECISION the product makes; a lock that restates the code it guards is a
+   tautology wearing an assertion.**
    ⚠ **Out of reach, recorded rather than faked:** `resolve_active_open_mount_epoch`
    (the anti-churn epoch machinery) takes `&mut ShellState` plus a clock; the
    matrix locks the mount IDENTITY those epochs feed (`terminal_mount_host_id`,
    the m1/m2 label source) instead of faking a ShellState, which would lock the
    fake rather than the product.
-   **All ten locks were red-proven by mutating the PRODUCTION call site** (e.g.
-   teaching each predicate about `remote-cc://`, dropping the `codex_like`
-   gate, dropping the epoch from the mount id) — six mutations, every one red,
-   none vacuous.
+   **Red-proof status, counted honestly: NINE of the ten locks have been turned
+   RED by mutating production** — the six original mutations (teaching each
+   §7.3 predicate about `remote-cc://`, dropping the `codex_like` gate, dropping
+   the epoch from the mount id), the three review mutations above, plus
+   narrowing the recovery gate and unregistering a shipping CLI. **The tenth,
+   `readiness_axes_…`, is structurally unprovable that way and always will be:
+   it calls nothing from production, so no production edit can move it.** That
+   is not a defect — it is the scope of a table/ledger lock — but it is the
+   reason it must never again be described as the both-directions mechanism.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a
    by-product) + **attach single-writer** (A1, A2 close here).
 4. **Extraction unification** (title/summary/working via descriptor).
