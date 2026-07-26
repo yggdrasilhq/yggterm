@@ -7,6 +7,9 @@ fn main() {
         "WPEBackend-fdo-1.0",
         "wpe-1.0",
         "EGL",
+        // Spike B (CPU readback) needs real GL entry points: the texture, the
+        // FBO and glReadPixels. Spike A never touched a pixel, so it did not.
+        "GLESv2",
         "gobject-2.0",
         "glib-2.0",
     ] {
