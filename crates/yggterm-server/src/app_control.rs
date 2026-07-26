@@ -284,10 +284,10 @@ pub enum VaultFieldSource {
 ///
 /// - **Real keys** drive a widget that keeps its own internal state (a segmented
 ///   OTP whose focus auto-advances, a component that ignores a scripted value
-///   write). Measured on a services portal's `input.input-otp`.
+///   write). Measured on a live portal's segmented OTP input.
 /// - **The native setter** (`HTMLInputElement.prototype.value` descriptor, then
 ///   bubbling `input`/`change`, then blur) is what a REACT CONTROLLED input
-///   needs. Measured on a services portal 2026-07-26: a 19-character per-key fill left
+///   needs. Measured live 2026-07-26: a 19-character per-key fill left
 ///   the field holding `Ja` — React re-rendered from state between injected
 ///   keystrokes and threw the rest away, while the verb reported `chars: 19`.
 ///
@@ -369,7 +369,7 @@ pub enum WebSurfaceDoAction {
     ///
     /// Why it is its own verb rather than a flag on `Type`: a field that already
     /// holds a value cannot be corrected by typing over it. Measured on
-    /// a services portal's 6-box `input.input-otp` — writing `292244` over a prior
+    /// a portal's 6-box segmented OTP input — writing `292244` over a prior
     /// `278347` produced **`278344`**, a MERGE of old and new digits, because
     /// nothing cleared first. The same run proved a JS/eval route cannot fix it:
     /// setting `.value` via the native setter plus `input`/`change` events, and
