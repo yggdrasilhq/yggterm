@@ -470,6 +470,77 @@ fn configure_linux_allocator_limits() -> Result<()> {
     Ok(())
 }
 
+/// Where the file-descriptor soft limit is raised to at startup.
+///
+/// NOT the hard limit, which on this host is 1,048,576. A very high
+/// `RLIMIT_NOFILE` is not free: a program that closes descriptors in a loop up
+/// to the limit before `exec` pays for every one of them, and yggterm spawns ssh
+/// children constantly (one per remote session, one per egress tunnel, one per
+/// remote command). 64 Ki is far past anything the GUI can reach — the measured
+/// baseline is 51 descriptors with one webview realized, and a webview costs
+/// single digits — while staying in the range where nothing behaves oddly.
+const FILE_DESCRIPTOR_SOFT_LIMIT_TARGET: u64 = 65_536;
+
+/// What to raise `RLIMIT_NOFILE`'s SOFT limit to, given the current pair.
+/// `None` = leave it alone.
+///
+/// The default soft limit is 1024 while the hard limit is 1,048,576, which is
+/// the shape every browser raises at startup: the soft limit is an inherited
+/// default, not a policy anyone chose. yggterm needs it for the same reason a
+/// browser does — each realized webview brings IPC sockets to its web and
+/// network processes plus (under DMABuf) imported buffer descriptors into the UI
+/// process, so the ceiling arrives exactly where many-tab use starts.
+///
+/// Never LOWERS the limit: a soft limit already above the target was set
+/// deliberately by whoever launched us, and stepping on that would be the same
+/// mistake in the other direction.
+fn raised_file_descriptor_soft_limit(soft: u64, hard: u64) -> Option<u64> {
+    let target = FILE_DESCRIPTOR_SOFT_LIMIT_TARGET.min(hard);
+    (target > soft).then_some(target)
+}
+
+/// Raise this process's file-descriptor soft limit toward its hard limit.
+///
+/// Observable after the fact at `/proc/<pid>/limits` ("Max open files"), which
+/// is where the 1024/1048576 pair was measured on the live GUI in the first
+/// place. Failure is non-fatal and traced: an unraised limit costs a ceiling,
+/// not correctness.
+#[cfg(target_os = "linux")]
+fn configure_file_descriptor_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::debug!("file-descriptor limit: getrlimit failed, leaving it alone");
+        return;
+    }
+    let Some(target) = raised_file_descriptor_soft_limit(limit.rlim_cur, limit.rlim_max) else {
+        return;
+    };
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        tracing::info!(
+            from = limit.rlim_cur,
+            to = target,
+            hard = limit.rlim_max,
+            "raised file-descriptor soft limit"
+        );
+    } else {
+        tracing::warn!(
+            from = limit.rlim_cur,
+            wanted = target,
+            "raising the file-descriptor soft limit failed"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_file_descriptor_limit() {}
+
 fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     let mut positional = Vec::new();
     let mut index = start;
@@ -1632,6 +1703,9 @@ fn main() -> Result<()> {
         hydrate_linux_gui_entry_environment_from_desktop();
     }
     configure_linux_allocator_limits()?;
+    // After the allocator re-exec above (which returns early), so the raise
+    // lands on the process that actually runs the GUI.
+    configure_file_descriptor_limit();
     configure_linux_desktop_backend();
     configure_linux_terminal_renderer_policy();
     configure_linux_accessibility_bridge();
@@ -5889,7 +5963,8 @@ mod tests {
     #[cfg(unix)]
     use super::superseded_client_termination_signal;
     use super::{
-        BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
+        BuiltinCliCommand, FILE_DESCRIPTOR_SOFT_LIMIT_TARGET, LinuxWindowProfileInput,
+        SignalClientScope, raised_file_descriptor_soft_limit,
         app_control_launch_state_timeout_ms, app_control_state_settled_for_launch,
         classify_builtin_cli_command, compatible_signal_client_count,
         linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
@@ -6940,5 +7015,48 @@ mod tests {
         assert!(!main_should_retire_superseded_clients_before_shell(&[
             "server".to_string()
         ]));
+    }
+
+    /// The measured pair on the live GUI: soft 1024, hard 1,048,576. The soft
+    /// limit is an inherited default nobody chose, and it is the wall many-tab
+    /// use hits first after memory — each realized webview brings IPC sockets to
+    /// its web and network processes plus imported buffer descriptors into the
+    /// UI process.
+    #[test]
+    fn the_inherited_1024_descriptor_soft_limit_is_raised() {
+        assert_eq!(
+            raised_file_descriptor_soft_limit(1024, 1_048_576),
+            Some(FILE_DESCRIPTOR_SOFT_LIMIT_TARGET),
+            "the live host's own limits must produce a raise"
+        );
+        // Raised, but NOT to the hard limit: a very high RLIMIT_NOFILE makes
+        // fork+exec expensive for anything that closes descriptors in a loop up
+        // to it, and yggterm spawns ssh children constantly.
+        assert!(FILE_DESCRIPTOR_SOFT_LIMIT_TARGET < 1_048_576);
+    }
+
+    /// It must never LOWER the limit, and never ask for more than the hard cap.
+    /// A soft limit already above the target was set deliberately by whoever
+    /// launched us; stepping on that is the same mistake in the other direction.
+    #[test]
+    fn the_descriptor_raise_never_lowers_and_never_exceeds_the_hard_cap() {
+        assert_eq!(raised_file_descriptor_soft_limit(200_000, 1_048_576), None);
+        assert_eq!(
+            raised_file_descriptor_soft_limit(
+                FILE_DESCRIPTOR_SOFT_LIMIT_TARGET,
+                FILE_DESCRIPTOR_SOFT_LIMIT_TARGET
+            ),
+            None,
+            "already at target is not a raise"
+        );
+        // A hard limit BELOW the target clamps to the hard limit — asking for
+        // more would just fail the setrlimit and leave 1024 in place.
+        assert_eq!(raised_file_descriptor_soft_limit(1024, 4096), Some(4096));
+        assert_eq!(raised_file_descriptor_soft_limit(4096, 4096), None);
+        // An unlimited hard cap still lands on the documented target.
+        assert_eq!(
+            raised_file_descriptor_soft_limit(1024, u64::MAX),
+            Some(FILE_DESCRIPTOR_SOFT_LIMIT_TARGET)
+        );
     }
 }

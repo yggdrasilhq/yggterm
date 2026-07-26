@@ -1266,15 +1266,51 @@ struct WebSurfaceTab {
     /// the normal hold. `None` = unleased.
     lease_until_ms: Option<u64>,
 }
+/// Whether the holder of a shared egress-tunnel handle is the LAST one, and may
+/// therefore tear the tunnel down.
+///
+/// The `ssh -N -D` child is the SESSION's egress and is shared by every tab of
+/// that session (see `adopt_web_surface_session_socks`), so the `Arc` is the
+/// refcount and "am I allowed to kill this" is exactly "is my handle the only
+/// one left". Without this guard, closing any ONE tab would sever the tunnel
+/// every sibling tab is still browsing through.
+///
+/// Generic over the payload so the rule is testable without spawning an ssh.
+fn web_surface_forward_is_last_holder<T>(child: &Arc<Mutex<T>>) -> bool {
+    Arc::strong_count(child) == 1
+}
+
 impl WebSurfaceTab {
     fn kill_forward(&self) {
-        if let Some(child) = &self.forward_child
-            && let Ok(mut child) = child.lock()
-        {
+        let Some(child) = &self.forward_child else {
+            return;
+        };
+        if !web_surface_forward_is_last_holder(child) {
+            return;
+        }
+        if let Ok(mut child) = child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+/// Which tab's live SOCKS egress a navigation on `tab_id` should adopt.
+///
+/// `tabs` is `(id, socks_port)` in the surface's own order. The tab's OWN
+/// tunnel wins (nothing to adopt — it already has one); otherwise the
+/// lowest-id sibling that has one. Lowest id rather than "first in the vec"
+/// deliberately: tab order is user-mutable (drag, filing), and a rule that
+/// changes its answer when the user reorders the strip would make egress depend
+/// on chrome layout.
+fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> Option<u64> {
+    if tabs.iter().any(|(id, port)| *id == tab_id && port.is_some()) {
+        return Some(tab_id);
+    }
+    tabs.iter()
+        .filter(|(_, port)| port.is_some())
+        .map(|(id, _)| *id)
+        .min()
 }
 fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
     for tab in &surface.tabs {
@@ -2853,14 +2889,29 @@ fn navigate_web_surface_tab(
         // general surface instability on every address-bar navigation. A loopback
         // `ssh -L` rewrite (socks_port None, forward present) is per-URL and
         // cannot be reused, so this only reuses a real SOCKS tunnel.
-        let reuse_socks = remote
-            && state.with(|shell| {
-                shell
-                    .web_surfaces
-                    .get(&session_path)
-                    .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
-                    .is_some_and(|tab| tab.socks_port.is_some())
-            });
+        // ...and REUSE IT ACROSS TABS. The tunnel is the SESSION's egress, not
+        // the tab's: every tab of this surface egresses through the same host, so
+        // a second tab spawning its own `ssh -N -D` buys nothing and costs a
+        // child process here, an SSH handshake, an sshd on the remote and a
+        // listening loopback port. At any real tab count that trips the remote's
+        // MaxStartups long before the GUI notices. `adopt_session_socks` hands
+        // this tab the session's live tunnel (an Arc clone — the tunnel is
+        // refcounted by its holders and torn down by the LAST one, see
+        // `kill_forward`), which is also what makes the tabs share one
+        // WebContext: the proxy is part of `web_context_key`.
+        //
+        // Peeked before any mutation: with no donor there is nothing to write,
+        // and a `with_mut` on that path would dirty the shell for a render that
+        // changes nothing.
+        let donor = remote
+            .then(|| state.with(|shell| shell.web_surface_socks_donor_for(&session_path, tab_id)))
+            .flatten();
+        let reuse_socks = donor.is_some_and(|donor_id| {
+            donor_id == tab_id
+                || state.with_mut(|shell| {
+                    shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
+                })
+        });
         if reuse_socks {
             // SOCKS passes the real URL unchanged, so effective_url == url and
             // socks_port stays put: the reconciler NAVIGATES the live webview
@@ -2996,12 +3047,25 @@ struct AppliedWebSurface {
 /// only when BOTH have lapsed — `max`, never `min`. A lease therefore only ever
 /// EXTENDS life: it cannot cut a hold short, so an agent can never reap a
 /// surface the user is about to come back to.
+///
+/// `media_active` is a third, absolute claim: a page the engine reports as
+/// PLAYING AUDIO is never destroyed, whatever the clocks say. Invisible is not
+/// unwanted — a playlist the user started and then switched away from is doing
+/// exactly what they asked, and the hold clock knows nothing about that. The
+/// veto covers DESTROY only: an audible background page still stops painting
+/// (see the throttle path below), because the axis that costs the machine is
+/// PAINT, not existence. Audio, timers and network are left alone, and muting is
+/// never used as a reclaim tool.
 fn web_surface_reap_due(
     now_ms: u64,
     stashed_at_ms: Option<u64>,
     hold_ms: u64,
     lease_until_ms: Option<u64>,
+    media_active: bool,
 ) -> bool {
+    if media_active {
+        return false;
+    }
     let hold_due = match stashed_at_ms {
         Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
         // Not yet marked stashed this tick: only a zero hold reaps immediately.
@@ -3073,7 +3137,7 @@ fn web_surface_lease_until_ms(
 /// a web session). A LEGACY surface draws above all DOM and nothing short
 /// of unmapping reliably clears its pixels (the stuck-composite /
 /// reload-white family) — legacy must keep the detach.
-fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> bool {
+fn web_surface_background_detach(under_glass: bool, reclaim_pressured: bool) -> bool {
     // Legacy stacking always detaches (a legacy page draws above all DOM; only
     // unmapping reliably clears its pixels). Under glass a backgrounded page is
     // covered by the opaque app-bg layer, so it normally stays ATTACHED — that
@@ -3081,13 +3145,18 @@ fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> boo
     // is cut). But an attached WebKitGTK view keeps its DOM timers, animation
     // and video running at full CPU and holds its full memory (a single Meta
     // surface measured ~1.3 GB and >1 core while invisible). When the machine is
-    // under memory pressure — swap climbing toward thrash — that instant-reveal
-    // luxury is exactly what tips it into a freeze, so under glass we DETACH
-    // under pressure too: unmapping throttles the view and lets the
-    // background-hold destroy reclaim its memory. Reveal then pays a re-attach,
-    // but only while RAM is genuinely tight. See the telemetry-run resource work
-    // (guihost froze on 13.5 GB swap while two backgrounded surfaces held ~1.8 GB).
-    !under_glass || swap_pressured
+    // genuinely short of memory that instant-reveal luxury is exactly what tips
+    // it into a freeze, so under glass we DETACH under pressure too: unmapping
+    // throttles the view and lets the background-hold destroy reclaim its
+    // memory. Reveal then pays a re-attach, but only while RAM is genuinely
+    // tight. See the telemetry-run resource work (guihost froze on 13.5 GB swap
+    // while two backgrounded surfaces held ~1.8 GB).
+    //
+    // The input is `MemoryPressureSnapshot::reclaim_pressured` — CURRENT
+    // headroom plus the kernel's own stall accounting — NOT `swap_pressured`,
+    // which is a history counter that latches TRUE after one bad afternoon and
+    // never clears (see that method's doc, and the Y1 lock in terminal_observe).
+    !under_glass || reclaim_pressured
 }
 /// Backgrounded-surface hold under memory pressure: collapse the default hold so
 /// a detached surface is destroyed (its memory reclaimed) within seconds instead
@@ -3095,9 +3164,10 @@ fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> boo
 /// destroying B needlessly.
 const WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS: u64 = 5_000;
 /// Verification override: force the pressure-triggered web-surface reclaim on
-/// without inducing real swap. Set `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` at
-/// launch to exercise the reclaim on a healthy machine — background a web
-/// surface and watch `native_stash detached:true swap_pressured:true` then
+/// without starving the machine for real. Set
+/// `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` at launch to exercise the reclaim on a
+/// healthy machine — background a web surface and watch
+/// `native_stash detached:true reclaim_pressured:true` then
 /// `native_close reason:background_hold_expired` within the short hold, and the
 /// WebKitWebProcess RSS drop. Never set in normal operation.
 fn web_surface_force_background_pressure() -> bool {
@@ -3167,18 +3237,20 @@ fn web_surface_recent_reaps(key: &(String, u64), now_ms: u64) -> u32 {
 /// unpressured hold so it can settle, and reclaim goes back to targeting
 /// surfaces that actually STAY backgrounded — which is where the memory it was
 /// after has always been.
-fn web_surface_background_hold_ms_for(swap_pressured: bool, recent_reaps: u32) -> u64 {
-    if swap_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
+fn web_surface_background_hold_ms_for(reclaim_pressured: bool, recent_reaps: u32) -> u64 {
+    if reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
         return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
-    web_surface_background_hold_ms(swap_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT)
+    web_surface_background_hold_ms(
+        reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT,
+    )
 }
 
-fn web_surface_background_hold_ms(swap_pressured: bool) -> u64 {
+fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
     // Under memory pressure, reclaim aggressively regardless of the configured
     // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
     // back to the system before it thrashes swap.
-    if swap_pressured {
+    if reclaim_pressured {
         return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
     let default_ms = 600_000;
@@ -3724,25 +3796,38 @@ struct WebSurfaceAppliedCounts {
     total: usize,
     visible: usize,
     stashed: usize,
+    /// Distinct engine `WebContext`s backing those surfaces. The sharing
+    /// invariant made readable: N tabs of one session must show `total: N` with
+    /// `contexts: 1`. A sample where the two track each other means every tab is
+    /// paying for its own process pool, network process and cookie jar.
+    contexts: usize,
 }
 
 fn web_surface_applied_counts(
     handles: &HashMap<(String, u64), WebSurfaceHandle>,
+    contexts: usize,
 ) -> WebSurfaceAppliedCounts {
     WebSurfaceAppliedCounts {
         total: handles.len(),
         visible: handles.values().filter(|handle| handle.visible).count(),
         stashed: handles.values().filter(|handle| handle.stashed).count(),
+        contexts,
     }
 }
+
+/// Published by the reconciler each tick from the GTK-main-thread host, because
+/// the context map is `Rc`-owned there and the probe loop cannot reach it.
+static WEB_SURFACE_CONTEXT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Counts from the reconciler's own publication — never recomputed from
 /// `ShellState`, which does not know what was actually realized.
 fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
+    let contexts = WEB_SURFACE_CONTEXT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     WEB_SURFACE_NATIVE_IDS
         .get()
         .and_then(|registry| registry.lock().ok())
-        .map(|handles| web_surface_applied_counts(&handles))
+        .map(|handles| web_surface_applied_counts(&handles, contexts))
         .unwrap_or_default()
 }
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
@@ -3765,7 +3850,11 @@ fn next_web_surface_generation() -> u64 {
 static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<(String, u64), WebSurfaceHandle>>,
 > = std::sync::OnceLock::new();
-fn publish_web_surface_native_ids(applied: &HashMap<(String, u64), AppliedWebSurface>) {
+fn publish_web_surface_native_ids(
+    applied: &HashMap<(String, u64), AppliedWebSurface>,
+    web_context_count: usize,
+) {
+    WEB_SURFACE_CONTEXT_COUNT.store(web_context_count, std::sync::atomic::Ordering::Relaxed);
     let registry = WEB_SURFACE_NATIVE_IDS.get_or_init(Default::default);
     if let Ok(mut map) = registry.lock() {
         map.clear();
@@ -4409,26 +4498,37 @@ async fn web_surface_native_reconcile_loop(
             .cloned()
             .collect();
         if !backgrounded.is_empty() {
-            // Pressure-triggered reclaim: sample swap once per pass. Under
-            // memory pressure a backgrounded surface is DETACHED (throttles its
-            // CPU) and its hold collapses so the destroy below reclaims its
-            // memory within seconds. Normal (no pressure) keeps the soft stash
-            // (attached, instant switch-back). One /proc/meminfo read, gated on
-            // there actually being a backgrounded surface to act on.
-            let swap_pressured = read_memory_pressure_snapshot().swap_pressured()
+            // Pressure-triggered reclaim: sample memory headroom once per pass.
+            // Under real memory pressure a backgrounded surface is DETACHED
+            // (throttles its CPU) and its hold collapses so the destroy below
+            // reclaims its memory within seconds. Normal (no pressure) keeps the
+            // soft stash (attached, instant switch-back). One /proc/meminfo +
+            // /proc/pressure/memory read, gated on there actually being a
+            // backgrounded surface to act on.
+            let reclaim_pressured = read_memory_pressure_snapshot().reclaim_pressured()
                 || web_surface_force_background_pressure();
+            let detach = web_surface_background_detach(under_glass, reclaim_pressured);
             for key in backgrounded {
                 // Per-surface, not per-pass: a surface that keeps being
                 // re-created after each reap is demonstrably wanted, and
                 // reaping it again reclaims nothing while costing a fresh web
                 // process. See web_surface_background_hold_ms_for.
                 let recent_reaps = web_surface_recent_reaps(&key, now_ms);
-                let hold_ms = web_surface_background_hold_ms_for(swap_pressured, recent_reaps);
+                let hold_ms = web_surface_background_hold_ms_for(reclaim_pressured, recent_reaps);
+                // "Suppose I have a YouTube playlist running in the background
+                // while I work here." Engine truth, read at the moment of the
+                // decision — a stale flag would be worse than none. The veto is
+                // on DESTROY only; the throttle below still runs, so the page
+                // stops PAINTING and keeps playing.
+                let media_active = applied
+                    .get(&key)
+                    .is_some_and(|entry| desktop.web_surface_is_playing_audio(entry.native_id));
                 let expired = web_surface_reap_due(
                     now_ms,
                     applied.get(&key).and_then(|entry| entry.stashed_at_ms),
                     hold_ms,
                     web_surface_lease_until_ms(&state, &key.0, key.1),
+                    media_active,
                 );
                 if expired {
                     let reap_count = web_surface_note_reap(&key, now_ms);
@@ -4449,7 +4549,7 @@ async fn web_surface_native_reconcile_loop(
                                 // climbing is the treadmill: reclaim destroying
                                 // a page that something keeps re-creating.
                                 "reaps_in_window": reap_count,
-                                "swap_pressured": swap_pressured,
+                                "reclaim_pressured": reclaim_pressured,
                                 "hold_ms": hold_ms,
                             }),
                         );
@@ -4457,7 +4557,7 @@ async fn web_surface_native_reconcile_loop(
                 } else if let Some(entry) = applied.get_mut(&key)
                     && entry.stashed_at_ms.is_none()
                 {
-                    if web_surface_background_detach(under_glass, swap_pressured) {
+                    if detach {
                         let _ = desktop.stash_web_surface(entry.native_id);
                     } else {
                         // Soft stash: stays attached below the glass (the
@@ -4502,8 +4602,9 @@ async fn web_surface_native_reconcile_loop(
                             "tab_id": key.1,
                             "native_id": entry.native_id,
                             "hold_ms": hold_ms,
-                            "detached": web_surface_background_detach(under_glass, swap_pressured),
-                            "swap_pressured": swap_pressured,
+                            "detached": detach,
+                            "reclaim_pressured": reclaim_pressured,
+                            "media_active": media_active,
                         }),
                     );
                 }
@@ -4523,7 +4624,7 @@ async fn web_surface_native_reconcile_loop(
                     "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');",
                 );
             }
-            publish_web_surface_native_ids(&applied);
+            publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
         }
@@ -4594,7 +4695,7 @@ async fn web_surface_native_reconcile_loop(
                 // session. The only thing a rect would tell us now is positioning
                 // and lazy-create for the ACTIVE surface — both safe to defer — so
                 // keep the active surface's applied state and retry next tick.
-                publish_web_surface_native_ids(&applied);
+                publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
@@ -5236,7 +5337,7 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
-        publish_web_surface_native_ids(&applied);
+        publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
         // Tick pacing with a SWITCH KICK. Chrome mounts on the FIRST render
         // after a session/view switch (the overlay gate is render-time), but
         // the page hole + reveal ride THIS loop — a plain tick sleep leaves
@@ -11063,6 +11164,57 @@ impl ShellState {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+    /// Give `tab_id` the SESSION's live SOCKS egress, and answer whether it now
+    /// has one.
+    ///
+    /// The `ssh -N -D` tunnel belongs to the session's host, and every tab of a
+    /// surface egresses through that same host — so one tunnel serves all of
+    /// them. A tab that already has the tunnel keeps it untouched (this is the
+    /// original per-tab reuse: no re-spawn on re-navigation, so the webview is
+    /// NAVIGATED rather than destroyed and recreated, and a just-set login
+    /// cookie still flushes). A tab with none adopts a sibling's: the `Arc` is
+    /// cloned, which is the refcount that keeps the tunnel alive until the last
+    /// tab holding it goes away.
+    ///
+    /// This is what stops N tabs on a remote session from becoming N ssh
+    /// children, N handshakes, N remote sshds and N loopback ports.
+    fn web_surface_socks_donor_for(&self, session_path: &str, tab_id: u64) -> Option<u64> {
+        let surface = self.web_surfaces.get(session_path)?;
+        let ports: Vec<(u64, Option<u16>)> = surface
+            .tabs
+            .iter()
+            .map(|tab| (tab.id, tab.socks_port))
+            .collect();
+        web_surface_socks_egress_donor(&ports, tab_id)
+    }
+    fn adopt_web_surface_session_socks(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        donor_id: u64,
+    ) -> bool {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return false;
+        };
+        let Some((port, child)) = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == donor_id)
+            .map(|donor| (donor.socks_port, donor.forward_child.clone()))
+        else {
+            return false;
+        };
+        let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        // The adopting tab may itself hold a stale forward (an `ssh -L`
+        // fallback from an earlier navigation). Release it first, honoring the
+        // same last-holder rule.
+        tab.kill_forward();
+        tab.socks_port = port;
+        tab.forward_child = child;
+        true
     }
     /// Navigate a tab that KEEPS its existing SOCKS egress (see
     /// `navigate_web_surface_tab`): update the URL + history but leave
@@ -21446,6 +21598,7 @@ fn render_probe_context(
         "web_surface_views": surfaces.total,
         "web_surface_views_visible": surfaces.visible,
         "web_surface_views_stashed": surfaces.stashed,
+        "web_surface_contexts": surfaces.contexts,
         "window_focused": shell.window_focused,
         "force_foreground": shell.force_foreground,
         "app_control_backgrounded": shell.app_control_backgrounded,
@@ -50891,18 +51044,136 @@ mod web_do_verb_tests {
         let hold = 600_000;
         let stashed = Some(1_000_u64);
         // Hold not yet up, no lease: keep.
-        assert!(!web_surface_reap_due(2_000, stashed, hold, None));
+        assert!(!web_surface_reap_due(2_000, stashed, hold, None, false));
         // Hold up, no lease: reap (unchanged behavior).
-        assert!(web_surface_reap_due(601_000, stashed, hold, None));
+        assert!(web_surface_reap_due(601_000, stashed, hold, None, false));
         // Hold up but lease still running: KEEP — this is what lease buys.
-        assert!(!web_surface_reap_due(601_000, stashed, hold, Some(900_000)));
+        assert!(!web_surface_reap_due(
+            601_000,
+            stashed,
+            hold,
+            Some(900_000),
+            false
+        ));
         // Hold up and lease lapsed: reap.
-        assert!(web_surface_reap_due(901_000, stashed, hold, Some(900_000)));
+        assert!(web_surface_reap_due(
+            901_000,
+            stashed,
+            hold,
+            Some(900_000),
+            false
+        ));
         // A lease SHORTER than the hold must not reap early.
-        assert!(!web_surface_reap_due(2_000, stashed, hold, Some(1_500)));
+        assert!(!web_surface_reap_due(
+            2_000,
+            stashed,
+            hold,
+            Some(1_500),
+            false
+        ));
         // Zero hold still honors a live lease.
-        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000)));
-        assert!(web_surface_reap_due(2_000, None, 0, None));
+        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000), false));
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+    }
+
+    /// ONE TUNNEL PER SESSION, NOT PER TAB. `ssh -N -D` is the session's egress:
+    /// every tab of a surface reaches the same host through it. Reuse used to be
+    /// keyed on the TAB, and `web_surface_new_tab` mints `socks_port: None`, so
+    /// each new tab spawned its own — N ssh children on the GUI host, N
+    /// handshakes, N sshds on the remote and N listening loopback ports, which
+    /// trips the remote's MaxStartups long before anything here notices.
+    #[test]
+    fn a_new_tab_adopts_the_sessions_socks_egress() {
+        // The tab's own tunnel always wins: nothing to adopt, and re-spawning
+        // would churn the port and force a webview destroy+recreate.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, Some(1080)), (2, Some(1081))], 2),
+            Some(2)
+        );
+        // A fresh tab (socks_port None) borrows the session's live tunnel
+        // instead of spawning a second one.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, Some(1080)), (7, None)], 7),
+            Some(1)
+        );
+        // Deterministic on the TAB ID, not on strip order — tab order is
+        // user-mutable (drag, filing) and egress must not follow chrome layout.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(9, Some(1090)), (3, Some(1030)), (7, None)], 7),
+            Some(3)
+        );
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(3, Some(1030)), (9, Some(1090)), (7, None)], 7),
+            Some(3)
+        );
+        // A LOCAL session has no tunnel at all: nothing to adopt, and the
+        // caller must fall through to real resolution rather than assume one.
+        assert_eq!(
+            web_surface_socks_egress_donor(&[(1, None), (2, None)], 2),
+            None
+        );
+        assert_eq!(web_surface_socks_egress_donor(&[], 1), None);
+    }
+
+    /// The refcount that makes sharing safe. With one tunnel serving N tabs,
+    /// closing ANY tab used to kill it — severing egress for every sibling still
+    /// browsing through it. Only the last holder may tear it down.
+    #[test]
+    fn a_shared_egress_tunnel_dies_only_with_its_last_holder() {
+        let tunnel = Arc::new(Mutex::new(1080_u16));
+        assert!(
+            web_surface_forward_is_last_holder(&tunnel),
+            "a tunnel only one tab holds is that tab's to kill"
+        );
+        let sibling = tunnel.clone();
+        assert!(!web_surface_forward_is_last_holder(&tunnel));
+        assert!(!web_surface_forward_is_last_holder(&sibling));
+        drop(sibling);
+        assert!(
+            web_surface_forward_is_last_holder(&tunnel),
+            "once the sibling is gone the survivor may reap"
+        );
+    }
+
+    /// INVISIBLE IS NOT UNWANTED. The user's stated constraint is a background
+    /// YouTube playlist that keeps playing while they work in another session.
+    /// Before this, nothing in the system knew a page was making a sound: the
+    /// only two survival inputs were the hold clock and an AGENT lease, and a
+    /// human's playlist has neither. Under the latched pressure predicate that
+    /// meant the playlist died five seconds after the switch.
+    ///
+    /// The veto is absolute against every clock — hold expired, no lease, and
+    /// even the collapsed five-second reclaim hold under genuine pressure. A
+    /// machine short of RAM is a reason to stop PAINTING a page, never a reason
+    /// to cut off what the user is listening to.
+    #[test]
+    fn an_audible_background_surface_is_never_reaped() {
+        let hold = 600_000;
+        let stashed = Some(1_000_u64);
+        // Hold long expired, no lease — the exact case that reaps today.
+        assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
+        assert!(!web_surface_reap_due(999_000, stashed, hold, None, true));
+        // The pressured five-second window does not beat the veto either.
+        assert!(web_surface_reap_due(
+            9_000,
+            stashed,
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            None,
+            false
+        ));
+        assert!(!web_surface_reap_due(
+            9_000,
+            stashed,
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            None,
+            true
+        ));
+        // Nor does a zero hold, the destroy-immediately configuration.
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+        assert!(!web_surface_reap_due(2_000, None, 0, None, true));
+        // And silence restores the ordinary clocks — the veto is a veto, not a
+        // permanent pin. A page that finished playing reaps on the next tick.
+        assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
     }
 
     // Slice 4.1b — the write-lock lifecycle: a held lock is released the moment
@@ -106719,7 +106990,7 @@ mod tests {
         handles.insert(("local://a".to_string(), 2), handle(2, false, true));
         handles.insert(("local://b".to_string(), 1), handle(3, false, true));
 
-        let counts = web_surface_applied_counts(&handles);
+        let counts = web_surface_applied_counts(&handles, 1);
 
         assert_eq!(counts.total, 3, "two sessions, three realized webviews");
         assert_eq!(counts.visible, 1);
@@ -106728,7 +106999,11 @@ mod tests {
             "soft-stashed surfaces stay alive and cost CPU; that is the whole point of              counting them apart"
         );
         assert_eq!(
-            web_surface_applied_counts(&HashMap::new()),
+            counts.contexts, 1,
+            "three webviews on ONE engine context is the sharing invariant"
+        );
+        assert_eq!(
+            web_surface_applied_counts(&HashMap::new(), 0),
             WebSurfaceAppliedCounts::default()
         );
     }
@@ -106757,6 +107032,7 @@ mod tests {
                 total: 3,
                 visible: 1,
                 stashed: 2,
+                contexts: 1,
             },
         );
 
@@ -106769,6 +107045,10 @@ mod tests {
         assert_eq!(context.get("web_surface_views"), Some(&json!(3)));
         assert_eq!(context.get("web_surface_views_visible"), Some(&json!(1)));
         assert_eq!(context.get("web_surface_views_stashed"), Some(&json!(2)));
+        // The instrument the optimization pass was missing: three webviews on
+        // ONE engine context. When these two track each other, every tab is
+        // paying for its own process pool, network process and cookie jar.
+        assert_eq!(context.get("web_surface_contexts"), Some(&json!(1)));
         // The physical fact, not `effective_window_focused()` — which would
         // read `true` here purely because app-control holds the override.
         assert_eq!(context.get("window_focused"), Some(&json!(false)));
@@ -111721,7 +112001,7 @@ mod tests {
 
     #[test]
     fn under_glass_backgrounding_detaches_and_reclaims_under_memory_pressure() {
-        // Pressure-triggered reclaim: under glass + swap pressured, a
+        // Pressure-triggered reclaim: under glass + genuinely short of memory, a
         // backgrounded surface DETACHES (unmap -> CPU throttled) and its hold
         // collapses to seconds so the destroy-on-hold branch reclaims its
         // memory instead of holding ~1.3 GB for ten minutes. Legacy is
@@ -111733,6 +112013,39 @@ mod tests {
         assert_eq!(
             web_surface_background_hold_ms(true),
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
+    }
+
+    /// The reclaim policy's INPUT, locked at the call site's boundary. Both of
+    /// these functions used to take `swap_pressured`, a latched history counter,
+    /// which is why 19 of 19 `native_stash` events on the live host carried
+    /// `detached:true hold_ms:5000`. Feed them the live host's real reading and
+    /// the soft stash must survive: attached, ten-minute hold.
+    #[test]
+    fn background_policy_reads_reclaim_pressure_not_swap_history() {
+        let mut live = crate::terminal_observe::parse_meminfo(
+            "MemTotal: 15473336 kB\nMemAvailable: 6976900 kB\n\
+             SwapTotal: 16776512 kB\nSwapFree: 4691496 kB\n",
+        );
+        live.psi_some_avg60_bp = Some(6);
+        assert!(live.swap_pressured(), "swap history is deep on this host");
+        // The argument both policy functions are handed. This is the defect: it
+        // was `swap_pressured()` (true here) and must be `reclaim_pressured()`.
+        // `web_surface_background_hold_ms(false)` reads
+        // `~/.yggterm/web-surface.json`, so asserting its RESULT would depend on
+        // the test machine's config — the deterministic statement is about the
+        // input, plus the pressured branch which returns before any file read.
+        assert!(
+            !live.reclaim_pressured(),
+            "45% of RAM available and 0.06% stall time is not reclaim pressure"
+        );
+        // Under glass with no real pressure: SOFT stash — stay attached, so
+        // switch-back is instant and the page is not destroyed.
+        assert!(!web_surface_background_detach(true, live.reclaim_pressured()));
+        assert_eq!(
+            web_surface_background_hold_ms(true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "the five-second window is what the wrong argument used to select"
         );
     }
 
@@ -130954,6 +131267,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 swap_total_kb: 16_000 * 1024,
                 mem_available_kb: 1_000 * 1024,
                 mem_total_kb: 16_000 * 1024,
+                ..Default::default()
             };
         }
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
@@ -130984,6 +131298,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 swap_total_kb: 16_000 * 1024,
                 mem_available_kb: 1_000 * 1024,
                 mem_total_kb: 16_000 * 1024,
+                ..Default::default()
             };
         }
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");

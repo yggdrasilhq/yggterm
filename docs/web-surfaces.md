@@ -61,18 +61,76 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
   the terminal-native way to end the foreground app, which then emits its own
   `close`.
 
+### Backgrounding: what stops, and what survives (2026-07-26)
+
+The axis is **PAINT, not existence**. A page the user cannot see must stop
+costing the compositor a frame; it must not stop being the thing they left
+running.
+
+Backgrounding a session's surface therefore does two separable things:
+
+- **Stop painting.** Under glass the container stays attached and demoted, and
+  the inner webview is hidden, so WebKitGTK marks the page
+  `visibilityState: 'hidden'` — `requestAnimationFrame` pauses and timers
+  throttle. Audio, network and JS heap are untouched. Under real memory pressure
+  the container is DETACHED instead (unmapped), which throttles the same way and
+  additionally lets the destroy below reclaim.
+- **Eventually destroy.** `web_surface_reap_due` decides this, and it has three
+  independent survival claims. The **hold** clock (default 600 s, config
+  `background_hold_secs`, 5 s under real pressure), an **agent lease**, and
+  **media**. Hold and lease are `max`, never `min` — a lease only ever extends
+  life. Media is an absolute veto: a surface WebKit reports as playing audio is
+  never destroyed, whatever either clock says.
+
+Two rules that keep the media veto honest:
+
+- It vetoes **destroy**, never **throttle**. An audible background tab still
+  stops painting. That is the cheap half and there is no reason to give it up.
+- `webkit_web_view_set_is_muted` is **never** used as a reclaim tool. Muting a
+  playlist to save CPU is precisely the failure the veto exists to prevent.
+
+⚠ **Memory pressure is `reclaim_pressured`, not `swap_pressured`.** Swap-*used*
+is a history counter: it latches TRUE after one bad afternoon and never clears.
+On the live host that meant every backgrounded surface was hard-detached and
+destroyed five seconds after a switch, on a machine sitting on 45% free RAM —
+**every** `native_stash` event in the retained trace (19 of 19) carried
+`detached:true swap_pressured:true hold_ms:5000`, alongside 53
+`background_hold_expired` closes, so the 600 s soft-stash hold has no recorded
+execution at all. The reclaim predicate reads current headroom (`MemAvailable`
+under 15% of `MemTotal`) or the kernel's PSI `some avg60` stall accounting. The
+`native_stash` trace event now publishes `reclaim_pressured` and `media_active`
+so the decision is readable after the fact.
+
 ## The egress rule
 
 **A surface's network egress is the invoking host's network — for ALL URLs.**
-Each tab of a remote session's surface gets its own `ssh -N -D <port>` SOCKS
-tunnel to the session's machine, and the tab's webview (private `WebContext`)
-proxies every request through it via `ProxyConfig::Socks5`. The *remote sshd*
+A remote session's surface gets ONE `ssh -N -D <port>` SOCKS tunnel to the
+session's machine, shared by every tab of that session, and the tabs' webviews
+proxy every request through it via `ProxyConfig::Socks5`. The *remote sshd*
 resolves every hostname and originates every connection on that machine —
-loopback URLs reach the REMOTE loopback. The tunnel dies with the tab. If the
-SOCKS tunnel cannot be established, loopback URLs fall back to the older
-`ssh -N -L` per-URL forward, and anything else falls back to direct load from
-the GUI host — a traced egress gap (`egress_gap` in the `open`/`tab_navigate`
-trace events), not a silent one. Local sessions load directly, no proxy.
+loopback URLs reach the REMOTE loopback. If the SOCKS tunnel cannot be
+established, loopback URLs fall back to the older `ssh -N -L` per-URL forward,
+and anything else falls back to direct load from the GUI host — a traced egress
+gap (`egress_gap` in the `open`/`tab_navigate` trace events), not a silent one.
+Local sessions load directly, no proxy.
+
+**The tunnel is the SESSION's, and it dies with its LAST tab** (2026-07-26). It
+used to be per-TAB: `web_surface_new_tab` mints `socks_port: None` and reuse was
+keyed on the tab, so every new tab of a remote session spawned another
+`ssh -N -D` — another child here, another handshake, another sshd on the remote,
+another listening loopback port, and the remote's `MaxStartups` reached well
+before any tab count a user would call "a lot". A tab with no tunnel now adopts
+the session's (`adopt_web_surface_session_socks`, donor chosen by lowest tab id
+so the answer does not follow a user-reorderable strip), and the `Arc` on the
+child is the refcount: `kill_forward` tears the tunnel down only when its handle
+is the last one (`web_surface_forward_is_last_holder`). A tab that already has
+the tunnel keeps it untouched, which is the older and still-necessary property —
+re-spawning would churn the port and force a webview destroy+recreate, dropping a
+just-set login cookie before it flushed.
+
+Sharing the tunnel is also what lets tabs of a remote session share one
+`WebContext`: the SOCKS port is part of `web_context_key`, so a per-tab tunnel
+forced a per-tab context.
 
 ## Browser chrome: tabs + address bar
 
