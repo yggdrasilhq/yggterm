@@ -6,17 +6,36 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
-- **★★★ WE FORCE SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL — THE
-  SINGLE LARGEST CPU ITEM IN THE PRODUCT. ✅ FIXED, DEPLOYED AND LIVE-PROVEN
-  2026-07-26 (GUI-only swap, daemon 1152900 untouched). Keep this entry until
-  a sustained re-measure lands (see the honest caveat at the end), then delete.**
+- **★★★ WE FORCED SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL. The
+  premise is fixed and DEPLOYED (2.12.14); ⛔ THE CPU WIN IS NOT ESTABLISHED AND
+  THE FIRST NUMBERS WERE AN ArecordsFACT. This entry STAYS until a matched-load
+  measurement settles it — see "what is actually true" below.**
+  ⛔ **Read this before repeating any figure from this entry.** The 18x/5x render
+  improvements first recorded here compared an evening of real use against an
+  overnight window with **23x less terminal activity** (`terminal_read` 9.22/min
+  vs 0.40/min, measured from the same daemon on both sides). The kill shot is
+  internal to the after-window: **`gpu_ms` was ZERO in 523 of its 532 render
+  ticks** — the CPU did not move to the GPU, it simply was not being spent
+  because nothing was painting. At matched exposure the render tree went
+  **0.297 → 0.264 cores (~11%, n=8 post ticks, low confidence)**, and the
+  current plateaued GUI with the GPU on and the window focused reads
+  **0.358-0.373 cores against a pre-fix evening p50 of 0.297** — on its face
+  NOT better, and unexplained. ⚠ A separate probe measured GUI-role CPU at
+  ~2.3x the previous build in a comparable painting regime; that may be a real
+  regression from hardware GL or from under-glass arming, and it is unresolved.
+  ✅ **What DOES hold:** the GPU is genuinely rasterizing (0 → 7 DRM fds on
+  `amdgpu`; 5,886.8 ms of engine time over 300 s deduped on `drm-client-id` =
+  1.96%), the policy publishes `hardware_gl_probed`, the surface paints cleanly,
+  and there have been no coredumps.
+  **What a real verification needs:** the same `terminal_read` rate on both
+  sides, several hundred render ticks, and `window_focused` held constant.
   **The live proof, on the GUI host, before → after the swap:**
   | | before (GUI 1151877) | after (GUI 1419187) |
   |---|---|---|
   | DRM render-node fds held | **0** | **7** (GUI 3, web content 4, `amdgpu`) |
   | GPU engine time accumulated | **0 ns** | GUI 335 ms, web content 698 ms |
   | VRAM allocated | — | 268 MB (`drm-total-vram`) |
-  | idle CPU, whole tree | **0.449 cores** | **0.065 cores** |
+  | idle CPU, whole tree | ⛔ 0.449 → 0.065 was busy-vs-quiet, NOT idle-vs-idle |
   | published policy | — | `YGGTERM_WEBKIT_GL_POLICY: hardware_gl_probed` |
   **The structural half is the part that cannot be argued with**: llvmpipe never
   opens a DRM node, so 0 fds → 7 fds on `/dev/dri/renderD128` with
