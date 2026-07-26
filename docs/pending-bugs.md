@@ -30,6 +30,17 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
+  pixel proof, 2026-07-26 ~17:55 IST).** `terminal new --no-activate` keeps the
+  VIEWPORT on the user's session (activation contract holds; metadata rail and
+  viewport stayed on the user's own row) but the Live Sessions
+  SELECTED-ROW highlight jumped to the agent-spawned ychrome row (the agent's records row, top of the list) while the user's session sat fourth. Selection is a
+  separate state from activation and the row-creation path moves it
+  unconditionally. The `--no-activate` contract must cover selected-row truth
+  too: an agent-created row must not take the highlight (nor scroll the list).
+  Related but distinct from the fifth-focus-path keyboard grab (fixed in-tree
+  the same day). GUI-only fix expected; no daemon involvement.
+
 - **★★★ `web do` FIDELITY ON RE-RENDERING DOMs — three reproducible defects,
   one family (a services portal filing run, 2026-07-26 ~15:30-16:00 IST, guihost 2.12.15,
   session `local://b556fb1b`, all self-reported SUCCESS while wrong):**
