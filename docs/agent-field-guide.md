@@ -250,11 +250,18 @@ Three traps in those four lines, all of which have bitten:
 - ⚠ **`ssh -n` or the loop silently reconnects only the FIRST row.** Plain `ssh`
   reads stdin, so it swallows the rest of `missing.txt`. The loop *looks* like it
   worked because the one row it did process succeeded.
-- ⚠ **`yggterm server reorder` cannot restore dormant rows' order.**
-  `replace_live_session_order` filters on `managed_session_is_live_runtime_session`,
-  so rows without a live runtime are ignored — the call still reports
-  `"requested": 19` and echoes your list back, which reads exactly like success.
-  Verify order by re-reading `server app rows`, never by the reorder response.
+- ✅ **`yggterm server reorder` now moves dormant rows too, and answers
+  honestly** (fixed in-tree 2026-07-26, NOT yet live-verified on guihost).
+  `replace_live_session_order` used to filter on
+  `managed_session_is_live_runtime_session`, so rows without a live runtime were
+  ignored while the call still reported `"requested": 19` and echoed your list
+  back — reading exactly like success. It now admits any row in
+  `live_session_order` and returns `applied` / `skipped` lists that the CLI
+  prints verbatim; a non-empty `skipped` also makes the command exit non-zero.
+  A path that is not a row is refused rather than added, so the verb can never
+  create a row. **Until a real daemon on guihost runs a build with this fix, keep
+  verifying order by re-reading `server app rows`** — an older daemon cannot
+  report `applied`, and the CLI then prints `applied_unreported_by_daemon`.
 
 Rows reappear 5–10 s later. Re-check the count **again once the predecessor has
 actually exited** — the drop can be delayed: the predecessor holds dormant rows
@@ -439,6 +446,17 @@ and that count was reported as a sign the restart went well, without ever
 comparing it against the ledger's recorded set — which is the only thing that
 can say whether those 28 are the RIGHT 28. The user had to point out twice that
 the number itself was the bug.
+
+**The ledger now reads back (in-tree 2026-07-26, not yet live-proven).** Each
+handover rebuild pass ends by reconciling the assembled row list against the
+ledger *as the daemon booted with it* — remembered rows take the ledger's order,
+rows the ledger never saw keep the slot the anchored import walk gave them, and
+the result is a permutation, so nothing can be resurrected through it. A daemon
+bump also drops a receipt at
+`~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json` (live order
+plus the whole ledger), written by the outgoing daemon on `PrepareUpdateRestart`
+and by the incoming daemon before it imports a single row. Newest 32 kept;
+hand-made `pre-gui-restart-*` snapshots share the directory and are never swept.
 
 **Rules:**
 - Before adding, removing, or judging any row, read the ledger. It is the record;
