@@ -17,12 +17,23 @@ fix) once the fix is verified live on jojo.
   internal to the after-window: **`gpu_ms` was ZERO in 523 of its 532 render
   ticks** — the CPU did not move to the GPU, it simply was not being spent
   because nothing was painting. At matched exposure the render tree went
-  **0.297 → 0.264 cores (~11%, n=8 post ticks, low confidence)**, and the
-  current plateaued GUI with the GPU on and the window focused reads
-  **0.358-0.373 cores against a pre-fix evening p50 of 0.297** — on its face
-  NOT better, and unexplained. ⚠ A separate probe measured GUI-role CPU at
-  ~2.3x the previous build in a comparable painting regime; that may be a real
-  regression from hardware GL or from under-glass arming, and it is unresolved.
+  **0.297 → 0.264 cores (~11%, n=8 post ticks, low confidence)**.
+  ⛔ **The "regression" half of this entry is WITHDRAWN (2026-07-26).** It said
+  the plateaued GUI reads **0.358-0.373 cores against a pre-fix evening p50 of
+  0.297**, and a separate probe called that a **~2.3x GUI-role regression** from
+  hardware GL. Both sides of that comparison differ in `window_focused`:
+  **1,194 of the 1,256 `render/gui` rows in the retained corpus are unfocused,
+  and ALL 1,131 pre-fix rows are** — while every number quoted as "after" came
+  from a focused window. On the same hardware arm, in the SAME process
+  (generation 1419187), focus moves `render/gui` p50 from **0.026 (n=524
+  unfocused) to 0.080 (n=8 focused)**, and across generations on that arm to
+  **0.179 — 3x to 7x, larger than the 2.3x being claimed.** Focus is not
+  cosmetic: `tick_hot_warmer` does SSH work only when focused. The comparison is
+  void and the regression is **unmeasured**, not disproven — the GUI process
+  really does hold DRM fds and submit GPU work it never did under llvmpipe, so
+  a real cost there remains possible. `window_focused` is now trap #4 in
+  `docs/optimization-pass.md` → "The standing measurement traps"; the A/B that
+  settles it is `scripts/gl_ab_experiment.sh` + `scripts/gl_ab_analyze.py`.
   ✅ **What DOES hold:** the GPU is genuinely rasterizing (0 → 7 DRM fds on
   `amdgpu`; 5,886.8 ms of engine time over 300 s deduped on `drm-client-id` =
   1.96%), the policy publishes `hardware_gl_probed`, the surface paints cleanly,
@@ -170,6 +181,39 @@ fix) once the fix is verified live on jojo.
   **Diagnose** by `~/.yggterm/hot-update-terminal-owners.json` (runtime key ->
   owner socket + pid) and PTY ancestry — never by row count, which stays
   healthy throughout.
+
+  **★ THE CHEAPER MITIGATION WAS COSTED AND DELIBERATELY NOT BUILT
+  (2026-07-26). Do not re-propose it without re-reading this.** Ground truth
+  from each daemon's own socket that morning: the 2.12.10 daemon (51 h) owned
+  exactly two sessions, both `kind=shell keep_alive=false` — "Secrets Fetch
+  Failure Debug" and "Workspace Shell". The 2.12.13 daemon owned an agent
+  session **and `local://1c17bfad` "New Yedit", `kind=shell keep_alive=TRUE`**.
+  So the reap frees **ONE** of the two supernumerary daemons; the other holds a
+  keep-alive shell it may never touch. Say "one daemon", never "36% of the
+  total".
+  **And what it now recovers is close to nothing.** Both of that daemon's
+  costs were global loops, not ownership, and both are fixed above it: the
+  perf-incident monitor's whole-corpus re-read (measured 334.7 MB per 90 s,
+  byte-identical in all three daemons) and the machine-wide transcript walk
+  (908.1 / 908.1 / 454.0 MB per 90 s). With those gone a superseded daemon
+  holding two idle shells costs ~0.001 cores and ~33 MB of RSS. **Weigh that
+  against killing a live PTY with 51 hours of state in it, named "Secrets Fetch
+  Failure Debug" — plausibly a human's debugging session. It is not worth it.**
+  **The defect underneath is real and stays open:** the non-keep-alive reap has
+  exactly ONE call site, `ServerRequest::PrepareClientClose` (`daemon.rs`;
+  `non_keep_alive_live_session_paths` has no other caller). A GUI that is
+  SIGKILLed, crashes, or is swapped by a deploy never sends it, so a shell the
+  user never marked keep-alive outlives the GUI it contracted to die with —
+  AGENTS.md: second-class sessions "survive GUI death IFF marked keep-alive".
+  Both 51-hour shells on jojo are that bug, not a policy gap. The right fix is
+  to close the path (reap on the successor's first tick when the predecessor's
+  client is provably gone), NOT to add a scheduled killer: pace it one per tick,
+  oldest-idle-first, with an idle-age floor, gated on `daemon_is_superseded`,
+  tracing the title and idle age of every reap. Never touch `keep_alive=true`
+  (shell OR agent), an agent kind (those are RELEASED for lossless re-resume by
+  `select_next_migration_candidate`, never killed), `remote-session://` /
+  `SshShell` rows, or the ~1,167 `server-*.sock` entries — those are symlink
+  ALIASES forming the cross-version compat plane, not litter.
 
 - **★★ `app open` CANNOT OPEN A TERMINAL SESSION ON A SHADOW CLIENT (found
   2026-07-25; ROOT-CAUSED and FIXED 2026-07-25, see the four changes below).**
