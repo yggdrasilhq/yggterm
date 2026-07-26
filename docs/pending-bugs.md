@@ -53,6 +53,20 @@ fix) once the fix is verified live on guihost.
   red.** Fix direction: verify-by-readback of the TARGET's final value against
   the requested text (honest failure when mismatched), clear-verify the
   resolved target element only, re-resolve rects after scroll before injecting.
+  4. **Duplicate DOM ids across repeated form blocks break `--selector`
+     targeting.** a services portal renders the complainant and OP blocks with the SAME
+     ids (`#Name`, `#District`…); `#id` selectors silently hit the FIRST, so
+     the agent drove the complainant's field while aiming at the OP's — twice.
+     Agent-side workaround: strip injected ids from previous holders before
+     re-tagging; address via `querySelectorAll("[id='X']")[n]`. Verb-plane
+     want: `--nth` on `--selector` (or an ambiguity warning in the response
+     when a selector matches >1 node).
+  5. **A stale MUI popper stays mounted and poisons the next pick** — after a
+     failed pick, `li[role=option]` still returns the OLD listbox's options,
+     so the next selection silently matches the wrong list. Proven recipe:
+     `web do key --key Escape` before each pick (that verb works). Candidate
+     verb-plane fix: role/option resolution scoped to the NEWEST open listbox
+     (aria-expanded owner), not the first match in document order.
   Falsified the other way (keep): MUI async Autocompletes ARE drivable via
   `do click` + `--role option`; headless file upload via DataTransfer works
   (379 KB PDF through one `web eval --stdin`, no GTK chooser).
