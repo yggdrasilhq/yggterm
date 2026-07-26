@@ -71,6 +71,25 @@ fix) once the fix is verified live on guihost.
      still, make it adaptive: skip the pre-roll when another notification played
      within the last few seconds, since the link is already awake.
 
+     **BUILT, NOT YET LIVE-VERIFIED ON guihost (2026-07-26).** The audio owner is
+     `emit_notification_chime` in `crates/yggterm-shell/src/shell.rs` — a
+     WebAudio graph built in Rust and handed to the webview via
+     `document::eval`. There is no bundled asset and no player process, so the
+     pre-roll is generated noise scheduled on the SAME `AudioContext` and the
+     same `ctx.currentTime` timeline as the chime; gapless by construction, and
+     structurally incapable of racing a second stream. Shipped:
+     400 ms TPDF noise at ~-57 dBFS (`NOTIFICATION_PREROLL_SECONDS`,
+     `NOTIFICATION_PREROLL_PEAK_AMPLITUDE`); an adaptive skip keyed on ONE owner
+     (`NOTIFICATION_CHIME_LAST_PLAYED_MS`, written only by the emitter) through
+     the pure `notification_preroll_decision(now, last_played)` with a 10 s
+     `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`; and a
+     `notification_sound_preroll {applied, reason, tone, preroll_ms,
+     since_last_ms}` trace row. The pre-roll lives inside the chime script, so
+     a notification with sound off emits neither. **Still to do:** hear it on
+     guihost through the user's Bluetooth speaker (the whole point is a physical
+     A2DP link) and confirm `notification_sound_preroll` in
+     `server trace tail`. Do not close this entry until that is done.
+
 - **★★★ USER REQUIREMENTS FOR THE SESSION-ROW LIFECYCLE (stated 2026-07-26, after
   curating the list by hand TWICE).** The user's words: *"A daemon bump and
   restart should not destroy the row order and number of sessions. If destroyed
