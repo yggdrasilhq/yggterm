@@ -2548,6 +2548,42 @@ impl HotRestartResult {
     }
 }
 
+/// Which peer-offered live rows a given import pass may admit. The two passes
+/// differ ONLY here — every other admission rule (the user's close outranks the
+/// peer, husks are refused) is one predicate for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerRowAdmission {
+    /// Superseded-daemon takeover: rescue only the runtimes the dying peer still
+    /// OWNS. A stale sibling holding mere metadata for a row the user closed on
+    /// the authoritative daemon must not resurrect it.
+    OwnedRuntimesOnly,
+    /// B4 live-row adoption: also adopt an ownerless agent row, which re-derives
+    /// from its CLI's own JSONL store and is owned by no daemon at rest.
+    OwnedOrAgentStore,
+}
+
+/// Drop every remembered-closed row from a persisted live set, returning the
+/// keys dropped. Cold restore is the one way back into the live order that does
+/// not pass an import admission predicate.
+fn drop_tombstoned_live_rows(
+    rows: &mut Vec<crate::PersistedLiveSession>,
+    tombstones: &crate::live_row_tombstones::LiveRowTombstones,
+    now: u64,
+) -> Vec<String> {
+    let mut dropped = Vec::new();
+    if tombstones.is_empty() {
+        return dropped;
+    }
+    rows.retain(|live| {
+        if tombstones.blocks(&crate::persisted_live_row_identity(live), now) {
+            dropped.push(live.key.clone());
+            return false;
+        }
+        true
+    });
+    dropped
+}
+
 struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
@@ -2565,6 +2601,13 @@ struct DaemonRuntime {
     /// predicates, cleared through the same persist chokepoint the ledger uses —
     /// see `live_row_tombstones.rs`.
     live_row_tombstones: crate::live_row_tombstones::LiveRowTombstones,
+    /// Live-row identities observed at the previous reconcile. The delta against
+    /// the current live order is what "this row came BACK" means; presence alone
+    /// is not, because a stale peer that never saw the close reports the row
+    /// live forever and would erase the veto on its next persist. Seeded from
+    /// the restored live order at boot, so a row that has simply never left is
+    /// never mistaken for a return.
+    live_row_identities_seen: HashSet<String>,
     /// Slice 4.2: which live client may WRITE each web profile. Two
     /// `WebContext`s on one profile corrupt it, so exactly one holder per
     /// profile at a time; a dead holder's lock is reclaimed on the next
@@ -2702,6 +2745,10 @@ impl DaemonRuntime {
         let mut restored_stored_sessions = 0usize;
         let mut restored_live_sessions = 0usize;
         let mut restored_remote_machines = 0usize;
+        let mut live_row_tombstones = crate::live_row_tombstones::LiveRowTombstones::load(
+            store.home_dir(),
+            crate::live_row_tombstones::now_secs(),
+        );
         if let Some(mut saved) = load_persisted_state(&state_path)? {
             // Never resurrect a predecessor's sessions from disk while it is
             // alive and owns their runtimes; it, not this file, is the truth.
@@ -2732,6 +2779,30 @@ impl DaemonRuntime {
                 );
                 saved.live_sessions.clear();
             }
+            // The user's close outranks the FILE too. Cold restore is the third
+            // way a closed row comes back and the only one the veto did not
+            // cover: a peer that never saw the close writes the row into the
+            // shared `server-state.json` on its next persist, and when the chain
+            // drains `may_cold_restore_live_sessions` says yes and the row
+            // returns unvetoed — the same shape as the 19 resurrected CLOSED
+            // sessions in [[finding-dead-sessions-revive-permanent-persist-mute]].
+            let vetoed = drop_tombstoned_live_rows(
+                &mut saved.live_sessions,
+                &live_row_tombstones,
+                crate::live_row_tombstones::now_secs(),
+            );
+            if !vetoed.is_empty() {
+                append_trace_event(
+                    store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "cold_restore_of_closed_live_rows_refused",
+                    serde_json::json!({
+                        "current_pid": our_pid,
+                        "vetoed_row_keys": vetoed,
+                    }),
+                );
+            }
             restored_from_persisted_state = true;
             restored_stored_sessions = saved.stored_sessions.len();
             restored_live_sessions = saved.live_sessions.len();
@@ -2751,10 +2822,8 @@ impl DaemonRuntime {
             row_order_ledger: crate::row_order_ledger::RowOrderLedger::load(
                 store_home_dir_for_ledger.as_path(),
             ),
-            live_row_tombstones: crate::live_row_tombstones::LiveRowTombstones::load(
-                store_home_dir_for_ledger.as_path(),
-                crate::live_row_tombstones::now_secs(),
-            ),
+            live_row_tombstones,
+            live_row_identities_seen: HashSet::new(),
             profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable::new(),
             remote_machine_refreshes_in_flight: HashSet::new(),
             codex_process_identity_cache: Mutex::new(BTreeMap::new()),
@@ -2773,6 +2842,11 @@ impl DaemonRuntime {
             remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
             last_persisted_state: None,
         };
+        // Baseline, not an observation: rows restored at boot have not "come
+        // back", they never left as far as this process can tell. Seeding them
+        // is what stops the first persist from reading the whole restored order
+        // as a wave of re-entries and clearing every remembered close.
+        runtime.live_row_identities_seen = runtime.live_row_identity_set();
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
             .retarget_loaded_registry_for_current_version(runtime.store.home_dir())?;
@@ -3711,16 +3785,30 @@ impl DaemonRuntime {
         peer_owned_identities: &HashSet<String>,
         tombstones: &crate::live_row_tombstones::LiveRowTombstones,
         now: u64,
+        admission: PeerRowAdmission,
     ) -> bool {
-        let identity = crate::normalized_live_row_identity(&live.key);
-        if tombstones.blocks(&identity, now) {
+        // TWO questions, deliberately keyed differently. "Did the user close
+        // this row?" must survive the row coming back under any spelling it can
+        // wear, so it asks for the key the row will LAND under
+        // (`persisted_live_row_identity` — a raw codex storage path re-keys to
+        // `local://<id>` on restore, and a peer offering that spelling walked
+        // straight past its own tombstone). "Does the peer still own this
+        // runtime?" compares one peer's advertised row key against the same
+        // peer's advertised runtime keys, which is what the plain key fold is.
+        if tombstones.blocks(&crate::persisted_live_row_identity(live), now) {
             return false;
         }
         if !crate::persisted_live_session_is_recoverable(live) {
             return false;
         }
-        peer_owned_identities.contains(&identity)
-            || crate::persisted_live_session_is_agent_store_recoverable(live)
+        let peer_owns_runtime =
+            peer_owned_identities.contains(&crate::normalized_live_row_identity(&live.key));
+        match admission {
+            PeerRowAdmission::OwnedRuntimesOnly => peer_owns_runtime,
+            PeerRowAdmission::OwnedOrAgentStore => {
+                peer_owns_runtime || crate::persisted_live_session_is_agent_store_recoverable(live)
+            }
+        }
     }
 
     /// B4 LIVE-row prevention — the third and last reconcile pass, and the one
@@ -3756,6 +3844,11 @@ impl DaemonRuntime {
     fn adopt_missing_live_session_rows_from_reachable_daemons(&mut self, reason: &'static str) {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let now = crate::live_row_tombstones::now_secs();
+        // A close recorded by a peer AFTER we booted is only on disk. Adopting
+        // against a boot-time copy re-adopts exactly the rows the user just
+        // closed, which is the whole reason the deny-list exists.
+        self.live_row_tombstones
+            .refresh(self.store.home_dir(), now);
         for (owner_endpoint, owner_status) in reachable_versioned_daemon_statuses_excluding_endpoint(
             self.store.home_dir(),
             &current_endpoint,
@@ -3774,7 +3867,13 @@ impl DaemonRuntime {
             let adopted = self
                 .server
                 .import_peer_live_rows_in_order(&owner_status.live_terminal_sessions, |live| {
-                    Self::peer_live_row_is_adoptable(live, &owned, tombstones, now)
+                    Self::peer_live_row_is_adoptable(
+                        live,
+                        &owned,
+                        tombstones,
+                        now,
+                        PeerRowAdmission::OwnedOrAgentStore,
+                    )
                 });
             if !adopted.is_empty() {
                 append_trace_event(
@@ -4112,6 +4211,9 @@ impl DaemonRuntime {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let current_triple = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION);
         let now = crate::live_row_tombstones::now_secs();
+        // Same reason as the B4 pass: the veto is only as good as its freshness.
+        self.live_row_tombstones
+            .refresh(self.store.home_dir(), now);
         let mut prepared = Vec::new();
         let mut prepare_errors = Vec::new();
         let mut imported_keys = Vec::new();
@@ -4175,9 +4277,13 @@ impl DaemonRuntime {
             imported_keys.extend(self.server.import_peer_live_rows_in_order(
                 &saved.live_sessions,
                 |live| {
-                    crate::persisted_live_session_is_recoverable(live)
-                        && owned.contains(&crate::normalized_live_row_identity(&live.key))
-                        && !tombstones.blocks(&crate::normalized_live_row_identity(&live.key), now)
+                    Self::peer_live_row_is_adoptable(
+                        live,
+                        &owned,
+                        tombstones,
+                        now,
+                        PeerRowAdmission::OwnedRuntimesOnly,
+                    )
                 },
             ));
         }
@@ -5370,12 +5476,17 @@ impl DaemonRuntime {
         else {
             return;
         };
-        if self
-            .live_row_tombstones
-            .record(&identity, crate::live_row_tombstones::now_secs())
-        {
-            self.save_live_row_tombstones();
-            append_trace_event(
+        // The row is going away; drop it from the baseline so that re-opening it
+        // before the next reconcile still reads as a re-entry and lifts its own
+        // veto. Without this a close+reopen inside one persist window leaves a
+        // veto on a row that is live right now.
+        self.live_row_identities_seen.remove(&identity);
+        match self.live_row_tombstones.record_close(
+            self.store.home_dir(),
+            &identity,
+            crate::live_row_tombstones::now_secs(),
+        ) {
+            Ok(true) => append_trace_event(
                 self.store.home_dir(),
                 "daemon",
                 "session",
@@ -5385,8 +5496,20 @@ impl DaemonRuntime {
                     "identity": identity,
                     "tombstone_count": self.live_row_tombstones.len(),
                 }),
-            );
+            ),
+            Ok(false) => {}
+            Err(error) => self.report_live_row_tombstone_write_failure("record", &error),
         }
+    }
+
+    /// The identities currently in the live order, folded the same way the
+    /// tombstone keys are.
+    fn live_row_identity_set(&self) -> HashSet<String> {
+        self.server
+            .live_session_order_keys()
+            .iter()
+            .map(|key| crate::normalized_live_row_identity(key))
+            .collect()
     }
 
     /// Expire old closes, and forget the close of any row that is live again.
@@ -5396,31 +5519,33 @@ impl DaemonRuntime {
     /// signal that the veto has served its purpose.
     fn reconcile_live_row_tombstones(&mut self) {
         let now = crate::live_row_tombstones::now_secs();
-        let mut changed = self.live_row_tombstones.gc(now);
-        let live: HashSet<String> = self
-            .server
-            .live_session_order_keys()
-            .iter()
-            .map(|key| crate::normalized_live_row_identity(key))
-            .collect();
-        let revived: Vec<String> = self
-            .live_row_tombstones
-            .identities()
-            .filter(|identity| live.contains(*identity))
-            .map(ToOwned::to_owned)
-            .collect();
-        for identity in &revived {
-            changed |= self.live_row_tombstones.clear(identity);
-        }
-        if changed {
-            self.save_live_row_tombstones();
+        let live = self.live_row_identity_set();
+        let entered =
+            crate::live_row_tombstones::EnteredLiveRows::since(&self.live_row_identities_seen, &live);
+        self.live_row_identities_seen = live;
+        if let Err(error) =
+            self.live_row_tombstones
+                .reconcile(self.store.home_dir(), now, &entered)
+        {
+            self.report_live_row_tombstone_write_failure("reconcile", &error);
         }
     }
 
-    fn save_live_row_tombstones(&self) {
-        if let Err(error) = self.live_row_tombstones.save(self.store.home_dir()) {
-            tracing::warn!(%error, "failed to save live-row tombstones");
-        }
+    /// A durability feature that fails silently is worse than one that is
+    /// absent, because the only other symptom is the bug coming back. The
+    /// record path traces its successes; this traces the failures of both.
+    fn report_live_row_tombstone_write_failure(&self, phase: &str, error: &anyhow::Error) {
+        tracing::warn!(%error, phase, "failed to save live-row tombstones");
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "session",
+            "live_session_row_tombstone_write_failed",
+            serde_json::json!({
+                "phase": phase,
+                "error": error.to_string(),
+            }),
+        );
     }
 
     /// Restore `path` to its remembered slot in the live order after it

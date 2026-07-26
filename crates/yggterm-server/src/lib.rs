@@ -481,6 +481,73 @@ pub(crate) fn normalized_live_row_identity(key: &str) -> String {
     }
 }
 
+/// Does [`YggtermServer::restore_live_session`] re-key this row onto a local
+/// runtime key (`local://<id>`)? One owner of the question — restore asks it of
+/// both the key and the id, and [`restored_live_row_key`] must agree with it or
+/// the identity it reports is a spelling the row never wears.
+fn live_row_rekeys_onto_local_runtime(key: &str, ssh_target: &str, kind: SessionKind) -> bool {
+    parse_remote_scanned_session_path(key).is_none()
+        && is_loopback_ssh_target(ssh_target)
+        && local_live_session_kind_is_recoverable(kind)
+}
+
+/// The local runtime id [`YggtermServer::restore_live_session`] re-keys a row
+/// onto, when the row carries one. `None` means the row has no stable id and
+/// restore mints a fresh uuid — so it is a NEW row and can match nothing
+/// remembered about an old one.
+fn restored_local_runtime_id(
+    key: &str,
+    id: &str,
+    kind: SessionKind,
+    storage_path: Option<&str>,
+) -> Option<String> {
+    let has_storage = storage_path.is_some_and(|path| !path.trim().is_empty());
+    if kind == SessionKind::Codex && has_storage && !id.trim().is_empty() {
+        return Some(id.to_string());
+    }
+    local_runtime_id_from_key(key)
+        .map(ToOwned::to_owned)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!id.trim().is_empty()).then(|| id.to_string()))
+}
+
+/// The live-order key [`YggtermServer::restore_live_session`] will file this row
+/// under — `None` when that key depends on a freshly minted uuid.
+///
+/// Restore RE-KEYS rows: a raw codex storage path becomes `local://<id>`, and a
+/// remote machine key is case-folded. Any question asked about a row BEFORE it
+/// lands ("did the user close this one?") has to be asked about the key it will
+/// wear AFTER, or a peer re-offering the row under its pre-migration spelling
+/// walks straight past the answer. One owner, used by restore itself, so the two
+/// cannot drift.
+pub(crate) fn restored_live_row_key(live: &PersistedLiveSession) -> Option<String> {
+    if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&live.key) {
+        return Some(remote_scanned_session_path(
+            &normalize_machine_key(raw_machine_key),
+            session_id,
+        ));
+    }
+    if !live_row_rekeys_onto_local_runtime(&live.key, &live.ssh_target, live.kind) {
+        return Some(live.key.clone());
+    }
+    let storage_path = live
+        .storage_path
+        .clone()
+        .or_else(|| is_local_codex_storage_session_path(&live.key).then(|| live.key.clone()));
+    restored_local_runtime_id(&live.key, &live.id, live.kind, storage_path.as_deref())
+        .map(|id| canonical_local_live_runtime_key(&live.key, &id))
+}
+
+/// The identity of a persisted/advertised row for cross-daemon memory —
+/// [`normalized_live_row_identity`] over the key the row will actually land
+/// under. Use this, not the raw key, wherever a row is judged before it is
+/// restored.
+pub(crate) fn persisted_live_row_identity(live: &PersistedLiveSession) -> String {
+    normalized_live_row_identity(
+        &restored_live_row_key(live).unwrap_or_else(|| live.key.clone()),
+    )
+}
+
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
     if is_local_codex_storage_session_path(key)
         || is_local_codex_storage_session_path(&session.session_path)
@@ -6690,6 +6757,7 @@ impl YggtermServer {
         // still-alive non-keep-alive REMOTE agents and live non-keep-alive shells
         // on load (guihost: dev CC/codex + shells vanished after an agentic restart).
         let store_recoverable = persisted_live_session_is_recoverable(&live);
+        let restored_row_key = restored_live_row_key(&live);
         let PersistedLiveSession {
             key,
             id,
@@ -6725,37 +6793,18 @@ impl YggtermServer {
                 let normalized_live_key = remote_scanned_session_path(&machine_key, session_id);
                 (machine_key, session_id.to_string(), normalized_live_key)
             });
-        let restored_local_id = if kind == SessionKind::Codex
-            && storage_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-            && !id.trim().is_empty()
-        {
-            id.clone()
-        } else {
-            local_runtime_id_from_key(&key)
-                .map(ToOwned::to_owned)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if id.trim().is_empty() {
-                        Uuid::new_v4().to_string()
-                    } else {
-                        id.clone()
-                    }
-                })
-        };
-        let key = if remote_scanned_key.is_none()
-            && is_loopback_ssh_target(&ssh_target)
-            && local_live_session_kind_is_recoverable(kind)
-        {
-            canonical_local_live_runtime_key(&key, &restored_local_id)
-        } else {
-            key
-        };
-        let id = if remote_scanned_key.is_none()
-            && is_loopback_ssh_target(&ssh_target)
-            && local_live_session_kind_is_recoverable(kind)
-        {
+        let restored_local_id =
+            restored_local_runtime_id(&key, &id, kind, storage_path.as_deref())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let rekeys_onto_local_runtime =
+            live_row_rekeys_onto_local_runtime(&key, &ssh_target, kind);
+        // The key this row lands under is `restored_live_row_key`'s answer —
+        // the same function every cross-daemon judgement about the row asks.
+        // It declines only when the id had to be minted just now, which is the
+        // one case where nothing can be remembered about the row anyway.
+        let key = restored_row_key
+            .unwrap_or_else(|| canonical_local_live_runtime_key(&key, &restored_local_id));
+        let id = if rekeys_onto_local_runtime {
             restored_local_id
         } else {
             id

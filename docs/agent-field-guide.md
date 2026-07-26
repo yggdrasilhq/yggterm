@@ -268,6 +268,127 @@ until its own disk-binary poll retires it, which can be ~20 minutes later.
 - Never type into a live agent prompt to "test" it.
 - Restore the user's active session after any probe that had to switch away.
 
+## 7. Gotchas that cost this project real time (2026-07-26)
+
+Each of these produced a CONFIDENT WRONG ANSWER, which is worse than an error.
+They are ordered by how much time they burned.
+
+### 7.1 A lock that mutates the new helper is not a lock
+
+**Five could-only-pass locks shipped in two rounds.** Every one tested a
+freshly-added helper with hand-built arguments instead of the wiring that was
+the actual defect:
+
+- the "20 sequential verbs deliver" test passed a **literal zero** seat-input
+  count, synthesizing away the exact bug it existed for;
+- a GL lock asserted `f(x) == Clear iff x`, restating a function that *is*
+  `if x { Clear } else { Apply }`;
+- a memo-key lock built struct literals and never called the production key
+  builder — a tautology over `derive(PartialEq)`;
+- a source scan anchored on a string occurring **zero times** in the file, so
+  `unwrap_or(len)` silently widened its "scope" to 75% of the file including
+  the test module;
+- the web-surface reclaim locks: reverting **all four production call sites**
+  left the suite green at the identical pass count the report cited as proof.
+
+**The rule: mutate the PRODUCTION CALL SITE, run it, see red, restore, and quote
+the red output.** If the loop is not directly testable, extract the decision
+into a pure function the loop CALLS, so reverting the loop's wiring changes the
+pure function's observed input. A test that calls the helper directly is
+structurally incapable of observing what the loop passes it.
+
+### 7.2 Never run several workflow lanes on `main` in one checkout
+
+Three fix lanes were pointed at `main` in the same working tree. Two edited
+`shell.rs` simultaneously; 1,222 uncommitted insertions interleaved, the tree
+stopped compiling mid-edit, and stopping them left half-finished refactors
+(renamed functions with un-updated test call sites, a test written for a
+function that was never written). **Use `isolation: 'worktree'` for every
+parallel lane, always** — even when the file sets look disjoint, because agents
+run the whole suite and will "fix" each other's in-flight edits.
+
+### 7.3 A measurement must be able to refuse
+
+Three separate A/B arms each produced a confident wrong number, all from the
+same failure — the load never reached the renderer and nothing said so:
+comparing an evening of real use against an overnight window with **23x less
+terminal activity**; piping the paint load to `/dev/null`; and restarting the
+GUI between arms so it came back displaying a **different session**. That last
+arm read 0.27 cores and looked like a 5x win.
+
+`scripts/gl_ab_measure.sh` now refuses to print a number unless the window is
+focused, the session under test is the one actually displayed, the active
+session did not change mid-arm, and the arm cost more than a floor.
+
+**Corollary — the confound that invalidated both a "win" and a "regression":**
+render rows carry `window_focused`, and unfocused→focused alone moves
+`render/gui` p50 by **7x**. Before comparing any two render windows, bucket them
+by `window_focused` and by `daemon_request/terminal_read` rate. `gpu_ms` zero in
+523 of 532 ticks means nothing painted, not that the GPU got faster.
+
+### 7.4 Instruments that lie about their own subject
+
+- **`set_var`/`remove_var` do NOT change `/proc/<pid>/environ`.** glibc
+  reallocates the environ array on the heap; the kernel keeps exposing the
+  exec-time stack page. Anything the process set AFTER exec is invisible there,
+  and after a hot restart the child's `/proc` shows the PREDECESSOR's values.
+  Publish a runtime decision from the process's OWN view.
+- **`drm-engine-*` is per DRM CLIENT, not per fd.** Duplicated fds share one
+  `struct file` and each repeats the same cumulative counter, so a per-fd sum
+  over-counts by the fd count — measured **5.00x on Xorg, 4.00x on a
+  compositor**. Dedup on `drm-client-id`.
+- **Zero GPU engine time in a window means IDLE, not software.** Read the
+  DRM-fd count first: llvmpipe never opens a DRM node, so that is the
+  structural answer; engine time is a workload answer.
+- **`grep -c` on a binary counts LINES.** Use `strings | grep -c`, and pick a
+  string the fix definitely contains — a format string, not a code identifier
+  that may be inlined away.
+
+### 7.5 The reaper can be the cause
+
+Reclaim that destroys a page which is immediately re-created reclaims nothing
+and pays for a fresh web process every cycle. Measured live: **166
+`background_hold_expired` closes against 166 re-opens in fifteen minutes**, one
+churned process ballooning to 3.9 GB, on a host whose swap was 100% full —
+the reaper reacting to pressure it was substantially creating, while the user
+could not hold keyboard focus long enough to type a prompt. Any pressure-driven
+reclaim needs hysteresis: a target that keeps coming back is not a target.
+
+### 7.6 A working GPU is not consent to arm a compositing mode
+
+Hardware GL armed Phase F under-glass by default, and the user's entire window
+became a background agent's page. Under glass the shell webview is TRANSPARENT
+by construction, so anything that stops the shell painting shows whatever
+surface is behind it, full screen — and it fired exactly when memory was
+exhausted, which is when the shell is least likely to paint. Under the legacy
+opaque stack the same starvation is invisible. Keep the GL decision and the
+compositing decision separate; `shm_force_for_arming` already refuses SHM on a
+hardware host, so hardware GL keeps DMABuf either way.
+
+### 7.7 `kill -TERM` on the daemon is not the graceful drain
+
+The graceful path is the binary-replacement self-retire, which drains in idle
+order. But it defers while ANY owned session was active in the last 300 s, so
+under agent load it never converges. Killing instead cost **~7 agent PTYs**;
+rows and transcripts survived and each resumes on a click, but in-flight work
+was interrupted. Decide deliberately, and tell the user the cost BEFORE doing
+it.
+
+### 7.8 The agent outlives the binary
+
+`ychrome-vault` and `yedit` both serve OLD code from a running process after
+the binary on disk is replaced — the vault agent had been serving pre-fix code
+for 42 hours with its exe deleted, while the fixed binary sat installed. A fix
+that is "deployed" is not running until the process that serves it restarts.
+Check `/proc/<pid>/exe` for ` (deleted)` and compare process start time against
+the fix's commit time.
+
+### 7.9 Source of truth for a tool's own source
+
+The deployed `yedit` binary's features existed **only** as untracked files on
+the build host — no git repo, no remote, no copy anywhere. Before editing any
+fleet tool, confirm its source is in version control and pushed.
+
 ## 6. Where the deep material lives
 
 - `docs/pending-bugs.md` — open, user-confirmed bugs. The work queue.

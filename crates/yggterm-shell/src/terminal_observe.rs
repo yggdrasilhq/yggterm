@@ -27,7 +27,17 @@ pub(crate) struct MemoryPressureSnapshot {
     /// when `/proc/pressure/memory` is absent or unreadable (kernel built
     /// without `CONFIG_PSI`, or a non-Linux host). Basis points rather than an
     /// `f64` so the snapshot stays `Eq` and comparisons stay exact.
+    ///
+    /// REPORTED ONLY — [`Self::reclaim_pressured`] does not read it. `some`
+    /// counts wall time in which *at least one* task stalled, which a large
+    /// build refaulting page cache produces on a machine with gigabytes free.
     pub(crate) psi_some_avg60_bp: Option<u32>,
+    /// Kernel PSI `memory` → `full avg60`, same units. `full` is the fraction of
+    /// wall time in which EVERY non-idle task was stalled on memory — i.e. the
+    /// machine got no useful work done. That is the honest "this box is
+    /// thrashing" signal, and it is the only PSI figure the reclaim predicate
+    /// reads.
+    pub(crate) psi_full_avg60_bp: Option<u32>,
 }
 
 /// Available-memory floor, as a percentage of `MemTotal`, below which the
@@ -35,10 +45,22 @@ pub(crate) struct MemoryPressureSnapshot {
 /// them work to buy memory nobody is asking for.
 const RECLAIM_AVAILABLE_FLOOR_PCT: u64 = 15;
 
-/// PSI `memory` `some avg60` (in basis points) at or above which the machine is
+/// PSI `memory` `full avg60` (in basis points) at or above which the machine is
 /// actively stalling on reclaim even if `MemAvailable` still looks comfortable.
-/// 10% of wall time stalled is well past "busy" and into "thrashing".
-const RECLAIM_PSI_SOME_AVG60_BP: u32 = 1_000;
+/// 10% of wall time with *every* task stalled is well past "busy" and into
+/// "thrashing".
+const RECLAIM_PSI_FULL_AVG60_BP: u32 = 1_000;
+
+/// Headroom ceiling, as a percentage of `MemTotal`, above which a kernel reclaim
+/// stall is NOT this application's memory problem. PSI is system-wide: a big
+/// build, a large copy, or another process refaulting its page cache all raise
+/// it while yggterm's pages are not what the machine is short of. Destroying the
+/// user's backgrounded pages on that signal buys memory nobody asked for — the
+/// exact failure Y1 exists to end, with a different latch. So the PSI route is
+/// vetoed by headroom: it may only fire while available memory is already
+/// uncomfortable, and it exists to catch the thrash that the hard floor alone
+/// misses.
+const RECLAIM_PSI_HEADROOM_CEILING_PCT: u64 = 30;
 
 impl MemoryPressureSnapshot {
     pub(crate) fn swap_used_mb(&self) -> u64 {
@@ -75,28 +97,36 @@ impl MemoryPressureSnapshot {
     ///
     /// Headroom answers the real question, in two ways that agree:
     /// - `MemAvailable` below [`RECLAIM_AVAILABLE_FLOOR_PCT`] of `MemTotal` — the
-    ///   kernel's own estimate of what can be handed out without swapping.
-    /// - PSI `some avg60` at or above [`RECLAIM_PSI_SOME_AVG60_BP`] — the kernel
-    ///   measuring actual reclaim stalls, which catches a thrash that headroom
-    ///   alone can miss.
+    ///   kernel's own estimate of what can be handed out without swapping. This
+    ///   is the primary route.
+    /// - PSI `full avg60` at or above [`RECLAIM_PSI_FULL_AVG60_BP`] *while*
+    ///   headroom is already below [`RECLAIM_PSI_HEADROOM_CEILING_PCT`] — the
+    ///   kernel measuring an actual thrash that the hard floor alone can miss.
+    ///   Headroom VETOES this route: PSI is system-wide and says nothing about
+    ///   whose memory is short, so a stall measured on a machine with plenty
+    ///   available is not a licence to destroy the user's pages.
     ///
-    /// An ABSENT snapshot reads FALSE. For the reveal-latency path an unknown
-    /// snapshot means "unknown", but here the action is destroying the user's
-    /// pages, and ignorance is not a licence to do that.
+    /// An ABSENT snapshot reads FALSE, checked FIRST and unconditionally. For the
+    /// reveal-latency path an unknown snapshot means "unknown", but here the
+    /// action is destroying the user's pages, and ignorance is not a licence to
+    /// do that. `/proc/meminfo` and `/proc/pressure/memory` are read
+    /// independently, so a PSI-only snapshot is constructible — and it carries no
+    /// headroom reading at all, which is precisely when this must refuse.
     pub(crate) fn reclaim_pressured(&self) -> bool {
-        if self
-            .psi_some_avg60_bp
-            .is_some_and(|bp| bp >= RECLAIM_PSI_SOME_AVG60_BP)
-        {
-            return true;
-        }
         if !self.is_present() {
             return false;
         }
-        self.mem_available_kb.saturating_mul(100)
-            < self
-                .mem_total_kb
-                .saturating_mul(RECLAIM_AVAILABLE_FLOOR_PCT)
+        if self.available_below_pct(RECLAIM_AVAILABLE_FLOOR_PCT) {
+            return true;
+        }
+        self.psi_full_avg60_bp
+            .is_some_and(|bp| bp >= RECLAIM_PSI_FULL_AVG60_BP)
+            && self.available_below_pct(RECLAIM_PSI_HEADROOM_CEILING_PCT)
+    }
+    /// `MemAvailable` strictly below `pct` percent of `MemTotal`. One owner for
+    /// the headroom comparison so the two routes cannot drift apart in rounding.
+    fn available_below_pct(&self, pct: u64) -> bool {
+        self.mem_available_kb.saturating_mul(100) < self.mem_total_kb.saturating_mul(pct)
     }
     /// Whether the snapshot carries any usable reading at all (false on
     /// platforms without `/proc/meminfo` or when the read failed).
@@ -114,6 +144,10 @@ impl MemoryPressureSnapshot {
             "reclaim_pressured": self.reclaim_pressured(),
             "psi_some_avg60_pct": self
                 .psi_some_avg60_bp
+                .map(|bp| Value::from(f64::from(bp) / 100.0))
+                .unwrap_or(Value::Null),
+            "psi_full_avg60_pct": self
+                .psi_full_avg60_bp
                 .map(|bp| Value::from(f64::from(bp) / 100.0))
                 .unwrap_or(Value::Null),
         })
@@ -153,26 +187,31 @@ pub(crate) fn parse_meminfo(text: &str) -> MemoryPressureSnapshot {
         mem_available_kb,
         mem_total_kb,
         psi_some_avg60_bp: None,
+        psi_full_avg60_bp: None,
     }
 }
 
-/// Parse kernel `/proc/pressure/memory` text into the `some avg60` figure, in
-/// basis points. Pure (no I/O). The file's shape is two lines:
+/// Parse one `avg60` figure out of kernel `/proc/pressure/memory` text, in basis
+/// points. Pure (no I/O). `kind` is `"some"` or `"full"`. The file's shape is two
+/// lines:
 ///
 /// ```text
 /// some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037
 /// full avg10=0.24 avg60=0.06 avg300=0.01 total=1613274815
 /// ```
 ///
-/// We read `some`, not `full`: `some` means at least one task stalled, which is
-/// the earliest honest signal that reclaim is costing the machine work. Returns
-/// `None` for absent/garbage input — never a silent zero, which would read as
-/// "measured, and healthy".
-pub(crate) fn parse_pressure_some_avg60_bp(text: &str) -> Option<u32> {
+/// One parser for both lines so the two readings cannot drift in parsing or
+/// rounding. `some` means at least one task stalled — reported, never acted on.
+/// `full` means every non-idle task stalled, and is what
+/// [`MemoryPressureSnapshot::reclaim_pressured`] reads. Returns `None` for
+/// absent/garbage input — never a silent zero, which would read as "measured,
+/// and healthy".
+pub(crate) fn parse_pressure_avg60_bp(text: &str, kind: &str) -> Option<u32> {
+    let prefix = format!("{kind} ");
     let line = text
         .lines()
         .map(str::trim)
-        .find(|line| line.starts_with("some "))?;
+        .find(|line| line.starts_with(&prefix))?;
     let field = line
         .split_whitespace()
         .find_map(|token| token.strip_prefix("avg60="))?;
@@ -191,15 +230,17 @@ pub(crate) fn parse_pressure_some_avg60_bp(text: &str) -> Option<u32> {
 /// "do not destroy the user's pages on a guess".
 ///
 /// PSI is optional and independent: a kernel without `CONFIG_PSI` simply leaves
-/// `psi_some_avg60_bp` at `None`, and the headroom half still answers.
+/// the PSI fields at `None`, and the headroom half still answers.
 pub(crate) fn read_memory_pressure_snapshot() -> MemoryPressureSnapshot {
     let mut snapshot = std::fs::read_to_string("/proc/meminfo")
         .map(|text| parse_meminfo(&text))
         .unwrap_or_default();
-    snapshot.psi_some_avg60_bp = std::fs::read_to_string("/proc/pressure/memory")
-        .ok()
-        .as_deref()
-        .and_then(parse_pressure_some_avg60_bp);
+    // One read, both lines — reading the file twice could straddle a kernel
+    // update and report a `some`/`full` pair that never coexisted.
+    if let Ok(pressure) = std::fs::read_to_string("/proc/pressure/memory") {
+        snapshot.psi_some_avg60_bp = parse_pressure_avg60_bp(&pressure, "some");
+        snapshot.psi_full_avg60_bp = parse_pressure_avg60_bp(&pressure, "full");
+    }
     snapshot
 }
 
@@ -3945,7 +3986,7 @@ mod tests {
 
     use super::{
         MemoryPressureSnapshot, RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
-        WorkspaceViewMode, parse_meminfo, parse_pressure_some_avg60_bp,
+        WorkspaceViewMode, parse_meminfo, parse_pressure_avg60_bp,
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
@@ -4053,11 +4094,11 @@ SwapCached:        20580 kB
 SwapTotal:      16776512 kB
 SwapFree:        4691496 kB
 ";
+        let pressure = "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
+             full avg10=0.24 avg60=0.06 avg300=0.01 total=1613274815\n";
         let mut snapshot = parse_meminfo(meminfo);
-        snapshot.psi_some_avg60_bp = parse_pressure_some_avg60_bp(
-            "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
-             full avg10=0.24 avg60=0.06 avg300=0.01 total=1613274815\n",
-        );
+        snapshot.psi_some_avg60_bp = parse_pressure_avg60_bp(pressure, "some");
+        snapshot.psi_full_avg60_bp = parse_pressure_avg60_bp(pressure, "full");
         // 16776512 - 4691496 = 12085016 kB ≈ 11.5 GiB of swap in use.
         assert_eq!(snapshot.swap_used_kb, 12_085_016);
         assert_eq!(snapshot.psi_some_avg60_bp, Some(6));
@@ -4089,42 +4130,94 @@ SwapFree:        4691496 kB
         let at_floor =
             parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 2400000 kB\nSwapTotal: 0 kB\n");
         assert!(!at_floor.reclaim_pressured());
-        // PSI route: plenty of headroom, but the kernel says a third of wall time
-        // is spent stalled on memory. That is a thrash and reclaim must fire.
-        let mut stalling = parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n");
+        // PSI route: headroom is uncomfortable (20%, above the hard 15% floor but
+        // below the 30% ceiling) AND the kernel says a third of wall time is
+        // spent with every task stalled. That is a thrash and reclaim must fire.
+        let mut stalling = parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 3200000 kB\n");
         assert!(!stalling.reclaim_pressured());
-        stalling.psi_some_avg60_bp =
-            parse_pressure_some_avg60_bp("some avg10=44.10 avg60=33.33 avg300=12.00 total=1\n");
-        assert_eq!(stalling.psi_some_avg60_bp, Some(3_333));
+        stalling.psi_full_avg60_bp =
+            parse_pressure_avg60_bp("full avg10=44.10 avg60=33.33 avg300=12.00 total=1\n", "full");
+        assert_eq!(stalling.psi_full_avg60_bp, Some(3_333));
         assert!(stalling.reclaim_pressured());
         // Unreadable machine: never reclaim on a guess.
         assert!(!MemoryPressureSnapshot::default().reclaim_pressured());
     }
 
+    /// The PSI route's two escape hatches, both of which fired at HEAD.
+    ///
+    /// 1. PSI is SYSTEM-WIDE. A machine with half its RAM free while a large
+    ///    build refaults page cache is not short of memory *for us*, and
+    ///    destroying the user's backgrounded pages there buys nothing. Headroom
+    ///    vetoes the stall signal.
+    /// 2. `/proc/meminfo` and `/proc/pressure/memory` are read INDEPENDENTLY, so
+    ///    a snapshot with PSI and no headroom reading is constructible. At HEAD
+    ///    the PSI test ran BEFORE `is_present()`, so that snapshot — which knows
+    ///    nothing at all about memory — reclaimed. The doc said the opposite.
     #[test]
-    fn pressure_psi_parser_reads_some_avg60_and_refuses_garbage() {
-        assert_eq!(
-            parse_pressure_some_avg60_bp(
-                "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
-                 full avg10=9.99 avg60=8.88 avg300=7.77 total=1613274815\n"
-            ),
-            // `some`, never `full` — the earliest honest stall signal.
-            Some(6)
+    fn a_kernel_stall_on_a_comfortable_or_unreadable_machine_never_reclaims() {
+        let mut comfortable = parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n");
+        comfortable.psi_full_avg60_bp =
+            parse_pressure_avg60_bp("full avg10=44.10 avg60=33.33 avg300=12.00 total=1\n", "full");
+        assert_eq!(comfortable.psi_full_avg60_bp, Some(3_333));
+        assert!(
+            !comfortable.reclaim_pressured(),
+            "50% of RAM available: whoever is stalling, it is not us being short"
         );
+        // `some` is not consulted at all — one task stalling is the normal state
+        // of a busy machine, and it is what a big build produces.
+        let mut some_only = parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 3200000 kB\n");
+        some_only.psi_some_avg60_bp =
+            parse_pressure_avg60_bp("some avg10=99.00 avg60=99.00 avg300=99.00 total=1\n", "some");
+        assert_eq!(some_only.psi_some_avg60_bp, Some(9_900));
+        assert!(
+            !some_only.reclaim_pressured(),
+            "`some avg60` must not be a reclaim latch; only `full` is"
+        );
+        // Headroom unreadable, PSI pegged: refuse. `is_present()` is checked
+        // FIRST, so there is no route past it.
+        let psi_only = MemoryPressureSnapshot {
+            psi_full_avg60_bp: Some(10_000),
+            psi_some_avg60_bp: Some(10_000),
+            ..Default::default()
+        };
+        assert!(!psi_only.is_present());
+        assert!(
+            !psi_only.reclaim_pressured(),
+            "a snapshot with no headroom reading knows nothing, and ignorance is \
+             not a licence to destroy the user's pages"
+        );
+    }
+
+    #[test]
+    fn pressure_psi_parser_reads_each_avg60_line_and_refuses_garbage() {
+        let live = "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
+                    full avg10=9.99 avg60=8.88 avg300=7.77 total=1613274815\n";
+        // The two lines must not be confusable — the reclaim predicate reads
+        // `full` and only `full`, so a parser that answers the wrong line would
+        // silently restore the over-eager latch.
+        assert_eq!(parse_pressure_avg60_bp(live, "some"), Some(6));
+        assert_eq!(parse_pressure_avg60_bp(live, "full"), Some(888));
         // Absent / malformed / non-Linux reads as UNKNOWN, never as a healthy 0.
-        assert_eq!(parse_pressure_some_avg60_bp(""), None);
+        assert_eq!(parse_pressure_avg60_bp("", "some"), None);
         assert_eq!(
-            parse_pressure_some_avg60_bp("full avg60=1.00 total=3\n"),
+            parse_pressure_avg60_bp("full avg60=1.00 total=3\n", "some"),
             None
         );
-        assert_eq!(parse_pressure_some_avg60_bp("some avg10=0.1 total=3\n"), None);
         assert_eq!(
-            parse_pressure_some_avg60_bp("some avg10=0.1 avg60=nan total=3\n"),
+            parse_pressure_avg60_bp("some avg60=1.00 total=3\n", "full"),
             None
         );
-        // A full stall reads as 100.00% == 10000 bp.
         assert_eq!(
-            parse_pressure_some_avg60_bp("some avg10=100.00 avg60=100.00 avg300=100.00 total=9\n"),
+            parse_pressure_avg60_bp("some avg10=0.1 total=3\n", "some"),
+            None
+        );
+        assert_eq!(
+            parse_pressure_avg60_bp("some avg10=0.1 avg60=nan total=3\n", "some"),
+            None
+        );
+        // A total stall reads as 100.00% == 10000 bp.
+        assert_eq!(
+            parse_pressure_avg60_bp("full avg10=100.00 avg60=100.00 avg300=100.00 total=9\n", "full"),
             Some(10_000)
         );
     }
