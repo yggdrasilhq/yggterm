@@ -7,6 +7,9 @@ pub mod click_grid;
 pub mod gl_probe;
 mod icon;
 mod install;
+/// THE notification tune — one owner for both the webview script and the
+/// native CLI player, so two players can never drift into two chimes.
+pub mod notification_audio;
 mod perf;
 pub mod render_probe;
 mod retention;
