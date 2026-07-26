@@ -2641,8 +2641,19 @@ fn navigate_web_surface_tab(
         // refcounted by its holders and torn down by the LAST one, see
         // `kill_forward`), which is also what makes the tabs share one
         // WebContext: the proxy is part of `web_context_key`.
-        let reuse_socks = remote
-            && state.with_mut(|shell| shell.adopt_web_surface_session_socks(&session_path, tab_id));
+        //
+        // Peeked before any mutation: with no donor there is nothing to write,
+        // and a `with_mut` on that path would dirty the shell for a render that
+        // changes nothing.
+        let donor = remote
+            .then(|| state.with(|shell| shell.web_surface_socks_donor_for(&session_path, tab_id)))
+            .flatten();
+        let reuse_socks = donor.is_some_and(|donor_id| {
+            donor_id == tab_id
+                || state.with_mut(|shell| {
+                    shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
+                })
+        });
         if reuse_socks {
             // SOCKS passes the real URL unchanged, so effective_url == url and
             // socks_port stays put: the reconciler NAVIGATES the live webview
@@ -10829,21 +10840,24 @@ impl ShellState {
     ///
     /// This is what stops N tabs on a remote session from becoming N ssh
     /// children, N handshakes, N remote sshds and N loopback ports.
-    fn adopt_web_surface_session_socks(&mut self, session_path: &str, tab_id: u64) -> bool {
-        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
-            return false;
-        };
+    fn web_surface_socks_donor_for(&self, session_path: &str, tab_id: u64) -> Option<u64> {
+        let surface = self.web_surfaces.get(session_path)?;
         let ports: Vec<(u64, Option<u16>)> = surface
             .tabs
             .iter()
             .map(|tab| (tab.id, tab.socks_port))
             .collect();
-        let Some(donor_id) = web_surface_socks_egress_donor(&ports, tab_id) else {
+        web_surface_socks_egress_donor(&ports, tab_id)
+    }
+    fn adopt_web_surface_session_socks(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        donor_id: u64,
+    ) -> bool {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
             return false;
         };
-        if donor_id == tab_id {
-            return true;
-        }
         let Some((port, child)) = surface
             .tabs
             .iter()
