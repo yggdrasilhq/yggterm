@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "pty-fd-handoff-spike"
+version = "0.1.0"
+edition = "2021"
+
+# Dependency-free, same convention as the WPE spikes: hand-written externs so
+# the spike measures the real primitive rather than a crate's ergonomics.
+[dependencies]
+
+[profile.release]
+debug = 0
