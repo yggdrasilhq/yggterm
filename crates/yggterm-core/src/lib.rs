@@ -65,8 +65,9 @@ pub use perf::{
     set_perf_profiling_enabled, summarize_perf_incidents, summarize_perf_telemetry,
 };
 pub use retention::{
-    DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, append_retained_jsonl_record,
-    jsonl_read_paths, prune_jsonl_generations, rotate_jsonl_with_retention,
+    DIAGNOSTIC_RETENTION_MAX_AGE_MS, JSONL_WINDOW_SLACK_MS, JsonlRetention,
+    append_retained_jsonl_record, for_each_jsonl_record_since, jsonl_line_ts_ms_upper_bound,
+    jsonl_read_paths, jsonl_read_paths_since, prune_jsonl_generations, rotate_jsonl_with_retention,
 };
 pub use session_kind::SessionKind;
 pub use telemetry::{
