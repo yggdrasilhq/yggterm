@@ -189,12 +189,13 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
-    SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
+    SessionPreviewBlock, SessionRemovalEvidence, SessionRenderedSection, SessionSource,
+    SessionTeardownProcess, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
     WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
     WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, app_control_pending_render_needed_for_worker,
+    YggtermServer, agent_plane_session_title, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
     fetch_remote_generation_context, focus_live_with_view, hot_restart, hot_restart_detailed,
@@ -216,7 +217,7 @@ use yggterm_server::{
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
-    wait_for_app_control_response,
+    verify_session_removal, wait_for_app_control_response,
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
@@ -4580,6 +4581,144 @@ mod web_surface_reclaim_locks {
                 "the headless create no longer does `{needle}`:\n{branch}",
             );
         }
+    }
+}
+
+/// THE TWO AGENT-PLANE CALL SITES THIS BUILD'S HONESTY DEPENDS ON.
+///
+/// Both live inside `process_pending_app_control_requests`, an `async` match
+/// over a live `Signal<ShellState>` that no unit test can enter, so the
+/// DECISIONS were moved into pure functions
+/// ([`agent_plane_session_title`], [`verify_session_removal`]) that are locked
+/// on their own — and the wiring that reaches them is locked here, over
+/// PRODUCT lines only (`yggterm_core::agent_cli::product_lines`, the
+/// workspace's one skip rule) so this module's own text cannot satisfy its own
+/// needles.
+#[cfg(test)]
+mod teardown_honesty_locks {
+    fn product_source() -> Vec<String> {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod teardown_honesty_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertions that name them",
+        );
+        product
+    }
+
+    /// The slice of the app-control match that handles one command, from its
+    /// arm header to the header of the next arm.
+    fn app_control_arm(product: &[String], arm: &str, next_arm: &str) -> String {
+        let header = format!("AppControlCommand::{arm} {{");
+        let start = product
+            .iter()
+            .position(|line| line.trim().starts_with(&header))
+            .unwrap_or_else(|| panic!("the {arm} arm is gone — move this lock with it"));
+        let next_header = format!("AppControlCommand::{next_arm} {{");
+        let end = product[start + 1..]
+            .iter()
+            .position(|line| line.trim().starts_with(&next_header))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("the {next_arm} arm is gone — move this lock with it"));
+        assert!(
+            end - start > 20,
+            "the captured {arm} arm is too short to be the real one"
+        );
+        product[start..end].join("\n")
+    }
+
+    /// A creation through the agent plane must NAME ITS DRIVER. Reverting the
+    /// fold — letting `title_hint` reach the daemon untouched — puts the row
+    /// back on the daemon's cwd-shaped default, which is the label a human's
+    /// shell in the same directory wears, and the row becomes unfindable by
+    /// any title probe.
+    #[test]
+    fn the_agent_plane_create_call_site_names_the_row_after_its_driver() {
+        let product = product_source();
+        let arm = app_control_arm(&product, "CreateTerminal", "SendTerminalInput");
+        for needle in [
+            // The synthesis happens only when the caller named nothing, so an
+            // explicit `--title` still wins and human creation (which never
+            // reaches this plane at all) is untouched.
+            "let synthesized_title = title_hint.is_none().then(|| {",
+            // The request's own agent identity, not a constant.
+            "request.agent.as_deref(),",
+            "purpose.as_deref(),",
+            // And the synthesized title must actually replace the empty hint.
+            "let title_hint = title_hint.or_else(|| synthesized_title.clone());",
+        ] {
+            assert!(
+                arm.contains(needle),
+                "the create arm no longer carries `{needle}`, so an agent's row \
+                 goes back to being named like a human's shell:\n{arm}"
+            );
+        }
+        // Ordering: the fold must precede the daemon call's argument capture,
+        // or the daemon is handed the unnamed hint.
+        let fold = arm
+            .find("let title_hint = title_hint.or_else(")
+            .expect("fold present");
+        let capture = arm
+            .find("let title_hint_for_task = title_hint.clone();")
+            .expect("the daemon call still captures the hint");
+        assert!(
+            fold < capture,
+            "the title fold must happen BEFORE the hint is handed to the daemon:\n{arm}"
+        );
+    }
+
+    /// A removal must answer from EVIDENCE. The exact defect was a hardcoded
+    /// `"accepted": true` on any successful round trip, so that literal must
+    /// not come back, and the verdict must be computed from the returned
+    /// snapshot plus the process census rather than from the daemon's prose.
+    #[test]
+    fn the_session_remove_call_site_answers_from_evidence_not_transport_success() {
+        let product = product_source();
+        let arm = app_control_arm(&product, "RemoveSession", "SetSessionKeepAlive");
+        for needle in [
+            // The census is taken BEFORE the removal; afterwards the row is
+            // gone and nothing can say what it was running.
+            "let teardown_census = session_teardown_census(runtime_pid_before);",
+            // The row check reads the snapshot the daemon just returned.
+            "let row_still_listed = snapshot",
+            // The process check reads /proc, not a message.
+            "surviving_teardown_processes(&teardown_census)",
+            // The decision has one owner.
+            "let verdict = verify_session_removal(&SessionRemovalEvidence {",
+            // And the answer is the verdict, not the round trip.
+            "\"accepted\": verdict.verified,",
+            "\"verified\": verdict.verified,",
+        ] {
+            assert!(
+                arm.contains(needle),
+                "the remove arm no longer carries `{needle}`, so it can report a \
+                 removal it never verified:\n{arm}"
+            );
+        }
+        assert!(
+            !arm.contains("\"accepted\": true,"),
+            "the remove arm hardcodes acceptance again — that literal IS the bug:\n{arm}"
+        );
+        assert!(
+            !arm.contains("message.contains") && !arm.contains("message.starts_with"),
+            "the remove arm is parsing the daemon's prose; prose is not a contract:\n{arm}"
+        );
     }
 }
 
@@ -39110,6 +39249,61 @@ fn app_control_remove_session_pending(
     }
 }
 
+/// How many times a teardown re-probes the processes it was accountable for
+/// before calling them survivors, and how long it waits between probes.
+///
+/// A bounded settle, not a quiet window: an interactive shell forwards the
+/// teardown's SIGHUP to its jobs, so a well-behaved child is a few tens of
+/// milliseconds from gone and reporting it as a survivor would be noise. The
+/// loop exits the instant nothing is left, so a clean teardown pays nothing
+/// and a genuinely surviving app is still named within half a second.
+const SESSION_TEARDOWN_SETTLE_ATTEMPTS: u32 = 5;
+const SESSION_TEARDOWN_SETTLE_INTERVAL_MS: u64 = 100;
+
+/// The processes a session teardown is accountable for: its PTY child plus
+/// every descendant that child fathered.
+///
+/// The teardown itself signals ONLY the direct child (see
+/// `PtySessionRuntime::signal_child_to_exit`), so an app the agent started
+/// under the shell is exactly what this census is for — it is the difference
+/// between "the terminal closed" and "everything the session was running is
+/// gone".
+fn session_teardown_census(runtime_pid: Option<i32>) -> Vec<SessionTeardownProcess> {
+    let Some(runtime_pid) = runtime_pid else {
+        return Vec::new();
+    };
+    yggterm_core::render_probe::observe_process_tree_stats(runtime_pid)
+        .into_iter()
+        .map(|stat| SessionTeardownProcess {
+            pid: stat.pid,
+            command: stat.comm,
+        })
+        .collect()
+}
+
+/// Which of a census are still running, re-read from `/proc` right now.
+fn surviving_teardown_processes(census: &[SessionTeardownProcess]) -> Vec<SessionTeardownProcess> {
+    census
+        .iter()
+        .filter(|process| {
+            yggterm_core::render_probe::process_still_running(process.pid, &process.command)
+        })
+        .cloned()
+        .collect()
+}
+
+fn session_teardown_process_values(processes: &[SessionTeardownProcess]) -> Vec<Value> {
+    processes
+        .iter()
+        .map(|process| {
+            json!({
+                "pid": process.pid,
+                "command": process.command,
+            })
+        })
+        .collect()
+}
+
 fn pending_live_sessions_unkept_only(pending: &PendingDeleteDialog) -> Option<PendingDeleteDialog> {
     if !pending.live_session_bulk_close
         || !pending.live_session_close
@@ -60511,11 +60705,27 @@ async fn process_pending_app_control_requests(
             machine_key,
             cwd,
             title_hint,
+            purpose,
             session_kind,
             activate,
         } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let requested_kind = session_kind.unwrap_or(SessionKind::Shell);
+            // Creation through THIS plane is agent creation: every human door
+            // (titlebar +, KeyTips, start page, row menu) goes through
+            // `start_local_session_placed` and never reaches app-control. So a
+            // row born here that nobody named would inherit the daemon's
+            // cwd-shaped default and be indistinguishable from a human's shell
+            // in the same directory — which is how an agent's scratch row hid
+            // in plain sight for hours. Name it after its driver instead.
+            let synthesized_title = title_hint.is_none().then(|| {
+                agent_plane_session_title(
+                    request.agent.as_deref(),
+                    purpose.as_deref(),
+                    requested_kind,
+                )
+            });
+            let title_hint = title_hint.or_else(|| synthesized_title.clone());
             // `--no-activate` (agent-driven spawns): remember the user's view
             // BEFORE the create; the snapshot apply below will mark the new
             // session active and we hand the view straight back — both
@@ -60630,6 +60840,8 @@ async fn process_pending_app_control_requests(
                                     "machine_key": machine_key,
                                     "cwd": cwd,
                                     "title_hint": title_hint,
+                                    "purpose": purpose,
+                                    "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
                                     "active_session_path": if activate == Some(false) {
@@ -60696,6 +60908,8 @@ async fn process_pending_app_control_requests(
                                     "machine_key": Value::Null,
                                     "cwd": cwd,
                                     "title_hint": title_hint,
+                                    "purpose": purpose,
+                                    "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
                                     "active_session_path": if activate == Some(false) {
@@ -62057,8 +62271,20 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::RemoveSession { session_path } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
-            let (pending, close_redirect_target) = state.with_mut(|shell| {
+            let (pending, close_redirect_target, runtime_pid_before) = state.with_mut(|shell| {
                 let pending = app_control_remove_session_pending(shell, &session_path);
+                // Read the PTY pid BEFORE the removal: afterwards the row is
+                // gone and nothing can say what the session was running.
+                // `None` on a live row is not "no processes" — it is "nobody
+                // here can see the runtime", which is the preserved-owner
+                // (older daemon) case and must be answered as unverifiable.
+                let runtime_pid_before = shell
+                    .server
+                    .live_sessions()
+                    .into_iter()
+                    .find(|session| session.session_path == session_path)
+                    .and_then(|session| session.terminal_process_id)
+                    .map(|pid| pid as i32);
                 let close_redirect_target = shell.close_redirect_target_for_pending(&pending);
                 shell.prepare_live_session_close_locally(
                     &pending,
@@ -62070,8 +62296,9 @@ async fn process_pending_app_control_requests(
                         "app_control_live_session_close_redirect",
                     );
                 }
-                (pending, close_redirect_target)
+                (pending, close_redirect_target, runtime_pid_before)
             });
+            let teardown_census = session_teardown_census(runtime_pid_before);
             let session_path_for_task = session_path.clone();
             let close_redirect_target_for_task = close_redirect_target.clone();
             let outcome: Result<(ServerUiSnapshot, Option<String>, Option<String>)> =
@@ -62097,6 +62324,34 @@ async fn process_pending_app_control_requests(
                 .await;
             match outcome {
                 Ok((snapshot, message, redirect_error)) => {
+                    // A successful ROUND TRIP is not a successful REMOVAL. The
+                    // daemon answers Ok while saying "no live session for this
+                    // path", and its teardown signals only the PTY child — so
+                    // the old hardcoded `accepted: true` read true for a row
+                    // that was still in the live order with the app it hosted
+                    // still running. Both halves are checked here, against the
+                    // snapshot the daemon just returned (the SSOT for rows)
+                    // and against /proc (the SSOT for processes). The daemon's
+                    // prose is never parsed.
+                    let row_still_listed = snapshot
+                        .live_sessions
+                        .iter()
+                        .any(|session| session.session_path == session_path);
+                    let mut still_running = surviving_teardown_processes(&teardown_census);
+                    for _ in 0..SESSION_TEARDOWN_SETTLE_ATTEMPTS {
+                        if still_running.is_empty() {
+                            break;
+                        }
+                        sleep(Duration::from_millis(SESSION_TEARDOWN_SETTLE_INTERVAL_MS)).await;
+                        still_running = surviving_teardown_processes(&teardown_census);
+                    }
+                    let verdict = verify_session_removal(&SessionRemovalEvidence {
+                        row_was_live: pending.live_session_close,
+                        runtime_pid_before,
+                        observed_before: &teardown_census,
+                        still_running_after: &still_running,
+                        row_still_listed,
+                    });
                     let active_session_path = state.with_mut(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
                         shell.prune_viewport_history_for_closed_paths(&pending.session_paths);
@@ -62120,17 +62375,28 @@ async fn process_pending_app_control_requests(
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: Some(json!({
-                            "accepted": true,
+                            "accepted": verdict.verified,
+                            "verified": verdict.verified,
+                            "verified_refusal": verdict.refusal.map(|refusal| refusal.as_str()),
                             "session_path": session_path,
                             "active_session_path": active_session_path,
                             "live_session_close": pending.live_session_close,
+                            "row_still_listed": row_still_listed,
+                            "runtime_process_id": runtime_pid_before,
+                            "reaped_processes": session_teardown_process_values(&verdict.reaped),
+                            "live_processes": session_teardown_process_values(&verdict.still_running),
                             "redirect_target": close_redirect_target
                                 .as_ref()
                                 .map(viewport_history_entry_app_control_value),
                             "redirect_error": redirect_error,
                             "message": message,
                         })),
-                        error: None,
+                        error: verdict.refusal.map(|refusal| {
+                            format!(
+                                "session remove for {session_path} could not be verified: {}",
+                                refusal.as_str()
+                            )
+                        }),
                     }
                 }
                 Err(error) => AppControlResponse {
@@ -62140,7 +62406,12 @@ async fn process_pending_app_control_requests(
                     output_path: None,
                     data: Some(json!({
                         "accepted": false,
+                        "verified": false,
                         "session_path": session_path,
+                        "runtime_process_id": runtime_pid_before,
+                        "live_processes": session_teardown_process_values(
+                            &surviving_teardown_processes(&teardown_census),
+                        ),
                     })),
                     error: Some(error.to_string()),
                 },
