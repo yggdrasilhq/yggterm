@@ -1595,6 +1595,19 @@ never costs an unlock.** Also: `ychrome-vault get` prints its *errors to stdout*
 `PW=$(ychrome-vault get …)` captures `Error: … has no username` **as the
 credential** — errors belong on stderr with a non-zero exit.
 
+**✅ BOTH SHIPPED, and (a) landed differently than asked — read this before
+re-deriving it.** The handover exists (`ychrome-vault handover` execs the new
+binary in place, same pid, same socket, unlock intact). The card path exists too,
+but there is **no `get --field card.number`** and there deliberately never will
+be: a PAN printed to stdout is durable in a scrollback and an agent CLI's JSONL,
+and unlike a password it cannot be rotated. The op is **`card-secret` on the
+agent socket**, and `web fill-card` speaks that socket directly rather than
+shelling out. Aiming it at the CLI is exactly what produced `vault_cli_no_card_op`
+at a live gateway's card form on 2026-07-26. The only refusal left is
+`vault_locked`; an unlocked vault serves a card to whoever reaches its socket, as
+every Bitwarden client does (user's ruling). Contract:
+`ychrome/docs/vault.md` → "The agent card path".
+
 **Two portable instrument lessons.** (i) A one-shot challenge is consumed by any
 attempt, not just a successful one — rtionline's captcha was burnt by a *failed*
 POST, and two submissions were lost to re-using it while the reading was correct.

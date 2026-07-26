@@ -177,7 +177,27 @@ yggterm server app web await --script fetch-status.js --session <path>
 # A credential without ever seeing it: the CLI names the item and field.
 yggterm server app web fill-vault --item sbi --field password \
   --role textbox --label "Password" --session <path>
+
+# A payment card, same rule. Four boxes, four calls; each one reads the vault
+# AGENT SOCKET (`card-secret`) — there is no CLI verb that prints a PAN and
+# there never will be, which is why aiming this at the CLI once answered
+# `vault_cli_no_card_op` at a live gateway.
+yggterm server app web fill-card --item 'HDFC Regalia' --field number  --selector '#pan'    --session <path>
+yggterm server app web fill-card --item 'HDFC Regalia' --field expiry  --selector '#exp'    --session <path>   # MM/YY
+yggterm server app web fill-card --item 'HDFC Regalia' --field code    --selector '#cvv2'   --session <path>
+yggterm server app web fill-card --item 'HDFC Regalia' --field holder  --selector '#name'   --session <path>
+# also: --field exp-month (MM) / exp-year (as stored, usually YYYY) for split forms
 ```
+
+**`fill-card`'s only gate is the vault UNLOCK.** Every Bitwarden client can read
+a card cipher and `ychrome-vault` is one, so there is no grant and no per-use
+consent (the user's ruling, 2026-07-26 — do not re-propose one). A locked vault
+answers `vault_locked` naming `ychrome-vault unlock`; a ychrome-vault too old to
+report its socket answers `vault_agent_socket_unknown`, and the remedy is to
+install the new one and `ychrome-vault handover` (which keeps the unlock). The
+answer is `{item, field, chars, matched}` — a name and a length, never the
+value — and every release leaves one line in `~/.yggterm/vault/audit.log`
+naming FIELDS, never values. Contract: `ychrome/docs/vault.md`.
 
 **Recovering a dead tab without destroying the session.** `web ensure` probes
 LIVENESS (it round-trips an eval through the content process, because tabs /

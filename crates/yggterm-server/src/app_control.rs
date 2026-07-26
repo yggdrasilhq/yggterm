@@ -260,20 +260,27 @@ pub enum WebCookieDirection {
 ///
 /// One command with a source, not two commands: the page-origin guard, the
 /// injection path, the redaction rules and the response shape are identical —
-/// only the vault CLI subcommand differs. Two commands would be a second
-/// encoding of all of that.
+/// only the door to the vault differs. Two commands would be a second encoding
+/// of all of that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VaultFieldSource {
-    /// A login item: `password`, `username`, `totp`, `notes`.
+    /// A login item: `password`, `username`, `totp`, `notes`. Read from the
+    /// `ychrome-vault` CLI, whose stdout carries the value.
     #[default]
     Login,
-    /// A card item: `number`, `expiry`, `code`, `holder`.
+    /// A card item: `number`, `code`, `holder`, `exp-month`, `exp-year`,
+    /// `expiry` (`MM/YY`).
     ///
-    /// BLOCKED on `ychrome-vault` growing a `card` op — no agent op reaches
-    /// `cipher.card` today. The verb refuses with `vault_cli_no_card_op` rather
-    /// than a generic failure, so the day that op lands this starts working
-    /// with no yggterm change.
+    /// Read from the vault AGENT SOCKET (`{"op":"card-secret"}`), never the CLI
+    /// — `ychrome-vault` deliberately has no verb that prints a PAN, because a
+    /// number in a scrollback or an agent CLI's JSONL is durable and, unlike a
+    /// password, cannot be rotated. Aiming this at the CLI is exactly the bug
+    /// that produced `vault_cli_no_card_op` at a live gateway's card form.
+    ///
+    /// The only policy refusal is the LOCK (`vault_locked`); an unlocked vault
+    /// serves a card to whoever reaches its socket, as every Bitwarden client
+    /// does. See `ychrome/docs/vault.md`.
     Card,
 }
 
