@@ -16416,7 +16416,7 @@ impl ShellState {
             .map(|epoch| terminal_mount_host_id(session_path, epoch))
     }
     fn terminal_session_uses_remote_runtime(&self, session_path: &str) -> bool {
-        if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+        if session_path_names_remote_runtime_by_scheme(session_path) {
             return true;
         }
         if self.server.active_session_path() == Some(session_path)
@@ -29912,7 +29912,17 @@ fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
             session.session_path == row.full_path && is_promoted_live_session(session)
         })
 }
-fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
+/// Whether a session path names a REMOTE runtime by its scheme alone, with no
+/// session view to consult.
+///
+/// Extracted from `terminal_session_uses_remote_runtime` (no behaviour change)
+/// so the shell arm matrix can lock it per arm: the scheme half is the only half
+/// that answers before a session view exists, and it is where the `remote-cc://`
+/// readiness hole lives (spec §7.3). Behind `&self` it was unlockable.
+pub(crate) fn session_path_names_remote_runtime_by_scheme(session_path: &str) -> bool {
+    session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")
+}
+pub(crate) fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
 }
 fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: bool) -> bool {
@@ -73961,9 +73971,48 @@ fn terminal_precis(session: &ManagedSessionView) -> String {
         })
         .unwrap_or_else(|| session.status_line.clone())
 }
-fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
+pub(crate) fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && session.source == SessionSource::LiveSsh
+}
+/// Whether the terminal mount treats this CLI as CODEX-LIKE — the family whose
+/// resize/replay handoff quirks the mount compensates for.
+///
+/// The ONE owner of that question. It was a `matches!` local inside
+/// `TerminalCanvas`, which meant the only way a test could state it was to
+/// restate the `matches!` — a test-local tautology that reads no production
+/// code and therefore stays green while the product widens underneath it. The
+/// arm matrix calls THIS (spec §7.6).
+pub(crate) fn codex_like_session(kind: SessionKind) -> bool {
+    matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+}
+/// Whether THIS mount takes the remote-resume readiness path.
+///
+/// The DECISION `TerminalCanvas` makes once per mount and threads into ~8
+/// downstream signals (`attach_ready`, `stalled_remote_resume`, overlay
+/// dismissal, the read-poll cadence, the placeholder text). Named separately
+/// from the predicate under it so the arm matrix locks the decision rather than
+/// one implementation of it: a widening applied HERE, leaving
+/// `is_remote_resume_agent_session` untouched, must still turn the matrix red
+/// (spec §7.3).
+pub(crate) fn terminal_mount_takes_remote_resume_readiness(session: &ManagedSessionView) -> bool {
+    is_remote_resume_agent_session(session)
+}
+/// Whether a reveal of THIS session may be seeded from the daemon's
+/// AUTHORITATIVE screen frame instead of the client's own (often sparse)
+/// snapshot — the §7.6 snapshot-poison axis.
+///
+/// The DECISION the retained-rehydrate task makes, expressed in the two inputs
+/// it actually has: the reveal mode and the session's CLI. The policy function
+/// under it takes a `codex_like` bool, so a fix could be applied by handing it a
+/// different bool at the call site while `codex_like_session` stayed narrow;
+/// routing the call site through this function is what makes that fix visible to
+/// the arm matrix.
+pub(crate) fn terminal_reveal_seed_allows_authoritative_screen(
+    mode: RetainedRehydrateMode,
+    kind: SessionKind,
+) -> bool {
+    retained_rehydrate_allow_screen_fallback(mode, codex_like_session(kind))
 }
 #[component]
 fn TerminalResumeContextFallback(
@@ -74919,7 +74968,7 @@ fn TerminalCanvas(
             snapshot.theme,
         ),
     );
-    let is_remote_resume_session = is_remote_resume_agent_session(&session);
+    let is_remote_resume_session = terminal_mount_takes_remote_resume_readiness(&session);
     let session_keep_alive = live_session_keep_alive(&session);
     let session_temporary_update_restore = live_session_temporary_update_restore(&session);
     let session_restart_protected = session_keep_alive || session_temporary_update_restore;
@@ -74965,7 +75014,7 @@ fn TerminalCanvas(
     // through the session host's sshd (egress rule). None = local session.
     let session_ssh_target = session.ssh_target.clone();
     let session_kind = session.kind;
-    let codex_like_session = matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+    let codex_like_session = codex_like_session(session_kind);
     // First-class agent CLIs that drive the sidebar "working" indicator (Codex
     // AND Claude Code). Deliberately broader than `codex_like_session`, which
     // gates codex-specific resize/replay handoff handling and must NOT include
@@ -75941,6 +75990,10 @@ fn TerminalCanvas(
         let session_path_for_task = session_path.clone();
         let trace_home = trace_home.clone();
         let codex_like_session_for_task = codex_like_session;
+        // The seed decision below asks the CLI, not a pre-computed bool, so that
+        // a change to WHICH CLIs get the authoritative screen has exactly one
+        // place to happen and the arm matrix can see it (spec §7.6).
+        let session_kind_for_task = session_kind;
         spawn(async move {
             sleep(Duration::from_millis(80)).await;
             let still_active = state.with(|shell| {
@@ -76210,9 +76263,9 @@ fn TerminalCanvas(
                                     // client snapshot (clip + broken composer bottom paint). The
                                     // 2.8.26 client reconcile gated on daemon_screen_snapshot, which
                                     // the daemon never offered here because this arg was hardcoded false.
-                                    retained_rehydrate_allow_screen_fallback(
+                                    terminal_reveal_seed_allows_authoritative_screen(
                                         retained_rehydrate_mode,
-                                        codex_like_session_for_task,
+                                        session_kind_for_task,
                                     ),
                                 );
                                 let selected_lines = selection.selected_lines;
@@ -85291,7 +85344,7 @@ fn remote_terminal_placeholder_text_before_2_1_103(
             .map(format_terminal_prefill_text)
     })
 }
-fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
+pub(crate) fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && metadata_value(session, "Remote Launch Action") == "start-codex"
 }
@@ -87098,12 +87151,12 @@ fn terminal_host_id(session_path: &str) -> String {
     id
 }
 
-fn terminal_host_id_belongs_to_session(session_path: &str, host_id: &str) -> bool {
+pub(crate) fn terminal_host_id_belongs_to_session(session_path: &str, host_id: &str) -> bool {
     let host_prefix = format!("{}-m", terminal_host_id(session_path));
     host_id.starts_with(&host_prefix)
 }
 
-fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
+pub(crate) fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
     format!("{}-m{}", terminal_host_id(session_path), mount_epoch)
 }
 fn sidebar_row_dom_id(path: &str) -> String {
