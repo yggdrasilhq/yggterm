@@ -2,6 +2,19 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Fixed: a plain shell no longer disappears from the sidebar when yggterm
+  updates itself.** An agent session survives a version change because the agent
+  keeps its own transcript, so yggterm can re-open it. A plain shell has no such
+  record, and until now its row vanished along with the old version's copy of
+  the terminal — one was lost mid-session and the user had to notice it was gone.
+  The row now stays exactly where it was, with its name and its folder, and
+  clicking it opens a fresh shell in that same folder. The old terminal's
+  scrollback is still lost; keeping that too needs the update to hand the live
+  terminal across rather than let it go, which is not built yet.
+  A shell you close yourself still goes away, as before.
+
 ## 2.12.14
 
 - **Changed: yggterm asks the machine whether it has usable graphics hardware
