@@ -448,9 +448,7 @@ pub fn promote_direct_install_active_version(
     let Some((root, state)) = found else {
         return Ok(false);
     };
-    if state.active_version == target_version
-        && state.active_executable == target_executable
-    {
+    if state.active_version == target_version && state.active_executable == target_executable {
         return Ok(true);
     }
     write_direct_install_state(
@@ -1550,9 +1548,26 @@ mod tests {
     /// binary's own decision: the GUI treats it as a deliberate user force-disable and
     /// returns before it ever asks the host. A launcher or smoke script that exports it
     /// is therefore not "being safe", it is silently overriding the probe.
+    ///
+    /// **A line that REMOVES the variable is the opposite of a declaration** and is
+    /// exempt — `scripts/gl_ab_experiment.sh` must scrub it before every arm, because
+    /// an inherited copy would pre-empt the probe and make the hardware arm silently
+    /// software. The exemption is deliberately narrow and cannot be gamed: an
+    /// assignment ALWAYS carries `=`, a removal never does, so any line with `=` on it
+    /// still counts however it is dressed up.
     #[cfg(target_os = "linux")]
     fn script_declares_the_webkit_gl_path(text: &str) -> bool {
-        text.contains("WEBKIT_DISABLE_COMPOSITING_MODE")
+        text.lines().any(|line| {
+            if !line.contains("WEBKIT_DISABLE_COMPOSITING_MODE") {
+                return false;
+            }
+            let removes = !line.contains('=')
+                && (line.contains("-u ")
+                    || line.contains("unset ")
+                    || line.trim().trim_matches(&['"', '\'', ',', ')'][..])
+                        == "WEBKIT_DISABLE_COMPOSITING_MODE");
+            !removes
+        })
     }
 
     /// The scanner must be able to FIRE. A lock that can only pass is worth nothing —
@@ -1569,6 +1584,25 @@ mod tests {
         ));
         assert!(!script_declares_the_webkit_gl_path(
             "export GDK_BACKEND=x11\nexport NO_AT_BRIDGE=1\n"
+        ));
+        // A scrub is exempt: the A/B harness must strip the variable, or an
+        // inherited copy pre-empts the probe and the hardware arm is software.
+        assert!(!script_declares_the_webkit_gl_path(
+            "\tWEBKIT_DISABLE_COMPOSITING_MODE\n"
+        ));
+        assert!(!script_declares_the_webkit_gl_path(
+            "env -u WEBKIT_DISABLE_COMPOSITING_MODE \"$YG\"\n"
+        ));
+        assert!(!script_declares_the_webkit_gl_path(
+            "unset WEBKIT_DISABLE_COMPOSITING_MODE\n"
+        ));
+        // ...but the exemption may not be used as cover. Any `=` on the line is
+        // an assignment, whatever else the line claims to be doing.
+        assert!(script_declares_the_webkit_gl_path(
+            "unset FOO; export WEBKIT_DISABLE_COMPOSITING_MODE=1\n"
+        ));
+        assert!(script_declares_the_webkit_gl_path(
+            "env -u FOO WEBKIT_DISABLE_COMPOSITING_MODE=1 \"$YG\"\n"
         ));
     }
 
@@ -1681,10 +1715,8 @@ mod tests {
 
     #[test]
     fn promote_direct_install_active_version_flips_state_to_target() {
-        let root = std::env::temp_dir().join(format!(
-            "yggterm-promote-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yggterm-promote-test-{}", uuid::Uuid::new_v4()));
         let next_dir = root.join("versions").join("2.8.5");
         let next_exe = next_dir.join("yggterm");
         fs::create_dir_all(&next_dir).expect("create version dir");
@@ -1714,10 +1746,7 @@ mod tests {
     #[test]
     fn promote_direct_install_active_version_is_noop_without_managed_install() {
         // An executable with no install-state in any ancestor is not managed.
-        let bare = std::env::temp_dir().join(format!(
-            "yggterm-unmanaged-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let bare = std::env::temp_dir().join(format!("yggterm-unmanaged-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&bare).expect("mkdir");
         let exe = bare.join("yggterm");
         // Only meaningful when the env override is not pointing at a real install.
