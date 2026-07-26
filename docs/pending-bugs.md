@@ -16,8 +16,17 @@ fix) once the fix is verified live on guihost.
   That is the durable half of the chaining bug, still open.
 - **The vault agents on dev and guihost still need ONE `ychrome-vault unlock` each**
   — the 401-on-write fix is installed but the running agents predate it.
-- **Five could-only-pass locks shipped in two rounds.** Before trusting ANY
-  test in a report, mutate the production call site yourself. Field guide §7.1.
+- ✅ **The five could-only-pass locks are all closed.** The last one — the
+  web-surface reclaim family, where reverting all four production call sites
+  left the suite green — is replaced by `shell::web_surface_reclaim_locks`,
+  eight tests that drive `web_surface_reclaim_background_pass` (the function the
+  reconcile loop calls) through a fake host, plus a structural lock on the loop's
+  own argument list. Twenty-one mutations, one per production call site, each
+  proven RED and restored. Field guide §7.1 has the shape.
+  ⚠ **Not live-verified on guihost** — this was a test-discipline lane, product
+  behaviour is unchanged and the deploy happens separately.
+  **The habit stands regardless: before trusting ANY test in a report, mutate
+  the production call site yourself.**
 
 ## Standing traps / other open bugs
 
