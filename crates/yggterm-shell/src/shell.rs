@@ -5354,6 +5354,13 @@ async fn web_surface_native_reconcile_loop(
                         rect.1,
                         rect.2,
                         rect.3,
+                        // Only a surface being SHOWN may take the window's
+                        // keyboard focus. A headless create is demoted three
+                        // lines below, and a webview that grabbed the focus on
+                        // its way to the stash keeps it — that is how an
+                        // invisible agent surface swallowed the keystrokes the
+                        // user was typing into their terminal (2026-07-26).
+                        want_visible,
                     ) {
                         Ok(()) => {
                             append_trace_event(
@@ -108526,6 +108533,89 @@ mod tests {
              guard — add {} to the script, or record the fn in RECORDED_PROBES if \
              it is deliberate automation: {unguarded:?}",
             "ui_focus_owner_selectors_js()"
+        );
+    }
+
+    /// THE FIFTH FOCUS PATH (2026-07-26), and the one no JS probe could reach.
+    ///
+    /// The first four thieves were all JavaScript. This one is GTK: a native web
+    /// surface's `gtk_widget_grab_focus` sets the **GtkWindow's focus widget**,
+    /// so an agent surface that nobody can see takes the keyboard away from the
+    /// shell's own webview — window still active, `activeElement` still the
+    /// xterm helper textarea, and yet `document.hasFocus()` false and every
+    /// keystroke the user types going into the agent's invisible page.
+    /// Live-caught on guihost with a simultaneous two-point read (shell
+    /// `hasFocus:false`, never-revealed agent surface `hasFocus:true`).
+    ///
+    /// Two ways in, so two clauses here:
+    /// 1. **At build time** — wry's `WebViewAttributes` default is
+    ///    `focused: true`, which `grab_focus()`es the moment the webview is
+    ///    built. Nothing in the tree said otherwise, so a headless `web ensure`
+    ///    surface stole the focus at birth. Every surface builder must now STATE
+    ///    its intent.
+    /// 2. **At injection time** — `inject_key`/`inject_click`/`inject_scroll`
+    ///    need the focus, but they may only BORROW it. Each must book the lender
+    ///    (`note_focus_owner_before_injection`) and arm the return
+    ///    (`schedule_focus_giveback`).
+    ///
+    /// This scans the vendored host, because enumerating focus sites by hand is
+    /// exactly what let the fourth path survive three rounds of fixes.
+    #[test]
+    fn no_web_surface_takes_the_window_keyboard_focus_without_giving_it_back() {
+        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        // Clause 1: every webview a surface builds SAYS whether it may focus.
+        let builders = HOST.matches("WebViewBuilder::new").count();
+        let declared = HOST.matches(".with_focused(").count();
+        assert!(
+            builders > 0,
+            "the scan lost its anchor: no WebViewBuilder in the surface host"
+        );
+        assert!(
+            declared >= builders,
+            "every surface WebViewBuilder must carry `.with_focused(..)`: wry \
+             defaults to `focused: true`, which grab_focus()es the toplevel at \
+             build time and hands an invisible agent surface the user's keyboard \
+             (builders={builders}, with_focused={declared})"
+        );
+        // Clause 2: every grab_focus outside the borrow helper borrows and returns.
+        const BORROW: &str = "note_focus_owner_before_injection";
+        const RETURN: &str = "schedule_focus_giveback";
+        let mut fn_name = "<top level>";
+        let mut chunks: Vec<(&str, String)> = Vec::new();
+        let mut body = String::new();
+        for line in HOST.lines() {
+            let mut trimmed = line.trim_start();
+            for prefix in ["pub(crate) ", "pub ", "async ", "unsafe "] {
+                trimmed = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
+            }
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
+                chunks.push((fn_name, std::mem::take(&mut body)));
+                fn_name = rest.split(['(', '<', ' ']).next().unwrap_or("<unknown>");
+            }
+            // CODE only. These names are all over the prose here (they have to
+            // be — the trap is subtle), and a scan that reads its own warning
+            // comments as call sites reports every documented site as a defect.
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        chunks.push((fn_name, body));
+        let mut thieves: Vec<&str> = Vec::new();
+        for (name, chunk) in &chunks {
+            if !chunk.contains("grab_focus(") || *name == BORROW {
+                continue;
+            }
+            if !(chunk.contains(BORROW) && chunk.contains(RETURN)) {
+                thieves.push(name);
+            }
+        }
+        assert!(
+            thieves.is_empty(),
+            "these grab the toplevel's keyboard focus for a web surface and never \
+             give it back — the agent may BORROW the focus around an injection \
+             ({BORROW} + {RETURN}), never keep it: {thieves:?}"
         );
     }
 
