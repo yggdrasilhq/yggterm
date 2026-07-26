@@ -2738,12 +2738,25 @@ struct AppliedWebSurface {
 /// only when BOTH have lapsed — `max`, never `min`. A lease therefore only ever
 /// EXTENDS life: it cannot cut a hold short, so an agent can never reap a
 /// surface the user is about to come back to.
+///
+/// `media_active` is a third, absolute claim: a page the engine reports as
+/// PLAYING AUDIO is never destroyed, whatever the clocks say. Invisible is not
+/// unwanted — a playlist the user started and then switched away from is doing
+/// exactly what they asked, and the hold clock knows nothing about that. The
+/// veto covers DESTROY only: an audible background page still stops painting
+/// (see the throttle path below), because the axis that costs the machine is
+/// PAINT, not existence. Audio, timers and network are left alone, and muting is
+/// never used as a reclaim tool.
 fn web_surface_reap_due(
     now_ms: u64,
     stashed_at_ms: Option<u64>,
     hold_ms: u64,
     lease_until_ms: Option<u64>,
+    media_active: bool,
 ) -> bool {
+    if media_active {
+        return false;
+    }
     let hold_due = match stashed_at_ms {
         Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
         // Not yet marked stashed this tick: only a zero hold reaps immediately.
@@ -4103,11 +4116,20 @@ async fn web_surface_native_reconcile_loop(
             let hold_ms = web_surface_background_hold_ms(reclaim_pressured);
             let detach = web_surface_background_detach(under_glass, reclaim_pressured);
             for key in backgrounded {
+                // "Suppose I have a YouTube playlist running in the background
+                // while I work here." Engine truth, read at the moment of the
+                // decision — a stale flag would be worse than none. The veto is
+                // on DESTROY only; the throttle below still runs, so the page
+                // stops PAINTING and keeps playing.
+                let media_active = applied
+                    .get(&key)
+                    .is_some_and(|entry| desktop.web_surface_is_playing_audio(entry.native_id));
                 let expired = web_surface_reap_due(
                     now_ms,
                     applied.get(&key).and_then(|entry| entry.stashed_at_ms),
                     hold_ms,
                     web_surface_lease_until_ms(&state, &key.0, key.1),
+                    media_active,
                 );
                 if expired {
                     if let Some(entry) = applied.remove(&key) {
@@ -4175,6 +4197,7 @@ async fn web_surface_native_reconcile_loop(
                             "hold_ms": hold_ms,
                             "detached": detach,
                             "reclaim_pressured": reclaim_pressured,
+                            "media_active": media_active,
                         }),
                     );
                 }
@@ -50409,18 +50432,77 @@ mod web_do_verb_tests {
         let hold = 600_000;
         let stashed = Some(1_000_u64);
         // Hold not yet up, no lease: keep.
-        assert!(!web_surface_reap_due(2_000, stashed, hold, None));
+        assert!(!web_surface_reap_due(2_000, stashed, hold, None, false));
         // Hold up, no lease: reap (unchanged behavior).
-        assert!(web_surface_reap_due(601_000, stashed, hold, None));
+        assert!(web_surface_reap_due(601_000, stashed, hold, None, false));
         // Hold up but lease still running: KEEP — this is what lease buys.
-        assert!(!web_surface_reap_due(601_000, stashed, hold, Some(900_000)));
+        assert!(!web_surface_reap_due(
+            601_000,
+            stashed,
+            hold,
+            Some(900_000),
+            false
+        ));
         // Hold up and lease lapsed: reap.
-        assert!(web_surface_reap_due(901_000, stashed, hold, Some(900_000)));
+        assert!(web_surface_reap_due(
+            901_000,
+            stashed,
+            hold,
+            Some(900_000),
+            false
+        ));
         // A lease SHORTER than the hold must not reap early.
-        assert!(!web_surface_reap_due(2_000, stashed, hold, Some(1_500)));
+        assert!(!web_surface_reap_due(
+            2_000,
+            stashed,
+            hold,
+            Some(1_500),
+            false
+        ));
         // Zero hold still honors a live lease.
-        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000)));
-        assert!(web_surface_reap_due(2_000, None, 0, None));
+        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000), false));
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+    }
+
+    /// INVISIBLE IS NOT UNWANTED. The user's stated constraint is a background
+    /// YouTube playlist that keeps playing while they work in another session.
+    /// Before this, nothing in the system knew a page was making a sound: the
+    /// only two survival inputs were the hold clock and an AGENT lease, and a
+    /// human's playlist has neither. Under the latched pressure predicate that
+    /// meant the playlist died five seconds after the switch.
+    ///
+    /// The veto is absolute against every clock — hold expired, no lease, and
+    /// even the collapsed five-second reclaim hold under genuine pressure. A
+    /// machine short of RAM is a reason to stop PAINTING a page, never a reason
+    /// to cut off what the user is listening to.
+    #[test]
+    fn an_audible_background_surface_is_never_reaped() {
+        let hold = 600_000;
+        let stashed = Some(1_000_u64);
+        // Hold long expired, no lease — the exact case that reaps today.
+        assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
+        assert!(!web_surface_reap_due(999_000, stashed, hold, None, true));
+        // The pressured five-second window does not beat the veto either.
+        assert!(web_surface_reap_due(
+            9_000,
+            stashed,
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            None,
+            false
+        ));
+        assert!(!web_surface_reap_due(
+            9_000,
+            stashed,
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            None,
+            true
+        ));
+        // Nor does a zero hold, the destroy-immediately configuration.
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+        assert!(!web_surface_reap_due(2_000, None, 0, None, true));
+        // And silence restores the ordinary clocks — the veto is a veto, not a
+        // permanent pin. A page that finished playing reaps on the next tick.
+        assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
     }
 
     // Slice 4.1b — the write-lock lifecycle: a held lock is released the moment

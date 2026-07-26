@@ -407,6 +407,38 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// Whether an open web surface is PLAYING AUDIO right now (engine truth,
+    /// from WebKit's media session). The reaper consults this before destroying
+    /// a backgrounded surface: an invisible page is not an unwanted page, and a
+    /// background playlist must survive a session switch. On platforms without
+    /// the native web-surface host this reads `false` — those platforms have no
+    /// surfaces to protect.
+    pub fn web_surface_is_playing_audio(&self, id: u64) -> bool {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .is_some_and(|host| host.is_playing_audio(id));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
     /// Current (uri, title, loading) of an open web surface's page,
     /// engine-reported. Follows in-page navigation the shell's nav model can't
     /// see, and carries the engine's own `is-loading` — the only honest source

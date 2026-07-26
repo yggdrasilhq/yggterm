@@ -61,6 +61,44 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
   the terminal-native way to end the foreground app, which then emits its own
   `close`.
 
+### Backgrounding: what stops, and what survives (2026-07-26)
+
+The axis is **PAINT, not existence**. A page the user cannot see must stop
+costing the compositor a frame; it must not stop being the thing they left
+running.
+
+Backgrounding a session's surface therefore does two separable things:
+
+- **Stop painting.** Under glass the container stays attached and demoted, and
+  the inner webview is hidden, so WebKitGTK marks the page
+  `visibilityState: 'hidden'` — `requestAnimationFrame` pauses and timers
+  throttle. Audio, network and JS heap are untouched. Under real memory pressure
+  the container is DETACHED instead (unmapped), which throttles the same way and
+  additionally lets the destroy below reclaim.
+- **Eventually destroy.** `web_surface_reap_due` decides this, and it has three
+  independent survival claims. The **hold** clock (default 600 s, config
+  `background_hold_secs`, 5 s under real pressure), an **agent lease**, and
+  **media**. Hold and lease are `max`, never `min` — a lease only ever extends
+  life. Media is an absolute veto: a surface WebKit reports as playing audio is
+  never destroyed, whatever either clock says.
+
+Two rules that keep the media veto honest:
+
+- It vetoes **destroy**, never **throttle**. An audible background tab still
+  stops painting. That is the cheap half and there is no reason to give it up.
+- `webkit_web_view_set_is_muted` is **never** used as a reclaim tool. Muting a
+  playlist to save CPU is precisely the failure the veto exists to prevent.
+
+⚠ **Memory pressure is `reclaim_pressured`, not `swap_pressured`.** Swap-*used*
+is a history counter: it latches TRUE after one bad afternoon and never clears,
+which is how the live host spent months hard-detaching and destroying every
+backgrounded surface five seconds after a switch (19 of 19 `native_stash` events
+carried `detached:true swap_pressured:true hold_ms:5000`) while sitting on 45%
+free RAM. The reclaim predicate reads current headroom (`MemAvailable` under 15%
+of `MemTotal`) or the kernel's PSI `some avg60` stall accounting. The
+`native_stash` trace event now publishes `reclaim_pressured` and `media_active`
+so the decision is readable after the fact.
+
 ## The egress rule
 
 **A surface's network egress is the invoking host's network — for ALL URLs.**

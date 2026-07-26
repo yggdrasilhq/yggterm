@@ -1644,6 +1644,31 @@ impl WebSurfaceHost {
         })
     }
 
+    /// Is surface `id` PLAYING AUDIO right now, as the engine sees it?
+    ///
+    /// `webkit_web_view_is_playing_audio` is WebKit's own answer, taken from the
+    /// media session inside the web process — it is true for a `<video>`, an
+    /// `<audio>`, and a WebAudio graph alike, and it goes false on pause. It is
+    /// the only honest source: nothing the shell can observe from outside (the
+    /// URL, the title, whether the tab was ever visible) can tell a playing
+    /// playlist from a parked one.
+    ///
+    /// The shell uses this to VETO DESTROY, never to veto throttling: an unseen
+    /// page must still stop painting (that is free and is the whole point of the
+    /// soft stash), but it must not be killed while the user is listening to it.
+    /// A missing surface reads `false` — there is nothing left to protect.
+    ///
+    /// Deliberately NOT paired with `set_is_muted`. Muting a page to save CPU
+    /// would be the exact failure this exists to prevent.
+    pub fn is_playing_audio(&self, id: u64) -> bool {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        self.surfaces
+            .borrow()
+            .get(&id)
+            .is_some_and(|s| s.webview.webview().is_playing_audio())
+    }
+
     pub fn close(&self, id: u64) {
         if let Some(s) = self.surfaces.borrow_mut().remove(&id) {
             // A stashed surface's container is already detached.
