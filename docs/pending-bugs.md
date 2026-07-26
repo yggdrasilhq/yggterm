@@ -71,6 +71,37 @@ fix) once the fix is verified live on guihost.
   `do click` + `--role option`; headless file upload via DataTransfer works
   (379 KB PDF through one `web eval --stdin`, no GTK chooser).
 
+  **STATUS 2026-07-26 — ALL FIVE HALVES ARE CODE-FIXED, NONE LIVE-VERIFIED.**
+  The fix is one mechanism, not five patches: **the matcher runs ONCE per verb
+  and its result is PINNED** (`window.__yggDoPins`), and every later step —
+  clear, clear-verification, the write, the readback, the rect re-measure —
+  addresses that handle instead of re-running the selector. A re-render can no
+  longer substitute a twin between any two steps of a verb.
+  - (1) `fill` now READS THE FIELD BACK through the pin and reports
+    `verified` / `verify_reason` / `requested` / `held` / `first_mismatch`.
+    `delivered: true` and `verified: false` co-exist and that is the point.
+    Plain text/textarea inputs are written with the **native value-setter +
+    bubbling `input`/`change`/blur** (`mechanism: native_setter`), the filing
+    agent's proven workaround; real keys stay for segmented widgets and for
+    secrets, and the response always names which ran.
+  - (2) clear-verification reads the PINNED nodes' state; a node the framework
+    re-rendered away is `node_replaced`, its own refusal, never `clear_failed`.
+  - (3) resolution is TWO phases — pin+scroll, settle 120 ms, RE-MEASURE the
+    pin — and `web_do_resolved_from_info` REFUSES any payload not stamped
+    `phase: post_scroll`, so collapsing them back cannot pass silently. The
+    response carries `resolved.rect_phase` + `is_connected`.
+  - (4) CSS targets resolve via `querySelectorAll(sel)[nth]`; `--nth` works on
+    `--selector` (wire: `{"css":…,"nth":…}`, bare string still means nth 0) and
+    every addressed response carries `match {matches,nth,hidden,ambiguous}`.
+  - (5) `role=option`/`menuitem` pools are filtered for liveness and scoped to
+    the listbox an `aria-expanded` combobox owns (else the last visible one);
+    a pool of only stale options refuses `stale_listbox_only`, never a click.
+  ⚠ **Live verification is OWED**: no a services portal re-run, no guihost deploy. The
+  daemon/GUI on guihost still runs the old behaviour until the next bump.
+  Remaining agent-side: the INVENTED characters in (1) are still attributed to
+  the concurrent focus-theft bug — the readback now catches them, it does not
+  prevent them.
+
 - **★★ THERE IS NO CLIENT TO RENDER AGENT SURFACES INTO ON dev (2026-07-26).**
   The data-fabric default "co-browse on a SHADOW surface on dev" is currently
   unusable: `server app clients` on dev → count 0 (no GUI, no shadow client),

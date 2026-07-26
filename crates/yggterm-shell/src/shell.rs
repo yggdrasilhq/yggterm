@@ -189,8 +189,8 @@ use yggterm_server::{
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
-    WebElementRef, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil,
-    WorkspaceViewMode,
+    WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
+    WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
@@ -49363,29 +49363,144 @@ const WEB_DO_CSS_PATH_FN_JS: &str = "var __yggPath=function(el){\
     parts.unshift(part);node=p;guard++;}\
     return parts.join(' > ');};";
 
-/// Resolve the addressed element, scroll it into view, and report everything
-/// the DOM knows about it at that instant. `__YGG_REF__` is replaced by the
-/// matcher expression; `__YGG_PATH_FN__` by [`WEB_DO_CSS_PATH_FN_JS`].
+/// The page-side global holding the ELEMENT HANDLES a verb resolved.
 ///
-/// Resolution happens HERE, immediately before injection — that is what retires
-/// the stale-coordinate hazard: a rect resolved in an earlier request can be
-/// invalidated by any reflow, and this one cannot be.
-const WEB_DO_RESOLVE_JS: &str = "(function(){__YGG_PATH_FN__\
-    var el=__YGG_REF__;if(!el)return{found:false};\
+/// Why a handle and not a re-query: every later step of a verb (clear, verify,
+/// read back, re-measure the rect) used to re-run the matcher, and on a
+/// re-rendering DOM the second run can land on a DIFFERENT node — MUI's
+/// role/label matcher even reads an input's own `value` as its accessible
+/// label, so filling a field CHANGES what `--role textbox --label X` resolves
+/// to. The measured consequence (a services portal, 2026-07-26): a batch fill of an
+/// EMPTY field aborted `clear_failed`, because the clear-verification re-query
+/// answered about a twin. Pinning makes "the node we acted on" and "the node we
+/// verify" the same object by construction.
+///
+/// This is NOT a second addressing scheme: [`web_element_ref_js`] stays the ONE
+/// matcher, and the pin is nothing but a reference to what IT returned.
+const WEB_DO_PIN_KEY: &str = "__yggDoPins";
+
+/// How long to let a scroll settle before RE-MEASURING the rect.
+///
+/// `scrollIntoView` is not necessarily synchronous — a container with CSS
+/// `scroll-behavior: smooth` (MUI's scrollable listbox is the measured case)
+/// animates it, so a `getBoundingClientRect()` in the same tick returns the
+/// PRE-scroll box. Injecting at that point is how `do click --role option
+/// --label X` came back `accepted`+`delivered`+`is_trusted` with nothing
+/// selected: the event landed where the option used to be.
+const WEB_DO_SCROLL_SETTLE: Duration = Duration::from_millis(120);
+
+/// Phase A of resolution: run the matcher, PIN the node, scroll it into view.
+///
+/// It deliberately reports nothing about geometry. Any rect read here is a
+/// pre-scroll rect, and the entire point of the two-phase split is that no such
+/// rect can reach the injector.
+const WEB_DO_SCROLL_PIN_JS: &str = "(function(){var el=__YGG_REF__;\
+    var m=window.__YGG_MATCH_KEY__||null;\
+    window.__YGG_PIN_KEY__=[el];\
+    if(!el)return{found:false,match:m};\
     var connected=(el.isConnected!==undefined)?!!el.isConnected\
     :!!(document.contains&&document.contains(el));\
-    try{el.scrollIntoView({block:'center',inline:'center'});}catch(e){}\
+    var top=(document.scrollingElement||document.documentElement||{}).scrollTop||0;\
+    try{el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});}\
+    catch(e){try{el.scrollIntoView(true);}catch(e2){}}\
+    return{found:true,isConnected:connected,scrollTopBefore:top,match:m};})()";
+
+/// Phase B: re-measure the PINNED node after the scroll settled, and report
+/// everything the DOM knows about it at that instant.
+///
+/// It must not scroll (a second scroll would invalidate its own measurement)
+/// and must not re-run the matcher (that is the twin hazard). `phase` is the
+/// contract token: [`web_do_resolved_from_info`] REFUSES a payload that does
+/// not carry it, so collapsing the two phases back into one cannot pass
+/// silently.
+const WEB_DO_RESOLVE_PINNED_JS: &str = "(function(){__YGG_PATH_FN__\
+    var el=(window.__YGG_PIN_KEY__||[])[0];\
+    if(!el)return{found:false,phase:'post_scroll',handle:'lost'};\
+    var connected=(el.isConnected!==undefined)?!!el.isConnected\
+    :!!(document.contains&&document.contains(el));\
     var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
     var hit=document.elementFromPoint(cx,cy);\
     var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
-    return{found:true,x:cx,y:cy,w:r.width,h:r.height,onTarget:!!onTarget,\
-    visible:r.width>0&&r.height>0,isConnected:connected,cssPath:__yggPath(el),\
-    tag:el.tagName};})()";
+    return{found:true,phase:'post_scroll',x:cx,y:cy,w:r.width,h:r.height,\
+    onTarget:!!onTarget,visible:r.width>0&&r.height>0,isConnected:connected,\
+    cssPath:__yggPath(el),tag:el.tagName};})()";
 
-/// Focus the addressed element. Same matcher, different action.
-const WEB_DO_FOCUS_JS: &str = "(function(){var el=__YGG_REF__;if(!el)return{found:false};\
+/// Focus the PINNED element (index 0 unless composed otherwise).
+///
+/// `focused` is what makes the subsequent `document.activeElement` work honest:
+/// the clear pass types into the focused element, and this is the assertion
+/// that the focused element IS the pinned one.
+const WEB_DO_FOCUS_PINNED_JS: &str = "(function(){\
+    var el=(window.__YGG_PIN_KEY__||[])[__YGG_PIN_INDEX__];\
+    if(!el)return{found:false};\
+    var connected=(el.isConnected!==undefined)?!!el.isConnected\
+    :!!(document.contains&&document.contains(el));\
+    if(!connected)return{found:true,isConnected:false};\
     try{el.focus();}catch(e){}\
-    return{found:true,focused:document.activeElement===el};})()";
+    return{found:true,isConnected:true,focused:document.activeElement===el};})()";
+
+/// The page-side global the matcher writes its own account of the resolution
+/// into: how many candidates it ended up with, which index it took, and how many
+/// it DROPPED as hidden or stale.
+///
+/// It exists because "returned null" and "returned the first of nine" are
+/// different answers that the old matcher gave identically — an `Element|null`
+/// expression cannot say "this was ambiguous" or "everything I found was a
+/// corpse". Every matcher arm writes it; the pin/resolve scripts report it.
+const WEB_DO_MATCH_KEY: &str = "__yggDoMatch";
+
+/// `__yggLive(el)`, `__yggListboxOf(el)`, `__yggOpenListbox()` — the staleness
+/// vocabulary the role matcher needs.
+///
+/// The measured failure (a services portal, 2026-07-26): after a failed pick, MUI leaves
+/// the OLD popper mounted, so `li[role=option]` keeps matching the dead list and
+/// the next selection lands in it. A pick must therefore be scoped to the
+/// listbox that is actually OPEN — the one an `aria-expanded` combobox owns, or
+/// failing that the last VISIBLE one in document order — and a pool that
+/// contains only stale options must resolve to nothing rather than to a corpse.
+const WEB_DO_LIVE_FN_JS: &str = "\
+    var __yggLive=function(e){\
+    if(!e||e.nodeType!==1)return false;\
+    var p=e,guard=0;\
+    while(p&&guard<24){\
+    if(p.getAttribute&&p.getAttribute('aria-hidden')==='true')return false;\
+    p=p.parentElement;guard++;}\
+    var r=e.getBoundingClientRect();\
+    if(!(r.width>0&&r.height>0))return false;\
+    var s=null;try{s=window.getComputedStyle(e);}catch(err){}\
+    if(s&&(s.visibility==='hidden'||s.display==='none'))return false;\
+    return true;};\
+    var __yggListboxOf=function(e){var p=e,guard=0;\
+    while(p&&guard<24){var r=p.getAttribute&&p.getAttribute('role');\
+    if(r==='listbox'||r==='menu')return p;p=p.parentElement;guard++;}\
+    return null;};\
+    var __yggOpenListbox=function(){\
+    var combos=document.querySelectorAll('[role=combobox][aria-expanded=true]');\
+    var found=null;\
+    for(var i=0;i<combos.length;i++){\
+    var id=combos[i].getAttribute('aria-controls')||combos[i].getAttribute('aria-owns');\
+    if(!id)continue;\
+    var t=document.getElementById(String(id).split(/\\s+/)[0]);\
+    if(t&&__yggLive(t))found=t;}\
+    return found;};";
+
+/// The ONE css resolution rule: `querySelectorAll(sel)[nth]`, with the match
+/// COUNT reported.
+///
+/// `querySelector` was the old rule and it is the duplicate-id defect: a page
+/// that renders two form blocks with the same ids answers with the first, every
+/// time, and says nothing about the other eight. Counting is not optional here —
+/// an ambiguous resolution that reports nothing is the same class of lie as a
+/// stale rect.
+fn web_css_matcher_js(selector: &str, nth: usize) -> String {
+    format!(
+        "(function(){{var els=document.querySelectorAll({sel});\
+         window.{key}={{n:els.length,nth:{nth},hidden:0}};\
+         return els[{nth}]||null;}})()",
+        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
+        key = WEB_DO_MATCH_KEY,
+    )
+}
 
 /// The matcher: a JS expression evaluating to the addressed `Element` or `null`.
 ///
@@ -49394,11 +49509,20 @@ const WEB_DO_FOCUS_JS: &str = "(function(){var el=__YGG_REF__;if(!el)return{foun
 /// composes it into its own script, so a click and the readback that verifies it
 /// can never disagree about which element was meant.
 fn web_element_ref_js(target: &WebElementRef) -> String {
+    // The arms below are written against placeholders so the staleness
+    // vocabulary and the diagnostics key each have ONE definition; they are
+    // substituted here, before the expression is composed into any script.
+    web_element_ref_js_raw(target)
+        .replace("__YGG_LIVE_FN__", WEB_DO_LIVE_FN_JS)
+        .replace("__YGG_MATCH_KEY__", WEB_DO_MATCH_KEY)
+}
+
+fn web_element_ref_js_raw(target: &WebElementRef) -> String {
     let quote = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     match target {
-        WebElementRef::Css(selector) => {
-            format!("document.querySelector({})", quote(selector))
-        }
+        // ONE css rule for both wire shapes: `Css(s)` is `CssNth{css:s,nth:0}`.
+        WebElementRef::Css(selector) => web_css_matcher_js(selector, 0),
+        WebElementRef::CssNth { css, nth } => web_css_matcher_js(css, *nth),
         WebElementRef::Text {
             text,
             exact,
@@ -49431,6 +49555,7 @@ fn web_element_ref_js(target: &WebElementRef) -> String {
                  for(var k=0;k<out.length;k++){{if(k!==j&&out[j].contains&&out[j].contains(out[k]))\
                  {{keep=false;break;}}}}\
                  if(keep)inner.push(out[j]);}}\
+                 window.__YGG_MATCH_KEY__={{n:inner.length,nth:nth,hidden:0}};\
                  return inner[nth]||null;}})()",
                 pool = quote(&pool),
                 want = quote(text),
@@ -49484,7 +49609,20 @@ fn web_element_ref_js(target: &WebElementRef) -> String {
              if(roleOf(e)!==want)continue;var lab=labelOf(e);\
              if(lab===wantLabel)ex.push(e);\
              else if(wantLabel&&lab.indexOf(wantLabel)!==-1)part.push(e);}}\
-             var pool=ex.length?ex:part;return pool[nth]||null;}})()",
+             var pool=ex.length?ex:part;\
+             __YGG_LIVE_FN__\
+             var live=[],dead=0;\
+             for(var i=0;i<pool.length;i++){{if(__yggLive(pool[i]))live.push(pool[i]);else dead++;}}\
+             if(want==='option'||want==='menuitem'){{\
+             var scope=__yggOpenListbox();\
+             if(!scope){{for(var i=0;i<live.length;i++){{var b=__yggListboxOf(live[i]);\
+             if(b&&__yggLive(b))scope=b;}}}}\
+             if(scope){{var inScope=[];\
+             for(var i=0;i<live.length;i++){{if(scope===live[i]||scope.contains(live[i]))\
+             inScope.push(live[i]);}}\
+             dead+=live.length-inScope.length;live=inScope;}}}}\
+             window.__YGG_MATCH_KEY__={{n:live.length,nth:nth,hidden:dead}};\
+             return live[nth]||null;}})()",
             role = quote(&role.to_lowercase()),
             label = quote(label),
             nth = nth.unwrap_or(0),
@@ -49495,9 +49633,209 @@ fn web_element_ref_js(target: &WebElementRef) -> String {
 /// Compose a target-shaped script: substitute the matcher (and the css-path
 /// helper, when the template asks for it) into `template`.
 fn web_do_script_for_ref(template: &str, target: &WebElementRef) -> String {
+    web_do_script_common(template).replace("__YGG_REF__", &web_element_ref_js(target))
+}
+
+/// Substitute everything that is NOT target-shaped: the css-path helper and the
+/// pin-registry key. One place, so a script can never address a differently
+/// named registry from the one the pinning step wrote.
+fn web_do_script_common(template: &str) -> String {
     template
         .replace("__YGG_PATH_FN__", WEB_DO_CSS_PATH_FN_JS)
-        .replace("__YGG_REF__", &web_element_ref_js(target))
+        .replace("__YGG_PIN_KEY__", WEB_DO_PIN_KEY)
+        .replace("__YGG_MATCH_KEY__", WEB_DO_MATCH_KEY)
+}
+
+/// Compose a script that addresses pin `index`.
+fn web_do_script_for_pin(template: &str, index: usize) -> String {
+    web_do_script_common(template).replace("__YGG_PIN_INDEX__", &index.to_string())
+}
+
+/// The JS expression naming pin `index` — the ONE way a follow-up script says
+/// "the node we already resolved".
+fn web_do_pinned_ref_js(index: usize) -> String {
+    format!("(window.{WEB_DO_PIN_KEY}||[])[{index}]")
+}
+
+/// Pin EVERY addressed element in one pass and report what each one is.
+///
+/// Built here rather than per-call so the array the fill writes to and the
+/// array every later step reads are literally the same array.
+fn web_do_pin_refs_script(targets: &[WebElementRef]) -> String {
+    // One push per target rather than one array literal: the matcher writes its
+    // account of each resolution into a single global, so it has to be READ
+    // between runs or every target would report the last one's diagnostics.
+    let pushes: String = targets
+        .iter()
+        .map(|target| {
+            format!(
+                "refs.push({matcher});diag.push(window.{key}||null);",
+                matcher = web_element_ref_js(target),
+                key = WEB_DO_MATCH_KEY,
+            )
+        })
+        .collect();
+    format!(
+        "(function(){{var refs=[],diag=[];{pushes}window.{key}=refs;var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el){{out.push({{found:false,match:diag[i]}});continue;}}\
+         var c=(el.isConnected!==undefined)?!!el.isConnected\
+         :!!(document.contains&&document.contains(el));\
+         var ty=null;\
+         if(el.tagName==='INPUT'&&el.getAttribute)\
+         ty=String(el.getAttribute('type')||'text').toLowerCase();\
+         out.push({{found:true,connected:c,tag:el.tagName,type:ty,\
+         editable:!!el.isContentEditable,match:diag[i]}});}}\
+         return{{pinned:refs.length,els:out}};}})()",
+        key = WEB_DO_PIN_KEY,
+    )
+}
+
+/// The matcher's own account of a resolution: how many candidates it ended up
+/// with, which one it took, and how many it dropped as hidden or stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MatchDiag {
+    matches: u64,
+    nth: u64,
+    hidden: u64,
+}
+
+impl MatchDiag {
+    fn from_value(value: Option<&Value>) -> Option<Self> {
+        let value = value?;
+        if !value.is_object() {
+            return None;
+        }
+        Some(Self {
+            matches: value.get("n").and_then(Value::as_u64).unwrap_or(0),
+            nth: value.get("nth").and_then(Value::as_u64).unwrap_or(0),
+            hidden: value.get("hidden").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    /// More than one candidate survived: the caller got ONE of several and, if
+    /// the page duplicates ids across form blocks, quite possibly the wrong one.
+    fn ambiguous(&self) -> bool {
+        self.matches > 1
+    }
+
+    /// Everything the matcher found was hidden or stale. A pick that lands here
+    /// must refuse — clicking a dead MUI option is exactly the silent no-op the
+    /// filing agent hit.
+    fn only_stale(&self) -> bool {
+        self.matches == 0 && self.hidden > 0
+    }
+}
+
+/// The ONE refusal message for a matcher that produced no usable element.
+///
+/// `stale_listbox_only` and `no element matches` are different diagnoses and the
+/// caller acts differently on them (dismiss the dead popper vs. fix the
+/// selector), so they are different messages — from one owner, so a click and a
+/// fill can never phrase the same failure two ways.
+fn web_do_match_refusal(target: &WebElementRef, diag: Option<MatchDiag>) -> String {
+    match diag {
+        Some(diag) if diag.only_stale() => format!(
+            "stale_listbox_only ({} matched {} hidden/stale node(s) and nothing live — \
+             dismiss the open popper and retry)",
+            target.describe(),
+            diag.hidden
+        ),
+        _ => format!("no element matches {}", target.describe()),
+    }
+}
+
+/// What the page said each pinned element IS. The `Auto` mechanism rule reads
+/// exactly this, so the choice is made from the live DOM, never from the
+/// caller's guess about the widget.
+///
+/// A `PinnedElement` is IN THE DOCUMENT by construction —
+/// [`web_do_pins_from_info`] refuses a detached node rather than building one —
+/// so there is no `connected` field to disagree with that.
+#[derive(Debug, Clone, PartialEq)]
+struct PinnedElement {
+    tag: Option<String>,
+    input_type: Option<String>,
+    content_editable: bool,
+    /// What the matcher said about HOW it got here — the ambiguity count is
+    /// reported even on success, because a `#Name` that matched nine nodes is a
+    /// fact the caller needs whether or not the first one was the right one.
+    diag: Option<MatchDiag>,
+}
+
+/// PURE half of pinning: turn the page's report into handles or a refusal.
+fn web_do_pins_from_info(
+    targets: &[WebElementRef],
+    info: &Value,
+) -> Result<Vec<PinnedElement>, String> {
+    let els = info
+        .get("els")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "pin_failed (the page did not report the resolved handles)".to_string())?;
+    if els.len() != targets.len() {
+        return Err(format!(
+            "pin_failed (asked for {} handle(s), the page reported {})",
+            targets.len(),
+            els.len()
+        ));
+    }
+    let mut pins = Vec::with_capacity(els.len());
+    for (index, el) in els.iter().enumerate() {
+        let diag = MatchDiag::from_value(el.get("match"));
+        let Some(target) = targets.get(index) else {
+            return Err("pin_failed (the page reported a handle nobody asked for)".to_string());
+        };
+        if !el.get("found").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(web_do_match_refusal(target, diag));
+        }
+        if !el
+            .get("connected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "detached_node ({} resolved to a node that is not in the document)",
+                target.describe()
+            ));
+        }
+        pins.push(PinnedElement {
+            tag: el.get("tag").and_then(Value::as_str).map(ToOwned::to_owned),
+            input_type: el
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            content_editable: el.get("editable").and_then(Value::as_bool).unwrap_or(false),
+            diag,
+        });
+    }
+    Ok(pins)
+}
+
+/// The ambiguity report a response owes whenever a target could have been
+/// several nodes. Pure.
+///
+/// `matches` is always present; `ambiguous` is the flag a caller can branch on.
+/// Reporting a 1 costs nothing and reporting a 9 is the whole point.
+fn web_do_match_report(diag: Option<MatchDiag>) -> Value {
+    match diag {
+        Some(diag) => json!({
+            "matches": diag.matches,
+            "nth": diag.nth,
+            "hidden": diag.hidden,
+            "ambiguous": diag.ambiguous(),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// Pin the addressed elements in the live page.
+async fn web_do_pin_refs(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    targets: &[WebElementRef],
+) -> Result<Vec<PinnedElement>, String> {
+    let info = web_do_eval(desktop, native_id, &web_do_pin_refs_script(targets)).await?;
+    web_do_pins_from_info(targets, &info)
 }
 
 /// What the DOM said about the addressed node AT CLICK TIME.
@@ -49517,6 +49855,11 @@ struct ResolvedElement {
     is_connected: bool,
     css_path: Option<String>,
     tag: Option<String>,
+    /// WHICH measurement this rect is. Read from the payload, never asserted by
+    /// the driver, so the response cannot claim a freshness it did not get.
+    rect_phase: String,
+    /// The matcher's account of how it got here (ambiguity, stale drops).
+    diag: Option<MatchDiag>,
 }
 
 /// PURE half of the resolver: turn the page's report into a decision.
@@ -49526,9 +49869,29 @@ struct ResolvedElement {
 fn web_do_resolved_from_info(
     target: &WebElementRef,
     info: &Value,
+    diag: Option<MatchDiag>,
 ) -> Result<ResolvedElement, String> {
+    // THE RECT MUST BE THE POST-SCROLL ONE. Only phase B stamps this token, so
+    // a payload without it is by construction a rect measured in the same tick
+    // as the `scrollIntoView` that moved the node — the measured cause of a
+    // `do click --role option --label X` in a scrolled MUI listbox reporting
+    // accepted + delivered + is_trusted while nothing was selected.
+    if info.get("phase").and_then(Value::as_str) != Some("post_scroll") {
+        return Err(format!(
+            "rect_not_reresolved ({} was measured before the scroll settled)",
+            target.describe()
+        ));
+    }
     if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(format!("no element matches {}", target.describe()));
+        // The handle vanishing between the two phases is its OWN answer: the
+        // framework replaced the node while we were scrolling to it.
+        if info.get("handle").and_then(Value::as_str) == Some("lost") {
+            return Err(format!(
+                "handle_lost ({} was replaced between the scroll and the re-measure)",
+                target.describe()
+            ));
+        }
+        return Err(web_do_match_refusal(target, diag));
     }
     let is_connected = info
         .get("isConnected")
@@ -49576,18 +49939,49 @@ fn web_do_resolved_from_info(
             .get("tag")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        rect_phase: info
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        diag,
     })
 }
 
-/// Resolve a [`WebElementRef`] in the page, right now.
+/// Resolve a [`WebElementRef`] in the page, right now — in TWO phases.
+///
+/// A: match, pin, scroll. Settle. B: re-measure the PINNED node and hit-test it.
+///
+/// One phase is not enough, and this is the whole N3 rect item: `scrollIntoView`
+/// followed by `getBoundingClientRect()` in the same tick reads the box the node
+/// had BEFORE the scroll whenever the scroller animates (CSS
+/// `scroll-behavior: smooth`, which MUI's listbox sets). The click then lands on
+/// whatever now occupies the old coordinates, and every field in the response —
+/// `accepted`, `delivered`, `is_trusted` — is truthfully `true` about an event
+/// that did nothing.
 async fn web_do_resolve_ref(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
     target: &WebElementRef,
 ) -> Result<ResolvedElement, String> {
-    let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, target);
-    let info = web_do_eval(desktop, native_id, &script).await?;
-    web_do_resolved_from_info(target, &info)
+    let pin = web_do_eval(
+        desktop,
+        native_id,
+        &web_do_script_for_ref(WEB_DO_SCROLL_PIN_JS, target),
+    )
+    .await?;
+    let diag = MatchDiag::from_value(pin.get("match"));
+    if !pin.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(web_do_match_refusal(target, diag));
+    }
+    sleep(WEB_DO_SCROLL_SETTLE).await;
+    let info = web_do_eval(
+        desktop,
+        native_id,
+        &web_do_script_common(WEB_DO_RESOLVE_PINNED_JS),
+    )
+    .await?;
+    web_do_resolved_from_info(target, &info, diag)
 }
 
 /// The positive report N3 asks for: what was clicked, not just that something
@@ -49607,7 +50001,15 @@ fn web_do_resolved_detail(verb: &str, target: &WebElementRef, resolved: &Resolve
             "rect": [resolved.x - resolved.w / 2.0, resolved.y - resolved.h / 2.0, resolved.w, resolved.h],
             "on_target": resolved.on_target,
             "is_connected": resolved.is_connected,
+            // Which measurement the injected point came from. `post_scroll` is
+            // the only value the resolver admits — see
+            // `web_do_resolved_from_info` — and reporting it is what lets a
+            // caller tell a re-measured click from a pre-scroll one.
+            "rect_phase": resolved.rect_phase,
         },
+        // How the target was picked out of the page: the match count, the index
+        // taken, and how many candidates were dropped as hidden/stale.
+        "match": web_do_match_report(resolved.diag),
     })
 }
 
@@ -49619,22 +50021,54 @@ async fn web_do_focus_ref(
     native_id: u64,
     target: &WebElementRef,
 ) -> Result<(), String> {
-    let script = web_do_script_for_ref(WEB_DO_FOCUS_JS, target);
-    let info = web_do_eval(desktop, native_id, &script).await?;
+    // Pin, then focus the pin: one matcher run, and the focus assertion is
+    // about the node THAT run returned rather than about whatever the selector
+    // resolves to a moment later.
+    web_do_pin_refs(desktop, native_id, std::slice::from_ref(target)).await?;
+    web_do_focus_pinned(desktop, native_id, 0, &target.describe()).await
+}
+
+/// PURE half of focusing: what the page reported, as a decision.
+///
+/// `node_replaced` is its own answer. A framework that re-renders the field
+/// while a verb is mid-flight is not the same failure as a field that refuses
+/// focus, and reporting the second for the first is what sent a filing agent
+/// hunting a nonexistent selector bug.
+fn web_do_focus_verdict(describe: &str, info: &Value) -> Result<(), String> {
     if !info.get("found").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(format!("no element matches {}", target.describe()));
+        return Err(format!(
+            "handle_lost (the pinned handle for {describe} is gone — the page navigated?)"
+        ));
+    }
+    if !info
+        .get("isConnected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "node_replaced ({describe} was re-rendered away mid-verb)"
+        ));
     }
     if !info
         .get("focused")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Err(format!(
-            "focus_failed (could not focus {})",
-            target.describe()
-        ));
+        return Err(format!("focus_failed (could not focus {describe})"));
     }
     Ok(())
+}
+
+/// Focus an ALREADY-PINNED element. `describe` is only for the message.
+async fn web_do_focus_pinned(
+    desktop: &dioxus::desktop::DesktopContext,
+    native_id: u64,
+    index: usize,
+    describe: &str,
+) -> Result<(), String> {
+    let script = web_do_script_for_pin(WEB_DO_FOCUS_PINNED_JS, index);
+    let info = web_do_eval(desktop, native_id, &script).await?;
+    web_do_focus_verdict(describe, &info)
 }
 
 /// Empty the focused field using REAL keys: select-all, then Delete, then a run
@@ -49649,16 +50083,27 @@ async fn web_do_focus_ref(
 /// The BackSpace run is bounded by the field's own length (read first, capped),
 /// so this cannot spin on a field that refuses to clear; a segmented box holds
 /// one character, and select-all+Delete already covers the ordinary case.
+/// `pin` names the handle whose length bounds the BackSpace run. Real keys
+/// necessarily go to whatever holds focus — which the caller has just ASSERTED
+/// is this pin (`web_do_focus_pinned` compares `document.activeElement` to the
+/// pinned node) — but the length is read from the pin itself, so the bound is
+/// about the field being cleared and not about whatever focus drifted to.
 async fn web_do_clear_focused_field(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
+    pin: Option<usize>,
 ) -> Result<(), String> {
     const CTRL: u32 = 1 << 2; // GDK_CONTROL_MASK
+    let resolver = pin
+        .map(web_do_pinned_ref_js)
+        .unwrap_or_else(|| "document.activeElement".to_string());
     let len = web_do_eval(
         desktop,
         native_id,
-        "(function(){var el=document.activeElement;if(!el)return{n:0};\
-         var v=(el.value!==undefined?el.value:el.textContent)||'';return{n:v.length};})()",
+        &format!(
+            "(function(){{var el={resolver};if(!el)return{{n:0}};\
+             var v=(el.value!==undefined?el.value:el.textContent)||'';return{{n:v.length}};}})()"
+        ),
     )
     .await
     .ok()
@@ -49730,36 +50175,101 @@ fn segmented_match(expected: &str, per_box: &[Option<String>]) -> (bool, Vec<boo
     (per.iter().all(|ok| *ok) && !per.is_empty(), per)
 }
 
-/// Build a JS array literal of the addressed elements, in order. Shared by the
-/// clear-verification and the segmented readback so both look at exactly the
-/// boxes the fill wrote to.
-fn web_do_refs_array_js(targets: &[WebElementRef]) -> String {
-    let refs: Vec<String> = targets.iter().map(web_element_ref_js).collect();
-    format!("[{}]", refs.join(","))
+/// What one PINNED box holds, as far as emptiness is concerned. Lengths and
+/// booleans only — no page value crosses back out (F4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClearBoxState {
+    /// The pinned handle still exists in the registry.
+    present: bool,
+    /// …and is still in the document.
+    connected: bool,
+    len: u64,
 }
 
-/// Is every box actually EMPTY? Returns `None` when it could not be read.
+/// The clear pass's verdict over the PINNED boxes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClearVerdict {
+    /// Every pinned box is in the document and empty.
+    Empty,
+    /// Boxes still holding text — the honest `clear_failed` case.
+    Stubborn(Vec<usize>),
+    /// The framework replaced the node(s) we cleared. NOT `clear_failed`: the
+    /// field we emptied is gone, so nothing is known about what replaced it.
+    NodeReplaced(Vec<usize>),
+    /// Could not be read at all.
+    Unknown,
+}
+
+/// PURE clear-verification rule.
+///
+/// Why it exists: the old verification RE-QUERIED the selector, so on a
+/// re-rendering DOM it could answer about a different node than the one the
+/// clear had emptied — the measured a services portal failure was a batch fill of an
+/// ALREADY-EMPTY field aborting `clear_failed`. Feeding this rule the pinned
+/// handles' state makes that shape unrepresentable: a handle that is no longer
+/// connected is `NodeReplaced`, never "still holds text".
+fn web_do_clear_verdict(boxes: Option<&[ClearBoxState]>) -> ClearVerdict {
+    let Some(boxes) = boxes else {
+        return ClearVerdict::Unknown;
+    };
+    if boxes.is_empty() {
+        return ClearVerdict::Empty;
+    }
+    let replaced: Vec<usize> = boxes
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| !state.present || !state.connected)
+        .map(|(index, _)| index)
+        .collect();
+    if !replaced.is_empty() {
+        return ClearVerdict::NodeReplaced(replaced);
+    }
+    let stubborn: Vec<usize> = boxes
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.len > 0)
+        .map(|(index, _)| index)
+        .collect();
+    if stubborn.is_empty() {
+        ClearVerdict::Empty
+    } else {
+        ClearVerdict::Stubborn(stubborn)
+    }
+}
+
+/// Read the PINNED boxes' emptiness state. `None` when it could not be read.
 ///
 /// Typing into a partially-cleared segmented widget is how the merge is
 /// manufactured, so the fill path asserts this between clearing and typing
 /// rather than assuming the clear worked.
-async fn web_do_boxes_are_empty(
+/// The clear-verification SCRIPT. Extracted so the wiring itself is lockable:
+/// it must address the pin registry, and it must contain neither
+/// `document.activeElement` nor a fresh matcher run — those two are the defect.
+fn web_do_pinned_box_states_script(count: usize) -> String {
+    format!(
+        "(function(){{var refs=window.{key}||[];\
+         if(refs.length!=={count})return{{known:false}};\
+         var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el){{out.push({{present:false,connected:false,len:0}});continue;}}\
+         var c=(el.isConnected!==undefined)?!!el.isConnected\
+         :!!(document.contains&&document.contains(el));\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push({{present:true,connected:c,len:v.length}});}}\
+         return{{known:true,boxes:out}};}})()",
+        key = WEB_DO_PIN_KEY,
+    )
+}
+
+async fn web_do_pinned_box_states(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    targets: &[WebElementRef],
-) -> Option<Vec<bool>> {
-    if targets.is_empty() {
+    count: usize,
+) -> Option<Vec<ClearBoxState>> {
+    if count == 0 {
         return Some(Vec::new());
     }
-    let script = format!(
-        "(function(){{var refs={refs};var out=[];\
-         for(var i=0;i<refs.length;i++){{var el=refs[i];\
-         if(!el)return{{known:false}};\
-         var v=(el.value!==undefined?el.value:el.textContent)||'';\
-         out.push(v.length===0);}}\
-         return{{known:true,boxes:out}};}})()",
-        refs = web_do_refs_array_js(targets),
-    );
+    let script = web_do_pinned_box_states_script(count);
     let info = web_do_eval(desktop, native_id, &script).await.ok()?;
     if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
         return None;
@@ -49768,7 +50278,17 @@ async fn web_do_boxes_are_empty(
         info.get("boxes")?
             .as_array()?
             .iter()
-            .map(|value| value.as_bool().unwrap_or(false))
+            .map(|value| ClearBoxState {
+                present: value
+                    .get("present")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                connected: value
+                    .get("connected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                len: value.get("len").and_then(Value::as_u64).unwrap_or(0),
+            })
             .collect(),
     )
 }
@@ -49779,6 +50299,27 @@ async fn web_do_boxes_are_empty(
 /// already in that page — the fill just typed them), the comparison happens
 /// page-side, and the answer names WHICH box is wrong without ever quoting a
 /// value.
+/// The segmented readback SCRIPT.
+///
+/// Read the PINNED handles, not a fresh matcher run: the boxes that were typed
+/// into and the boxes that are read back must be the same objects, or a
+/// re-render between the two turns a real merge into a clean pass.
+fn web_do_segmented_readback_script(expected: &str, boxes: usize) -> String {
+    let want = segmented_expectation(expected, boxes);
+    format!(
+        "(function(){{var refs=window.{key}||[];var want={want};\
+         if(refs.length!==want.length)return{{known:false}};\
+         var out=[];\
+         for(var i=0;i<refs.length;i++){{var el=refs[i];\
+         if(!el)return{{known:false}};\
+         var v=(el.value!==undefined?el.value:el.textContent)||'';\
+         out.push(v===want[i]);}}\
+         return{{known:true,boxes:out}};}})()",
+        key = WEB_DO_PIN_KEY,
+        want = serde_json::to_string(&want).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
 async fn web_do_verify_segmented_value(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
@@ -49788,17 +50329,7 @@ async fn web_do_verify_segmented_value(
     if targets.is_empty() {
         return None;
     }
-    let want = segmented_expectation(expected, targets.len());
-    let script = format!(
-        "(function(){{var refs={refs};var want={want};var out=[];\
-         for(var i=0;i<refs.length;i++){{var el=refs[i];\
-         if(!el)return{{known:false}};\
-         var v=(el.value!==undefined?el.value:el.textContent)||'';\
-         out.push(v===want[i]);}}\
-         return{{known:true,boxes:out}};}})()",
-        refs = web_do_refs_array_js(targets),
-        want = serde_json::to_string(&want).unwrap_or_else(|_| "[]".to_string()),
-    );
+    let script = web_do_segmented_readback_script(expected, targets.len());
     let info = web_do_eval(desktop, native_id, &script).await.ok()?;
     if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
         return None;
@@ -49812,35 +50343,344 @@ async fn web_do_verify_segmented_value(
     )
 }
 
-/// Did the field actually end up holding `expected`? Returns `None` when it
-/// could not be read (unknown, which is not the same as "no").
+/// The answer to "did the field end up holding what we asked for?".
 ///
-/// The comparison happens PAGE-SIDE and only a boolean comes back: this verb is
-/// used for OTPs and passwords, so the value must never re-enter a log, a trace
-/// event, or an app-control response (F4 output redaction).
+/// `verified: None` is UNKNOWN and is not the same as `Some(false)`; the reason
+/// names which of the four things happened. `held` is present only when the
+/// caller did not ask for redaction.
+#[derive(Debug, Clone, PartialEq)]
+struct FillVerification {
+    verified: Option<bool>,
+    reason: Option<&'static str>,
+    held: Option<String>,
+    held_len: Option<u64>,
+    requested_len: u64,
+    /// Index of the first differing character, `-1` when the strings agree over
+    /// their common length. Reportable even under redaction.
+    first_mismatch: Option<i64>,
+}
+
+/// PURE readback rule for a single field.
+///
+/// This is the honesty half of the fidelity family. The measured failures
+/// (a services portal, 2026-07-26) were BOTH of the shape "the verb reported success
+/// and the field held something else": `chars: 19` delivered into a field
+/// holding `Ja`, and `chars: 10` into a field holding `0000000000hg`. Neither
+/// was expressible as a failure, because the response said `delivered: true`
+/// and nothing else. A rule that must produce `verified` from the field's OWN
+/// final value cannot make that mistake — and when it cannot read the field, it
+/// says so rather than assuming.
+fn web_do_fill_verification(
+    requested: &str,
+    reveal: bool,
+    info: Option<&Value>,
+) -> FillVerification {
+    let requested_len = requested.chars().count() as u64;
+    let unknown = |reason: &'static str| FillVerification {
+        verified: None,
+        reason: Some(reason),
+        held: None,
+        held_len: None,
+        requested_len,
+        first_mismatch: None,
+    };
+    let Some(info) = info else {
+        return unknown("unreadable");
+    };
+    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
+        return unknown(match info.get("reason").and_then(Value::as_str) {
+            Some("handle_lost") => "handle_lost",
+            Some("node_replaced") => "node_replaced",
+            _ => "unreadable",
+        });
+    }
+    if !info
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        // The node we wrote to left the document before we could read it. That
+        // is not "the value is wrong" — it is "there is no longer a field to
+        // ask", and calling it a mismatch would send the caller after the wrong
+        // bug.
+        return unknown("node_replaced");
+    }
+    let same = info.get("same").and_then(Value::as_bool).unwrap_or(false);
+    FillVerification {
+        verified: Some(same),
+        reason: if same { None } else { Some("value_mismatch") },
+        held: if reveal {
+            info.get("held")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        },
+        held_len: info.get("len").and_then(Value::as_u64),
+        requested_len,
+        first_mismatch: info.get("firstMismatch").and_then(Value::as_i64),
+    }
+}
+
+/// Read the PINNED field's final value back and compare it to what was asked
+/// for.
+///
+/// Through the pinned handle, never `document.activeElement` and never a fresh
+/// matcher run: the field that was written and the field that is read back must
+/// be the same object, or a re-render turns a dropped-character fill into a
+/// clean pass.
+///
+/// The comparison happens PAGE-SIDE. Under `reveal` the held string comes back
+/// so a caller can SEE `Ja` where it asked for nineteen characters; under
+/// redaction only lengths and the first-mismatch index cross out, which still
+/// names the failure without putting an OTP or a password into a response (F4).
 async fn web_do_verify_field_value(
     desktop: &dioxus::desktop::DesktopContext,
     native_id: u64,
-    target: Option<&WebElementRef>,
+    pinned: bool,
     expected: &str,
-) -> Option<bool> {
-    // Same matcher as the focus/click paths, so the box that was written and
-    // the box that is read back can never be different elements.
-    let resolver = target
-        .map(web_element_ref_js)
-        .unwrap_or_else(|| "document.activeElement".to_string());
-    let script = format!(
-        "(function(){{var el={resolver};\
-         if(!el)return{{known:false}};\
+    reveal: bool,
+) -> Option<Value> {
+    let script = web_do_field_readback_script(pinned, expected, reveal);
+    web_do_eval(desktop, native_id, &script).await.ok()
+}
+
+/// The single-field readback SCRIPT.
+///
+/// `pinned` is only false for a fill with NO addressed target, where the page's
+/// own focus is by definition the only thing there is to read. Every addressed
+/// fill reads its pin — `document.activeElement` is what made the old readback
+/// answer about whatever focus had drifted to.
+fn web_do_field_readback_script(pinned: bool, expected: &str, reveal: bool) -> String {
+    let resolver = if pinned {
+        web_do_pinned_ref_js(0)
+    } else {
+        "document.activeElement".to_string()
+    };
+    format!(
+        "(function(){{var el={resolver};var want={want};var reveal={reveal};\
+         if(!el)return{{known:false,reason:'handle_lost'}};\
+         var c=(el.isConnected!==undefined)?!!el.isConnected\
+         :!!(document.contains&&document.contains(el));\
          var v=(el.value!==undefined?el.value:el.textContent)||'';\
-         return{{known:true,same:v==={want}}};}})()",
+         var mm=-1,n=Math.max(v.length,want.length);\
+         for(var i=0;i<n;i++){{if(v.charAt(i)!==want.charAt(i)){{mm=i;break;}}}}\
+         var out={{known:true,connected:c,same:v===want,len:v.length,firstMismatch:mm}};\
+         if(reveal)out.held=v;\
+         return out;}})()",
         want = serde_json::to_string(expected).unwrap_or_else(|_| "\"\"".to_string()),
-    );
-    let info = web_do_eval(desktop, native_id, &script).await.ok()?;
-    if !info.get("known").and_then(Value::as_bool).unwrap_or(false) {
-        return None;
+        reveal = if reveal { "true" } else { "false" },
+    )
+}
+
+/// Set the PINNED field through the native value setter, then fire the events a
+/// framework listens for.
+///
+/// `HTMLInputElement.prototype.value`'s setter is the one React does not shadow:
+/// assigning `el.value` directly on a controlled input writes the DOM node
+/// while React's own state stays behind, and the next render puts the old value
+/// back. Going through the prototype descriptor and then dispatching a bubbling
+/// `input` is the mechanism React's synthetic event system actually observes —
+/// the filing agent's proven workaround, promoted here from a per-agent recipe
+/// to the verb's own behaviour.
+fn web_do_native_setter_script(text: &str) -> String {
+    format!(
+        "(function(){{var el={pin};var v={text};\
+         if(!el)return{{ok:false,reason:'handle_lost'}};\
+         var c=(el.isConnected!==undefined)?!!el.isConnected\
+         :!!(document.contains&&document.contains(el));\
+         if(!c)return{{ok:false,reason:'node_replaced'}};\
+         try{{el.focus();}}catch(e){{}}\
+         var proto=(el.tagName==='TEXTAREA')?window.HTMLTextAreaElement.prototype\
+         :window.HTMLInputElement.prototype;\
+         var d=null;try{{d=Object.getOwnPropertyDescriptor(proto,'value');}}catch(e){{}}\
+         try{{if(d&&d.set){{d.set.call(el,v);}}\
+         else if(el.value!==undefined){{el.value=v;}}\
+         else{{el.textContent=v;}}}}catch(e){{return{{ok:false,reason:'set_threw'}};}}\
+         try{{el.dispatchEvent(new Event('input',{{bubbles:true}}));}}catch(e){{}}\
+         try{{el.dispatchEvent(new Event('change',{{bubbles:true}}));}}catch(e){{}}\
+         try{{el.blur();}}catch(e){{}}\
+         return{{ok:true}};}})()",
+        pin = web_do_pinned_ref_js(0),
+        text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// The mechanism that will run, and WHY. `mechanism` is never `Auto` — this is
+/// where `Auto` becomes a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FillMechanismChoice {
+    mechanism: WebFillMechanism,
+    reason: &'static str,
+}
+
+/// Is this pinned element the plain text box the native setter is FOR?
+fn web_do_pin_is_plain_text_input(pin: &PinnedElement) -> bool {
+    if pin.content_editable {
+        return false;
     }
-    Some(info.get("same").and_then(Value::as_bool).unwrap_or(false))
+    match pin.tag.as_deref() {
+        Some("TEXTAREA") => true,
+        Some("INPUT") => matches!(
+            pin.input_type.as_deref().unwrap_or("text"),
+            "text" | "email" | "tel" | "url" | "search" | "password" | "number" | ""
+        ),
+        _ => false,
+    }
+}
+
+/// THE mechanism rule — one owner, evaluated against what the page said the
+/// element IS, never against the caller's guess.
+///
+/// The order is load-bearing:
+/// 1. A segmented widget needs real keys whatever anyone asked for: its focus
+///    auto-advance IS the mechanism, and a scripted write leaves the component's
+///    own per-box state holding the old digits (the measured `278344` merge).
+/// 2. A redacted (secret) fill never takes the native-setter path, even when
+///    explicitly asked: that path puts the value inside an eval script string,
+///    and F4 says a secret goes in as keystrokes or not at all.
+/// 3. An explicit request wins over the automatic rule.
+/// 4. `Auto` on a plain text/textarea input picks the native setter — the fix
+///    for the React controlled-input character drop (`chars: 19` reported, `Ja`
+///    held).
+/// 5. Anything else keeps real keys, which is the conservative behaviour the
+///    verb shipped with.
+fn web_do_fill_mechanism(
+    requested: WebFillMechanism,
+    redact: bool,
+    segmented: bool,
+    pin: Option<&PinnedElement>,
+) -> FillMechanismChoice {
+    let choose = |mechanism, reason| FillMechanismChoice { mechanism, reason };
+    if segmented {
+        return choose(
+            WebFillMechanism::RealKeys,
+            "segmented_widget_needs_real_keys",
+        );
+    }
+    if redact {
+        return choose(
+            WebFillMechanism::RealKeys,
+            "secret_never_enters_an_eval_script",
+        );
+    }
+    match requested {
+        WebFillMechanism::RealKeys => choose(WebFillMechanism::RealKeys, "requested"),
+        WebFillMechanism::NativeSetter => choose(WebFillMechanism::NativeSetter, "requested"),
+        WebFillMechanism::Auto => match pin {
+            Some(pin) if web_do_pin_is_plain_text_input(pin) => choose(
+                WebFillMechanism::NativeSetter,
+                "plain_text_input_react_controlled_fidelity",
+            ),
+            Some(_) => choose(WebFillMechanism::RealKeys, "not_a_plain_text_input"),
+            None => choose(WebFillMechanism::RealKeys, "no_addressed_target"),
+        },
+    }
+}
+
+/// The wire name of a mechanism. One owner, so the response and the CLI flag
+/// can never spell it differently.
+fn web_fill_mechanism_name(mechanism: WebFillMechanism) -> &'static str {
+    match mechanism {
+        WebFillMechanism::Auto => "auto",
+        WebFillMechanism::RealKeys => "real_keys",
+        WebFillMechanism::NativeSetter => "native_setter",
+    }
+}
+
+/// Everything one `fill` did, and the response it owes.
+///
+/// It is a struct with a PURE `detail()` because the response shape IS the fix:
+/// the defect was a `fill` that answered `chars: 19, delivered: true` about a
+/// field holding `Ja`, and no arrangement of the old fields could have said
+/// otherwise. Being pure, the shape is pinned by a test with no webview.
+#[derive(Debug, Clone, PartialEq)]
+struct FillOutcome {
+    typed: u32,
+    cleared_fields: u32,
+    cleared_retried: bool,
+    segmented: bool,
+    cleared_verified: Option<Vec<bool>>,
+    choice: FillMechanismChoice,
+    verification: FillVerification,
+    matched_boxes: Option<Vec<bool>>,
+    /// What was asked for. Reported back only when not redacted.
+    requested: String,
+    reveal: bool,
+    /// The matcher's account of the FIRST target — a `#Name` that matched nine
+    /// nodes is the duplicate-id defect, and silence about it is the same class
+    /// of lie as a stale rect.
+    match_report: Value,
+}
+
+impl FillOutcome {
+    fn detail(&self) -> Value {
+        json!({
+            "verb": "fill",
+            "chars": self.typed,
+            "cleared_fields": self.cleared_fields,
+            // Whether a stubborn box needed the second clear pass.
+            "cleared_retried": self.cleared_retried,
+            "segmented": self.segmented,
+            // Which boxes were verified EMPTY (through the PINNED handles);
+            // `null` when the page could not be read.
+            "cleared_verified": self.cleared_verified,
+            // WHICH mechanism actually ran, and why it was chosen.
+            "mechanism": web_fill_mechanism_name(self.choice.mechanism),
+            "mechanism_reason": self.choice.reason,
+            // THE honest answer: read back from the resolved target itself.
+            // `null` = could not be read, which is not "no".
+            "verified": self.verification.verified,
+            "verify_reason": self.verification.reason,
+            // Enough to name the failure even under redaction.
+            "requested_len": self.verification.requested_len,
+            "held_len": self.verification.held_len,
+            "first_mismatch": self.verification.first_mismatch,
+            // The two strings the diagnosis actually needs — withheld, both of
+            // them, when the caller asked for redaction (F4).
+            "requested": if self.reveal { Value::String(self.requested.clone()) } else { Value::Null },
+            "held": self.verification.held.clone().map(Value::String).unwrap_or(Value::Null),
+            // Wire-compatible ALIAS of `verified` for callers written against
+            // the old field. Same value, one owner — never computed twice.
+            "matched": self.verification.verified,
+            // Names the wrong box instead of a bare false.
+            "matched_boxes": self.matched_boxes,
+            "match": self.match_report.clone(),
+        })
+    }
+}
+
+impl FillVerification {
+    /// The segmented verdict, expressed in the same type as the single-field
+    /// one so the response has ONE verification, not two.
+    fn from_boxes(requested: &str, boxes: Option<&[bool]>) -> Self {
+        let requested_len = requested.chars().count() as u64;
+        match boxes {
+            Some(boxes) if !boxes.is_empty() => {
+                let ok = boxes.iter().all(|b| *b);
+                Self {
+                    verified: Some(ok),
+                    reason: if ok { None } else { Some("value_mismatch") },
+                    held: None,
+                    held_len: None,
+                    requested_len,
+                    first_mismatch: boxes
+                        .iter()
+                        .position(|b| !*b)
+                        .map(|index| index as i64)
+                        .or(Some(-1)),
+                }
+            }
+            _ => Self {
+                verified: None,
+                reason: Some("unreadable"),
+                held: None,
+                held_len: None,
+                requested_len,
+                first_mismatch: None,
+            },
+        }
+    }
 }
 
 /// GDK button number for an app-control pointer button.
@@ -49924,9 +50764,12 @@ fn web_do_observed_event_types(action: &WebSurfaceDoAction) -> &'static [&'stati
         }
         WebSurfaceDoAction::Move { .. } => &["mousemove"],
         WebSurfaceDoAction::Scroll { .. } => &["wheel"],
-        WebSurfaceDoAction::Key { .. }
-        | WebSurfaceDoAction::Type { .. }
-        | WebSurfaceDoAction::Fill { .. } => &["keydown"],
+        WebSurfaceDoAction::Key { .. } | WebSurfaceDoAction::Type { .. } => &["keydown"],
+        // A fill arrives as EITHER real keys or a native value write, and the
+        // recorder must be able to see both — watching `keydown` alone would
+        // read a good native-setter fill as `delivered: false`. `input` is what
+        // both mechanisms produce.
+        WebSurfaceDoAction::Fill { .. } => &["keydown", "input"],
     }
 }
 
@@ -50519,6 +51362,8 @@ async fn web_do_perform(
             text,
             selector,
             selectors,
+            mechanism,
+            redact,
         } => {
             // Which boxes to clear: the segmented set if given, else the single
             // field. Clearing EVERY box matters — a segmented component keeps
@@ -50529,119 +51374,174 @@ async fn web_do_perform(
             } else {
                 selector.iter().cloned().collect()
             };
+            let segmented = !selectors.is_empty();
+            let reveal = !*redact;
+            // ONE matcher run for the whole verb. Everything after this
+            // addresses the HANDLES it produced — clear, clear-verification,
+            // the write, and the readback — so a re-render cannot substitute a
+            // twin between any two steps.
+            let pins = if targets.is_empty() {
+                Vec::new()
+            } else {
+                match web_do_pin_refs(desktop, native_id, &targets).await {
+                    Ok(pins) => pins,
+                    Err(reason) => return Err(reason),
+                }
+            };
             let mut cleared = 0u32;
-            for target in &targets {
-                if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
+            for (index, target) in targets.iter().enumerate() {
+                if let Err(reason) =
+                    web_do_focus_pinned(desktop, native_id, index, &target.describe()).await
+                {
                     return Err(reason);
                 }
-                if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
+                if let Err(reason) =
+                    web_do_clear_focused_field(desktop, native_id, Some(index)).await
+                {
                     return Err(reason);
                 }
                 cleared += 1;
             }
-            // ASSERT the clear (N2). "I sent select-all and Delete" is not
-            // evidence a segmented widget is empty, and typing into a
-            // partially-cleared one is exactly how the observed merge is
+            // ASSERT the clear (N2), against the PINNED handles. "I sent
+            // select-all and Delete" is not evidence a widget is empty, and
+            // typing into a partially-cleared one is how the merge is
             // manufactured. One retry per stubborn box, then REFUSE — an
             // aborted fill is recoverable, a wrong OTP submitted to a bank is
             // not.
-            let cleared_verified = web_do_boxes_are_empty(desktop, native_id, &targets).await;
-            if let Some(flags) = cleared_verified.as_ref() {
-                let stubborn: Vec<usize> = flags
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, empty)| !**empty)
-                    .map(|(index, _)| index)
-                    .collect();
+            let mut states = web_do_pinned_box_states(desktop, native_id, targets.len()).await;
+            let mut cleared_retried = false;
+            if let ClearVerdict::Stubborn(stubborn) = web_do_clear_verdict(states.as_deref()) {
+                cleared_retried = true;
                 for index in &stubborn {
                     let Some(target) = targets.get(*index) else {
                         continue;
                     };
-                    if let Err(reason) = web_do_focus_ref(desktop, native_id, target).await {
+                    if let Err(reason) =
+                        web_do_focus_pinned(desktop, native_id, *index, &target.describe()).await
+                    {
                         return Err(reason);
                     }
-                    if let Err(reason) = web_do_clear_focused_field(desktop, native_id).await {
+                    if let Err(reason) =
+                        web_do_clear_focused_field(desktop, native_id, Some(*index)).await
+                    {
                         return Err(reason);
                     }
                 }
-                if !stubborn.is_empty() {
-                    let after = web_do_boxes_are_empty(desktop, native_id, &targets).await;
-                    let still: Vec<usize> = after
-                        .unwrap_or_default()
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, empty)| !**empty)
-                        .map(|(index, _)| index)
-                        .collect();
-                    if !still.is_empty() {
-                        return Err(format!(
-                                "clear_failed (box(es) {still:?} of {total} still hold text after \
-                                 two clear attempts; typing now would merge old and new)",
-                            total = targets.len()
-                        ));
-                    }
+                states = web_do_pinned_box_states(desktop, native_id, targets.len()).await;
+            }
+            match web_do_clear_verdict(states.as_deref()) {
+                ClearVerdict::Stubborn(still) => {
+                    return Err(format!(
+                        "clear_failed (box(es) {still:?} of {total} still hold text after \
+                         two clear attempts; typing now would merge old and new)",
+                        total = targets.len()
+                    ));
                 }
+                // A node that left the document is NOT a field that refused to
+                // clear. Saying `clear_failed` here is the false negative the
+                // filing agent chased: a batch fill of an EMPTY field aborted,
+                // because the verification had re-queried the selector and
+                // answered about a re-rendered twin.
+                ClearVerdict::NodeReplaced(which) => {
+                    return Err(format!(
+                        "node_replaced (box(es) {which:?} of {total} were re-rendered away while \
+                         clearing; the fill was NOT attempted)",
+                        total = targets.len()
+                    ));
+                }
+                ClearVerdict::Empty | ClearVerdict::Unknown => {}
             }
-            // Type into the FIRST box; a segmented component auto-advances focus
-            // itself, and driving that is the point of using real keys.
-            if let Some(first) = targets.first()
-                && let Err(reason) = web_do_focus_ref(desktop, native_id, first).await
-            {
-                return Err(reason);
-            }
+            let cleared_verified: Option<Vec<bool>> = states.as_ref().map(|states| {
+                states
+                    .iter()
+                    .map(|s| s.present && s.connected && s.len == 0)
+                    .collect()
+            });
+            let choice = web_do_fill_mechanism(*mechanism, *redact, segmented, pins.first());
             let mut typed = 0u32;
             let mut error: Option<String> = None;
-            for c in text.chars() {
-                let keyval = web_do_char_to_keyval(c);
-                if let Err(reason) = desktop
-                    .inject_web_surface_key(native_id, true, keyval, 0)
-                    .and(desktop.inject_web_surface_key(native_id, false, keyval, 0))
-                {
-                    error = Some(reason);
-                    break;
+            match choice.mechanism {
+                WebFillMechanism::NativeSetter => {
+                    match web_do_eval(desktop, native_id, &web_do_native_setter_script(text)).await
+                    {
+                        Ok(out) if out.get("ok").and_then(Value::as_bool).unwrap_or(false) => {
+                            typed = text.chars().count() as u32;
+                        }
+                        Ok(out) => {
+                            error = Some(format!(
+                                "native_setter_failed ({})",
+                                out.get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                            ));
+                        }
+                        Err(reason) => error = Some(reason),
+                    }
                 }
-                typed += 1;
+                // Real keys. Type into the FIRST box; a segmented component
+                // auto-advances focus itself, and driving that is the point.
+                WebFillMechanism::RealKeys | WebFillMechanism::Auto => {
+                    if let Some(target) = targets.first()
+                        && let Err(reason) =
+                            web_do_focus_pinned(desktop, native_id, 0, &target.describe()).await
+                    {
+                        return Err(reason);
+                    }
+                    for c in text.chars() {
+                        let keyval = web_do_char_to_keyval(c);
+                        if let Err(reason) = desktop
+                            .inject_web_surface_key(native_id, true, keyval, 0)
+                            .and(desktop.inject_web_surface_key(native_id, false, keyval, 0))
+                        {
+                            error = Some(reason);
+                            break;
+                        }
+                        typed += 1;
+                    }
+                }
             }
             match error {
                 Some(reason) => Err(reason),
                 None => {
-                    // Read the value back. The whole reason this verb exists is
-                    // that a field can report success and still hold the wrong
-                    // string, so "I sent the keys" is not an answer — `matched`
-                    // is. Compared by LENGTH and equality page-side so the
-                    // secret never crosses back out (F4 redaction).
-                    // Segmented inputs are read back PER BOX. The old
+                    // READ IT BACK, always, through the SAME handle that was
+                    // written. "I sent the keys" is not an answer and neither is
+                    // "the page saw a keydown" — the field's own final value is.
+                    // Segmented inputs are read back PER BOX, because the old
                     // single-selector comparison held the whole expected string
                     // against one box and so could never express the merge it
                     // existed to catch (N2).
-                    let matched_boxes = if selectors.is_empty() {
-                        None
+                    let matched_boxes = if segmented {
+                        web_do_verify_segmented_value(desktop, native_id, &targets, text).await
                     } else {
-                        web_do_verify_segmented_value(desktop, native_id, &targets, &text).await
+                        None
                     };
-                    let matched = match matched_boxes.as_ref() {
-                        Some(boxes) => Some(boxes.iter().all(|ok| *ok) && !boxes.is_empty()),
-                        None if selectors.is_empty() => {
-                            web_do_verify_field_value(desktop, native_id, targets.first(), &text)
-                                .await
-                        }
-                        // Segmented, but the boxes could not be read: unknown,
-                        // which is not the same as "no".
-                        None => None,
+                    let verification = if segmented {
+                        FillVerification::from_boxes(text, matched_boxes.as_deref())
+                    } else {
+                        let info = web_do_verify_field_value(
+                            desktop,
+                            native_id,
+                            !targets.is_empty(),
+                            text,
+                            reveal,
+                        )
+                        .await;
+                        web_do_fill_verification(text, reveal, info.as_ref())
                     };
-                    Ok(json!({
-                        "verb": "fill",
-                        "chars": typed,
-                        "cleared_fields": cleared,
-                        "segmented": !selectors.is_empty(),
-                        // Which boxes were verified EMPTY before typing; `null`
-                        // when the page could not be read.
-                        "cleared_verified": cleared_verified,
-                        // `null` = could not be read back (not a failure claim).
-                        "matched": matched,
-                        // Names the wrong box instead of a bare false.
-                        "matched_boxes": matched_boxes,
-                    }))
+                    Ok(FillOutcome {
+                        typed,
+                        cleared_fields: cleared,
+                        cleared_retried,
+                        segmented,
+                        cleared_verified,
+                        choice,
+                        verification,
+                        matched_boxes,
+                        requested: text.clone(),
+                        reveal,
+                        match_report: web_do_match_report(pins.first().and_then(|pin| pin.diag)),
+                    }
+                    .detail())
                 }
             }
         }
@@ -51130,6 +52030,9 @@ mod web_do_verb_tests {
     fn resolved_info(overrides: Value) -> Value {
         let mut base = json!({
             "found": true,
+            // Phase B's own token. Every payload the injector may act on has
+            // it, because phase A is structurally incapable of producing one.
+            "phase": "post_scroll",
             "x": 120.0,
             "y": 240.0,
             "w": 80.0,
@@ -51217,12 +52120,19 @@ mod web_do_verb_tests {
             WebElementRef::Css("#a".into()),
             WebElementRef::Css("#b".into()),
         ];
-        let js = web_do_refs_array_js(&targets);
-        assert_eq!(
-            js,
-            "[document.querySelector(\"#a\"),document.querySelector(\"#b\")]"
+        // The PIN pass is where the shared matcher runs, once per box, in
+        // order — and it is the only place it runs for this verb.
+        let pin = web_do_pin_refs_script(&targets);
+        assert!(pin.contains("querySelectorAll(\"#a\")"), "{pin}");
+        assert!(pin.contains("querySelectorAll(\"#b\")"), "{pin}");
+        assert_eq!(pin.matches("refs.push(").count(), 2, "{pin}");
+        // …and every later step reads the HANDLES that pass produced.
+        let readback = web_do_segmented_readback_script("29", targets.len());
+        assert!(readback.contains(WEB_DO_PIN_KEY), "{readback}");
+        assert!(
+            !readback.contains("querySelector"),
+            "the readback must not re-run the matcher: {readback}"
         );
-        assert!(web_do_refs_array_js(&[]).is_empty() || web_do_refs_array_js(&[]) == "[]");
     }
 
     // THE BATCH LOCK, gate half. Twenty sequential verbs under the ONE agent
@@ -52256,13 +53166,18 @@ mod web_do_verb_tests {
         );
     }
 
-    // C4: every addressing shape must produce a matcher, and the CSS shape must
-    // still be the plain `querySelector` it always was — the two new shapes are
-    // additions to ONE matcher, not a second resolution path.
+    // C4: every addressing shape must produce a matcher, and the CSS shape is
+    // an indexed `querySelectorAll` — the shapes are additions to ONE matcher,
+    // not a second resolution path. (`querySelector` was the pre-2026-07-26
+    // form; it could not count its matches, which is the duplicate-id defect.)
     #[test]
     fn every_addressing_shape_compiles_to_one_matcher() {
         let css = web_element_ref_js(&WebElementRef::Css("#login".into()));
-        assert_eq!(css, "document.querySelector(\"#login\")");
+        assert!(
+            css.contains("document.querySelectorAll(\"#login\")"),
+            "{css}"
+        );
+        assert!(css.contains("els[0]"), "{css}");
 
         let by_text = web_element_ref_js(&WebElementRef::Text {
             text: "Proceed to Pay".into(),
@@ -52312,12 +53227,27 @@ mod web_do_verb_tests {
     // failure that reads as "the site refused us".
     #[test]
     fn script_composition_leaves_no_placeholders() {
-        let script = web_do_script_for_ref(WEB_DO_RESOLVE_JS, &WebElementRef::Css("#a".into()));
+        let script = web_do_script_common(WEB_DO_RESOLVE_PINNED_JS);
         assert!(!script.contains("__YGG_REF__"), "{script}");
         assert!(!script.contains("__YGG_PATH_FN__"), "{script}");
+        assert!(!script.contains("__YGG_PIN_KEY__"), "{script}");
         assert!(script.contains("__yggPath"), "{script}");
-        let focus = web_do_script_for_ref(WEB_DO_FOCUS_JS, &WebElementRef::Css("#a".into()));
-        assert!(!focus.contains("__YGG_REF__"), "{focus}");
+        let scroll = web_do_script_for_ref(WEB_DO_SCROLL_PIN_JS, &WebElementRef::Css("#a".into()));
+        assert!(!scroll.contains("__YGG_REF__"), "{scroll}");
+        assert!(!scroll.contains("__YGG_PIN_KEY__"), "{scroll}");
+        assert!(!scroll.contains("__YGG_MATCH_KEY__"), "{scroll}");
+        let focus = web_do_script_for_pin(WEB_DO_FOCUS_PINNED_JS, 0);
+        assert!(!focus.contains("__YGG_PIN_INDEX__"), "{focus}");
+        assert!(!focus.contains("__YGG_PIN_KEY__"), "{focus}");
+        // The role matcher composes the staleness vocabulary; a leftover
+        // placeholder there would be a syntax error in the page.
+        let role = web_element_ref_js(&WebElementRef::Role {
+            role: "option".into(),
+            label: "PASSPORT".into(),
+            nth: None,
+        });
+        assert!(!role.contains("__YGG_LIVE_FN__"), "{role}");
+        assert!(!role.contains("__YGG_MATCH_KEY__"), "{role}");
     }
 
     // N3: `accepted` (the injector ran), `resolved.*` (what the DOM said) and
@@ -52332,7 +53262,7 @@ mod web_do_verb_tests {
             tag: None,
             nth: None,
         };
-        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})))
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})), None)
             .expect("a live, visible, on-target node resolves");
         let detail = web_do_resolved_detail("click_selector", &target, &resolved);
 
@@ -52355,7 +53285,7 @@ mod web_do_verb_tests {
     #[test]
     fn a_css_target_still_reports_as_a_bare_string() {
         let target = WebElementRef::Css("#submit".into());
-        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({}))).unwrap();
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})), None).unwrap();
         let detail = web_do_resolved_detail("click_selector", &target, &resolved);
         assert_eq!(detail["selector"], json!("#submit"));
     }
@@ -52366,21 +53296,605 @@ mod web_do_verb_tests {
     #[test]
     fn a_detached_node_is_refused_rather_than_clicked() {
         let target = WebElementRef::Css("#otp".into());
-        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"isConnected": false})))
-            .expect_err("a detached node must refuse");
+        let err =
+            web_do_resolved_from_info(&target, &resolved_info(json!({"isConnected": false})), None)
+                .expect_err("a detached node must refuse");
         assert!(err.starts_with("detached_node"), "{err}");
 
-        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"visible": false})))
-            .expect_err("a zero-size element must refuse");
+        let err =
+            web_do_resolved_from_info(&target, &resolved_info(json!({"visible": false})), None)
+                .expect_err("a zero-size element must refuse");
         assert!(err.contains("zero-size"), "{err}");
 
-        let err = web_do_resolved_from_info(&target, &resolved_info(json!({"onTarget": false})))
-            .expect_err("an occluded/moved target must refuse");
+        let err =
+            web_do_resolved_from_info(&target, &resolved_info(json!({"onTarget": false})), None)
+                .expect_err("an occluded/moved target must refuse");
         assert!(err.starts_with("target_moved"), "{err}");
 
-        let err = web_do_resolved_from_info(&target, &json!({"found": false}))
+        let err = web_do_resolved_from_info(&target, &json!({"found": false, "phase": "post_scroll"}), None)
             .expect_err("no match must refuse");
         assert!(err.contains("no element matches css:#otp"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // THE `web do` FIDELITY FAMILY (a services portal filing run, 2026-07-26).
+    // Five defects, one shape: the verb resolved or verified against DOM
+    // state that had moved, and its self-report could not go red.
+    // ------------------------------------------------------------------
+
+    fn readback_info(overrides: Value) -> Value {
+        let mut base = json!({"known": true, "connected": true, "same": true,
+                              "len": 0, "firstMismatch": -1});
+        let (Some(base_obj), Some(over)) = (base.as_object_mut(), overrides.as_object()) else {
+            return base;
+        };
+        for (key, value) in over {
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base
+    }
+
+    fn fill_outcome(verification: FillVerification, reveal: bool) -> FillOutcome {
+        FillOutcome {
+            typed: 19,
+            cleared_fields: 1,
+            cleared_retried: false,
+            segmented: false,
+            cleared_verified: Some(vec![true]),
+            choice: FillMechanismChoice {
+                mechanism: WebFillMechanism::NativeSetter,
+                reason: "plain_text_input_react_controlled_fidelity",
+            },
+            verification,
+            matched_boxes: None,
+            requested: "Example Fixture Road".to_string(),
+            reveal,
+            match_report: web_do_match_report(Some(MatchDiag {
+                matches: 1,
+                nth: 0,
+                hidden: 0,
+            })),
+        }
+    }
+
+    // DEFECT 1, THE LOCK. The measured response: `chars: 19, delivered: true,
+    // is_trusted: true, cleared_verified: [true]` — and the field held **"Ja"**.
+    // Every field in that response was TRUE about something, and none of them
+    // was about the field's value, so nothing could contradict the success.
+    //
+    // The rule below is fed that literal case. It must call it a failure AND
+    // name both strings, and `delivered: true` painted on afterwards must not
+    // launder it — that co-existence IS the fix: the page really did see the
+    // keystrokes, and the field really does hold the wrong thing.
+    #[test]
+    fn a_fill_that_dropped_characters_reads_back_as_verified_false() {
+        let verification = web_do_fill_verification(
+            "Example Fixture Road",
+            true,
+            Some(&readback_info(
+                json!({"same": false, "len": 2, "firstMismatch": 2, "held": "Ja"}),
+            )),
+        );
+        assert_eq!(verification.verified, Some(false));
+        assert_eq!(verification.reason, Some("value_mismatch"));
+        assert_eq!(verification.held.as_deref(), Some("Ja"));
+        assert_eq!(verification.requested_len, 19);
+        assert_eq!(verification.held_len, Some(2));
+        assert_eq!(verification.first_mismatch, Some(2));
+
+        let mut detail = fill_outcome(verification, true).detail();
+        // The verb reported nineteen characters sent. That stays true and stays
+        // useless on its own.
+        assert_eq!(detail["chars"], json!(19));
+        assert_eq!(detail["verified"], json!(false));
+        assert_eq!(detail["verify_reason"], json!("value_mismatch"));
+        assert_eq!(detail["requested"], json!("Example Fixture Road"));
+        assert_eq!(detail["held"], json!("Ja"));
+        // The legacy field is an ALIAS, never a second opinion.
+        assert_eq!(detail["matched"], detail["verified"]);
+
+        web_do_apply_delivery(&mut detail, WebDoDelivery::Delivered { trusted: true });
+        assert_eq!(detail["delivered"], json!(true));
+        assert_eq!(detail["is_trusted"], json!(true));
+        assert_eq!(
+            detail["verified"],
+            json!(false),
+            "a delivered, trusted keystroke stream must not be able to overwrite the readback"
+        );
+    }
+
+    // The unknowns stay unknown. A node that left the document, a handle that
+    // is gone, and an unreadable page are three different answers and NONE of
+    // them is `verified: false` — claiming a mismatch we did not observe would
+    // send the caller after the wrong bug, exactly as `clear_failed` did.
+    #[test]
+    fn a_fill_readback_separates_unknown_from_wrong() {
+        for (info, want) in [
+            (
+                readback_info(json!({"connected": false, "same": false})),
+                "node_replaced",
+            ),
+            (
+                json!({"known": false, "reason": "handle_lost"}),
+                "handle_lost",
+            ),
+            (json!({"known": false}), "unreadable"),
+        ] {
+            let verification = web_do_fill_verification("abc", true, Some(&info));
+            assert_eq!(verification.verified, None, "{info}");
+            assert_eq!(verification.reason, Some(want), "{info}");
+        }
+        assert_eq!(
+            web_do_fill_verification("abc", true, None).reason,
+            Some("unreadable")
+        );
+    }
+
+    // F4 survives the new honesty: a redacted fill still NAMES the failure —
+    // lengths and the first differing index — without either string appearing.
+    #[test]
+    fn a_redacted_fill_names_the_failure_without_quoting_a_value() {
+        let verification = web_do_fill_verification(
+            "292244",
+            false,
+            Some(&readback_info(
+                json!({"same": false, "len": 6, "firstMismatch": 1, "held": "278344"}),
+            )),
+        );
+        assert_eq!(verification.verified, Some(false));
+        assert_eq!(verification.held, None, "the page value must not cross out");
+        let detail = fill_outcome(verification, false).detail();
+        assert_eq!(detail["held"], Value::Null);
+        assert_eq!(detail["requested"], Value::Null);
+        // Still fully diagnosable.
+        assert_eq!(detail["requested_len"], json!(6));
+        assert_eq!(detail["held_len"], json!(6));
+        assert_eq!(detail["first_mismatch"], json!(1));
+        let rendered = serde_json::to_string(&detail).unwrap();
+        assert!(!rendered.contains("278344"), "{rendered}");
+        assert!(!rendered.contains("292244"), "{rendered}");
+    }
+
+    // DEFECT 2, THE LOCK. A batch fill of an EMPTY `#Landmark` aborted with
+    // `clear_failed (box(es) [0] of 1 still hold text)`. The field was empty;
+    // the verification had re-queried the selector and answered about a
+    // re-rendered twin.
+    //
+    // Fed the pinned handles' state, the rule cannot produce that: a handle
+    // that is no longer connected is `NodeReplaced` — its own diagnosis with
+    // its own remedy — and only a live handle that still holds characters can
+    // ever be `Stubborn`.
+    #[test]
+    fn a_re_rendered_field_is_node_replaced_not_clear_failed() {
+        let empty = [ClearBoxState {
+            present: true,
+            connected: true,
+            len: 0,
+        }];
+        assert_eq!(web_do_clear_verdict(Some(&empty)), ClearVerdict::Empty);
+
+        let replaced = [ClearBoxState {
+            present: true,
+            connected: false,
+            len: 0,
+        }];
+        assert_eq!(
+            web_do_clear_verdict(Some(&replaced)),
+            ClearVerdict::NodeReplaced(vec![0]),
+            "a node that left the document is not a field that refused to clear"
+        );
+
+        let gone = [ClearBoxState {
+            present: false,
+            connected: false,
+            len: 0,
+        }];
+        assert_eq!(
+            web_do_clear_verdict(Some(&gone)),
+            ClearVerdict::NodeReplaced(vec![0])
+        );
+
+        // The REAL clear failure is still a clear failure, and still names the
+        // boxes: a live handle holding characters.
+        let stubborn = [
+            ClearBoxState {
+                present: true,
+                connected: true,
+                len: 0,
+            },
+            ClearBoxState {
+                present: true,
+                connected: true,
+                len: 3,
+            },
+        ];
+        assert_eq!(
+            web_do_clear_verdict(Some(&stubborn)),
+            ClearVerdict::Stubborn(vec![1])
+        );
+        assert_eq!(web_do_clear_verdict(None), ClearVerdict::Unknown);
+        assert_eq!(web_do_clear_verdict(Some(&[])), ClearVerdict::Empty);
+    }
+
+    // …and the WIRING half: the scripts that answer those questions address the
+    // pin registry, never `document.activeElement` and never a fresh matcher
+    // run. Both of those are the defect, stated as code.
+    #[test]
+    fn clear_and_readback_scripts_address_the_pinned_handle() {
+        let clear = web_do_pinned_box_states_script(1);
+        assert!(clear.contains(WEB_DO_PIN_KEY), "{clear}");
+        assert!(!clear.contains("activeElement"), "{clear}");
+        assert!(!clear.contains("querySelector"), "{clear}");
+        // It reports CONNECTEDNESS, which is what makes `node_replaced`
+        // expressible at all.
+        assert!(clear.contains("isConnected"), "{clear}");
+
+        let readback = web_do_field_readback_script(true, "abc", true);
+        assert!(readback.contains(WEB_DO_PIN_KEY), "{readback}");
+        assert!(!readback.contains("activeElement"), "{readback}");
+        assert!(!readback.contains("querySelector"), "{readback}");
+        // Only a fill with NO addressed target may read ambient focus.
+        let ambient = web_do_field_readback_script(false, "abc", true);
+        assert!(ambient.contains("document.activeElement"), "{ambient}");
+        // Redaction is a script-level decision, not a post-filter.
+        let redacted = web_do_field_readback_script(true, "abc", false);
+        assert!(redacted.contains("reveal=false"), "{redacted}");
+    }
+
+    // DEFECT 3, THE LOCK. `do click --role option --label PASSPORT` in a
+    // scrolled MUI listbox came back `accepted: true, delivered: true,
+    // is_trusted: true` and nothing happened: the rect was measured in the same
+    // tick as the `scrollIntoView` that moved the node.
+    //
+    // Only phase B stamps `post_scroll`, so a rect that did not survive a
+    // re-measure cannot reach the injector — the resolver refuses it.
+    #[test]
+    fn a_rect_measured_before_the_scroll_is_refused() {
+        let target = WebElementRef::Role {
+            role: "option".into(),
+            label: "PASSPORT".into(),
+            nth: None,
+        };
+        let mut pre_scroll = resolved_info(json!({}));
+        pre_scroll.as_object_mut().unwrap().remove("phase");
+        let err = web_do_resolved_from_info(&target, &pre_scroll, None)
+            .expect_err("a pre-scroll rect must refuse");
+        assert!(err.starts_with("rect_not_reresolved"), "{err}");
+        assert!(err.contains("role:option[PASSPORT]"), "{err}");
+
+        // Re-measured, it resolves — and the response SAYS which measurement it
+        // is, so a caller can tell the two apart.
+        let resolved = web_do_resolved_from_info(&target, &resolved_info(json!({})), None)
+            .expect("a post-scroll rect resolves");
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+        assert_eq!(detail["resolved"]["rect_phase"], json!("post_scroll"));
+
+        // The handle vanishing between the phases is its own answer.
+        let lost = json!({"found": false, "phase": "post_scroll", "handle": "lost"});
+        let err = web_do_resolved_from_info(&target, &lost, None).expect_err("a lost pin refuses");
+        assert!(err.starts_with("handle_lost"), "{err}");
+    }
+
+    // The two-phase split, as WIRING. Phase A scrolls and pins and reports no
+    // geometry; phase B measures the pin, does not scroll, and does not re-run
+    // the matcher. Collapsing them back into one script is the defect.
+    #[test]
+    fn resolution_is_two_phases_and_only_the_second_measures() {
+        let scroll = web_do_script_for_ref(WEB_DO_SCROLL_PIN_JS, &WebElementRef::Css("#a".into()));
+        assert!(scroll.contains("scrollIntoView"), "{scroll}");
+        assert!(
+            scroll.contains(&format!("window.{WEB_DO_PIN_KEY}=[el]")),
+            "phase A must PIN what it scrolled to: {scroll}"
+        );
+        assert!(
+            !scroll.contains("getBoundingClientRect"),
+            "phase A must not measure — any rect it took would be pre-scroll: {scroll}"
+        );
+
+        let measure = web_do_script_common(WEB_DO_RESOLVE_PINNED_JS);
+        assert!(measure.contains("getBoundingClientRect"), "{measure}");
+        assert!(measure.contains("phase:'post_scroll'"), "{measure}");
+        assert!(measure.contains(WEB_DO_PIN_KEY), "{measure}");
+        assert!(
+            !measure.contains("scrollIntoView"),
+            "phase B must not scroll — it would invalidate its own measurement: {measure}"
+        );
+        assert!(
+            !measure.contains("querySelector"),
+            "phase B must read the pin, not re-run the matcher: {measure}"
+        );
+        // And the settle beat is real, not zero.
+        assert!(WEB_DO_SCROLL_SETTLE >= Duration::from_millis(50));
+    }
+
+    // DEFECT 4, THE LOCK. a services portal renders the complainant block and the
+    // opposite-party block with the SAME ids, so `#Name` is ambiguous.
+    // `querySelector` answered with the first one silently and the agent filled
+    // the wrong block twice.
+    #[test]
+    fn a_css_target_counts_its_matches_and_can_take_the_nth() {
+        let first = web_element_ref_js(&WebElementRef::Css("#Name".into()));
+        assert!(
+            first.contains("querySelectorAll(\"#Name\")"),
+            "counting requires querySelectorAll: {first}"
+        );
+        assert!(first.contains("els[0]"), "{first}");
+        assert!(
+            first.contains(&format!("window.{WEB_DO_MATCH_KEY}")),
+            "{first}"
+        );
+
+        // `--nth 1` reaches the second block. `Css(s)` IS `CssNth{s,0}`: same
+        // matcher, same description.
+        let second = web_element_ref_js(&WebElementRef::CssNth {
+            css: "#Name".into(),
+            nth: 1,
+        });
+        assert!(second.contains("els[1]"), "{second}");
+        assert_eq!(
+            web_element_ref_js(&WebElementRef::CssNth {
+                css: "#Name".into(),
+                nth: 0
+            }),
+            first,
+            "nth 0 must compile to exactly the bare form"
+        );
+        assert_eq!(
+            WebElementRef::CssNth {
+                css: "#Name".into(),
+                nth: 0
+            }
+            .describe(),
+            WebElementRef::Css("#Name".into()).describe()
+        );
+
+        // And the ambiguity is REPORTED, on success, not just on failure.
+        let report = web_do_match_report(Some(MatchDiag {
+            matches: 9,
+            nth: 0,
+            hidden: 0,
+        }));
+        assert_eq!(report["matches"], json!(9));
+        assert_eq!(report["ambiguous"], json!(true));
+        assert_eq!(
+            web_do_match_report(Some(MatchDiag {
+                matches: 1,
+                nth: 0,
+                hidden: 0
+            }))["ambiguous"],
+            json!(false)
+        );
+        let target = WebElementRef::Css("#Name".into());
+        let resolved = web_do_resolved_from_info(
+            &target,
+            &resolved_info(json!({})),
+            Some(MatchDiag {
+                matches: 9,
+                nth: 0,
+                hidden: 0,
+            }),
+        )
+        .unwrap();
+        let detail = web_do_resolved_detail("click_selector", &target, &resolved);
+        assert_eq!(detail["match"]["matches"], json!(9));
+        assert_eq!(detail["match"]["ambiguous"], json!(true));
+    }
+
+    // DEFECT 5, THE LOCK. After a failed pick MUI leaves the OLD popper
+    // mounted, so `li[role=option]` keeps matching the dead list. A pick that
+    // finds ONLY stale options must refuse with its own reason — clicking one
+    // is the silent no-op, and `no element matches` would send the caller after
+    // the selector instead of the popper.
+    #[test]
+    fn an_option_pick_that_finds_only_a_dead_popper_refuses() {
+        let target = WebElementRef::Role {
+            role: "option".into(),
+            label: "PASSPORT".into(),
+            nth: None,
+        };
+        let stale = web_do_match_refusal(
+            &target,
+            Some(MatchDiag {
+                matches: 0,
+                nth: 0,
+                hidden: 7,
+            }),
+        );
+        assert!(stale.starts_with("stale_listbox_only"), "{stale}");
+        assert!(stale.contains("7"), "{stale}");
+
+        // Genuinely absent is still genuinely absent.
+        let absent = web_do_match_refusal(
+            &target,
+            Some(MatchDiag {
+                matches: 0,
+                nth: 0,
+                hidden: 0,
+            }),
+        );
+        assert!(absent.starts_with("no element matches"), "{absent}");
+        assert!(
+            web_do_match_refusal(&target, None).starts_with("no element matches"),
+            "an unreported match must not be guessed at"
+        );
+
+        // The pin pass routes through the SAME refusal owner.
+        let err = web_do_pins_from_info(
+            std::slice::from_ref(&target),
+            &json!({"els": [{"found": false, "match": {"n": 0, "nth": 0, "hidden": 3}}]}),
+        )
+        .expect_err("only-stale must refuse");
+        assert!(err.starts_with("stale_listbox_only"), "{err}");
+    }
+
+    // …and the matcher WIRING that makes it possible: an option pool is
+    // filtered for liveness and scoped to the listbox that is actually OPEN,
+    // rather than answered from document order.
+    #[test]
+    fn the_option_matcher_scopes_to_the_open_listbox() {
+        let role = web_element_ref_js(&WebElementRef::Role {
+            role: "option".into(),
+            label: "PASSPORT".into(),
+            nth: None,
+        });
+        assert!(role.contains("__yggLive"), "{role}");
+        assert!(role.contains("__yggOpenListbox"), "{role}");
+        assert!(role.contains("aria-expanded=true"), "{role}");
+        assert!(role.contains("aria-hidden"), "{role}");
+        assert!(
+            role.contains("hidden:dead"),
+            "the drop count must be reported or `stale_listbox_only` cannot exist: {role}"
+        );
+        assert!(
+            !role.contains("return pool[nth]||null"),
+            "answering straight out of the unfiltered pool is the defect: {role}"
+        );
+    }
+
+    // DEFECT 1's other half: WHICH mechanism runs. Per-key GTK injection is
+    // what React's re-render throws away, so a plain text input gets the native
+    // setter — but a segmented widget and a secret both override that, in that
+    // order, and the response always says which one ran.
+    #[test]
+    fn the_fill_mechanism_rule_picks_the_native_setter_only_where_it_belongs() {
+        let input = |ty: &str| PinnedElement {
+            tag: Some("INPUT".into()),
+            input_type: Some(ty.into()),
+            content_editable: false,
+            diag: None,
+        };
+        let auto = WebFillMechanism::Auto;
+
+        // The measured case: a plain text field on a React form.
+        let choice = web_do_fill_mechanism(auto, false, false, Some(&input("text")));
+        assert_eq!(choice.mechanism, WebFillMechanism::NativeSetter);
+        assert_eq!(choice.reason, "plain_text_input_react_controlled_fidelity");
+        assert_eq!(
+            web_do_fill_mechanism(
+                auto,
+                false,
+                false,
+                Some(&PinnedElement {
+                    tag: Some("TEXTAREA".into()),
+                    input_type: None,
+                    ..input("text")
+                })
+            )
+            .mechanism,
+            WebFillMechanism::NativeSetter
+        );
+
+        // Not a text box: keep the conservative path.
+        for ty in ["checkbox", "radio", "file", "date"] {
+            assert_eq!(
+                web_do_fill_mechanism(auto, false, false, Some(&input(ty))).mechanism,
+                WebFillMechanism::RealKeys,
+                "type={ty}"
+            );
+        }
+        assert_eq!(
+            web_do_fill_mechanism(
+                auto,
+                false,
+                false,
+                Some(&PinnedElement {
+                    tag: Some("DIV".into()),
+                    input_type: None,
+                    content_editable: true,
+                    ..input("text")
+                })
+            )
+            .mechanism,
+            WebFillMechanism::RealKeys
+        );
+        assert_eq!(
+            web_do_fill_mechanism(auto, false, false, None).reason,
+            "no_addressed_target"
+        );
+
+        // A segmented widget overrides an explicit native-setter request: its
+        // focus auto-advance IS the mechanism.
+        let segmented = web_do_fill_mechanism(
+            WebFillMechanism::NativeSetter,
+            false,
+            true,
+            Some(&input("text")),
+        );
+        assert_eq!(segmented.mechanism, WebFillMechanism::RealKeys);
+        assert_eq!(segmented.reason, "segmented_widget_needs_real_keys");
+
+        // …and so does a SECRET, because the native setter would put the value
+        // inside an eval script string. This ordering is F4, not a preference.
+        let secret = web_do_fill_mechanism(
+            WebFillMechanism::NativeSetter,
+            true,
+            false,
+            Some(&input("password")),
+        );
+        assert_eq!(secret.mechanism, WebFillMechanism::RealKeys);
+        assert_eq!(secret.reason, "secret_never_enters_an_eval_script");
+
+        // An explicit request otherwise wins, and is reported as such.
+        assert_eq!(
+            web_do_fill_mechanism(
+                WebFillMechanism::RealKeys,
+                false,
+                false,
+                Some(&input("text"))
+            ),
+            FillMechanismChoice {
+                mechanism: WebFillMechanism::RealKeys,
+                reason: "requested",
+            }
+        );
+        // The response names it with the SAME spelling the CLI flag uses.
+        assert_eq!(
+            web_fill_mechanism_name(WebFillMechanism::NativeSetter),
+            "native_setter"
+        );
+    }
+
+    // The native-setter path must go through the PROTOTYPE descriptor and fire
+    // a bubbling `input` — assigning `el.value` directly is what a React
+    // controlled input silently discards on its next render.
+    #[test]
+    fn the_native_setter_script_writes_through_the_prototype_descriptor() {
+        let script = web_do_native_setter_script("Example Fixture Road");
+        assert!(script.contains("getOwnPropertyDescriptor"), "{script}");
+        assert!(script.contains("HTMLInputElement.prototype"), "{script}");
+        assert!(script.contains("HTMLTextAreaElement.prototype"), "{script}");
+        assert!(script.contains("d.set.call(el,v)"), "{script}");
+        assert!(
+            script.contains("new Event('input',{bubbles:true})"),
+            "{script}"
+        );
+        assert!(
+            script.contains("new Event('change',{bubbles:true})"),
+            "{script}"
+        );
+        assert!(script.contains("el.blur()"), "{script}");
+        // It writes to the PIN, and refuses a node that left the document
+        // rather than writing into a corpse.
+        assert!(script.contains(WEB_DO_PIN_KEY), "{script}");
+        assert!(script.contains("node_replaced"), "{script}");
+        assert!(!script.contains("querySelector"), "{script}");
+    }
+
+    // A fill has to be observable whichever mechanism ran. The recorder used to
+    // watch `keydown` alone, which would have read a perfectly good
+    // native-setter fill as `delivered: false` — a NEW dishonesty in place of
+    // the old one.
+    #[test]
+    fn a_fill_is_observed_through_both_mechanisms() {
+        let types = web_do_observed_event_types(&WebSurfaceDoAction::Fill {
+            text: "x".to_string(),
+            selector: None,
+            selectors: Vec::new(),
+            mechanism: WebFillMechanism::Auto,
+            redact: false,
+        });
+        assert!(types.contains(&"keydown"), "{types:?}");
+        assert!(types.contains(&"input"), "{types:?}");
     }
 
     // Delivery is an OBSERVATION with three honest answers. A dropped event
@@ -54868,6 +56382,11 @@ async fn web_surface_fill_vault_for(
         text: secret,
         selector: Some(target.clone()),
         selectors: Vec::new(),
+        // Real keys, explicitly: the native setter would put the secret inside
+        // an eval script string, and this path's whole contract is that the
+        // value exists as keystrokes and nowhere else.
+        mechanism: WebFillMechanism::RealKeys,
+        redact: true,
     };
     let (result, delivery) = web_do_execute_one(desktop, native_id, &action).await;
     // The trace carries NAMES and a length. Never the value, never the page's
