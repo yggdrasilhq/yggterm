@@ -147,6 +147,14 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default(),
+        // Which PROCESS spent this time. `append_trace_event` has always carried
+        // one; the perf stream did not, and that omission is why "the daemon
+        // background chore ran 13,316 times" could not be split across the three
+        // daemons sharing this home — attributing DAEMON-1 and DAEMON-2 needed a
+        // live `/proc/<pid>/task/<tid>/io` walk that only works while the process
+        // is still alive (2026-07-26). Several writers append to one file; a
+        // record that cannot name its writer cannot be attributed at all.
+        "pid": std::process::id(),
         "category": category,
         "name": name,
         "payload": payload,
@@ -279,6 +287,14 @@ pub struct PerfSpanSummary {
     pub max_ms: f64,
     pub mean_ms: f64,
     pub total_ms: f64,
+    /// Every process that contributed to this row, ascending. Three daemons and
+    /// a GUI append to ONE `perf-telemetry.jsonl` per home, so without this a
+    /// row like `daemon/background_copy_chore count=13,316` cannot be split
+    /// across them — the attribution that named DAEMON-1 and DAEMON-2 had to
+    /// come from a live `/proc` walk instead, which only works while the
+    /// processes are still alive. Empty for rows written before
+    /// [`append_perf_event`] started stamping `pid` (2026-07-26).
+    pub pids: Vec<u32>,
 }
 
 impl PerfSpanSummary {
@@ -311,43 +327,32 @@ pub fn summarize_perf_telemetry(
     category_filter: Option<&str>,
 ) -> Vec<PerfSpanSummary> {
     let mut durations: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
-    for path in crate::retention::jsonl_read_paths(&perf_telemetry_path(home)) {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let Some(since) = since_ms
-                && event.get("ts_ms").and_then(Value::as_u64).unwrap_or(0) < since
-            {
-                continue;
-            }
-            let category = event.get("category").and_then(Value::as_str).unwrap_or("");
-            if let Some(filter) = category_filter
-                && category != filter
-            {
-                continue;
-            }
-            let name = event.get("name").and_then(Value::as_str).unwrap_or("");
-            let Some(duration) = event
-                .get("payload")
-                .and_then(|payload| payload.get("duration_ms"))
-                .and_then(Value::as_f64)
-            else {
-                continue;
-            };
-            durations
-                .entry((category.to_string(), name.to_string()))
-                .or_default()
-                .push(duration);
+    let mut pids: BTreeMap<(String, String), std::collections::BTreeSet<u32>> = BTreeMap::new();
+    crate::retention::for_each_jsonl_record_since(&perf_telemetry_path(home), since_ms, |event| {
+        let category = event.get("category").and_then(Value::as_str).unwrap_or("");
+        if let Some(filter) = category_filter
+            && category != filter
+        {
+            return;
         }
-    }
+        let name = event.get("name").and_then(Value::as_str).unwrap_or("");
+        let Some(duration) = event
+            .get("payload")
+            .and_then(|payload| payload.get("duration_ms"))
+            .and_then(Value::as_f64)
+        else {
+            return;
+        };
+        let key = (category.to_string(), name.to_string());
+        if let Some(pid) = event
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        {
+            pids.entry(key.clone()).or_default().insert(pid);
+        }
+        durations.entry(key).or_default().push(duration);
+    });
     let mut summaries: Vec<PerfSpanSummary> = durations
         .into_iter()
         .map(|((category, name), mut values)| {
@@ -355,6 +360,10 @@ pub fn summarize_perf_telemetry(
             let count = values.len();
             let total_ms: f64 = values.iter().sum();
             let time_base = perf_span_time_base(&category);
+            let row_pids = pids
+                .remove(&(category.clone(), name.clone()))
+                .map(|set| set.into_iter().collect())
+                .unwrap_or_default();
             PerfSpanSummary {
                 category,
                 name,
@@ -370,6 +379,7 @@ pub fn summarize_perf_telemetry(
                     total_ms / count as f64
                 },
                 total_ms,
+                pids: row_pids,
             }
         })
         .collect();
@@ -410,26 +420,11 @@ pub struct PerfIncidentSummary {
 /// caller's business, so parsing it here would be a second encoding of it.
 pub fn read_perf_incidents(home: &Path, since_ms: Option<u64>) -> Vec<Value> {
     let mut records = Vec::new();
-    for path in crate::retention::jsonl_read_paths(&home.join(PERF_INCIDENT_FILENAME)) {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let Some(since) = since_ms
-                && record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0) < since
-            {
-                continue;
-            }
-            records.push(record);
-        }
-    }
+    crate::retention::for_each_jsonl_record_since(
+        &home.join(PERF_INCIDENT_FILENAME),
+        since_ms,
+        |record| records.push(record),
+    );
     records.sort_by_key(|record| record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0));
     records
 }
@@ -706,6 +701,7 @@ mod tests {
             max_ms,
             mean_ms: 0.0,
             total_ms,
+            pids: Vec::new(),
         }
     }
 
@@ -1029,6 +1025,75 @@ mod tests {
         assert!(current_text.contains("\"ok\":true"));
         assert!(!rotated.exists());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A perf record must name the process that wrote it. Several daemons and a
+    /// GUI append to one `perf-telemetry.jsonl` per home, so a record that
+    /// cannot name its writer cannot be attributed to one — which is why
+    /// "the background chore ran 13,316 times" had to be split by a live
+    /// `/proc` walk instead of by reading the log (2026-07-26).
+    #[test]
+    fn every_perf_event_names_the_process_that_wrote_it() {
+        let dir = temp_test_dir("pid-stamp");
+        append_perf_event(
+            &dir,
+            "daemon",
+            "background_copy_chore",
+            json!({
+                "duration_ms": 900.0
+            }),
+        );
+        let text = fs::read_to_string(perf_telemetry_path(&dir)).expect("read telemetry");
+        let record: Value = serde_json::from_str(text.trim()).expect("one record");
+        assert_eq!(
+            record.get("pid").and_then(Value::as_u64),
+            Some(u64::from(std::process::id())),
+            "the record must carry the writing process id: {text}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// And the read side must SURFACE it, or the field is unreadable telemetry —
+    /// the exact failure that left 183 incident records unopened.
+    #[test]
+    fn the_summary_attributes_a_shared_span_to_every_daemon_that_wrote_it() {
+        let dir = temp_test_dir("pid-attribution");
+        let row = |pid: u64, duration: f64| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "ts_ms": 1_000_000u64,
+                    "pid": pid,
+                    "category": "daemon",
+                    "name": "background_copy_chore",
+                    "payload": { "duration_ms": duration },
+                }))
+                .unwrap()
+            )
+        };
+        // Three daemons, one home, one span — the live shape on jojo.
+        fs::write(
+            perf_telemetry_path(&dir),
+            format!(
+                "{}{}{}",
+                row(1_152_900, 900.0),
+                row(3_535_306, 917.0),
+                row(1_558_420, 880.0)
+            ),
+        )
+        .unwrap();
+        let summaries = summarize_perf_telemetry(&dir, None, None);
+        let chore = summaries
+            .iter()
+            .find(|summary| summary.name == "background_copy_chore")
+            .expect("the chore row");
+        assert_eq!(chore.count, 3);
+        assert_eq!(
+            chore.pids,
+            vec![1_152_900, 1_558_420, 3_535_306],
+            "the row must name every process that contributed to it, ascending"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }
