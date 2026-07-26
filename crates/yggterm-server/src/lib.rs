@@ -8,6 +8,10 @@ pub mod grid_overlay;
 mod host;
 mod live_row_tombstones;
 mod profile_write_lock;
+// Level (b) increment 1: owning a PTY we did not spawn — the Owned/Adopted
+// child split and a MasterPty over a received fd. Not yet wired to any
+// handoff; see docs/spikes/pty-fd-handoff/ for the proof it is built on.
+mod pty_adoption;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
