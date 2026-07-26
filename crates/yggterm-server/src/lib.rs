@@ -35947,7 +35947,6 @@ terminal_window_id: None,
     #[test]
     fn the_remote_cc_scan_script_agrees_with_the_rust_owner() {
         use std::io::Write as _;
-        use super::short_session_id;
         if std::process::Command::new("python3")
             .arg("--version")
             .output()
