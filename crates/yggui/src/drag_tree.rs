@@ -264,6 +264,22 @@ pub fn build_tree_reorder_plan<K: Clone>(
     Some(plan)
 }
 
+/// How far the pointer must travel from the press before a press becomes a
+/// DRAG. Under it the gesture is still a click.
+///
+/// ONE number for every draggable surface. The cwd tree waited 6px while the
+/// contributed rail began dragging on contact, so every click on a rail row
+/// dimmed it and armed a drop target — the same gesture behaving two ways in
+/// one window, and the reason an ordinary click could commit a reorder.
+pub const DRAG_BEGIN_THRESHOLD_PX: f64 = 6.0;
+
+/// Has the pointer travelled far enough from the press for this to be a drag?
+pub fn drag_threshold_reached(origin: (f64, f64), pointer: (f64, f64)) -> bool {
+    let dx = pointer.0 - origin.0;
+    let dy = pointer.1 - origin.1;
+    dx.hypot(dy) >= DRAG_BEGIN_THRESHOLD_PX
+}
+
 /// Reorder a FLAT list: move `moved` to sit before/after `target`, returning the
 /// new order, or `None` when the drop is a no-op or names an id the list does
 /// not hold.
@@ -303,6 +319,38 @@ mod tests {
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    // A press is not a drag. The rail used to begin one on contact while the
+    // cwd tree waited, so every click on a note row dimmed it and armed a drop
+    // target — and the release then committed a reorder nobody gestured.
+    #[test]
+    fn a_press_becomes_a_drag_only_once_it_travels() {
+        let origin = (100.0, 100.0);
+        assert!(
+            !drag_threshold_reached(origin, origin),
+            "a press is not a drag"
+        );
+        assert!(
+            !drag_threshold_reached(origin, (103.0, 103.0)),
+            "4.24px of hand-shake is still a click"
+        );
+        // The boundary is inclusive, and it is measured as DISTANCE — not per
+        // axis, or a diagonal press would need 8.5px while a straight one needs
+        // 6px.
+        assert!(!drag_threshold_reached(origin, (105.9, 100.0)));
+        assert!(drag_threshold_reached(
+            origin,
+            (100.0 + DRAG_BEGIN_THRESHOLD_PX, 100.0)
+        ));
+        assert!(drag_threshold_reached(
+            origin,
+            (100.0, 100.0 - DRAG_BEGIN_THRESHOLD_PX)
+        ));
+        assert!(
+            drag_threshold_reached(origin, (104.3, 104.3)),
+            "6.08px diagonally is a drag"
+        );
     }
 
     #[test]

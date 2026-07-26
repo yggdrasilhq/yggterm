@@ -222,7 +222,8 @@ use yggui::{
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
     chrome_material_tint, clamp_theme_spec, default_theme_editor_spec, dominant_accent,
-    emphasized_enter_transition, emphasized_exit_transition, gradient_background_repeat_css,
+    drag_threshold_reached, emphasized_enter_transition, emphasized_exit_transition,
+    gradient_background_repeat_css,
     gradient_background_size_css, gradient_css, join_tree_child_path, live_blur_gradient_css,
     material_blur_radius_px, preview_surface_css,
     reorder_flat_list, resolve_drag_drop_target as resolve_tree_drag_drop_target,
@@ -1800,7 +1801,13 @@ impl AppPaneWidget {
             AppPaneWidget::Label { .. } => format!("label-{index}"),
             AppPaneWidget::Tabs { id, .. } => format!("tabs-{id}"),
             AppPaneWidget::SearchBox { id, .. } => format!("search-{id}-{}", epoch(id)),
-            AppPaneWidget::TextInput { id, .. } => format!("text-{id}-{}", epoch(id)),
+            // The identity rides the key ahead of the epoch: a field that
+            // swaps to a different buffer is a DIFFERENT node even if the two
+            // buffers happen to hold identical text, which is exactly the case
+            // (two empty new notes) the epoch alone could not tell apart.
+            AppPaneWidget::TextInput { id, value_key, .. } => {
+                format!("text-{id}-{value_key}-{}", epoch(id))
+            }
             AppPaneWidget::NumberInput { id, .. } => format!("number-{id}-{}", epoch(id)),
             AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
             AppPaneWidget::Button { id, .. } => format!("button-{id}"),
@@ -1842,6 +1849,49 @@ impl AppPaneWidget {
             | AppPaneWidget::Markdown { .. } => None,
         }
     }
+
+    /// `(id, value_key)` — WHICH buffer this widget's slot currently holds, for
+    /// the widgets that can hold more than one over their lifetime.
+    ///
+    /// THE one reader of `TextInput::value_key`. Everything that needs the
+    /// identity — the remount rule, the DOM key, the POST that tells the app
+    /// which buffer a draft belongs to — comes through here, so the three can
+    /// never disagree about what is loaded. A widget with no identity concept
+    /// answers `None`, which is indistinguishable from declaring `""`.
+    fn declared_value_key(&self) -> Option<(String, String)> {
+        match self {
+            AppPaneWidget::TextInput { id, value_key, .. } if !value_key.is_empty() => {
+                Some((id.clone(), value_key.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The value keys a schema's widgets declare, as `{widget id: value key}` —
+/// the record of WHICH buffers a mounted schema is holding.
+///
+/// Derived from the schema, never stored beside it: the last applied schema IS
+/// the record, so there is nothing to keep in sync. Ordered, so the POST body
+/// is byte-identical for the same schema.
+fn app_pane_value_keys(widgets: &[AppPaneWidget]) -> BTreeMap<String, String> {
+    widgets
+        .iter()
+        .filter_map(AppPaneWidget::declared_value_key)
+        .collect()
+}
+
+/// [`app_pane_value_keys`] on the wire. Sent alongside `values` on every action
+/// POST so the app can tell WHICH buffer a draft belongs to instead of assuming
+/// it is whatever it currently considers active. A key absent here means the
+/// widget declared none, and the app falls back to its own idea of the target.
+fn app_pane_value_keys_json(widgets: &[AppPaneWidget]) -> serde_json::Value {
+    serde_json::Value::Object(
+        app_pane_value_keys(widgets)
+            .into_iter()
+            .map(|(id, key)| (id, serde_json::Value::String(key)))
+            .collect(),
+    )
 }
 
 /// The widget id a renaming row's field holds its draft under. One owner, so
@@ -1898,6 +1948,23 @@ enum AppPaneWidget {
         placeholder: String,
         #[serde(default)]
         value: String,
+        /// WHAT this field is editing — an opaque, app-owned buffer identity
+        /// (yedit declares the note id). It is NOT a second widget id: `id`
+        /// names the SLOT in the pane, `value_key` names the CONTENT currently
+        /// loaded into it, and only the app can tell them apart.
+        ///
+        /// Why it exists: the editor's `<textarea>` is uncontrolled, so it only
+        /// reloads when its DOM key changes, and the key used to change only
+        /// when the app declared *different text*. Content equality was standing
+        /// in for buffer identity — so two brand-new (both empty) notes compared
+        /// equal, the field never remounted, and the debounced draft POST then
+        /// carried one note's text with nothing to say which note it belonged
+        /// to. Identity first, content second.
+        ///
+        /// Empty = the app declares no identity, and the field behaves exactly
+        /// as it did before this existed (ychrome's vault/search fields).
+        #[serde(default)]
+        value_key: String,
         /// Fired when the user presses Enter in the field, exactly as `search-box`
         /// does. A password field declares its submit action here so the vault
         /// unlocks without reaching for the mouse. NEVER fires for `multiline` —
@@ -1964,6 +2031,19 @@ enum AppPaneWidget {
         subtitle: String,
         #[serde(default)]
         icon: String,
+        /// The row's STATUS DOT, in yggterm's durability vocabulary (DESIGN.md
+        /// "Status indicator vocabulary"). The app names the class; yggterm
+        /// owns the colour, so a contributed row and a Live Sessions row can
+        /// never drift apart. See [`app_pane_row_status_dot_style`] for the
+        /// tokens. Anything else (including a reserved token that is not wired
+        /// yet) degrades to the empty slot rather than failing the pane.
+        ///
+        /// This exists because apps were encoding status INTO the title — a
+        /// literal `●` glued in front of the name, which painted in the row's
+        /// text colour and shifted the title sideways. `list-row` simply had no
+        /// status slot while `SessionStyleRow` had had one all along.
+        #[serde(default)]
+        status: String,
         #[serde(default)]
         selected: bool,
         #[serde(default)]
@@ -2185,6 +2265,7 @@ fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
 #[cfg(test)]
 mod app_pane_reorder_tests {
     use super::*;
+    use yggui::DRAG_BEGIN_THRESHOLD_PX;
 
     fn shell() -> ShellState {
         ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
@@ -2192,12 +2273,22 @@ mod app_pane_reorder_tests {
         ))
     }
 
+    /// The real gesture: press, then travel past the threshold. Every drag the
+    /// user can perform goes through both steps, so every test does too.
+    fn drag_row(shell: &mut ShellState, pane_id: &str, row_id: &str) {
+        shell.arm_app_pane_row_drag(pane_id.to_string(), row_id.to_string(), (0.0, 0.0));
+        assert!(
+            shell.maybe_begin_app_pane_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)),
+            "the pointer travelled past the threshold"
+        );
+    }
+
     // The gesture, end to end, on the state machine the render drives.
     #[test]
     fn a_rail_row_drag_reports_the_panes_new_order_on_drop() {
         let rows = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut shell = shell();
-        shell.begin_app_pane_row_drag("notes".into(), "c".into());
+        drag_row(&mut shell, "notes", "c");
         shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::Before);
         assert_eq!(
             shell.app_pane_row_drop_edge("notes", "a"),
@@ -2223,7 +2314,7 @@ mod app_pane_reorder_tests {
     fn a_drop_that_changes_nothing_reports_no_reorder() {
         let rows = vec!["a".to_string(), "b".to_string()];
         let mut shell = shell();
-        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("notes", "b", DragDropPlacement::Before);
         assert_eq!(
             shell.take_app_pane_row_drop(&rows),
@@ -2238,7 +2329,7 @@ mod app_pane_reorder_tests {
     fn a_drag_released_over_nothing_is_abandoned() {
         let rows = vec!["a".to_string(), "b".to_string()];
         let mut shell = shell();
-        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        drag_row(&mut shell, "notes", "a");
         assert_eq!(shell.take_app_pane_row_drop(&rows), None);
         assert!(shell.app_pane_row_drag.is_none());
     }
@@ -2249,7 +2340,7 @@ mod app_pane_reorder_tests {
     fn a_hover_over_another_pane_is_not_a_drop_target() {
         let rows = vec!["a".to_string(), "b".to_string()];
         let mut shell = shell();
-        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("tabs", "b", DragDropPlacement::After);
         assert_eq!(shell.app_pane_row_drop_edge("tabs", "b"), None);
         assert_eq!(shell.take_app_pane_row_drop(&rows), None);
@@ -2261,7 +2352,7 @@ mod app_pane_reorder_tests {
     fn hovering_the_dragged_row_itself_is_not_a_target() {
         let rows = vec!["a".to_string(), "b".to_string()];
         let mut shell = shell();
-        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::After);
         assert_eq!(shell.app_pane_row_drop_edge("notes", "a"), None);
         assert_eq!(shell.take_app_pane_row_drop(&rows), None);
@@ -2284,8 +2375,158 @@ mod app_pane_reorder_tests {
             (10.0, 10.0),
         );
         assert!(shell.app_pane_context_menu.is_some());
-        shell.begin_app_pane_row_drag("notes".into(), "a".into());
+        drag_row(&mut shell, "notes", "a");
         assert!(shell.app_pane_context_menu.is_none());
+    }
+
+    // YS-3, the "weird lighter colors": a rail drag that ends anywhere but on
+    // another reorderable row had NO exit — `clear_app_pane_row_drag` had zero
+    // call sites — so the row kept its dim forever. The dim is painted from
+    // shell state, which outlives every schema refetch, so nothing the app did
+    // could ever wash it out.
+    #[test]
+    fn a_release_outside_the_rows_ends_the_gesture_and_undims_the_row() {
+        let mut shell = shell();
+        drag_row(&mut shell, "notes", "a");
+        assert!(shell.app_pane_row_is_dragging("notes", "a"));
+
+        // The user lets go over the pane heading / the footer / the terminal.
+        // Both release paths (the pane container and the shell root) run this.
+        shell.clear_app_pane_row_drag();
+
+        assert!(
+            !shell.app_pane_row_is_dragging("notes", "a"),
+            "a released row must not stay dimmed"
+        );
+        assert!(shell.app_pane_row_drag.is_none());
+        assert!(shell.app_pane_row_drop_target.is_none());
+    }
+
+    // The second face of the same defect: with the gesture stuck, merely moving
+    // the pointer over the list re-armed a drop target, so the user's next
+    // ordinary click POSTed a reorder they never gestured. A press that has not
+    // travelled is still a click, and accepts no target.
+    #[test]
+    fn a_press_that_never_travels_is_a_click_not_a_drag() {
+        let rows = vec!["a".to_string(), "b".to_string()];
+        let mut shell = shell();
+        shell.arm_app_pane_row_drag("notes".into(), "a".into(), (100.0, 100.0));
+
+        // A pixel of jitter is not a drag.
+        assert!(!shell.maybe_begin_app_pane_row_drag((101.0, 100.0)));
+        assert!(
+            !shell.app_pane_row_is_dragging("notes", "a"),
+            "an armed press must not dim its row"
+        );
+        shell.hover_app_pane_row_drop("notes", "b", DragDropPlacement::After);
+        assert_eq!(
+            shell.app_pane_row_drop_edge("notes", "b"),
+            None,
+            "an armed press accepts no drop target"
+        );
+        assert_eq!(
+            shell.take_app_pane_row_drop(&rows),
+            None,
+            "releasing a click must never reorder anything"
+        );
+        assert!(shell.app_pane_row_drag.is_none(), "and it still clears");
+    }
+
+    // One drag threshold for the whole window. The rail began dragging on
+    // contact while the cwd tree waited 6px.
+    #[test]
+    fn the_rail_and_the_tree_share_one_drag_threshold() {
+        let mut shell = shell();
+        shell.arm_app_pane_row_drag("notes".into(), "a".into(), (0.0, 0.0));
+        assert!(
+            !shell.maybe_begin_app_pane_row_drag((DRAG_BEGIN_THRESHOLD_PX - 0.5, 0.0)),
+            "under the shared threshold is still a click"
+        );
+        assert!(
+            shell.maybe_begin_app_pane_row_drag((DRAG_BEGIN_THRESHOLD_PX, 0.0)),
+            "at the shared threshold it is a drag"
+        );
+    }
+
+    // ONE dim for a dragged row, from the shared row engine. The rail used to
+    // hand-write `opacity:0.55` on its own outer box while every other row
+    // family took 0.58 from `session_row_container_style`.
+    #[test]
+    fn a_dragged_rail_row_dims_with_the_shared_row_engine() {
+        let dimmed = session_row_container_style(
+            SessionRowDensity::Rail,
+            0,
+            false,
+            true,
+            true,
+            "#eef",
+            "#123",
+        );
+        let plain = session_row_container_style(
+            SessionRowDensity::Rail,
+            0,
+            false,
+            false,
+            true,
+            "#eef",
+            "#123",
+        );
+        assert!(dimmed.contains("opacity:0.58"), "{dimmed}");
+        assert!(plain.contains("opacity:1"), "{plain}");
+        // The rail must not carry a second dim of its own. `dimmed` reaches
+        // SessionStyleRow as a prop, so the row's own render is the only place
+        // a competing opacity could be written; scan exactly that.
+        let source = include_str!("shell.rs");
+        let row_render_start = source
+            .find("\"data-app-pane-row-reorderable\"")
+            .expect("the rail row render is anchored on its reorderable flag");
+        let row_render = &source[row_render_start..];
+        let row_render_end = row_render
+            .find("AppPaneWidget::Markdown")
+            .expect("the rail's row arm ends where the next widget arm begins");
+        let row_render = &row_render[..row_render_end];
+        assert!(
+            row_render.contains("dimmed: row_is_dragging"),
+            "the dragged row's dim comes from the shared row engine"
+        );
+        assert!(
+            !row_render.contains("opacity:"),
+            "the rail must take its dim from SessionStyleRow, not hand-write one"
+        );
+    }
+
+    // The rail gesture must be OBSERVABLE. It was absent from `server app
+    // state` entirely, so "the row stays dimmed forever" could only be argued
+    // from a screenshot — and `dragging` is precisely the flag that paints the
+    // dim. `describe_app_state_snapshot` needs a live Signal + DesktopContext,
+    // so the lock is on the snapshot builder's source: if the field is dropped,
+    // this fails rather than the gap going quiet again.
+    #[test]
+    fn the_rail_gesture_is_visible_in_the_app_state_snapshot() {
+        let source = include_str!("shell.rs");
+        // Anchor on the DEFINITION (its signature spans lines), not on the
+        // name — this test mentions the name too, and it appears earlier in the
+        // file, which would scan the wrong region.
+        let builder_start = source
+            .find("fn describe_app_state_snapshot(\n    state: &Signal<ShellState>,")
+            .expect("the app-state snapshot builder exists");
+        let builder = &source[builder_start..];
+        let builder_end = builder
+            .find("\nfn describe_app_control_")
+            .unwrap_or(builder.len());
+        let builder = &builder[..builder_end];
+        for field in [
+            "\"app_pane_row_drag\"",
+            "\"app_pane_row_drop_target\"",
+            "\"dragging\": drag.begun",
+            "\"armed\": !drag.begun",
+        ] {
+            assert!(
+                builder.contains(field),
+                "the app-state snapshot must export {field} — without it a stuck \
+                 rail drag is invisible to every probe"
+            );
+        }
     }
 
     #[test]
@@ -2300,6 +2541,23 @@ mod app_pane_reorder_tests {
             "a flat list has no inside — Into draws as After, matching reorder_flat_list"
         );
     }
+}
+
+/// A contributed rail row's reorder gesture.
+///
+/// TWO phases, the same shape the cwd tree's `PendingTreeDrag` → `drag_paths`
+/// pair has always had: ARMED on mousedown (the press may still turn out to be
+/// a click) and BEGUN once the pointer clears
+/// [`yggui::DRAG_BEGIN_THRESHOLD_PX`]. Only a begun gesture dims its row or
+/// accepts a drop target.
+#[derive(Debug, Clone, PartialEq)]
+struct AppPaneRowDrag {
+    pane_id: String,
+    row_id: String,
+    /// Where the press landed, so the threshold is measured from the press and
+    /// not from wherever the last move happened to be reported.
+    origin: (f64, f64),
+    begun: bool,
 }
 
 /// Half a rail row's height: above it a drop lands BEFORE the row, below it
@@ -6436,9 +6694,9 @@ struct ShellState {
     /// over nothing, which is a no-op on release.
     web_tab_drag: Option<u64>,
     web_tab_drop_target: Option<Option<String>>,
-    /// A contributed rail row being dragged to reorder: `(pane id, row id)`.
-    /// Only rows whose app declared `reorder_action` ever land here.
-    app_pane_row_drag: Option<(String, String)>,
+    /// A contributed rail row's reorder gesture. Only rows whose app declared
+    /// `reorder_action` ever land here. See [`AppPaneRowDrag`].
+    app_pane_row_drag: Option<AppPaneRowDrag>,
     /// Where that drag currently hovers: `(pane id, row id, placement)`. The
     /// row draws the drop line; release commits. `None` over a non-reorderable
     /// row, which makes the release a no-op rather than a guess.
@@ -6926,7 +7184,7 @@ struct RenderSnapshot {
     web_tab_folder_rename: Option<(String, String)>,
     web_tab_drag: Option<u64>,
     web_tab_drop_target: Option<Option<String>>,
-    app_pane_row_drag: Option<(String, String)>,
+    app_pane_row_drag: Option<AppPaneRowDrag>,
     app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
     web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
@@ -11784,12 +12042,17 @@ impl ShellState {
         if seq != self.app_pane_request_seq {
             return;
         }
-        let previous_epochs = self
+        let mounted = self
             .app_pane_schema
             .as_ref()
-            .filter(|state| state.pane_id == pane_id)
+            .filter(|state| state.pane_id == pane_id);
+        let previous_epochs = mounted
             .map(|state| state.value_epochs.clone())
             .unwrap_or_default();
+        let previous_value_keys = mounted
+            .map(|state| app_pane_value_keys(&state.schema.widgets))
+            .unwrap_or_default();
+        let declared_value_keys = app_pane_value_keys(&schema.widgets);
         let mut value_epochs: HashMap<String, u64> = HashMap::new();
         let mut values: HashMap<String, String> = HashMap::new();
         for widget in &schema.widgets {
@@ -11797,11 +12060,19 @@ impl ShellState {
                 continue;
             };
             let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
+            // Identity first, exactly as the document channel does it: a slot
+            // that now holds a different buffer remounts even when the two
+            // buffers read identically. One rule, both channels.
+            let buffer_changed = previous_value_keys.get(&id) != declared_value_keys.get(&id);
             // Bump ONLY when the app pushes a value the field is not already
             // showing. An app that merely echoes back what the user typed (the
             // search box does exactly this) must not rebuild the node, or the
             // caret jumps out from under them mid-search.
-            let unchanged = self.app_pane_values.get(&id).is_some_and(|shown| *shown == declared);
+            let unchanged = !buffer_changed
+                && self
+                    .app_pane_values
+                    .get(&id)
+                    .is_some_and(|shown| *shown == declared);
             value_epochs.insert(
                 id.clone(),
                 if unchanged { epoch } else { epoch.wrapping_add(1) },
@@ -11906,28 +12177,55 @@ impl ShellState {
     // tracks the gesture; the APP owns the order — nothing here mutates the
     // rail, it only computes what the drop meant and hands that to the app.
 
-    /// Begin dragging a reorderable rail row. Any open row menu is dismissed:
-    /// a menu left standing over a moving row is the stale-overlay bug class.
-    fn begin_app_pane_row_drag(&mut self, pane_id: String, row_id: String) {
-        self.close_app_pane_context_menu();
-        self.app_pane_row_drag = Some((pane_id, row_id));
+    /// ARM a reorderable rail row's gesture on mousedown. The press is not yet
+    /// a drag — nothing dims and no drop target is accepted until the pointer
+    /// has moved [`yggui::DRAG_BEGIN_THRESHOLD_PX`]. Every click on a note row
+    /// used to start a drag outright, which is why an ordinary click could dim
+    /// the row and, on release, commit a reorder the user never gestured.
+    fn arm_app_pane_row_drag(&mut self, pane_id: String, row_id: String, pointer: (f64, f64)) {
+        self.app_pane_row_drag = Some(AppPaneRowDrag {
+            pane_id,
+            row_id,
+            origin: pointer,
+            begun: false,
+        });
         self.app_pane_row_drop_target = None;
+    }
+
+    /// Promote an armed press to a live drag once it clears the threshold.
+    /// Returns whether the gesture is live. Any open row menu is dismissed at
+    /// this point: a menu left standing over a moving row is the stale-overlay
+    /// bug class.
+    fn maybe_begin_app_pane_row_drag(&mut self, pointer: (f64, f64)) -> bool {
+        let Some(drag) = self.app_pane_row_drag.as_mut() else {
+            return false;
+        };
+        if drag.begun {
+            return true;
+        }
+        if !drag_threshold_reached(drag.origin, pointer) {
+            return false;
+        }
+        drag.begun = true;
+        self.close_app_pane_context_menu();
+        true
     }
 
     /// Hover `row_id` at `placement` while a drag is live. Ignored unless the
     /// hovered row belongs to the SAME pane — a rail row cannot be dropped into
     /// another app's list, and silently accepting that would POST an order
-    /// containing ids the app has never heard of.
+    /// containing ids the app has never heard of. Also ignored while the
+    /// gesture is only ARMED: a press that has not travelled is still a click.
     fn hover_app_pane_row_drop(
         &mut self,
         pane_id: &str,
         row_id: &str,
         placement: DragDropPlacement,
     ) {
-        let Some((drag_pane, drag_row)) = self.app_pane_row_drag.as_ref() else {
+        let Some(drag) = self.app_pane_row_drag.as_ref().filter(|drag| drag.begun) else {
             return;
         };
-        if drag_pane != pane_id || drag_row == row_id {
+        if drag.pane_id != pane_id || drag.row_id == row_id {
             // Over itself is not a target; leaving it `None` is what makes the
             // release a no-op instead of a POST that changes nothing.
             self.app_pane_row_drop_target = None;
@@ -11942,16 +12240,19 @@ impl ShellState {
     /// End the gesture and report what it meant: `(pane, moved row, new order)`,
     /// or `None` for a drag that never found a target or that changed nothing.
     /// `rows` is the pane's reorderable row ids in their CURRENT displayed order.
+    ///
+    /// ALWAYS clears, whatever it returns. That is the contract every release
+    /// path relies on: the gesture cannot outlive the mouse button.
     fn take_app_pane_row_drop(&mut self, rows: &[String]) -> Option<(String, String, Vec<String>)> {
         let drag = self.app_pane_row_drag.take();
         let target = self.app_pane_row_drop_target.take();
-        let (drag_pane, moved) = drag?;
+        let drag = drag.filter(|drag| drag.begun)?;
         let (target_pane, target_row, placement) = target?;
-        if target_pane != drag_pane {
+        if target_pane != drag.pane_id {
             return None;
         }
-        let order = reorder_flat_list(rows, &moved, &target_row, placement)?;
-        Some((drag_pane, moved, order))
+        let order = reorder_flat_list(rows, &drag.row_id, &target_row, placement)?;
+        Some((drag.pane_id, drag.row_id, order))
     }
 
     fn clear_app_pane_row_drag(&mut self) {
@@ -11968,10 +12269,12 @@ impl ShellState {
             .map(|(_, _, placement)| *placement)
     }
 
+    /// Is this row the live drag's subject? Only a BEGUN gesture counts — an
+    /// armed press must look exactly like a click until it travels.
     fn app_pane_row_is_dragging(&self, pane_id: &str, row_id: &str) -> bool {
         self.app_pane_row_drag
             .as_ref()
-            .is_some_and(|(pane, row)| pane == pane_id && row == row_id)
+            .is_some_and(|drag| drag.begun && drag.pane_id == pane_id && drag.row_id == row_id)
     }
     // ===== the DOCUMENT SURFACE's schema channel =====
     // A viewport-placement pane rendered as shell DOM in the main viewport.
@@ -12015,12 +12318,19 @@ impl ShellState {
         if seq != channel.request_seq {
             return;
         }
-        let previous_epochs = channel
+        let mounted = channel
             .schema
             .as_ref()
-            .filter(|state| state.pane_id == pane_id)
+            .filter(|state| state.pane_id == pane_id);
+        let previous_epochs = mounted
             .map(|state| state.value_epochs.clone())
             .unwrap_or_default();
+        // WHICH buffers the currently-mounted schema holds. A different pane is
+        // a different everything, so its keys do not carry over.
+        let previous_value_keys = mounted
+            .map(|state| app_pane_value_keys(&state.schema.widgets))
+            .unwrap_or_default();
+        let declared_value_keys = app_pane_value_keys(&schema.widgets);
         let mut value_epochs: HashMap<String, u64> = HashMap::new();
         let mut values: HashMap<String, String> = HashMap::new();
         let mut last_sent: HashMap<String, String> = HashMap::new();
@@ -12029,6 +12339,14 @@ impl ShellState {
                 continue;
             };
             let epoch = previous_epochs.get(&id).copied().unwrap_or(0);
+            // IDENTITY FIRST. When the app says this slot now holds a different
+            // buffer, the field is disturbed no matter what the text says —
+            // remount it and adopt the declared value. Content equality is not
+            // buffer identity: two brand-new notes are both empty, compare
+            // equal, and used to leave the previous note's live draft sitting
+            // in the field (and, once the debounced sync fired, in the wrong
+            // note's file).
+            let buffer_changed = previous_value_keys.get(&id) != declared_value_keys.get(&id);
             // The field is undisturbed when the app declares the value it is
             // already showing, OR when it merely echoes a draft the GUI sent up
             // — the search box echoes on Enter, and a multiline editor's draft
@@ -12046,7 +12364,10 @@ impl ShellState {
                 .last_sent
                 .get(&id)
                 .is_some_and(|sent| *sent == declared);
-            let undisturbed = matches_live_draft || is_echo_of_sent;
+            // The echo suppression (the "spam-click to type" fix) still holds —
+            // but only WITHIN one buffer. Across a buffer change it must not
+            // apply, or a stale draft would survive the switch.
+            let undisturbed = !buffer_changed && (matches_live_draft || is_echo_of_sent);
             value_epochs.insert(
                 id.clone(),
                 if undisturbed { epoch } else { epoch.wrapping_add(1) },
@@ -12135,6 +12456,15 @@ impl ShellState {
             id.hash(&mut hasher);
             value.hash(&mut hasher);
         }
+        // The buffer identities ride the settle hash too. Without them, "the
+        // same text in a DIFFERENT note" hashes identical to the draft already
+        // synced, and the `entry.1 != hash` guard would swallow the new note's
+        // sync entirely — the draft would sit in the GUI and never reach the
+        // app's crash-safe store.
+        for (id, key) in app_pane_value_keys(&schema_state.schema.widgets) {
+            id.hash(&mut hasher);
+            key.hash(&mut hasher);
+        }
         let hash = hasher.finish();
         for widget in &schema_state.schema.widgets {
             let Some((id, declared)) = widget.declared_value() else {
@@ -12166,6 +12496,17 @@ impl ShellState {
                 .map(|(id, value)| (id.clone(), serde_json::Value::String(value.clone())))
                 .collect(),
         )
+    }
+    /// WHICH buffer each of this document's fields is holding, as the action
+    /// POST carries it. Rides beside `values`, never inside it: `values` is a
+    /// flat `{widget id: draft}` map by contract and every app indexes it that
+    /// way, so an identity smuggled in under a reserved widget id would be a
+    /// second meaning for the same namespace.
+    fn document_pane_value_keys_json(&self, session_path: &str) -> serde_json::Value {
+        self.document_pane_channel(session_path)
+            .and_then(|channel| channel.schema.as_ref())
+            .map(|state| app_pane_value_keys_json(&state.schema.widgets))
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
     }
     /// The viewport-placement pane a session's contribution declares, if any.
     /// First one wins; one document surface per session.
@@ -17658,9 +17999,7 @@ impl ShellState {
         if pending.path != row.full_path {
             return false;
         }
-        let dx = pointer.0 - pending.pointer.0;
-        let dy = pointer.1 - pending.pointer.1;
-        if dx.hypot(dy) < 6.0 {
+        if !drag_threshold_reached(pending.pointer, pointer) {
             return false;
         }
         self.begin_drag(row, pointer);
@@ -30548,6 +30887,31 @@ fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bo
     )
 }
 
+/// A contributed `list-row`'s status dot, from the token the app declared.
+///
+/// The APP names a durability CLASS; yggterm owns the paint, and it comes from
+/// [`live_session_status_dot_style`] — the same function the Live Sessions rows
+/// use — so a yedit note and a live session can never end up with two different
+/// greens. DESIGN.md "Status indicator vocabulary" is the contract:
+///
+/// - `"durable"` → GREEN: the content survives the app (yedit: saved to disk).
+/// - `"transient"` → BLUE: the content lives only inside the app's own store
+///   (yedit: an unsaved buffer held in its sqlite drafts table).
+/// - `""` → no dot. The SLOT still lays out, so a dot appearing later never
+///   shoves the title sideways (DESIGN.md "Session-style rows").
+///
+/// Anything else — including DESIGN.md's reserved `ORANGE`/`RED` classes, which
+/// that section forbids wiring without a spec update there first — also reads
+/// as the empty slot. An app inventing a token gets a plain row, never a
+/// mispainted one and never a failed pane.
+fn app_pane_row_status_dot_style(palette: Palette, status: &str) -> Option<String> {
+    match status {
+        "durable" => Some(live_session_status_dot_style(palette, true, false)),
+        "transient" => Some(live_session_status_dot_style(palette, false, false)),
+        _ => None,
+    }
+}
+
 fn live_session_keep_alive_dot_style(palette: Palette) -> String {
     live_session_status_dot_style(palette, true, false)
 }
@@ -39085,6 +39449,28 @@ fn describe_app_state_snapshot(
                 })
             }),
             "drag_pointer": shell.drag_pointer.map(|(x, y)| json!({ "x": x, "y": y })),
+            // The CONTRIBUTED RAIL's reorder gesture. Absent from the snapshot
+            // until now, which is why "the row stays dimmed forever" could only
+            // ever be argued from a screenshot: `dragging` is exactly the flag
+            // that paints the dim, and `armed` distinguishes a press that has
+            // not travelled (a click) from a live drag.
+            "app_pane_row_drag": shell.app_pane_row_drag.as_ref().map(|drag| {
+                json!({
+                    "pane": drag.pane_id,
+                    "row": drag.row_id,
+                    "armed": !drag.begun,
+                    "dragging": drag.begun,
+                })
+            }),
+            "app_pane_row_drop_target": shell.app_pane_row_drop_target.as_ref().map(
+                |(pane, row, placement)| {
+                    json!({
+                        "pane": pane,
+                        "row": row,
+                        "placement": format!("{placement:?}"),
+                    })
+                },
+            ),
             "terminal_attach_in_flight": shell
                 .terminal_attach_in_flight
                 .iter()
@@ -46508,11 +46894,12 @@ async fn document_pane_run_action(
     action: String,
     value: Option<String>,
 ) {
-    let (control_url, mut values) = {
+    let (control_url, mut values, value_keys) = {
         let shell = state.read();
         (
             shell.sidebar_control_url(&session_path),
             shell.document_pane_values_json(&session_path),
+            shell.document_pane_value_keys_json(&session_path),
         )
     };
     let Some(control_url) = control_url else {
@@ -46529,7 +46916,14 @@ async fn document_pane_run_action(
         shell.document_pane_next_request(&session_path)
     });
     let url = app_pane_action_url(&control_url);
-    let body = json!({ "pane": pane_id, "action": action, "values": values });
+    // `value_keys` names WHICH buffer each draft in `values` belongs to. The
+    // debounced draft sync is the reason it must be on the wire: it lands ~2.5s
+    // after the keystrokes, by which time the user may have switched notes, and
+    // an app with no target to check against can only apply it to whatever it
+    // currently considers active — which is how one note's text got written
+    // into another's.
+    let body =
+        json!({ "pane": pane_id, "action": action, "values": values, "value_keys": value_keys });
     let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
         .await
         .unwrap_or_else(|error| Err(format!("document action panicked: {error}")));
@@ -46840,7 +47234,7 @@ async fn app_pane_run_action_with_order(
     value: Option<String>,
     order: Option<Vec<String>>,
 ) {
-    let (control_url, mut values, host, live_zoom, secure, prefs) = {
+    let (control_url, mut values, value_keys, host, live_zoom, secure, prefs) = {
         let shell = state.read();
         let active = shell.server.active_session_path().map(str::to_string);
         let control = active
@@ -46856,6 +47250,11 @@ async fn app_pane_run_action_with_order(
             shell.settings.web_surface_restore_tabs,
         );
         let mut values = shell.app_pane_values_json();
+        let mut value_keys = shell
+            .app_pane_schema
+            .as_ref()
+            .map(|state| app_pane_value_keys_json(&state.schema.widgets))
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
         // When the SAME contribution also runs a document surface, its live
         // draft rides along under the document's widget ids (rail keys win a
         // collision). This is what lets a rail Save flush the editor buffer
@@ -46871,8 +47270,19 @@ async fn app_pane_run_action_with_order(
                 map.entry(id.clone())
                     .or_insert_with(|| serde_json::Value::String(value.clone()));
             }
+            // The draft's buffer identity travels WITH the draft. A rail action
+            // (Save, a row click) carrying the editor's text but not which note
+            // it came from puts the app back to guessing.
+            if let (Some(keys), Some(map)) = (
+                shell.document_pane_value_keys_json(path).as_object(),
+                value_keys.as_object_mut(),
+            ) {
+                for (id, key) in keys {
+                    map.entry(id.clone()).or_insert_with(|| key.clone());
+                }
+            }
         }
-        (control, values, host, live_zoom, secure, prefs)
+        (control, values, value_keys, host, live_zoom, secure, prefs)
     };
     let Some(control_url) = control_url else {
         return;
@@ -46907,7 +47317,8 @@ async fn app_pane_run_action_with_order(
     }
     let seq = state.with_mut(|shell| shell.app_pane_next_request());
     let url = app_pane_action_url(&control_url);
-    let body = json!({ "pane": pane_id, "action": action, "values": values });
+    let body =
+        json!({ "pane": pane_id, "action": action, "values": values, "value_keys": value_keys });
     let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
         .await
         .unwrap_or_else(|error| Err(format!("action panicked: {error}")));
@@ -61992,6 +62403,14 @@ fn app() -> Element {
                     queue_drop_current_drag_target(state);
                     state.with_mut(|shell| shell.clear_drag_state());
                 }
+                // The rail's gesture ends here too. Row → pane container → root:
+                // by the time this runs a real drop has already been taken and
+                // cleared, so this only catches the releases that landed outside
+                // the pane entirely (over the terminal, the tree, the titlebar).
+                // A gesture must never outlive the mouse button.
+                if state.read().app_pane_row_drag.is_some() {
+                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                }
                 state.with_mut(|shell| shell.finish_sidebar_resize());
                 state.with_mut(|shell| shell.finish_rail_resize());
             },
@@ -66213,9 +66632,14 @@ fn SessionStyleRow(
                 }
             },
             ..attributes,
-            if let Some(dot) = dot {
-                span {
-                    style: session_row_dot_rail_style(density),
+            // The status slot is ALWAYS laid out, dot or no dot (DESIGN.md
+            // "Session-style rows"): a row whose status appears later —
+            // a yedit note going dirty — must not shove its own title
+            // sideways, and two rows of the same list must not start their
+            // titles at different x.
+            span {
+                style: session_row_dot_rail_style(density),
+                if let Some(dot) = dot {
                     {dot}
                 }
             }
@@ -98931,6 +99355,17 @@ fn AppPaneRailBody(
             content: rsx!{
             div {
                 style: "display:flex; flex-direction:column; gap:10px;",
+                // A release ANYWHERE in the pane ends the gesture, exactly as
+                // the WebTabs rail container does. Without it the only exit was
+                // the per-row handler, so letting go over a section heading, the
+                // toolbar or the footer left the drag standing: the row kept its
+                // dim forever and the next pointer move re-armed a drop target.
+                onmouseup: {
+                    let mut state = state;
+                    move |_: MouseEvent| {
+                        state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                    }
+                },
                 if let Some(error) = error {
                     div { style: "{muted_style}", "{error}" }
                 } else if let Some(schema) = schema {
@@ -99177,7 +99612,7 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, icon, selected, row_action, actions, menu, rename, reorder_action } => {
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, status, selected, row_action, actions, menu, rename, reorder_action } => {
                                 // The SHARED row engine (Phase 1): same anatomy
                                 // and metrics as the cwdtree rows and WebTabs
                                 // rail — whole-row clickable, selected tinted,
@@ -99345,7 +99780,7 @@ fn AppPaneRailBody(
                                         },
                                         "data-app-pane-row-dragging": if row_is_dragging { "1" } else { "0" },
                                         style: format!(
-                                            "{}{}{}",
+                                            "{}{}",
                                             if follows_row { "margin-top:-8px;" } else { "" },
                                             drop_edge
                                                 .map(|placement| app_pane_row_drop_line_style(
@@ -99353,9 +99788,6 @@ fn AppPaneRailBody(
                                                     palette.accent,
                                                 ))
                                                 .unwrap_or_default(),
-                                            // The row being dragged dims, so the
-                                            // gesture has a subject on screen.
-                                            if row_is_dragging { " opacity:0.55;" } else { "" },
                                         ),
                                         // A reorder drag is a MOUSE gesture, like
                                         // the cwd tree's: HTML5 dnd never fires
@@ -99370,10 +99802,15 @@ fn AppPaneRailBody(
                                                 {
                                                     return;
                                                 }
+                                                // ARM only. The press becomes a drag
+                                                // when it travels, so a plain click
+                                                // stays a plain click.
+                                                let pointer = evt.client_coordinates();
                                                 state.with_mut(|shell| {
-                                                    shell.begin_app_pane_row_drag(
+                                                    shell.arm_app_pane_row_drag(
                                                         pane_id.clone(),
                                                         row_id.clone(),
+                                                        (pointer.x, pointer.y),
                                                     );
                                                 });
                                             }
@@ -99385,6 +99822,18 @@ fn AppPaneRailBody(
                                                 if !reorderable {
                                                     return;
                                                 }
+                                                // No button held ⇒ this is a hover,
+                                                // not a drag. Without this gate a
+                                                // stuck gesture re-armed a drop
+                                                // target under a moving pointer and
+                                                // the next ordinary click committed
+                                                // a reorder nobody asked for. The
+                                                // cwd tree's root handler has always
+                                                // checked exactly this.
+                                                if !evt.held_buttons().contains(MouseButton::Primary) {
+                                                    return;
+                                                }
+                                                let pointer = evt.client_coordinates();
                                                 // Above/below the row's midpoint —
                                                 // a flat list has only two bands.
                                                 let y = evt.element_coordinates().y.max(0.0);
@@ -99394,6 +99843,11 @@ fn AppPaneRailBody(
                                                     DragDropPlacement::After
                                                 };
                                                 state.with_mut(|shell| {
+                                                    if !shell.maybe_begin_app_pane_row_drag((
+                                                        pointer.x, pointer.y,
+                                                    )) {
+                                                        return;
+                                                    }
                                                     shell.hover_app_pane_row_drop(
                                                         &pane_id,
                                                         &row_id,
@@ -99465,11 +99919,22 @@ fn AppPaneRailBody(
                                         "data-app-pane-row": "{id}",
                                         density: SessionRowDensity::Rail,
                                         selected,
+                                        // ONE dim for a dragged row. The rail
+                                        // used to fade its own outer box by a
+                                        // hand-written amount while every other
+                                        // row family took the shared engine's.
+                                        dimmed: row_is_dragging,
                                         text_color: palette.text.to_string(),
                                         selected_bg: palette.accent_soft.to_string(),
                                         label: title.clone(),
                                         subtitle: (!subtitle.is_empty()).then(|| subtitle.clone()),
                                         subtitle_color: Some(palette.muted.to_string()),
+                                        // The status slot the native rows have
+                                        // always had. The app names the class,
+                                        // yggterm paints it from the shared
+                                        // traffic-signal vocabulary.
+                                        dot: app_pane_row_status_dot_style(palette, &status)
+                                            .map(|dot| rsx! { span { style: "{dot}" } }),
                                         icon: (!icon.is_empty()).then(|| app_pane_row_icon(&icon)),
                                         // The cwdtree's icon rule: muted at
                                         // rest, text color on the selected row.
@@ -99495,6 +99960,11 @@ fn AppPaneRailBody(
                                                     key: "{row_action.action}",
                                                     style: session_row_action_button_style(palette.muted),
                                                     title: "{row_action.title}",
+                                                    // Pressing a row's ✕ must not
+                                                    // arm the row's drag — the
+                                                    // rename buttons already guard
+                                                    // mousedown for the same reason.
+                                                    onmousedown: |evt: MouseEvent| evt.stop_propagation(),
                                                     onclick: {
                                                         let (pane_id, action, row_id) =
                                                             (pane_id.clone(), row_action.action.clone(), id.clone());
@@ -107393,23 +107863,17 @@ mod tests {
         );
     }
 
-    // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
-    // a bumped epoch remounts the node and yanks focus + caret. A draft sync
-    // POSTs the buffer for crash safety, the app echoes it back, and the user
-    // keeps typing PAST the echo — so the echo must not be mistaken for new
-    // content and remount the field mid-type (the "focus stolen, spam-click to
-    // write" bug). Genuinely new content the GUI never typed still remounts.
-    #[test]
-    fn a_draft_echo_never_remounts_the_editor_but_new_content_does() {
-        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
-        let mut shell = ShellState::new(bootstrap);
-        let editor = |value: &str| AppPaneSchema {
+    /// A one-editor document schema: `value_key` names WHICH buffer is loaded,
+    /// `value` is its text. Empty key = an app that declares no identity.
+    fn document_editor_schema(value_key: &str, value: &str) -> AppPaneSchema {
+        AppPaneSchema {
             title: "Doc".to_string(),
             widgets: vec![AppPaneWidget::TextInput {
                 id: "editor".into(),
                 label: String::new(),
                 placeholder: String::new(),
                 value: value.to_string(),
+                value_key: value_key.to_string(),
                 action: String::new(),
                 secret: false,
                 multiline: true,
@@ -107418,7 +107882,140 @@ mod tests {
                 word_wrap: true,
             }],
             footer: Vec::new(),
-        };
+        }
+    }
+
+    fn document_editor_epoch(shell: &ShellState, session: &str) -> u64 {
+        shell
+            .document_pane_channel(session)
+            .and_then(|c| c.schema.as_ref())
+            .and_then(|s| s.value_epochs.get("editor").copied())
+            .expect("the editor has a value epoch")
+    }
+
+    // THE new-file collision (YS-1). Two brand-new notes are both EMPTY, so
+    // content equality said "undisturbed" and the uncontrolled textarea was
+    // never remounted between them — one buffer serving two files. Buffer
+    // identity, not text, decides whether the field reloads.
+    #[test]
+    fn switching_to_a_different_buffer_remounts_the_editor_even_when_both_are_empty() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+
+        // Note A mounts, empty.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n1", ""));
+        let mounted = document_editor_epoch(&shell, "local://a");
+
+        // The user pastes into A. The draft is live in the GUI and has not yet
+        // been synced (the sync is debounced ~2.5s).
+        shell.set_document_pane_value("local://a", "editor", "pasted into A".into());
+
+        // They click note B before the debounce fires. B is also brand new, so
+        // the app declares the SAME text A declared: "".
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n2", ""));
+
+        assert_ne!(
+            document_editor_epoch(&shell, "local://a"),
+            mounted,
+            "a different note is a different buffer — the textarea must remount"
+        );
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!(""),
+            "note B's editor must not open holding note A's paste"
+        );
+    }
+
+    // The other half of the identity: the draft POST must name the buffer it
+    // came from. Without it the app can only apply a late-landing draft to
+    // whatever it currently considers active — which is the corruption.
+    #[test]
+    fn a_document_draft_post_names_the_buffer_it_belongs_to() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n1", ""));
+        shell.set_document_pane_value("local://a", "editor", "pasted into A".into());
+
+        assert_eq!(
+            shell.document_pane_value_keys_json("local://a")["editor"],
+            serde_json::json!("n1"),
+            "the POST carries WHICH note the editor draft belongs to"
+        );
+        // Beside `values`, never inside it: `values` is a flat {widget id: draft}
+        // map every app indexes directly.
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!("pasted into A")
+        );
+
+        // An app that declares no identity gets exactly the old wire shape.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("", "x"));
+        assert_eq!(
+            shell.document_pane_value_keys_json("local://a"),
+            serde_json::json!({}),
+            "no declared identity, no key on the wire"
+        );
+    }
+
+    // The debounced sync's settle hash keys on the values alone. Type the same
+    // text in a second note and the hash repeats, so the "already synced this
+    // draft" guard would swallow the new note's sync and the buffer would never
+    // reach the app's crash-safe store. Identity has to ride the hash.
+    #[test]
+    fn the_same_text_in_a_different_buffer_still_syncs() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n1", ""));
+        shell.set_document_pane_value("local://a", "editor", "same text".into());
+        // Two ticks: the first records the hash, the second sees it settled.
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            None,
+            "not settled yet"
+        );
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            Some("doc".to_string()),
+            "a settled dirty draft syncs"
+        );
+
+        // Note B, then the identical text typed into it.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", document_editor_schema("n2", ""));
+        shell.set_document_pane_value("local://a", "editor", "same text".into());
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            None,
+            "not settled yet"
+        );
+        assert_eq!(
+            shell.document_draft_sync_due("local://a"),
+            Some("doc".to_string()),
+            "the same text in a different note is a different draft"
+        );
+    }
+
+    // The document editor is an UNCONTROLLED textarea keyed by its value epoch:
+    // a bumped epoch remounts the node and yanks focus + caret. A draft sync
+    // POSTs the buffer for crash safety, the app echoes it back, and the user
+    // keeps typing PAST the echo — so the echo must not be mistaken for new
+    // content and remount the field mid-type (the "focus stolen, spam-click to
+    // write" bug). Genuinely new content the GUI never typed still remounts.
+    //
+    // REGRESSION LOCK for the 2026-07-24 fix: identity narrowed this rule to
+    // within one buffer, it must never have removed it. If this goes red, a
+    // user cannot type in yedit at all — strictly worse than the bug above.
+    #[test]
+    fn a_draft_echo_never_remounts_the_editor_but_new_content_does() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let editor = |value: &str| document_editor_schema("", value);
         let epoch = |shell: &ShellState| {
             shell
                 .document_pane_channel("local://a")
@@ -107458,6 +108055,45 @@ mod tests {
             shell.document_pane_values_json("local://a")["editor"],
             serde_json::json!("# a different note"),
             "the editor adopts genuinely new content"
+        );
+    }
+
+    // The same lock, on the shape yedit actually emits (a declared identity).
+    // Narrowing echo suppression to "within one buffer" must not weaken it
+    // while the buffer is unchanged — that is the whole typing path.
+    #[test]
+    fn an_echo_within_one_buffer_never_remounts_the_editor() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(
+            seq,
+            "local://a",
+            "doc",
+            document_editor_schema("n1", "hello"),
+        );
+        let mounted = document_editor_epoch(&shell, "local://a");
+
+        shell.set_document_pane_value("local://a", "editor", "hello world".into());
+        shell.document_pane_mark_sent("local://a");
+        shell.set_document_pane_value("local://a", "editor", "hello world!!".into());
+
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(
+            seq,
+            "local://a",
+            "doc",
+            document_editor_schema("n1", "hello world"),
+        );
+        assert_eq!(
+            document_editor_epoch(&shell, "local://a"),
+            mounted,
+            "the app echoing our own draft back must not remount the field mid-type"
+        );
+        assert_eq!(
+            shell.document_pane_values_json("local://a")["editor"],
+            serde_json::json!("hello world!!"),
+            "the live draft survives the echo"
         );
     }
 
@@ -114651,6 +115287,7 @@ mod tests {
         // Identity, not position: the same row keeps its key as the list moves.
         let row = |id: &str| AppPaneWidget::ListRow {
             icon: String::new(),
+            status: String::new(),
             selected: false,
             row_action: String::new(),
             id: id.to_string(),
@@ -114668,6 +115305,7 @@ mod tests {
         // epoch too — that is the only way a generated name reaches the DOM.
         let renaming = |id: &str, value: &str| AppPaneWidget::ListRow {
             icon: String::new(),
+            status: String::new(),
             selected: false,
             row_action: String::new(),
             id: id.to_string(),
@@ -114689,6 +115327,7 @@ mod tests {
         // drop land in a slot the app never offered.
         let reorderable = |id: &str| AppPaneWidget::ListRow {
             icon: String::new(),
+            status: String::new(),
             selected: false,
             row_action: String::new(),
             id: id.to_string(),
@@ -114743,6 +115382,7 @@ mod tests {
             label: String::new(),
             placeholder: String::new(),
             value: String::new(),
+            value_key: String::new(),
             action: String::new(),
             secret: true,
             multiline: false,
@@ -114792,6 +115432,110 @@ mod tests {
         assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { word_wrap: true, .. }));
         // A schema with no footer is the common case and must parse to empty.
         assert!(schema.footer.is_empty());
+        // Both identity fields are OPTIONAL: an app that never heard of them
+        // parses to the empty string and behaves exactly as it did before.
+        assert!(
+            matches!(&schema.widgets[4], AppPaneWidget::TextInput { value_key, .. } if value_key.is_empty())
+        );
+        assert!(
+            matches!(&schema.widgets[10], AppPaneWidget::ListRow { status, .. } if status.is_empty())
+        );
+    }
+
+    // The two fields the apps had to work around: a buffer identity on the
+    // editor and a status class on a row.
+    #[test]
+    fn app_pane_schema_parses_a_buffer_identity_and_a_row_status() {
+        let schema: AppPaneSchema = serde_json::from_value(json!({
+            "widgets": [
+                {"kind": "text-input", "id": "editor", "multiline": true,
+                 "value": "", "value_key": "note-7f3a"},
+                {"kind": "list-row", "id": "note-7f3a", "title": "prompt.md",
+                 "status": "transient"},
+            ],
+        }))
+        .expect("schema parses");
+        assert!(
+            matches!(&schema.widgets[0], AppPaneWidget::TextInput { value_key, .. } if value_key == "note-7f3a")
+        );
+        assert!(
+            matches!(&schema.widgets[1], AppPaneWidget::ListRow { status, title, .. }
+                if status == "transient" && title == "prompt.md")
+        );
+        // The identity reaches the wire under its own name, not inside `values`.
+        assert_eq!(
+            app_pane_value_keys_json(&schema.widgets),
+            json!({ "editor": "note-7f3a" }),
+        );
+    }
+
+    // YS-4: a contributed row's STATUS DOT. Apps were encoding save state INTO
+    // the title (a literal `●` glued in front of the name, painted in the row's
+    // text colour) because `list-row` had no status slot while the native rows
+    // had one all along. The app names a durability class; yggterm paints it
+    // from the SAME function the Live Sessions rows use, so a yedit note and a
+    // live session can never end up with two different greens.
+    #[test]
+    fn a_contributed_rows_status_paints_from_the_shared_traffic_vocabulary() {
+        let palette = palette(UiTheme::ZedLight);
+        assert_eq!(
+            app_pane_row_status_dot_style(palette, "durable"),
+            Some(live_session_status_dot_style(palette, true, false)),
+            "durable is the same GREEN a keep-alive session shows"
+        );
+        assert_eq!(
+            app_pane_row_status_dot_style(palette, "transient"),
+            Some(live_session_status_dot_style(palette, false, false)),
+            "transient is the same BLUE a GUI-lifetime session shows"
+        );
+        // yedit's mapping, stated as colours so a silent swap is caught:
+        // BLUE = the content lives only in the app's db, GREEN = saved.
+        assert!(
+            app_pane_row_status_dot_style(palette, "transient")
+                .expect("blue")
+                .contains("#3b82f6")
+        );
+        assert!(
+            app_pane_row_status_dot_style(palette, "durable")
+                .expect("green")
+                .contains("#22c55e")
+        );
+
+        // No status, and any token yggterm does not paint (including DESIGN.md's
+        // reserved amber/red, which that section forbids wiring without a spec
+        // update there), degrade to the EMPTY SLOT — never a mispainted dot and
+        // never a failed pane.
+        for unknown in ["", "attention", "error", "🙂", "DURABLE"] {
+            assert_eq!(
+                app_pane_row_status_dot_style(palette, unknown),
+                None,
+                "{unknown:?} must not paint a dot"
+            );
+        }
+    }
+
+    // The slot is laid out even when EMPTY (DESIGN.md "Session-style rows"), so
+    // a note going dirty does not shove its own title sideways and two rows of
+    // one list start their titles at the same x.
+    #[test]
+    fn the_status_slot_is_laid_out_even_with_no_dot() {
+        let source = include_str!("shell.rs");
+        let component = source
+            .split("fn SessionStyleRow(")
+            .nth(1)
+            .expect("the shared row component exists");
+        let body_start = component
+            .find("..attributes,")
+            .expect("the row's children follow its attribute spread");
+        let slot = component
+            .find("session_row_dot_rail_style(density)")
+            .expect("the row lays out the dot rail");
+        assert!(slot > body_start, "the dot rail is a child of the row");
+        assert!(
+            !component[body_start..slot].contains("if let Some(dot)"),
+            "the dot rail must be rendered unconditionally — a slot that only \
+             appears when there is a dot moves the title as the status changes"
+        );
     }
 
     // The rail status footer (yedit wc + wrap toggle was the forcing consumer):
