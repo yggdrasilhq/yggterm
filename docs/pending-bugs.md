@@ -89,18 +89,18 @@ fix) once the fix is verified live on jojo.
      automatically, and an agent had to reconstruct by hand. Build the restore
      path, and make a daemon bump write a pre-swap snapshot the way a deploy
      does.
-  3. **⚠ "All rows not connected should die" NEEDS A DECISION, because as
-     written it contradicts requirement 1 and the product's core promise.**
-     Right now 9 of the user's own curated 21 rows have no runtime — they are
-     agent-CLI rows kept precisely so click = resume works
-     (`snapshot_session_is_agent_store_recoverable`, the first-class-session
-     contract in CLAUDE.md). Reaping every runtime-less row would cut the
-     curated list to 12 and delete the resumable history the whole product is
-     built on. The user is unlikely to mean that. **Ask what "not connected"
-     means to them** — most likely: a row whose CLI transcript is gone, or one
-     the user closed, or a plain shell whose PTY died (which IS a husk and
-     should go) — and then implement exactly that. Do not guess; an agent
-     already deleted seven of their sessions on a guess today.
+  3. ✅ **"All rows not connected should die" — DECIDED by the user
+     (2026-07-26, asked directly): "not connected" means rows that were
+     explicitly CLOSED — by the user or by an agent.** It does NOT mean
+     runtime-less rows (call #4 stands: never reap those). That is exactly the
+     tombstone plane: both the GUI close and an agent's session-remove flow
+     through the same daemon handler (`tombstone_live_row` before
+     `remove_live_session`), so the requirement is implemented and was proven
+     across the 2.12.15 bump (8 closed, 8 tombstones kept, 0 resurrected).
+     One recorded nuance, deliberate: the `PrepareClientClose` non-keep-alive
+     reap does NOT tombstone — that is contract death (second-class shells die
+     with their GUI), not an explicit close; the import admission predicate's
+     owns-runtime refusal is what keeps those husks from coming back.
 
 - **★★★ WE FORCED SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL. The
   premise is fixed and DEPLOYED (2.12.14); ⛔ THE CPU WIN IS NOT ESTABLISHED AND
