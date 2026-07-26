@@ -6,6 +6,7 @@ mod codex_cli;
 mod daemon;
 pub mod grid_overlay;
 mod host;
+mod live_row_tombstones;
 mod profile_write_lock;
 mod protocol;
 mod remote_cli;
@@ -425,17 +426,59 @@ pub(crate) fn session_path_is_remote_agent(path: &str) -> bool {
 /// the snapshot runtime-truth filter hides any shell whose PTY did not survive.
 /// Used to let agents SKIP the update-restart husk guard (they need no preserved
 /// PTY); the restore path itself gates on [`persisted_live_session_is_recoverable`].
+///
+/// ONE OWNER of the question, asked over the three row shapes the system carries
+/// ([`ManagedSessionView`], [`SnapshotSessionView`], [`PersistedLiveSession`]) —
+/// the wrappers below reduce each to `(key, kind, is-a-local-row)` and this
+/// function answers. It was previously spelled out twice with independent
+/// wording (here and in `daemon::snapshot_session_is_agent_store_recoverable`),
+/// which is exactly the second encoding that can silently diverge.
+pub(crate) fn agent_store_recoverable_row(key: &str, kind: SessionKind, local_row: bool) -> bool {
+    let is_local_agent = (local_row || local_runtime_id_from_key(key).is_some())
+        && matches!(
+            kind,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        );
+    is_local_agent || session_path_is_remote_agent(key)
+}
+
 fn managed_live_session_is_agent_store_recoverable(
     key: &str,
     session: &ManagedSessionView,
 ) -> bool {
-    let is_local_agent = (session.source == SessionSource::LiveLocal
-        || local_runtime_id_from_key(key).is_some())
-        && matches!(
-            session.kind,
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        );
-    is_local_agent || session_path_is_remote_agent(key)
+    agent_store_recoverable_row(
+        key,
+        session.kind,
+        session.source == SessionSource::LiveLocal,
+    )
+}
+
+/// [`agent_store_recoverable_row`] over a persisted/advertised row. A persisted
+/// row has no `SessionSource`; a loopback ssh target is what makes it local
+/// (the same test [`persisted_live_session_is_recoverable`] already uses).
+pub(crate) fn persisted_live_session_is_agent_store_recoverable(
+    live: &PersistedLiveSession,
+) -> bool {
+    agent_store_recoverable_row(
+        &live.key,
+        live.kind,
+        is_loopback_ssh_target(&live.ssh_target),
+    )
+}
+
+/// The identity of a Live Sessions ROW across daemons and across re-keys.
+///
+/// A local runtime row is addressed by several equivalent keys over its life
+/// (`local://<id>`, `codex-runtime://<id>`, `codex-litellm://<id>` …), so two
+/// daemons can hold the same row under different spellings. Every cross-daemon
+/// comparison — import de-dup, the tombstone deny-list, owned-runtime matching
+/// — must fold those to one string, and must fold them the SAME way. This is
+/// that fold; do not re-spell it at a call site.
+pub(crate) fn normalized_live_row_identity(key: &str) -> String {
+    match local_runtime_id_from_key(key) {
+        Some(id) => format!("id::{id}"),
+        None => key.to_string(),
+    }
 }
 
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
@@ -3875,8 +3918,16 @@ impl YggtermServer {
     /// listed with no owned runtime, which is exactly the case B4 drops), so
     /// resolving a session entry alone would not answer this.
     pub fn live_session_row_exists(&self, path: &str) -> bool {
+        self.live_session_row_key(path).is_some()
+    }
+
+    /// The key this row is currently listed under in `live_session_order`, if it
+    /// is listed at all. `live_session_row_exists` is this question with the
+    /// answer thrown away; callers that need the anchor (the cross-daemon
+    /// import walk) need the key itself, so there is one lookup, not two.
+    pub(crate) fn live_session_row_key(&self, path: &str) -> Option<String> {
         self.resolve_live_session_key(path)
-            .is_some_and(|key| self.live_session_order.iter().any(|entry| *entry == key))
+            .filter(|key| self.live_session_order.iter().any(|entry| entry == key))
     }
 
     pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
@@ -3971,6 +4022,68 @@ impl YggtermServer {
             None => 0,
         };
         self.live_session_order.insert(insert_at, entry);
+    }
+
+    /// ONE OWNER of cross-daemon live-row import.
+    ///
+    /// Both import paths — the superseded-daemon takeover (older daemon about to
+    /// die, rows read back out of the shared state file) and the B4 live-row
+    /// adoption (reachable peer advertising its in-memory rows) — bring another
+    /// daemon's Live Sessions rows into ours. They must differ ONLY in which
+    /// rows they admit, never in where those rows land: two placements of the
+    /// same concept is how the B4 path ended up appending while the takeover
+    /// path anchored, and appending is the "rows in weird places after restart"
+    /// scramble the user re-hand-drags after every swap.
+    ///
+    /// The walk: iterate `peer_rows` IN THE PEER'S ORDER, tracking the last peer
+    /// row that already exists here as the anchor, and reposition each import to
+    /// sit immediately after its anchor (front when there is none). The peer's
+    /// relative arrangement is therefore woven into ours instead of being piled
+    /// at the tail. Only ADDS: a row we already hold is left exactly as it is —
+    /// we never overwrite our own live state with a peer's view of it.
+    ///
+    /// Returns the keys actually imported, in import order.
+    pub(crate) fn import_peer_live_rows_in_order(
+        &mut self,
+        peer_rows: &[PersistedLiveSession],
+        admit: impl Fn(&PersistedLiveSession) -> bool,
+    ) -> Vec<String> {
+        let mut order_lookup: HashMap<String, String> = self
+            .live_session_order
+            .iter()
+            .map(|key| (normalized_live_row_identity(key), key.clone()))
+            .collect();
+        let mut anchor: Option<String> = None;
+        let mut imported = Vec::new();
+        for live in peer_rows {
+            let identity = normalized_live_row_identity(&live.key);
+            if let Some(present) = self
+                .live_session_row_key(&live.key)
+                .or_else(|| order_lookup.get(&identity).cloned())
+            {
+                // Already ours. It still moves the anchor forward: the peer's
+                // shared rows are the landmarks its unique rows are placed
+                // against.
+                anchor = Some(present);
+                continue;
+            }
+            if !admit(live) {
+                continue;
+            }
+            let key = live.key.clone();
+            self.restore_live_session(live.clone());
+            // restore_live_session has its own refusals (husk guard, Document
+            // rows, key migration). Anchor only what actually became a row, and
+            // under the key it actually landed under.
+            let Some(row_key) = self.live_session_row_key(&key) else {
+                continue;
+            };
+            self.move_live_session_after(&row_key, anchor.as_deref());
+            order_lookup.insert(identity, row_key.clone());
+            anchor = Some(row_key.clone());
+            imported.push(row_key);
+        }
+        imported
     }
 
     pub(crate) fn live_codex_session_keys_for_runtime_identity(&self) -> Vec<String> {
@@ -30523,6 +30636,142 @@ terminal_window_id: None,
         assert_eq!(server.live_session_order, vec!["d", "b", "c", "a"]);
         server.move_live_session_after("zzz", Some("b"));
         assert_eq!(server.live_session_order, vec!["d", "b", "c", "a"]);
+    }
+
+    /// ORD-1: both cross-daemon importers now share ONE anchored walk, so the
+    /// peer's arrangement is woven into ours instead of piled at the tail. A
+    /// bare append is the "rows in weird places after restart" scramble —
+    /// measured on jojo 2026-07-26, 22 rows adopted through the B4 path and
+    /// four of them teleported to the extremes of the Live pane.
+    #[test]
+    fn import_peer_live_rows_weaves_them_in_at_their_peer_anchors() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let row = |id: &str| PersistedLiveSession {
+            key: format!("local://{id}"),
+            id: id.to_string(),
+            title: id.to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        };
+
+        // Our own rows, in the user's arrangement.
+        for id in ["a", "b", "c"] {
+            server.restore_live_session(row(id));
+        }
+        assert_eq!(
+            server.live_session_order,
+            vec!["local://a", "local://b", "local://c"]
+        );
+
+        // The peer advertises the same three plus three of its own, interleaved.
+        let peer_rows: Vec<PersistedLiveSession> = ["a", "x", "b", "y", "c", "z"]
+            .into_iter()
+            .map(row)
+            .collect();
+        let imported = server.import_peer_live_rows_in_order(&peer_rows, |_| true);
+
+        assert_eq!(imported, vec!["local://x", "local://y", "local://z"]);
+        assert_eq!(
+            server.live_session_order,
+            vec![
+                "local://a",
+                "local://x",
+                "local://b",
+                "local://y",
+                "local://c",
+                "local://z"
+            ],
+            "an appended import ([a, b, c, x, y, z]) is the scramble this locks out"
+        );
+    }
+
+    /// A peer row that precedes every row we hold anchors at the FRONT, and the
+    /// admission predicate is the ONLY thing the two importers may differ on.
+    #[test]
+    fn import_peer_live_rows_honours_the_front_anchor_and_the_admit_predicate() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let row = |id: &str| PersistedLiveSession {
+            key: format!("local://{id}"),
+            id: id.to_string(),
+            title: id.to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        };
+        server.restore_live_session(row("mine"));
+
+        let peer_rows: Vec<PersistedLiveSession> = ["top", "refused", "mine", "tail"]
+            .into_iter()
+            .map(row)
+            .collect();
+        let imported =
+            server.import_peer_live_rows_in_order(&peer_rows, |live| live.key != "local://refused");
+
+        assert_eq!(imported, vec!["local://top", "local://tail"]);
+        assert_eq!(
+            server.live_session_order,
+            vec!["local://top", "local://mine", "local://tail"],
+            "a peer row ahead of every row we hold belongs at the front, not the tail"
+        );
+
+        // Only ADDS: a second import of the same peer view is a no-op that
+        // never reshuffles what we already hold.
+        let again = server.import_peer_live_rows_in_order(&peer_rows, |_| true);
+        assert_eq!(again, vec!["local://refused"]);
+        assert_eq!(
+            server.live_session_order,
+            vec![
+                "local://top",
+                "local://refused",
+                "local://mine",
+                "local://tail"
+            ]
+        );
     }
 
     #[test]
