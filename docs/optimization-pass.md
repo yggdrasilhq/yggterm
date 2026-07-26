@@ -546,6 +546,34 @@ Two lanes, sequenced so the risky one cannot block the useful one:
   nowhere**, and there is no mature Rust binding. Verify reachability from Rust before
   committing to it.
 
+**★ USER-SETTLED 2026-07-26: WPE is the destination, not a spike.** The user
+raised it unprompted ("a lower primitive of WebKitGTK") and agreed with the
+full philosophy, so Lane A is promoted from timeboxed spike to the target
+architecture, with Lane B as the bootstrap that must not wait for it. The
+settled reasoning, so it is not re-derived:
+
+- WPE is the same engine core (WebCore + JSC, same GObject API family minus
+  the GtkWidget), so the ychrome verb plane and site lore carry over — this is
+  NOT an engine switch.
+- What it kills structurally: the GTK-widget focus-grab class (the fifth focus
+  path — views are not widgets, input routing becomes our code), the
+  under-glass widget-stacking hazard (we composite exported DMABuf textures
+  deliberately), and the GUI-host burn / dev-no-client gap (agent surfaces
+  render server-side with no compositor at all).
+- What it does not fix, recorded honestly: JSC/WebCore heap crashes are
+  engine-core and identical; the GL crash surface changes owner (ours, not
+  GTK's); nothing for Windows (WebView2 remains the Windows engine — WPE is
+  the Linux/server plane only).
+- The "no Rust binding" blocker is a bounded maintenance cost, not a wall:
+  regenerate gir bindings against WPE's `.gir` and vendor them, the same way
+  wry/dioxus-desktop are already vendored and patched.
+- Sequence: agent engine on WPE first (agents are the only consumers — lowest
+  risk, highest immediate win), then GUI web-surface hosting migrates
+  view-by-view (WebKitGTK remains under the Dioxus chrome until last), each
+  step reversible and each killing a named bug class.
+- **ghostty is NEVER the answer here** (user-settled the same day): no
+  native-terminal-renderer detour rides this workstream.
+
 ### WS3: agent dev tools and the read ladder
 
 The "cli dev tools++ for agents" the user asked for.
