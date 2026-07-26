@@ -8628,14 +8628,29 @@ fn remote_runtime_agent_display(kind: SessionKind) -> &'static str {
     }
 }
 
-fn remote_agent_resume_subcommand(kind: SessionKind) -> &'static str {
+pub(crate) fn remote_agent_resume_subcommand(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::ClaudeCode => "resume-cc",
         _ => "resume-codex",
     }
 }
 
-fn remote_agent_start_subcommand(kind: SessionKind) -> &'static str {
+/// Whether `action` is a start subcommand this build emits for SOME agent CLI.
+///
+/// Derived from [`remote_agent_start_subcommand`] over the CLI registry, so the
+/// shell's cold-launch discriminator (start vs resume) cannot fall behind when
+/// a CLI is added — it used to compare against the single literal
+/// `"start-codex"` and therefore treated every freshly started remote Claude
+/// Code session as a resume (harness spec §7.3).
+pub fn agent_start_subcommand_is_registered(action: &str) -> bool {
+    let action = action.trim();
+    !action.is_empty()
+        && yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .any(|descriptor| remote_agent_start_subcommand(descriptor.kind) == action)
+}
+
+pub(crate) fn remote_agent_start_subcommand(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::ClaudeCode => "start-cc",
         _ => "start-codex",

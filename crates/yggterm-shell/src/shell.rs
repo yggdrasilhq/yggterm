@@ -153,6 +153,7 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::agent_presence::{AGENT_CURSOR_TTL_MS, AgentPointer, AgentPresence};
+use yggterm_core::agent_scheme;
 use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
@@ -9049,7 +9050,7 @@ fn created_remote_terminal_should_prewarm(session_path: &str) -> bool {
 }
 fn active_remote_recovery_snapshot_probe_should_start(
     is_remote_resume_session: bool,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     host_is_active_session: bool,
     _retained_live: bool,
     has_unready_open_attempt: bool,
@@ -9057,7 +9058,7 @@ fn active_remote_recovery_snapshot_probe_should_start(
 ) -> bool {
     let _ = (
         is_remote_resume_session,
-        remote_starting_codex_session,
+        remote_starting_agent_session,
         host_is_active_session,
         has_unready_open_attempt,
         surface_mounted,
@@ -20798,7 +20799,7 @@ fn remote_resume_blank_host_snapshot_is_replayable(snapshot: &str) -> bool {
 }
 fn remote_resume_snapshot_is_replayable_for_session(
     snapshot: &str,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     codex_like_session: bool,
 ) -> bool {
     if codex_like_session && terminal_replay_snapshot_has_cursor_addressed_scrollback_risk(snapshot)
@@ -20809,7 +20810,7 @@ fn remote_resume_snapshot_is_replayable_for_session(
         return false;
     }
     let trimmed = snapshot.trim();
-    if remote_starting_codex_session {
+    if remote_starting_agent_session {
         return terminal_chunk_is_codex_prompt_surface(trimmed)
             || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
     }
@@ -20823,14 +20824,14 @@ fn remote_resume_snapshot_is_replayable_for_session(
 
 fn remote_resume_screen_snapshot_is_replayable_for_blank_host(
     snapshot: &str,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     codex_like_session: bool,
 ) -> bool {
     if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
         return false;
     }
     let trimmed = snapshot.trim();
-    if remote_starting_codex_session {
+    if remote_starting_agent_session {
         return terminal_chunk_is_codex_prompt_surface(trimmed)
             || terminal_chunk_is_codex_interactive_setup_prompt(trimmed);
     }
@@ -20982,7 +20983,7 @@ fn remote_retained_surface_fault_requires_confirmation(reason: Option<&str>) -> 
 }
 fn remote_prompt_gap_resize_nudge_allowed(
     is_remote_resume_session: bool,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     traced_attach_ready: bool,
     terminal_overlay_dismissed: bool,
     terminal_geometry_ready: bool,
@@ -20993,7 +20994,7 @@ fn remote_prompt_gap_resize_nudge_allowed(
 ) -> bool {
     let _ = (
         is_remote_resume_session,
-        remote_starting_codex_session,
+        remote_starting_agent_session,
         traced_attach_ready,
         terminal_overlay_dismissed,
         terminal_geometry_ready,
@@ -21053,7 +21054,7 @@ fn remote_resume_visual_reveal_can_complete(
 }
 fn fresh_remote_codex_start_surface_ready(
     is_remote_resume_session: bool,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     attach_ready: bool,
     visible_resume_surface: bool,
     saw_prompt_ready_surface: bool,
@@ -21065,7 +21066,7 @@ fn fresh_remote_codex_start_surface_ready(
     saw_prompt_only_surface: bool,
 ) -> bool {
     is_remote_resume_session
-        && remote_starting_codex_session
+        && remote_starting_agent_session
         && attach_ready
         && visible_resume_surface
         && saw_prompt_ready_surface
@@ -29912,18 +29913,33 @@ fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
             session.session_path == row.full_path && is_promoted_live_session(session)
         })
 }
+/// Whether a session path names a REMOTE AGENT ROW — `remote-session://` or
+/// `remote-cc://` — derived from the scheme registry.
+///
+/// The ONE owner of that question on the shell side. Four predicates used to
+/// answer it independently by hand-listing `remote-session://`, so remote
+/// Claude Code silently missed all four (harness spec §7.3): no readiness or
+/// overlay path, no loading notice, classified local until a session view
+/// appeared, and no start-vs-resume discrimination. Registering a future CLI's
+/// remote scheme now covers every one of them at once.
+pub(crate) fn session_path_is_remote_agent_row(session_path: &str) -> bool {
+    let trimmed = session_path.trim_start();
+    agent_scheme::remote_agent_row_schemes().any(|scheme| trimmed.starts_with(scheme.prefix))
+}
+
 /// Whether a session path names a REMOTE runtime by its scheme alone, with no
 /// session view to consult.
 ///
-/// Extracted from `terminal_session_uses_remote_runtime` (no behaviour change)
-/// so the shell arm matrix can lock it per arm: the scheme half is the only half
-/// that answers before a session view exists, and it is where the `remote-cc://`
-/// readiness hole lives (spec §7.3). Behind `&self` it was unlockable.
+/// The scheme half is the only half that answers before a session view exists.
+/// Registry-derived: the remote agent rows plus `ssh://`, i.e. every row whose
+/// runtime lives on another machine. This is a question about LOCALITY and says
+/// nothing about which CLI, or whether there is a CLI at all.
 pub(crate) fn session_path_names_remote_runtime_by_scheme(session_path: &str) -> bool {
-    session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")
+    let trimmed = session_path.trim_start();
+    agent_scheme::remote_row_schemes().any(|scheme| trimmed.starts_with(scheme.prefix))
 }
 pub(crate) fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
-    row.full_path.starts_with("remote-session://")
+    session_path_is_remote_agent_row(&row.full_path)
 }
 fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: bool) -> bool {
     !retained_live_terminal
@@ -73972,7 +73988,12 @@ fn terminal_precis(session: &ManagedSessionView) -> String {
         .unwrap_or_else(|| session.status_line.clone())
 }
 pub(crate) fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
-    session.session_path.starts_with("remote-session://")
+    // Was `remote-session://` only, which denied every remote Claude Code
+    // session the ~8 readiness signals this gate drives (attach_ready,
+    // stalled_remote_resume, overlay dismissal, the faster read-poll cadence).
+    // A remote CC session is remote for exactly the same reasons a remote codex
+    // session is, so the question is answered by locality, never by CLI.
+    session_path_is_remote_agent_row(&session.session_path)
         && session.source == SessionSource::LiveSsh
 }
 #[component]
@@ -74933,7 +74954,7 @@ fn TerminalCanvas(
     let session_keep_alive = live_session_keep_alive(&session);
     let session_temporary_update_restore = live_session_temporary_update_restore(&session);
     let session_restart_protected = session_keep_alive || session_temporary_update_restore;
-    let remote_starting_codex_session = remote_session_starts_new_codex(&session);
+    let remote_starting_agent_session = remote_session_starts_new_agent(&session);
     let terminal_shell_background = theme.background.clone();
     let terminal_shell_shadow = "none".to_string();
     let terminal_frame = terminal_frame_style(snapshot.fullscreen);
@@ -74976,10 +74997,15 @@ fn TerminalCanvas(
     let session_ssh_target = session.ssh_target.clone();
     let session_kind = session.kind;
     let codex_like_session = matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
-    // First-class agent CLIs that drive the sidebar "working" indicator (Codex
-    // AND Claude Code). Deliberately broader than `codex_like_session`, which
-    // gates codex-specific resize/replay handoff handling and must NOT include
-    // Claude Code.
+    // First-class agent CLIs (Codex AND Claude Code). Deliberately broader than
+    // `codex_like_session`, which gates codex-specific resize/geometry handoff
+    // handling and must NOT include Claude Code.
+    //
+    // Drives the sidebar "working" indicator AND — since phase 3 of the harness
+    // spec (§7.6) — the retained-rehydrate screen fallback. Every agent CLI
+    // repaints IN PLACE, so its conversation lives in the client buffer and the
+    // daemon screen is the only authoritative current content; gating that on
+    // `codex_like_session` left CC reveals on a sparse client snapshot.
     let agent_cli_session = matches!(
         session_kind,
         SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
@@ -75778,7 +75804,7 @@ fn TerminalCanvas(
         (
             active_remote_recovery_snapshot_probe_should_start(
                 is_remote_resume_session,
-                remote_starting_codex_session,
+                remote_starting_agent_session,
                 host_is_active_session,
                 shell.terminal_session_is_retained_live(&session_path),
                 latest_unready_attempt_id.is_some(),
@@ -75798,7 +75824,7 @@ fn TerminalCanvas(
             state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
         let session_path_for_task = session_path.clone();
         let trace_home_for_task = trace_home.clone();
-        let remote_starting_codex_session_for_task = remote_starting_codex_session;
+        let remote_starting_agent_session_for_task = remote_starting_agent_session;
         spawn(async move {
             for attempt in 1_u64..=60 {
                 let still_recovering = state.with(|shell| {
@@ -75832,7 +75858,7 @@ fn TerminalCanvas(
                         && runtime_output_seen
                         && remote_resume_screen_snapshot_is_replayable_for_blank_host(
                             &snapshot_text,
-                            remote_starting_codex_session_for_task,
+                            remote_starting_agent_session_for_task,
                             codex_like_session,
                         )
                         && remote_resume_geometry_fence_allows_snapshot_replay(
@@ -75951,6 +75977,9 @@ fn TerminalCanvas(
         let session_path_for_task = session_path.clone();
         let trace_home = trace_home.clone();
         let codex_like_session_for_task = codex_like_session;
+        // Separate from the codex-only local above ON PURPOSE: the geometry
+        // fence stays codex-specific, the screen fallback covers every agent.
+        let agent_cli_session_for_task = agent_cli_session;
         spawn(async move {
             sleep(Duration::from_millis(80)).await;
             let still_active = state.with(|shell| {
@@ -76222,7 +76251,7 @@ fn TerminalCanvas(
                                     // the daemon never offered here because this arg was hardcoded false.
                                     retained_rehydrate_allow_screen_fallback(
                                         retained_rehydrate_mode,
-                                        codex_like_session_for_task,
+                                        agent_cli_session_for_task,
                                     ),
                                 );
                                 let selected_lines = selection.selected_lines;
@@ -76378,7 +76407,7 @@ fn TerminalCanvas(
         state.with(|shell| shell.terminal_session_ready_for_daemon_retained_replay(&session_path));
     if daemon_retained_snapshot_replay_should_start(
         is_remote_resume_session,
-        remote_starting_codex_session,
+        remote_starting_agent_session,
         codex_like_session,
         host_is_active_session,
         active_host_selected,
@@ -76897,7 +76926,7 @@ fn TerminalCanvas(
         let theme = future_theme.clone();
         let placeholder = terminal_resume_prefill.clone();
         let session_kind = session_kind;
-        let remote_starting_codex_session = remote_starting_codex_session;
+        let remote_starting_agent_session = remote_starting_agent_session;
         let session_launch_phase_running = session_launch_phase_running;
         let trace_home = trace_home.clone();
         let delayed_recovery_trace_home = trace_home.clone();
@@ -76979,7 +77008,7 @@ fn TerminalCanvas(
             let title = title;
             let theme = theme;
             let placeholder = placeholder;
-            let remote_starting_codex_session = remote_starting_codex_session;
+            let remote_starting_agent_session = remote_starting_agent_session;
             let trace_home = trace_home;
             let mut state = state;
             let terminal_has_meaningful_output = terminal_has_meaningful_output;
@@ -78854,7 +78883,7 @@ fn TerminalCanvas(
                                     terminal_host_surface_text(&cursor_line_text, &text_tail);
                                 if is_remote_resume_session
                                     && codex_like_session
-                                    && !remote_starting_codex_session
+                                    && !remote_starting_agent_session
                                     && (has_transport_error
                                         || terminal_chunk_is_generic_codex_idle(host_surface_text)
                                         || terminal_chunk_has_generic_codex_idle_footer(
@@ -78934,7 +78963,7 @@ fn TerminalCanvas(
                                 let prompt_gap_looks_stale =
                                     remote_prompt_gap_resize_nudge_allowed(
                                         is_remote_resume_session,
-                                        remote_starting_codex_session,
+                                        remote_starting_agent_session,
                                         traced_attach_ready,
                                         terminal_overlay_dismissed(),
                                         terminal_geometry_ready,
@@ -79855,7 +79884,7 @@ fn TerminalCanvas(
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
-                                                remote_starting_codex_session,
+                                                remote_starting_agent_session,
                                                 codex_like_session,
                                             ) && remote_resume_geometry_fence_allows_snapshot_replay(
                                                 &snapshot_text,
@@ -81142,7 +81171,7 @@ fn TerminalCanvas(
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
-                                                remote_starting_codex_session,
+                                                remote_starting_agent_session,
                                                 codex_like_session,
                                             ) && remote_resume_geometry_fence_allows_snapshot_replay(
                                                 &snapshot_text,
@@ -81346,7 +81375,7 @@ fn TerminalCanvas(
                                     .is_some_and(terminal_chunk_is_transport_error);
                                 if is_remote_resume_session
                                     && codex_like_session
-                                    && !remote_starting_codex_session
+                                    && !remote_starting_agent_session
                                     && (has_transport_error
                                         || saw_generic_idle_output
                                         || tail_generic_idle_output
@@ -81399,7 +81428,7 @@ fn TerminalCanvas(
                                 let suppress_resume_control_only_output =
                                     should_suppress_remote_resume_surface_output(
                                         is_remote_resume_session,
-                                        remote_starting_codex_session,
+                                        remote_starting_agent_session,
                                         terminal_overlay_dismissed(),
                                         runtime_running,
                                         has_transport_error,
@@ -81584,7 +81613,7 @@ fn TerminalCanvas(
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
                                         saw_codex_ready_surface,
-                                        remote_starting_codex_session,
+                                        remote_starting_agent_session,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -82029,7 +82058,7 @@ fn TerminalCanvas(
                                             saw_attach_ready_marker,
                                             saw_transcript_browser_output,
                                             saw_codex_ready_surface,
-                                            remote_starting_codex_session,
+                                            remote_starting_agent_session,
                                             saw_generic_idle_output
                                                 || tail_generic_idle_output,
                                             saw_generic_idle_footer_output
@@ -82155,7 +82184,7 @@ fn TerminalCanvas(
                                 if !terminal_overlay_dismissed()
                                     && fresh_remote_codex_start_surface_ready(
                                     is_remote_resume_session,
-                                    remote_starting_codex_session,
+                                    remote_starting_agent_session,
                                     attach_ready,
                                     visible_resume_surface,
                                     saw_prompt_ready_surface,
@@ -82262,7 +82291,7 @@ fn TerminalCanvas(
                                 }
                                 if is_remote_resume_session
                                     && traced_attach_ready
-                                    && !remote_starting_codex_session
+                                    && !remote_starting_agent_session
                                     && !resume_post_attach_redraw_nudged
                                     && terminal_geometry_ready
                                 {
@@ -82310,7 +82339,7 @@ fn TerminalCanvas(
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
                                         saw_codex_ready_surface,
-                                        remote_starting_codex_session,
+                                        remote_starting_agent_session,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -82651,7 +82680,7 @@ fn TerminalCanvas(
                                     && !traced_attach_ready
                                     && (!terminal_has_visible_output || !terminal_geometry_ready)
                                     && current_millis().saturating_sub(mount_started_ms)
-                                        >= if remote_starting_codex_session {
+                                        >= if remote_starting_agent_session {
                                             REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS
                                         } else {
                                             REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS
@@ -82680,7 +82709,7 @@ fn TerminalCanvas(
                                     && runtime_running
                                     && visible_resume_surface;
                                 let fresh_codex_idle_surface_is_live =
-                                    remote_starting_codex_session
+                                    remote_starting_agent_session
                                         && runtime_running
                                         && visible_resume_surface;
                                 let dead_codex_resume_instruction_surface =
@@ -85275,7 +85304,7 @@ fn remote_live_session_prompt_ready_replay_text_for_active_session<'a>(
         .or_else(|| remote_live_session_prompt_ready_replay_text(active_session))
 }
 fn remote_terminal_prefill_text_before_2_1_103(session: &ManagedSessionView) -> Option<String> {
-    if remote_session_starts_new_codex(session) {
+    if remote_session_starts_new_agent(session) {
         return None;
     }
     remote_resume_overlay_excerpt(session)
@@ -85301,9 +85330,21 @@ fn remote_terminal_placeholder_text_before_2_1_103(
             .map(format_terminal_prefill_text)
     })
 }
-pub(crate) fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
-    session.session_path.starts_with("remote-session://")
-        && metadata_value(session, "Remote Launch Action") == "start-codex"
+/// Whether this remote agent row is a FRESH START rather than a resume.
+///
+/// A started session has no prior content; a resumed one does, and the reveal
+/// differs. Renamed from `remote_session_starts_new_codex`: it had no
+/// `start-cc` twin, so a freshly started remote Claude Code session took the
+/// resume-flavoured reveal — which expects content that does not exist yet.
+/// The launch action is written by the server's own
+/// `remote_agent_start_subcommand`, so both arms are compared against that
+/// registry rather than against one hand-written string.
+pub(crate) fn remote_session_starts_new_agent(session: &ManagedSessionView) -> bool {
+    if !session_path_is_remote_agent_row(&session.session_path) {
+        return false;
+    }
+    let action = metadata_value(session, "Remote Launch Action");
+    yggterm_server::agent_start_subcommand_is_registered(&action)
 }
 fn app_control_terminal_input_write_path(shell: &ShellState, session_path: &str) -> String {
     terminal_input_write_path_for_runtime(
