@@ -23,6 +23,65 @@ The web view (separate surface) is where JSONL gets pretty-formatted into a chat
 
 Full mission statement: `[[project-purpose]]` in `~/.claude/projects/-home-user-gh-yggterm/memory/project-purpose.md`.
 
+## ⚖ THE CONSTITUTION — why daemon and GUI are separate (read before every restart decision)
+
+**The daemon/GUI split exists so that yggterm's own development and the other
+agents' work never block each other.** That is not an implementation detail; it
+is the reason the architecture has the shape it has, stated by the person who
+built it:
+
+> *"When I built daemon and gui separate architecture, I knew that yggterm agent
+> work and other agents should work in harmony; in other words, we should not
+> stall updating while the other agents work and they should not stall their work
+> for our work to finish. This basic fundamental architecture philosophy should
+> always be preserved."*
+
+Two obligations, symmetric, and neither may be traded away:
+
+1. **We never stall our work waiting for other agents.** Ship, bump, restart,
+   deploy — whenever the work is ready.
+2. **They never stall their work waiting for ours.** A restart of ours must not
+   interrupt, reset, or destroy what another agent is doing.
+
+### The behaviour this forbids
+
+⛔ **Do NOT ask permission to restart, and do NOT defer a deploy because other
+agents are working.** An agent doing this has misread the architecture as
+fragile and is trading away obligation 1 to protect obligation 2. Both are
+supposed to hold at once. Asking is not caution here — it is a symptom that the
+mechanism is not trusted, and the correct response is to make the mechanism
+trustworthy, not to route around it with a question.
+
+**If a restart would genuinely disturb another agent, THAT IS THE BUG.** File it,
+fix it. Do not treat it as a cost of doing business and do not ask the user to
+absorb it.
+
+### What the architecture must therefore guarantee
+
+- **Version-coexisting daemons.** A new daemon starts and serves new work while
+  older daemons stay alive, unchanged, still owning the sessions that were
+  mid-flight on them — until that work finishes on its own terms. Finessing a
+  new daemon in is normal; evicting an old one that is still working is not.
+- **Other agents' sessions survive our restarts**, including their shadow
+  surfaces, and including across a version bump.
+- **Row identity, order and count survive** a daemon handover.
+- **The drain must not require a quiet window.** A gate that only converges when
+  nothing is active can never converge on a machine that is always active, which
+  turns every deploy into a choice between waiting forever and killing PTYs.
+- **Plain shells are first-class** and must survive a bump like anything else.
+
+### Where this stood on 2026-07-26, honestly
+
+Not yet true, which is why it is being written down. `kill -TERM` on a daemon
+cost ~7 agent PTYs because the graceful self-retire defers while any session was
+active in the last 300 s and therefore never converged under load; a plain
+shell's row was lost outright; and row order was not preserved. Until those
+hold, an agent may still have to make a judgement call — but the default is to
+proceed and fix the mechanism, never to ask the user to schedule around a
+weakness in our own design.
+
+**This is the highest-value load-bearing work in the project.**
+
 ## Pending bugs
 
 Open, user-confirmed bugs live in `docs/pending-bugs.md`. When the user says
