@@ -2815,7 +2815,7 @@ fn web_surface_lease_until_ms(
 /// a web session). A LEGACY surface draws above all DOM and nothing short
 /// of unmapping reliably clears its pixels (the stuck-composite /
 /// reload-white family) — legacy must keep the detach.
-fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> bool {
+fn web_surface_background_detach(under_glass: bool, reclaim_pressured: bool) -> bool {
     // Legacy stacking always detaches (a legacy page draws above all DOM; only
     // unmapping reliably clears its pixels). Under glass a backgrounded page is
     // covered by the opaque app-bg layer, so it normally stays ATTACHED — that
@@ -2823,13 +2823,18 @@ fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> boo
     // is cut). But an attached WebKitGTK view keeps its DOM timers, animation
     // and video running at full CPU and holds its full memory (a single Meta
     // surface measured ~1.3 GB and >1 core while invisible). When the machine is
-    // under memory pressure — swap climbing toward thrash — that instant-reveal
-    // luxury is exactly what tips it into a freeze, so under glass we DETACH
-    // under pressure too: unmapping throttles the view and lets the
-    // background-hold destroy reclaim its memory. Reveal then pays a re-attach,
-    // but only while RAM is genuinely tight. See the telemetry-run resource work
-    // (guihost froze on 13.5 GB swap while two backgrounded surfaces held ~1.8 GB).
-    !under_glass || swap_pressured
+    // genuinely short of memory that instant-reveal luxury is exactly what tips
+    // it into a freeze, so under glass we DETACH under pressure too: unmapping
+    // throttles the view and lets the background-hold destroy reclaim its
+    // memory. Reveal then pays a re-attach, but only while RAM is genuinely
+    // tight. See the telemetry-run resource work (guihost froze on 13.5 GB swap
+    // while two backgrounded surfaces held ~1.8 GB).
+    //
+    // The input is `MemoryPressureSnapshot::reclaim_pressured` — CURRENT
+    // headroom plus the kernel's own stall accounting — NOT `swap_pressured`,
+    // which is a history counter that latches TRUE after one bad afternoon and
+    // never clears (see that method's doc, and the Y1 lock in terminal_observe).
+    !under_glass || reclaim_pressured
 }
 /// Backgrounded-surface hold under memory pressure: collapse the default hold so
 /// a detached surface is destroyed (its memory reclaimed) within seconds instead
@@ -2837,9 +2842,10 @@ fn web_surface_background_detach(under_glass: bool, swap_pressured: bool) -> boo
 /// destroying B needlessly.
 const WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS: u64 = 5_000;
 /// Verification override: force the pressure-triggered web-surface reclaim on
-/// without inducing real swap. Set `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` at
-/// launch to exercise the reclaim on a healthy machine — background a web
-/// surface and watch `native_stash detached:true swap_pressured:true` then
+/// without starving the machine for real. Set
+/// `YGGTERM_WEB_SURFACE_FORCE_PRESSURE=1` at launch to exercise the reclaim on a
+/// healthy machine — background a web surface and watch
+/// `native_stash detached:true reclaim_pressured:true` then
 /// `native_close reason:background_hold_expired` within the short hold, and the
 /// WebKitWebProcess RSS drop. Never set in normal operation.
 fn web_surface_force_background_pressure() -> bool {
@@ -2850,11 +2856,11 @@ fn web_surface_force_background_pressure() -> bool {
 /// intact) before it is destroyed. `~/.yggterm/web-surface.json`
 /// `{"background_hold_secs": N}`; default 600, 0 = destroy immediately (the
 /// pre-hold behavior).
-fn web_surface_background_hold_ms(swap_pressured: bool) -> u64 {
+fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
     // Under memory pressure, reclaim aggressively regardless of the configured
     // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
     // back to the system before it thrashes swap.
-    if swap_pressured {
+    if reclaim_pressured {
         return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
     let default_ms = 600_000;
@@ -4085,15 +4091,17 @@ async fn web_surface_native_reconcile_loop(
             .cloned()
             .collect();
         if !backgrounded.is_empty() {
-            // Pressure-triggered reclaim: sample swap once per pass. Under
-            // memory pressure a backgrounded surface is DETACHED (throttles its
-            // CPU) and its hold collapses so the destroy below reclaims its
-            // memory within seconds. Normal (no pressure) keeps the soft stash
-            // (attached, instant switch-back). One /proc/meminfo read, gated on
-            // there actually being a backgrounded surface to act on.
-            let swap_pressured = read_memory_pressure_snapshot().swap_pressured()
+            // Pressure-triggered reclaim: sample memory headroom once per pass.
+            // Under real memory pressure a backgrounded surface is DETACHED
+            // (throttles its CPU) and its hold collapses so the destroy below
+            // reclaims its memory within seconds. Normal (no pressure) keeps the
+            // soft stash (attached, instant switch-back). One /proc/meminfo +
+            // /proc/pressure/memory read, gated on there actually being a
+            // backgrounded surface to act on.
+            let reclaim_pressured = read_memory_pressure_snapshot().reclaim_pressured()
                 || web_surface_force_background_pressure();
-            let hold_ms = web_surface_background_hold_ms(swap_pressured);
+            let hold_ms = web_surface_background_hold_ms(reclaim_pressured);
+            let detach = web_surface_background_detach(under_glass, reclaim_pressured);
             for key in backgrounded {
                 let expired = web_surface_reap_due(
                     now_ms,
@@ -4120,7 +4128,7 @@ async fn web_surface_native_reconcile_loop(
                 } else if let Some(entry) = applied.get_mut(&key)
                     && entry.stashed_at_ms.is_none()
                 {
-                    if web_surface_background_detach(under_glass, swap_pressured) {
+                    if detach {
                         let _ = desktop.stash_web_surface(entry.native_id);
                     } else {
                         // Soft stash: stays attached below the glass (the
@@ -4165,8 +4173,8 @@ async fn web_surface_native_reconcile_loop(
                             "tab_id": key.1,
                             "native_id": entry.native_id,
                             "hold_ms": hold_ms,
-                            "detached": web_surface_background_detach(under_glass, swap_pressured),
-                            "swap_pressured": swap_pressured,
+                            "detached": detach,
+                            "reclaim_pressured": reclaim_pressured,
                         }),
                     );
                 }
@@ -110942,7 +110950,7 @@ mod tests {
 
     #[test]
     fn under_glass_backgrounding_detaches_and_reclaims_under_memory_pressure() {
-        // Pressure-triggered reclaim: under glass + swap pressured, a
+        // Pressure-triggered reclaim: under glass + genuinely short of memory, a
         // backgrounded surface DETACHES (unmap -> CPU throttled) and its hold
         // collapses to seconds so the destroy-on-hold branch reclaims its
         // memory instead of holding ~1.3 GB for ten minutes. Legacy is
@@ -110954,6 +110962,39 @@ mod tests {
         assert_eq!(
             web_surface_background_hold_ms(true),
             WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
+    }
+
+    /// The reclaim policy's INPUT, locked at the call site's boundary. Both of
+    /// these functions used to take `swap_pressured`, a latched history counter,
+    /// which is why 19 of 19 `native_stash` events on the live host carried
+    /// `detached:true hold_ms:5000`. Feed them the live host's real reading and
+    /// the soft stash must survive: attached, ten-minute hold.
+    #[test]
+    fn background_policy_reads_reclaim_pressure_not_swap_history() {
+        let mut live = crate::terminal_observe::parse_meminfo(
+            "MemTotal: 15473336 kB\nMemAvailable: 6976900 kB\n\
+             SwapTotal: 16776512 kB\nSwapFree: 4691496 kB\n",
+        );
+        live.psi_some_avg60_bp = Some(6);
+        assert!(live.swap_pressured(), "swap history is deep on this host");
+        // The argument both policy functions are handed. This is the defect: it
+        // was `swap_pressured()` (true here) and must be `reclaim_pressured()`.
+        // `web_surface_background_hold_ms(false)` reads
+        // `~/.yggterm/web-surface.json`, so asserting its RESULT would depend on
+        // the test machine's config — the deterministic statement is about the
+        // input, plus the pressured branch which returns before any file read.
+        assert!(
+            !live.reclaim_pressured(),
+            "45% of RAM available and 0.06% stall time is not reclaim pressure"
+        );
+        // Under glass with no real pressure: SOFT stash — stay attached, so
+        // switch-back is instant and the page is not destroyed.
+        assert!(!web_surface_background_detach(true, live.reclaim_pressured()));
+        assert_eq!(
+            web_surface_background_hold_ms(true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "the five-second window is what the wrong argument used to select"
         );
     }
 
@@ -130067,6 +130108,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 swap_total_kb: 16_000 * 1024,
                 mem_available_kb: 1_000 * 1024,
                 mem_total_kb: 16_000 * 1024,
+                ..Default::default()
             };
         }
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
@@ -130097,6 +130139,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 swap_total_kb: 16_000 * 1024,
                 mem_available_kb: 1_000 * 1024,
                 mem_total_kb: 16_000 * 1024,
+                ..Default::default()
             };
         }
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
