@@ -460,6 +460,22 @@ process; the probe reports that and lets the caller record what was realized alo
 it (`web_surface_views`, `web_surface_views_visible`, `web_surface_views_stashed`,
 `web_surface_contexts`).
 
+**`web_surface_views_visible` became load-bearing on 2026-07-27.** It is now the
+page-visibility denominator: every realized view outside it has been told it is off
+screen, so its `requestAnimationFrame` is paused and its timers are throttled by the
+engine. Before that date an unrevealed surface reported `visibilityState: "visible"` to
+its own page and animated forever — one spinner on a surface nobody had ever revealed
+measured **0.241 cores of web content + 0.399 cores of GUI compositing = 0.85 cores**
+against a ~0.5-core idle floor. Reading a sample: `web_surface_views_visible` equal to
+`web_surface_views` while the window is showing one session is the SHAPE of that bug.
+There is deliberately no separate "hidden" count — it is `web_surface_views` minus
+`web_surface_views_visible`, and a second field could disagree with the first.
+
+Measuring the change: the /proc walk (`server render-top`) over a fixed window, quoting
+`web_surface_contexts` so the sample's regime is legible. Never `ps %CPU` (a lifetime
+average), and never an injected `rAF` probe — a `rAF` loop installed to measure `rAF`
+sustains itself at the refresh rate and measures its own existence.
+
 ⛔ **CORRECTION (2026-07-26).** This section previously read "WebKitGTK runs one web
 process per profile serving every surface on it, so a per-surface CPU number would be a
 fabrication", and §5.3 below drew the conclusion that profiles are not the lever because

@@ -159,6 +159,110 @@ struct Surface {
     // context (its jar, its proxy, its web process) — that sharing is exactly
     // what a popup is.
     _ctx: Option<Rc<RefCell<WebContext>>>,
+    // TRUE while THIS HOST is holding the inner webview hidden so the ENGINE
+    // believes the page is off screen. That is the whole Page Visibility
+    // contract: an unmapped WebKitGTK view reports
+    // `document.visibilityState === 'hidden'`, `requestAnimationFrame` stops and
+    // timers throttle. It is the only thing that makes a background page cheap,
+    // and a surface nobody has revealed must have it.
+    //
+    // The host's SINGLE record of "we hid this": a hidden `open`, `set_visible`
+    // and `set_throttled` write it; `set_visible(true)`, `set_throttled(false)`
+    // and `unstash` are the only clearers. The one consumer that must not guess
+    // is `engine_webview_for_injection` — an unmapped view silently drops
+    // synthesized events, so the agent drive path wakes a view WE hid (and only
+    // one WE hid) for the length of the burst.
+    //
+    // A DETACHED (hard-stash) surface is unmapped too and this stays false: its
+    // container has no parent, so showing the webview would not map it, and
+    // injection must keep failing closed there exactly as it did before.
+    engine_hidden: Cell<bool>,
+    // Re-arm token for the injection wake's re-hide, the same shape as
+    // `FOCUS_GIVEBACK_TOKEN`: every injected event bumps it and schedules a
+    // re-hide, and a re-hide holding a stale token belongs to an earlier event
+    // in the burst and does nothing. Per surface, so two agents driving two
+    // surfaces cannot re-hide each other's.
+    wake_token: Cell<u64>,
+}
+
+/// What an injection has to do to a surface's webview before it may deliver an
+/// event to it. See [`injection_map_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionMapPlan {
+    /// Mapped, and nobody is holding it hidden: deliver, nothing to give back.
+    Deliver,
+    /// Mapped, but WE are still holding it hidden — an earlier event in this
+    /// burst woke it. Deliver, and RE-ARM the re-hide so the loan ends when the
+    /// burst does instead of part-way through it.
+    DeliverAndRehide,
+    /// Hidden by us and unmapped: show it, deliver, arm the re-hide.
+    WakeAndRehide,
+    /// Unmapped and NOT ours to wake — a detached (hard-stashed) container,
+    /// whose child cannot be mapped by showing it. Refuse: an event delivered
+    /// into an unmapped view is silently dropped, and a lie of success is worse
+    /// than a refusal.
+    Refuse,
+}
+
+/// Decide the above from the two ENGINE readings, taken for the surface about
+/// to be driven: are we holding it hidden, and is its webview mapped right now.
+///
+/// The cell that carries the whole design is `(engine_hidden: false, mapped:
+/// false) => Refuse`. Page-visibility throttling unmaps every surface nobody is
+/// being shown, and those are exactly the surfaces agents drive — so injection
+/// may no longer treat "unmapped" as "unreachable". But it may only wake what
+/// IT hid: a detached container has no parent to map into, and a surface hidden
+/// by something else is not ours to reveal.
+fn injection_map_plan(engine_hidden: bool, mapped: bool) -> InjectionMapPlan {
+    match (engine_hidden, mapped) {
+        (false, true) => InjectionMapPlan::Deliver,
+        (true, true) => InjectionMapPlan::DeliverAndRehide,
+        (true, false) => InjectionMapPlan::WakeAndRehide,
+        (false, false) => InjectionMapPlan::Refuse,
+    }
+}
+
+/// How long after the last injected event a surface woken for injection goes
+/// back to engine-hidden. Long enough to cover a click's press+release and the
+/// next event of a batch, short enough that a page nobody revealed is never
+/// left painting. Same order as [`FOCUS_GIVEBACK_DELAY_MS`], and for the same
+/// reason: the loan ends when the burst does.
+const ENGINE_REHIDE_DELAY_MS: u64 = 400;
+
+/// Arm (or re-arm) the re-hide of a surface woken for injection.
+///
+/// Copied deliberately from [`schedule_focus_giveback`], including its refusal
+/// to take back something that is no longer ours: if the reconciler REVEALED
+/// the surface while the burst was in flight then `engine_hidden` is already
+/// clear and this does nothing, because re-hiding a revealed page would blank
+/// the view the user is looking at.
+fn schedule_engine_rehide(surfaces: &Rc<RefCell<HashMap<u64, Surface>>>, id: u64) {
+    let token = {
+        let map = surfaces.borrow();
+        let Some(surface) = map.get(&id) else {
+            return;
+        };
+        let next = surface.wake_token.get().wrapping_add(1);
+        surface.wake_token.set(next);
+        next
+    };
+    let surfaces = surfaces.clone();
+    gtk::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(ENGINE_REHIDE_DELAY_MS),
+        move || {
+            let map = surfaces.borrow();
+            let Some(surface) = map.get(&id) else {
+                return; // closed since
+            };
+            if surface.wake_token.get() != token {
+                return; // a later injection re-armed this; that one re-hides
+            }
+            if !surface.engine_hidden.get() {
+                return; // revealed since — those pixels are the user's now
+            }
+            let _ = surface.webview.set_visible(false);
+        },
+    );
 }
 
 /// Which surfaces may share one `WebKitWebContext`, as a deterministic key.
@@ -1204,6 +1308,14 @@ fn build_popup_webview(
             container,
             webview,
             _ctx: None,
+            // A popup opened by an unrevealed opener is hidden by hiding its
+            // CONTAINER (see the branch above), which is the hard-stash shape,
+            // not ours: page visibility is already correct for it (an unmapped
+            // view reports hidden), and the injection wake must keep refusing,
+            // because showing the inner view of a hidden container would not
+            // map it. So this is false even when the popup is invisible.
+            engine_hidden: Cell::new(false),
+            wake_token: Cell::new(0),
         },
     );
     Some(webkit)
@@ -1496,6 +1608,16 @@ impl WebSurfaceHost {
     /// edges (claude.ai answers it "Request not allowed"); `None` keeps the
     /// engine default. Bounds are logical pixels relative to the window's
     /// top-left.
+    ///
+    /// `visible` is "is this surface being REVEALED to someone right now", and
+    /// it decides two things at birth: whether the view may take the toplevel's
+    /// keyboard focus, and whether the ENGINE is told the page is on screen. A
+    /// surface created for a session nobody is looking at is born hidden — same
+    /// rule, same shape as `build_popup_webview` — so its
+    /// `document.visibilityState` reads `hidden` from the first frame and its
+    /// `requestAnimationFrame` never starts. Creating it visible and hiding it a
+    /// tick later would be a lie the page has already acted on: a spinner on a
+    /// never-revealed surface measured 0.85 cores that way.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -1511,7 +1633,7 @@ impl WebSurfaceHost {
         y: i32,
         w: i32,
         h: i32,
-        focused: bool,
+        visible: bool,
     ) -> Result<(), String> {
         // Replace any existing surface with this id.
         self.close(id);
@@ -1572,7 +1694,7 @@ impl WebSurfaceHost {
             // "the shadow session spawn took focus away from my viewport",
             // 2026-07-26. A surface only gets the focus when it is being shown
             // TO SOMEONE.
-            .with_focused(focused)
+            .with_focused(visible)
             .with_devtools(true)
             // Every surface reports `window.close()`. A normal tab's request is
             // REFUSED by the shell (Chrome's rule), but the shell can only refuse
@@ -1713,6 +1835,16 @@ impl WebSurfaceHost {
         // touches the webview, and a sibling `open` needs the cell free.
         drop(ctx);
         container.show_all();
+        // ...but only a surface being REVEALED is shown to the ENGINE. Hiding
+        // the inner view unmaps it, which is how WebKitGTK derives page
+        // visibility (there is no page-visibility setter on this API), so an
+        // unrevealed surface's page reads `hidden` and throttles itself from its
+        // first frame. The container stays shown-and-attached — it is what
+        // `demote` reorders and what an instant raise-reveal needs — and it
+        // paints only `install_container_fill`'s flat backdrop, below the glass.
+        if !visible {
+            let _ = webview.set_visible(false);
+        }
 
         if let Some(ruleset) = adblock_ruleset {
             let store_dir = ruleset
@@ -1808,6 +1940,10 @@ impl WebSurfaceHost {
                 container,
                 webview,
                 _ctx: Some(ctx_cell),
+                // Born hidden when nobody is being shown it, and recorded as
+                // OURS so the agent drive path can wake it for a burst.
+                engine_hidden: Cell::new(!visible),
+                wake_token: Cell::new(0),
             },
         );
         Ok(())
@@ -1845,10 +1981,15 @@ impl WebSurfaceHost {
         }
     }
 
+    /// Show or hide surface `id` — BOTH the widget and, through it, the page's
+    /// own `document.visibilityState`. The two are the same fact, and this is
+    /// one of the four places allowed to write it (`open`, `set_throttled` and
+    /// `unstash` are the others).
     pub fn set_visible(&self, id: u64, visible: bool) {
         if let Some(s) = self.surfaces.borrow().get(&id) {
             let _ = s.webview.set_visible(visible);
             s.container.set_visible(visible);
+            s.engine_hidden.set(!visible);
         }
     }
 
@@ -1966,6 +2107,10 @@ impl WebSurfaceHost {
         apply_bounds(s, x, y, w, h);
         let _ = s.webview.set_visible(true);
         s.container.show_all();
+        // Reveal clears the engine-hidden fact (as do `set_visible(true)` and
+        // `set_throttled(false)`). Leaving it set would let a re-hide armed by
+        // an in-flight agent burst blank the page the user just switched to.
+        s.engine_hidden.set(false);
         self.overlay.queue_resize();
         Ok(())
     }
@@ -2002,10 +2147,18 @@ impl WebSurfaceHost {
     /// keep working. The stale-pixel hazard that makes a plain hidden webview
     /// unsafe over a revealed session does not apply here: the surface is
     /// demoted beneath the opaque glass, so nobody ever sees those pixels.
+    ///
+    /// Not conditional on a lease. A lease is an agent's claim that the surface
+    /// must keep EXISTING; it is not evidence that anyone is LOOKING at it, and
+    /// the leased-and-never-revealed case is exactly the one that was measured
+    /// burning 0.85 cores on one spinner. Agent reach survives regardless: eval
+    /// and capture run on a hidden view, and injection wakes it for the burst
+    /// (`engine_webview_for_injection`).
     pub fn set_throttled(&self, id: u64, throttled: bool) -> Result<(), String> {
         let surfaces = self.surfaces.borrow();
         let s = surfaces.get(&id).ok_or("no such surface")?;
         let _ = s.webview.set_visible(!throttled);
+        s.engine_hidden.set(throttled);
         Ok(())
     }
 
@@ -2310,19 +2463,66 @@ impl WebSurfaceHost {
     // (`docs/spikes/slice2a-istrusted-inject`). `x`/`y` are CSS-viewport pixels;
     // page zoom → widget px is applied here, next to the webview.
 
-    /// Resolve surface `id`'s engine webview, refusing if it is not MAPPED.
-    /// An unmapped webview (legacy hard-stash / fully hidden) silently drops
-    /// synthesized events (slice-2a hidden-phase proof), so injection fails
-    /// closed with `surface_not_mapped` instead of a lie of success. The
-    /// under-glass soft-stash keeps demoted surfaces mapped (occluded, still
-    /// realized), so `do` works on them.
-    fn mapped_engine_webview(&self, id: u64) -> Result<webkit2gtk::WebView, String> {
+    /// Resolve surface `id`'s engine webview for an injected event, WAKING it
+    /// first if this host is the one holding it hidden.
+    ///
+    /// An unmapped webview silently drops synthesized events (slice-2a
+    /// hidden-phase proof: `events == []`), so injection has always failed
+    /// closed with `surface_not_mapped` rather than lie about success. That
+    /// refusal is still right for a surface we did not hide — a hard-stashed
+    /// (detached) container cannot be mapped by showing its child, and there is
+    /// nothing to wake.
+    ///
+    /// But page-visibility throttling deliberately unmaps every unrevealed
+    /// surface, and those are precisely the surfaces agents drive. Visibility
+    /// gates RENDERING; it must never gate the drive path. So a view WE hid is
+    /// shown for the burst and re-hidden [`ENGINE_REHIDE_DELAY_MS`] after its
+    /// last event — the same borrow-and-give-back shape as the keyboard focus
+    /// loan, including the rule that a give-back only ever takes back what is
+    /// still ours.
+    ///
+    /// GTK maps a shown widget synchronously when its parent is mapped and
+    /// realized, so the map is re-checked immediately and the wake is UNDONE
+    /// (and the injection refused) if it did not take. A refusal is honest; an
+    /// event delivered into an unmapped view is not.
+    ///
+    /// The deliberate consequence: a burst flips `visibilitychange` twice. The
+    /// page really is briefly presentable, which is a truth, and it is strictly
+    /// better than the alternative of claiming `visible` forever.
+    fn engine_webview_for_injection(&self, id: u64) -> Result<webkit2gtk::WebView, String> {
         use wry::WebViewExtUnix as _;
         let surfaces = self.surfaces.borrow();
         let surface = surfaces.get(&id).ok_or("no such surface")?;
         let webkit = surface.webview.webview();
-        if !gtk::prelude::WidgetExt::is_mapped(&webkit) {
-            return Err("surface_not_mapped".to_string());
+        // Both readings taken HERE, from the engine, for THIS surface — the
+        // decision is made in `injection_map_plan` so it is lockable, and this
+        // is the wiring that lock cannot reach.
+        let plan = injection_map_plan(
+            surface.engine_hidden.get(),
+            gtk::prelude::WidgetExt::is_mapped(&webkit),
+        );
+        match plan {
+            InjectionMapPlan::Refuse => return Err("surface_not_mapped".to_string()),
+            InjectionMapPlan::WakeAndRehide => {
+                let _ = surface.webview.set_visible(true);
+                // GTK maps a shown widget synchronously under a mapped, realized
+                // parent — but if it did not, undo the wake and refuse rather
+                // than deliver into a view that will drop the event.
+                if !gtk::prelude::WidgetExt::is_mapped(&webkit) {
+                    let _ = surface.webview.set_visible(false);
+                    return Err("surface_not_mapped".to_string());
+                }
+            }
+            InjectionMapPlan::Deliver | InjectionMapPlan::DeliverAndRehide => {}
+        }
+        if matches!(
+            plan,
+            InjectionMapPlan::WakeAndRehide | InjectionMapPlan::DeliverAndRehide
+        ) {
+            // Re-armed by EVERY event of the burst, so the loan is given back
+            // once, after the last one — never part-way through a batch.
+            drop(surfaces);
+            schedule_engine_rehide(&self.surfaces, id);
         }
         Ok(webkit)
     }
@@ -2332,7 +2532,7 @@ impl WebSurfaceHost {
     /// button number (1 left, 2 middle, 3 right). `(x, y)` are CSS-viewport px
     /// (post-scroll); zoom→widget mapping happens here, next to the webview.
     pub fn inject_click(&self, id: u64, x: f64, y: f64, button: u32) -> Result<(), String> {
-        let webkit = self.mapped_engine_webview(id)?;
+        let webkit = self.engine_webview_for_injection(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
         // WebKit focuses the widget itself on a button press, so this path takes
         // the toplevel's keyboard focus even though nothing here calls
@@ -2351,7 +2551,7 @@ impl WebSurfaceHost {
 
     /// A pointer move (real hover — drives `:hover`, tooltips, menu reveal).
     pub fn inject_move(&self, id: u64, x: f64, y: f64) -> Result<(), String> {
-        let webkit = self.mapped_engine_webview(id)?;
+        let webkit = self.engine_webview_for_injection(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
         unsafe { synth_motion(&webkit, wx, wy) }
     }
@@ -2359,7 +2559,7 @@ impl WebSurfaceHost {
     /// A smooth-scroll wheel event at CSS-viewport `(x, y)` with the given
     /// deltas (positive `dy` scrolls the page content down, like a real wheel).
     pub fn inject_scroll(&self, id: u64, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), String> {
-        let webkit = self.mapped_engine_webview(id)?;
+        let webkit = self.engine_webview_for_injection(id)?;
         let (wx, wy) = css_viewport_to_widget(&webkit, x, y);
         note_focus_owner_before_injection(&webkit);
         grant_injection_credits(id, 1);
@@ -2371,7 +2571,7 @@ impl WebSurfaceHost {
     /// A single key press OR release. `keyval` is the GDK keyval (the shell maps
     /// key names / characters to it); `state` is the GDK modifier bitmask.
     pub fn inject_key(&self, id: u64, press: bool, keyval: u32, state: u32) -> Result<(), String> {
-        let webkit = self.mapped_engine_webview(id)?;
+        let webkit = self.engine_webview_for_injection(id)?;
         // A key event needs keyboard focus in the target webview, so BORROW it:
         // note the lender first, grab, and hand it back when the burst ends. The
         // grab is NOT widget-local — it sets the GtkWindow's focus widget, which
@@ -2954,5 +3154,196 @@ mod seat_input_tests {
         note_seat_input(id);
         forget_seat_input(id);
         assert_eq!(take_seat_input_count(id), 0);
+    }
+}
+
+/// LOCKS for engine page-visibility — the fact that decides whether a surface's
+/// page paints at all.
+///
+/// WebKitGTK derives `document.visibilityState` from widget mapping; there is
+/// no page-visibility setter on this API. So "is this page allowed to animate"
+/// is decided by exactly four writes in this file (a hidden `open`,
+/// `set_visible`, `set_throttled`, `unstash`) and consumed by one reader
+/// (`engine_webview_for_injection`). None of the five can be exercised without a
+/// live GtkWindow, so the decision is a pure function and the WIRING is scanned:
+/// a reverted write or a reverted reading changes the text these needles look
+/// for.
+#[cfg(test)]
+mod engine_visibility_locks {
+    use super::*;
+
+    /// PRODUCT lines of this file: everything outside a `#[cfg(test)] mod`
+    /// block. Without it every needle below would be satisfied by the assertion
+    /// that names it — the source-scan failure this workspace has already
+    /// shipped once. Local rather than shared because a vendored engine crate
+    /// must not depend on the shell's crates.
+    fn product_lines() -> Vec<String> {
+        let source = include_str!("web_surface.rs");
+        let mut out = Vec::new();
+        let mut in_test_module = false;
+        let mut pending_test_attribute = false;
+        for line in source.lines() {
+            if in_test_module {
+                if line == "}" {
+                    in_test_module = false;
+                }
+                continue;
+            }
+            if line.starts_with("#[cfg(test)]") {
+                pending_test_attribute = true;
+                continue;
+            }
+            if pending_test_attribute {
+                pending_test_attribute = false;
+                if line.starts_with("mod ") || line.starts_with("pub mod ") {
+                    in_test_module = true;
+                    continue;
+                }
+            }
+            out.push(line.to_string());
+        }
+        out
+    }
+
+    /// The body of the named free function or method, from its signature line to
+    /// the first line that closes it at the same indent.
+    fn body_of(product: &[String], signature: &str) -> String {
+        let start = product
+            .iter()
+            .position(|line| line.contains(signature))
+            .unwrap_or_else(|| panic!("`{signature}` is gone from this file"));
+        let indent = product[start].len() - product[start].trim_start().len();
+        let end = product[start + 1..]
+            .iter()
+            .position(|line| line.trim() == "}" && line.len() - line.trim_start().len() == indent)
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("unterminated `{signature}`"));
+        assert!(
+            end - start > 3,
+            "the captured body of `{signature}` is too short to be the real one",
+        );
+        product[start..=end].join("\n")
+    }
+
+    /// Injection may wake what WE hid, and only what we hid. The cell that
+    /// carries the design is `(engine_hidden: false, mapped: false)`: a detached
+    /// container's child cannot be mapped by showing it, so that case must still
+    /// fail closed exactly as it did before page-visibility throttling existed.
+    #[test]
+    fn only_a_surface_this_host_hid_is_woken_for_an_injection() {
+        assert_eq!(
+            injection_map_plan(false, true),
+            InjectionMapPlan::Deliver,
+            "a revealed, mapped surface needs nothing done to it",
+        );
+        assert_eq!(
+            injection_map_plan(false, false),
+            InjectionMapPlan::Refuse,
+            "unmapped and not ours to wake (detached / hard-stashed): refusing is \
+             the honest answer, because the engine drops the event silently",
+        );
+        assert_eq!(
+            injection_map_plan(true, false),
+            InjectionMapPlan::WakeAndRehide,
+            "a surface WE hid for page visibility is the ordinary agent target — \
+             visibility gates rendering, never the drive path",
+        );
+        assert_eq!(
+            injection_map_plan(true, true),
+            InjectionMapPlan::DeliverAndRehide,
+            "mid-burst: already woken, still ours, so the re-hide must be re-armed \
+             or the loan ends part-way through the batch",
+        );
+    }
+
+    /// The reader's wiring. The decision above is worth nothing if the resolver
+    /// stops taking its two readings from the engine, stops undoing a wake that
+    /// did not map, or stops arming the give-back.
+    #[test]
+    fn the_injection_resolver_reads_the_engine_and_gives_the_wake_back() {
+        let product = product_lines();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod engine_visibility_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        let body = body_of(&product, "fn engine_webview_for_injection(");
+        for needle in [
+            // Both readings, taken here, for THIS surface. A hardcoded either
+            // side turns the wake permanently on or permanently off.
+            "surface.engine_hidden.get(),",
+            "gtk::prelude::WidgetExt::is_mapped(&webkit),",
+            "let plan = injection_map_plan(",
+            // Refuse must still be a refusal, with the same string the agent
+            // control plane already documents.
+            "InjectionMapPlan::Refuse => return Err(\"surface_not_mapped\".to_string()),",
+            // The wake, and the fail-closed re-check that undoes it.
+            "let _ = surface.webview.set_visible(true);",
+            "let _ = surface.webview.set_visible(false);",
+            // The give-back. Without it a driven surface stays mapped and
+            // painting forever, which is the bug wearing a different hat.
+            "schedule_engine_rehide(&self.surfaces, id);",
+        ] {
+            assert!(
+                body.contains(needle),
+                "the injection resolver no longer does `{needle}`:\n{body}",
+            );
+        }
+    }
+
+    /// The four writers. Page visibility has ONE record in this host
+    /// (`Surface::engine_hidden`) precisely so a second one cannot disagree with
+    /// it — and the give-back consults that record before re-hiding, so a
+    /// writer that stops maintaining it can blank a page the user just revealed.
+    #[test]
+    fn every_visibility_write_records_what_the_engine_was_told() {
+        let product = product_lines();
+        let open = body_of(&product, "pub fn open(");
+        assert!(
+            open.contains("if !visible {") && open.contains("let _ = webview.set_visible(false);"),
+            "a surface is no longer born hidden when nobody is being shown it — \
+             creating it visible and hiding it a tick later is a lie the page has \
+             already acted on",
+        );
+        assert!(
+            open.contains("engine_hidden: Cell::new(!visible),"),
+            "the create no longer records whether it hid the surface, so the \
+             injection wake cannot tell its own hiding from a hard stash",
+        );
+
+        let set_visible = body_of(&product, "pub fn set_visible(");
+        assert!(
+            set_visible.contains("s.engine_hidden.set(!visible);"),
+            "set_visible no longer records what the engine was told",
+        );
+
+        let set_throttled = body_of(&product, "pub fn set_throttled(");
+        assert!(
+            set_throttled.contains("let _ = s.webview.set_visible(!throttled);")
+                && set_throttled.contains("s.engine_hidden.set(throttled);"),
+            "the throttle no longer hides the inner webview and records it — \
+             hiding the webview IS the page-visibility mechanism",
+        );
+
+        let unstash = body_of(&product, "pub fn unstash(");
+        assert!(
+            unstash.contains("let _ = s.webview.set_visible(true);")
+                && unstash.contains("s.engine_hidden.set(false);"),
+            "reveal no longer clears the engine-hidden record, so a re-hide armed \
+             by an in-flight agent burst can blank the page the user switched to",
+        );
+
+        let rehide = body_of(&product, "fn schedule_engine_rehide(");
+        assert!(
+            rehide.contains("if !surface.engine_hidden.get() {"),
+            "the re-hide no longer checks that the surface is still ours to hide",
+        );
+        assert!(
+            rehide.contains("if surface.wake_token.get() != token {"),
+            "the re-hide no longer honours the re-arm token, so a burst gives its \
+             wake back part-way through",
+        );
     }
 }
