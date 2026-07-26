@@ -140,11 +140,13 @@ impl DesktopService {
     /// invoking host's tunnel). Bounds are logical pixels from the window's
     /// top-left. Errors on backends without the GTK/WebKit overlay path.
     ///
-    /// `focused` says whether this surface is being created for someone to LOOK
+    /// `visible` says whether this surface is being created for someone to LOOK
     /// AT. It must be false for a headless create (`web ensure`, which demotes
-    /// the surface in the same tick): a surface nobody can see may not hold the
-    /// window's keyboard focus, or the user's typing goes into it instead of
-    /// their terminal.
+    /// the surface in the same tick), and it decides two things: a surface
+    /// nobody can see may not hold the window's keyboard focus (or the user's
+    /// typing goes into it instead of their terminal), and it is born HIDDEN to
+    /// the engine so its page reports `document.visibilityState: 'hidden'` and
+    /// throttles its animation from the first frame.
     #[allow(clippy::too_many_arguments)]
     pub fn open_web_surface(
         &self,
@@ -160,7 +162,7 @@ impl DesktopService {
         y: i32,
         w: i32,
         h: i32,
-        focused: bool,
+        visible: bool,
     ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
@@ -183,7 +185,7 @@ impl DesktopService {
                     y,
                     w,
                     h,
-                    focused,
+                    visible,
                 ),
                 None => Err("web surface host not installed".to_string()),
             };
@@ -208,7 +210,7 @@ impl DesktopService {
                 y,
                 w,
                 h,
-                focused,
+                visible,
             );
             Err("web surfaces require the GTK/WebKit backend".to_string())
         }
@@ -650,8 +652,12 @@ impl DesktopService {
         }
     }
 
-    /// Throttle/unthrottle a soft-stashed surface's CPU by hiding/showing its
-    /// inner webview (WebKitGTK page-visibility). See `WebSurfaceHost::set_throttled`.
+    /// Throttle/unthrottle a surface's CPU by hiding/showing its inner webview,
+    /// which is how WebKitGTK derives page visibility — a throttled surface's
+    /// page reads `document.visibilityState: 'hidden'`, so `rAF` stops and
+    /// timers throttle. Applied to every surface nobody is being shown, whether
+    /// it is soft-stashed on backgrounding or was created headless and never
+    /// revealed at all. See `WebSurfaceHost::set_throttled`.
     pub fn throttle_web_surface(&self, id: u64, throttled: bool) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
