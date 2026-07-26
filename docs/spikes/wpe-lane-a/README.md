@@ -253,3 +253,143 @@ env -u DISPLAY -u WAYLAND_DISPLAY ./target/release/wpe-readback \
 ```
 
 Exit 0 = PASS. `--size WxH` sets the offscreen viewport.
+
+
+---
+
+# Spike C — input routing + per-view process lifecycle (2026-07-27)
+
+Spike B's verdict was that pixels are solved and Lane-A's two remaining unknowns
+are **input** and **per-view lifecycle**. Both are now closed.
+`src/bin/wpe-input.rs`, shared plumbing in `src/headless.rs`.
+
+## Result
+
+```
+[spike] 1. view-a painted its initial state: red [255, 0, 0, 255]
+[spike]    child processes now: [(…, "WPENetworkProce"), (…, "bwrap"), (…, "bwrap"),
+                                 (…, "xdg-dbus-proxy"), (…, "bwrap"), (…, "bwrap"),
+                                 (…, "WPEWebProcess")]
+[spike] 2. CLICK LANDED — page turned green [0, 255, 0, 255]
+[spike] 3. KEYSTROKE LANDED — page turned blue [0, 0, 255, 255]
+[spike] 4. view-b painted independently: red [255, 0, 0, 255]
+[spike] 5. WPEWebProcess children: [3457713, 3457797]
+[spike] 6. killed WPEWebProcess 3457713
+[spike] view-a: web-process-terminated fired
+[spike] 7. views reporting web-process-terminated: ["view-a"]
+[spike] 8. survivor view-b STILL INTERACTIVE after the kill — answered a click
+[spike] 9. RESTARTED view-a via reload — painting again: red
+[spike] 10. restarted view-a answers input again
+[spike]    web processes after restart: [3457797, 3457862]
+[spike] ACCEPTANCE=PASS
+```
+
+**Everything is proven through the readback, never through a DOM query.** The
+fixture turns green only on `pointerdown` and blue only on a `keydown` whose
+`e.key === "x"`. Reading those colours out of the compositor's exported frame
+proves a real event travelled the real input path into WebCore; a
+`document.querySelector` check would have proven only that JavaScript runs.
+
+## Input — it works, with two gotchas
+
+- `wpe_view_backend_dispatch_pointer_event`: send a **motion event first**. The
+  button event alone has no hit-test position and lands at (0,0).
+- `wpe_view_backend_dispatch_keyboard_event`: `key_code` is an **XKB keysym**
+  (`XK_x` = 0x78), not an ASCII byte and not a scancode. `hardware_key_code` is
+  the evdev code + 8 (`KEY_X` 45 → 53). Get either wrong and the event is
+  silently ignored, which is indistinguishable from "input does not work".
+
+### ⛔ A claim I made and then falsified
+
+I expected `wpe_view_backend_add_activity_state(VISIBLE|FOCUSED|IN_WINDOW)` to
+be what makes keyboard delivery work, and wrote that into the code as "the
+single most important line in the spike". **A negative control removed it and
+steps 1-3 still passed** — click and keystroke both land without it on WPE
+2.52.5 + fdo. The comment is corrected in place rather than quietly dropped, so
+nobody cargo-cults it as the fix for dropped input.
+
+It is still set, for a different and real reason: activity state is what an
+embedder owes the engine for visibility/occlusion, which is exactly what page
+throttling keys on. A headless view that never declares its visibility is the
+"unrevealed surfaces report visible, so their pages never throttle" problem from
+the other direction.
+
+### ⚠ The crash that cost the most, and it is not in any header
+
+`wpe_view_backend_exportable_fdo_egl_create` **stores the client-struct pointer;
+it does not copy the struct.** Spike C first declared the client as a local
+inside the per-view constructor and took SIGSEGV as soon as the main loop
+dispatched a frame — at a *different point on each run*, the signature of
+reading a freed stack frame.
+
+Spikes A and B never hit this only because each had one view and declared the
+client inside `main`, where it happened to live for the whole program. **The
+moment views are constructed in a function — which any real multi-view engine
+does — the bug is immediate.** The client must be `static` or owned alongside
+the backend.
+
+## Per-view process lifecycle — better than assumed
+
+- **Isolation is the DEFAULT.** Two views produced **two `WPEWebProcess`**
+  instances with no extra configuration (no second `WebKitWebContext`, no
+  `g_object_new` gymnastics).
+- **A kill is attributed correctly.** Killing view-a's web process fired
+  `web-process-terminated` on **view-a only**.
+- **The survivor keeps working.** Proven by driving it: view-b *answered a
+  click* after the kill. ⚠ The first version of this check waited for a new
+  frame from the survivor and failed — a static page never repaints, so
+  "wait for a frame" can only ever prove the test is wrong. Interactivity is
+  the right evidence for "still working".
+- **Restart is `webkit_web_view_reload()`**, and it is complete: the view paints
+  again *and* answers input again, on a **new** web-process pid.
+- ⚠ **Web processes are NOT direct children.** The tree is
+  `app → bwrap → WPEWebProcess` (bubblewrap sandbox), plus a
+  `WPENetworkProcess` and an `xdg-dbus-proxy`. And `comm` in `/proc/<pid>/stat`
+  is truncated to 15 chars (`WPENetworkProce`). **Any supervisor must walk
+  descendants and match on a prefix** — a direct-children scan finds only
+  `bwrap` and concludes there are zero web processes, which is exactly what this
+  spike did on its first attempt.
+
+## Entry points — 6 new (46 total across A+B+C)
+
+| purpose | function |
+| --- | --- |
+| input | `wpe_view_backend_dispatch_pointer_event`, `wpe_view_backend_dispatch_keyboard_event` |
+| visibility | `wpe_view_backend_add_activity_state` |
+| lifecycle | `webkit_web_view_reload`, plus the `web-process-terminated` signal via the existing `g_signal_connect_data` |
+| main loop | `g_main_context_iteration` (non-blocking pump, replacing `g_main_loop_run`) |
+
+## Revised Lane-A sizing — the unknown list is EMPTY
+
+Spike A said the engine runs headless. Spike B said pixels come back at ~5 ms
+per megapixel. Spike C says **input lands and lifecycle is per-view and
+recoverable**. Nothing on the original Lane-A unknown list remains:
+
+- ~~Can Rust drive WPE headless?~~ Yes (A).
+- ~~Can we get pixels to the CPU?~~ Yes, ~5 ms/MP (B).
+- ~~Does input routing work without a widget hierarchy?~~ Yes (C) — and it is
+  *simpler* than GTK's, because there is no focus hierarchy to fight: the view
+  gets the event we hand it, which is precisely the "views are not widgets,
+  input routing becomes our code" property the plan wanted.
+- ~~Is per-view process lifecycle ours to build?~~ Mostly not. WebKit already
+  gives one process per view, correct per-view termination signals, and a
+  one-call restart.
+
+**What is genuinely left is bookkeeping, not risk:** a supervisor that walks
+sandboxed descendants (bwrap, truncated `comm`) to map process → view, since
+neither API reports that mapping; owning the client-struct lifetime; and the
+keysym translation table for synthetic keyboard input. The binding surface is
+now measured end-to-end at **46 hand-written declarations** — still no codegen,
+no gir, no new workspace dependency. Lane A is no longer a research question;
+it is an implementation with known parts.
+
+## Running it
+
+```sh
+cd docs/spikes/wpe-lane-a
+python3 -m http.server 8742 --bind 127.0.0.1 --directory fixture &
+cargo build --release --bin wpe-input
+env -u DISPLAY -u WAYLAND_DISPLAY ./target/release/wpe-input http://127.0.0.1:8742
+```
+
+Exit 0 = PASS.
