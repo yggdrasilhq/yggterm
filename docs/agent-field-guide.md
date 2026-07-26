@@ -297,6 +297,32 @@ into a pure function the loop CALLS, so reverting the loop's wiring changes the
 pure function's observed input. A test that calls the helper directly is
 structurally incapable of observing what the loop passes it.
 
+**All five are now closed** (`41b7b1b` GL, `4a2c836` memo key, ROUND-15 scan
+coverage floor, the batch locks in `web_do_verb_tests`, and
+`shell::web_surface_reclaim_locks` for the reclaim family). The reclaim one is
+the worked example of the rule, because it is the case where the wiring lived in
+an `async` loop holding a live `DesktopContext` — nothing a test can call:
+
+1. **The loop keeps no policy and no bookkeeping.** It reads `/proc`, reads the
+   configured hold, names its backgrounded surfaces, and calls
+   `web_surface_reclaim_background_pass`. Every decision — which pressure
+   reading, which surface's audio, whether the reap is recorded, whether a soft
+   stash demotes or detaches — moved into that pass.
+2. **The world is a trait.** `WebSurfaceBackgroundHost` carries destroy / stash /
+   demote / throttle / clear-loading / trace, so a test asserts on what the pass
+   DID, not on what a helper returned. `LiveWebSurfaceBackgroundHost` is the only
+   un-mockable code left and is four one-line methods.
+3. **The residual seam is locked structurally.** The loop's own argument list
+   still cannot be reached, so
+   `the_reclaim_pass_call_site_is_wired_to_the_live_machine` scans it — over
+   `yggterm_core::agent_cli::product_lines`, the workspace's ONE test-module skip
+   rule, so the lock's own text cannot satisfy the needles it looks for.
+
+**Twenty-one mutations were run against it, one per production call site, each
+proven red and restored.** If you touch this family, re-run them: the script
+shape is in the round-25 report, and a lock nobody re-proves decays into the
+thing this section is about.
+
 ### 7.2 Never run several workflow lanes on `main` in one checkout
 
 Three fix lanes were pointed at `main` in the same working tree. Two edited
