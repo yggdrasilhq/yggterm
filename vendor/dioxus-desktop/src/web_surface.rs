@@ -172,9 +172,10 @@ struct Surface {
 /// - **profile dir** — the on-disk jar. Different jars must never mix.
 /// - **socks port** — wry sets the proxy on the context's `WebsiteDataManager`
 ///   at build time (`webkitgtk/mod.rs`), so two surfaces egressing through
-///   different tunnels cannot share one. Today a remote session mints a tunnel
-///   per TAB, which keeps its tabs apart until the tunnel is hoisted to the
-///   session; a local session (no proxy) shares immediately.
+///   different tunnels cannot share one. A remote session's tabs share ONE
+///   `ssh -N -D` tunnel (`adopt_web_surface_session_socks`), so they agree here;
+///   a local session has no proxy and agrees trivially. Sessions on different
+///   hosts have different tunnels and correctly do not share.
 /// - **signer base** — the `yggterm-appctl://` scheme is registered on the
 ///   CONTEXT and proxies to exactly one session's control endpoint. Two sessions
 ///   sharing a profile must not share a context, or one session's page would
