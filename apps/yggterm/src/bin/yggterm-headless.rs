@@ -16,7 +16,7 @@ use yggterm_server::{
     ensure_local_daemon_running, fetch_remote_generation_context,
     persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_split_group, run_app_control_create_terminal,
+    run_app_control_create_split_group, run_app_control_create_terminal_with_tenancy,
     run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_split_pane, run_app_control_focus_window,
@@ -163,6 +163,7 @@ fn print_server_help() {
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin)
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
+  yggterm-headless server terminal tenants [<session>]
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
@@ -192,6 +193,22 @@ fn print_server_app_help() {
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm-headless server app terminal send <session> (--data <data>|--stdin)
+  yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+      [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--ephemeral [--ephemeral-owner-pid <pid>] [--ephemeral-idle-ttl-secs <n>]]
+
+row tenancy (server app terminal new): every create from this CLI is stamped
+  with the creating pid, this host, and --purpose if given; read it back with
+  `server terminal tenants`. --ephemeral additionally OPTS IN to reaping: the
+  row is closed gracefully (tombstone + trace) once the owner pid leaves /proc,
+  or after --ephemeral-idle-ttl-secs seconds with no output, whichever rule was
+  declared. The owner defaults to THIS CLI'S PARENT process — a row that must
+  outlive the shell that created it needs an explicit --ephemeral-owner-pid or
+  an idle TTL. Ephemerality BEATS keep-alive: both are the agent's own
+  declarations and the explicit one at creation is the later, narrower word.
+  Rows created any other way, and rows with no declaration, are never reaped.
+  The check rides an existing daemon chore tick (12-60 s), so a rule fires
+  within about a minute of becoming true, never instantly.
 
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
@@ -383,6 +400,25 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// and resurrects closed sessions.
 fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
     yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
+}
+
+/// Provenance + opt-in ephemerality for a row this CLI is about to create.
+/// Every agent CLI create is stamped; only an explicit `--ephemeral` arms the
+/// reaper. See `yggterm_server::session_tenancy`.
+fn agent_cli_create_terminal_tenancy(
+    args: &[String],
+) -> Result<yggterm_server::CreateTerminalTenancy> {
+    use yggterm_server::session_tenancy::{
+        calling_process_parent_pid, create_terminal_tenancy_from_args, local_host_token,
+    };
+    create_terminal_tenancy_from_args(
+        args,
+        std::process::id(),
+        calling_process_parent_pid(),
+        &local_host_token(),
+        cli_flag_value(args, "--purpose"),
+    )
+    .map_err(|message| anyhow::anyhow!(message))
 }
 
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
@@ -1174,6 +1210,33 @@ fn main() -> Result<()> {
                 "running": running,
                 "declare_count": records.len(),
                 "declares": records,
+            }))?
+        );
+        return Ok(());
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
+        // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant
+        // class). Read-only and ON DEMAND — nothing polls, so asking costs one
+        // /proc reading and idling costs nothing. Connect directly like the
+        // other read-only diagnostics: no version gate, no daemon spawn.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let session_path = args.get(3).map(String::as_str).filter(|value| {
+            !value.starts_with("--")
+        });
+        let (rows, degraded) = yggterm_server::terminal_tenants(&endpoint, session_path)?;
+        let measured = rows
+            .iter()
+            .filter(|row| row.unavailable_reason.is_none())
+            .count();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_path": session_path,
+                "row_count": rows.len(),
+                "measured_rows": measured,
+                "unmeasured_rows": rows.len() - measured,
+                "degraded": degraded,
+                "rows": rows,
             }))?
         );
         return Ok(());
@@ -2233,12 +2296,13 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
-                        run_app_control_create_terminal(
+                        run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
                             title_hint,
                             kind,
                             activate,
+                            Some(agent_cli_create_terminal_tenancy(&args)?),
                             timeout_ms,
                         )
                     }

@@ -30,7 +30,8 @@ use yggterm_server::{
     open_stored_session_with_view, ping, reorder_live_sessions_scoped,
     resolve_client_daemon_endpoint, row_order_ledger_report, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_create_terminal_with_tenancy, run_app_control_describe_rows,
+    run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_ensure_web_surface, run_app_control_focus_window,
     run_app_control_grid, run_app_control_key, run_app_control_list_clients,
@@ -573,6 +574,26 @@ fn apply_client_identity_args(args: &[String]) -> Result<()> {
     }
     yggterm_server::set_client_identity(yggterm_server::ClientIdentity { role, client_id });
     Ok(())
+}
+
+/// Provenance + opt-in ephemerality for a row this CLI is about to create.
+/// Same surface as the headless binary's — both are the agent CLI, and the
+/// flags must mean the same thing on either. See
+/// `yggterm_server::session_tenancy`.
+fn agent_cli_create_terminal_tenancy(
+    args: &[String],
+) -> Result<yggterm_server::CreateTerminalTenancy> {
+    use yggterm_server::session_tenancy::{
+        calling_process_parent_pid, create_terminal_tenancy_from_args, local_host_token,
+    };
+    create_terminal_tenancy_from_args(
+        args,
+        std::process::id(),
+        calling_process_parent_pid(),
+        &local_host_token(),
+        cli_flag_value(args, "--purpose"),
+    )
+    .map_err(|message| anyhow::anyhow!(message))
 }
 
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -3106,12 +3127,13 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
-                        run_app_control_create_terminal(
+                        run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
                             title_hint,
                             kind,
                             activate,
+                            Some(agent_cli_create_terminal_tenancy(&args)?),
                             timeout_ms,
                         )
                     }
