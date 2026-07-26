@@ -65,7 +65,40 @@ def load_samples(outdir: Path) -> list[dict]:
     return rows
 
 
-def focus_intervals(trace_path: Path) -> list[tuple[int, int]]:
+def generation_paths(outdir: Path, arm: str, stem: str) -> list[Path]:
+    """Every generation of one arm's stream, oldest first.
+
+    These streams rotate by SIZE into `<stem>.g<ts_ms>.jsonl` (plus the legacy
+    `<stem>.previous.jsonl`), and the ONE window_focus transition a lab GUI
+    emits is the OLDEST line in the oldest file. Reading only the live file
+    means a rotation — guaranteed on a 25-minute arm under a forced emitter —
+    silently costs the arm its focus evidence and part of its exposure count.
+    Ordered by the generation stamp in the NAME, never by mtime: a copy
+    rewrites mtime.
+    """
+    live = outdir / f"{arm}.{stem}.jsonl"
+    stamped: list[tuple[int, Path]] = []
+    for path in outdir.glob(f"{arm}.{stem}.g*.jsonl"):
+        digits = path.name[len(f"{arm}.{stem}.g") : -len(".jsonl")]
+        if digits.isdigit():
+            stamped.append((int(digits), path))
+    stamped.sort()
+    legacy = outdir / f"{arm}.{stem}.previous.jsonl"
+    ordered = [path for path in (legacy,) if path.exists()]
+    ordered += [path for _, path in stamped]
+    if live.exists():
+        ordered.append(live)
+    return ordered
+
+
+def read_stream_lines(paths: list[Path]) -> list[str]:
+    lines: list[str] = []
+    for path in paths:
+        lines.extend(path.read_text(errors="replace").splitlines())
+    return lines
+
+
+def focus_intervals(trace_lines: list[str]) -> list[tuple[int, int]]:
     """Focused intervals as a STEP FUNCTION from ui/window_focus/transition.
 
     Reconstructed rather than read per sample, because focus is a property of
@@ -73,11 +106,12 @@ def focus_intervals(trace_path: Path) -> list[tuple[int, int]]:
     focused nor unfocused — it is uninterpretable, and averaging it in is
     exactly how the 2.3x "regression" happened. An interval left open at the
     end of the trace stays open.
+
+    Takes LINES, not a path: the trace arrives as several rotated generations
+    and the transition that matters is usually in the oldest one.
     """
-    if not trace_path.exists():
-        return []
     events = []
-    for line in trace_path.read_text(errors="replace").splitlines():
+    for line in trace_lines:
         if '"window_focus"' not in line:
             continue
         try:
@@ -106,12 +140,15 @@ def wholly_inside(sample: dict, intervals: list[tuple[int, int]]) -> bool:
     return any(start <= t0 and t1 <= end for start, end in intervals)
 
 
-def exposure(perf_path: Path, t0: int, t1: int) -> int:
-    """xterm_write_flush events inside the window: how much actually painted."""
-    if not perf_path.exists():
-        return 0
+def exposure(perf_lines: list[str], t0: int, t1: int) -> int:
+    """xterm_write_flush events inside the window: how much actually painted.
+
+    Lines, not a path, for the same reason as `focus_intervals` — and because
+    this is called once per sample, so re-reading the (now multi-generation)
+    stream per row would be quadratic.
+    """
     count = 0
-    for line in perf_path.read_text(errors="replace").splitlines():
+    for line in perf_lines:
         if "xterm_write_flush" not in line:
             continue
         try:
@@ -130,11 +167,13 @@ def annotate(rows: list[dict], outdir: Path) -> list[dict]:
     for row in rows:
         by_arm.setdefault(row["arm"], []).append(row)
     for arm, arm_rows in by_arm.items():
-        intervals = focus_intervals(outdir / f"{arm}.event-trace.jsonl")
-        perf = outdir / f"{arm}.perf-telemetry.jsonl"
+        intervals = focus_intervals(
+            read_stream_lines(generation_paths(outdir, arm, "event-trace"))
+        )
+        perf_lines = read_stream_lines(generation_paths(outdir, arm, "perf-telemetry"))
         for row in arm_rows:
             row["focused"] = wholly_inside(row, intervals) if intervals else None
-            row["exposure"] = exposure(perf, int(row["t0_ms"]), int(row["t1_ms"]))
+            row["exposure"] = exposure(perf_lines, int(row["t0_ms"]), int(row["t1_ms"]))
     return rows
 
 
@@ -412,13 +451,69 @@ def self_test() -> int:
     if "DRIFT" not in buffer.getvalue():
         failures.append(f"drift-gate: a 0.01 shift under 0.5 drift was not caught: {buffer.getvalue()!r}")
 
+    # 9. the ONE focus transition lives in a ROTATED generation. Reading only
+    #    the live file voids the arm for "no window_focus trace" — a refusal
+    #    that has nothing to do with GL, and the exact shape of the bug: a
+    #    25-minute arm under a forced emitter rotates an 8 MiB trace, and the
+    #    single transition a lab GUI emits is the oldest line in it.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as scratch:
+        outdir = Path(scratch)
+        (outdir / "H.event-trace.g1000.jsonl").write_text(
+            json.dumps(
+                {
+                    "ts_ms": 1000,
+                    "category": "window_focus",
+                    "name": "transition",
+                    "payload": {"focused": True},
+                }
+            )
+            + "\n"
+        )
+        (outdir / "H.event-trace.jsonl").write_text(
+            json.dumps({"ts_ms": 99000, "category": "render", "name": "frame"}) + "\n"
+        )
+        (outdir / "H.perf-telemetry.g900.jsonl").write_text(
+            json.dumps({"ts_ms": 2000, "name": "xterm_write_flush"}) + "\n"
+        )
+        (outdir / "H.perf-telemetry.jsonl").write_text(
+            json.dumps({"ts_ms": 3000, "name": "xterm_write_flush"}) + "\n"
+        )
+        names = [path.name for path in generation_paths(outdir, "H", "event-trace")]
+        if names != ["H.event-trace.g1000.jsonl", "H.event-trace.jsonl"]:
+            failures.append(f"generations: wrong order or coverage: {names}")
+        annotated = annotate(
+            [
+                {
+                    "arm": "H",
+                    "cores": 0.3,
+                    "gpu_ms": 7,
+                    "t0_ms": 1500,
+                    "t1_ms": 6500,
+                }
+            ],
+            outdir,
+        )
+        if annotated[0]["focused"] is not True:
+            failures.append(
+                "generations: the focus transition in a rotated generation was "
+                "not seen — the arm would be VOIDed for a non-GL reason"
+            )
+        if annotated[0]["exposure"] != 2:
+            failures.append(
+                f"generations: exposure counted {annotated[0]['exposure']} of 2 "
+                f"flushes — rotated perf generations are being dropped"
+            )
+
     if failures:
         print("SELF-TEST FAILED:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("SELF-TEST PASSED: all 8 gate behaviours verified (5 refusals fire, "
-          "clean arms pass, exposure and drift gates fire)")
+    print("SELF-TEST PASSED: all 9 gate behaviours verified (5 refusals fire, "
+          "clean arms pass, exposure and drift gates fire, rotated generations "
+          "are read)")
     return 0
 
 

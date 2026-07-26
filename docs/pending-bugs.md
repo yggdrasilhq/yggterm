@@ -4,6 +4,21 @@ Open, user-confirmed bugs that are NOT yet fixed. An agent asked to "finish the
 pending bugs" should start here. Remove an entry (in the same commit as the
 fix) once the fix is verified live on jojo.
 
+## ⚠ READ FIRST — the state of the machine, 2026-07-26
+
+- **jojo runs hardware GL with Phase F under-glass OFF.** That pairing is new
+  and deliberate: arming under-glass put a background agent's page over the
+  user's entire window. `YGGTERM_FORCE_SOFTWARE_GL=1` reverts everything.
+- **The GPU CPU win is NOT established.** Every large figure previously recorded
+  here was an artefact of comparing windows with different paint exposure. See
+  `docs/optimization-pass.md` and field guide §7.3 before quoting any number.
+- **Two supernumerary daemons persist** holding unmigratable `local://` shells.
+  That is the durable half of the chaining bug, still open.
+- **The vault agents on dev and jojo still need ONE `ychrome-vault unlock` each**
+  — the 401-on-write fix is installed but the running agents predate it.
+- **Five could-only-pass locks shipped in two rounds.** Before trusting ANY
+  test in a report, mutate the production call site yourself. Field guide §7.1.
+
 ## Standing traps / other open bugs
 
 - **★★★ WE FORCED SOFTWARE GL ON A HOST THAT HAS WORKING HARDWARE GL. The

@@ -670,3 +670,34 @@ runs the S/H/G/S2 arms and `scripts/gl_ab_analyze.py` gates the result on all fo
 standing traps plus a drift control. It is built to answer **"this settles nothing"**,
 and that is a valid outcome — three earlier hand-rolled attempts each returned a
 confident number instead.
+
+## 8. What the agent-load incident taught, and what is still owed (2026-07-26)
+
+The pass was chasing a render number while the actual felt problem was
+elsewhere. Under a real swarm of agents the machine went to **124 kB of free
+swap out of 16.7 GB**, 76.6 °C, and the GUI could not answer `server app state`
+for 25 seconds. What was consuming it was not painting:
+
+- **The reaper was causing the pressure it reacted to** — 166 destroy/recreate
+  cycles in fifteen minutes, one churned WebKit process ballooning to 3.9 GB.
+  Fixed (real-pressure predicate + per-surface hysteresis + audio veto).
+- **One WebContext per TAB** — see `docs/web-surfaces.md`. This is where the
+  memory ceiling for "hundreds of tabs" actually lives, not in the renderer.
+- **Three chained daemons burned 0.205 cores** — 36% of yggterm's total 0.564
+  — while owning almost nothing, because each re-read the whole retained
+  perf-telemetry corpus every 30 s and each walked the full transcript store
+  regardless of what it owned. Both fixed; measured after, the new daemon runs
+  0.0130 cores against the old ones' 0.0183/0.0157 — **~25%, not the large win
+  the finding implied**, because the corpus is smaller now than when it was
+  measured. Re-measure when the log grows before quoting it.
+
+**Still owed, and it is the honest gate on this whole pass:** a matched-load
+A/B. `scripts/gl_ab_experiment.sh` + `gl_ab_measure.sh` + `gl_ab_analyze.py`
+exist and are built to be able to answer "this settles nothing". They need a
+quiet host, `window_focused` held constant on both arms, several hundred render
+ticks, and the same `daemon_request/terminal_read` rate on each side.
+`YGGTERM_FORCE_SOFTWARE_GL=1` is the A/B switch, so both arms run on ONE build.
+
+⚠ Do not start that experiment while agents are working: the one arm that did
+paint was contaminated by five concurrent agents on the host, and the arm after
+it measured a GUI displaying a different session entirely.

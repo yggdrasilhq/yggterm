@@ -58,11 +58,19 @@
 #   N=240             samples per arm               (default 240)
 #   SAMPLE_S=5        seconds per sample            (default 5)
 #   WARM_S=300        warm-up discarded per arm     (default 300)
+#   LAUNCH_S=15       settle time before verify_arm (default 15)
 #   LINES_PER_S=20    deterministic paint rate      (default 20)
 #   YG=...            yggterm binary                (default ~/.local/bin/yggterm)
+#   GL_AB_MEASURE=... per-sample measurement script (default gl_ab_measure.sh;
+#                     scripts/gl_ab_selftest.sh is the only caller that should
+#                     ever set it — the refusals that make a sample trustworthy
+#                     live in the default)
 #
 # Smoke it before committing 90 minutes:
 #   ARMS="S H" WARM_S=120 N=60 scripts/gl_ab_experiment.sh /tmp/glab-smoke
+#
+# Prove the harness itself still works, on any machine, GUI or not:
+#   scripts/gl_ab_selftest.sh
 
 set -uo pipefail
 
@@ -71,18 +79,35 @@ ARMS="${ARMS:-S H G S2}"
 N="${N:-240}"
 SAMPLE_S="${SAMPLE_S:-5}"
 WARM_S="${WARM_S:-300}"
+LAUNCH_S="${LAUNCH_S:-15}"
 LINES_PER_S="${LINES_PER_S:-20}"
 YG="${YG:-$HOME/.local/bin/yggterm}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEASURE="$HERE/gl_ab_measure.sh"
+MEASURE="${GL_AB_MEASURE:-$HERE/gl_ab_measure.sh}"
+VERIFY_ENV="$HERE/gl_ab_verify_env.py"
 
-# Every GL key that can decide an arm behind our back. `env -u` all of them on
-# every launch; `verify_arm` then asserts they are still absent afterwards.
-GL_KEYS=(
+# The keys that can decide the GL path BEHIND OUR BACK: the shell half of
+# yggterm_core::gl_probe::GL_PROBE_STRIPPED_ENV. `verify_arm` asserts a hardware
+# arm published NONE of them; the Rust drift lock
+# (gl_probe.rs::the_gl_ab_harness_scrubs_every_key_the_probe_strips) keeps this
+# list from falling behind the binary's.
+#
+# ONE list, used twice. It was two: the scrub knew four keys and the absence
+# assertion inlined its own three, dropping WEBKIT_DISABLE_COMPOSITING_MODE —
+# the exact key an inheriting agent shell carries, and the one that makes an arm
+# report hardware while presenting over SHM.
+SOFTWARE_GL_KEYS=(
 	LIBGL_ALWAYS_SOFTWARE
 	GALLIUM_DRIVER
 	WEBKIT_DISABLE_DMABUF_RENDERER
 	WEBKIT_DISABLE_COMPOSITING_MODE
+)
+
+# Every GL key that can decide an arm behind our back. `env -u` all of them on
+# every launch; `verify_arm` then asserts the software-forcing ones are still
+# absent afterwards.
+GL_KEYS=(
+	"${SOFTWARE_GL_KEYS[@]}"
 	YGGTERM_FORCE_SOFTWARE_GL
 	YGGTERM_ENABLE_WEBKIT_COMPOSITING
 	YGGTERM_WEBKIT_GL_POLICY
@@ -95,6 +120,7 @@ note() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 [ -x "$YG" ] || die "no yggterm binary at $YG"
 [ -x "$MEASURE" ] || die "missing $MEASURE — this script measures THROUGH it, on purpose"
+[ -r "$VERIFY_ENV" ] || die "missing $VERIFY_ENV — an arm that cannot be verified must not run"
 command -v sway >/dev/null || die "sway is the headless compositor backend; not found"
 mkdir -p "$OUT" || die "cannot create $OUT"
 
@@ -150,6 +176,13 @@ verify_arm() { # arm gui_pid -> 0 or die
 	# the exec-time environment, and every GL key is written after exec, so it
 	# shows nothing on a fresh launch and the PREDECESSOR's decision after a
 	# hot restart.
+	#
+	# The reader is a FILE taking the report as an argument, not a heredoc
+	# taking it on stdin. It was the latter, with the JSON ALSO on stdin as a
+	# herestring: two redirections, one fd, the herestring last — so python read
+	# the JSON as its program and this function died on every arm of every run.
+	# One thing on fd 0, and the reader is self-testable on a machine with no
+	# GUI at all.
 	local policy absent
 	read -r policy absent < <(python3 - "$arm" <<-'PY' <<<"$identity"
 		import json, sys
@@ -221,7 +254,13 @@ run_arm() {
 		"${armenv[@]}" \
 		"$YG" >"$OUT/$arm.gui.log" 2>&1 &
 	local gui=$!
-	sleep 15
+	# Published BEFORE anything can refuse, so the EXIT trap can reap it. Every
+	# `die` below used to skip the kill at the end of this function, so the first
+	# refusal orphaned a GUI and its daemon still holding YGGTERM_HOME=$home —
+	# and the next run's `rm -rf "$home"` deleted that home under a live daemon.
+	ARM_GUI_PID="$gui"
+	ARM_GUI_HOME="$home"
+	sleep "$LAUNCH_S"
 	[ -d "/proc/$gui" ] || die "[$arm] GUI died on launch; see $OUT/$arm.gui.log"
 
 	export YGGTERM_HOME="$home"
@@ -256,17 +295,59 @@ run_arm() {
 	done
 	note "arm $arm: $ok samples accepted, $refused refused by the measurement"
 
-	cp "$home/perf-telemetry.jsonl" "$OUT/$arm.perf-telemetry.jsonl" 2>/dev/null || true
-	cp "$home/event-trace.jsonl" "$OUT/$arm.event-trace.jsonl" 2>/dev/null || true
+	# EVERY GENERATION, not just the live file. These streams rotate by SIZE
+	# (event-trace at 8 MiB, perf-telemetry at 16 MiB) into
+	# `<stem>.g<ts_ms>.jsonl`, and an arm runs ~25 minutes under a forced
+	# 20-lines/s emitter. A lab GUI that focuses at launch and stays focused
+	# emits exactly ONE ui/window_focus/transition — the OLDEST line in the
+	# file. Copying only the live file drops it the moment the stream rotates,
+	# and the analyzer then voids the arm for "no window_focus trace": a refusal
+	# that has nothing to do with GL. Exposure counts degrade the same way, and
+	# asymmetrically per arm.
+	copy_stream() { # stem
+		local stem="$1" generation base
+		for generation in "$home/$stem".jsonl "$home/$stem".g*.jsonl "$home/$stem".previous.jsonl; do
+			[ -f "$generation" ] || continue
+			base="$(basename "$generation")"
+			cp "$generation" "$OUT/$arm.$base" 2>/dev/null || true
+		done
+	}
+	copy_stream perf-telemetry
+	copy_stream event-trace
 
 	kill "$gui" 2>/dev/null
 	wait "$gui" 2>/dev/null
+	# The GUI's daemon does NOT die with it: it holds this arm's home, and the
+	# next arm's `rm -rf` would delete the home out from under it. YGGTERM_HOME
+	# is spelled inline rather than inherited so this can never reach the user's
+	# own daemon.
+	YGGTERM_HOME="$home" "$YG" server shutdown >/dev/null 2>&1 || true
+	ARM_GUI_PID=""
+	ARM_GUI_HOME=""
 	unset YGGTERM_HOME
 	[ "$ok" -gt 0 ] || die "[$arm] every sample was refused — nothing to analyze"
 }
 
 # ---------------------------------------------------------------------------
-trap 'kill ${COMP_PID:-} 2>/dev/null' EXIT
+# Reap EVERYTHING this run started, on every exit path including `die`. The
+# trap used to kill only the compositor.
+ARM_GUI_PID=""
+ARM_GUI_HOME=""
+cleanup() {
+	local status=$?
+	if [ -n "$ARM_GUI_PID" ]; then
+		kill "$ARM_GUI_PID" 2>/dev/null || true
+		wait "$ARM_GUI_PID" 2>/dev/null || true
+	fi
+	if [ -n "$ARM_GUI_HOME" ]; then
+		YGGTERM_HOME="$ARM_GUI_HOME" "$YG" server shutdown >/dev/null 2>&1 || true
+	fi
+	if [ -n "${COMP_PID:-}" ]; then
+		kill "$COMP_PID" 2>/dev/null || true
+	fi
+	exit "$status"
+}
+trap cleanup EXIT
 
 start_compositor || die "the private compositor did not get its own wayland socket — refusing to run the lab window on the user's desktop"
 note "private compositor pid=$COMP_PID socket=$LAB_WAYLAND"

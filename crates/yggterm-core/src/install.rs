@@ -1619,6 +1619,7 @@ mod tests {
         let mut offenders: Vec<String> = Vec::new();
         let mut files_scanned = 0usize;
         let mut lines_scanned = 0usize;
+        let mut harness_seen = 0usize;
         for entry in fs::read_dir(&scripts)
             .expect("scripts/ must be readable")
             .flatten()
@@ -1636,6 +1637,29 @@ mod tests {
             };
             files_scanned += 1;
             lines_scanned += text.lines().count();
+            // The GL A/B harness is the one legitimate GL-path setter in
+            // scripts/: an A/B whose arms cannot force their own arm is not an
+            // A/B. It is a MEASUREMENT tool, never installed and never on a
+            // launch path — which is the distinction this lock is really about.
+            // Named exactly, not pattern-matched, so a launcher cannot smuggle
+            // itself in by picking a similar filename.
+            let is_the_gl_experiment_harness = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "gl_ab_experiment.sh"
+                            | "gl_ab_measure.sh"
+                            | "gl_ab_selftest.sh"
+                            | "gl_ab_verify_env.py"
+                            | "gl_ab_analyze.py"
+                    )
+                });
+            if is_the_gl_experiment_harness {
+                harness_seen += 1;
+                continue;
+            }
             if script_declares_the_webkit_gl_path(&text) {
                 offenders.push(path.display().to_string());
             }
@@ -1649,6 +1673,14 @@ mod tests {
         assert!(
             lines_scanned >= 20_000,
             "the scanner only read {lines_scanned} lines — it has gone blind"
+        );
+        // The exemption must apply to something that EXISTS. If the harness is
+        // renamed or deleted, this list is silently exempting nothing and the
+        // next launcher to set a GL var walks straight through the hole.
+        assert!(
+            harness_seen >= 2,
+            "the GL-harness exemption matched {harness_seen} files — it is stale, \
+             so it is now a hole rather than an exemption"
         );
         assert!(
             offenders.is_empty(),
