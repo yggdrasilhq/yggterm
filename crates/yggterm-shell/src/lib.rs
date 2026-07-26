@@ -1,6 +1,13 @@
 #![recursion_limit = "512"]
 
 mod agent_input_arbiter;
+// The SHELL-side arm matrix is a TEST artifact (harness spec §8 phase 2b), the
+// twin of `yggterm_server::agent_arm_matrix`: it locks the GUI-side per-arm
+// decisions — readiness/overlay (§7.3), attach seed (§7.6), mount identity
+// (§7.10) — against one table, so a change that touches one arm cannot pass
+// while quietly changing another.
+#[cfg(test)]
+mod agent_arm_shell_matrix;
 mod app_capture;
 mod command_registry;
 // The ONE client-side owner of "a daemon handover is in progress, stop painting"
