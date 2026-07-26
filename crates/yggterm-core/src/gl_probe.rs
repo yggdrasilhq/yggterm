@@ -862,6 +862,43 @@ mod tests {
         assert_eq!(args, vec![GL_PROBE_FLAG.to_string()]);
     }
 
+    /// The A/B harness scrubs the GL environment before every arm launch, and its
+    /// list must not drift below the binary's own. [`GL_PROBE_STRIPPED_ENV`] is the
+    /// SSOT for "environment that must not be allowed to decide the GL path"; a key
+    /// added there and missed in the harness means an arm launches carrying an
+    /// inherited answer and reports `hardware_gl_probed` while presenting over SHM.
+    /// That failure is silent in both directions, which is why it is locked rather
+    /// than documented.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gl_ab_harness_scrubs_every_key_the_probe_strips() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("gl_ab_experiment.sh");
+        let text = std::fs::read_to_string(&script).expect("gl_ab_experiment.sh must be readable");
+        let scrub = text
+            .split("GL_KEYS=(")
+            .nth(1)
+            .and_then(|suffix| suffix.split(')').next())
+            .expect("gl_ab_experiment.sh must declare a GL_KEYS scrub list");
+        // Coverage floor: an empty capture would satisfy nothing below.
+        assert!(
+            scrub.lines().count() > 4,
+            "the scrub-list scanner captured {} lines — it has gone blind",
+            scrub.lines().count()
+        );
+        for key in GL_PROBE_STRIPPED_ENV {
+            assert!(
+                scrub.contains(key),
+                "gl_ab_experiment.sh does not scrub {key}, which the probe strips — \
+                 an arm launched with it inherited would report hardware while \
+                 presenting over SHM"
+            );
+        }
+    }
+
     #[test]
     fn the_probe_flag_selects_probe_mode() {
         assert!(should_run_as_gl_probe(&[GL_PROBE_FLAG.to_string()]));
