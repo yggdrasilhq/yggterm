@@ -4524,10 +4524,28 @@ fn under_glass_default_armed(
     if software_gl && under_glass_var != Some("1") {
         return false;
     }
-    match under_glass_var {
-        Some(value) => value == "1",
-        None => true,
-    }
+    // ⛔ HARDWARE GL DOES NOT IMPLY ARMING PHASE F. It used to: the default was
+    // `true` for any host that was not on software GL, so probing a working GPU
+    // silently turned under-glass on for the first time in production — and the
+    // user's whole window became an agent's background page.
+    //
+    // Under glass the shell webview is TRANSPARENT by construction and the
+    // surfaces composite behind it, so anything that stops the shell painting
+    // stops being "a blank window" and starts being "whatever page happens to
+    // be back there, full screen". On the live host that happened while memory
+    // was exhausted (swap 100% full, the GUI too starved to answer a state
+    // probe for 25 s) — exactly when the shell is least likely to paint. Under
+    // the legacy stack the same starvation is invisible, because the shell is
+    // opaque.
+    //
+    // The two decisions were bundled for a reason that no longer holds. Under
+    // glass genuinely REQUIRES DMABuf (the refusal above), but the reverse was
+    // never true, and `shm_force_for_arming` now refuses SHM on a probed
+    // hardware host whatever arming decides. So hardware GL keeps DMABuf and
+    // keeps the measured GL benefit with under-glass OFF; Phase F is a separate
+    // feature and now needs its own explicit opt-in, which is what the user
+    // asked for when they said hardware GL should come back without this.
+    under_glass_var == Some("1")
 }
 
 /// What the arming decision implies for the WebKit presentation path. The
@@ -5999,18 +6017,35 @@ mod tests {
         );
     }
 
-    // F.1 tail: under-glass is DEFAULT ON — unset env arms it; only an
-    // explicit =0 or the legacy force turns it off. The legacy force wins
-    // over an explicit =1 (it is the escape hatch of last resort).
+    // ⛔ UNDER-GLASS IS OPT-IN, and this test used to assert the opposite.
+    //
+    // It was default-on for any host not on software GL, so the moment the GL
+    // probe found a working GPU, Phase F armed in production for the first time
+    // — and the user's entire window became an agent's background page. Under
+    // glass the shell is transparent by construction, so a shell that fails to
+    // paint (memory was exhausted: swap 100% full, the GUI too starved to
+    // answer a state probe for 25 s) stops showing a blank window and starts
+    // showing whatever surface is behind it, full screen.
+    //
+    // Arming now requires saying so. The GL benefit does not depend on it:
+    // `shm_force_for_arming` refuses SHM on a probed hardware host whatever
+    // arming decides, so hardware GL keeps DMABuf either way.
     #[test]
-    fn under_glass_defaults_on_with_explicit_opt_outs() {
-        // Hardware GL (software_gl = false): the historical default-on matrix.
-        assert!(under_glass_default_armed(None, None, false));
+    fn under_glass_arms_only_when_asked() {
+        // Hardware GL is NOT consent: an unset var must not arm Phase F.
+        assert!(
+            !under_glass_default_armed(None, None, false),
+            "hardware GL must not silently arm under-glass — that is how a \
+             background page took over the whole window"
+        );
         assert!(under_glass_default_armed(Some("1"), None, false));
         assert!(!under_glass_default_armed(Some("0"), None, false));
+        // The legacy force is the escape hatch of last resort and beats an
+        // explicit opt-in.
         assert!(!under_glass_default_armed(None, Some("1"), false));
         assert!(!under_glass_default_armed(Some("1"), Some("1"), false));
-        assert!(under_glass_default_armed(None, Some("0"), false));
+        // Legacy explicitly off is still not an opt-IN.
+        assert!(!under_glass_default_armed(None, Some("0"), false));
     }
 
     // A software-GL host must NOT arm by default: under glass requires the
@@ -6222,14 +6257,25 @@ mod tests {
                                          explicit under-glass request ({context})"
                                     );
                                     if under_glass_var.is_none() && !compositing_disabled_env {
-                                        // No user opinion at all: the default must be
-                                        // the diagonal and nothing but the diagonal.
+                                        // No user opinion at all. DMABuf still
+                                        // follows hardware GL — that is the
+                                        // measured half of the win and it must
+                                        // not depend on Phase F.
                                         assert_eq!(
                                             policy.hardware_gl,
                                             plan.webkit_disable_dmabuf_renderer
                                                 == GlEnvAction::Remove
                                         );
-                                        assert_eq!(policy.hardware_gl, armed);
+                                        // ...but arming does NOT follow it. A
+                                        // working GPU is not consent to turn on
+                                        // under-glass compositing; that pairing
+                                        // is what put an agent's page over the
+                                        // user's whole window.
+                                        assert!(
+                                            !armed,
+                                            "under-glass must stay unarmed without an \
+                                             explicit request ({context})"
+                                        );
                                     }
                                     cells += 1;
                                 }
