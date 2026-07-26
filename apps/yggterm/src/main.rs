@@ -1,5 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+/// The NATIVE notification audio path (`server app audio`). Not the webview:
+/// WebKitGTK's autoplay gate streams silent samples without a user gesture,
+/// which an agent cannot produce.
+mod audio_cli;
 mod supervisor;
 
 use anyhow::{Context, Result};
@@ -1144,6 +1148,16 @@ enum BuiltinCliCommand {
     ServerSnapshot,
 }
 
+/// `server app` subcommands that print their OWN help.
+///
+/// The generic `server app … --help` interception below runs BEFORE the app
+/// dispatcher, so without this exception it swallows the deeper help and the
+/// subcommand's help printer becomes dead code the user can never reach —
+/// which is exactly what happened to `server app audio --help`.
+fn server_app_subcommand_owns_its_help(subcommand: &str) -> bool {
+    matches!(subcommand, "audio")
+}
+
 fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
     match args {
         [arg] if matches!(arg.as_str(), "--help" | "-h" | "help") => {
@@ -1161,6 +1175,9 @@ fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
         [server, app, rest @ ..]
             if server == "server"
                 && app == "app"
+                && !rest
+                    .first()
+                    .is_some_and(|sub| server_app_subcommand_owns_its_help(sub))
                 && rest
                     .iter()
                     .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
@@ -1296,6 +1313,12 @@ fn web_usage_block() -> String {
 fn print_server_app_help() {
     println!(
         "usage:
+  yggterm server app audio play [--tone info|success|warning|error] [--repeat n]
+                                [--gap-ms n] [--preroll on|off|auto] [--volume 0..1]
+  yggterm server app audio tune --notes '[[startSec,freqHz,peak], …]'
+    NATIVE audio (no webview, no GUI needed): WebKitGTK's autoplay gate streams
+    silent samples without a user gesture, which an agent cannot produce.
+    `server app audio --help` has the tone patterns and the tune's provenance
   yggterm server app clients
   yggterm server app desktop-identity
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
@@ -2437,6 +2460,7 @@ fn main() -> Result<()> {
                     run_screenshot_capture(target, output_path, timeout_ms)
                 }
             }
+            "audio" => audio_cli::run_audio_command(&args),
             "screenrecord" => {
                 let duration_secs = args
                     .windows(2)
@@ -6075,8 +6099,9 @@ mod tests {
         app_control_state_settled_for_launch, classify_builtin_cli_command,
         compatible_signal_client_count, linux_window_profile_from_input,
         main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
-        record_matches_executable, should_handoff_to_preferred_executable,
-        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
+        record_matches_executable, server_app_subcommand_owns_its_help,
+        should_handoff_to_preferred_executable, should_retire_superseded_client,
+        signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
         signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
         superseded_client_retirement_strategy_label, under_glass_default_armed,
@@ -6509,6 +6534,53 @@ mod tests {
                 "--help".to_string()
             ]),
             Some(BuiltinCliCommand::ServerSessionsHelp)
+        );
+    }
+
+    /// A `server app` subcommand that prints its OWN help must not have that
+    /// help swallowed by the generic interception, or its help printer is code
+    /// the user can never reach. `audio` is the case that found this.
+    #[test]
+    fn a_server_app_subcommand_that_owns_its_help_is_not_intercepted() {
+        for spelling in ["--help", "-h", "help"] {
+            assert_eq!(
+                classify_builtin_cli_command(&[
+                    "server".to_string(),
+                    "app".to_string(),
+                    "audio".to_string(),
+                    spelling.to_string(),
+                ]),
+                None,
+                "`server app audio {spelling}` must fall through to the audio \
+                 dispatcher, which owns the audio help",
+            );
+        }
+        // Only the subcommands that actually have their own help are exempt —
+        // everything else still gets the app-level help, as before.
+        assert!(server_app_subcommand_owns_its_help("audio"));
+        assert!(!server_app_subcommand_owns_its_help("screenshot"));
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "screenshot".to_string(),
+                "--help".to_string(),
+            ]),
+            Some(BuiltinCliCommand::ServerAppHelp),
+        );
+        // Bare `server app` is still the app-level help, and `server app audio`
+        // with no subcommand still falls through to the audio help.
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
+            Some(BuiltinCliCommand::ServerAppHelp),
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "audio".to_string(),
+            ]),
+            None,
         );
     }
 
