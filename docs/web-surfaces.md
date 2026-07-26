@@ -90,12 +90,14 @@ Two rules that keep the media veto honest:
   playlist to save CPU is precisely the failure the veto exists to prevent.
 
 ⚠ **Memory pressure is `reclaim_pressured`, not `swap_pressured`.** Swap-*used*
-is a history counter: it latches TRUE after one bad afternoon and never clears,
-which is how the live host spent months hard-detaching and destroying every
-backgrounded surface five seconds after a switch (19 of 19 `native_stash` events
-carried `detached:true swap_pressured:true hold_ms:5000`) while sitting on 45%
-free RAM. The reclaim predicate reads current headroom (`MemAvailable` under 15%
-of `MemTotal`) or the kernel's PSI `some avg60` stall accounting. The
+is a history counter: it latches TRUE after one bad afternoon and never clears.
+On the live host that meant every backgrounded surface was hard-detached and
+destroyed five seconds after a switch, on a machine sitting on 45% free RAM —
+**every** `native_stash` event in the retained trace (19 of 19) carried
+`detached:true swap_pressured:true hold_ms:5000`, alongside 53
+`background_hold_expired` closes, so the 600 s soft-stash hold has no recorded
+execution at all. The reclaim predicate reads current headroom (`MemAvailable`
+under 15% of `MemTotal`) or the kernel's PSI `some avg60` stall accounting. The
 `native_stash` trace event now publishes `reclaim_pressured` and `media_active`
 so the decision is readable after the fact.
 
