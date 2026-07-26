@@ -621,7 +621,18 @@ fn parse_web_element_ref(
         .map(|raw| raw.parse::<usize>().context("--nth needs a number"))
         .transpose()?;
     if let Some(selector) = cli_flag_value(args, "--selector") {
-        return Ok(Some(WebElementRef::Css(selector.to_string())));
+        // `--nth` applies to a CSS selector too. A page that renders the same
+        // ids in two form blocks (a services portal's complainant/opposite-party pair)
+        // makes `#Name` ambiguous, and `querySelector` answers with the first
+        // silently — so the index has to be expressible. `nth: 0` serializes
+        // back to the bare string every existing payload uses.
+        return Ok(Some(match nth {
+            Some(0) | None => WebElementRef::Css(selector.to_string()),
+            Some(nth) => WebElementRef::CssNth {
+                css: selector.to_string(),
+                nth,
+            },
+        }));
     }
     if let Some(role) = cli_flag_value(args, "--role") {
         let label = cli_flag_value(args, "--label")
@@ -860,6 +871,22 @@ fn parse_web_surface_do_action(
                         .collect()
                 })
                 .unwrap_or_default(),
+            // Default `auto`: a plain text/textarea input gets the native
+            // setter (React controlled inputs drop injected keystrokes), and
+            // anything else keeps real keys.
+            mechanism: match cli_flag_value(args, "--mechanism") {
+                Some("real-keys" | "real_keys" | "keys") => {
+                    yggterm_server::WebFillMechanism::RealKeys
+                }
+                Some("native-setter" | "native_setter" | "native") => {
+                    yggterm_server::WebFillMechanism::NativeSetter
+                }
+                Some("auto") | None => yggterm_server::WebFillMechanism::Auto,
+                Some(other) => {
+                    anyhow::bail!("unsupported --mechanism: {other} (auto|real-keys|native-setter)")
+                }
+            },
+            redact: args.iter().any(|arg| arg == "--redact"),
         },
         "key" | "press" => WebSurfaceDoAction::Key {
             key: cli_flag_value(args, "--key")
@@ -1227,7 +1254,7 @@ const WEB_ACTIONS: &[(&str, &str)] = &[
     ("read", "  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]\n    read with NO --frame searches EVERY reachable frame and returns\n    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []\n"),
     ("await", "  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]\n    the script is the BODY of an async function; `return` its value.\n    `eval` cannot return a Promise — this is the one verb that can.\n"),
     ("frames", "  yggterm server app web frames [--session <path>]\n    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)\n"),
-    ("do", "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n"),
+    ("do", "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> [--nth <n>] | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n    fill only: --mechanism <auto|real-keys|native-setter>  (auto: native setter on plain text inputs)\n               --redact                                    (secret: keep the value out of the response)\n    every addressed response carries `match` {matches,nth,hidden,ambiguous} — a\n    selector matching >1 node is reported, never silently resolved to the first.\n"),
     ("fill-vault", "  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]\n"),
     ("fill-card", "  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]\n"),
     ("fill", "  yggterm server app web fill [--entry <name>] [--user <u>] [--session <path>]\n    auto-match the page host against the vault and fill the login form.\n    For ONE named field into ONE addressed element, use fill-vault.\n"),

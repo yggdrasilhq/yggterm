@@ -211,6 +211,36 @@ do <handle> move    --x --y                     # real hover — menus/tooltips
   "click a surface." The existing grid machinery (`ClickGridParams`, `Show`/
   refine) is not thrown away — it is reused for slice-3's capture-side agent
   grid (which is therefore ~80% built, not net-new).
+- **Resolution happens ONCE per verb and the result is PINNED (normative).** The
+  matcher runs one time, its node is held in a page-side handle registry, and
+  every later step of the verb — scroll, re-measure, clear, clear-verification,
+  write, readback — addresses THAT handle. Re-querying a selector mid-verb is
+  forbidden: on a re-rendering DOM the second query can answer about a twin,
+  which is what made a fill of an empty field abort `clear_failed` and a
+  19-character fill report success over a field holding two characters
+  (a services portal, 2026-07-26). A handle whose node leaves the document is
+  `node_replaced` / `handle_lost` — its own refusal, never a value verdict.
+- **A rect is measured only AFTER the scroll settled (normative).** Resolution
+  is two phases (pin+scroll, settle, re-measure) and the injector refuses any
+  measurement not stamped `post_scroll`; the response reports
+  `resolved.rect_phase` and `resolved.is_connected`.
+- **Addressing is countable and honest (normative).** CSS targets resolve as
+  `querySelectorAll(sel)[nth]` (`--nth` works on `--selector`), and every
+  addressed response carries `match {matches, nth, hidden, ambiguous}` — a
+  selector that matched nine nodes says so. `role=option`/`menuitem` pools are
+  filtered for liveness and scoped to the listbox an `aria-expanded` combobox
+  owns (else the last visible one); a pool of only stale options refuses
+  `stale_listbox_only` rather than clicking a dead popper.
+- **`do fill` verifies by READBACK (normative).** The response carries
+  `verified` (true/false/**null** = could not read), `verify_reason`,
+  `requested_len`/`held_len`/`first_mismatch`, and — unless `--redact` — the
+  `requested` and `held` strings. `delivered: true` is an observation about the
+  page, never a stand-in for success; the two co-exist. `mechanism` names how
+  the text was written: `native_setter` (prototype value descriptor +
+  bubbling `input`/`change`/blur — required for React controlled inputs, which
+  discard injected keystrokes) or `real_keys` (trusted per-key GDK injection,
+  forced for segmented widgets and for redacted secrets, which must never enter
+  an eval script).
 - **Coordinate space, focus targeting, and freshness are normative** — see the
   "Action & lifecycle correctness" section. In short: coords are CSS px in the
   target webview's document space (the resolver applies page zoom and scroll,
