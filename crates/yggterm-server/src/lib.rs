@@ -1845,6 +1845,77 @@ fn managed_session_is_promoted_live_session(key: &str, session: &ManagedSessionV
     true
 }
 
+/// Why a requested path did not take part in a reorder.
+pub const SKIPPED_NOT_A_LIVE_ROW: &str = "not a Live Sessions row";
+/// Why a requested path did not take part in a reorder.
+pub const SKIPPED_DUPLICATE_ROW: &str = "listed more than once";
+
+/// A requested reorder path that did NOT move, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedLiveSessionOrderRow {
+    /// The path exactly as the caller spelled it.
+    pub path: String,
+    /// One of [`SKIPPED_NOT_A_LIVE_ROW`] / [`SKIPPED_DUPLICATE_ROW`].
+    pub reason: String,
+}
+
+/// The honest result of [`YggtermServer::replace_live_session_order`].
+///
+/// The reorder verb used to answer with the request echoed back plus
+/// `requested: N`, which reads as success even when every listed row was
+/// silently dropped (field guide §4.5). This type is the SSOT for what actually
+/// happened, and it is what the daemon puts on the wire: it rides in the
+/// existing `ServerResponse::Snapshot.message` as JSON (same trick as
+/// `RowOrderLedgerReport`) so the honest answer needs no protocol-shape bump.
+/// Both the CLI and the GUI parse it back with [`Self::from_message`] and fall
+/// back to the raw string when talking to an older daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSessionOrderUpdate {
+    /// Did the live order actually move?
+    pub changed: bool,
+    /// Resolved row keys that took the requested order, in that order.
+    pub applied: Vec<String>,
+    /// Requested paths that did not move, with the reason.
+    pub skipped: Vec<SkippedLiveSessionOrderRow>,
+}
+
+impl LiveSessionOrderUpdate {
+    /// One-line human account. The GUI status line and the CLI both show this,
+    /// so there is one sentence, not two phrasings that can disagree.
+    pub fn summary(&self) -> String {
+        let head = if self.changed {
+            "reordered live sessions"
+        } else {
+            "live session order unchanged"
+        };
+        if self.skipped.is_empty() {
+            return format!("{head} ({} applied)", self.applied.len());
+        }
+        let detail = self
+            .skipped
+            .iter()
+            .map(|row| format!("{} ({})", row.path, row.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{head} ({} applied, {} skipped: {detail})",
+            self.applied.len(),
+            self.skipped.len()
+        )
+    }
+
+    /// The wire form carried in the response message.
+    pub fn to_message(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.summary())
+    }
+
+    /// Parse a response message back. `None` for any message that is not one of
+    /// ours — an older daemon's plain sentence, which the caller shows as-is.
+    pub fn from_message(message: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(message).ok()
+    }
+}
+
 fn managed_session_is_live_runtime_session(key: &str, session: &ManagedSessionView) -> bool {
     managed_session_is_promoted_live_session(key, session)
         || (matches!(
@@ -3997,28 +4068,66 @@ impl YggtermServer {
             .filter(|key| self.live_session_order.iter().any(|entry| entry == key))
     }
 
-    pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
+    /// Set the Live Sessions row order. Listed rows are promoted, in the given
+    /// order; every unlisted row keeps its relative position after them, so a
+    /// partial list can only promote and never drops a row.
+    ///
+    /// **A row is anything in `live_session_order`, runtime or not.** The old
+    /// gate here was `managed_session_is_live_runtime_session`, which silently
+    /// dropped every dormant row from the request while the response still
+    /// echoed the full list back — reading exactly like success (field guide
+    /// §4.5). Nine of the user's own twenty-one curated rows have no runtime
+    /// (*"No runtime is none of our business. The user can click to start it."*),
+    /// so the gate made the verb useless on almost half the sidebar. It also
+    /// admitted a live-runtime session that was NOT a row, which quietly ADDED
+    /// one; a reorder verb reorders rows, it does not create them, and refusing
+    /// that is what keeps the ledger restore unable to resurrect a tombstoned
+    /// row through this door.
+    ///
+    /// The returned [`LiveSessionOrderUpdate`] is the honest account of which
+    /// requested paths landed and which did not — the caller must report it
+    /// rather than echoing the request.
+    pub fn replace_live_session_order(
+        &mut self,
+        ordered_paths: &[String],
+    ) -> LiveSessionOrderUpdate {
         let current = self.live_session_order.clone();
         let mut seen = HashSet::<String>::new();
         let mut next = Vec::<String>::new();
+        let mut applied = Vec::<String>::new();
+        let mut skipped = Vec::<SkippedLiveSessionOrderRow>::new();
         for path in ordered_paths {
-            if let Some((resolved_key, session)) = self.resolve_live_session_entry(path)
-                && managed_session_is_live_runtime_session(&resolved_key, &session)
-                && seen.insert(resolved_key.clone())
-            {
-                next.push(resolved_key);
+            let Some(row_key) = self.live_session_row_key(path) else {
+                skipped.push(SkippedLiveSessionOrderRow {
+                    path: path.clone(),
+                    reason: SKIPPED_NOT_A_LIVE_ROW.to_string(),
+                });
+                continue;
+            };
+            if !seen.insert(row_key.clone()) {
+                skipped.push(SkippedLiveSessionOrderRow {
+                    path: path.clone(),
+                    reason: SKIPPED_DUPLICATE_ROW.to_string(),
+                });
+                continue;
             }
+            next.push(row_key.clone());
+            applied.push(row_key);
         }
         for key in current {
             if seen.insert(key.clone()) {
                 next.push(key);
             }
         }
-        if next == self.live_session_order {
-            return false;
+        let changed = next != self.live_session_order;
+        if changed {
+            self.live_session_order = next;
         }
-        self.live_session_order = next;
-        true
+        LiveSessionOrderUpdate {
+            changed,
+            applied,
+            skipped,
+        }
     }
 
     /// Place a (newly started) live session directly below an anchor row in
@@ -28220,7 +28329,7 @@ terminal_window_id: None,
         let third =
             server.start_local_session(SessionKind::Shell, Some("/tmp/three"), Some("Three"));
         let manual_order = vec![second.clone(), first.clone(), third.clone()];
-        assert!(server.replace_live_session_order(&manual_order));
+        assert!(server.replace_live_session_order(&manual_order).changed);
 
         server.focus_live_session(&first);
 
@@ -28233,6 +28342,219 @@ terminal_window_id: None,
                 .collect::<Vec<_>>(),
             manual_order,
             "focusing a live session must not turn user drag order into recency order"
+        );
+    }
+
+    /// A bare server with `count` local shell rows, in start order.
+    fn row_order_test_server(count: usize) -> (YggtermServer, Vec<String>) {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let mut rows = Vec::new();
+        for index in 0..count {
+            rows.push(server.start_local_session(
+                SessionKind::Shell,
+                Some(&format!("/tmp/row-{index}")),
+                Some(&format!("Row {index}")),
+            ));
+        }
+        // start_local_session inserts at the front; report them in sidebar order.
+        rows.reverse();
+        assert_eq!(server.live_session_order, rows);
+        (server, rows)
+    }
+
+    /// Turn a row into a DORMANT one — still a Live Sessions row, no live
+    /// runtime. That is the state nine of the user's twenty-one curated rows
+    /// are in, and it is deliberate: *"No runtime is none of our business. The
+    /// user can click to start it."*
+    fn make_row_dormant(server: &mut YggtermServer, path: &str) {
+        let session = server
+            .sessions
+            .get_mut(path)
+            .expect("row should have a managed session");
+        session.source = SessionSource::Stored;
+        let session = server.sessions.get(path).expect("row still present");
+        assert!(
+            !super::managed_session_is_live_runtime_session(path, session),
+            "the fixture must actually be dormant, or the test proves nothing"
+        );
+        assert!(
+            server.live_session_order.iter().any(|key| key == path),
+            "a dormant row is still a row"
+        );
+    }
+
+    /// The reorder verb's known defect (field guide §4.5): it filtered on
+    /// `managed_session_is_live_runtime_session`, so a dormant row was silently
+    /// dropped from the request while the response still echoed the list back.
+    #[test]
+    fn reorder_moves_a_dormant_row_and_reports_applied_and_skipped() {
+        let (mut server, rows) = row_order_test_server(3);
+        let dormant = rows[2].clone();
+        make_row_dormant(&mut server, &dormant);
+
+        let update = server.replace_live_session_order(&[
+            dormant.clone(),
+            "local://never-existed".to_string(),
+            dormant.clone(),
+        ]);
+
+        assert!(update.changed, "the dormant row must actually move");
+        assert_eq!(
+            server.live_session_order,
+            vec![dormant.clone(), rows[0].clone(), rows[1].clone()],
+            "a dormant row reorders like any other row"
+        );
+        assert_eq!(update.applied, vec![dormant.clone()]);
+        assert_eq!(
+            update.skipped,
+            vec![
+                super::SkippedLiveSessionOrderRow {
+                    path: "local://never-existed".to_string(),
+                    reason: super::SKIPPED_NOT_A_LIVE_ROW.to_string(),
+                },
+                super::SkippedLiveSessionOrderRow {
+                    path: dormant.clone(),
+                    reason: super::SKIPPED_DUPLICATE_ROW.to_string(),
+                },
+            ],
+            "the response must name what it refused, not echo the request"
+        );
+        let summary = update.summary();
+        assert!(
+            summary.contains("1 applied") && summary.contains("2 skipped"),
+            "the one-line answer must not read like success: {summary}"
+        );
+        assert_eq!(
+            super::LiveSessionOrderUpdate::from_message(&update.to_message()).as_ref(),
+            Some(&update),
+            "the wire form must round-trip"
+        );
+    }
+
+    /// A reorder reorders ROWS; it must not conjure one. The old gate admitted
+    /// any live-runtime session, row or not, which quietly ADDED it to the
+    /// sidebar — and would have given the ledger restore a way past
+    /// `live_row_tombstones`.
+    #[test]
+    fn reorder_refuses_to_add_a_session_that_is_not_a_row() {
+        let (mut server, rows) = row_order_test_server(2);
+        let orphan = server.start_local_session(SessionKind::Shell, Some("/tmp/orphan"), None);
+        server.live_session_order.retain(|key| key != &orphan);
+        assert!(
+            server.sessions.contains_key(&orphan),
+            "the orphan must still be a known session, or the test proves nothing"
+        );
+
+        let update = server.replace_live_session_order(&[orphan.clone()]);
+
+        assert!(!update.changed);
+        assert!(update.applied.is_empty());
+        assert_eq!(
+            update.skipped,
+            vec![super::SkippedLiveSessionOrderRow {
+                path: orphan.clone(),
+                reason: super::SKIPPED_NOT_A_LIVE_ROW.to_string(),
+            }]
+        );
+        assert_eq!(server.live_session_order, rows);
+    }
+
+    /// The restore path end to end, on a real server: a handover rebuild left
+    /// the rows scrambled (restored first, adopted after), and the ledger the
+    /// daemon booted with holds the user's curated order.
+    #[test]
+    fn ledger_restore_puts_the_curated_order_back_over_a_rebuilt_row_list() {
+        let (mut server, rows) = row_order_test_server(4);
+        let adopted = server.start_local_session(SessionKind::Shell, Some("/tmp/adopted"), None);
+        let fresh = server.start_local_session(SessionKind::Shell, Some("/tmp/fresh"), None);
+        // The rebuild's shape, as observed across the 2.12.15 bump: rows
+        // restored from the state file first, rows adopted from peer daemons
+        // woven in after, and the user's top two rows pushed down.
+        let scrambled = vec![
+            rows[2].clone(),
+            adopted.clone(),
+            rows[3].clone(),
+            rows[0].clone(),
+            rows[1].clone(),
+            fresh.clone(),
+        ];
+        assert!(server.replace_live_session_order(&scrambled).changed);
+        // The user's curated order, as the ledger remembers it. Neither
+        // `adopted` nor `fresh` is in it — both are new to this ledger.
+        let remembered = rows.clone();
+
+        let update = crate::row_order_ledger::restore_live_row_order(&mut server, &remembered);
+
+        assert!(update.changed);
+        assert_eq!(
+            server.live_session_order,
+            vec![
+                rows[0].clone(),
+                rows[1].clone(),
+                // `fresh` trailed rows[1] in the rebuild and still does.
+                fresh.clone(),
+                rows[2].clone(),
+                // `adopted` trailed rows[2] in the rebuild and still does.
+                adopted.clone(),
+                rows[3].clone(),
+            ],
+            "ledger rows take the ledger's order; a row the ledger never saw keeps \
+             the slot the anchored import walk gave it, under the same neighbour"
+        );
+    }
+
+    /// The restore may never resurrect. The ledger remembers rows that are not
+    /// live — including the ones the user CLOSED, whose tombstones veto every
+    /// import path — so the restore is a permutation of what the daemon already
+    /// holds and nothing more.
+    #[test]
+    fn ledger_restore_cannot_resurrect_a_tombstoned_row() {
+        let (mut server, rows) = row_order_test_server(2);
+        let closed_identity = "local://closed-by-the-user".to_string();
+        let now = crate::live_row_tombstones::now_secs();
+        let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::default();
+        tombstones.record(&closed_identity, now);
+        assert!(
+            tombstones.blocks(&closed_identity, now),
+            "the fixture must actually be tombstoned, or the test proves nothing"
+        );
+        // The ledger still remembers the closed row's slot — by design.
+        let remembered = vec![rows[1].clone(), closed_identity.clone(), rows[0].clone()];
+
+        crate::row_order_ledger::restore_live_row_order(&mut server, &remembered);
+
+        assert_eq!(
+            server.live_session_order,
+            vec![rows[1].clone(), rows[0].clone()],
+            "the remembered order applies to the rows we hold"
+        );
+        assert!(
+            !server
+                .live_session_order
+                .iter()
+                .any(|key| key == &closed_identity),
+            "a tombstoned row must not come back through the ledger restore"
+        );
+        assert!(
+            !server.sessions.contains_key(&closed_identity),
+            "the restore must not create a session either"
         );
     }
 

@@ -391,7 +391,11 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect '<path>' --view preview"  
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server order" > /tmp/order.bak      # one path per line
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin" < /tmp/order.bak
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder '<path1>' '<path2>'" # listed rows -> TOP
-# -> {requested, live_session_count, changed, order:[...]}
+# -> {requested:[...], applied:[...], skipped:[{path,reason}], live_session_count,
+#     changed, order:[...], message}
+# NON-ZERO EXIT when `skipped` is non-empty. On a daemon older than the honest-
+# response fix the report carries applied:null + applied_unreported_by_daemon:true
+# — that build silently ignored rows with no runtime, so verify with `server order`.
 
 # Inspect the durable row-order LEDGER (v2.9.64+): per-client-scope memory of
 # row slots, including rows that are NOT currently live.
@@ -413,6 +417,17 @@ at once); placement falls back to the `shared` scope when the client's own scope
 doesn't know the row. `server order` + `server reorder --stdin` still round-trip —
 **take a backup before any batch operation.**
 
+**The ledger now RESTORES, and a daemon bump leaves a receipt (in-tree 2026-07-26,
+not yet live-proven).** Each handover rebuild pass ends by reconciling the assembled
+row list against the ledger as the daemon booted with it: rows the ledger remembers
+take the ledger's order, rows it has never seen keep the slot the anchored import
+walk gave them, and the result is a permutation — so nothing tombstoned in
+`removed-rows.json` can come back through it. Every bump also writes
+`~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json` (live order +
+the whole ledger), from the outgoing daemon on `PrepareUpdateRestart` and from the
+incoming daemon before it imports a row; newest 32 kept, hand-made
+`pre-gui-restart-*` snapshots in that directory are never swept.
+
 **What `connect` does** — the headless twin of clicking a row, issuing the SAME
 daemon requests as the GUI (one source of truth):
 - a session the daemon already tracks → `FocusLive` (kind-agnostic; also un-hides a
@@ -430,7 +445,10 @@ daemon requests as the GUI (one source of truth):
 - `connect` is order-preserving since 2.9.63; with `--top` (or on any older build) it
   **prepends** and buries the user's ordering. Capture `server order` before a batch.
 - `reorder` never drops a row: listed paths go first, every unlisted live row is
-  appended after, so a partial list is safe.
+  appended after, so a partial list is safe. It also never ADDS one — a path that
+  is not already a Live Sessions row is refused (`skipped`), not created. Dormant
+  rows (no runtime) reorder like any other row since the honest-response fix;
+  before it they were silently ignored while the response echoed success.
 - Verify a reconnect with the session's `status_line`/`last_launch_error` from
   `server snapshot`, not `app terminal read-buffer` — the GUI may not have mounted
   the xterm yet even though the resume is healthy. Since 2.12.10 `read-buffer`
