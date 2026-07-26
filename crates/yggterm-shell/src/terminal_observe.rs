@@ -22,7 +22,23 @@ pub(crate) struct MemoryPressureSnapshot {
     pub(crate) swap_total_kb: u64,
     pub(crate) mem_available_kb: u64,
     pub(crate) mem_total_kb: u64,
+    /// Kernel PSI `memory` → `some avg60`, in BASIS POINTS (100 bp == 1.00% of
+    /// wall time in which at least one task stalled on memory reclaim). `None`
+    /// when `/proc/pressure/memory` is absent or unreadable (kernel built
+    /// without `CONFIG_PSI`, or a non-Linux host). Basis points rather than an
+    /// `f64` so the snapshot stays `Eq` and comparisons stay exact.
+    pub(crate) psi_some_avg60_bp: Option<u32>,
 }
+
+/// Available-memory floor, as a percentage of `MemTotal`, below which the
+/// machine is genuinely short of RAM. Above it, reclaiming a user's pages costs
+/// them work to buy memory nobody is asking for.
+const RECLAIM_AVAILABLE_FLOOR_PCT: u64 = 15;
+
+/// PSI `memory` `some avg60` (in basis points) at or above which the machine is
+/// actively stalling on reclaim even if `MemAvailable` still looks comfortable.
+/// 10% of wall time stalled is well past "busy" and into "thrashing".
+const RECLAIM_PSI_SOME_AVG60_BP: u32 = 1_000;
 
 impl MemoryPressureSnapshot {
     pub(crate) fn swap_used_mb(&self) -> u64 {
@@ -43,6 +59,45 @@ impl MemoryPressureSnapshot {
     pub(crate) fn swap_pressured(&self) -> bool {
         self.swap_used_kb > 512 * 1024
     }
+    /// True when the machine is short of memory RIGHT NOW, i.e. when reclaiming
+    /// a user's live pages is worth what it costs them.
+    ///
+    /// This is a DIFFERENT question from [`Self::swap_pressured`] and must never
+    /// be collapsed into it. `swap_used` is a HISTORY counter: pages the kernel
+    /// swapped out an hour ago stay counted long after the pressure that evicted
+    /// them ended, and Linux has no reason to fault them back in while nothing
+    /// touches them. So `swap_pressured` latches TRUE after one bad afternoon and
+    /// never clears — which is exactly what happened on the live host, where
+    /// 11.99 GB of swap was "used" while 6.4 GB of memory sat available and the
+    /// kernel's own stall accounting read ~0.06%. Under that latched predicate
+    /// every backgrounded web surface was hard-detached and destroyed five
+    /// seconds later, so the ten-minute soft-stash hold never executed once.
+    ///
+    /// Headroom answers the real question, in two ways that agree:
+    /// - `MemAvailable` below [`RECLAIM_AVAILABLE_FLOOR_PCT`] of `MemTotal` — the
+    ///   kernel's own estimate of what can be handed out without swapping.
+    /// - PSI `some avg60` at or above [`RECLAIM_PSI_SOME_AVG60_BP`] — the kernel
+    ///   measuring actual reclaim stalls, which catches a thrash that headroom
+    ///   alone can miss.
+    ///
+    /// An ABSENT snapshot reads FALSE. For the reveal-latency path an unknown
+    /// snapshot means "unknown", but here the action is destroying the user's
+    /// pages, and ignorance is not a licence to do that.
+    pub(crate) fn reclaim_pressured(&self) -> bool {
+        if self
+            .psi_some_avg60_bp
+            .is_some_and(|bp| bp >= RECLAIM_PSI_SOME_AVG60_BP)
+        {
+            return true;
+        }
+        if !self.is_present() {
+            return false;
+        }
+        self.mem_available_kb.saturating_mul(100)
+            < self
+                .mem_total_kb
+                .saturating_mul(RECLAIM_AVAILABLE_FLOOR_PCT)
+    }
     /// Whether the snapshot carries any usable reading at all (false on
     /// platforms without `/proc/meminfo` or when the read failed).
     pub(crate) fn is_present(&self) -> bool {
@@ -56,6 +111,11 @@ impl MemoryPressureSnapshot {
             "mem_available_mb": self.mem_available_mb(),
             "mem_total_mb": self.mem_total_mb(),
             "swap_pressured": self.swap_pressured(),
+            "reclaim_pressured": self.reclaim_pressured(),
+            "psi_some_avg60_pct": self
+                .psi_some_avg60_bp
+                .map(|bp| Value::from(f64::from(bp) / 100.0))
+                .unwrap_or(Value::Null),
         })
     }
 }
@@ -92,17 +152,55 @@ pub(crate) fn parse_meminfo(text: &str) -> MemoryPressureSnapshot {
         swap_total_kb,
         mem_available_kb,
         mem_total_kb,
+        psi_some_avg60_bp: None,
     }
 }
 
-/// Read live system memory pressure from `/proc/meminfo`. Returns the default
-/// (all zeros, `is_present() == false`) on any platform without the file or on
-/// read failure — callers treat an absent snapshot as "unknown", never as
-/// "no pressure".
+/// Parse kernel `/proc/pressure/memory` text into the `some avg60` figure, in
+/// basis points. Pure (no I/O). The file's shape is two lines:
+///
+/// ```text
+/// some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037
+/// full avg10=0.24 avg60=0.06 avg300=0.01 total=1613274815
+/// ```
+///
+/// We read `some`, not `full`: `some` means at least one task stalled, which is
+/// the earliest honest signal that reclaim is costing the machine work. Returns
+/// `None` for absent/garbage input — never a silent zero, which would read as
+/// "measured, and healthy".
+pub(crate) fn parse_pressure_some_avg60_bp(text: &str) -> Option<u32> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("some "))?;
+    let field = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("avg60="))?;
+    let value: f64 = field.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some((value * 100.0).round().min(f64::from(u32::MAX)) as u32)
+}
+
+/// Read live system memory pressure from `/proc/meminfo` plus the kernel's PSI
+/// stall accounting from `/proc/pressure/memory`. Returns the default (all
+/// zeros, `is_present() == false`) on any platform without `/proc/meminfo` or on
+/// read failure — the reveal-latency callers treat an absent snapshot as
+/// "unknown", never as "no pressure", while `reclaim_pressured` treats it as
+/// "do not destroy the user's pages on a guess".
+///
+/// PSI is optional and independent: a kernel without `CONFIG_PSI` simply leaves
+/// `psi_some_avg60_bp` at `None`, and the headroom half still answers.
 pub(crate) fn read_memory_pressure_snapshot() -> MemoryPressureSnapshot {
-    std::fs::read_to_string("/proc/meminfo")
+    let mut snapshot = std::fs::read_to_string("/proc/meminfo")
         .map(|text| parse_meminfo(&text))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    snapshot.psi_some_avg60_bp = std::fs::read_to_string("/proc/pressure/memory")
+        .ok()
+        .as_deref()
+        .and_then(parse_pressure_some_avg60_bp);
+    snapshot
 }
 
 /// One finished terminal reveal (ready or failed), retained in a small ring so
@@ -3847,7 +3945,7 @@ mod tests {
 
     use super::{
         MemoryPressureSnapshot, RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
-        WorkspaceViewMode, parse_meminfo,
+        WorkspaceViewMode, parse_meminfo, parse_pressure_some_avg60_bp,
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
@@ -3922,7 +4020,113 @@ SwapFree:        1048576 kB
         let snapshot = MemoryPressureSnapshot::default();
         assert!(!snapshot.is_present());
         assert!(!snapshot.swap_pressured());
+        assert!(!snapshot.reclaim_pressured());
         assert_eq!(snapshot.to_json()["present"], json!(false));
+    }
+
+    /// THE LATCHED-PREDICATE LOCK. These are the live host's REAL numbers,
+    /// copied verbatim from `jojo:/proc/meminfo` and `jojo:/proc/pressure/memory`
+    /// on 2026-07-26 while the machine was idle and comfortable: 6.98 GB of 15.47
+    /// GB available (45%), and the kernel measuring 0.06% of wall time stalled on
+    /// memory. That machine is NOT short of RAM.
+    ///
+    /// It nonetheless shows 11.5 GB of swap "used", because swap-used is a
+    /// history counter — pages evicted hours ago stay counted. `swap_pressured`
+    /// therefore reads TRUE here and has read TRUE continuously (19 of 19
+    /// `native_stash` trace events carried `swap_pressured:true`), which
+    /// hard-detached every backgrounded web surface and destroyed it five seconds
+    /// later. The ten-minute soft-stash hold never ran once on this machine.
+    ///
+    /// So: the reveal-latency predicate must KEEP saying "swap is deep" (that
+    /// finding is real and unchanged), and the reclaim predicate must say "there
+    /// is nothing to reclaim for". If these two ever collapse back into one
+    /// answer, a background playlist dies five seconds after a session switch.
+    #[test]
+    fn deep_swap_history_is_not_current_reclaim_pressure() {
+        let meminfo = "\
+MemTotal:       15473336 kB
+MemFree:         6866564 kB
+MemAvailable:    6976900 kB
+Buffers:               0 kB
+Cached:           201156 kB
+SwapCached:        20580 kB
+SwapTotal:      16776512 kB
+SwapFree:        4691496 kB
+";
+        let mut snapshot = parse_meminfo(meminfo);
+        snapshot.psi_some_avg60_bp = parse_pressure_some_avg60_bp(
+            "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
+             full avg10=0.24 avg60=0.06 avg300=0.01 total=1613274815\n",
+        );
+        // 16776512 - 4691496 = 12085016 kB ≈ 11.5 GiB of swap in use.
+        assert_eq!(snapshot.swap_used_kb, 12_085_016);
+        assert_eq!(snapshot.psi_some_avg60_bp, Some(6));
+        assert!(
+            snapshot.swap_pressured(),
+            "the reveal-latency finding still holds: this machine's swap IS deep"
+        );
+        assert!(
+            !snapshot.reclaim_pressured(),
+            "45% of RAM available and 0.06% stall time is not a reason to destroy \
+             the user's backgrounded pages"
+        );
+    }
+
+    /// The other side of the same predicate: genuine shortage must still trigger
+    /// reclaim, by EITHER route, and an unreadable machine must not.
+    #[test]
+    fn reclaim_pressure_fires_on_headroom_or_on_kernel_stalls() {
+        // Headroom route: 900 MB available of 16 GB == 5.5%, under the 15% floor.
+        // Swap is untouched, so `swap_pressured` alone would have said "fine" —
+        // the two predicates disagree in BOTH directions, which is why they are
+        // two predicates.
+        let tight = parse_meminfo(
+            "MemTotal: 16777216 kB\nMemAvailable: 921600 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        );
+        assert!(!tight.swap_pressured());
+        assert!(tight.reclaim_pressured());
+        // Exactly at the floor is not under it.
+        let at_floor =
+            parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 2400000 kB\nSwapTotal: 0 kB\n");
+        assert!(!at_floor.reclaim_pressured());
+        // PSI route: plenty of headroom, but the kernel says a third of wall time
+        // is spent stalled on memory. That is a thrash and reclaim must fire.
+        let mut stalling = parse_meminfo("MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n");
+        assert!(!stalling.reclaim_pressured());
+        stalling.psi_some_avg60_bp =
+            parse_pressure_some_avg60_bp("some avg10=44.10 avg60=33.33 avg300=12.00 total=1\n");
+        assert_eq!(stalling.psi_some_avg60_bp, Some(3_333));
+        assert!(stalling.reclaim_pressured());
+        // Unreadable machine: never reclaim on a guess.
+        assert!(!MemoryPressureSnapshot::default().reclaim_pressured());
+    }
+
+    #[test]
+    fn pressure_psi_parser_reads_some_avg60_and_refuses_garbage() {
+        assert_eq!(
+            parse_pressure_some_avg60_bp(
+                "some avg10=0.24 avg60=0.06 avg300=0.01 total=1680834037\n\
+                 full avg10=9.99 avg60=8.88 avg300=7.77 total=1613274815\n"
+            ),
+            // `some`, never `full` — the earliest honest stall signal.
+            Some(6)
+        );
+        // Absent / malformed / non-Linux reads as UNKNOWN, never as a healthy 0.
+        assert_eq!(parse_pressure_some_avg60_bp(""), None);
+        assert_eq!(
+            parse_pressure_some_avg60_bp("full avg60=1.00 total=3\n"),
+            None
+        );
+        assert_eq!(parse_pressure_some_avg60_bp("some avg10=0.1 total=3\n"), None);
+        assert_eq!(
+            parse_pressure_some_avg60_bp("some avg10=0.1 avg60=nan total=3\n"),
+            None
+        );
+        // A full stall reads as 100.00% == 10000 bp.
+        assert_eq!(
+            parse_pressure_some_avg60_bp("some avg10=100.00 avg60=100.00 avg300=100.00 total=9\n"),
+            Some(10_000)
+        );
     }
 
     #[test]
@@ -3944,6 +4148,7 @@ SwapFree:        1048576 kB
                 swap_total_kb: 16_000 * 1024,
                 mem_available_kb: 3_500 * 1024,
                 mem_total_kb: 16_000 * 1024,
+                ..Default::default()
             },
         };
         assert_eq!(entry.total_ms(), 3_400);
