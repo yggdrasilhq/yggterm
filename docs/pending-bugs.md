@@ -30,6 +30,34 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★★ AN UNREVEALED AGENT SURFACE REPORTS `visibilityState: "visible"`, SO
+  ITS PAGE ANIMATES AT FULL RATE AND THE GUI COMPOSITES IT — measured
+  2026-07-26 night, and this is very likely THE mechanism behind every
+  "agents make the GUI host hot" report in this campaign.**
+  Ground truth: a payment-gateway page on a headless, never-revealed surface
+  the user cannot even see (no row — see the entry above) reported
+  `visibilityState: "visible"` with **1 running animation** (a spinner). Cost,
+  measured over 20 s from `/proc` (never `ps %CPU`): **web content 0.241 cores
+  + GUI 0.399 cores = 0.85 cores total against guihost's ~0.5-core idle floor**,
+  Tctl 61.6 °C — the user's fan spun up on a machine that had been silent all
+  evening, while they were touching nothing.
+  **Why it is a product bug, not the page's fault:** every browser throttles
+  `requestAnimationFrame`, CSS animations and timers on a hidden page — that is
+  the Page Visibility contract, and it is the ONLY thing that makes background
+  tabs cheap. Our unrevealed surfaces claim to be visible, so the page has no
+  way to know it is not on screen and paints forever, and the shell composites
+  every frame of a surface nobody is looking at.
+  **FIX:** a surface that is not currently revealed on some client must be
+  marked hidden to the web engine (WebKitGTK page visibility / `is_visible`
+  on the webview, plus stopping compositing when nothing displays it), and
+  flip to visible on reveal. Cheap, mechanical, and it should be worth more
+  than every reaper heuristic combined — the reaper was destroying pages to
+  reclaim cost that this makes unnecessary.
+  ⚠ Do NOT "fix" this by navigating agent surfaces to `about:blank` between
+  actions — that is the workaround (correct for an agent to do voluntarily,
+  and it is now in the agent brief) but it hides the defect and breaks any
+  flow whose page state must survive.
+
 - **★★★ A LIVE, LEASED WEB SURFACE CAN EXIST WITH NO ROW — the user cannot see
   or reach an agent that is browsing with their profile (found live
   2026-07-26 night by a filing agent; user-reported the same hour as "why is
