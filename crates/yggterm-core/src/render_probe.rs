@@ -21,12 +21,22 @@
 //!
 //! # What it deliberately does NOT claim
 //!
-//! WebKitGTK runs **one web process per profile, serving every surface on it**. The
-//! kernel can attribute CPU to a process, so a *per-surface* CPU number would be a
-//! fabrication dressed up as telemetry. This module reports **per-process** cost with
-//! a role label, and leaves the caller to record how many surfaces shared that
-//! process as plain context. That asymmetry is the finding, not a gap: it is the
-//! argument for profile partitioning as the actual lever.
+//! The kernel attributes CPU to a PROCESS, so this module reports **per-process** cost
+//! with a role label and leaves the caller to record how many surfaces were realized
+//! alongside it (`web_surface_views`) and how many engine contexts backed them
+//! (`web_surface_contexts`). Whether a per-process number is also a per-surface number
+//! depends on that ratio, and the caller can read it — this module does not guess.
+//!
+//! ⚠ **This section used to assert that "WebKitGTK runs one web process per profile,
+//! serving every surface on it", and concluded that profile partitioning was the
+//! actual lever.** That was false, and a whole workstream was costed on it.
+//! `WebSurfaceHost::open` built a `WebContext` per SURFACE, and a `WebContext` is a
+//! process pool — so two tabs of one session ran two `WebKitWebProcess`es, two
+//! `WebKitNetworkProcess`es and two cookie jars over one directory. Per-process WAS
+//! per-tab, and the disclaimer had it exactly backwards. Contexts are now shared per
+//! (jar, egress, control endpoint); `web_surface_contexts` is the field that says
+//! which regime a given sample was taken in, and it must be read before any
+//! per-surface claim is made from a per-process number.
 //!
 //! # The GPU gauge
 //!

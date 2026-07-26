@@ -24994,6 +24994,7 @@ mod tests {
             &target,
             Some("Remote Runtime".to_string()),
             false,
+            false,
         );
 
         assert_eq!(
@@ -28706,6 +28707,7 @@ terminal_window_id: None,
             &target,
             Some("active".to_string()),
             false,
+            false,
         );
         server.insert_live_session_with_launch(
             &inactive,
@@ -28713,6 +28715,7 @@ terminal_window_id: None,
             SessionKind::Shell,
             &target,
             Some("inactive".to_string()),
+            false,
             false,
         );
         server.active_session_path = Some(active.clone());
@@ -31158,6 +31161,7 @@ terminal_window_id: None,
             SessionKind::Shell,
             &target,
             Some("Closing Shell".to_string()),
+            false,
             false,
         );
         server.active_session_path = Some("local://closing-shell".to_string());
