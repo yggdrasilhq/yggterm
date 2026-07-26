@@ -1255,23 +1255,44 @@ fn main() -> Result<()> {
         }
         let (snapshot, message) = yggterm_server::reorder_live_sessions(&endpoint, &ordered_paths)?;
         // The daemon keeps only the rows it actually has, so report what the order
-        // BECAME rather than echoing the request back as if it succeeded.
-        let applied: Vec<&str> = snapshot
+        // BECAME rather than echoing the request back as if it succeeded — and
+        // take `applied`/`skipped` from the DAEMON's own answer rather than
+        // re-deriving them here, so this surface and `yggterm server reorder`
+        // cannot disagree about what happened.
+        let resulting_order: Vec<&str> = snapshot
             .live_sessions
             .iter()
             .map(|session| session.session_path.as_str())
             .collect();
         let requested: Vec<&str> = ordered_paths.iter().map(String::as_str).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "requested": requested.len(),
-                "live_rows": applied.len(),
-                "matches_request": applied == requested,
-                "applied_order": applied,
-                "message": message,
-            }))?
-        );
+        let update = message
+            .as_deref()
+            .and_then(yggterm_server::LiveSessionOrderUpdate::from_message);
+        let mut report = serde_json::json!({
+            "requested": requested.len(),
+            "live_rows": resulting_order.len(),
+            "matches_request": resulting_order == requested,
+            "applied_order": resulting_order,
+        });
+        match &update {
+            Some(update) => {
+                report["applied"] = serde_json::json!(update.applied);
+                report["skipped"] = serde_json::json!(update.skipped);
+                report["message"] = serde_json::json!(update.summary());
+            }
+            // An older daemon cannot say what it applied; say so instead of
+            // guessing.
+            None => {
+                report["applied_unreported_by_daemon"] = serde_json::json!(true);
+                report["message"] = serde_json::json!(message);
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(update) = update
+            && !update.skipped.is_empty()
+        {
+            anyhow::bail!("{}", update.summary());
+        }
         return Ok(());
     }
     if args.len() >= 3

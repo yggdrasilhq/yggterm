@@ -38575,7 +38575,8 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
         let mut should_persist = false;
         let endpoint = state.read().bootstrap.server_endpoint.clone();
         state.with_mut(|shell| {
-            let changed = shell.server.replace_live_session_order(&reordered_paths);
+            let update = shell.server.replace_live_session_order(&reordered_paths);
+            let changed = update.changed;
             should_persist = changed;
             shell.record_ui_telemetry(
                 if changed {
@@ -38588,13 +38589,14 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
                     "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
                     "drag_paths": shell.drag_paths.clone(),
                     "order": reordered_paths,
+                    "applied": &update.applied,
+                    "skipped": &update.skipped,
                 }),
             );
-            shell.last_action = if changed {
-                "reordered live sessions".to_string()
-            } else {
-                "live session order unchanged".to_string()
-            };
+            // The optimistic local answer is the daemon's answer in miniature —
+            // same function, same honesty. A drop that only shows up in
+            // telemetry is the dishonest-response bug wearing a different hat.
+            shell.last_action = update.summary();
             shell.clear_drag_state();
         });
         if should_persist {
@@ -38613,8 +38615,17 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
                     Ok(Ok((snapshot, message))) => {
                         shell.server.apply_snapshot(snapshot);
                         shell.needs_initial_server_sync = false;
+                        // The daemon answers with a JSON
+                        // `LiveSessionOrderUpdate` (one encoding, shared type);
+                        // render its own sentence. An older daemon sends a
+                        // plain sentence, which passes straight through.
                         shell.last_action = message
                             .clone()
+                            .map(|raw| {
+                                yggterm_server::LiveSessionOrderUpdate::from_message(&raw)
+                                    .map(|update| update.summary())
+                                    .unwrap_or(raw)
+                            })
                             .unwrap_or_else(|| "saved live session order".to_string());
                         shell.record_ui_telemetry(
                             "live_session_reorder_persisted",
@@ -121332,7 +121343,7 @@ mod tests {
                 snapshot_session_view_for_ui(session_c),
             ],
         });
-        assert!(shell.server.replace_live_session_order(&reordered));
+        assert!(shell.server.replace_live_session_order(&reordered).changed);
         assert_eq!(
             shell
                 .server
@@ -121366,6 +121377,14 @@ mod tests {
         assert!(
             handler.contains("gui_row_order_scope()"),
             "drag/drop reorders must carry this GUI's ledger scope so per-client arrangements survive"
+        );
+        assert!(
+            handler.contains("update.summary()"),
+            "the status line must show what actually applied, not a fixed 'reordered' sentence"
+        );
+        assert!(
+            handler.contains("LiveSessionOrderUpdate::from_message("),
+            "the daemon's honest answer must be parsed, not shown raw or discarded"
         );
     }
 
