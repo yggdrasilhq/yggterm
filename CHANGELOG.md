@@ -2,6 +2,43 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.12.14
+
+- **Fixed: yggterm was drawing everything with the processor while the graphics
+  chip sat idle.** The app had decided, once and for all, that this machine had
+  no usable graphics hardware — and it was wrong. One failed check on the wrong
+  device had been generalised into "there is no GPU here", so every character
+  the terminal painted was drawn in software across sixteen threads. yggterm now
+  asks the machine what it can do at startup and believes the answer. On the
+  laptop this was measured on: the graphics chip is now doing the drawing, the
+  app uses a fraction of the processor it used to, and the machine runs cooler
+  and quieter. If a machine's graphics really are broken, the old behaviour is
+  one setting away (`YGGTERM_FORCE_SOFTWARE_GL=1`).
+- **Fixed: the app stalling for seconds at a time while it scanned for
+  sessions.** The background scan was copying its entire picture of a remote
+  machine once for every session on that machine — hundreds of times per pass,
+  megabytes each. The worst pause measured went from over thirty seconds to
+  under a twentieth of a second.
+- **Faster: saving state no longer rewrites the whole file when nothing
+  changed**, and the screen a session hands out is remembered until something
+  actually changes it.
+- **New, for driving a browser from an agent:** cookies can be moved in and out
+  of a page's session, one element can be photographed on its own (a captcha, a
+  QR code) even when the browser is not on screen, a page's frames can be listed
+  and addressed, buttons can be clicked by their visible text instead of a
+  brittle internal name, waiting can key on the address bar rather than a page
+  that is about to be replaced, a password can be typed straight from the vault
+  without ever being printed, and a run of actions can be sent as one batch that
+  a real click still interrupts.
+- **Fixed: a browser tab that had died could not be revived** without destroying
+  the whole session around it. Reviving now checks whether the page is actually
+  alive, rebuilds it when it is not, and says which it did.
+- **Fixed: several commands failed by going silent.** A command this version did
+  not understand used to be deleted, leaving the caller waiting for an answer
+  that was never coming; asking a dead page to run something reported the same
+  error as asking it for an unsupported value; and a batch where every single
+  action missed still reported success.
+
 ## 2.12.13
 
 - **Fixed: a session made in a wider window no longer paints garbled text.** A
