@@ -5828,6 +5828,7 @@ impl YggtermServer {
             &target,
             Some(resolved_title.clone()),
             launch_terminal,
+            launch_terminal,
         );
         let mut applied_head_preview = false;
         if let Some(session) = self.sessions.get_mut(&session_path) {
@@ -6331,6 +6332,7 @@ impl YggtermServer {
                 &target,
                 Some(title.clone()),
                 false,
+                false,
             );
         }
         let launch_command = if saved_session_exists {
@@ -6495,6 +6497,7 @@ impl YggtermServer {
                 kind,
                 &target,
                 Some(title.clone()),
+                false,
                 false,
             );
         }
@@ -6920,6 +6923,7 @@ impl YggtermServer {
                 &target,
                 Some(resolved_title.clone()),
                 false,
+                false,
             );
             self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
@@ -6995,6 +6999,7 @@ impl YggtermServer {
             normalized_kind,
             &target,
             Some(title),
+            false,
             false,
         );
         self.append_restored_live_session_order(&key);
@@ -7793,7 +7798,7 @@ impl YggtermServer {
         target: &SshConnectTarget,
         title_override: Option<String>,
     ) {
-        self.insert_live_session_with_launch(key, session_id, kind, target, title_override, true);
+        self.insert_live_session_with_launch(key, session_id, kind, target, title_override, true, true);
     }
 
     fn insert_live_session_with_launch(
@@ -7804,6 +7809,7 @@ impl YggtermServer {
         target: &SshConnectTarget,
         title_override: Option<String>,
         launch_now: bool,
+        activate: bool,
     ) {
         let mut session = build_live_session(
             session_id,
@@ -7849,6 +7855,7 @@ impl YggtermServer {
                     "cwd": target.cwd,
                     "ssh_target": target.ssh_target,
                     "launch_now": launch_now,
+                    "activate": activate,
                     "prior_active": self.active_session_path,
                 }),
             );
@@ -7856,7 +7863,20 @@ impl YggtermServer {
         self.sessions.insert(key.to_string(), session);
         self.live_session_order.retain(|existing| existing != key);
         self.live_session_order.insert(0, key.to_string());
-        if launch_now {
+        // TWO DECISIONS, NOT ONE. `launch_now` means "start this session's PTY
+        // now"; `activate` means "and take over the user's viewport". They were
+        // the same flag, and that conflation is a focus-steal the user feels
+        // directly: with several agents spawning sessions, each spawn moved the
+        // daemon's active path, every GUI followed it one poll later
+        // (`apply_snapshot`, which is RIGHT to follow the daemon for the user's
+        // own client), and the human lost the viewport mid-keystroke — reported
+        // as having to spam-click to type a single prompt.
+        //
+        // `--no-activate` already existed at the CLI and in the app-control
+        // command, but it could only be honoured CLIENT-side, so the daemon
+        // re-imposed the new session on the very next snapshot. A viewport
+        // decision has to be made where the viewport state lives.
+        if launch_now && activate {
             self.active_session_path = Some(key.to_string());
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();

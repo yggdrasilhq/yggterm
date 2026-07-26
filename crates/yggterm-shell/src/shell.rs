@@ -2850,6 +2850,72 @@ fn web_surface_force_background_pressure() -> bool {
 /// intact) before it is destroyed. `~/.yggterm/web-surface.json`
 /// `{"background_hold_secs": N}`; default 600, 0 = destroy immediately (the
 /// pre-hold behavior).
+/// How many reap→reopen cycles inside [`WEB_SURFACE_THRASH_WINDOW_MS`] mean a
+/// surface is being actively used rather than abandoned.
+const WEB_SURFACE_THRASH_REOPEN_LIMIT: u32 = 2;
+const WEB_SURFACE_THRASH_WINDOW_MS: u64 = 120_000;
+
+/// Reaps per surface inside the thrash window. Keyed the same way the reconciler
+/// keys surfaces, so a surface that is destroyed and immediately recreated is
+/// recognised as the SAME logical page rather than as a brand-new one.
+fn web_surface_reap_history() -> &'static std::sync::Mutex<HashMap<(String, u64), Vec<u64>>> {
+    static HISTORY: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, u64), Vec<u64>>>> =
+        std::sync::OnceLock::new();
+    HISTORY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record that a surface was reaped, and answer how many times it has been
+/// reaped inside the window.
+fn web_surface_note_reap(key: &(String, u64), now_ms: u64) -> u32 {
+    let Ok(mut history) = web_surface_reap_history().lock() else {
+        return 0;
+    };
+    let entry = history.entry(key.clone()).or_default();
+    entry.retain(|at| now_ms.saturating_sub(*at) <= WEB_SURFACE_THRASH_WINDOW_MS);
+    entry.push(now_ms);
+    entry.len() as u32
+}
+
+fn web_surface_recent_reaps(key: &(String, u64), now_ms: u64) -> u32 {
+    let Ok(history) = web_surface_reap_history().lock() else {
+        return 0;
+    };
+    history
+        .get(key)
+        .map(|hits| {
+            hits.iter()
+                .filter(|at| now_ms.saturating_sub(**at) <= WEB_SURFACE_THRASH_WINDOW_MS)
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+/// ⛔ **Reclaim that keeps destroying a page which keeps coming back is not
+/// reclaim — it is a treadmill, and it COSTS memory rather than saving it.**
+///
+/// Measured on the live host: swap was full, so every backgrounded surface got
+/// the 5 s pressured hold, was destroyed, was immediately re-opened by whatever
+/// still wanted it, and was destroyed again — **166 `background_hold_expired`
+/// closes against 166 re-opens in fifteen minutes**, about eleven cycles a
+/// minute. Each cycle allocated a *fresh* WebKit web process (one of them
+/// ballooned to 3.9 GB), each re-open composited a full-size webview, and the
+/// user could not keep keyboard focus long enough to type a sentence. The
+/// pressure the reaper was reacting to was in large part the pressure the
+/// reaper was creating.
+///
+/// So a surface that has been reaped `WEB_SURFACE_THRASH_REOPEN_LIMIT` times in
+/// the window is, by demonstration, wanted: something re-creates it the moment
+/// it dies. Reclaiming it is the one thing guaranteed not to help. It keeps the
+/// unpressured hold so it can settle, and reclaim goes back to targeting
+/// surfaces that actually STAY backgrounded — which is where the memory it was
+/// after has always been.
+fn web_surface_background_hold_ms_for(swap_pressured: bool, recent_reaps: u32) -> u64 {
+    if swap_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+    }
+    web_surface_background_hold_ms(swap_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT)
+}
+
 fn web_surface_background_hold_ms(swap_pressured: bool) -> u64 {
     // Under memory pressure, reclaim aggressively regardless of the configured
     // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
@@ -4093,8 +4159,13 @@ async fn web_surface_native_reconcile_loop(
             // there actually being a backgrounded surface to act on.
             let swap_pressured = read_memory_pressure_snapshot().swap_pressured()
                 || web_surface_force_background_pressure();
-            let hold_ms = web_surface_background_hold_ms(swap_pressured);
             for key in backgrounded {
+                // Per-surface, not per-pass: a surface that keeps being
+                // re-created after each reap is demonstrably wanted, and
+                // reaping it again reclaims nothing while costing a fresh web
+                // process. See web_surface_background_hold_ms_for.
+                let recent_reaps = web_surface_recent_reaps(&key, now_ms);
+                let hold_ms = web_surface_background_hold_ms_for(swap_pressured, recent_reaps);
                 let expired = web_surface_reap_due(
                     now_ms,
                     applied.get(&key).and_then(|entry| entry.stashed_at_ms),
@@ -4102,6 +4173,7 @@ async fn web_surface_native_reconcile_loop(
                     web_surface_lease_until_ms(&state, &key.0, key.1),
                 );
                 if expired {
+                    let reap_count = web_surface_note_reap(&key, now_ms);
                     if let Some(entry) = applied.remove(&key) {
                         desktop.close_web_surface(entry.native_id);
                         append_trace_event(
@@ -4114,6 +4186,13 @@ async fn web_surface_native_reconcile_loop(
                                 "tab_id": key.1,
                                 "native_id": entry.native_id,
                                 "reason": "background_hold_expired",
+                                // How many times this surface has been reaped
+                                // inside the thrash window. A number that keeps
+                                // climbing is the treadmill: reclaim destroying
+                                // a page that something keeps re-creating.
+                                "reaps_in_window": reap_count,
+                                "swap_pressured": swap_pressured,
+                                "hold_ms": hold_ms,
                             }),
                         );
                     }
@@ -110932,6 +111011,70 @@ mod tests {
     // session. Legacy stacking MUST keep the detach: a legacy surface
     // draws above all DOM and only unmapping clears its pixels (the
     // stuck-composite / reload-white family).
+    /// THE TREADMILL LOCK. Reclaim that destroys a page which is immediately
+    /// re-created reclaims nothing and costs a fresh WebKit process every cycle.
+    /// Measured live before this guard existed: **166 `background_hold_expired`
+    /// closes against 166 re-opens in fifteen minutes**, ~11 cycles a minute,
+    /// one of the churned processes ballooning to 3.9 GB, on a host whose swap
+    /// was 100% full — the reaper reacting to pressure it was itself creating,
+    /// while the user could not hold keyboard focus long enough to type.
+    ///
+    /// So: pressure alone still reclaims fast (that is the feature), but a
+    /// surface that has demonstrated it comes back must stop being a target.
+    #[test]
+    fn a_surface_that_keeps_coming_back_stops_being_reaped_on_the_pressure_timer() {
+        let pressured_hold = web_surface_background_hold_ms_for(true, 0);
+        assert_eq!(
+            pressured_hold, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "first reap under pressure must still be fast — that is the feature"
+        );
+        assert_eq!(
+            web_surface_background_hold_ms_for(true, WEB_SURFACE_THRASH_REOPEN_LIMIT - 1),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "below the limit it is still an ordinary reclaim candidate"
+        );
+        let thrashing = web_surface_background_hold_ms_for(true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
+        assert!(
+            thrashing > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "a surface reaped {} times in the window is demonstrably wanted; \
+             reaping it again is the treadmill — got {thrashing} ms",
+            WEB_SURFACE_THRASH_REOPEN_LIMIT,
+        );
+        // And the escalation must be per-surface, not global: a DIFFERENT
+        // surface with no history is still reclaimed promptly, or one busy page
+        // would switch reclaim off for everything.
+        assert_eq!(
+            web_surface_background_hold_ms_for(true, 0),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            "one thrashing surface must not spare every other surface"
+        );
+    }
+
+    /// The counter that feeds the guard has to actually count, and it has to
+    /// forget: a surface reaped twice yesterday is not thrashing today.
+    #[test]
+    fn the_reap_counter_is_per_surface_and_forgets_outside_the_window() {
+        let a = ("live::treadmill-a".to_string(), 0u64);
+        let b = ("live::treadmill-b".to_string(), 0u64);
+        let t0 = 10_000_000_u64;
+        assert_eq!(web_surface_note_reap(&a, t0), 1);
+        assert_eq!(web_surface_note_reap(&a, t0 + 1_000), 2);
+        assert_eq!(
+            web_surface_recent_reaps(&b, t0 + 1_000),
+            0,
+            "reaps must be counted per surface, not globally"
+        );
+        // Past the window relative to the LAST entry, not the first — an
+        // entry 119 s old is legitimately still inside a 120 s window.
+        let later = t0 + 1_000 + WEB_SURFACE_THRASH_WINDOW_MS + 1;
+        assert_eq!(
+            web_surface_note_reap(&a, later),
+            1,
+            "entries older than the window must be forgotten, or a surface \
+             reaped long ago would be exempt from reclaim forever"
+        );
+    }
+
     #[test]
     fn a_under_glass_backgrounding_never_detaches_the_webview() {
         // Legacy always detaches; under glass with no memory pressure keeps the
