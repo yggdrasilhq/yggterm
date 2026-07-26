@@ -69,6 +69,31 @@ absorb it.
   nothing is active can never converge on a machine that is always active, which
   turns every deploy into a choice between waiting forever and killing PTYs.
 - **Plain shells are first-class** and must survive a bump like anything else.
+- **A session owned by an OLDER daemon is still a first-class row in the current
+  GUI**, and clicking it must WORK. The user's case, stated directly: restart
+  yggterm while an agent is mid-flight, see that agent's shadow session as a
+  running row on the finessed older daemon, click it, and **co-browse it**. Not
+  "observe that it exists", not "get an error about a version mismatch" — open
+  it and share it.
+
+  ⚠ **This is harder than it looks and the difficulty is our own doing.** The
+  session/view contract currently assumes ONE viewer per session; the shadow
+  client only works because it was made READ-ONLY and pinned to the daemon's PTY
+  grid, which dodges the assumption rather than fixing it. Genuine co-browse
+  means two live viewers of one session, with different window sizes, and that
+  is the thing the pin exists to avoid. **Solve multi-viewer properly** —
+  per-viewer geometry over a shared session — instead of widening the read-only
+  hatch.
+
+  The cross-version half is equally real: a declare proxied to a pre-2.12.10
+  owner silently returned nothing, so mixed-version rows have already failed
+  quietly once. Version-coexisting daemons only deliver the constitution if the
+  CURRENT GUI can drive a row on an OLD daemon without the user ever learning
+  that two daemons exist.
+
+**The user must never have to know which daemon owns what.** Every guarantee
+above is in service of that: daemon topology is our bookkeeping, not their
+concern, and any friction that leaks it to them is a bug.
 
 ### Where this stood on 2026-07-26, honestly
 
