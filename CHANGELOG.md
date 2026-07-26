@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **New: you can ask what is running inside your terminal rows, and what it is
+  costing.** A row keeps its terminal alive on purpose — that is the whole
+  point of them — but until now nothing told you that something you started
+  days ago was still in there burning the fan. `yggterm-headless server
+  terminal tenants` now lists, for every row: the command in front, everything
+  running underneath it, the processor time the row has used, and how long the
+  oldest thing in there has been sitting. It answers only when you ask, so it
+  costs nothing the rest of the time, and any row it cannot look inside says
+  why instead of reporting a comfortable zero.
+- **New: rows made by a tool now say who made them, and can be told to clean
+  themselves up.** A row created from the command line records the process that
+  asked for it, this machine, and an optional note about what it was for, and
+  that record survives a restart. A caller can additionally mark a row
+  disposable at the moment it creates it — closed once the process that asked
+  for it is gone, or after a chosen stretch of silence. Rows you make yourself
+  are never affected, rows created without that mark are never affected, and
+  the close is an ordinary close: the row goes away properly rather than being
+  yanked.
 - **Fixed: a plain shell no longer disappears from the sidebar when yggterm
   updates itself.** An agent session survives a version change because the agent
   keeps its own transcript, so yggterm can re-open it. A plain shell has no such
