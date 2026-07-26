@@ -6,7 +6,7 @@
 //! split it: script the mechanical parts on `curl`, hand the session to a
 //! surface for the one step that genuinely needs a browser, and hand it back.
 //! That was proven both necessary and sufficient in the field — transplanting a
-//! single `PHPSESSID` into a browser made rtionline render the applicant's name
+//! single `PHPSESSID` into a browser rendered a logged-in applicant page
 //! and the fee — and the only thing missing was a way to move the jar.
 //!
 //! `curl -c`/`-b` speaks exactly one format, so this module speaks exactly that
