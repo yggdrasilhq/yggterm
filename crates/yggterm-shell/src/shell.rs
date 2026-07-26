@@ -4,8 +4,11 @@ use crate::app_capture::{
     move_app_window_by, overlay_terminal_canvas_onto_snapshot, record_visible_app_surface,
     resize_app_window,
 };
+use crate::handover_gate::{
+    HandoverPaintGate, HandoverPaintTransition, handover_observation_from_parts,
+};
 use crate::hot_update_policy::{
-    daemon_update_state_json, runtime_status_is_current_app_version,
+    daemon_update_state_json, runtime_status_handoff_active, runtime_status_is_current_app_version,
     runtime_status_matches_current_app, startup_authorized_hot_update_runtime_keys_from_sources,
     startup_daemon_hot_swap_reason_with_authorized_keys,
     startup_daemon_should_preserve_stale_runtime,
@@ -696,6 +699,14 @@ const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
 const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 16;
 const TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS: u64 = 16_000;
 const TERMINAL_UNFOCUSED_TUI_DROP_READ_POLL_MS: u64 = 15_000;
+/// How often a bridge whose paint is suspended for a daemon handover looks
+/// again. It does NOT read the PTY (that is the point — the daemon keeps every
+/// byte and the normal read replays them on resume); this is just how quickly it
+/// notices the handover ended.
+const TERMINAL_HANDOVER_SUSPENDED_POLL_MS: u64 = 500;
+/// Coalescing key for the "Daemon updating" job notification (DESIGN.md:
+/// long-running work gets ONE job notification, not a toast stack).
+const HANDOVER_NOTIFICATION_JOB_KEY: &str = "daemon-handover";
 const TERMINAL_REMOTE_IDLE_READ_POLL_MAX_MS: u64 = 220;
 const TERMINAL_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 3_000;
 const TERMINAL_UNFOCUSED_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 8_000;
@@ -7167,6 +7178,10 @@ struct ShellState {
     background_live_session_snapshot_skipped_input_hot_count: u64,
     background_live_session_snapshot_skipped_noop_count: u64,
     latest_runtime_status: Option<ServerRuntimeStatus>,
+    /// ⛔ THE owner of "a daemon handover is in progress, stop painting"
+    /// (user-settled call #7). Driven from `latest_runtime_status` and nothing
+    /// else; read through `handover_paint_suspended()`.
+    handover_gate: HandoverPaintGate,
     working_flags_poll_started: bool,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -8979,6 +8994,7 @@ impl ShellState {
             background_live_session_snapshot_skipped_input_hot_count: 0,
             background_live_session_snapshot_skipped_noop_count: 0,
             latest_runtime_status: None,
+            handover_gate: HandoverPaintGate::default(),
             working_flags_poll_started: false,
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -9066,6 +9082,105 @@ impl ShellState {
             context.preferred_executable = Some(update.executable.clone());
         }
         context
+    }
+    /// ⛔ The ONLY way `latest_runtime_status` is written. Every status the
+    /// client learns must pass through here, because learning the daemon's
+    /// status IS the moment the handover predicate can change — a second
+    /// assignment site would be a handover the user is never told about.
+    fn set_latest_runtime_status(&mut self, runtime_status: Option<ServerRuntimeStatus>) {
+        self.latest_runtime_status = runtime_status;
+        self.observe_daemon_handover(current_millis());
+    }
+    /// Runtime keys of every terminal this client currently has a mounted host
+    /// for — what it is actually painting, and therefore what a handover is
+    /// allowed to veil. A shadow/read-only client mounts hosts the same way, so
+    /// it is covered by construction.
+    fn mounted_terminal_runtime_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .terminal_mount_epochs
+            .keys()
+            .map(|session_path| self.server.terminal_runtime_key_for_path(session_path))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+    /// Feed the daemon's own handover report to the gate and act on the edge:
+    /// tell the user, and let every paint site see the new verdict.
+    fn observe_daemon_handover(&mut self, now_ms: u64) {
+        // No status = nothing observed. Deliberately NOT an observation of "no
+        // handover": the gate treats its first observation as the baseline, and
+        // spending that baseline on a failed startup sync would let the first
+        // real status — which may legitimately show a lingering preserved owner
+        // — open the GUI behind a veil.
+        let Some(status) = self.latest_runtime_status.as_ref() else {
+            return;
+        };
+        let observation = handover_observation_from_parts(
+            runtime_status_handoff_active(status),
+            &format!("pid={}:{}", status.server_pid, status.server_version),
+            &status.preserved_terminal_owner_keys,
+            &self.mounted_terminal_runtime_keys(),
+        );
+        let transition = self.handover_gate.observe(observation, now_ms);
+        self.apply_handover_transition(transition, now_ms);
+    }
+    /// The wall-clock half: the suspension ceiling must be able to expire on a
+    /// tick that costs no daemon IPC (a daemon that dies mid-handover stops
+    /// answering, and a stuck veil is worse than the burn).
+    fn tick_daemon_handover(&mut self, now_ms: u64) {
+        let transition = self.handover_gate.tick(now_ms);
+        self.apply_handover_transition(transition, now_ms);
+    }
+    fn apply_handover_transition(
+        &mut self,
+        transition: Option<HandoverPaintTransition>,
+        now_ms: u64,
+    ) {
+        let Some(transition) = transition else {
+            return;
+        };
+        match transition {
+            HandoverPaintTransition::Suspended => {
+                // DESIGN.md "Notifications": long-running work uses a coalescing
+                // job notification, not a stack of toasts. No progress fraction —
+                // the daemon cannot tell us how far along a handover is, and a
+                // fake bar would be an invented source of truth.
+                self.upsert_job_notification(
+                    HANDOVER_NOTIFICATION_JOB_KEY,
+                    NotificationTone::Info,
+                    "Daemon updating",
+                    "Sessions will settle in a moment. The terminal is paused so the update stays cheap.",
+                    None,
+                    false,
+                );
+            }
+            HandoverPaintTransition::ResumedAdopted | HandoverPaintTransition::ResumedTimedOut => {
+                self.clear_job_notification(HANDOVER_NOTIFICATION_JOB_KEY);
+            }
+        }
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "daemon_handover",
+                match transition {
+                    HandoverPaintTransition::Suspended => "handover_paint_suspended",
+                    HandoverPaintTransition::ResumedAdopted
+                    | HandoverPaintTransition::ResumedTimedOut => "handover_paint_resumed",
+                },
+                json!({
+                    "transition": transition.as_str(),
+                    "gate": self.handover_gate.to_app_state_json(now_ms),
+                    "mounted_runtime_keys": self.mounted_terminal_runtime_keys(),
+                }),
+            );
+        }
+    }
+    /// ⛔ The one question a paint/read site asks. Never re-derive it from the
+    /// runtime status at a call site.
+    fn handover_paint_suspended(&self) -> bool {
+        self.handover_gate.paint_suspended()
     }
     /// Project the daemon's own status into what the metadata rail renders. The daemon
     /// remains the single source of truth for every one of these facts — this narrows
@@ -22009,6 +22124,17 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // on the overwhelming majority of ticks this decides "nothing" off
             // a read-only pass and spawns no task.
             spawn(restore_app_surfaces_tick(state, trace_home.clone()));
+            // The handover suspension's fail-safe ceiling rides this tick too, and
+            // for the same reason: it must expire on WALL CLOCK, not on the next
+            // status poll. A daemon that dies mid-handover stops answering, and a
+            // veil that outlives its daemon is worse than the burn it prevents.
+            // Read-only precheck so an idle tick never dirties the signal.
+            let handover_tick_due = state.with(|shell| shell.handover_paint_suspended());
+            if handover_tick_due {
+                let _ = safe_shell_mut(state, "handover_paint_gate_tick", |shell| {
+                    shell.tick_daemon_handover(current_millis());
+                });
+            }
             // Endpoint-ping liveness rides the same tick (Phase 2): fire and
             // forget — the ping task owns its own short timeout. Phase 5 folds
             // the command drain + background stamp sweep into the same tick.
@@ -22245,7 +22371,7 @@ fn spawn_initial_server_sync(
                         .as_ref()
                         .map(|runtime| format!("server ready · {}", runtime.host_kind))
                         .unwrap_or_else(|| "server ready".to_string());
-                    shell.latest_runtime_status = runtime;
+                    shell.set_latest_runtime_status(runtime);
                     shell.apply_daemon_snapshot_result(Ok((snapshot, Some(message))));
                     shell.server_daemon_detail = detail;
                     shell.next_background_copy_scan_after_ms = current_millis() + 2_500;
@@ -25751,7 +25877,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 match outcome {
                     Ok(((snapshot, message), runtime_status)) => {
                         if let Some(runtime_status) = runtime_status {
-                            shell.latest_runtime_status = Some(runtime_status);
+                            shell.set_latest_runtime_status(Some(runtime_status));
                         }
                         let input_hot = current_millis() < terminal_input_hot_until_ms();
                         if input_hot
@@ -40036,6 +40162,9 @@ fn describe_app_state_snapshot(
         "live_session_snapshot_debug": live_session_snapshot_debug,
         "runtime_truth": runtime_truth,
         "daemon_update_state": daemon_update_state,
+        // User-settled call #7: the handover paint gate, so an agent can probe
+        // the predicate live instead of inferring it from the burn.
+        "handover_paint": shell.handover_gate.to_app_state_json(notification_now_ms),
         "idle_policy": idle_policy,
         "background_refresh_suspended": background_refresh_suspended,
         // Reveal telemetry: a bounded history of finished reveals (timing + the
@@ -55781,7 +55910,7 @@ async fn refresh_runtime_status_for_app_control(
             let server_version = runtime_status.server_version.clone();
             let server_pid = runtime_status.server_pid;
             let _ = safe_shell_mut(state, "app_control_refresh_runtime_status", |shell| {
-                shell.latest_runtime_status = Some(runtime_status);
+                shell.set_latest_runtime_status(Some(runtime_status));
             });
             json!({
                 "ok": true,
@@ -70685,6 +70814,61 @@ enum TerminalBridgeReadPolicy {
     Paused,
 }
 
+/// What one tick of the mounted-terminal read loop is allowed to do.
+///
+/// The daemon-handover suspension (user-settled call #7) lives HERE rather than
+/// inside `terminal_session_bridge_read_policy` on purpose: that function owns
+/// the VISIBILITY cadence and its paused→active edge is what arms the reveal
+/// screen reconcile. A handover must not look like a reveal — the resume has to
+/// come back through the normal read/attach path, never through a
+/// daemon-screen replay (field guide §5: a replay collapses scrollback and can
+/// blank the viewport). So the two decisions compose here, and this is the only
+/// place they meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReadTickAction {
+    /// Read the PTY. `poll_ms_override` clamps the cadence for a trickling host.
+    Read { poll_ms_override: Option<u64> },
+    /// Skip the read AND the pending write flush; re-check in `poll_ms`.
+    Skip { poll_ms: u64, reason: &'static str },
+}
+
+fn terminal_read_tick_action(
+    policy: TerminalBridgeReadPolicy,
+    handover_paint_suspended: bool,
+) -> TerminalReadTickAction {
+    // Checked FIRST, and it overrides Active: a focused, visible session is
+    // exactly the one whose re-resume repaint storm burns the GUI host during a
+    // daemon handover, so it is the one that must stop.
+    if handover_paint_suspended {
+        return TerminalReadTickAction::Skip {
+            poll_ms: TERMINAL_HANDOVER_SUSPENDED_POLL_MS,
+            reason: "daemon_handover_paint_suspended",
+        };
+    }
+    match policy {
+        TerminalBridgeReadPolicy::Paused => TerminalReadTickAction::Skip {
+            poll_ms: TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS,
+            reason: "bridge_reads_paused",
+        },
+        TerminalBridgeReadPolicy::BackgroundTrickle => TerminalReadTickAction::Read {
+            poll_ms_override: Some(TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS),
+        },
+        TerminalBridgeReadPolicy::Active => TerminalReadTickAction::Read {
+            poll_ms_override: None,
+        },
+    }
+}
+
+/// May the bridge hand its staged bytes to `term.write` right now? A suspended
+/// handover keeps them staged — the daemon owns every byte and the normal read
+/// replays them once paint resumes, so nothing is lost by not painting them.
+fn terminal_bridge_write_flush_allowed(
+    policy: TerminalBridgeReadPolicy,
+    handover_paint_suspended: bool,
+) -> bool {
+    !handover_paint_suspended && policy != TerminalBridgeReadPolicy::Paused
+}
+
 fn terminal_background_trickle_reads_enabled() -> bool {
     !matches!(
         std::env::var("YGGTERM_DISABLE_BACKGROUND_TRICKLE_READS")
@@ -74220,6 +74404,9 @@ fn TerminalCanvas(
             // the repaint; overwriting mid-turn tears).
             let mut screen_reconcile_unwritable_retries: u8 = 0;
             let mut last_bridge_reads_paused = false;
+            // Edge tracker for the handover veil so the JS command is sent once
+            // per transition, not once per loop tick.
+            let mut last_handover_paint_suspended = false;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
@@ -74350,8 +74537,40 @@ fn TerminalCanvas(
                             tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
                     }
                 }
-                let bridge_read_policy = state
-                    .with(|shell| terminal_session_bridge_read_policy(shell, &session_path));
+                let (bridge_read_policy, handover_paint_suspended) = state.with(|shell| {
+                    (
+                        terminal_session_bridge_read_policy(shell, &session_path),
+                        // ⛔ THE handover predicate, read from its one owner.
+                        shell.handover_paint_suspended(),
+                    )
+                });
+                // Tell the host to stop its own render-health / visible-paint
+                // work and drop a static veil over the viewport for the
+                // duration. A spinner would be the opposite of the point.
+                // Gated on `js_ready` so the edge is not consumed before there
+                // is a host to receive it — an unready host paints nothing
+                // anyway, and it will pick the state up on the next tick.
+                if js_ready && handover_paint_suspended != last_handover_paint_suspended {
+                    last_handover_paint_suspended = handover_paint_suspended;
+                    let _ = eval.send(TerminalJsCommand::SetHandoverPaintSuspended {
+                        suspended: handover_paint_suspended,
+                    });
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "daemon_handover",
+                        if handover_paint_suspended {
+                            "handover_paint_suspended"
+                        } else {
+                            "handover_paint_resumed"
+                        },
+                        json!({
+                            "session_path": session_path.clone(),
+                            "surface": "terminal_bridge",
+                            "js_ready": js_ready,
+                        }),
+                    );
+                }
                 // "Paused" here means NOT active-visible+focused — the edge
                 // below (paused→unpaused) is the became-active transition the
                 // reveal reconcile keys on. Trickled hosts still count as
@@ -74375,7 +74594,10 @@ fn TerminalCanvas(
                     last_bridge_reads_paused = bridge_reads_paused;
                 }
                 if js_ready
-                    && bridge_read_policy != TerminalBridgeReadPolicy::Paused
+                    && terminal_bridge_write_flush_allowed(
+                        bridge_read_policy,
+                        handover_paint_suspended,
+                    )
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
                     record_terminal_forward_sample(&trace_home, data.len(), current_millis());
@@ -77570,24 +77792,37 @@ fn TerminalCanvas(
                                 + Duration::from_millis(read_poll_ms);
                             continue;
                         }
-                        match state.with(|shell| {
-                            terminal_session_bridge_read_policy(shell, &session_path)
-                        }) {
-                            TerminalBridgeReadPolicy::Paused => {
-                                read_poll_ms = TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS;
+                        let read_tick_action = state.with(|shell| {
+                            terminal_read_tick_action(
+                                terminal_session_bridge_read_policy(shell, &session_path),
+                                // ⛔ THE handover predicate, read from its one
+                                // owner. While it is on this tick does no daemon
+                                // read and no `term.write`: the daemon keeps
+                                // every byte and the normal read replays them
+                                // from the unchanged cursor once it clears.
+                                shell.handover_paint_suspended(),
+                            )
+                        });
+                        match read_tick_action {
+                            TerminalReadTickAction::Skip { poll_ms, reason: _ } => {
+                                read_poll_ms = poll_ms;
                                 next_read_deadline = tokio::time::Instant::now()
                                     + Duration::from_millis(read_poll_ms);
                                 continue;
                             }
-                            TerminalBridgeReadPolicy::BackgroundTrickle => {
+                            TerminalReadTickAction::Read {
                                 // Lane-2: read at the slow trickle cadence so
                                 // the retained buffer stays current while
                                 // hidden — the reveal then has nothing to
                                 // correct (no flicker). Falls through to the
                                 // normal read below.
-                                read_poll_ms = TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS;
+                                poll_ms_override: Some(poll_ms),
+                            } => {
+                                read_poll_ms = poll_ms;
                             }
-                            TerminalBridgeReadPolicy::Active => {}
+                            TerminalReadTickAction::Read {
+                                poll_ms_override: None,
+                            } => {}
                         }
                         match terminal_read_async(
                             endpoint.clone(),
@@ -89700,6 +89935,48 @@ fn terminal_eval_script_with_canvas_renderer(
         applySoftwareCanvasLayerOptimization('initial_mount');
         let paintCount = 0;
         let lastPaintKey = '';
+        // Daemon-handover paint suspension (user-settled call #7). Set by the
+        // `set_handover_paint_suspended` command; while true this host does no
+        // render-health sampling, no recovery redraw and no visible paint, and
+        // wears a STATIC veil. Nothing else may write it.
+        let handoverPaintSuspended = false;
+        // The veil is a SIBLING of `.xterm` inside the host — the same shape the
+        // cold-mount veil uses (`.yggterm-cold-mount-veil`), so attachment
+        // checks that count host children keep working. Solid host background +
+        // one line of static text: no animation, no spinner, no timer.
+        const applyHandoverPaintVeil = (on) => {{
+            try {{
+                const existing = host.querySelector('.yggterm-handover-veil');
+                if (!on) {{
+                    if (existing) {{ existing.remove(); }}
+                    return;
+                }}
+                if (existing) {{ return; }}
+                if (window.getComputedStyle(host).position === 'static') {{
+                    host.style.position = 'relative';
+                }}
+                const veil = document.createElement('div');
+                veil.className = 'yggterm-handover-veil';
+                veil.setAttribute('aria-live', 'polite');
+                veil.style.position = 'absolute';
+                veil.style.inset = '0';
+                veil.style.zIndex = '40';
+                veil.style.pointerEvents = 'none';
+                veil.style.display = 'flex';
+                veil.style.alignItems = 'center';
+                veil.style.justifyContent = 'center';
+                veil.style.backgroundColor =
+                    window.getComputedStyle(host).backgroundColor || '#000';
+                const label = document.createElement('div');
+                label.textContent = 'Daemon updating. Sessions will settle in a moment.';
+                label.style.fontSize = '12px';
+                label.style.fontFamily = 'var(--yggterm-term-font-family, monospace)';
+                label.style.letterSpacing = '0.2px';
+                label.style.color = 'var(--yggterm-term-dim-foreground, #8b949e)';
+                veil.appendChild(label);
+                host.appendChild(veil);
+            }} catch (_error) {{}}
+        }};
         let visiblePaintFramePending = false;
         let pendingVisiblePaintForceFullRefresh = false;
         let visiblePaintRecoveryTimer = null;
@@ -90844,6 +91121,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 return {{ status: 'superseded', reason: 'closure_stood_down', ink: null,
                     recovery_count: 0, recovery_pending: false }};
             }}
+            // Daemon handover: the canvas is legitimately blank behind the veil
+            // and the PTY is being re-created, so every reading here would be a
+            // false "unhealthy" — and its recovery is a full redrawTerminal (a
+            // glyph-atlas clear), i.e. exactly the render cost this suspension
+            // exists to avoid. Refusing to judge is the honest verdict.
+            if (handoverPaintSuspended) {{
+                return {{ status: 'suspended', reason: 'daemon_handover_paint_suspended', ink: null,
+                    recovery_count: renderHealthRecoveryCount, recovery_pending: false }};
+            }}
             const now = Date.now();
             lastRenderHealthCheckedAtMs = now;
             const skipInkSample = Boolean(options && options.skip_ink_sample);
@@ -91115,6 +91401,13 @@ fn terminal_eval_script_with_canvas_renderer(
             }}, waitMs);
         }};
         const requestVisiblePaint = (forceFullRefresh = false) => {{
+            // Daemon handover: every repaint here is a full-window blit on a
+            // software-GL host, and the frame it would present is the re-resume
+            // churn behind the veil. Drop the request outright — the resume path
+            // repaints from the daemon's own bytes.
+            if (handoverPaintSuspended) {{
+                return;
+            }}
             pendingVisiblePaintForceFullRefresh = Boolean(
                 pendingVisiblePaintForceFullRefresh || forceFullRefresh
             );
@@ -95380,6 +95673,25 @@ fn terminal_eval_script_with_canvas_renderer(
                     emitHostHealth();
                 }});
                 scheduleResizeNudges();
+            }} else if (message.kind === "set_handover_paint_suspended") {{
+                const nextSuspended = Boolean(message.suspended);
+                if (nextSuspended !== handoverPaintSuspended) {{
+                    handoverPaintSuspended = nextSuspended;
+                    applyHandoverPaintVeil(nextSuspended);
+                    if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                        window.__yggtermXtermHosts[hostId].handoverPaintSuspended = nextSuspended;
+                    }}
+                    sendTerminalEvent({{
+                        kind: "debug",
+                        message: `handover_paint_${{nextSuspended ? 'suspended' : 'resumed'}} host=${{hostId}}`
+                    }});
+                    if (!nextSuspended) {{
+                        // Resume through the NORMAL path: one paint of whatever the
+                        // read loop has since written. Never a daemon-screen replay
+                        // (field guide §5 — it collapses scrollback).
+                        requestVisiblePaint(false);
+                    }}
+                }}
             }} else if (message.kind === "redraw") {{
                 redrawTerminal(message.reason || 'command-redraw');
             }} else if (message.kind === "drop_unfocused_tui_frame") {{
@@ -134532,6 +134844,322 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_session_bridge_read_policy(&shell, "local://not-retained"),
             TerminalBridgeReadPolicy::Paused
         );
+    }
+
+    /// A daemon status whose `preserved_terminal_owner_keys` is the handover
+    /// signal itself — the keys this daemon serves but a PREDECESSOR still owns.
+    fn runtime_status_with_preserved_keys(
+        server_version: &str,
+        server_pid: u32,
+        preserved_keys: &[String],
+    ) -> ServerRuntimeStatus {
+        serde_json::from_value(json!({
+            "server_version": server_version,
+            "server_build_id": 0,
+            "server_pid": server_pid,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "terminal_session_count": preserved_keys.len(),
+            "terminal_session_keys": preserved_keys,
+            "preserved_terminal_owner_count": preserved_keys.len(),
+            "preserved_terminal_owner_keys": preserved_keys,
+            "managed_session_count": 0,
+        }))
+        .expect("test runtime status")
+    }
+
+    fn handover_notification_shown(shell: &ShellState) -> bool {
+        shell.notifications.iter().any(|notification| {
+            notification.job_key.as_deref() == Some(HANDOVER_NOTIFICATION_JOB_KEY)
+        })
+    }
+
+    #[test]
+    fn daemon_handover_tells_the_user_and_stops_the_terminal_paint_path() {
+        // User-settled call #7 (docs/pending-bugs.md): "On a daemon version
+        // change the GUI host burns. Spawn a notification …, stop drawing the
+        // terminal for the duration". The predicate must come from the DAEMON'S
+        // OWN report (preserved-owner keys), be scoped to what this client is
+        // painting, and clear when the successor has adopted our sessions.
+        let session_path = "codex://handover-lane";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        // The client is PAINTING this session (it has a mounted host).
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+
+        // Baseline: the daemon owns everything, nothing is preserved.
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.16",
+            4242,
+            &[],
+        )));
+        assert!(!shell.handover_paint_suspended());
+        assert!(!handover_notification_shown(&shell));
+
+        // Somebody ELSE's session is mid-handover on a lingering older daemon —
+        // the constitutional norm, and none of our business.
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.16",
+            4242,
+            &["local://another-agent".to_string()],
+        )));
+        assert!(
+            !shell.handover_paint_suspended(),
+            "another client's handover must never veil this viewport"
+        );
+
+        // Now OUR mounted session is handed off to a successor.
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.17",
+            5151,
+            &[runtime_key.clone()],
+        )));
+        assert!(
+            shell.handover_paint_suspended(),
+            "the daemon's own handoff report over a session we paint must suspend paint"
+        );
+        assert!(
+            handover_notification_shown(&shell),
+            "the user must be told the daemon is updating"
+        );
+        // …and that verdict must actually stop the terminal read/write path,
+        // even for the focused, visible session (the one that burns).
+        assert_eq!(
+            terminal_read_tick_action(
+                TerminalBridgeReadPolicy::Active,
+                shell.handover_paint_suspended()
+            ),
+            TerminalReadTickAction::Skip {
+                poll_ms: TERMINAL_HANDOVER_SUSPENDED_POLL_MS,
+                reason: "daemon_handover_paint_suspended",
+            }
+        );
+        assert!(!terminal_bridge_write_flush_allowed(
+            TerminalBridgeReadPolicy::Active,
+            shell.handover_paint_suspended()
+        ));
+
+        // The successor adopted it: resume through the normal read path.
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.17",
+            5151,
+            &[],
+        )));
+        assert!(!shell.handover_paint_suspended());
+        assert!(
+            !handover_notification_shown(&shell),
+            "the notification must resolve when the handover does"
+        );
+        assert_eq!(
+            terminal_read_tick_action(
+                TerminalBridgeReadPolicy::Active,
+                shell.handover_paint_suspended()
+            ),
+            TerminalReadTickAction::Read {
+                poll_ms_override: None
+            }
+        );
+        assert!(terminal_bridge_write_flush_allowed(
+            TerminalBridgeReadPolicy::Active,
+            shell.handover_paint_suspended()
+        ));
+    }
+
+    #[test]
+    fn a_failed_startup_sync_does_not_spend_the_handover_baseline() {
+        // The gate's first observation is its baseline. A startup sync that
+        // could not reach the daemon observes NOTHING — spending the baseline on
+        // it would let the first real status (which may legitimately show a
+        // lingering preserved owner ⚖ version-coexisting daemons) open the GUI
+        // behind a veil.
+        let session_path = "codex://handover-startup";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+
+        shell.set_latest_runtime_status(None);
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.16",
+            4242,
+            &[runtime_key],
+        )));
+        assert!(
+            !shell.handover_paint_suspended(),
+            "the first REAL status is the baseline; a GUI must never start veiled"
+        );
+        assert!(!handover_notification_shown(&shell));
+    }
+
+    #[test]
+    fn a_handover_signal_that_never_clears_stops_veiling_at_the_ceiling() {
+        // Fail-safe: a stuck veil is worse than the burn. The ceiling runs on
+        // wall clock so it expires even when the daemon stops answering.
+        let session_path = "codex://handover-stuck";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.16",
+            4242,
+            &[],
+        )));
+        let suspended_at_ms = current_millis();
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.17",
+            5151,
+            &[runtime_key],
+        )));
+        assert!(shell.handover_paint_suspended());
+
+        // Not yet.
+        shell.tick_daemon_handover(
+            suspended_at_ms + crate::handover_gate::HANDOVER_PAINT_SUSPEND_MAX_MS / 2,
+        );
+        assert!(shell.handover_paint_suspended());
+
+        // Ceiling reached with the signal unchanged: paint resumes anyway.
+        shell.tick_daemon_handover(
+            suspended_at_ms + crate::handover_gate::HANDOVER_PAINT_SUSPEND_MAX_MS + 1,
+        );
+        assert!(!shell.handover_paint_suspended());
+        assert!(!handover_notification_shown(&shell));
+        assert_eq!(
+            terminal_read_tick_action(
+                TerminalBridgeReadPolicy::Active,
+                shell.handover_paint_suspended()
+            ),
+            TerminalReadTickAction::Read {
+                poll_ms_override: None
+            }
+        );
+    }
+
+    #[test]
+    fn handover_suspension_never_reaches_for_the_destructive_reveal_reconcile() {
+        // The resume must come back through the NORMAL read/attach path. The
+        // reveal reconcile is armed by the VISIBILITY policy's paused→active
+        // edge, so the handover suspension must live outside that function —
+        // otherwise a handover would look like a reveal and replay the daemon
+        // screen (field guide §5: collapses scrollback, can blank the viewport).
+        let session_path = "codex://handover-no-reconcile";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.16",
+            4242,
+            &[],
+        )));
+        shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
+            "2.12.17",
+            5151,
+            &[runtime_key],
+        )));
+        assert!(shell.handover_paint_suspended());
+        assert_eq!(
+            terminal_session_bridge_read_policy(&shell, session_path),
+            TerminalBridgeReadPolicy::Active,
+            "the visibility cadence must be untouched by a handover; only the \
+             composed tick action changes, so no paused→active reveal edge fires"
+        );
+    }
+
+    #[test]
+    fn terminal_read_loop_consults_the_handover_gate_at_both_paint_sites() {
+        // LOCK: the decision functions above are only worth anything if the
+        // read loop actually feeds them the gate. Both call sites live inside a
+        // 4,000-line `spawn`ed loop that no unit test can enter, so the wiring
+        // itself is what is pinned here.
+        //
+        // ⚠ Every needle carries `\n` ESCAPES on purpose. A plain-text needle
+        // would sit in THIS test's own source, `include_str!` would find its own
+        // copy, and the scan could never fail no matter what the loop does —
+        // the could-only-pass lock of field guide §7.1. The escapes are literal
+        // backslash-n bytes here and real newlines at run time, so only the
+        // production call site can satisfy them.
+        let source = include_str!("shell.rs");
+        let read_tick_wiring = concat!(
+            "let read_tick_action = state.with(|shell| {\n",
+            "                            terminal_read_tick_action(\n",
+            "                                terminal_session_bridge_read_policy(shell, &session_path),\n",
+        );
+        assert!(
+            source.contains(read_tick_wiring),
+            "the read tick must compose the visibility policy with the handover gate"
+        );
+        let read_tick_predicate = concat!(
+            "                                shell.handover_paint_suspended(),\n",
+            "                            )\n",
+            "                        });\n",
+        );
+        assert!(
+            source.contains(read_tick_predicate),
+            "the read tick must be fed the LIVE predicate, never a literal"
+        );
+        let write_flush_gate = concat!(
+            "                    && terminal_bridge_write_flush_allowed(\n",
+            "                        bridge_read_policy,\n",
+            "                        handover_paint_suspended,\n",
+            "                    )\n",
+        );
+        assert!(
+            source.contains(write_flush_gate),
+            "the staged-write flush must be gated on the handover predicate too, \
+             or the suspension would still hand bytes to term.write"
+        );
+        let loop_predicate = concat!(
+            "                        shell.handover_paint_suspended(),\n",
+            "                    )\n",
+            "                });\n",
+        );
+        assert!(
+            source.contains(loop_predicate),
+            "the loop must read the predicate once per tick to drive the veil command"
+        );
+        let veil_command = concat!(
+            "eval.send(TerminalJsCommand::SetHandoverPaintSuspended {\n",
+            "                        suspended: handover_paint_suspended,\n",
+        );
+        assert!(
+            source.contains(veil_command),
+            "the host must be told to stop its own render work, not just the reads"
+        );
+    }
+
+    #[test]
+    fn terminal_host_script_stops_its_own_render_work_while_a_handover_is_suspended() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("let handoverPaintSuspended = false;"));
+        assert!(script.contains("} else if (message.kind === \"set_handover_paint_suspended\") {"));
+        // The two render loops the suspension exists to stop.
+        assert!(
+            script.contains(
+                "            if (handoverPaintSuspended) {\n                return { status: 'suspended', reason: 'daemon_handover_paint_suspended', ink: null,"
+            ),
+            "render-health sampling (and its full redrawTerminal recovery) must stand down"
+        );
+        assert!(
+            script.contains(
+                "            if (handoverPaintSuspended) {\n                return;\n            }\n            pendingVisiblePaintForceFullRefresh = Boolean("
+            ),
+            "the visible-paint scheduler must drop requests while paint is suspended"
+        );
+        // A STATIC veil: the render cost is the thing being avoided, so no
+        // animation, no spinner, no timer.
+        assert!(script.contains("veil.className = 'yggterm-handover-veil';"));
+        assert!(!script.contains("yggterm-handover-veil-spin"));
     }
 
     #[test]

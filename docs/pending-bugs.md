@@ -215,6 +215,32 @@ fix) once the fix is verified live on guihost.
      changing, please wait"), **stop drawing the terminal for the duration**, and
      entertain the user. The render cost during handover is the thing being
      avoided, so the fix is to stop painting, not to paint a spinner harder.
+
+     ⏳ **BUILT, NOT YET LIVE-VERIFIED (GUI-side, no daemon change — it deploys
+     without a version bump).** `crates/yggterm-shell/src/handover_gate.rs` is
+     the one owner of the predicate, derived from the DAEMON'S OWN report
+     (`preserved_terminal_owner_keys` — the keys it serves but a predecessor
+     still owns), scoped to the runtime keys this client has mounted, and
+     resolved when the successor adopts them. On the ON edge: a coalescing
+     "Daemon updating" job notification, a static veil over the viewport, and
+     the terminal read/write path stops — no daemon read, no `term.write`, no
+     render-health sampling (so no recovery `redrawTerminal`), no visible-paint
+     scheduling. Resume is the NORMAL read from the unchanged cursor, never a
+     daemon-screen replay. Three fail-safes: the first observation is a baseline
+     (a GUI starting beside a lingering preserved owner never opens veiled), an
+     unreadable status resumes paint, and a 90 s ceiling ends any suspension and
+     latches that handover so it cannot re-arm. Probe it at
+     `server app state` → `handover_paint`; trace events
+     `handover_paint_suspended` / `handover_paint_resumed` (component
+     `daemon_handover`).
+     **Still open:** (a) live proof on guihost across a real daemon bump — nobody
+     has watched this fire yet; (b) detection latency is bounded by the
+     runtime-status poll (10 s busy / 60 s idle), so the notification can land
+     several seconds into the handover — a cheaper immediate trigger (e.g. an
+     out-of-band status refresh on the read loop's cursor-rewind tell) is the
+     obvious follow-up; (c) suspending reads for a long handover can overrun the
+     daemon's 512-chunk ring, which lands on the existing `resync_required`
+     path (scrollback-preserving screen reconcile), unchanged by this lane.
   8. **AUDIO NOTIFICATIONS NEED A PRE-ROLL.** Bluetooth speakers clip roughly the
      first ~300 ms while the link wakes, so the start of every notification is
      lost. The user suggested ~150 ms and invited a better figure. **Use ~400 ms

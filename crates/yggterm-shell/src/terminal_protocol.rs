@@ -55,6 +55,14 @@ pub(crate) enum TerminalJsCommand {
         reason: String,
     },
     Refit,
+    /// Daemon-handover paint suspension (user-settled call #7). While `true` the
+    /// host stops its OWN render work — the render-health probe and its recovery
+    /// redraw, and the visible-paint scheduler — and drops a static veil over
+    /// the viewport. Deliberately static: the render cost during a handover is
+    /// the thing being avoided, so a spinner would be the opposite of the point.
+    SetHandoverPaintSuspended {
+        suspended: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
