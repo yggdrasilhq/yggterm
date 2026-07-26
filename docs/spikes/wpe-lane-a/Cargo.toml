@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "wpe-lane-a-spike"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: the point of the spike is to MEASURE the
+# hand-written binding surface, so no bindgen / gtk-rs / glib crate is used.
+# The count it arrives at (19 fns) is the deliverable.
+[dependencies]
+
+[profile.release]
+debug = 0
