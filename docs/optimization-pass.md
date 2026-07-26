@@ -541,10 +541,20 @@ Two lanes, sequenced so the risky one cannot block the useful one:
 - **Lane B ships first, because it works today.** The installed WebKitGTK 2.52.4 plus a
   headless compositor on a server host (`sway --headless` or Xvfb, both already proven in the
   shadow-client work). Cost: one compositor process per host.
-- **Lane A is a timeboxed spike.** True WPE headless (`WPEDisplayHeadless`), no display
-  server at all. `libwpewebkit-2.0-dev` 2.52.4-1 is available in sid and **installed
-  nowhere**, and there is no mature Rust binding. Verify reachability from Rust before
-  committing to it.
+- **Lane A is a timeboxed spike.** True WPE headless, no display server at all. There
+  is no mature Rust binding. Verify reachability from Rust before committing to it.
+  **✅ RESOLVED 2026-07-26 — Lane A is REACHABLE; see `docs/spikes/wpe-lane-a/`.**
+  A dependency-free Rust binary loaded a page, reached `WEBKIT_LOAD_FINISHED`, read
+  the title and got 2 exported frames, with no X and no Wayland: 278 ms warm, on a
+  hardware render node. Two corrections the spike forced, recorded here because the
+  text above stated both wrongly:
+  - **`WPEDisplayHeadless` is NOT the mechanism.** Debian builds WPE without
+    `ENABLE_WPE_PLATFORM` — zero `wpe_display_*` symbols exist. The working route is
+    the legacy **libwpe + WPEBackend-fdo exportable backend** (in-process nested
+    Wayland compositor, buffers exported to our callbacks). Drop `WPEDisplayHeadless`
+    from the plan.
+  - Package is **2.52.5-1**, and the fdo dev package is the **1.0** ABI
+    (`libwpebackend-fdo-1.0-dev`); a `1.1` does not exist.
 
 **★ USER-SETTLED 2026-07-26: WPE is the destination, not a spike.** The user
 raised it unprompted ("a lower primitive of WebKitGTK") and agreed with the
@@ -564,9 +574,15 @@ settled reasoning, so it is not re-derived:
   engine-core and identical; the GL crash surface changes owner (ours, not
   GTK's); nothing for Windows (WebView2 remains the Windows engine — WPE is
   the Linux/server plane only).
-- The "no Rust binding" blocker is a bounded maintenance cost, not a wall:
-  regenerate gir bindings against WPE's `.gir` and vendor them, the same way
-  wry/dioxus-desktop are already vendored and patched.
+- The "no Rust binding" blocker is a bounded maintenance cost, not a wall.
+  **Corrected 2026-07-26 by the Lane-A spike:** it is bounded for a better
+  reason than the gir plan assumed. Debian ships **no `.gir`/typelib for WPE
+  at all** (`gir1.2-webkit-*` are the GTK port only), so "regenerate gir
+  bindings and vendor them" cannot be executed without rebuilding WPE from
+  source with introspection. It does not need to be: the surface actually
+  required is **19 hand-written `extern "C"` declarations** plus one `repr(C)`
+  callback struct — no bindgen, no gir toolchain, no new dependency. Hand-written
+  FFI is the recommendation; see `docs/spikes/wpe-lane-a/README.md`.
 - Sequence: agent engine on WPE first (agents are the only consumers — lowest
   risk, highest immediate win), then GUI web-surface hosting migrates
   view-by-view (WebKitGTK remains under the Dioxus chrome until last), each
