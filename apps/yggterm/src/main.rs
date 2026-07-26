@@ -23,44 +23,29 @@ use yggterm_core::{
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
-    PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, WorkspaceViewMode,
-    focus_live_with_view, open_remote_session_with_view, open_stored_session_with_view,
-    reorder_live_sessions_scoped, row_order_ledger_report, YggtermServer,
-    active_client_instance_records, default_endpoint, detect_ghostty_host,
-    ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
-    resolve_client_daemon_endpoint,
-    run_app_control_background_window, run_app_control_close_window,
-    run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
-    run_app_control_ensure_web_surface,
-    run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
+    PersistedDaemonState, ProbeTerminalViewportInputMode, ScreenshotPostProcess, SessionKind,
+    WorkspaceViewMode, YggtermServer, active_client_instance_records, default_endpoint,
+    detect_ghostty_host, ensure_local_daemon_running, focus_live_with_view,
+    local_headless_companion_executable_from_current, open_remote_session_with_view,
+    open_stored_session_with_view, ping, reorder_live_sessions_scoped,
+    resolve_client_daemon_endpoint, row_order_ledger_report, run_app_control_background_window,
+    run_app_control_close_window, run_app_control_close_window_preserving_sessions,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
+    run_app_control_dump_state, run_app_control_ensure_web_surface, run_app_control_focus_window,
+    run_app_control_grid, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_dom_eval, run_app_control_grid, run_app_control_pointer,
-    run_app_control_probe_terminal_context_menu,
+    run_app_control_pointer, run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_redraw_terminal, run_app_control_remove_session, run_app_control_rename_session,
-    run_app_control_restart_session,
+    run_app_control_probe_terminal_viewport_select, run_app_control_read_terminal_buffer,
+    run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
+    run_app_control_remove_session, run_app_control_rename_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
-    run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
+    run_app_control_restart_pending_update, run_app_control_restart_session,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
-    run_app_control_web_surface_await, run_app_control_web_surface_batch,
-    run_app_control_web_surface_capture_element,
-    run_app_control_web_surface_close, run_app_control_web_surface_cookies,
-    run_app_control_web_surface_frames,
-    run_app_control_web_surface_reload,
-    run_app_control_web_surface_devtools, run_app_control_web_surface_do,
-    run_app_control_web_surface_fill_vault,
-    run_app_control_web_surface_lease,
-    run_app_control_web_surface_eval,
-    run_app_control_web_surface_fill, run_app_control_web_surface_read,
-    run_app_control_web_surface_screenshot,
-    run_app_control_web_surface_totp, run_app_control_web_surface_wait,
-    run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
     run_app_control_set_main_zoom, run_app_control_set_maximized,
@@ -69,13 +54,20 @@ use yggterm_server::{
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
-    run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
-    ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
-    run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
-    run_trace_transitions,
-    shutdown, snapshot, start_local_session, status, terminal_history, terminal_resize,
-    terminal_restart, terminal_retained_snapshot, terminal_snapshot, terminal_write,
-    try_run_remote_server_command,
+    run_app_control_start_action, run_app_control_submit_terminal_prompt,
+    run_app_control_trigger_update_check, run_app_control_web_surface_await,
+    run_app_control_web_surface_batch, run_app_control_web_surface_capture_element,
+    run_app_control_web_surface_close, run_app_control_web_surface_cookies,
+    run_app_control_web_surface_devtools, run_app_control_web_surface_do,
+    run_app_control_web_surface_eval, run_app_control_web_surface_fill,
+    run_app_control_web_surface_fill_vault, run_app_control_web_surface_frames,
+    run_app_control_web_surface_lease, run_app_control_web_surface_read,
+    run_app_control_web_surface_reload, run_app_control_web_surface_screenshot,
+    run_app_control_web_surface_totp, run_app_control_web_surface_wait, run_attach, run_daemon,
+    run_screenrecord_capture, run_screenshot_capture, run_screenshot_capture_with_post_process,
+    run_trace_bundle, run_trace_follow, run_trace_tail, run_trace_transitions, shutdown, snapshot,
+    start_local_session, status, terminal_history, terminal_resize, terminal_restart,
+    terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -685,7 +677,11 @@ fn parse_web_frame_ref(args: &[String]) -> anyhow::Result<Option<yggterm_server:
         return Ok(Some(WebFrameRef::Index(index)));
     }
     let separators: &[char] = &['.', ','];
-    if raw.contains(separators) && raw.split(separators).all(|part| part.trim().parse::<usize>().is_ok()) {
+    if raw.contains(separators)
+        && raw
+            .split(separators)
+            .all(|part| part.trim().parse::<usize>().is_ok())
+    {
         let path = raw
             .split(separators)
             .map(|part| part.trim().parse::<usize>().unwrap_or(0))
@@ -747,15 +743,17 @@ fn tokenize_argv_line(line: &str) -> anyhow::Result<Vec<String>> {
 /// `parse_web_surface_do_action` a CLI verb goes through, so a batched action
 /// and a typed one can never mean different things; that shared parser is the
 /// single source of truth for what a `do` verb IS.
-fn parse_web_do_batch_script(script: &str) -> anyhow::Result<Vec<yggterm_server::WebSurfaceDoAction>> {
+fn parse_web_do_batch_script(
+    script: &str,
+) -> anyhow::Result<Vec<yggterm_server::WebSurfaceDoAction>> {
     let mut actions = Vec::new();
     for (index, line) in script.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let tokens = tokenize_argv_line(trimmed)
-            .with_context(|| format!("batch line {}", index + 1))?;
+        let tokens =
+            tokenize_argv_line(trimmed).with_context(|| format!("batch line {}", index + 1))?;
         // `parse_web_surface_do_action` reads the verb at args[4] — the shape a
         // real `server app web do …` invocation has — so the line is spliced
         // onto that prefix rather than parsed by a second, parallel reader.
@@ -870,7 +868,9 @@ fn parse_web_surface_do_action(
                 .unwrap_or_default(),
             selector: parse_web_element_ref(args, false)?,
         },
-        other => anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|fill|key)"),
+        other => {
+            anyhow::bail!("unsupported web do verb: {other} (click|move|scroll|type|fill|key)")
+        }
     };
     Ok(action)
 }
@@ -1223,25 +1223,79 @@ fn print_server_help() {
 /// dispatcher's own match arms disagree with it. An alias carries an empty
 /// usage string — it is named in its primary's line.
 const WEB_ACTIONS: &[(&str, &str)] = &[
-    ("eval", "  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]\n"),
-    ("read", "  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]\n    read with NO --frame searches EVERY reachable frame and returns\n    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []\n"),
-    ("await", "  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]\n    the script is the BODY of an async function; `return` its value.\n    `eval` cannot return a Promise — this is the one verb that can.\n"),
-    ("frames", "  yggterm server app web frames [--session <path>]\n    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)\n"),
-    ("do", "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n"),
-    ("fill-vault", "  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]\n"),
-    ("fill-card", "  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]\n"),
-    ("fill", "  yggterm server app web fill [--entry <name>] [--user <u>] [--session <path>]\n    auto-match the page host against the vault and fill the login form.\n    For ONE named field into ONE addressed element, use fill-vault.\n"),
-    ("totp", "  yggterm server app web totp [--entry <name>] [--user <u>] [--session <path>]  (alias: code)\n    put the entry's current TOTP code into the page's one-time-code field\n"),
-    ("batch", "  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]\n    one `do` invocation per line; # comments and blank lines skipped\n"),
-    ("wait", "  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]\n    cond: load:committed | load:finished | idle:<ms> | settled:<ms>\n        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>\n    url:* and settled:* are read from the ENGINE, so they survive a navigation\n    that makes every page-side predicate unavailable\n"),
-    ("ensure", "  yggterm server app web ensure --session <path> [--ttl <secs>]\n    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,\n    and reports generation_before/generation_after + healed so a caller can tell\n    a new page from the same one. Refusals name WHICH fact failed (no_declare,\n    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).\n"),
-    ("reload", "  yggterm server app web reload --session <path>\n"),
+    (
+        "eval",
+        "  yggterm server app web eval (<script>|--script <js>|--stdin) [--frame <f>] [--session <path>]\n",
+    ),
+    (
+        "read",
+        "  yggterm server app web read [--as snapshot|forms|tables|readable|links|text|html] [--frame <f>] [--session <path>]\n    read with NO --frame searches EVERY reachable frame and returns\n    frames:[ {{frame:{{path,url}},result}} ] — the top document is frame []\n",
+    ),
+    (
+        "await",
+        "  yggterm server app web await (<script>|--script <file>|--stdin) [--await-timeout <ms>] [--session <path>]\n    the script is the BODY of an async function; `return` its value.\n    `eval` cannot return a Promise — this is the one verb that can.\n",
+    ),
+    (
+        "frames",
+        "  yggterm server app web frames [--session <path>]\n    --frame <f> is an index (2), a path (0.2), or a url substring (billdesk)\n",
+    ),
+    (
+        "do",
+        "  yggterm server app web do <click|move|scroll|type|fill|key> <target> [--text …|--key …|--mods …] [--generation <n>] [--new-batch] [--session <path>]\n    target (resolved in the page at click time, precedence in this order):\n      --selector <css> | --role <r> --label <s> [--nth <n>]\n      | --target-text <s> [--exact] [--tag <css>] [--nth <n>]   (on `click`, --text is an alias)\n      | --selector-set <css,css,…>   (segmented inputs: one box per character)\n      | --x <n> --y <n>              (blind coordinates; prefer an addressed target)\n",
+    ),
+    (
+        "fill-vault",
+        "  yggterm server app web fill-vault --item <name> [--field password|username|totp|notes] [--user <u>] <target> [--session <path>]\n",
+    ),
+    (
+        "fill-card",
+        "  yggterm server app web fill-card --item <name> [--field number|expiry|code|holder] <target> [--session <path>]\n",
+    ),
+    (
+        "fill",
+        "  yggterm server app web fill [--entry <name>] [--user <u>] [--session <path>]\n    auto-match the page host against the vault and fill the login form.\n    For ONE named field into ONE addressed element, use fill-vault.\n",
+    ),
+    (
+        "totp",
+        "  yggterm server app web totp [--entry <name>] [--user <u>] [--session <path>]  (alias: code)\n    put the entry's current TOTP code into the page's one-time-code field\n",
+    ),
+    (
+        "batch",
+        "  yggterm server app web batch (--script <file>|--stdin) [--stop-on-error] [--generation <n>] [--session <path>]\n    one `do` invocation per line; # comments and blank lines skipped\n",
+    ),
+    (
+        "wait",
+        "  yggterm server app web wait --until <cond> [--visible] [--wait-timeout <ms>] [--session <path>]\n    cond: load:committed | load:finished | idle:<ms> | settled:<ms>\n        | selector:<css> | js:<expr> | url:matches:<regex> | url:contains:<substring>\n    url:* and settled:* are read from the ENGINE, so they survive a navigation\n    that makes every page-side predicate unavailable\n",
+    ),
+    (
+        "ensure",
+        "  yggterm server app web ensure --session <path> [--ttl <secs>]\n    LIVENESS-based: probes the page with a real round trip, rebuilds a corpse,\n    and reports generation_before/generation_after + healed so a caller can tell\n    a new page from the same one. Refusals name WHICH fact failed (no_declare,\n    declare_stale, declare_url_scheme_refused, daemon_declare_unavailable, ...).\n",
+    ),
+    (
+        "reload",
+        "  yggterm server app web reload --session <path>\n",
+    ),
     ("close", "  yggterm server app web close --session <path>\n"),
-    ("lease", "  yggterm server app web lease --ttl <secs> [--session <path>]\n"),
-    ("screenshot", "  yggterm server app web screenshot [output.png] [--session <path>]\n"),
-    ("cookies", "  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]\n    Netscape format, both ways (what `curl -c`/`-b` writes and reads).\n    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the\n    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers\n    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to\n    the engine API and are reported as export_scope=root_path_per_domain.\n"),
-    ("capture-element", "  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]\n    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface\n"),
-    ("devtools", "  yggterm server app web devtools [--close] [--session <path>]\n"),
+    (
+        "lease",
+        "  yggterm server app web lease --ttl <secs> [--session <path>]\n",
+    ),
+    (
+        "screenshot",
+        "  yggterm server app web screenshot [output.png] [--session <path>]\n",
+    ),
+    (
+        "cookies",
+        "  yggterm server app web cookies (--import <jar>|--export <jar>) [--session <path>]\n    Netscape format, both ways (what `curl -c`/`-b` writes and reads).\n    WARNING: the jar is per-PROFILE; an unqualified surface is `default`, the\n    user's own browsing jar. Use an `agent-<n>` profile surface. Export covers\n    every ROOT-PATH cookie per domain — path-scoped cookies are not visible to\n    the engine API and are reported as export_scope=root_path_per_domain.\n",
+    ),
+    (
+        "capture-element",
+        "  yggterm server app web capture-element <target> [out.png] [--split <n>] [--session <path>]\n    in-page canvas rasterize of one <img>/<canvas>/<video>; works on an UNMAPPED surface\n",
+    ),
+    (
+        "devtools",
+        "  yggterm server app web devtools [--close] [--session <path>]\n",
+    ),
     ("code", ""),
     ("capture", ""),
 ];
@@ -1414,8 +1468,7 @@ fn connect_scanned_metadata(
         .iter()
         .flat_map(|machine| machine.sessions.iter())
         .find(|scanned| {
-            scanned.session_id == want
-                || connect_path_session_uuid(&scanned.session_path) == want
+            scanned.session_id == want || connect_path_session_uuid(&scanned.session_path) == want
         })
         .map(|scanned| {
             let cwd = (!scanned.cwd.trim().is_empty()).then(|| scanned.cwd.clone());
@@ -1437,8 +1490,7 @@ fn connect_session_key_is_known(snapshot: &yggterm_server::ServerUiSnapshot, pat
     let want = connect_path_session_uuid(path);
     connect_session_is_active(snapshot, path)
         || snapshot.live_sessions.iter().any(|session| {
-            session.session_path == path
-                || connect_path_session_uuid(&session.session_path) == want
+            session.session_path == path || connect_path_session_uuid(&session.session_path) == want
         })
 }
 
@@ -1462,9 +1514,8 @@ fn connect_desired_order(
     placement: &ConnectPlacement,
 ) -> Vec<String> {
     let want = connect_path_session_uuid(connected);
-    let same = |candidate: &str| {
-        candidate == connected || connect_path_session_uuid(candidate) == want
-    };
+    let same =
+        |candidate: &str| candidate == connected || connect_path_session_uuid(candidate) == want;
     // If the row was already live, leave it exactly where the user had it.
     if before.iter().any(|path| same(path)) {
         return before.to_vec();
@@ -1484,9 +1535,7 @@ fn connect_desired_order(
             let mut placed = false;
             for path in before {
                 order.push(path.clone());
-                if !placed
-                    && (path == anchor || connect_path_session_uuid(path) == anchor_uuid)
-                {
+                if !placed && (path == anchor || connect_path_session_uuid(path) == anchor_uuid) {
                     order.push(connected.to_string());
                     placed = true;
                 }
@@ -1639,9 +1688,7 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
         .remote_machines
         .iter()
         .flat_map(|machine| machine.sessions.iter())
-        .filter(|scanned| {
-            !live_uuids.contains(&connect_path_session_uuid(&scanned.session_path))
-        })
+        .filter(|scanned| !live_uuids.contains(&connect_path_session_uuid(&scanned.session_path)))
         .collect();
     // Newest first, so the sessions the user was most recently working with are
     // at the top of what can be a large scan (a busy host has hundreds).
@@ -1918,8 +1965,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "release" => {
-                let status =
-                    yggterm_server::release_profile_write_lock(&endpoint, profile, pid)?;
+                let status = yggterm_server::release_profile_write_lock(&endpoint, profile, pid)?;
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 return Ok(());
             }
@@ -1988,7 +2034,10 @@ fn main() -> Result<()> {
             .position(|arg| arg == "--scope")
             .and_then(|ix| args.get(ix + 1))
             .cloned();
-        let scope_value_ix = args.iter().position(|arg| arg == "--scope").map(|ix| ix + 1);
+        let scope_value_ix = args
+            .iter()
+            .position(|arg| arg == "--scope")
+            .map(|ix| ix + 1);
         let ordered: Vec<String> = if args.iter().any(|arg| arg == "--stdin") {
             let mut buf = String::new();
             std::io::stdin()
@@ -2003,14 +2052,14 @@ fn main() -> Result<()> {
             args[2..]
                 .iter()
                 .enumerate()
-                .filter(|(ix, arg)| {
-                    !arg.starts_with('-') && Some(ix + 2) != scope_value_ix
-                })
+                .filter(|(ix, arg)| !arg.starts_with('-') && Some(ix + 2) != scope_value_ix)
                 .map(|(_, arg)| arg.clone())
                 .collect()
         };
         if ordered.is_empty() {
-            anyhow::bail!("usage: yggterm server reorder <session-path>... | --stdin [--scope <scope>]");
+            anyhow::bail!(
+                "usage: yggterm server reorder <session-path>... | --stdin [--scope <scope>]"
+            );
         }
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = cli_server_endpoint(store.home_dir());
@@ -2100,12 +2149,18 @@ fn main() -> Result<()> {
         let endpoint = cli_server_endpoint(store.home_dir());
         let retained = args.iter().any(|arg| arg == "--retained");
         let raw = args.iter().any(|arg| arg == "--raw");
-        let (text, running, runtime_output_seen, post_resize_output_seen, last_resize_seq, _runtime_spawn_id) =
-            if retained {
-                terminal_retained_snapshot(&endpoint, &args[3])?
-            } else {
-                terminal_snapshot(&endpoint, &args[3])?
-            };
+        let (
+            text,
+            running,
+            runtime_output_seen,
+            post_resize_output_seen,
+            last_resize_seq,
+            _runtime_spawn_id,
+        ) = if retained {
+            terminal_retained_snapshot(&endpoint, &args[3])?
+        } else {
+            terminal_snapshot(&endpoint, &args[3])?
+        };
         if raw {
             print!("{text}");
         } else {
@@ -2205,15 +2260,11 @@ fn main() -> Result<()> {
             .find_map(|window| (window[0] == "--session").then(|| window[1].clone()));
         let last_ms = args
             .windows(2)
-            .find_map(|window| {
-                (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?
-            })
+            .find_map(|window| (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?)
             .unwrap_or(180_000);
         let limit = args
             .windows(2)
-            .find_map(|window| {
-                (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?
-            })
+            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
             .unwrap_or(200);
         return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
@@ -3241,8 +3292,9 @@ fn main() -> Result<()> {
                             .into_iter()
                             .next()
                             .context("missing session path for server app terminal scroll")?;
-                        let to = cli_flag_value(&args, "--to")
-                            .context("missing --to (top|bottom|±N lines) for server app terminal scroll")?;
+                        let to = cli_flag_value(&args, "--to").context(
+                            "missing --to (top|bottom|±N lines) for server app terminal scroll",
+                        )?;
                         run_app_control_scroll_terminal_viewport(session_path, to, timeout_ms)
                     }
                     "read-buffer" => {
@@ -3353,8 +3405,7 @@ fn main() -> Result<()> {
                             // because an async body is rarely a one-liner. A
                             // path that does not exist is read as the script
                             // itself rather than failing silently.
-                            std::fs::read_to_string(path)
-                                .unwrap_or_else(|_| path.to_string())
+                            std::fs::read_to_string(path).unwrap_or_else(|_| path.to_string())
                         } else {
                             cli_positional_args(&args, 4)
                                 .into_iter()
@@ -3366,11 +3417,7 @@ fn main() -> Result<()> {
                             .map(|raw| raw.parse::<u64>().context("--await-timeout needs ms"))
                             .transpose()?
                             .unwrap_or(15_000);
-                        run_app_control_web_surface_await(
-                            session_path,
-                            &script,
-                            await_timeout_ms,
-                        )
+                        run_app_control_web_surface_await(session_path, &script, await_timeout_ms)
                     }
                     "frames" => {
                         // What frames this page has, and how much is IN each:
@@ -3468,9 +3515,12 @@ fn main() -> Result<()> {
                         )?;
                         let item = cli_flag_value(&args, "--item")
                             .context("missing --item (the vault entry NAME) for web fill-vault")?;
-                        let field = cli_flag_value(&args, "--field").unwrap_or(
-                            if action == "fill-card" { "number" } else { "password" },
-                        );
+                        let field =
+                            cli_flag_value(&args, "--field").unwrap_or(if action == "fill-card" {
+                                "number"
+                            } else {
+                                "password"
+                            });
                         let user = cli_flag_value(&args, "--user");
                         let generation = cli_flag_value(&args, "--generation")
                             .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
@@ -3507,10 +3557,7 @@ fn main() -> Result<()> {
                         // the current `generation` to pin the next call with.
                         let action = parse_web_surface_do_action(&args)?;
                         let generation = cli_flag_value(&args, "--generation")
-                            .map(|raw| {
-                                raw.parse::<u64>()
-                                    .context("--generation needs a number")
-                            })
+                            .map(|raw| raw.parse::<u64>().context("--generation needs a number"))
                             .transpose()?;
                         // `--new-batch` is the documented recovery from a
                         // `preempted` refusal: the agent asserts it re-observed
@@ -3575,9 +3622,8 @@ fn main() -> Result<()> {
                         // Both report generation_before; compare it against a
                         // following `web ensure`'s generation_after to tell a
                         // HEALED surface from the same corpse.
-                        let session = session_path.context(
-                            "web reload/close needs --session <path>",
-                        )?;
+                        let session =
+                            session_path.context("web reload/close needs --session <path>")?;
                         if action == "reload" {
                             run_app_control_web_surface_reload(session, timeout_ms)
                         } else {
@@ -4324,10 +4370,7 @@ fn configure_linux_terminal_renderer_policy() {
 /// inherited decision; only a bare flag (user export) or one whose marker
 /// says "xterm_canvas_explicit" (re-exec of an honored override) is explicit.
 #[cfg(target_os = "linux")]
-fn linux_canvas_env_is_user_explicit(
-    canvas_env_present: bool,
-    policy_env: Option<&str>,
-) -> bool {
+fn linux_canvas_env_is_user_explicit(canvas_env_present: bool, policy_env: Option<&str>) -> bool {
     canvas_env_present
         && policy_env
             .map(str::trim)
@@ -4647,6 +4690,10 @@ struct LinuxWebkitGlEnvInherited<'a> {
     webkit_disable_dmabuf_renderer_present: bool,
     web_surface_under_glass: Option<&'a str>,
     web_surface_legacy_stack: Option<&'a str>,
+    /// `__EGL_VENDOR_LIBRARY_FILENAMES` already set: someone (the user, a
+    /// wrapper) has an opinion about GLVND vendor selection and the guard
+    /// defers to it.
+    egl_vendor_library_filenames_present: bool,
 }
 
 /// Everything the GL decision does to the process environment, as a value.
@@ -4662,6 +4709,7 @@ struct LinuxWebkitGlEnvPlan {
     libgl_always_software: GlEnvAction,
     gallium_driver: GlEnvAction,
     webkit_disable_dmabuf_renderer: GlEnvAction,
+    egl_vendor_library_filenames: GlEnvAction,
 }
 
 #[cfg(target_os = "linux")]
@@ -4680,6 +4728,7 @@ fn gl_env_set_if_unset(present: bool, value: &'static str) -> GlEnvAction {
 fn linux_webkit_gl_env_plan(
     policy: LinuxWebkitGlPolicy,
     compositing_disabled_env: bool,
+    stray_nvidia_egl_vendor: bool,
     inherited: LinuxWebkitGlEnvInherited<'_>,
 ) -> LinuxWebkitGlEnvPlan {
     // Under-glass by DEFAULT: resolve the two env knobs into the ONE arming variable
@@ -4700,6 +4749,20 @@ fn linux_webkit_gl_env_plan(
         libgl_always_software: GlEnvAction::Keep,
         gallium_driver: GlEnvAction::Keep,
         webkit_disable_dmabuf_renderer: GlEnvAction::Keep,
+        // A stray NVIDIA GLVND ICD on a device-less host gets libEGL_nvidia mapped
+        // into this process and every web process, and it showed up in live WebKit
+        // crash stacks right behind `eglMakeCurrent failed` (guihost, 2026-07-26). Pin
+        // GLVND to the Mesa ICD — but only on the hardware path (the crash class
+        // lives there, and `YGGTERM_FORCE_SOFTWARE_GL=1` must keep restoring the
+        // old behaviour whole), and never over an explicit user filter.
+        egl_vendor_library_filenames: if policy.hardware_gl
+            && stray_nvidia_egl_vendor
+            && !inherited.egl_vendor_library_filenames_present
+        {
+            GlEnvAction::Set(yggterm_core::gl_probe::MESA_EGL_VENDOR_JSON)
+        } else {
+            GlEnvAction::Keep
+        },
     };
     // Escape hatch: if the user force-disabled compositing, respect it — WebGL becomes
     // unavailable and the renderer policy falls back to DOM. Deliberately AFTER the
@@ -4758,7 +4821,7 @@ fn linux_webkit_gl_env_plan(
 #[cfg(target_os = "linux")]
 fn linux_webkit_gl_env_plan_entries(
     plan: &LinuxWebkitGlEnvPlan,
-) -> [(&'static str, GlEnvAction); 5] {
+) -> [(&'static str, GlEnvAction); 6] {
     use yggterm_core::gl_probe as probe;
     [
         (probe::ENV_YGGTERM_WEBKIT_GL_POLICY, plan.webkit_gl_policy),
@@ -4771,6 +4834,10 @@ fn linux_webkit_gl_env_plan_entries(
         (
             probe::ENV_WEBKIT_DISABLE_DMABUF_RENDERER,
             plan.webkit_disable_dmabuf_renderer,
+        ),
+        (
+            probe::ENV_EGL_VENDOR_LIBRARY_FILENAMES,
+            plan.egl_vendor_library_filenames,
         ),
     ]
 }
@@ -4896,6 +4963,7 @@ fn configure_linux_webkit_compositing() {
     let plan = linux_webkit_gl_env_plan(
         policy,
         compositing_disabled_env,
+        yggterm_core::gl_probe::stray_nvidia_egl_vendor(),
         LinuxWebkitGlEnvInherited {
             libgl_always_software_present: std::env::var_os(
                 yggterm_core::gl_probe::ENV_LIBGL_ALWAYS_SOFTWARE,
@@ -4909,6 +4977,10 @@ fn configure_linux_webkit_compositing() {
             .is_some(),
             web_surface_under_glass: under_glass.as_deref(),
             web_surface_legacy_stack: legacy_stack.as_deref(),
+            egl_vendor_library_filenames_present: std::env::var_os(
+                yggterm_core::gl_probe::ENV_EGL_VENDOR_LIBRARY_FILENAMES,
+            )
+            .is_some(),
         },
     );
     for (key, action) in linux_webkit_gl_env_plan_entries(&plan) {
@@ -5922,12 +5994,14 @@ mod web_usage_tests {
              lowering this floor",
             dispatcher.len()
         );
-        assert!(dispatcher.contains(&"eval".to_string()), "sanity: {dispatcher:?}");
+        assert!(
+            dispatcher.contains(&"eval".to_string()),
+            "sanity: {dispatcher:?}"
+        );
 
         let documented: std::collections::BTreeSet<&str> =
             WEB_ACTIONS.iter().map(|(name, _)| *name).collect();
-        let implemented: std::collections::BTreeSet<String> =
-            dispatcher.iter().cloned().collect();
+        let implemented: std::collections::BTreeSet<String> = dispatcher.iter().cloned().collect();
 
         let undocumented: Vec<&String> = implemented
             .iter()
@@ -5978,22 +6052,21 @@ mod web_usage_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::KEYTIPS_AUDIT_JS;
     #[cfg(unix)]
     use super::superseded_client_termination_signal;
     use super::{
         BuiltinCliCommand, FILE_DESCRIPTOR_SOFT_LIMIT_TARGET, LinuxWindowProfileInput,
-        SignalClientScope, raised_file_descriptor_soft_limit,
-        app_control_launch_state_timeout_ms, app_control_state_settled_for_launch,
-        classify_builtin_cli_command, compatible_signal_client_count,
-        linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
+        SignalClientScope, app_control_launch_state_timeout_ms,
+        app_control_state_settled_for_launch, classify_builtin_cli_command,
+        compatible_signal_client_count, linux_window_profile_from_input,
+        main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
         record_matches_executable, should_handoff_to_preferred_executable,
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
-        under_glass_default_armed,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
         signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
-        superseded_client_retirement_strategy_label,
+        superseded_client_retirement_strategy_label, under_glass_default_armed,
     };
-    use super::KEYTIPS_AUDIT_JS;
 
     // §12.1: a control whose badge marker is a child span is REACHABLE, whatever
     // encloses it. If the exempt-ancestor test ran first, wiring a control inside
@@ -6169,115 +6242,154 @@ mod tests {
                                 // the outcome is the INHERITED environment, so it is
                                 // an input here.
                                 for inherited_software_force in [false, true] {
-                                    let policy = linux_webkit_gl_policy_from_input(
-                                        LinuxWebkitGlPolicyInput {
-                                            compositing_disabled_env,
-                                            force_software_gl,
-                                            enable_compositing,
-                                            probe,
-                                        },
-                                    );
-                                    let plan = linux_webkit_gl_env_plan(
-                                        policy,
-                                        compositing_disabled_env,
-                                        LinuxWebkitGlEnvInherited {
-                                            libgl_always_software_present: inherited_software_force,
-                                            gallium_driver_present: inherited_software_force,
-                                            webkit_disable_dmabuf_renderer_present: already_forced,
-                                            web_surface_under_glass: under_glass_var,
-                                            web_surface_legacy_stack: None,
-                                        },
-                                    );
-                                    let armed = under_glass_default_armed(
-                                        under_glass_var,
-                                        None,
-                                        !policy.hardware_gl,
-                                    );
-                                    let explicit_under_glass = under_glass_var == Some("1");
-                                    let context = format!(
-                                        "hardware_gl={} probe={probe:?} \
+                                    for stray_nvidia in [false, true] {
+                                        for egl_filter_present in [false, true] {
+                                            let policy = linux_webkit_gl_policy_from_input(
+                                                LinuxWebkitGlPolicyInput {
+                                                    compositing_disabled_env,
+                                                    force_software_gl,
+                                                    enable_compositing,
+                                                    probe,
+                                                },
+                                            );
+                                            let plan = linux_webkit_gl_env_plan(
+                                                policy,
+                                                compositing_disabled_env,
+                                                stray_nvidia,
+                                                LinuxWebkitGlEnvInherited {
+                                                    libgl_always_software_present:
+                                                        inherited_software_force,
+                                                    gallium_driver_present:
+                                                        inherited_software_force,
+                                                    webkit_disable_dmabuf_renderer_present:
+                                                        already_forced,
+                                                    web_surface_under_glass: under_glass_var,
+                                                    web_surface_legacy_stack: None,
+                                                    egl_vendor_library_filenames_present:
+                                                        egl_filter_present,
+                                                },
+                                            );
+                                            let armed = under_glass_default_armed(
+                                                under_glass_var,
+                                                None,
+                                                !policy.hardware_gl,
+                                            );
+                                            let explicit_under_glass = under_glass_var == Some("1");
+                                            let context = format!(
+                                                "hardware_gl={} probe={probe:?} \
                                          disabled={compositing_disabled_env} \
                                          force_sw={force_software_gl} \
                                          enable={enable_compositing} \
                                          glass={under_glass_var:?} forced={already_forced} \
                                          inherited_sw={inherited_software_force}",
-                                        policy.hardware_gl
-                                    );
-                                    // The decision is always observable, escape hatch
-                                    // or not — otherwise the one instrument is missing
-                                    // exactly when someone asks why the GPU is off.
-                                    assert_eq!(
-                                        plan.webkit_gl_policy,
-                                        GlEnvAction::Set(policy.reason),
-                                        "the policy must publish itself ({context})"
-                                    );
-                                    assert_eq!(
-                                        plan.web_surface_under_glass,
-                                        GlEnvAction::Set(if armed { "1" } else { "0" }),
-                                        "arming must publish itself ({context})"
-                                    );
-                                    // ⚠⚠ THE LOCK THE PREVIOUS ONE ONLY LOOKED LIKE.
-                                    // Live-caught 2026-07-25: declining to SET the
-                                    // software-GL pair is not the same as owning it. A
-                                    // GUI relaunched by a running GUI inherits
-                                    // LIBGL_ALWAYS_SOFTWARE=1 from its predecessor, so
-                                    // on a probed-hardware host the policy said
-                                    // hardware while WebKit stayed on llvmpipe. This
-                                    // fails if `Clear` is ever downgraded to
-                                    // "set if unset".
-                                    let expected_software_pair = if compositing_disabled_env {
-                                        // Compositing force-disabled: there is no GPU
-                                        // path left to choose, so we touch neither.
-                                        (GlEnvAction::Keep, GlEnvAction::Keep)
-                                    } else if policy.hardware_gl {
-                                        (GlEnvAction::Remove, GlEnvAction::Remove)
-                                    } else if inherited_software_force {
-                                        (GlEnvAction::Keep, GlEnvAction::Keep)
-                                    } else {
-                                        (GlEnvAction::Set("1"), GlEnvAction::Set("llvmpipe"))
-                                    };
-                                    assert_eq!(
-                                        (plan.libgl_always_software, plan.gallium_driver),
-                                        expected_software_pair,
-                                        "hardware GL must CLEAR an inherited software force, \
+                                                policy.hardware_gl
+                                            );
+                                            // The decision is always observable, escape hatch
+                                            // or not — otherwise the one instrument is missing
+                                            // exactly when someone asks why the GPU is off.
+                                            assert_eq!(
+                                                plan.webkit_gl_policy,
+                                                GlEnvAction::Set(policy.reason),
+                                                "the policy must publish itself ({context})"
+                                            );
+                                            assert_eq!(
+                                                plan.web_surface_under_glass,
+                                                GlEnvAction::Set(if armed { "1" } else { "0" }),
+                                                "arming must publish itself ({context})"
+                                            );
+                                            // ⚠⚠ THE LOCK THE PREVIOUS ONE ONLY LOOKED LIKE.
+                                            // Live-caught 2026-07-25: declining to SET the
+                                            // software-GL pair is not the same as owning it. A
+                                            // GUI relaunched by a running GUI inherits
+                                            // LIBGL_ALWAYS_SOFTWARE=1 from its predecessor, so
+                                            // on a probed-hardware host the policy said
+                                            // hardware while WebKit stayed on llvmpipe. This
+                                            // fails if `Clear` is ever downgraded to
+                                            // "set if unset".
+                                            let expected_software_pair = if compositing_disabled_env
+                                            {
+                                                // Compositing force-disabled: there is no GPU
+                                                // path left to choose, so we touch neither.
+                                                (GlEnvAction::Keep, GlEnvAction::Keep)
+                                            } else if policy.hardware_gl {
+                                                (GlEnvAction::Remove, GlEnvAction::Remove)
+                                            } else if inherited_software_force {
+                                                (GlEnvAction::Keep, GlEnvAction::Keep)
+                                            } else {
+                                                (
+                                                    GlEnvAction::Set("1"),
+                                                    GlEnvAction::Set("llvmpipe"),
+                                                )
+                                            };
+                                            assert_eq!(
+                                                (plan.libgl_always_software, plan.gallium_driver),
+                                                expected_software_pair,
+                                                "hardware GL must CLEAR an inherited software force, \
                                          not decline to set one ({context})"
-                                    );
-                                    let expected_shm = if compositing_disabled_env {
-                                        GlEnvAction::Keep
-                                    } else if policy.hardware_gl || explicit_under_glass {
-                                        GlEnvAction::Remove
-                                    } else if already_forced {
-                                        GlEnvAction::Keep
-                                    } else {
-                                        GlEnvAction::Set("1")
-                                    };
-                                    assert_eq!(
-                                        plan.webkit_disable_dmabuf_renderer, expected_shm,
-                                        "DMABuf is legal only with hardware GL or an \
+                                            );
+                                            let expected_shm = if compositing_disabled_env {
+                                                GlEnvAction::Keep
+                                            } else if policy.hardware_gl || explicit_under_glass {
+                                                GlEnvAction::Remove
+                                            } else if already_forced {
+                                                GlEnvAction::Keep
+                                            } else {
+                                                GlEnvAction::Set("1")
+                                            };
+                                            assert_eq!(
+                                                plan.webkit_disable_dmabuf_renderer, expected_shm,
+                                                "DMABuf is legal only with hardware GL or an \
                                          explicit under-glass request ({context})"
-                                    );
-                                    if under_glass_var.is_none() && !compositing_disabled_env {
-                                        // No user opinion at all. DMABuf still
-                                        // follows hardware GL — that is the
-                                        // measured half of the win and it must
-                                        // not depend on Phase F.
-                                        assert_eq!(
-                                            policy.hardware_gl,
-                                            plan.webkit_disable_dmabuf_renderer
-                                                == GlEnvAction::Remove
-                                        );
-                                        // ...but arming does NOT follow it. A
-                                        // working GPU is not consent to turn on
-                                        // under-glass compositing; that pairing
-                                        // is what put an agent's page over the
-                                        // user's whole window.
-                                        assert!(
-                                            !armed,
-                                            "under-glass must stay unarmed without an \
+                                            );
+                                            // The GLVND vendor guard: pin to Mesa exactly when
+                                            // the hardware path is on, the NVIDIA ICD is stray
+                                            // (installed, no device), and nobody set their own
+                                            // filter. Everywhere else: hands off — the escape
+                                            // hatch must keep restoring the old behaviour
+                                            // whole, and a user filter always wins.
+                                            let expected_egl_filter = if policy.hardware_gl
+                                                && stray_nvidia
+                                                && !egl_filter_present
+                                            {
+                                                GlEnvAction::Set(
+                                                    yggterm_core::gl_probe::MESA_EGL_VENDOR_JSON,
+                                                )
+                                            } else {
+                                                GlEnvAction::Keep
+                                            };
+                                            assert_eq!(
+                                                plan.egl_vendor_library_filenames,
+                                                expected_egl_filter,
+                                                "the stray-NVIDIA vendor guard fires only on the \
+                                         hardware path with no user filter ({context} \
+                                         stray={stray_nvidia} filter={egl_filter_present})"
+                                            );
+                                            if under_glass_var.is_none()
+                                                && !compositing_disabled_env
+                                            {
+                                                // No user opinion at all. DMABuf still
+                                                // follows hardware GL — that is the
+                                                // measured half of the win and it must
+                                                // not depend on Phase F.
+                                                assert_eq!(
+                                                    policy.hardware_gl,
+                                                    plan.webkit_disable_dmabuf_renderer
+                                                        == GlEnvAction::Remove
+                                                );
+                                                // ...but arming does NOT follow it. A
+                                                // working GPU is not consent to turn on
+                                                // under-glass compositing; that pairing
+                                                // is what put an agent's page over the
+                                                // user's whole window.
+                                                assert!(
+                                                    !armed,
+                                                    "under-glass must stay unarmed without an \
                                              explicit request ({context})"
-                                        );
+                                                );
+                                            }
+                                            cells += 1;
+                                        }
                                     }
-                                    cells += 1;
                                 }
                             }
                         }
@@ -6286,7 +6398,7 @@ mod tests {
             }
         }
         // A cross-product that silently collapsed to nothing would pass vacuously.
-        assert_eq!(cells, 3 * 2 * 2 * 2 * 3 * 2 * 2);
+        assert_eq!(cells, 3 * 2 * 2 * 2 * 3 * 2 * 2 * 2 * 2);
     }
 
     /// The applier may not know a key the plan does not, and vice versa.
@@ -6304,6 +6416,7 @@ mod tests {
                 enable_compositing: false,
                 probe: yggterm_core::gl_probe::GlClass::Hardware,
             }),
+            false,
             false,
             LinuxWebkitGlEnvInherited::default(),
         );
