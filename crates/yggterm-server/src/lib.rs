@@ -3719,9 +3719,28 @@ impl YggtermServer {
     }
 
     /// Record who created this row and, optionally, that they declared it
-    /// ephemeral. Write-once: a row already carrying a declaration keeps the
-    /// one it was born with, so no later caller can retro-mark someone else's
-    /// long-running row as disposable.
+    /// ephemeral.
+    ///
+    /// **Write-once, and that is a NARROWER protection than it sounds.** It
+    /// refuses a SECOND declaration on a row that already carries one; it does
+    /// not stop a caller from putting the FIRST one on a row it did not
+    /// create. An undeclared long-running row can still be marked disposable by
+    /// anyone who can reach this verb, and the tests in this file perform
+    /// exactly that attack on a user-shaped row to keep the limit visible.
+    ///
+    /// What actually keeps that from happening, stated honestly, is two things
+    /// and neither is write-once:
+    /// 1. ROLE GATING — `DeclareSessionTenancy` is `ShadowAccess::Deny`, so the
+    ///    agent's default probe surface cannot issue it at all.
+    /// 2. NOTHING IN THE PRODUCT CALLS IT except the agent CLI's own create
+    ///    runner, immediately after the create that produced the row.
+    ///
+    /// RESIDUAL (round-25 review, unbuilt): the real fix is a creator binding —
+    /// the create mints a one-shot declaration token and only the holder may
+    /// declare that row. There is no cheap honest version of that today: the
+    /// create goes out through app-control to a GUI worker and the declaration
+    /// comes back on a SEPARATE daemon connection, so nothing links the two.
+    /// Until the token exists, the sentence above is the whole guarantee.
     pub fn declare_live_session_tenancy(
         &mut self,
         path: &str,
@@ -3761,11 +3780,16 @@ impl YggtermServer {
             .and_then(EphemeralDeclaration::parse)
     }
 
-    /// Every live row that carries an ephemerality declaration, with the row's
-    /// keep-alive flag alongside — the reap pass's whole input from this side.
-    pub fn ephemeral_live_session_declarations(
-        &self,
-    ) -> Vec<(String, EphemeralDeclaration, bool)> {
+    /// Every live row that carries an ephemerality declaration — the reap
+    /// pass's whole input from this side, and therefore the whole blast radius:
+    /// a row with no declaration is not in this list and cannot be reaped.
+    ///
+    /// Keep-alive is deliberately NOT a filter here. It governs whether a
+    /// runtime survives the GUI window closing, not whether an explicit close
+    /// may take the row (`remove_session_should_detach_keep_alive_runtime` is a
+    /// constant `false`), and a reap is an explicit close. A keep-alive row
+    /// that its own creator declared ephemeral is still reaped.
+    pub fn ephemeral_live_session_declarations(&self) -> Vec<(String, EphemeralDeclaration)> {
         self.live_session_order
             .iter()
             .filter_map(|key| {
@@ -3773,7 +3797,7 @@ impl YggtermServer {
                 let declaration = session_metadata_value(session, EPHEMERAL_METADATA_LABEL)
                     .as_deref()
                     .and_then(EphemeralDeclaration::parse)?;
-                Some((key.clone(), declaration, session_keep_alive(session)))
+                Some((key.clone(), declaration))
             })
             .collect()
     }
@@ -19056,10 +19080,31 @@ fn stamp_created_terminal_tenancy(
         });
     };
     let endpoint = resolve_client_daemon_endpoint(home).endpoint;
+    declare_created_terminal_tenancy(&endpoint, session_path, tenancy)
+}
+
+/// The round trip that decides what `"declared"` says.
+///
+/// `"declared": true` means the daemon WROTE the stamp on that row. Anything
+/// else — the row is not live here, the row already carried a declaration, the
+/// daemon could not be reached — reports `"declared": false` and hands back the
+/// daemon's own message. The earlier version stamped `true` whenever the
+/// request completed, so a create against a path the daemon did not know
+/// answered "declared: true" over a row carrying nothing, and an agent reading
+/// its own create output would believe it had armed a reap rule that does not
+/// exist (round-25 review, finding P2).
+///
+/// Split out from [`stamp_created_terminal_tenancy`] so a test can drive the
+/// whole round trip against a real socket; only the endpoint resolution stays
+/// on the other side of the seam.
+pub(crate) fn declare_created_terminal_tenancy(
+    endpoint: &ServerEndpoint,
+    session_path: &str,
+    tenancy: &CreateTerminalTenancy,
+) -> Value {
     let created_by = tenancy.created_by.encode();
     let ephemeral = tenancy.ephemeral.as_ref().map(EphemeralDeclaration::encode);
-    match declare_session_tenancy(&endpoint, session_path, Some(&created_by), ephemeral.as_deref())
-    {
+    match declare_session_tenancy(endpoint, session_path, Some(&created_by), ephemeral.as_deref()) {
         Ok(message) => json!({
             "declared": true,
             "session_path": session_path,
@@ -19070,6 +19115,7 @@ fn stamp_created_terminal_tenancy(
         Err(error) => json!({
             "declared": false,
             "session_path": session_path,
+            "ephemeral": ephemeral,
             "error": format!("{error:#}"),
         }),
     }
@@ -32090,7 +32136,7 @@ terminal_window_id: None,
         );
         assert_eq!(
             server.ephemeral_live_session_declarations(),
-            vec![(agent_shell.clone(), declared, false)],
+            vec![(agent_shell.clone(), declared)],
             "only the declared row is a candidate, and the user's shell is not"
         );
         assert_eq!(
@@ -32101,9 +32147,59 @@ terminal_window_id: None,
         );
     }
 
-    /// Write-once: nothing may retro-mark a row that is already carrying a
-    /// tenancy declaration — the immortal-tenant fix must never become a way to
-    /// arm the reaper on someone else's long-running row.
+    /// THE KEEP-ALIVE MECHANISM, locked where it actually lives.
+    ///
+    /// The lane's first cut carried an `EphemeralCandidate.keep_alive` field
+    /// nothing read and a lock that mutated a clause production did not
+    /// contain — it asserted the reaper "skips the keep-alive detach branch",
+    /// a branch that has been unreachable since
+    /// `remove_session_should_detach_keep_alive_runtime` became a constant
+    /// `false`. The OUTCOME it claimed is real and this is where it is decided:
+    /// keep-alive marks a row as surviving the GUI WINDOW closing (that is what
+    /// `non_keep_alive_live_session_paths` feeds), and it does not remove the
+    /// row from the reaper's candidate list. Filter this list on keep-alive and
+    /// a creator's own `--ephemeral` silently stops working on exactly the rows
+    /// agent CLI kinds are BORN keep-alive on.
+    #[test]
+    fn a_keep_alive_row_that_declared_itself_ephemeral_is_still_a_candidate() {
+        use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
+        let mut server = tenancy_test_server();
+        let row = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("Agent Probe"));
+        let declared = EphemeralDeclaration::new(Some(4242), "host-a", Some(900));
+        server
+            .declare_live_session_tenancy(
+                &row,
+                Some(&CreatorStamp::new(99, "host-a", None)),
+                Some(&declared),
+            )
+            .expect("the declaration lands");
+        server
+            .set_live_session_keep_alive(&row, true)
+            .expect("the row can be marked keep-alive");
+        assert!(
+            server.live_session_keep_alive(&row),
+            "the row really is marked keep-alive, so the filter would have something to bite on"
+        );
+        assert_eq!(
+            server.ephemeral_live_session_declarations(),
+            vec![(row.clone(), declared)],
+            "keep-alive governs window-close survival, not whether an explicit close may \
+             take the row — the creator's own declaration still stands"
+        );
+        // And the row keeps its keep-alive marking: the declaration reads the
+        // metadata, it does not rewrite the user's or the kind's choice.
+        assert!(server.live_session_keep_alive(&row));
+    }
+
+    /// Write-once, and its HONEST limit.
+    ///
+    /// The refusal covers a SECOND declaration on a row that already carries
+    /// one. It does not stop the first declaration landing on a row this caller
+    /// never created — the second half of this test performs exactly that
+    /// attack on a user-shaped row and it SUCCEEDS, which is why the commit
+    /// prose may not claim write-once prevents retro-marking. What prevents it
+    /// is role-gating plus the fact that nothing in the product calls the verb
+    /// except the create runner (see `declare_live_session_tenancy`).
     #[test]
     fn a_row_already_carrying_a_declaration_refuses_a_second_one() {
         use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
@@ -32128,6 +32224,26 @@ terminal_window_id: None,
             server.live_session_ephemeral_declaration(&row),
             None,
             "and it must not have taken effect"
+        );
+
+        // The limit, stated as a test rather than as a hope: an UNDECLARED row
+        // — the shape every user/GUI create has — accepts a first declaration
+        // from anyone who reaches this verb.
+        let users_row = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/user/gh/yggterm"),
+            Some("Workspace Shell"),
+        );
+        assert!(
+            server
+                .declare_live_session_tenancy(
+                    &users_row,
+                    None,
+                    Some(&EphemeralDeclaration::new(Some(3), "host-a", None)),
+                )
+                .expect("no live-session error"),
+            "write-once does not gate the FIRST declaration; only role-gating and the \
+             absence of any product caller keep this off the user's rows"
         );
     }
 
@@ -32201,18 +32317,11 @@ terminal_window_id: None,
             !runner.contains("?;\n        write_stdout_payload"),
             "a failed stamp must not abort before the caller learns the row exists"
         );
-
-        let stamp = source
-            .split("fn stamp_created_terminal_tenancy(")
-            .nth(1)
-            .expect("the stamp helper")
-            .split("\npub fn ")
-            .next()
-            .expect("the end of the stamp helper");
-        assert!(
-            stamp.contains("\"declared\": false") && stamp.contains("\"declared\": true"),
-            "the stamp outcome must be reported honestly in both directions"
-        );
+        // What `"declared"` actually SAYS is not scanned for here. The first
+        // cut asserted both string literals appear in the helper, which a
+        // helper that always reports `true` satisfies just as well — the bug
+        // the reviewer found. The honest lock is the round trip in daemon.rs:
+        // `an_unknown_path_round_trip_reports_declared_false_with_the_daemons_message`.
     }
 
     fn tenancy_test_server() -> YggtermServer {
