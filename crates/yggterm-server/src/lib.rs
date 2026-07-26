@@ -4582,8 +4582,11 @@ impl YggtermServer {
                 // is by construction recoverable. Agents (local AND remote)
                 // re-derive from their CLI JSONL store; plain shells re-adopt
                 // their preserved daemon PTY across a hot/update restart, and the
-                // snapshot runtime-truth filter hides any shell whose PTY did NOT
-                // survive (so a husk is never shown). The ONLY place a
+                // snapshot runtime-truth filter hides a shell whose PTY did NOT
+                // survive UNLESS the row crossed a daemon handover (a rescued
+                // row keeps its row and is restartable by a click —
+                // `daemon::snapshot_session_is_handover_orphaned_row`), so a
+                // husk is still never shown. The ONLY place a
                 // non-keep-alive session dies is PrepareClientClose — a genuine
                 // user GUI-close — which removes it from live_session_order so it
                 // never reaches this filter. This ends the demotion of still-alive
@@ -6751,8 +6754,11 @@ impl YggtermServer {
         // restores runtime-present preserved owners, so a row reaching here was
         // deliberately persisted: agents (local AND remote) re-derive from their
         // CLI JSONL store; a plain shell was only persisted when its PTY was
-        // preserved, and the snapshot runtime-truth filter hides any shell whose
-        // PTY did not actually survive — so a husk never shows. The prior gate
+        // preserved, and the snapshot runtime-truth filter hides a shell whose
+        // PTY did not actually survive — unless the row is marked as having
+        // crossed a daemon handover, in which case the ROW is kept deliberately
+        // (user-settled: a plain shell's row must survive a daemon bump) and
+        // the click re-spawns it at the recorded cwd. The prior gate
         // (`!keep_alive && !temporary_update_restore && !local_agent`) dropped
         // still-alive non-keep-alive REMOTE agents and live non-keep-alive shells
         // on load (jojo: dev CC/codex + shells vanished after an agentic restart).

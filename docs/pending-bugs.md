@@ -66,6 +66,96 @@ fix) once the fix is verified live on jojo.
      not a documented limitation.** Two levels of fix, both wanted: (a) the ROW
      must survive even when the PTY cannot, so the user can restart it with a
      click; (b) properly, lossless fd handoff so the PTY survives too.
+
+     **LEVEL (a) IS BUILT — ⚠ NOT LIVE-VERIFIED (the deploy happens after the
+     lane that wrote it, so this entry STAYS until a real bump proves it).**
+     What the cause chain actually was, and where each half is fixed:
+     - The predecessor advertises its ROUTINE persist as `live_terminal_sessions`,
+       and a routine persist synthesizes no `restore_reason` — so the successor
+       adopted the shell (correctly: the peer still owned its PTY, which is the
+       `peer_live_row_is_adoptable` rescue arm) but the adopted row carried no
+       record of WHY it was there. Fixed by `peer_live_rows_marked_as_rescued`
+       in `adopt_missing_live_session_rows_from_reachable_daemons`: rows the
+       peer still owns are stamped with the handover restore reason before
+       admission. The ownerless-agent arm is deliberately NOT stamped.
+     - Then, the moment the predecessor retired and the PTY died,
+       `apply_terminal_runtime_truth_to_snapshot` erased the row: a shell has no
+       agent-store arm to fall back on. Fixed by
+       `snapshot_session_is_handover_orphaned_row` — a row that crossed a daemon
+       handover survives its runtime as a RUNTIME-LESS row
+       (`TerminalLaunchPhase::RemoteBootstrap`, the same shape agent rows
+       already use), and the click resolves through the ordinary
+       `terminal_spec` → shell launch command at the recorded `Cwd`. Scrollback
+       is lost at this level; the row, title, cwd and POSITION are not.
+     - The discriminator is deliberately narrow: **a shell whose own PTY exited
+       (the user typed `exit`) is still a husk and still disappears.** That is
+       the same class `peer_live_row_is_adoptable` refuses, and widening the
+       arm to "any Shell" would put jojo's three ownerless loopback shells
+       (`local://3803a7ed`, `local://5220ce5d`, `local://a689ee28`) back on
+       screen. It also does NOT weaken keep-alive: `PrepareClientClose` still
+       removes a non-keep-alive shell from the live order outright, so a GUI
+       close never reaches this filter.
+     - **Known residual, level (a):** the mark is only re-applied on an
+       update-restart persist and on a rescue adoption. A daemon killed WITHOUT
+       a handoff (`kill -TERM`, a crash) writes only routine persists, so a
+       shell row cold-restored from that file has no mark and is still hidden.
+       Closing that means letting the routine persist carry the row's existing
+       `Runtime Restore Reason` metadata instead of re-deriving it — cheap, but
+       it also widens `live_session_restart_protected`, so it was left out
+       rather than guessed at.
+     - **Second residual:** nothing CLEARS the mark once the successor spawns
+       its own PTY for the row, so a rescued shell the user later exits keeps a
+       runtime-less row instead of becoming a husk. That reads as correct under
+       call #4 ("no runtime is none of our business") and as a husk under
+       requirement 3 below — which is exactly the question requirement 3 says to
+       ask the user rather than guess. Clearing it at the `ensure_session`
+       chokepoint is the obvious fix once that answer exists.
+
+     **LEVEL (b) — LOSSLESS `SCM_RIGHTS` FD HANDOFF: where it would slot in.**
+     Not built; this is the map so the next session can size it rather than
+     re-survey.
+     - **Who owns the fd.** `PtySessionRuntime` in
+       `crates/yggterm-server/src/terminal.rs` holds
+       `master: Arc<Mutex<Box<dyn MasterPty + Send>>>`, and
+       `TerminalManager { sessions: HashMap<String, PtySessionRuntime> }` is the
+       map keyed by runtime key. The raw fd is already reachable —
+       `master.as_raw_fd()` is what `foreground_process_group_leader` uses for
+       `tcgetpgrp` — so the SEND side needs no new plumbing into the pty layer.
+     - **Who owns the child.** `PtySessionRuntime.child:
+       Arc<Mutex<Box<dyn Child + Send + Sync>>>`. This is the part that does not
+       travel: a `Child` handle cannot cross a process boundary, and the shell
+       is the predecessor's direct child. After the fd moves, the successor can
+       drive the PTY but cannot `waitpid` it; the predecessor must either stay
+       alive as a reaper until it exits (defeats the point) or the child must be
+       re-parented to init and the successor must fall back to
+       `kill(pid, 0)` / `/proc` liveness. **Decide this before writing any
+       `sendmsg`** — it is the actual design question, not the ancillary data.
+     - **Who owns the scrollback.** The reader thread plus `chunks`,
+       `seq`, `retained_bytes` and `spawn_id` on the same struct. The fd alone
+       hands over a live terminal with an empty transcript, so the ring has to
+       travel beside it (the existing `terminal_snapshot` payload is the obvious
+       carrier) or the user gets a working shell with no history — barely better
+       than level (a).
+     - **Where `sendmsg` would live.** The wire is one JSON line per request over
+       a `UnixStream` (`read_request` / `write_response` in `daemon.rs`), which
+       has no room for ancillary data — `SCM_RIGHTS` needs a real `sendmsg`
+       on the same socket, so this must be an out-of-band step on the handoff
+       connection, not a new `ServerRequest` field. The natural site is the
+       `ServerRequest::HotRestart` preserving-handoff branch in `daemon.rs`,
+       immediately where it calls `PreservedTerminalOwnerRegistry::write_handoff`
+       — that registry (`hot-update-terminal-owners.json`, runtime key → owner
+       socket + pid) is already exactly the list of fds that would be sent, and
+       `attempt_self_retire_preserving_handoff` is the caller that reaches it on
+       a `disk_binary_replaced` retire.
+     - **The receive side is the expensive half.** `portable_pty`'s `MasterPty`
+       is a trait object with no `from_raw_fd` constructor, so the successor
+       cannot rebuild a `PtySessionRuntime` from a received fd without either a
+       local Unix master type implementing the trait or a fork of the pty layer.
+       Budget the work there, not in the socket call.
+     - **What it would retire.** `session_kind_is_migratable_agent` could then
+       admit `Shell`, and `progressive_migration_session_released` would stop
+       being kill-and-re-resume for every kind — which is also what unpins the
+       supernumerary daemons that one idle `bash -i` keeps alive forever.
   2. **THE ROW-ORDER LEDGER IS WRITE-ONLY ON RESTORE — BUILD THE RESTORE PATH.**
      Verified across the 2.12.15 bump: the ledger was byte-identical before and
      after (143 entries, the user's curated order intact) and *nothing read it
