@@ -183,6 +183,16 @@ jobs:
           bash -n scripts/package-platform-release.sh
           bash -n scripts/package-release.sh
           bash -n scripts/package-release-ffi.sh
+          bash -n scripts/gl_ab_measure.sh
+          bash -n scripts/gl_ab_experiment.sh
+
+      # The GL A/B analyzer's whole product is its REFUSALS. Its self-test
+      # asserts that every gate FIRES on a fixture that should be rejected and
+      # that clean arms still pass — a measurement that cannot fail is worth
+      # exactly what a test that cannot fail is worth, and this question has
+      # already produced four confident wrong answers.
+      - name: GL A/B analyzer gates must fire
+        run: python3 scripts/gl_ab_analyze.py --self-test
 
       - name: Validate PowerShell installer syntax
         run: pwsh -NoProfile -Command "[void][scriptblock]::Create((Get-Content 'scripts/install.ps1' -Raw))"

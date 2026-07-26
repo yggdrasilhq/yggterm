@@ -29,6 +29,14 @@
 # Usage:  gl_ab_measure.sh <arm-label> <expected-session-path> <duration-s>
 # The paint load is generated SEPARATELY, by the session named above, because
 # only the displayed session's output reaches the renderer.
+#
+# Environment (all optional, none of them relaxes a refusal above):
+#   YG           path to the yggterm binary        (default ~/.local/bin/yggterm)
+#   GUI_PID      measure this process tree instead of discovering the user's GUI
+#                — gl_ab_experiment.sh sets it so an isolated lab GUI is measured
+#                and never the desktop one
+#   SAMPLE_JSON  append one machine-readable sample record to this file
+#   SAMPLE_TAG   opaque label carried through into that record
 
 set -uo pipefail
 
@@ -36,14 +44,15 @@ ARM="${1:?arm label}"
 EXPECT_SESSION="${2:?session path that will generate the load}"
 DUR="${3:-40}"
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
-YG="$HOME/.local/bin/yggterm"
+YG="${YG:-$HOME/.local/bin/yggterm}"
 
 fail() { echo "REFUSED[$ARM]: $*" >&2; exit 1; }
 
-gui_pid=$(pgrep -x yggterm | while read -r p; do
+gui_pid="${GUI_PID:-$(pgrep -x yggterm | while read -r p; do
 	[ -n "$(pgrep -P "$p" -x yggterm)" ] || echo "$p"
-done | head -1)
+done | head -1)}"
 [ -n "${gui_pid:-}" ] || fail "no GUI process"
+[ -d "/proc/$gui_pid" ] || fail "GUI pid $gui_pid is not running"
 
 # --- preconditions, read from the GUI's own state -------------------------
 state_probe() {
@@ -90,6 +99,7 @@ gpu_ns() {
 }
 
 declare -A t0 g0
+t_start_ms=$(date +%s%3N)
 for p in "${pids[@]}"; do t0[$p]=$(cpu_ticks "$p"); g0[$p]=$(gpu_ns "$p"); done
 
 sleep "$DUR"
@@ -119,3 +129,14 @@ below=$(awk -v c="$total_cores" 'BEGIN{print (c < 0.05) ? 1 : 0}')
 [ "$below" = "0" ] || fail "total ${total_cores} cores over ${DUR}s — the load did not reach the renderer"
 
 echo "ARM=$ARM TOTAL_CORES=$total_cores TOTAL_GPU_MS=$total_gpu DUR=${DUR}s"
+
+# One machine-readable record per accepted sample, for gl_ab_analyze.py. Only
+# samples that passed EVERY refusal above get written, so the analyzer never
+# sees a number the measurement itself could not justify. `t0_ms`/`t1_ms` are
+# what let it join focus intervals and paint exposure per sample rather than
+# averaging across them.
+if [ -n "${SAMPLE_JSON:-}" ]; then
+	printf '{"arm":"%s","tag":"%s","session":"%s","dur_s":%s,"cores":%s,"gpu_ms":%s,"t0_ms":%s,"t1_ms":%s}\n' \
+		"$ARM" "${SAMPLE_TAG:-}" "$EXPECT_SESSION" "$DUR" "$total_cores" "$total_gpu" \
+		"$t_start_ms" "$(date +%s%3N)" >>"$SAMPLE_JSON"
+fi
