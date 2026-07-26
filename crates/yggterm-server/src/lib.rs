@@ -19,6 +19,7 @@ mod pty_adoption;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
+pub mod session_tenancy;
 pub mod transcript_view;
 mod row_order_ledger;
 mod terminal;
@@ -83,8 +84,9 @@ pub use daemon::{
     start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
     switch_agent_session_mode,
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
+    declare_session_tenancy,
     terminal_app_declares, terminal_ensure, terminal_history, terminal_read, terminal_resize,
-    terminal_restart,
+    terminal_restart, terminal_tenants,
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
@@ -143,6 +145,10 @@ use yggterm_core::{
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
 };
+use session_tenancy::{
+    CREATED_BY_METADATA_LABEL, CreatorStamp, EPHEMERAL_METADATA_LABEL, EphemeralDeclaration,
+};
+pub use session_tenancy::CreateTerminalTenancy;
 use yggterm_platform::configure_background_service_command;
 use yggui_contract::{UiTheme, YgguiClipboardContents};
 
@@ -620,6 +626,32 @@ fn session_kind_persists_by_default(kind: SessionKind) -> bool {
     }
 }
 
+/// The ONE writer of the tenancy metadata labels. Both the create-time
+/// declaration and the daemon-handover restore go through here, so the live
+/// metadata and the persisted row can never encode the same fact two ways.
+/// Values are the canonical strings from [`crate::session_tenancy`]; `None`
+/// leaves whatever is already there alone (restore never invents a stamp).
+fn apply_session_tenancy_metadata(
+    session: &mut ManagedSessionView,
+    created_by: Option<&str>,
+    ephemeral: Option<&str>,
+) {
+    if let Some(created_by) = created_by.map(str::trim).filter(|value| !value.is_empty()) {
+        upsert_session_metadata(
+            &mut session.metadata,
+            CREATED_BY_METADATA_LABEL,
+            created_by.to_string(),
+        );
+    }
+    if let Some(ephemeral) = ephemeral.map(str::trim).filter(|value| !value.is_empty()) {
+        upsert_session_metadata(
+            &mut session.metadata,
+            EPHEMERAL_METADATA_LABEL,
+            ephemeral.to_string(),
+        );
+    }
+}
+
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
     if keep_alive {
         upsert_session_metadata(
@@ -681,6 +713,8 @@ fn persisted_live_session_from_managed(
         remote_launch_action,
         storage_path,
         restore_reason,
+        created_by: session_metadata_value(session, CREATED_BY_METADATA_LABEL),
+        ephemeral: session_metadata_value(session, EPHEMERAL_METADATA_LABEL),
     })
 }
 
@@ -2450,6 +2484,16 @@ pub struct PersistedLiveSession {
     pub storage_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_reason: Option<String>,
+    /// The canonical [`crate::session_tenancy::CreatorStamp`] string, verbatim
+    /// from the row's metadata. Persisted because the leak class this exists
+    /// for is measured in DAYS, and a row outlives many daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// The canonical [`crate::session_tenancy::EphemeralDeclaration`] string.
+    /// Persisted for the same reason, and because a mark lost at a daemon
+    /// handover would silently make the row immortal again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3682,6 +3726,90 @@ impl YggtermServer {
     pub fn live_session_keep_alive(&self, path: &str) -> bool {
         self.resolve_live_session_entry(path)
             .is_some_and(|(_resolved_key, session)| session_keep_alive(&session))
+    }
+
+    /// Record who created this row and, optionally, that they declared it
+    /// ephemeral.
+    ///
+    /// **Write-once, and that is a NARROWER protection than it sounds.** It
+    /// refuses a SECOND declaration on a row that already carries one; it does
+    /// not stop a caller from putting the FIRST one on a row it did not
+    /// create. An undeclared long-running row can still be marked disposable by
+    /// anyone who can reach this verb, and the tests in this file perform
+    /// exactly that attack on a user-shaped row to keep the limit visible.
+    ///
+    /// What actually keeps that from happening, stated honestly, is two things
+    /// and neither is write-once:
+    /// 1. ROLE GATING — `DeclareSessionTenancy` is `ShadowAccess::Deny`, so the
+    ///    agent's default probe surface cannot issue it at all.
+    /// 2. NOTHING IN THE PRODUCT CALLS IT except the agent CLI's own create
+    ///    runner, immediately after the create that produced the row.
+    ///
+    /// RESIDUAL (round-25 review, unbuilt): the real fix is a creator binding —
+    /// the create mints a one-shot declaration token and only the holder may
+    /// declare that row. There is no cheap honest version of that today: the
+    /// create goes out through app-control to a GUI worker and the declaration
+    /// comes back on a SEPARATE daemon connection, so nothing links the two.
+    /// Until the token exists, the sentence above is the whole guarantee.
+    pub fn declare_live_session_tenancy(
+        &mut self,
+        path: &str,
+        created_by: Option<&CreatorStamp>,
+        ephemeral: Option<&EphemeralDeclaration>,
+    ) -> anyhow::Result<bool> {
+        let Some((resolved_key, _session)) = self.resolve_live_session_entry(path) else {
+            return Ok(false);
+        };
+        let Some(session) = self.sessions.get_mut(&resolved_key) else {
+            return Ok(false);
+        };
+        if session_metadata_value(session, CREATED_BY_METADATA_LABEL).is_some()
+            || session_metadata_value(session, EPHEMERAL_METADATA_LABEL).is_some()
+        {
+            anyhow::bail!("session {path} already carries a tenancy declaration");
+        }
+        apply_session_tenancy_metadata(
+            session,
+            created_by.map(CreatorStamp::encode).as_deref(),
+            ephemeral.map(EphemeralDeclaration::encode).as_deref(),
+        );
+        Ok(true)
+    }
+
+    pub fn live_session_creator_stamp(&self, path: &str) -> Option<CreatorStamp> {
+        let (_key, session) = self.resolve_live_session_entry(path)?;
+        session_metadata_value(&session, CREATED_BY_METADATA_LABEL)
+            .as_deref()
+            .and_then(CreatorStamp::parse)
+    }
+
+    pub fn live_session_ephemeral_declaration(&self, path: &str) -> Option<EphemeralDeclaration> {
+        let (_key, session) = self.resolve_live_session_entry(path)?;
+        session_metadata_value(&session, EPHEMERAL_METADATA_LABEL)
+            .as_deref()
+            .and_then(EphemeralDeclaration::parse)
+    }
+
+    /// Every live row that carries an ephemerality declaration — the reap
+    /// pass's whole input from this side, and therefore the whole blast radius:
+    /// a row with no declaration is not in this list and cannot be reaped.
+    ///
+    /// Keep-alive is deliberately NOT a filter here. It governs whether a
+    /// runtime survives the GUI window closing, not whether an explicit close
+    /// may take the row (`remove_session_should_detach_keep_alive_runtime` is a
+    /// constant `false`), and a reap is an explicit close. A keep-alive row
+    /// that its own creator declared ephemeral is still reaped.
+    pub fn ephemeral_live_session_declarations(&self) -> Vec<(String, EphemeralDeclaration)> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| {
+                let session = self.sessions.get(key)?;
+                let declaration = session_metadata_value(session, EPHEMERAL_METADATA_LABEL)
+                    .as_deref()
+                    .and_then(EphemeralDeclaration::parse)?;
+                Some((key.clone(), declaration))
+            })
+            .collect()
     }
 
     pub fn live_session_is_temporary_update_restore(&self, path: &str) -> bool {
@@ -6896,6 +7024,8 @@ impl YggtermServer {
             remote_launch_action,
             storage_path,
             restore_reason,
+            created_by,
+            ephemeral,
         } = live;
         let storage_path =
             storage_path.or_else(|| is_local_codex_storage_session_path(&key).then(|| key.clone()));
@@ -7046,6 +7176,14 @@ impl YggtermServer {
                 // update-restore would be silently promoted to Keep Alive
                 // (a distinction daemon.rs deliberately maintains).
                 set_session_keep_alive_metadata(&mut session, keep_alive);
+                // The stamp is the row's provenance, and provenance is exactly
+                // what a daemon handover used to erase. Restore is authoritative
+                // for it too, on the same reading as keep-alive above.
+                apply_session_tenancy_metadata(
+                    &mut session,
+                    created_by.as_deref(),
+                    ephemeral.as_deref(),
+                );
                 if temporary_update_restore {
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -7136,6 +7274,12 @@ impl YggtermServer {
                 // update-restore would be silently promoted to Keep Alive
                 // (a distinction daemon.rs deliberately maintains).
                 set_session_keep_alive_metadata(session, keep_alive);
+                // Restore is authoritative for the tenancy stamp too.
+                apply_session_tenancy_metadata(
+                    session,
+                    created_by.as_deref(),
+                    ephemeral.as_deref(),
+                );
                 if has_saved_codex_identity {
                     upsert_session_metadata(
                         &mut session.metadata,
@@ -7247,6 +7391,8 @@ impl YggtermServer {
             }
             // Restore is authoritative — see the note at the sibling site above.
             set_session_keep_alive_metadata(session, keep_alive);
+            // Restore is authoritative for the tenancy stamp too.
+            apply_session_tenancy_metadata(session, created_by.as_deref(), ephemeral.as_deref());
             if temporary_update_restore {
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -18894,6 +19040,28 @@ pub fn run_app_control_create_terminal(
     activate: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
+    run_app_control_create_terminal_with_tenancy(
+        machine_key,
+        cwd,
+        title_hint,
+        purpose,
+        kind,
+        activate,
+        None,
+        timeout_ms,
+    )
+}
+
+pub fn run_app_control_create_terminal_with_tenancy(
+    machine_key: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    purpose: Option<&str>,
+    kind: Option<&str>,
+    activate: bool,
+    tenancy: Option<CreateTerminalTenancy>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
@@ -18907,8 +19075,79 @@ pub fn run_app_control_create_terminal(
         },
         timeout_ms,
     )?;
-    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    let mut payload = serde_json::to_value(&response)?;
+    if let Some(tenancy) = tenancy {
+        let outcome = stamp_created_terminal_tenancy(&home, &response, &tenancy);
+        // The stamp rides ALONGSIDE the create result, never replacing it: a
+        // caller must be able to see that the row exists even when the stamp
+        // did not land, because the row is the thing they now own.
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("tenancy".to_string(), outcome);
+        }
+    }
+    write_stdout_payload(&serde_json::to_string_pretty(&payload)?)?;
     Ok(())
+}
+
+/// Declare the tenancy of the row the create just produced, and report exactly
+/// what was declared — the caller sees the reap rules it actually armed, not
+/// the ones it hoped for.
+fn stamp_created_terminal_tenancy(
+    home: &Path,
+    response: &AppControlResponse,
+    tenancy: &CreateTerminalTenancy,
+) -> Value {
+    let Some(session_path) = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("session_path"))
+        .and_then(Value::as_str)
+    else {
+        return json!({
+            "declared": false,
+            "error": "the create returned no session path to stamp",
+        });
+    };
+    let endpoint = resolve_client_daemon_endpoint(home).endpoint;
+    declare_created_terminal_tenancy(&endpoint, session_path, tenancy)
+}
+
+/// The round trip that decides what `"declared"` says.
+///
+/// `"declared": true` means the daemon WROTE the stamp on that row. Anything
+/// else — the row is not live here, the row already carried a declaration, the
+/// daemon could not be reached — reports `"declared": false` and hands back the
+/// daemon's own message. The earlier version stamped `true` whenever the
+/// request completed, so a create against a path the daemon did not know
+/// answered "declared: true" over a row carrying nothing, and an agent reading
+/// its own create output would believe it had armed a reap rule that does not
+/// exist (round-25 review, finding P2).
+///
+/// Split out from [`stamp_created_terminal_tenancy`] so a test can drive the
+/// whole round trip against a real socket; only the endpoint resolution stays
+/// on the other side of the seam.
+pub(crate) fn declare_created_terminal_tenancy(
+    endpoint: &ServerEndpoint,
+    session_path: &str,
+    tenancy: &CreateTerminalTenancy,
+) -> Value {
+    let created_by = tenancy.created_by.encode();
+    let ephemeral = tenancy.ephemeral.as_ref().map(EphemeralDeclaration::encode);
+    match declare_session_tenancy(endpoint, session_path, Some(&created_by), ephemeral.as_deref()) {
+        Ok(message) => json!({
+            "declared": true,
+            "session_path": session_path,
+            "created_by": created_by,
+            "ephemeral": ephemeral,
+            "message": message,
+        }),
+        Err(error) => json!({
+            "declared": false,
+            "session_path": session_path,
+            "ephemeral": ephemeral,
+            "error": format!("{error:#}"),
+        }),
+    }
 }
 
 pub fn run_app_control_set_session_keep_alive(
@@ -23734,6 +23973,8 @@ mod tests {
             remote_launch_action: None,
             storage_path: Some("/home/user/.claude/projects/x/8247344a.jsonl".to_string()),
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         };
         assert!(
             super::persisted_live_session_is_recoverable(&cc),
@@ -30616,6 +30857,8 @@ terminal_window_id: None,
                     remote_launch_action: None,
                     storage_path: None,
                     restore_reason: None,
+                    created_by: None,
+                    ephemeral: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -30675,6 +30918,8 @@ terminal_window_id: None,
                     remote_launch_action: None,
                     storage_path: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                    created_by: None,
+                    ephemeral: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -30761,6 +31006,8 @@ terminal_window_id: None,
                     remote_launch_action: None,
                     storage_path: None,
                     restore_reason: None,
+                    created_by: None,
+                    ephemeral: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -30850,6 +31097,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         let local_shell = server.start_local_session(
             SessionKind::Shell,
@@ -31016,6 +31265,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         assert!(server.represents_terminal_runtime_key(&kept_remote));
         assert!(
@@ -31103,6 +31354,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         };
 
         // Our own rows, in the user's arrangement.
@@ -31170,6 +31423,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         };
         server.restore_live_session(row("mine"));
 
@@ -31509,6 +31764,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server
@@ -31633,6 +31890,8 @@ terminal_window_id: None,
                     remote_launch_action: None,
                     storage_path: None,
                     restore_reason: None,
+                    created_by: None,
+                    ephemeral: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -31682,6 +31941,8 @@ terminal_window_id: None,
                     remote_launch_action: None,
                     storage_path: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                    created_by: None,
+                    ephemeral: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -31739,6 +32000,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         };
 
         assert!(
@@ -31848,6 +32111,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         server.open_or_focus_session(
             SessionKind::ClaudeCode,
@@ -31862,6 +32127,246 @@ terminal_window_id: None,
             !session_keep_alive(session),
             "re-opening an existing row must not overwrite its keep-alive choice"
         );
+    }
+
+    /// THE DOCTRINE LOCK for the reaper's blast radius, at the production call
+    /// sites: `ephemeral_live_session_declarations` is the reap pass's ONLY
+    /// source of candidates, so a row that never gets a declaration can never
+    /// be reaped. A GUI/user create makes exactly such a row.
+    #[test]
+    fn an_undeclared_row_is_never_a_reap_candidate_and_a_declared_one_is() {
+        use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
+        let mut server = tenancy_test_server();
+        let user_shell = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/user/gh/yggterm"),
+            Some("Workspace Shell"),
+        );
+        assert!(
+            server.ephemeral_live_session_declarations().is_empty(),
+            "a row created without a declaration must be invisible to the reaper"
+        );
+        assert_eq!(server.live_session_ephemeral_declaration(&user_shell), None);
+
+        let agent_shell = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/user/gh/yggterm"),
+            Some("Agent Probe"),
+        );
+        let declared = EphemeralDeclaration::new(Some(4242), "host-a", Some(1_800));
+        assert!(
+            server
+                .declare_live_session_tenancy(
+                    &agent_shell,
+                    Some(&CreatorStamp::new(99, "host-a", Some("probe"))),
+                    Some(&declared),
+                )
+                .expect("the declaration lands")
+        );
+        assert_eq!(
+            server.ephemeral_live_session_declarations(),
+            vec![(agent_shell.clone(), declared)],
+            "only the declared row is a candidate, and the user's shell is not"
+        );
+        assert_eq!(
+            server
+                .live_session_creator_stamp(&agent_shell)
+                .map(|stamp| stamp.pid),
+            Some(99)
+        );
+    }
+
+    /// THE KEEP-ALIVE MECHANISM, locked where it actually lives.
+    ///
+    /// The lane's first cut carried an `EphemeralCandidate.keep_alive` field
+    /// nothing read and a lock that mutated a clause production did not
+    /// contain — it asserted the reaper "skips the keep-alive detach branch",
+    /// a branch that has been unreachable since
+    /// `remove_session_should_detach_keep_alive_runtime` became a constant
+    /// `false`. The OUTCOME it claimed is real and this is where it is decided:
+    /// keep-alive marks a row as surviving the GUI WINDOW closing (that is what
+    /// `non_keep_alive_live_session_paths` feeds), and it does not remove the
+    /// row from the reaper's candidate list. Filter this list on keep-alive and
+    /// a creator's own `--ephemeral` silently stops working on exactly the rows
+    /// agent CLI kinds are BORN keep-alive on.
+    #[test]
+    fn a_keep_alive_row_that_declared_itself_ephemeral_is_still_a_candidate() {
+        use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
+        let mut server = tenancy_test_server();
+        let row = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("Agent Probe"));
+        let declared = EphemeralDeclaration::new(Some(4242), "host-a", Some(900));
+        server
+            .declare_live_session_tenancy(
+                &row,
+                Some(&CreatorStamp::new(99, "host-a", None)),
+                Some(&declared),
+            )
+            .expect("the declaration lands");
+        server
+            .set_live_session_keep_alive(&row, true)
+            .expect("the row can be marked keep-alive");
+        assert!(
+            server.live_session_keep_alive(&row),
+            "the row really is marked keep-alive, so the filter would have something to bite on"
+        );
+        assert_eq!(
+            server.ephemeral_live_session_declarations(),
+            vec![(row.clone(), declared)],
+            "keep-alive governs window-close survival, not whether an explicit close may \
+             take the row — the creator's own declaration still stands"
+        );
+        // And the row keeps its keep-alive marking: the declaration reads the
+        // metadata, it does not rewrite the user's or the kind's choice.
+        assert!(server.live_session_keep_alive(&row));
+    }
+
+    /// Write-once, and its HONEST limit.
+    ///
+    /// The refusal covers a SECOND declaration on a row that already carries
+    /// one. It does not stop the first declaration landing on a row this caller
+    /// never created — the second half of this test performs exactly that
+    /// attack on a user-shaped row and it SUCCEEDS, which is why the commit
+    /// prose may not claim write-once prevents retro-marking. What prevents it
+    /// is role-gating plus the fact that nothing in the product calls the verb
+    /// except the create runner (see `declare_live_session_tenancy`).
+    #[test]
+    fn a_row_already_carrying_a_declaration_refuses_a_second_one() {
+        use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
+        let mut server = tenancy_test_server();
+        let row = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("row"));
+        assert!(
+            server
+                .declare_live_session_tenancy(
+                    &row,
+                    Some(&CreatorStamp::new(1, "host-a", None)),
+                    None,
+                )
+                .expect("the first declaration lands")
+        );
+        let second = server.declare_live_session_tenancy(
+            &row,
+            None,
+            Some(&EphemeralDeclaration::new(Some(2), "host-a", None)),
+        );
+        assert!(second.is_err(), "a second declaration must be refused");
+        assert_eq!(
+            server.live_session_ephemeral_declaration(&row),
+            None,
+            "and it must not have taken effect"
+        );
+
+        // The limit, stated as a test rather than as a hope: an UNDECLARED row
+        // — the shape every user/GUI create has — accepts a first declaration
+        // from anyone who reaches this verb.
+        let users_row = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/user/gh/yggterm"),
+            Some("Workspace Shell"),
+        );
+        assert!(
+            server
+                .declare_live_session_tenancy(
+                    &users_row,
+                    None,
+                    Some(&EphemeralDeclaration::new(Some(3), "host-a", None)),
+                )
+                .expect("no live-session error"),
+            "write-once does not gate the FIRST declaration; only role-gating and the \
+             absence of any product caller keep this off the user's rows"
+        );
+    }
+
+    /// A row outlives many daemons, and the leak this exists for is measured in
+    /// DAYS — so the stamp and the declaration must survive a persist/restore.
+    /// A mark dropped at a handover makes the row silently immortal again.
+    #[test]
+    fn the_tenancy_stamp_survives_a_persist_and_restore() {
+        use crate::session_tenancy::{CreatorStamp, EphemeralDeclaration};
+        let mut server = tenancy_test_server();
+        let row = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("row"));
+        let stamp = CreatorStamp::new(7, "host-a", Some("aged ssh probe"));
+        let declared = EphemeralDeclaration::new(Some(7), "host-a", Some(900));
+        server
+            .declare_live_session_tenancy(&row, Some(&stamp), Some(&declared))
+            .expect("declaration lands");
+
+        let persisted = server.persisted_state();
+        let live = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == row)
+            .expect("the row persists");
+        assert_eq!(live.created_by.as_deref(), Some(stamp.encode().as_str()));
+        assert_eq!(live.ephemeral.as_deref(), Some(declared.encode().as_str()));
+
+        let mut restored = tenancy_test_server();
+        restored.restore_live_session(live.clone());
+        assert_eq!(restored.live_session_creator_stamp(&row), Some(stamp));
+        assert_eq!(
+            restored.live_session_ephemeral_declaration(&row),
+            Some(declared)
+        );
+    }
+
+    /// The create runner is the ONE place a stamp is written, and it must not
+    /// let a failed stamp swallow the create: an agent that is told nothing
+    /// happened, while a row exists, is the invisible-row bug this lane is part
+    /// of fixing. Structural because the runner needs a live GUI worker and a
+    /// live daemon; scanned over the product half of the file so this lock's
+    /// own text cannot satisfy it (field guide §7.1).
+    #[test]
+    fn the_create_runner_stamps_the_row_and_reports_the_row_either_way() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runner = source
+            .split("pub fn run_app_control_create_terminal_with_tenancy(")
+            .nth(1)
+            .expect("the create runner")
+            .split("\n/// ")
+            .next()
+            .expect("the end of the runner");
+        assert!(
+            runner.contains("stamp_created_terminal_tenancy(&home, &response, &tenancy)"),
+            "a create carrying a tenancy must actually declare it, or --ephemeral is a no-op"
+        );
+        let stamped = runner
+            .find("stamp_created_terminal_tenancy(")
+            .expect("the stamp call");
+        let printed = runner
+            .find("write_stdout_payload(")
+            .expect("the runner still prints its result");
+        assert!(
+            stamped < printed,
+            "the declaration is reported WITH the create result, not instead of it"
+        );
+        assert!(
+            !runner.contains("?;\n        write_stdout_payload"),
+            "a failed stamp must not abort before the caller learns the row exists"
+        );
+        // What `"declared"` actually SAYS is not scanned for here. The first
+        // cut asserted both string literals appear in the helper, which a
+        // helper that always reports `true` satisfies just as well — the bug
+        // the reviewer found. The honest lock is the round trip in daemon.rs:
+        // `an_unknown_path_round_trip_reports_declared_false_with_the_daemons_message`.
+    }
+
+    fn tenancy_test_server() -> YggtermServer {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            ..Default::default()
+        };
+        YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        )
     }
 
     #[test]
@@ -31912,6 +32417,8 @@ terminal_window_id: None,
                             "/home/user/.codex/sessions/kept-remote.jsonl".to_string(),
                         ),
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                     PersistedLiveSession {
                         key: "local://update-shell".to_string(),
@@ -31925,6 +32432,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                        created_by: None,
+                        ephemeral: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -31984,6 +32493,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                     PersistedLiveSession {
                         key: "codex-runtime://dead-codex".to_string(),
@@ -31997,6 +32508,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                     PersistedLiveSession {
                         key: "document::dead-doc".to_string(),
@@ -32010,6 +32523,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -32081,6 +32596,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                     PersistedLiveSession {
                         key: "local::second-shell".to_string(),
@@ -32094,6 +32611,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -32218,6 +32737,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                     PersistedLiveSession {
                         key: second_path.clone(),
@@ -32231,6 +32752,8 @@ terminal_window_id: None,
                         remote_launch_action: None,
                         storage_path: None,
                         restore_reason: None,
+                        created_by: None,
+                        ephemeral: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -32381,6 +32904,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         assert!(!server.sessions.contains_key(storage_path));
@@ -32433,6 +32958,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
         });
 
         let live = server
@@ -32498,6 +33025,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server.sessions.get(key).expect("restored remote cc row");
@@ -32558,6 +33087,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -32660,6 +33191,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         server.request_terminal_launch_for_path(&runtime_key);
 
@@ -32782,6 +33315,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -32940,6 +33475,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -33017,6 +33554,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         assert!(
@@ -33119,6 +33658,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -33603,6 +34144,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server
@@ -33671,6 +34214,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server
@@ -33962,6 +34507,8 @@ terminal_window_id: None,
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
+                created_by: None,
+                ephemeral: None,
             });
 
             let session = server
@@ -34063,6 +34610,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server
@@ -34153,6 +34702,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let session = server
@@ -34277,6 +34828,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -34345,6 +34898,8 @@ terminal_window_id: None,
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+            created_by: None,
+            ephemeral: None,
         });
         server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -34424,6 +34979,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         assert_eq!(
@@ -34507,6 +35064,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "remote-session://guihost/live-2".to_string(),
@@ -34520,6 +35079,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let targets = server.remote_shutdown_targets();
@@ -34592,6 +35153,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let (machine, session_id) = server
@@ -34732,6 +35295,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
@@ -34771,6 +35336,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         server.active_session_path = Some(path.to_string());
@@ -34814,6 +35381,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "local://shell".to_string(),
@@ -34827,6 +35396,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         // No session with an interactive prompt may be stopped by typing into
@@ -34868,6 +35439,8 @@ terminal_window_id: None,
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
+            created_by: None,
+            ephemeral: None,
         });
 
         assert!(

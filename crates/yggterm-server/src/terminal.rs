@@ -697,6 +697,16 @@ impl TerminalManager {
             .and_then(|session| session.process_id())
     }
 
+    /// The pid of the PTY's foreground process group leader — what the user
+    /// would be typing at if they opened this row. Tenant accounting starts its
+    /// "what is running in here" answer from this, and it is the only value the
+    /// daemon can get without walking anything.
+    pub fn session_foreground_process_group_leader(&self, key: &str) -> Option<u32> {
+        self.sessions
+            .get(key)
+            .and_then(|session| session.foreground_process_group_leader())
+    }
+
     pub fn session_foreground_process_active(&self, key: &str) -> Option<bool> {
         self.sessions
             .get(key)
