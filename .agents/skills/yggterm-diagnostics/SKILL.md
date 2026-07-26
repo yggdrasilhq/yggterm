@@ -128,6 +128,32 @@ are profiling).
   (above). The `server terminal screen` and `server app terminal read-buffer` CLI verbs
   referenced in older notes are NOT wired in the shipped headless binary (they return
   "unsupported command") — do not rely on them; use `server snapshot` / `server app state`.
+- `server terminal tenants [<session>]` (since v2.12.17) — **what is RUNNING inside a
+  row, and what it has cost.** The immortal-tenant probe (`docs/pending-bugs.md`, the
+  aged-`ssh`/`htop` class): per row it reports the foreground command, every descendant
+  with per-process CPU seconds and age, the age+command of the oldest NON-SHELL tenant
+  ("something has been squatting in here for days"), plus the row's creator stamp and any
+  ephemerality declaration. ON DEMAND ONLY — one `/proc` reading serves every row in the
+  answer and nothing polls, so asking is the entire cost. A row it cannot measure reports
+  a NAMED reason (`no_local_runtime`, `runtime_not_running`, `root_pid_unavailable`,
+  `root_pid_not_in_proc`, `proc_unreadable`, `not_supported_on_platform`,
+  `runtime_unreachable`) with every number left EMPTY — never a zero, because a zero
+  reads as "this row is cheap". A row whose PTY another daemon owns is PROXIED to that
+  owner and merged under our row identity, so the answer never tells you to go ask
+  elsewhere; `runtime_unreachable` means that owner did not answer. Read-only, and
+  allowed for shadow clients — it is the verb an agent uses to audit what its
+  predecessors left running. KNOWN UNDER-COUNT: the walk is descendants-only, so a
+  tenant that reparented away (daemonised, orphaned to pid 1) is not counted.
+- `server app terminal new … [--purpose <text>] [--ephemeral (--ephemeral-owner-pid <pid>
+  | --ephemeral-idle-ttl-secs <n>)]` — every agent-CLI create stamps provenance on the row
+  (creator pid + host + purpose, persisted across a daemon handover; read it back with
+  `terminal tenants`). `--ephemeral` additionally opts the row IN to reaping and is
+  REFUSED on its own: there is no default owner, because under `bash -c "<cli>"` the
+  parent is the wrapper bash and under `ssh host "<cli>"` it is sshd-session, both dead
+  within milliseconds of the create — a defaulted owner would reap the row on the next
+  chore tick. Name a pid you know outlives the create (your own), or give a TTL. The
+  create response echoes what was armed under `tenancy.declared`; `declared: false`
+  means NOTHING was armed, with the daemon's reason alongside.
 - `server trace tail` — the event trace (daemon + `ui` events). Time-order it to see a
   reveal/reconcile/replay sequence. (Rotates — grep `~/.yggterm/trace/*.jsonl` for older.)
 - `server app rows` — browser/sidebar rows (kind, label, full_path).

@@ -195,20 +195,25 @@ fn print_server_app_help() {
   yggterm-headless server app terminal send <session> (--data <data>|--stdin)
   yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
-      [--ephemeral [--ephemeral-owner-pid <pid>] [--ephemeral-idle-ttl-secs <n>]]
+      [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
 
 row tenancy (server app terminal new): every create from this CLI is stamped
   with the creating pid, this host, and --purpose if given; read it back with
-  `server terminal tenants`. --ephemeral additionally OPTS IN to reaping: the
-  row is closed gracefully (tombstone + trace) once the owner pid leaves /proc,
-  or after --ephemeral-idle-ttl-secs seconds with no output, whichever rule was
-  declared. The owner defaults to THIS CLI'S PARENT process — a row that must
-  outlive the shell that created it needs an explicit --ephemeral-owner-pid or
-  an idle TTL. Ephemerality BEATS keep-alive: both are the agent's own
-  declarations and the explicit one at creation is the later, narrower word.
-  Rows created any other way, and rows with no declaration, are never reaped.
-  The check rides an existing daemon chore tick (12-60 s), so a rule fires
-  within about a minute of becoming true, never instantly.
+  `server terminal tenants`. --ephemeral additionally OPTS IN to reaping, and it
+  is REFUSED on its own: it needs --ephemeral-owner-pid <pid> naming a process
+  you KNOW outlives the create (your own pid), or --ephemeral-idle-ttl-secs <n>
+  for a TTL-only rule, or both. There is no default owner — under
+  `bash -c \"<cli>\"` the parent is the wrapper bash and under `ssh host \"<cli>\"`
+  it is sshd-session, both dead within milliseconds, so a defaulted owner would
+  reap the row on the next tick. The row is then closed gracefully (tombstone +
+  trace) once the owner pid leaves /proc, or after n seconds with no output.
+  A TTL-only declaration names no owner and is never owner-reaped. Keep-alive
+  does NOT shield a declared row: keep-alive governs whether a runtime survives
+  the GUI WINDOW closing, and an explicit close — which is what a reap is —
+  takes a keep-alive row like any other. Rows created any other way, and rows
+  with no declaration, are never reaped. The check rides an existing daemon
+  chore tick (12-60 s), so a rule fires within about a minute of becoming true,
+  never instantly. Every flag takes --flag value or --flag=value.
 
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
@@ -335,20 +340,12 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     positional
 }
 
+/// THE argv flag rule, shared with the `yggterm` binary and with the
+/// server-side parsers that read the same argv — one implementation, so
+/// `--flag=value` cannot be honoured on one entry point and silently discarded
+/// on another. See [`yggterm_core::cli_args`].
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let inline_prefix = format!("{flag}=");
-    for (index, value) in args.iter().enumerate() {
-        if value == flag {
-            return args
-                .get(index + 1)
-                .map(String::as_str)
-                .filter(|next| !next.starts_with("--"));
-        }
-        if let Some(inline) = value.strip_prefix(&inline_prefix) {
-            return Some(inline);
-        }
-    }
-    None
+    yggterm_core::cli_flag_value(args, flag)
 }
 
 /// Parse the screenshot post-process flags (`--region <name>`, `--crop x,y,w,h`,
@@ -400,25 +397,6 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// and resurrects closed sessions.
 fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
     yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
-}
-
-/// Provenance + opt-in ephemerality for a row this CLI is about to create.
-/// Every agent CLI create is stamped; only an explicit `--ephemeral` arms the
-/// reaper. See `yggterm_server::session_tenancy`.
-fn agent_cli_create_terminal_tenancy(
-    args: &[String],
-) -> Result<yggterm_server::CreateTerminalTenancy> {
-    use yggterm_server::session_tenancy::{
-        calling_process_parent_pid, create_terminal_tenancy_from_args, local_host_token,
-    };
-    create_terminal_tenancy_from_args(
-        args,
-        std::process::id(),
-        calling_process_parent_pid(),
-        &local_host_token(),
-        cli_flag_value(args, "--purpose"),
-    )
-    .map_err(|message| anyhow::anyhow!(message))
 }
 
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
@@ -2302,7 +2280,11 @@ fn main() -> Result<()> {
                             title_hint,
                             kind,
                             activate,
-                            Some(agent_cli_create_terminal_tenancy(&args)?),
+                            // Provenance + opt-in ephemerality, parsed by the
+                            // ONE shared reader both binaries call.
+                            Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
+                                &args,
+                            )?),
                             timeout_ms,
                         )
                     }

@@ -576,40 +576,12 @@ fn apply_client_identity_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Provenance + opt-in ephemerality for a row this CLI is about to create.
-/// Same surface as the headless binary's — both are the agent CLI, and the
-/// flags must mean the same thing on either. See
-/// `yggterm_server::session_tenancy`.
-fn agent_cli_create_terminal_tenancy(
-    args: &[String],
-) -> Result<yggterm_server::CreateTerminalTenancy> {
-    use yggterm_server::session_tenancy::{
-        calling_process_parent_pid, create_terminal_tenancy_from_args, local_host_token,
-    };
-    create_terminal_tenancy_from_args(
-        args,
-        std::process::id(),
-        calling_process_parent_pid(),
-        &local_host_token(),
-        cli_flag_value(args, "--purpose"),
-    )
-    .map_err(|message| anyhow::anyhow!(message))
-}
-
+/// THE argv flag rule, shared with the `yggterm-headless` binary and with the
+/// server-side parsers that read the same argv — one implementation, so
+/// `--flag=value` cannot be honoured on one entry point and silently discarded
+/// on another. See [`yggterm_core::cli_args`].
 fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let inline_prefix = format!("{flag}=");
-    for (index, value) in args.iter().enumerate() {
-        if value == flag {
-            return args
-                .get(index + 1)
-                .map(String::as_str)
-                .filter(|next| !next.starts_with("--"));
-        }
-        if let Some(inline) = value.strip_prefix(&inline_prefix) {
-            return Some(inline);
-        }
-    }
-    None
+    yggterm_core::cli_flag_value(args, flag)
 }
 
 /// Parse the element-addressing flags shared by every `do` verb into ONE
@@ -1334,9 +1306,25 @@ fn print_server_app_help() {
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)
+  yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+      [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
   yggterm server app keytips audit
   yggterm server app command <list|invoke <id>>
 {web_usage}
+row tenancy (server app terminal new): these flags are parsed by the SAME reader
+  as the headless binary's, so they mean one thing on either. Every create from
+  this CLI records the creating pid, this host and --purpose; read it back with
+  `yggterm-headless server terminal tenants` (that verb lives on the headless
+  binary). --ephemeral OPTS IN to reaping and is REFUSED on its own: name
+  --ephemeral-owner-pid <pid> (a process you KNOW outlives the create, i.e. your
+  own pid — under `bash -c` or `ssh host \"<cli>\"` the parent is a wrapper that
+  dies immediately, which is why there is no default), or
+  --ephemeral-idle-ttl-secs <n> for a TTL-only rule, or both. Keep-alive does not
+  shield a declared row — it governs GUI-window-close survival, not an explicit
+  close. Rows made any other way are never reaped. Every flag takes
+  --flag value or --flag=value.
+
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
@@ -3133,7 +3121,11 @@ fn main() -> Result<()> {
                             title_hint,
                             kind,
                             activate,
-                            Some(agent_cli_create_terminal_tenancy(&args)?),
+                            // Provenance + opt-in ephemerality, parsed by the
+                            // ONE shared reader both binaries call.
+                            Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
+                                &args,
+                            )?),
                             timeout_ms,
                         )
                     }
