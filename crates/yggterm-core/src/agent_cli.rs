@@ -612,7 +612,13 @@ pub fn store_literal_scan_coverage(source: &str) -> (usize, usize) {
 /// thirds of the file, including every product site the lock exists to watch —
 /// and pass green while seeing almost nothing. A rustfmt'd top-level block
 /// always closes on a column-0 `}`.
-fn product_lines(source: &str) -> Vec<(usize, &str)> {
+///
+/// Public because it is the workspace's ONE skip rule. The shell's reclaim
+/// call-site lock scans `shell.rs` for its own production wiring and would
+/// otherwise be satisfied by the test module that quotes every needle it looks
+/// for; a second copy of this rule living over there is exactly the divergence
+/// this module exists to prevent.
+pub fn product_lines(source: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut in_test_module = false;
     let mut pending_test_attribute = false;
