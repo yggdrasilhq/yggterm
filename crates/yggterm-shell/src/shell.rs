@@ -18169,10 +18169,13 @@ impl ShellState {
     /// as one value, so a mutation that must not disturb it can hand it back.
     fn capture_user_view(&self) -> PreservedUserView {
         PreservedUserView {
-            active: self
-                .server
-                .active_session_path()
-                .map(|path| (path.to_string(), self.server.active_view_mode())),
+            viewport: match self.server.active_session_path() {
+                Some(path) => PreservedViewport::Session {
+                    path: path.to_string(),
+                    view_mode: self.server.active_view_mode(),
+                },
+                None => PreservedViewport::StartPage,
+            },
             selection: SidebarSelection {
                 anchor: self.selection_anchor.clone(),
                 tree_paths: self.selected_tree_paths.clone(),
@@ -18186,8 +18189,24 @@ impl ShellState {
     /// vanished during the mutation would leave the INTRUDING selection
     /// standing instead of falling back to none.
     fn restore_user_view(&mut self, preserved: PreservedUserView) {
-        if let Some((path, view_mode)) = preserved.active {
-            self.server.restore_active_session(&path, view_mode);
+        match preserved.viewport {
+            PreservedViewport::Session { path, view_mode } => {
+                self.server.restore_active_session(&path, view_mode);
+            }
+            // The same hand-back the viewport history performs for its own
+            // `StartPage` entry. `show_start_page` is the SSOT setter (path and
+            // view mode together — clearing the path alone leaves a terminal
+            // view active without an active session), and
+            // `show_start_page_when_no_live_sessions` is forced FALSE rather
+            // than restored: while it is true every later snapshot promotes the
+            // first live session back to active, which is now the row the
+            // create was told not to activate.
+            PreservedViewport::StartPage => {
+                self.server.show_start_page();
+                self.show_start_page_when_no_live_sessions = false;
+                self.active_terminal_host_id = None;
+                self.clear_terminal_resume_notifications_except(None);
+            }
         }
         self.selection_anchor = preserved.selection.anchor;
         self.selected_tree_paths = preserved.selection.tree_paths;
@@ -40867,6 +40886,36 @@ struct SidebarSelection {
     tree_paths: HashSet<String>,
     browser_path: Option<String>,
 }
+/// Where the user's viewport stood, as a state that can always be handed back.
+///
+/// **The start page is a viewport, not the absence of one.** Captured as a bare
+/// `Option<(path, mode)>`, `None` meant BOTH "no session was active" and
+/// "nothing to restore", so a `--no-activate` create made while the start page
+/// was showing had no path to hand back to and the new session's activation
+/// stood. Naming the start page makes the outer `Option<PreservedUserView>`
+/// the only thing that still means "this create hands nothing back".
+#[derive(Clone, Debug, PartialEq)]
+enum PreservedViewport {
+    /// No session was active — the body renders the start page. No view mode is
+    /// carried because `show_start_page` is the only way back and it forces
+    /// `Rendered`, which is also the only snapshot-contract-clean shape for a
+    /// `None` active path.
+    StartPage,
+    Session {
+        path: String,
+        view_mode: WorkspaceViewMode,
+    },
+}
+impl PreservedViewport {
+    /// The session path this viewport hands back, or `None` for the start page
+    /// — which is a viewport, not a session, and therefore reports no path.
+    fn active_session_path(&self) -> Option<&str> {
+        match self {
+            PreservedViewport::StartPage => None,
+            PreservedViewport::Session { path, .. } => Some(path.as_str()),
+        }
+    }
+}
 /// The user's view as it stood before a create that promised not to move it.
 ///
 /// **Activation and selection are separate state.** `--no-activate` used to
@@ -40876,7 +40925,7 @@ struct SidebarSelection {
 /// selected path, not the active one.
 #[derive(Clone, Debug, PartialEq)]
 struct PreservedUserView {
-    active: Option<(String, WorkspaceViewMode)>,
+    viewport: PreservedViewport,
     selection: SidebarSelection,
 }
 /// What a create must hand back once its snapshot lands, or `None` when the
@@ -40890,6 +40939,29 @@ fn preserved_user_view_for_create(
     activate: Option<bool>,
 ) -> Option<PreservedUserView> {
     (activate == Some(false)).then(|| shell.capture_user_view())
+}
+/// The `active_session_path` an app-control create reports back: the viewport
+/// it handed the user back to, or the row it activated.
+///
+/// ONE owner for both transports. The two response builders carried
+/// byte-identical copies of this expression, which is exactly the drift the
+/// create path was unified to avoid. `null` is the honest answer for a
+/// `--no-activate` create made on the start page — the start page is not a
+/// session — and it is now also the TRUE one, because the hand-back leaves the
+/// start page showing instead of letting the new session's activation stand.
+fn app_control_create_active_session_path(
+    activate: Option<bool>,
+    preserved_view: Option<&PreservedUserView>,
+    created_path: Option<&str>,
+) -> Value {
+    if activate == Some(false) {
+        preserved_view
+            .and_then(|view| view.viewport.active_session_path())
+            .map(|path| json!(path))
+            .unwrap_or(Value::Null)
+    } else {
+        json!(created_path)
+    }
 }
 fn selected_sidebar_row_from_rows(
     rows: &[BrowserRow],
@@ -60844,15 +60916,11 @@ async fn process_pending_app_control_requests(
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
-                                    "active_session_path": if activate == Some(false) {
-                                        preserved_view
-                                            .as_ref()
-                                            .and_then(|view| view.active.as_ref())
-                                            .map(|(path, _)| json!(path))
-                                            .unwrap_or(Value::Null)
-                                    } else {
-                                        json!(created_path)
-                                    },
+                                    "active_session_path": app_control_create_active_session_path(
+                                        activate,
+                                        preserved_view.as_ref(),
+                                        created_path.as_deref(),
+                                    ),
                                     "session_path": created_path,
                                     "message": message,
                                 })),
@@ -60912,15 +60980,11 @@ async fn process_pending_app_control_requests(
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "activated": activate != Some(false),
-                                    "active_session_path": if activate == Some(false) {
-                                        preserved_view
-                                            .as_ref()
-                                            .and_then(|view| view.active.as_ref())
-                                            .map(|(path, _)| json!(path))
-                                            .unwrap_or(Value::Null)
-                                    } else {
-                                        json!(created_path)
-                                    },
+                                    "active_session_path": app_control_create_active_session_path(
+                                        activate,
+                                        preserved_view.as_ref(),
+                                        created_path.as_deref(),
+                                    ),
                                     "session_path": created_path,
                                     "message": message,
                                 })),
@@ -141322,6 +141386,33 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         agent_session.title = "Northgate records request".to_string();
         agent_session
     }
+    /// The other shell an agent's spawn lands on: the START PAGE, with no
+    /// session active and none live. `show_start_page_when_no_live_sessions` is
+    /// left at what the bootstrap derives (true), because that is the state the
+    /// user is actually in and it is what makes the create's own apply promote
+    /// the new row.
+    fn shell_on_start_page() -> ShellState {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        shell.needs_initial_server_sync = false;
+        shell
+    }
+    /// What the daemon answers a create with when the agent's row is the ONLY
+    /// live session. `created_terminal_snapshot` always carries a user session
+    /// too, which would contradict the precondition this fixture exists for:
+    /// nothing was active because nothing was live.
+    fn agent_only_created_terminal_snapshot(
+        agent_session: &ManagedSessionView,
+    ) -> ServerUiSnapshot {
+        ServerUiSnapshot {
+            active_session_path: Some(agent_session.session_path.clone()),
+            active_session: Some(snapshot_session_view_for_ui(agent_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(agent_session.clone())],
+            apps: Vec::new(),
+        }
+    }
     #[test]
     fn no_activate_create_leaves_the_users_selected_row_alone() {
         // The user-reported defect: `terminal new --no-activate` kept the
@@ -141432,6 +141523,158 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.selected_tree_paths,
             HashSet::from([folder_path.to_string()])
         );
+    }
+
+    #[test]
+    fn no_activate_create_on_the_start_page_leaves_the_start_page_showing() {
+        // The adjacent half of the same defect: with NO session active the
+        // hand-back had nothing to restore to, so the create's activation of
+        // the agent's row stood and the user was thrown off the start page.
+        let agent_path = "local://agent-ychrome";
+        let mut shell = shell_on_start_page();
+        let agent_session = agent_spawned_session(agent_path);
+        assert!(
+            start_page_is_current_surface_state(&shell),
+            "precondition: the start page is the current surface"
+        );
+        let selected_before = current_selected_sidebar_row(&shell).map(|row| row.full_path);
+        let anchor_before = shell.selection_anchor.clone();
+
+        // The same two production functions the app-control arm calls, with the
+        // value `--no-activate` parses to.
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        assert_eq!(
+            preserved.as_ref().map(|view| &view.viewport),
+            Some(&PreservedViewport::StartPage),
+            "the start page must be captured as a viewport, not as 'nothing to hand back'"
+        );
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                agent_only_created_terminal_snapshot(&agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+
+        assert!(
+            start_page_is_current_surface_state(&shell),
+            "an agent spawn must leave the start page showing"
+        );
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(shell.server.active_session().is_none());
+        assert_eq!(
+            shell.server.active_view_mode(),
+            WorkspaceViewMode::Rendered,
+            "clearing the path without the view mode is a terminal view with no active session"
+        );
+        assert_eq!(
+            current_selected_sidebar_row(&shell).map(|row| row.full_path),
+            selected_before,
+            "the highlight must be exactly where the create found it"
+        );
+        assert_eq!(shell.selection_anchor, anchor_before);
+        assert!(!shell.selected_tree_paths.contains(agent_path));
+    }
+
+    #[test]
+    fn a_background_snapshot_does_not_pull_the_start_page_onto_the_agents_row() {
+        // The hand-back is client-local: the DAEMON still reports the new
+        // session active. One poll later the client must still be on the start
+        // page, or the fix only survives until the next refresh.
+        let agent_path = "local://agent-ychrome";
+        let mut shell = shell_on_start_page();
+        let agent_session = agent_spawned_session(agent_path);
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                agent_only_created_terminal_snapshot(&agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+        assert!(start_page_is_current_surface_state(&shell));
+
+        shell.apply_snapshot_result_without_request(
+            Ok((agent_only_created_terminal_snapshot(&agent_session), None)),
+            true,
+            "start_page_hand_back_lock",
+            false,
+        );
+
+        assert!(
+            start_page_is_current_surface_state(&shell),
+            "a background refresh must not adopt the row the create was told not to activate"
+        );
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(!shell.selected_tree_paths.contains(agent_path));
+    }
+
+    #[test]
+    fn the_create_response_reports_the_view_the_user_is_left_on() {
+        // `active_session_path` in the response is how the caller learns where
+        // it left the user. It is only honest if it equals what the shell
+        // actually ended up showing — on the start page it reported `null`
+        // while the shell had activated the new row.
+        let agent_path = "local://agent-ychrome";
+        let mut shell = shell_on_start_page();
+        let agent_session = agent_spawned_session(agent_path);
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        let reported = app_control_create_active_session_path(
+            Some(false),
+            preserved.as_ref(),
+            Some(agent_path),
+        );
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                agent_only_created_terminal_snapshot(&agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+        assert_eq!(reported, Value::Null, "the start page is not a session");
+        assert_eq!(
+            reported.as_str(),
+            shell.server.active_session_path(),
+            "the reported active path must be the view the user was left on"
+        );
+
+        // Same reporter, session viewport: the path handed back is the path
+        // reported.
+        let user_path = "remote-cc://dev/user-session";
+        let (mut shell, user_session) = shell_with_user_session_selected(user_path);
+        let agent_session = agent_spawned_session(agent_path);
+        let preserved = preserved_user_view_for_create(&shell, Some(false));
+        let reported = app_control_create_active_session_path(
+            Some(false),
+            preserved.as_ref(),
+            Some(agent_path),
+        );
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                created_terminal_snapshot(&user_session, &agent_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+        assert_eq!(reported.as_str(), Some(user_path));
+        assert_eq!(reported.as_str(), shell.server.active_session_path());
+
+        // Control: an activating create reports the row it activated.
+        let created_path = "local://user-new-terminal";
+        let (mut shell, user_session) = shell_with_user_session_selected(user_path);
+        let created_session = agent_spawned_session(created_path);
+        let preserved = preserved_user_view_for_create(&shell, None);
+        let reported =
+            app_control_create_active_session_path(None, preserved.as_ref(), Some(created_path));
+        shell.apply_created_terminal_snapshot(
+            Ok((
+                created_terminal_snapshot(&user_session, &created_session),
+                Some("created".to_string()),
+            )),
+            preserved,
+        );
+        assert_eq!(reported.as_str(), Some(created_path));
+        assert_eq!(reported.as_str(), shell.server.active_session_path());
     }
 
     #[test]
