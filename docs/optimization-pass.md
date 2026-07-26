@@ -341,9 +341,34 @@ proof on jojo. Per-process render cost, delta-based, role-classified, emitted un
 `render` category with `duration_ms` set to CPU milliseconds so the existing aggregator
 handles it unchanged.
 
-Deliberate limit: **per-process, never per-surface.** WebKitGTK runs one web process per
-profile serving every surface on it, so a per-surface CPU number would be a fabrication.
-Surface counts ride along as caller-supplied context.
+Deliberate limit: **per-process, never per-surface.** The kernel attributes CPU to a
+process; the probe reports that and lets the caller record what was realized alongside
+it (`web_surface_views`, `web_surface_views_visible`, `web_surface_views_stashed`,
+`web_surface_contexts`).
+
+⛔ **CORRECTION (2026-07-26).** This section previously read "WebKitGTK runs one web
+process per profile serving every surface on it, so a per-surface CPU number would be a
+fabrication", and §5.3 below drew the conclusion that profiles are not the lever because
+isolation "comes from the process model". **The premise was false.**
+`WebSurfaceHost::open` called `WebContext::new(profile_dir)` unconditionally, once per
+SURFACE, and a `WebContext` is a process pool — so two tabs of one ychrome session (which
+share a profile by construction: `web_surface_new_tab` copies the first tab's profile)
+got two `WebKitWebProcess`es, two `WebKitNetworkProcess`es, and two in-memory cookie
+jars writing the same on-disk `cookies` file. jojo's own telemetry corroborates it:
+`web_content` and `web_network` process counts moved 1→2→3 in lockstep with realized
+surfaces. So per-process WAS per-tab, profile partitioning was never the lever, and the
+process model was a no-op dial while every context had its own pool.
+
+Contexts are now shared per `(profile jar, egress, control endpoint)` — see
+`web_context_key` in `vendor/dioxus-desktop/src/web_surface.rs`. Two consequences for
+anyone reading numbers out of this doc:
+
+- **The free per-tab CPU attribution is gone.** It existed only because the bug existed.
+  Any per-surface claim now has to come from page-level accounting, not from `/proc`.
+- **`web_surface_contexts` says which regime a sample was taken in.** Read it before
+  comparing any two samples. A sample where `web_surface_contexts` tracks
+  `web_surface_views` is from the old regime (or from tabs on different sessions), and a
+  before/after across that boundary is not a measurement.
 
 Remaining in WS1:
 
@@ -484,6 +509,11 @@ Independent of the render work, so it can run in parallel.
    comes from the **process model**, which yggterm has never set, and the policy reads
    the machine: process-per-site is harmful on a 14 GB laptop and free on a
    large-memory server. That is literally what a settings-scaling game engine does.
+   ⚠ Note the ordering the correction in WS1 forces: setting the process model was a
+   **no-op** while every surface had its own `WebContext` (a context is its own pool, so
+   you got process-per-tab whatever the model said). It only becomes a real dial now
+   that contexts are shared, and `webkit_web_view_new_with_related_view` — already used
+   in-tree for OAuth popups — is the finer-grained control than either model setting.
 4. **The lease must not be optimized away.** `c068f67` made verbs renew a surface's
    lease so an actively-driven surface is not reaped. That deliberately raises
    residency. Do not "optimize" it back into reaping mid-flow.

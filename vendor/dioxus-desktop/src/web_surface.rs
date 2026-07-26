@@ -151,11 +151,55 @@ struct Surface {
     // margin-start/top + size-request.
     container: gtk::Fixed,
     webview: wry::WebView,
-    // wry requires the WebContext to outlive the webview; co-own it here. A
-    // POPUP has none of its own: it is built RELATED to its opener, which means
-    // it shares the opener's context (its jar, its proxy, its web process) —
-    // that sharing is exactly what a popup is.
-    _ctx: Option<WebContext>,
+    // wry requires the WebContext to outlive the webview; co-own it here. SHARED
+    // with every sibling surface on the same jar+egress+control endpoint (see
+    // `web_context_key`), which is what makes two tabs of one session one web
+    // process pool and — crucially — ONE cookie jar. A POPUP has none of its
+    // own: it is built RELATED to its opener, which means it shares the opener's
+    // context (its jar, its proxy, its web process) — that sharing is exactly
+    // what a popup is.
+    _ctx: Option<Rc<RefCell<WebContext>>>,
+}
+
+/// Which surfaces may share one `WebKitWebContext`, as a deterministic key.
+/// `None` means "never share".
+///
+/// A `WebContext` is not just a cookie jar. It is a process pool, a
+/// `WebsiteDataManager`, a network-proxy setting, and a custom-scheme registry,
+/// and every one of those is per-context. So the sharing unit is the
+/// intersection of all four:
+///
+/// - **profile dir** — the on-disk jar. Different jars must never mix.
+/// - **socks port** — wry sets the proxy on the context's `WebsiteDataManager`
+///   at build time (`webkitgtk/mod.rs`), so two surfaces egressing through
+///   different tunnels cannot share one. Today a remote session mints a tunnel
+///   per TAB, which keeps its tabs apart until the tunnel is hoisted to the
+///   session; a local session (no proxy) shares immediately.
+/// - **signer base** — the `yggterm-appctl://` scheme is registered on the
+///   CONTEXT and proxies to exactly one session's control endpoint. Two sessions
+///   sharing a profile must not share a context, or one session's page would
+///   reach the other's endpoint. wry also refuses a duplicate registration
+///   outright (`DuplicateCustomProtocol`), so this is a correctness bound, not a
+///   preference.
+///
+/// Ephemeral surfaces (`profile_dir == None`) return `None` and each get their
+/// own context: an ephemeral jar that two surfaces shared would not be
+/// ephemeral in the sense the caller asked for.
+///
+/// The key is built with unit separators around components that can each be
+/// arbitrary text, so no two distinct inputs can collide by concatenation.
+fn web_context_key(
+    profile_dir: Option<&std::path::Path>,
+    socks_port: Option<u16>,
+    signer_base: Option<&str>,
+) -> Option<String> {
+    let dir = profile_dir?;
+    Some(format!(
+        "{}\u{1f}{}\u{1f}{}",
+        dir.display(),
+        socks_port.map(|p| p.to_string()).unwrap_or_default(),
+        signer_base.unwrap_or_default()
+    ))
 }
 
 /// Engine-native ad/tracker blocking (AdGuard-class network + cosmetic rules)
@@ -332,6 +376,21 @@ pub struct WebSurfaceHost {
     /// change so the per-tick reconciler doesn't spam the compositor.
     last_glass_holes: RefCell<Option<(Vec<(i32, i32, i32, i32)>, Vec<(i32, i32, i32, i32)>)>>,
     surfaces: Rc<RefCell<HashMap<u64, Surface>>>,
+    /// Live `WebContext`s, keyed by `web_context_key`. THE single owner of "which
+    /// engine context backs this jar+egress+endpoint"; surfaces borrow from here
+    /// and never construct their own.
+    ///
+    /// This map is why two tabs of one session are one web process pool and one
+    /// cookie jar. It used to be one context PER SURFACE, unconditionally, which
+    /// meant two tabs of a single ychrome invocation ran two WebKitWebProcesses,
+    /// two WebKitNetworkProcesses, and — the real bug — two independent
+    /// in-memory cookie stores writing the same Netscape-text `cookies` file:
+    /// a login in tab A was invisible in tab B, and whichever flushed last won.
+    ///
+    /// Entries are strong refs, so they are swept on `close` once nothing else
+    /// holds them (see `prune_contexts`) — the last surface leaving still tears
+    /// the context down, exactly as before, just no longer the only surface.
+    contexts: Rc<RefCell<HashMap<String, Rc<RefCell<WebContext>>>>>,
     /// Native surface ids. The HOST allocates them, because it is no longer the
     /// only thing that creates surfaces: a popup is born inside a WebKit signal
     /// handler, and two allocators would eventually hand out the same id.
@@ -1190,6 +1249,7 @@ impl WebSurfaceHost {
             glass: Rc::new(RefCell::new(None)),
             last_glass_holes: RefCell::new(None),
             surfaces: Rc::new(RefCell::new(HashMap::new())),
+            contexts: Rc::new(RefCell::new(HashMap::new())),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
             close_requests: Rc::new(RefCell::new(Vec::new())),
@@ -1358,10 +1418,30 @@ impl WebSurfaceHost {
         // ephemeral mode — `WebContext::new(None)` is NOT that (it silently
         // shares WebKit's default on-disk jar), which would leak temp-profile
         // browsing onto disk.
-        let mut ctx = match profile_dir {
-            Some(dir) => WebContext::new(Some(dir.to_path_buf())),
-            None => WebContext::new_ephemeral(),
+        //
+        // SHARED across surfaces that agree on jar + egress + control endpoint
+        // (`web_context_key`). A context created here is the FIRST surface on
+        // that key; `context_is_new` is false for every sibling that follows,
+        // which matters because the custom scheme below may only be registered
+        // once per context.
+        let ctx_key = web_context_key(profile_dir, socks_port, signer_base);
+        let (ctx_cell, context_is_new) = match ctx_key.as_ref() {
+            Some(key) => {
+                let mut contexts = self.contexts.borrow_mut();
+                match contexts.get(key) {
+                    Some(existing) => (existing.clone(), false),
+                    None => {
+                        let dir = profile_dir.expect("a keyed context always has a profile dir");
+                        let created =
+                            Rc::new(RefCell::new(WebContext::new(Some(dir.to_path_buf()))));
+                        contexts.insert(key.clone(), created.clone());
+                        (created, true)
+                    }
+                }
+            }
+            None => (Rc::new(RefCell::new(WebContext::new_ephemeral())), true),
         };
+        let mut ctx = ctx_cell.borrow_mut();
         // Devtools are always available on surfaces: the agent is a first-class
         // user and drives pages through the inspector/eval; the user opens it
         // per surface. (WebKitGTK: enables developer extras; the inspector
@@ -1473,7 +1553,14 @@ impl WebSurfaceHost {
         // app). Async: a `/fido2/get` blocks up to two minutes for the presence
         // dialog, so the forward runs off the GTK main thread — a blocking handler
         // would freeze the very dialog it is waiting on.
-        if let Some(base) = signer_base {
+        //
+        // Registered ONCE per context. wry refuses a second registration of the
+        // same scheme on a context (`DuplicateCustomProtocol`), and the refusal
+        // is stored as the builder's error — so a sibling tab re-registering
+        // would fail to build at all. It is also unnecessary: the key includes
+        // `signer_base`, so every surface sharing this context proxies to the
+        // same control endpoint the first one registered.
+        if let Some(base) = signer_base.filter(|_| context_is_new) {
             let base = base.trim_end_matches('/').to_string();
             builder = builder.with_asynchronous_custom_protocol(
                 APP_CONTROL_SCHEME.to_string(),
@@ -1485,10 +1572,21 @@ impl WebSurfaceHost {
 
         let webview = {
             use wry::WebViewBuilderExtUnix;
-            builder
-                .build_gtk(&container)
-                .map_err(|e| format!("build surface webview: {e}"))?
+            match builder.build_gtk(&container) {
+                Ok(webview) => webview,
+                Err(e) => {
+                    // A context created for a surface that never built has no
+                    // owner but the map; sweep it rather than leave a pool
+                    // behind for a jar nobody opened.
+                    drop(ctx);
+                    self.prune_contexts();
+                    return Err(format!("build surface webview: {e}"));
+                }
+            }
         };
+        // The builder's borrow of the shared context ends here; everything below
+        // touches the webview, and a sibling `open` needs the cell free.
+        drop(ctx);
         container.show_all();
 
         if let Some(ruleset) = adblock_ruleset {
@@ -1584,10 +1682,37 @@ impl WebSurfaceHost {
             Surface {
                 container,
                 webview,
-                _ctx: Some(ctx),
+                _ctx: Some(ctx_cell),
             },
         );
         Ok(())
+    }
+
+    /// Drop every shared `WebContext` no surface holds any more.
+    ///
+    /// The map's own entry is a strong ref, so "unused" is `strong_count == 1`.
+    /// This preserves the pre-sharing lifetime exactly — a context died when its
+    /// surface closed, and still dies when its LAST surface closes — while
+    /// making the intermediate state (N tabs, one context) possible at all.
+    fn prune_contexts(&self) {
+        self.contexts
+            .borrow_mut()
+            .retain(|_, ctx| Rc::strong_count(ctx) > 1);
+    }
+
+    /// How many distinct `WebContext`s are alive right now.
+    ///
+    /// The instrument for the sharing invariant: with N tabs open on one
+    /// session this must read 1, not N. Paired with `surface_count` it is the
+    /// only in-process way to tell "two tabs, one process pool" from "two tabs,
+    /// two of everything" without going to `/proc` and guessing from `comm`.
+    pub fn web_context_count(&self) -> usize {
+        self.contexts.borrow().len()
+    }
+
+    /// How many surfaces (tabs, popups) are open.
+    pub fn surface_count(&self) -> usize {
+        self.surfaces.borrow().len()
     }
 
     pub fn set_bounds(&self, id: u64, x: i32, y: i32, w: i32, h: i32) {
@@ -1675,8 +1800,11 @@ impl WebSurfaceHost {
             if s.container.parent().is_some() {
                 self.overlay.remove(&s.container);
             }
-            // Surface drops here: webview + WebContext torn down together.
+            // Surface drops here: the webview is torn down, and its share of the
+            // WebContext is released. The context itself survives while a
+            // sibling tab still holds it.
         }
+        self.prune_contexts();
         // Do not leave a seat-input tally behind for a surface that is gone —
         // ids are reused, and a stale count would preempt the next agent batch
         // on the new surface for something the user did to the old one.
@@ -1985,8 +2113,16 @@ impl WebSurfaceHost {
 
     /// The cookie manager for surface `id`'s web context.
     ///
-    /// Per-`WebContext` means per-PROFILE: two surfaces on the same profile
-    /// share one jar, and two on different profiles cannot see each other's.
+    /// The jar is per-`WebContext`, and the sharing unit for a context is
+    /// `web_context_key` — jar + egress + control endpoint — NOT the profile
+    /// alone. Surfaces that agree on that key see one another's cookies; ones
+    /// that differ on any component cannot.
+    ///
+    /// ⚠ This comment used to read "per-`WebContext` means per-PROFILE: two
+    /// surfaces on the same profile share one jar". That was false and it hid a
+    /// real bug: `open` built a context per SURFACE, so two tabs of one session
+    /// held two in-memory cookie stores over one on-disk `cookies` file, a login
+    /// in one was invisible in the other, and the last flush won.
     fn cookie_manager(&self, id: u64) -> Result<webkit2gtk::CookieManager, String> {
         use webkit2gtk::{WebContextExt as _, WebViewExt as _};
         use wry::WebViewExtUnix as _;
@@ -2447,6 +2583,90 @@ fn cors_response(status: u16, body: Vec<u8>) -> Response<Vec<u8>> {
         .header("Cache-Control", "no-store")
         .body(body)
         .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+#[cfg(test)]
+mod web_context_key_tests {
+    use super::web_context_key;
+    use std::path::Path;
+
+    /// THE SHARING RULE. Two tabs of one ychrome session agree on jar, egress
+    /// and control endpoint by construction (`web_surface_new_tab` copies the
+    /// first tab's profile), so they must land on ONE key — one WebContext, one
+    /// process pool, one cookie jar.
+    ///
+    /// Before this, `open` called `WebContext::new(profile_dir)` unconditionally
+    /// per surface, so those two tabs got two contexts pointing at the same
+    /// directory: two WebKitWebProcesses, two WebKitNetworkProcesses, and two
+    /// independent in-memory cookie stores writing one Netscape-text file. A
+    /// login in tab A was invisible in tab B and whichever flushed last won.
+    #[test]
+    fn two_tabs_of_one_session_share_exactly_one_context() {
+        let jar = Path::new("/home/u/.yggterm/web-profiles/default");
+        let a = web_context_key(Some(jar), None, Some("http://127.0.0.1:9001"));
+        let b = web_context_key(Some(jar), None, Some("http://127.0.0.1:9001"));
+        assert!(a.is_some());
+        assert_eq!(a, b, "same jar + egress + endpoint is ONE context");
+    }
+
+    /// The three components are each load-bearing, and each for its own reason:
+    /// the jar is the storage boundary, the proxy is fixed on the context's
+    /// WebsiteDataManager at build time, and the `yggterm-appctl://` scheme is
+    /// registered on the context and proxies to exactly ONE session's control
+    /// endpoint. Collapsing any of them would be a real bug, not a cost saving.
+    #[test]
+    fn jar_egress_and_control_endpoint_each_split_the_context() {
+        let jar = Path::new("/home/u/.yggterm/web-profiles/default");
+        let other = Path::new("/home/u/.yggterm/web-profiles/work");
+        let base = web_context_key(Some(jar), Some(1080), Some("http://127.0.0.1:9001"));
+        assert_ne!(
+            base,
+            web_context_key(Some(other), Some(1080), Some("http://127.0.0.1:9001")),
+            "different jars must never mix"
+        );
+        assert_ne!(
+            base,
+            web_context_key(Some(jar), Some(1081), Some("http://127.0.0.1:9001")),
+            "the proxy is per-context: a different tunnel is a different context"
+        );
+        assert_ne!(
+            base,
+            web_context_key(Some(jar), Some(1080), Some("http://127.0.0.1:9002")),
+            "appctl:// proxies to ONE session's endpoint; sharing would cross sessions"
+        );
+        assert_ne!(
+            base,
+            web_context_key(Some(jar), None, Some("http://127.0.0.1:9001")),
+            "no proxy is not the same egress as a proxy"
+        );
+    }
+
+    /// Ephemeral means ephemeral. A shared ephemeral context would be a jar two
+    /// surfaces could see each other through, which is precisely what the caller
+    /// asked not to have.
+    #[test]
+    fn ephemeral_surfaces_never_share() {
+        assert_eq!(web_context_key(None, None, None), None);
+        assert_eq!(
+            web_context_key(None, Some(1080), Some("http://127.0.0.1:9001")),
+            None
+        );
+    }
+
+    /// The components are arbitrary text (a path, a URL), so concatenation must
+    /// not be able to forge a match. A separator that could appear inside a
+    /// component would let `("/a\u{1f}b", None, "")` collide with `("/a", None,
+    /// "b")` — different jars reading one another's cookies.
+    #[test]
+    fn components_cannot_collide_by_concatenation() {
+        let a = web_context_key(Some(Path::new("/a")), None, Some("b"));
+        let b = web_context_key(Some(Path::new("/a\u{1f}\u{1f}b")), None, None);
+        assert_ne!(a, b);
+        assert_ne!(
+            web_context_key(Some(Path::new("/a")), Some(10), Some("80")),
+            web_context_key(Some(Path::new("/a")), Some(1080), None)
+        );
+    }
 }
 
 #[cfg(test)]
