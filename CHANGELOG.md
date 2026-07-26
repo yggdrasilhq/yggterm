@@ -2,6 +2,18 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Changed: when the background service updates itself, the terminal says so
+  and stops drawing until it settles.** Swapping the service re-opens every
+  running session, and the flood of redrawing that follows was the app's most
+  expensive minute — spent painting frames that were half-finished anyway. The
+  window now tells you what is happening, covers the viewport with a plain
+  still panel, and puts the terminal down until the new service has picked your
+  sessions up; nothing is lost, because the service keeps every byte and the
+  terminal reads them back when it wakes. If the signal ever goes missing the
+  app resumes drawing on its own rather than leaving you behind a cover.
+
 ## 2.12.14
 
 - **Changed: yggterm asks the machine whether it has usable graphics hardware
