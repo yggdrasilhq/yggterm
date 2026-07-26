@@ -231,6 +231,43 @@ pub fn remote_agent_schemes() -> impl Iterator<Item = &'static SchemeDescriptor>
         .filter(|scheme| scheme.agent && !scheme.legacy && scheme.locality == SchemeLocality::Remote)
 }
 
+/// Current remote AGENT ROW schemes — `remote-session://` and `remote-cc://`.
+///
+/// Narrower than [`remote_agent_schemes`], which also yields the runtime keys.
+/// This is the set every predicate that asks "is this row a remote agent
+/// session" must cover: readiness/overlay, the scanned-row classification and
+/// the cold-launch discriminator (harness spec §7.3). Each of those hand-listed
+/// `remote-session://` alone and therefore skipped remote Claude Code entirely;
+/// deriving from here means registering a future CLI's remote scheme covers all
+/// of them at once, which is the whole point of the registry.
+pub fn remote_agent_row_schemes() -> impl Iterator<Item = &'static SchemeDescriptor> {
+    SESSION_PATH_SCHEMES.iter().filter(|scheme| {
+        scheme.agent
+            && !scheme.legacy
+            && scheme.locality == SchemeLocality::Remote
+            && matches!(
+                scheme.role,
+                SchemeRole::RowIdentity | SchemeRole::RowAndRuntimeKey
+            )
+    })
+}
+
+/// Current REMOTE row schemes, agent or not — the two above plus `ssh://`.
+///
+/// The set for "does this path name a runtime that lives on another machine",
+/// which is a question about locality and says nothing about which CLI (or
+/// whether there is a CLI at all).
+pub fn remote_row_schemes() -> impl Iterator<Item = &'static SchemeDescriptor> {
+    SESSION_PATH_SCHEMES.iter().filter(|scheme| {
+        !scheme.legacy
+            && scheme.locality == SchemeLocality::Remote
+            && matches!(
+                scheme.role,
+                SchemeRole::RowIdentity | SchemeRole::RowAndRuntimeKey
+            )
+    })
+}
+
 /// Legacy aliases parsers must still accept.
 pub fn legacy_alias_schemes() -> impl Iterator<Item = &'static SchemeDescriptor> {
     SESSION_PATH_SCHEMES.iter().filter(|scheme| scheme.legacy)
@@ -279,30 +316,6 @@ pub const KNOWN_PREDICATE_HOLES: &[PredicateHole] = &[
         scheme: "cc-runtime://",
         recorded: "2026-07-23",
         consequence: "CC daemon-owned runtimes miss runtime-owned handling",
-    },
-    PredicateHole {
-        predicate: "terminal_key_prefers_initial_screen_snapshot",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "CC attaches don't get the codex initial-snapshot seed policy",
-    },
-    PredicateHole {
-        predicate: "terminal_key_prefers_initial_screen_snapshot",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "CC attaches don't get the codex initial-snapshot seed policy",
-    },
-    PredicateHole {
-        predicate: "launch_command_looks_like_remote_resume_attach",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "matches resume-codex/start-codex only — resume-cc/start-cc invisible",
-    },
-    PredicateHole {
-        predicate: "initial_remote_attach_should_preserve_retained_chunks",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "remote CC attaches never preserve retained chunks the codex way",
     },
     PredicateHole {
         predicate: "bridge_initial_snapshot_should_use_raw_stream",
