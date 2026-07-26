@@ -711,12 +711,23 @@ Independent of the render work, so it can run in parallel.
    lease so an actively-driven surface is not reaped. That deliberately raises
    residency. Do not "optimize" it back into reaping mid-flow.
 
-## 6. Small bug to fix in the same pass
+## 6. Small bug from the same pass — fixed, with one residual
 
-An agent launching a session without revealing it still steals the user's session
-**focus**. `terminal new --no-activate` correctly does not switch the viewport, but the
-active-session follows the new session anyway. Start at the `--no-activate` spawn path
-and whatever sets active-session after a birth.
+An agent launching a session without revealing it used to steal the user's session
+**focus**. `terminal new --no-activate` now hands the user's view back as ONE value —
+active session, view mode and selected row together — in the same mutation window as
+the create's snapshot apply, so nothing flashes. The last case to fall was a create
+made while NO session was active: the start page was captured as an absence rather
+than as a state, so the hand-back had nothing to restore to and the new row's
+activation stood. It is now a named viewport, restored through the same setter the
+viewport history uses.
+
+**Residual, deliberately outside that scope.** The hand-back is client-local. The
+daemon still marks a newly started session active whatever the flag said, so the GUI's
+viewport and the daemon's active path disagree until the user opens something, and any
+path that adopts daemon truth wholesale re-adopts the new row. The honest fix is
+daemon-side: a create that says "do not activate" must not move the daemon's active
+session either.
 
 ## 7. Verifying a claimed win
 
