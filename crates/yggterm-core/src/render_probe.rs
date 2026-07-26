@@ -141,6 +141,10 @@ impl RenderRole {
 pub struct ProcStat {
     pub pid: i32,
     pub comm: String,
+    /// Field 3, the single-letter run state. `Z` is a corpse whose parent has
+    /// not waited yet: the process no longer runs, so a liveness check that
+    /// reads only `/proc/<pid>` existence would report it as a survivor.
+    pub state: char,
     pub ppid: i32,
     /// Field 14, user-mode ticks.
     pub utime_ticks: u64,
@@ -171,12 +175,14 @@ pub fn parse_proc_stat(text: &str) -> Option<ProcStat> {
     // After the closing paren, field 3 is `state`, so `utime` (field 14) is index 11
     // and `stime` (field 15) is index 12 of this remainder.
     let rest: Vec<&str> = text.get(close + 1..)?.split_whitespace().collect();
+    let state: char = rest.first()?.chars().next()?;
     let ppid: i32 = rest.get(1)?.parse().ok()?;
     let utime_ticks: u64 = rest.get(11)?.parse().ok()?;
     let stime_ticks: u64 = rest.get(12)?.parse().ok()?;
     Some(ProcStat {
         pid,
         comm,
+        state,
         ppid,
         utime_ticks,
         stime_ticks,
@@ -669,6 +675,23 @@ impl RenderProbe {
 /// processes on a shared host (dev and oc are LXC containers on one kernel: a
 /// whole-system walk would attribute a neighbour's load to us).
 pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
+    observe_process_tree_stats(root_pid)
+        .into_iter()
+        .map(|stat| RenderProcObservation {
+            memory: read_process_memory(stat.pid),
+            gpu_ns: drm_engine_ns_for_pid(stat.pid),
+            stat,
+        })
+        .collect()
+}
+
+/// The tree walk on its own: `root_pid` plus every descendant, stats only.
+///
+/// Split out from [`observe_process_tree`] so the ONE walk has one owner. A
+/// caller that only needs to know WHICH processes hang off a pid (a teardown
+/// census, say) must not pay for a `smaps_rollup` read and a DRM fdinfo scan
+/// per process, and must not grow a second copy of the parent-child fold.
+pub fn observe_process_tree_stats(root_pid: i32) -> Vec<ProcStat> {
     let mut by_ppid: BTreeMap<i32, Vec<ProcStat>> = BTreeMap::new();
     let mut roots: Vec<ProcStat> = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -692,20 +715,37 @@ pub fn observe_process_tree(root_pid: i32) -> Vec<RenderProcObservation> {
             by_ppid.entry(stat.ppid).or_default().push(stat);
         }
     }
-    let mut observations = Vec::new();
+    let mut stats = Vec::new();
     let mut queue = roots;
     while let Some(stat) = queue.pop() {
         if let Some(children) = by_ppid.remove(&stat.pid) {
             queue.extend(children);
         }
-        let pid = stat.pid;
-        observations.push(RenderProcObservation {
-            memory: read_process_memory(pid),
-            gpu_ns: drm_engine_ns_for_pid(pid),
-            stat,
-        });
+        stats.push(stat);
     }
-    observations
+    stats
+}
+
+/// Whether `pid` still names the SAME running process a census saw as `comm`.
+///
+/// Three ways a naive check gets this wrong, all of which turn a teardown
+/// report into a lie:
+/// - `/proc/<pid>` existing is not "running": a zombie is a corpse the parent
+///   has not waited for, and reporting one as a survivor makes a clean teardown
+///   look dirty forever;
+/// - pids are RECYCLED, so a stale pid can name a stranger — the census command
+///   name is the discriminator, and a recycled pid running the same program is
+///   the only residual confusion;
+/// - an unreadable `/proc` entry is not evidence of life. It reads as gone,
+///   which is the direction that cannot invent a survivor.
+pub fn process_still_running(pid: i32, comm: &str) -> bool {
+    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(stat) = parse_proc_stat(&text) else {
+        return false;
+    };
+    stat.pid == pid && stat.comm == comm && stat.state != 'Z' && stat.state != 'X'
 }
 
 /// One role's cost over the interval, summed across the processes filling that role.
@@ -1827,5 +1867,94 @@ drm-engine-compute:\t3434919 ns\n";
             "log: {log}"
         );
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A teardown census asks "is this pid still RUNNING", and `/proc` answers
+    /// that with the run state, not with the directory's existence. Parse it,
+    /// or a corpse reads as a survivor.
+    #[test]
+    fn proc_stat_carries_the_run_state_so_a_corpse_is_not_a_survivor() {
+        let running = parse_proc_stat(&stat_line(4242, "bash", 1, 3, 4)).expect("parses");
+        assert_eq!(running.state, 'S');
+        assert_eq!(running.pid, 4242);
+        assert_eq!(running.ppid, 1);
+        // Same line with the state field flipped to Z: everything else must be
+        // read from the SAME offsets, which is what a hand-rolled second parser
+        // would get wrong.
+        let zombie_line = stat_line(4242, "bash", 1, 3, 4).replacen(") S ", ") Z ", 1);
+        let zombie = parse_proc_stat(&zombie_line).expect("parses");
+        assert_eq!(zombie.state, 'Z');
+        assert_eq!(zombie.utime_ticks, running.utime_ticks);
+        assert_eq!(zombie.stime_ticks, running.stime_ticks);
+    }
+
+    /// The liveness re-probe against real `/proc`: a live child is running, the
+    /// same pid under a DIFFERENT command name is not (pid reuse), and a pid
+    /// that cannot exist is not.
+    #[test]
+    fn process_still_running_answers_from_proc_and_refuses_a_recycled_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn probe child");
+        let pid = child.id() as i32;
+        let comm = parse_proc_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).unwrap())
+            .expect("child stat parses")
+            .comm;
+
+        assert!(
+            process_still_running(pid, &comm),
+            "a live child must read as running"
+        );
+        assert!(
+            !process_still_running(pid, "a-command-no-process-runs"),
+            "a pid whose command no longer matches the census is a recycled pid, not a survivor"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !process_still_running(pid, &comm),
+            "a killed and waited child must not read as running"
+        );
+        assert!(
+            !process_still_running(-1, &comm),
+            "an unreadable /proc entry must read as gone, never as alive"
+        );
+    }
+
+    /// The census property the teardown report stands on: the walk reaches
+    /// GRANDCHILDREN, not just the direct child. A teardown that signals only
+    /// its PTY child is accountable for everything this returns.
+    #[test]
+    fn the_process_tree_walk_reaches_a_grandchild() {
+        let mut root = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5 & wait")
+            .spawn()
+            .expect("spawn probe root");
+        let root_pid = root.id() as i32;
+
+        let mut tree = Vec::new();
+        for _ in 0..50 {
+            tree = observe_process_tree_stats(root_pid);
+            if tree.len() > 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            tree.iter().any(|stat| stat.pid == root_pid),
+            "the walk must include its own root: {tree:?}"
+        );
+        assert!(
+            tree.iter()
+                .any(|stat| stat.pid != root_pid && stat.ppid == root_pid),
+            "the walk must reach the process the root forked: {tree:?}"
+        );
+
+        let _ = root.kill();
+        let _ = root.wait();
     }
 }
