@@ -16416,7 +16416,7 @@ impl ShellState {
             .map(|epoch| terminal_mount_host_id(session_path, epoch))
     }
     fn terminal_session_uses_remote_runtime(&self, session_path: &str) -> bool {
-        if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+        if session_path_names_remote_runtime_by_scheme(session_path) {
             return true;
         }
         if self.server.active_session_path() == Some(session_path)
@@ -29912,7 +29912,17 @@ fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
             session.session_path == row.full_path && is_promoted_live_session(session)
         })
 }
-fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
+/// Whether a session path names a REMOTE runtime by its scheme alone, with no
+/// session view to consult.
+///
+/// Extracted from `terminal_session_uses_remote_runtime` (no behaviour change)
+/// so the shell arm matrix can lock it per arm: the scheme half is the only half
+/// that answers before a session view exists, and it is where the `remote-cc://`
+/// readiness hole lives (spec §7.3). Behind `&self` it was unlockable.
+pub(crate) fn session_path_names_remote_runtime_by_scheme(session_path: &str) -> bool {
+    session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")
+}
+pub(crate) fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
 }
 fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: bool) -> bool {
@@ -73961,7 +73971,7 @@ fn terminal_precis(session: &ManagedSessionView) -> String {
         })
         .unwrap_or_else(|| session.status_line.clone())
 }
-fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
+pub(crate) fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && session.source == SessionSource::LiveSsh
 }
@@ -85291,7 +85301,7 @@ fn remote_terminal_placeholder_text_before_2_1_103(
             .map(format_terminal_prefill_text)
     })
 }
-fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
+pub(crate) fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && metadata_value(session, "Remote Launch Action") == "start-codex"
 }
@@ -87098,12 +87108,12 @@ fn terminal_host_id(session_path: &str) -> String {
     id
 }
 
-fn terminal_host_id_belongs_to_session(session_path: &str, host_id: &str) -> bool {
+pub(crate) fn terminal_host_id_belongs_to_session(session_path: &str, host_id: &str) -> bool {
     let host_prefix = format!("{}-m", terminal_host_id(session_path));
     host_id.starts_with(&host_prefix)
 }
 
-fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
+pub(crate) fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
     format!("{}-m{}", terminal_host_id(session_path), mount_epoch)
 }
 fn sidebar_row_dom_id(path: &str) -> String {

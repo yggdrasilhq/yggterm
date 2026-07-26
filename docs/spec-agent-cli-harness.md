@@ -562,10 +562,39 @@ a source-scan lock in each crate now fails the build if you do.
    phase-0 burn-down contract): codex re-roots and codex-litellm does not, and
    the codex home env var forks by locality. Unifying either fails the test
    until its `RECORDED_ARM_FORKS` row is deleted.
-   **2b, NOT built:** the GUI-side arm axes — readiness/overlay (§7.3), attach
-   seed (§7.6), mount/reveal (§7.10) — live in `yggterm-shell` and need their
-   own twin of this table. That is where the `remote-cc` readiness hole lives,
-   so 2b is a prerequisite for phase 3 rather than a nicety.
+   ✅ **2b SHIPPED 2026-07-26 (the GUI-side axes)**:
+   `crates/yggterm-shell/src/agent_arm_shell_matrix.rs` — the twin of 2a's
+   table, same six arms, covering readiness/overlay (§7.3), attach seed (§7.6)
+   and mount identity (§7.10). **The invariant it states once:** every one of
+   these axes is a property of WHERE the PTY lives, never of WHICH CLI is
+   talking — the same shape as 2a's write-strategy rule.
+   **It ships RED-BY-DESIGN, and that is the deliverable.** Five holes are
+   real today and now recorded in `RECORDED_SHELL_ARM_HOLES` with their
+   user-visible symptoms, locked in both directions (phase 0's burn-down
+   contract): `is_remote_resume_agent_session`, `is_remote_scanned_sidebar_row`,
+   the scheme half of `terminal_session_uses_remote_runtime`, and
+   `remote_session_starts_new_codex` ALL match `remote-session://` only, so
+   **`remote-cc://` fails four §7.3 axes on one arm**; and
+   `retained_rehydrate_allow_screen_fallback` is `codex_like`-gated, so CC gets
+   no authoritative screen on a plain InitialRead reveal (§7.6, the
+   snapshot-poison axis) on BOTH localities.
+   `readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded`
+   asserts the deviation SET exactly: a new hole fails as unrecorded, a fixed
+   one fails until its ledger row is deleted. **Phase 3 is now unblocked, and
+   its acceptance is this file going green as rows are deleted.**
+   ⚠ **One production change, no behaviour change:** the scheme half of
+   `terminal_session_uses_remote_runtime` was extracted to
+   `session_path_names_remote_runtime_by_scheme`, because behind `&self` it was
+   unlockable. Six items became `pub(crate)` for the same reason.
+   ⚠ **Out of reach, recorded rather than faked:** `resolve_active_open_mount_epoch`
+   (the anti-churn epoch machinery) takes `&mut ShellState` plus a clock; the
+   matrix locks the mount IDENTITY those epochs feed (`terminal_mount_host_id`,
+   the m1/m2 label source) instead of faking a ShellState, which would lock the
+   fake rather than the product.
+   **All ten locks were red-proven by mutating the PRODUCTION call site** (e.g.
+   teaching each predicate about `remote-cc://`, dropping the `codex_like`
+   gate, dropping the epoch from the mount id) — six mutations, every one red,
+   none vacuous.
 3. **Birth-site collapse** (fixes the standing keep-alive bug as a
    by-product) + **attach single-writer** (A1, A2 close here).
 4. **Extraction unification** (title/summary/working via descriptor).
