@@ -249,6 +249,20 @@ fn startup_daemon_should_preserve_stale_runtime_with_authorized_keys(
         && runtime_status_owned_runtime_is_authorized(runtime_status, authorized_runtime_keys)
 }
 
+/// The daemon's OWN report that a preserved-owner handoff is in flight: it is
+/// serving runtime keys a PREDECESSOR still holds and it has not adopted them
+/// yet. One owner, because two places already needed this reading — the daemon
+/// update panel (`daemon_update_state_json`) and the paint gate
+/// ([[crate::handover_gate]]) — and a second copy could disagree about whether
+/// the user is mid-handover.
+///
+/// Deliberately NOT a version comparison: a version mismatch says two builds
+/// exist, not that sessions are moving between them.
+pub(crate) fn runtime_status_handoff_active(runtime_status: &ServerRuntimeStatus) -> bool {
+    runtime_status.preserved_terminal_owner_count > 0
+        || !runtime_status.preserved_terminal_owner_keys.is_empty()
+}
+
 pub(crate) fn runtime_status_is_current_app_version(runtime_status: &ServerRuntimeStatus) -> bool {
     runtime_status.server_version.as_str() == current_version().as_str()
 }
@@ -381,8 +395,7 @@ pub(crate) fn daemon_update_state_json(runtime_status: Option<&ServerRuntimeStat
     let active_version = runtime_status.server_version.as_str();
     let version_mismatch = active_version != expected_version.as_str();
     let session_survival_required = runtime_status_has_live_terminal_runtime(runtime_status);
-    let handoff_active = runtime_status.preserved_terminal_owner_count > 0
-        || !runtime_status.preserved_terminal_owner_keys.is_empty();
+    let handoff_active = runtime_status_handoff_active(runtime_status);
     let hot_update_pending =
         startup_daemon_hot_update_pending_reason(runtime_status, expected_version.as_str())
             .is_some();
