@@ -15,18 +15,29 @@ impl RetainedRehydrateMode {
 
 // XTERM-BUG: blank-viewport-client-snapshot-poison
 // Whether a retained-rehydrate reveal may fall back to the daemon's AUTHORITATIVE
-// screen snapshot when the retained payload is a cursor-addressed (codex) frame with
-// no plain scrollback history. For a CollapsedScrollbackRecovery reveal (the live
-// broken case: switch-back / surface re-reveal) or any codex-like session, the daemon
+// screen snapshot when the retained payload is a cursor-addressed frame with no
+// plain scrollback history. For a CollapsedScrollbackRecovery reveal (the live
+// broken case: switch-back / surface re-reveal) or any AGENT CLI session, the daemon
 // screen frame is the real current content and MUST be offered, so the client's
 // reconcile-from-daemon path (daemon_screen_snapshot) engages. Otherwise the selector
 // returns daemon_retained_snapshot, which the client downgrades to its own sparse
 // xterm_session_snapshot -> clip + truncated/broken composer bottom paint.
+//
+// ⚠ WIDENED 2026-07-27 (harness spec §7.6, phase 3): this took `codex_like`, and
+// `codex_like` EXCLUDES Claude Code. So on a plain InitialRead reveal a CC session
+// was never offered the authoritative screen and fell back to its own sparse
+// snapshot — the clipped / truncated-bottom paint — on BOTH localities. CC is
+// cursor-addressed for exactly the same reason codex is: it repaints in place, so
+// its conversation lives in the CLIENT buffer and the daemon's screen is the only
+// authoritative current content. The gate is a question about "does this CLI repaint
+// in place", which is true of every agent CLI, so the parameter now names that.
+// Plain shells are unchanged: they stream scrollback and still get the retained
+// payload on an InitialRead.
 pub(crate) fn retained_rehydrate_allow_screen_fallback(
     mode: RetainedRehydrateMode,
-    codex_like: bool,
+    agent_cli_session: bool,
 ) -> bool {
-    codex_like || matches!(mode, RetainedRehydrateMode::CollapsedScrollbackRecovery)
+    agent_cli_session || matches!(mode, RetainedRehydrateMode::CollapsedScrollbackRecovery)
 }
 /// The minimum scrollback depth (baseY) for a client buffer to count as a "rich"
 /// transcript worth protecting from a collapse-reseed.
@@ -295,7 +306,7 @@ pub(crate) fn daemon_retained_snapshot_replay_identity_key(
 
 pub(crate) fn daemon_retained_snapshot_replay_should_start(
     is_remote_resume_session: bool,
-    remote_starting_codex_session: bool,
+    remote_starting_agent_session: bool,
     codex_like_session: bool,
     host_is_active_session: bool,
     active_host_selected: bool,
@@ -303,7 +314,7 @@ pub(crate) fn daemon_retained_snapshot_replay_should_start(
     terminal_live_host_connected: bool,
     retained_snapshot_already_staged: bool,
 ) -> bool {
-    let _ = (remote_starting_codex_session, codex_like_session);
+    let _ = (remote_starting_agent_session, codex_like_session);
     is_remote_resume_session
         && host_is_active_session
         && active_host_selected

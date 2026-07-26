@@ -2985,9 +2985,37 @@ fn shell_command(
     command
 }
 
+/// True when a launch command is a REMOTE AGENT resume/start attach.
+///
+/// ⚠ Fixed 2026-07-27 (harness spec §7.3, phase 3): this hand-listed
+/// `resume-codex` / `start-codex`, so a remote CLAUDE CODE attach matched
+/// neither this nor the `remote-session://` key check beside it — BOTH halves of
+/// the retained-chunk preservation guards missed remote-cc. Now derived from the
+/// wrapper subcommand registry, so a new CLI is covered by registering it.
 fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
-    launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
-        || launch_command.contains("server'\\'' '\\''remote'\\'' '\\''start-codex")
+    yggterm_core::agent_cli::AGENT_CLIS.iter().any(|descriptor| {
+        [
+            crate::remote_agent_resume_subcommand(descriptor.kind),
+            crate::remote_agent_start_subcommand(descriptor.kind),
+        ]
+        .iter()
+        .any(|subcommand| {
+            launch_command.contains(&format!(
+                "server'\\'' '\\''remote'\\'' '\\''{subcommand}"
+            ))
+        })
+    })
+}
+
+/// True when a terminal key names a runtime that lives on another machine and
+/// belongs to an agent CLI — the remote agent ROW schemes plus their RUNTIME
+/// keys, derived from the scheme registry.
+///
+/// Replaces three hand-written `remote-session:// || codex-runtime://` lists
+/// that each skipped Claude Code (harness spec §7.3).
+fn terminal_key_is_remote_agent(key: &str) -> bool {
+    yggterm_core::agent_scheme::remote_agent_schemes()
+        .any(|scheme| key.starts_with(scheme.prefix))
 }
 
 /// True when a session's PTY child is carried over ssh (remote agent bridges
@@ -3010,8 +3038,7 @@ fn remote_resume_attach_shell_command(launch_command: &str) -> String {
 }
 
 fn terminal_key_prefers_initial_screen_snapshot(key: &str, launch_command: &str) -> bool {
-    key.starts_with("remote-session://")
-        || key.starts_with("codex-runtime://")
+    terminal_key_is_remote_agent(key)
         || launch_command_looks_like_remote_resume_attach(launch_command)
 }
 
@@ -3020,7 +3047,7 @@ fn initial_remote_attach_should_preserve_retained_chunks(
     launch_command: &str,
     chunks: &[TerminalChunk],
 ) -> bool {
-    if !(key.starts_with("remote-session://")
+    if !(terminal_key_is_remote_agent(key)
         || launch_command_looks_like_remote_resume_attach(launch_command))
     {
         return false;
@@ -3036,7 +3063,7 @@ fn select_remote_retained_initial_chunks(
     chunks: &VecDeque<TerminalChunk>,
 ) -> Vec<TerminalChunk> {
     let mut selected = select_initial_attach_chunks_for_launch(chunks, launch_command);
-    if !(key.starts_with("remote-session://")
+    if !(terminal_key_is_remote_agent(key)
         || launch_command_looks_like_remote_resume_attach(launch_command))
         || selected
             .iter()
