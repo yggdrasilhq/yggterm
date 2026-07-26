@@ -208,17 +208,65 @@ pub const ENV_GALLIUM_DRIVER: &str = "GALLIUM_DRIVER";
 pub const ENV_WEBKIT_DISABLE_DMABUF_RENDERER: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 /// The resolved under-glass arming flag every downstream reader keys on.
 pub const ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS: &str = "YGGTERM_WEB_SURFACE_UNDER_GLASS";
+/// GLVND's vendor-library filter. Owned by the GL decision on a host where the
+/// NVIDIA ICD is installed with no NVIDIA device behind it (see
+/// [`stray_nvidia_egl_vendor`]): GLVND sorts `10_nvidia.json` ahead of
+/// `50_mesa.json`, so `libEGL_nvidia` gets mapped into the GUI and every web
+/// process on an AMD-only machine — it appeared in three WebKit crash stacks and
+/// immediately preceded an `eglMakeCurrent failed` → SIGSEGV on the live host
+/// (2026-07-26). Pinning the filter to the Mesa ICD keeps the dead vendor out.
+pub const ENV_EGL_VENDOR_LIBRARY_FILENAMES: &str = "__EGL_VENDOR_LIBRARY_FILENAMES";
 
-/// The five variables that ARE the GL path: the decision plus the four settings it
+/// The six variables that ARE the GL path: the decision plus the five settings it
 /// owns. One list, so a reader publishing "which GL path is this window on" cannot
-/// answer with four of five and look complete.
+/// answer with five of six and look complete.
 pub const WEBKIT_GL_ENVIRONMENT_KEYS: &[&str] = &[
     ENV_YGGTERM_WEBKIT_GL_POLICY,
     ENV_LIBGL_ALWAYS_SOFTWARE,
     ENV_GALLIUM_DRIVER,
     ENV_WEBKIT_DISABLE_DMABUF_RENDERER,
     ENV_YGGTERM_WEB_SURFACE_UNDER_GLASS,
+    ENV_EGL_VENDOR_LIBRARY_FILENAMES,
 ];
+
+/// The Mesa GLVND ICD the vendor filter pins to. An absolute path baked as a
+/// constant on purpose: the filter is only ever SET when this exact file was
+/// observed to exist (see [`stray_nvidia_egl_vendor`]), so a distro that keeps
+/// it elsewhere simply never activates the guard.
+pub const MESA_EGL_VENDOR_JSON: &str = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+const NVIDIA_EGL_VENDOR_JSON: &str = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json";
+
+/// True when the NVIDIA GLVND ICD is installed but no NVIDIA device exists —
+/// the misconfiguration where GLVND tries (and maps) `libEGL_nvidia` first on a
+/// machine that cannot use it. Requires the Mesa ICD to be present too: pinning
+/// the filter to a file that does not exist would take EGL down entirely, which
+/// is strictly worse than the stray vendor.
+pub fn stray_nvidia_egl_vendor() -> bool {
+    stray_nvidia_egl_vendor_at(std::path::Path::new("/"))
+}
+
+/// [`stray_nvidia_egl_vendor`] against an arbitrary root, so a test can build
+/// the three filesystem states without touching the host's real `/usr` or
+/// `/dev`.
+pub fn stray_nvidia_egl_vendor_at(root: &std::path::Path) -> bool {
+    let strip = |abs: &str| abs.trim_start_matches('/').to_string();
+    let nvidia_icd = root.join(strip(NVIDIA_EGL_VENDOR_JSON));
+    let mesa_icd = root.join(strip(MESA_EGL_VENDOR_JSON));
+    if !nvidia_icd.is_file() || !mesa_icd.is_file() {
+        return false;
+    }
+    let dev = root.join("dev");
+    let Ok(entries) = std::fs::read_dir(&dev) else {
+        // An unreadable /dev cannot prove the device absent; stay out.
+        return false;
+    };
+    !entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("nvidia"))
+    })
+}
 
 /// What THIS process decided its GL path is — read from this process's own
 /// environment, which is the only place the answer exists.
@@ -958,5 +1006,35 @@ mod tests {
         );
         assert_eq!(report.class, GlClass::Unknown);
         assert_eq!(report.reason, "probe_spawn_failed");
+    }
+
+    /// The stray-vendor predicate: fires only when BOTH ICDs exist and no
+    /// nvidia device node does — every other combination stays out, including
+    /// the one where pinning would break EGL (Mesa ICD missing).
+    #[test]
+    fn the_stray_nvidia_vendor_predicate_requires_both_icds_and_no_device() {
+        let root = std::env::temp_dir().join(format!("yggterm-glvnd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let icds = root.join("usr/share/glvnd/egl_vendor.d");
+        std::fs::create_dir_all(&icds).unwrap();
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+
+        // Nothing installed: no opinion.
+        assert!(!stray_nvidia_egl_vendor_at(&root));
+        // NVIDIA ICD alone (no Mesa to pin to): must stay out.
+        std::fs::write(icds.join("10_nvidia.json"), b"{}").unwrap();
+        assert!(!stray_nvidia_egl_vendor_at(&root));
+        // Both ICDs, no device: THE misconfiguration.
+        std::fs::write(icds.join("50_mesa.json"), b"{}").unwrap();
+        assert!(stray_nvidia_egl_vendor_at(&root));
+        // A real nvidia device appears: the vendor is not stray.
+        std::fs::write(root.join("dev/nvidia0"), b"").unwrap();
+        assert!(!stray_nvidia_egl_vendor_at(&root));
+        // nvidiactl alone counts as a device too.
+        std::fs::remove_file(root.join("dev/nvidia0")).unwrap();
+        std::fs::write(root.join("dev/nvidiactl"), b"").unwrap();
+        assert!(!stray_nvidia_egl_vendor_at(&root));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
