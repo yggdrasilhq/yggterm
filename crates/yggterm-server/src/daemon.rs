@@ -2562,6 +2562,62 @@ enum PeerRowAdmission {
     OwnedOrAgentStore,
 }
 
+/// Does the peer offering this row still OWN the PTY behind it?
+///
+/// ONE OWNER of the question, because two callers ask it and a disagreement is
+/// silent: the admission predicate uses it as one of the two honest reasons to
+/// hand a row over, and [`peer_live_rows_marked_as_rescued`] uses it to decide
+/// which of those rows are rescues. If they folded equivalent local runtime
+/// keys differently, a row could be admitted as a rescue and then not be marked
+/// as one — and the mark is the only thing that keeps its row alive once the
+/// rescuer dies.
+fn peer_owns_row_runtime(
+    live: &crate::PersistedLiveSession,
+    peer_owned_identities: &HashSet<String>,
+) -> bool {
+    peer_owned_identities.contains(&crate::normalized_live_row_identity(&live.key))
+}
+
+/// Stamp the handover restore reason on every row we are adopting BECAUSE THE
+/// PEER STILL OWNS ITS PTY.
+///
+/// A peer advertises its ROUTINE persist (`persisted_state()`), and that persist
+/// synthesizes `restore_reason` only under update-restart protection — so the
+/// rows arriving here carry none, however plainly they are being rescued. The
+/// superseded-daemon takeover does not need this: it reads the state file the
+/// dying peer wrote through `PrepareUpdateRestart`, where every non-keep-alive
+/// row is already marked.
+///
+/// Why it matters, and only for this path: adopting a row whose runtime belongs
+/// to a daemon that is about to die is the ONLY way a plain shell's row crosses
+/// a version bump (no `SCM_RIGHTS` fd passing exists, so the PTY cannot come
+/// with it). Without the mark the row is adopted, shown while the predecessor
+/// lingers, and then silently erased by the snapshot's runtime-truth filter the
+/// moment that predecessor retires — which is exactly how `local://b7ccbab4`
+/// was lost at 2.12.15. With it,
+/// [`snapshot_session_is_handover_orphaned_row`] keeps the row as a
+/// runtime-less, clickable row.
+///
+/// Deliberately NOT applied to the ownerless-agent arm: those rows survive on
+/// their own store arm, and marking them would quietly extend the restart
+/// protection that `Runtime Restore Reason` also drives.
+fn peer_live_rows_marked_as_rescued(
+    peer_rows: &[crate::PersistedLiveSession],
+    peer_owned_identities: &HashSet<String>,
+) -> Vec<crate::PersistedLiveSession> {
+    peer_rows
+        .iter()
+        .map(|live| {
+            if !peer_owns_row_runtime(live, peer_owned_identities) {
+                return live.clone();
+            }
+            let mut rescued = live.clone();
+            rescued.restore_reason = Some(crate::UPDATE_RESTART_RESTORE_REASON.to_string());
+            rescued
+        })
+        .collect()
+}
+
 /// Drop every remembered-closed row from a persisted live set, returning the
 /// keys dropped. Cold restore is the one way back into the live order that does
 /// not pass an import admission predicate.
@@ -3801,8 +3857,7 @@ impl DaemonRuntime {
         if !crate::persisted_live_session_is_recoverable(live) {
             return false;
         }
-        let peer_owns_runtime =
-            peer_owned_identities.contains(&crate::normalized_live_row_identity(&live.key));
+        let peer_owns_runtime = peer_owns_row_runtime(live, peer_owned_identities);
         match admission {
             PeerRowAdmission::OwnedRuntimesOnly => peer_owns_runtime,
             PeerRowAdmission::OwnedOrAgentStore => {
@@ -3847,8 +3902,7 @@ impl DaemonRuntime {
         // A close recorded by a peer AFTER we booted is only on disk. Adopting
         // against a boot-time copy re-adopts exactly the rows the user just
         // closed, which is the whole reason the deny-list exists.
-        self.live_row_tombstones
-            .refresh(self.store.home_dir(), now);
+        self.live_row_tombstones.refresh(self.store.home_dir(), now);
         for (owner_endpoint, owner_status) in reachable_versioned_daemon_statuses_excluding_endpoint(
             self.store.home_dir(),
             &current_endpoint,
@@ -3864,15 +3918,21 @@ impl DaemonRuntime {
                 .map(|key| crate::normalized_live_row_identity(key))
                 .collect();
             let tombstones = &self.live_row_tombstones;
+            // Mark the rescues BEFORE admission so the row lands carrying the
+            // reason it is here. The peer's routine persist cannot say it (see
+            // `peer_live_rows_marked_as_rescued`), and without it a rescued
+            // plain shell's row dies the moment the rescuer retires.
+            let advertised =
+                peer_live_rows_marked_as_rescued(&owner_status.live_terminal_sessions, &owned);
             let adopted = self
                 .server
-                .import_peer_live_rows_in_order(&owner_status.live_terminal_sessions, |live| {
+                .import_peer_live_rows_in_order(&advertised, |live| {
                     Self::peer_live_row_is_adoptable(
                         live,
                         &owned,
                         tombstones,
                         now,
-        PeerRowAdmission::OwnedOrAgentStore,
+                        PeerRowAdmission::OwnedOrAgentStore,
                     )
                 });
             if !adopted.is_empty() {
@@ -4212,8 +4272,7 @@ impl DaemonRuntime {
         let current_triple = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION);
         let now = crate::live_row_tombstones::now_secs();
         // Same reason as the B4 pass: the veto is only as good as its freshness.
-        self.live_row_tombstones
-            .refresh(self.store.home_dir(), now);
+        self.live_row_tombstones.refresh(self.store.home_dir(), now);
         let mut prepared = Vec::new();
         let mut prepare_errors = Vec::new();
         let mut imported_keys = Vec::new();
@@ -5520,12 +5579,14 @@ impl DaemonRuntime {
     fn reconcile_live_row_tombstones(&mut self) {
         let now = crate::live_row_tombstones::now_secs();
         let live = self.live_row_identity_set();
-        let entered =
-            crate::live_row_tombstones::EnteredLiveRows::since(&self.live_row_identities_seen, &live);
+        let entered = crate::live_row_tombstones::EnteredLiveRows::since(
+            &self.live_row_identities_seen,
+            &live,
+        );
         self.live_row_identities_seen = live;
-        if let Err(error) =
-            self.live_row_tombstones
-                .reconcile(self.store.home_dir(), now, &entered)
+        if let Err(error) = self
+            .live_row_tombstones
+            .reconcile(self.store.home_dir(), now, &entered)
         {
             self.report_live_row_tombstone_write_failure("reconcile", &error);
         }
@@ -7562,10 +7623,10 @@ fn snapshot_session_is_keep_alive_recovery_target(session: &SnapshotSessionView)
 /// store via resume-codex / resume-cc): recognizing only the LOCAL agent here
 /// stripped every non-keep-alive REMOTE agent from the Live Sessions snapshot
 /// whenever its runtime was not currently connected (live-caught on jojo
-/// 2026-07-08). Plain shells stay runtime-gated here: a non-keep-alive shell
-/// with no live PTY is a husk, so it is retained only when its runtime IS
-/// present — never as a recovery target. (Run #16 gate-#5 family: runtime exit
-/// was the pre-swap row eraser for local codex rows.)
+/// 2026-07-08). Plain shells are NOT covered by this arm — a shell has no store
+/// to re-derive from — but they are no longer erased outright either: see
+/// [`snapshot_session_is_handover_orphaned_row`]. (Run #16 gate-#5 family:
+/// runtime exit was the pre-swap row eraser for local codex rows.)
 fn snapshot_session_is_agent_store_recoverable(session: &SnapshotSessionView) -> bool {
     // Source alone is not enough: restored/recovery-created rows carry
     // source=Stored while holding a live local runtime key (the 2.8.79
@@ -7581,6 +7642,49 @@ fn snapshot_session_is_agent_store_recoverable(session: &SnapshotSessionView) ->
     )
 }
 
+/// PLAIN SHELLS ARE FIRST-CLASS AND THEIR ROW MUST SURVIVE A DAEMON BUMP
+/// (user-settled 2026-07-26, level (a) — the ROW survives even when the PTY
+/// cannot). The 2.12.15 bump lost `local://b7ccbab4` ("ychrome HTTP Fixture
+/// Support"): a shell is not re-resumable and there is no `SCM_RIGHTS` fd
+/// passing anywhere in the tree, so its PTY died with its daemon — and then
+/// this filter erased the row too, because a shell has no store arm to fall
+/// back on. Losing the PTY is level (b) work; losing the ROW is a bug.
+///
+/// The discriminator is WHY the runtime is absent, and the row already carries
+/// it: `Runtime Restore Reason: update-restart` means "this row arrived across
+/// a daemon restart, and the PTY behind it was another daemon's". Two shapes of
+/// runtime-less shell, deliberately told apart:
+///
+/// * **Its daemon went away.** Handover-marked → the row stays, runtime-less
+///   and clickable, and the click spawns a fresh shell at the recorded cwd
+///   through the ordinary `terminal_spec` path. Scrollback is lost; the row,
+///   its title, its position and its cwd are not.
+/// * **The shell itself exited** (the user typed `exit`) — no marker, so it is
+///   still a husk and still disappears. That is the same class the peer-row
+///   admission gate refuses (`peer_live_row_is_adoptable`): three ownerless
+///   loopback shells were being re-adopted at every swap on jojo 2026-07-26 and
+///   hidden only here. Widening this arm to "any Shell" would put them back.
+///
+/// Kind is deliberately NOT part of the test. The question is about the row's
+/// runtime provenance, not about what runs in it; an inherited remote shell
+/// deserves the same answer, and the agent kinds already have their own arm.
+fn snapshot_session_is_handover_orphaned_row(session: &SnapshotSessionView) -> bool {
+    snapshot_session_requires_terminal_runtime(session) && snapshot_session_update_restore(session)
+}
+
+/// ONE OWNER of "this row stays in Live Sessions even though no daemon holds a
+/// terminal runtime for it".
+///
+/// The three arms were spelled out twice — once to flip the launch phase and
+/// once to retain the row — and the flip/retain pair MUST agree: a row retained
+/// without the phase flip keeps a stale `Running` label over a dead runtime,
+/// and a row flipped without being retained is relabelled on its way out.
+fn snapshot_session_row_survives_runtime_loss(session: &SnapshotSessionView) -> bool {
+    snapshot_session_is_keep_alive_recovery_target(session)
+        || snapshot_session_is_agent_store_recoverable(session)
+        || snapshot_session_is_handover_orphaned_row(session)
+}
+
 fn apply_terminal_runtime_truth_to_snapshot(
     server: &YggtermServer,
     runtime_keys: &HashSet<String>,
@@ -7589,10 +7693,7 @@ fn apply_terminal_runtime_truth_to_snapshot(
     if let Some(active_session) = snapshot.active_session.as_mut() {
         let runtime_owned = runtime_keys
             .contains(&server.terminal_runtime_key_for_path(&active_session.session_path));
-        if !runtime_owned
-            && (snapshot_session_is_keep_alive_recovery_target(active_session)
-                || snapshot_session_is_agent_store_recoverable(active_session))
-        {
+        if !runtime_owned && snapshot_session_row_survives_runtime_loss(active_session) {
             active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(active_session) {
             // Runtime truth outranks a stale stored phase in BOTH directions: a
@@ -7607,10 +7708,7 @@ fn apply_terminal_runtime_truth_to_snapshot(
     for session in &mut snapshot.live_sessions {
         let runtime_owned =
             runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path));
-        if !runtime_owned
-            && (snapshot_session_is_keep_alive_recovery_target(session)
-                || snapshot_session_is_agent_store_recoverable(session))
-        {
+        if !runtime_owned && snapshot_session_row_survives_runtime_loss(session) {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(session) {
             session.launch_phase = crate::TerminalLaunchPhase::Running;
@@ -7622,12 +7720,14 @@ fn apply_terminal_runtime_truth_to_snapshot(
             .as_ref()
             .map(|session| session.session_path.clone())
     });
+    // `retain` keeps the surviving rows in place, which is the row-ORDER half of
+    // the daemon-bump contract: a rescued shell must come back where the user
+    // left it, not at the top or the bottom.
     snapshot.live_sessions.retain(|session| {
         runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
             || (active_path.as_deref() == Some(session.session_path.as_str())
                 && snapshot_session_is_pending_runtime_launch(session))
-            || snapshot_session_is_keep_alive_recovery_target(session)
-            || snapshot_session_is_agent_store_recoverable(session)
+            || snapshot_session_row_survives_runtime_loss(session)
     });
 
     let Some(active_path) = active_path else {
@@ -11463,6 +11563,12 @@ fn progressive_migration_enabled() -> bool {
 /// unsent draft). A plain shell has no such persistence — re-running its launch
 /// command yields a fresh shell — so it is never released this way (it stays
 /// with the lingering owner, awaiting a future lossless fd-handoff).
+///
+/// ⚠ This is about the PTY, not the ROW. A shell that cannot migrate must still
+/// keep its row when its daemon finally goes: that guarantee lives in
+/// [`snapshot_session_is_handover_orphaned_row`] and does not depend on this
+/// predicate. Widening this list to admit `Shell` would kill a live shell and
+/// hand back an empty one, which is not migration.
 fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
     matches!(
         kind,
@@ -14128,7 +14234,7 @@ mod tests {
                 &owned(&[]),
                 &none,
                 1_000,
-super::PeerRowAdmission::OwnedOrAgentStore,
+                super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "an ownerless loopback shell is a husk and must not be adopted"
         );
@@ -14141,7 +14247,7 @@ super::PeerRowAdmission::OwnedOrAgentStore,
                 &owned(&["local://3803a7ed"]),
                 &none,
                 1_000,
-super::PeerRowAdmission::OwnedOrAgentStore,
+                super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "a shell whose PTY the peer still owns must be rescued"
         );
@@ -14173,7 +14279,7 @@ super::PeerRowAdmission::OwnedOrAgentStore,
                 &owned(&["codex-runtime://dcb70bd5"]),
                 &none,
                 1_000,
-super::PeerRowAdmission::OwnedOrAgentStore,
+                super::PeerRowAdmission::OwnedOrAgentStore,
             ),
             "owned-runtime matching must fold equivalent local runtime keys"
         );
@@ -16718,8 +16824,10 @@ super::PeerRowAdmission::OwnedOrAgentStore,
 
     // Run #16 gate-#5 family: a LOCAL agent CLI row re-derives from the CLI's
     // own JSONL store, so a runtime exit must keep the row (flipped to a
-    // recoverable launch phase) instead of erasing it. A non-keep-alive plain
-    // shell still dies with its PTY (second-class per the keep-alive spec).
+    // recoverable launch phase) instead of erasing it. A shell whose OWN PTY
+    // exited is still a husk and still goes — the shell here carries no
+    // handover marker, which is what separates it from the rescued shell in
+    // `a_plain_shells_row_survives_the_daemon_bump_that_killed_its_pty`.
     #[test]
     fn local_agent_rows_survive_runtime_exit_but_plain_shells_do_not() {
         let tree = daemon_test_tree();
@@ -16786,6 +16894,237 @@ super::PeerRowAdmission::OwnedOrAgentStore,
                 .as_ref()
                 .map(|session| session.launch_phase),
             Some(TerminalLaunchPhase::RemoteBootstrap),
+        );
+    }
+
+    /// PLAIN SHELLS ARE FIRST-CLASS AND THEIR ROW MUST SURVIVE A DAEMON BUMP
+    /// (user-settled 2026-07-26, level (a): the ROW survives even when the PTY
+    /// cannot). This is the path that actually lost `local://b7ccbab4`
+    /// ("ychrome HTTP Fixture Support") at 2.12.15, driven end to end through
+    /// the production functions and nothing else:
+    ///
+    /// 1. the predecessor's ROUTINE persist — literally what a peer advertises
+    ///    as `live_terminal_sessions`, and the reason the rescue is unmarked at
+    ///    the wire (that field is only synthesized on an update-restart persist);
+    /// 2. `peer_live_rows_marked_as_rescued` — the peer still owns the PTY;
+    /// 3. `peer_live_row_is_adoptable` — the real admission predicate;
+    /// 4. `import_peer_live_rows_in_order` — the anchored placement walk;
+    /// 5. `apply_terminal_runtime_truth_to_snapshot` with an EMPTY runtime-key
+    ///    set — the predecessor has now retired and the shell's PTY died with
+    ///    it, because no `SCM_RIGHTS` fd handoff exists to carry it over.
+    ///
+    /// The only synthesized input is the runtime-key set, and its two values
+    /// ARE the scenario: owned by the peer at adoption time, owned by nobody at
+    /// display time.
+    #[test]
+    fn a_plain_shells_row_survives_the_daemon_bump_that_killed_its_pty() {
+        let tree = daemon_test_tree();
+        let mut predecessor = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        // Two rows, so the shell has a POSITION to keep across the bump. The
+        // agent row is the control: it survives on its own store arm and must
+        // keep doing so.
+        let agent_key = predecessor.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("row lifecycle"),
+        );
+        let shell_key = predecessor.start_local_session(
+            SessionKind::Shell,
+            Some("/home/user/gh/ychrome"),
+            Some("ychrome HTTP Fixture Support"),
+        );
+        let advertised = predecessor.persisted_state().live_sessions;
+        let advertised_order = advertised
+            .iter()
+            .map(|live| live.key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            advertised_order.contains(&shell_key) && advertised_order.contains(&agent_key),
+            "a peer advertises both rows; got {advertised_order:?}"
+        );
+        assert!(
+            advertised.iter().all(|live| live.restore_reason.is_none()),
+            "a ROUTINE persist carries no restore reason — that absence is the defect's \
+             starting condition, so a test that starts from a marked row proves nothing"
+        );
+
+        // The predecessor owns both PTYs right now; it is about to die.
+        let peer_owned = HashSet::from([
+            crate::normalized_live_row_identity(&shell_key),
+            crate::normalized_live_row_identity(&agent_key),
+        ]);
+        let rescued = super::peer_live_rows_marked_as_rescued(&advertised, &peer_owned);
+
+        let mut successor = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let tombstones = LiveRowTombstones::default();
+        let imported = successor.import_peer_live_rows_in_order(&rescued, |live| {
+            DaemonRuntime::peer_live_row_is_adoptable(
+                live,
+                &peer_owned,
+                &tombstones,
+                1_000,
+                super::PeerRowAdmission::OwnedOrAgentStore,
+            )
+        });
+        assert_eq!(
+            imported, advertised_order,
+            "row ORDER and COUNT must survive the handover, not just row identity"
+        );
+        assert!(
+            !tombstones.blocks(&crate::normalized_live_row_identity(&shell_key), 1_000),
+            "a handover-lost row is NOT a user close; tombstoning it would have the \
+             import veto it forever"
+        );
+
+        // The predecessor has retired. Its PTYs died with it — nobody owns a
+        // runtime for either row.
+        let mut snapshot = successor.snapshot();
+        apply_terminal_runtime_truth_to_snapshot(&successor, &HashSet::new(), &mut snapshot);
+
+        let surviving = snapshot
+            .live_sessions
+            .iter()
+            .map(|session| session.session_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surviving, advertised_order,
+            "the plain shell's row must survive the bump, in place — losing it is the \
+             2.12.15 defect and moving it is the row-order defect"
+        );
+
+        let shell_row = snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.session_path == shell_key)
+            .expect("the rescued shell row");
+        assert_eq!(shell_row.kind, SessionKind::Shell);
+        assert_eq!(shell_row.title, "ychrome HTTP Fixture Support");
+        assert_eq!(
+            shell_row
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Cwd")
+                .map(|entry| entry.value.as_str()),
+            Some("/home/user/gh/ychrome"),
+            "the row keeps the cwd its fresh shell has to start in"
+        );
+        assert_eq!(
+            shell_row.launch_phase,
+            TerminalLaunchPhase::RemoteBootstrap,
+            "a row with no runtime is correct and desirable — it must present as \
+             runtime-less-but-startable, the same shape an agent row uses"
+        );
+
+        // Click = start. The click path resolves through the ordinary terminal
+        // spec, so the spawn must land in the recorded cwd with the ordinary
+        // shell launch command — no second spawn encoding for rescued rows.
+        let (launch_command, cwd) = successor
+            .terminal_spec(&shell_key)
+            .expect("clicking a runtime-less shell row must resolve a spawn");
+        assert_eq!(cwd.as_deref(), Some("/home/user/gh/ychrome"));
+        assert_eq!(
+            launch_command,
+            crate::local_interactive_shell_launch_command(&crate::local_interactive_shell_program()),
+            "the restart must reuse the ordinary local-shell launch command"
+        );
+    }
+
+    /// The rescue mark is only worth having if the ADOPTION LOOP applies it, and
+    /// a handover must never be recorded as a user close. Structural, because
+    /// the loop needs reachable peer daemons; the wiring is the part that
+    /// silently reverts.
+    #[test]
+    fn the_adoption_loop_marks_rescues_and_no_handover_path_tombstones_a_row() {
+        // CODE ONLY. The prose above every one of these call sites names the
+        // functions being asserted on, so a scan that reads comments passes on
+        // a reverted wiring — the "lock that can only pass" class (field guide
+        // §7.1). Strip them, and prove the stripper left something behind.
+        fn code_of(source: &str, marker: &str, name: &str) -> String {
+            let body = source
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: `{marker}` must still exist"))
+                .split("\n    fn ")
+                .next()
+                .and_then(|body| body.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{name}: no function body"));
+            let code = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                code.len() > 200,
+                "{name}: the comment stripper swallowed the body ({} bytes left) — a \
+                 scanner with nothing to scan cannot fail",
+                code.len()
+            );
+            code
+        }
+
+        let source = include_str!("daemon.rs");
+        let adopt = code_of(
+            source,
+            "fn adopt_missing_live_session_rows_from_reachable_daemons(",
+            "the B4 adoption pass",
+        );
+        assert!(
+            adopt.contains("import_peer_live_rows_in_order("),
+            "the scan must be looking at the adoption loop's import call"
+        );
+        assert!(
+            adopt.contains("peer_live_rows_marked_as_rescued(&owner_status.live_terminal_sessions"),
+            "the adoption loop must mark the rows the peer still owns, or a rescued \
+             plain shell's row dies the moment the rescuer retires"
+        );
+        assert!(
+            !adopt.contains("import_peer_live_rows_in_order(&owner_status.live_terminal_sessions"),
+            "the import must receive the MARKED rows, not the peer's raw advertisement"
+        );
+
+        // A row released or lost in a handover is not a row the user closed:
+        // tombstoning one would have the import admission predicate veto it
+        // forever, which is the opposite of the guarantee.
+        for (name, marker) in [
+            (
+                "the progressive-migration release",
+                "fn release_session_for_migration(",
+            ),
+            (
+                "the progressive-migration drain",
+                "fn spawn_progressive_session_migration(",
+            ),
+            (
+                "the B4 adoption pass",
+                "fn adopt_missing_live_session_rows_from_reachable_daemons(",
+            ),
+        ] {
+            assert!(
+                !code_of(source, marker, name).contains("tombstone_live_row"),
+                "{name} must not tombstone a row"
+            );
+        }
+        // The scan is only meaningful if it can SEE a tombstone write. The one
+        // legitimate writer is the user's explicit close.
+        assert!(
+            code_of(
+                source,
+                "ServerRequest::RemoveSession { path } => {",
+                "the explicit-close arm",
+            )
+            .contains("tombstone_live_row"),
+            "the close path must still tombstone — if this scan cannot find the one \
+             real writer, it cannot find an illegitimate one either"
         );
     }
 
