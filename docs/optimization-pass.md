@@ -574,6 +574,25 @@ settled reasoning, so it is not re-derived:
 - **ghostty is NEVER the answer here** (user-settled the same day): no
   native-terminal-renderer detour rides this workstream.
 
+### WS3a: two recorded speedups for agent web flows (user-raised 2026-07-26)
+
+1. **Lore-compiled flows (the primary item).** A portal's KNOWN flow gets
+   compiled from site-lore into a deterministic `web batch` script — steps,
+   assertions, readback checks — so the model re-enters only at genuine
+   branches (captcha, OTP, unexpected state). The measured cost of live runs
+   is agent ROUND TRIPS, not verb latency; this attacks exactly that, with
+   more reliability rather than less. The skillify idea, applied to the verb
+   plane.
+2. **The lore-anchored pixel rung (the deliberate "dirty" fallback).** For
+   DOM-hostile surfaces only (canvas, cross-origin frames, obfuscated
+   markup): lore caches pixel anchors from `capture-element` crops; a click
+   runs a MILD DOM identity check first (is this the page/region lore says),
+   then `do click --x --y` under the existing elementFromPoint guard. Slower
+   and less stable than addressed clicks — never the primary mode — but it is
+   the same primitive yRDP's Windows plane needs (no DOM exists there at
+   all), so it is built once and shared. Do not reach for it where a selector
+   works; the post-2.12.16 pinned/readback DOM plane is the fast path.
+
 ### WS3: agent dev tools and the read ladder
 
 The "cli dev tools++ for agents" the user asked for.
