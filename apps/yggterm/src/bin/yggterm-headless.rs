@@ -188,9 +188,14 @@ fn print_server_app_help() {
   yggterm-headless server app maximize <on|off|toggle> [--pid <pid>]
   yggterm-headless server app force-foreground <on|off> [--pid <pid>]
   yggterm-headless server app session <remove|delete> <session-path> [--pid <pid>]
+    answers verified:true only when the row left the live order AND every
+    process the session owned is gone; otherwise verified:false with a named
+    refusal and the surviving pids in live_processes
   yggterm-headless server app start-page [--pid <pid>]
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
+    with no --title the row is named for the driving agent and its purpose
   yggterm-headless server app terminal send <session> (--data <data>|--stdin)
 
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
@@ -2225,6 +2230,13 @@ fn main() -> Result<()> {
                                 None
                             }
                         });
+                        let purpose = args.windows(2).find_map(|window| {
+                            if window[0] == "--purpose" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
                         let kind = args.windows(2).find_map(|window| {
                             if window[0] == "--kind" {
                                 Some(window[1].as_str())
@@ -2237,6 +2249,7 @@ fn main() -> Result<()> {
                             machine_key,
                             cwd,
                             title_hint,
+                            purpose,
                             kind,
                             activate,
                             timeout_ms,
@@ -3131,5 +3144,56 @@ mod tests {
                 "3".to_string(),
             ])
         );
+    }
+
+    /// `server app terminal new` is parsed TWICE — once here and once in the
+    /// GUI binary — so a flag added to one and not the other is a silent
+    /// divergence: the same command means different things depending on which
+    /// executable the agent reached for. Both parses are read from source
+    /// here, because there is no shared parser to assert against.
+    #[test]
+    fn both_binaries_parse_the_same_terminal_new_flags() {
+        let headless = include_str!("yggterm-headless.rs");
+        let gui = include_str!("../main.rs");
+        for flag in ["--machine-key", "--cwd", "--title", "--purpose", "--kind"] {
+            let needle = format!("if window[0] == \"{flag}\"");
+            assert!(
+                headless.contains(&needle),
+                "the headless binary no longer parses `{flag}` for terminal new"
+            );
+            assert!(
+                gui.contains(&needle),
+                "the GUI binary no longer parses `{flag}` for terminal new — \
+                 the same command would mean different things per executable"
+            );
+        }
+        // The purpose has to REACH the verb, not just be parsed and dropped.
+        for source in [headless, gui] {
+            let call = source
+                .find("run_app_control_create_terminal(")
+                .map(|start| &source[start..start + 220])
+                .expect("the create verb is still called");
+            assert!(
+                call.contains("purpose,"),
+                "a parsed `--purpose` that never reaches the verb names nothing:\n{call}"
+            );
+        }
+    }
+
+    /// Both usage blocks must teach the two things an agent gets wrong without
+    /// them: that a nameless create names itself, and that a removal answers
+    /// with a verdict rather than an assertion.
+    #[test]
+    fn both_usage_blocks_teach_the_naming_flag_and_the_verified_removal() {
+        for source in [include_str!("yggterm-headless.rs"), include_str!("../main.rs")] {
+            assert!(
+                source.contains("[--purpose <what-for>]"),
+                "the usage block never mentions --purpose, so no agent will pass it"
+            );
+            assert!(
+                source.contains("verified:false"),
+                "the usage block never mentions that a removal can refuse"
+            );
+        }
     }
 }

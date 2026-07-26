@@ -724,6 +724,12 @@ pub enum AppControlCommand {
         cwd: Option<String>,
         #[serde(default)]
         title_hint: Option<String>,
+        /// What this agent-plane session is FOR, in the agent's own words
+        /// (`--purpose`). Folded with the request's agent identity into the
+        /// row title when no explicit `--title` was given, so an agent's
+        /// scratch row is never title-indistinguishable from a human's shell.
+        #[serde(default)]
+        purpose: Option<String>,
         #[serde(default)]
         session_kind: Option<SessionKind>,
         /// `Some(false)` = create WITHOUT switching the user's active view
@@ -1421,6 +1427,182 @@ pub fn resolve_agent_identity() -> Option<String> {
         .or_else(|| std::env::var("YGGTERM_AGENT").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Every agent-plane row title starts with this word, so a title-based probe
+/// can find agent-owned rows without knowing which agent made them. The
+/// original incident was the opposite: an agent's scratch row was titled from
+/// its cwd exactly like a human's shell in the same directory, so every
+/// title search for it missed and only the user's eyes found it.
+pub const AGENT_PLANE_TITLE_PREFIX: &str = "Agent";
+
+/// Identity used when a request carries no `--agent`/`$YGGTERM_AGENT`. The
+/// request field's own contract is "absent means SOME agent", so the title
+/// says that rather than pretending the row has no owner.
+const AGENT_PLANE_TITLE_UNNAMED: &str = "unnamed";
+
+/// Longest purpose fragment folded into a row title. A sidebar row is a label,
+/// not a paragraph; the full purpose stays in the verb's response.
+const AGENT_PLANE_TITLE_PURPOSE_MAX_CHARS: usize = 64;
+
+/// Collapse a caller-supplied fragment to one line of printable text.
+fn agent_plane_title_fragment(value: Option<&str>) -> Option<String> {
+    let cleaned = value?
+        .split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn agent_plane_title_truncated(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    value.chars().take(max_chars).collect::<String>()
+}
+
+/// The title a session created through the AGENT plane wears when the caller
+/// gave no explicit `--title`.
+///
+/// The defect this exists for: `terminal new --kind shell` fell back to the
+/// cwd, which the copy layer then humanized into `<Leaf> Shell` — the SAME
+/// label a human's shell in the same directory gets. An agent could therefore
+/// report a session "removed" while a row nobody could attribute stayed on
+/// screen for hours.
+///
+/// The output must survive the copy layer, which throws away titles it judges
+/// generated junk. That judgement has ONE owner
+/// ([`looks_like_generated_fallback_title`]), so this asks it rather than
+/// re-deriving the rule: if folding the caller's purpose in would produce a
+/// title the copy layer would discard, the purpose is dropped and the bare
+/// agent-and-kind form — which is fixed text this build controls — is used.
+pub fn agent_plane_session_title(
+    agent: Option<&str>,
+    purpose: Option<&str>,
+    kind: SessionKind,
+) -> String {
+    let identity = agent_plane_title_fragment(agent)
+        .map(|value| agent_plane_title_truncated(value, AGENT_PLANE_TITLE_PURPOSE_MAX_CHARS))
+        .unwrap_or_else(|| AGENT_PLANE_TITLE_UNNAMED.to_string());
+    let kind_label = crate::session_kind_label(kind);
+    let base = format!("{AGENT_PLANE_TITLE_PREFIX} {identity} {kind_label}");
+    let Some(purpose) = agent_plane_title_fragment(purpose)
+        .map(|value| agent_plane_title_truncated(value, AGENT_PLANE_TITLE_PURPOSE_MAX_CHARS))
+    else {
+        return base;
+    };
+    let with_purpose = format!("{base}: {purpose}");
+    if yggterm_core::looks_like_generated_fallback_title(&with_purpose) {
+        return base;
+    }
+    with_purpose
+}
+
+/// One process a session teardown was accountable for: the PTY child itself,
+/// or anything it fathered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTeardownProcess {
+    pub pid: i32,
+    /// `/proc` command name at census time. Kept because it is what makes a
+    /// later liveness re-probe able to refuse a RECYCLED pid, and because the
+    /// report is useless to a human without it.
+    pub command: String,
+}
+
+/// What was observed around a `session remove`, as facts rather than prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRemovalEvidence<'a> {
+    /// Whether this row was a LIVE session before the remove. A stored row has
+    /// no runtime to verify, so its removal is decided by the row check alone.
+    pub row_was_live: bool,
+    /// The PTY process id the owning daemon reported before the remove.
+    /// `None` on a live row means nobody local could see the runtime — the
+    /// preserved-owner (older daemon) case — and that is unverifiable, not
+    /// clean.
+    pub runtime_pid_before: Option<i32>,
+    /// The PTY child plus every descendant, as seen before the remove.
+    pub observed_before: &'a [SessionTeardownProcess],
+    /// Of `observed_before`, the ones still running after the remove.
+    pub still_running_after: &'a [SessionTeardownProcess],
+    /// Whether the post-remove snapshot still lists the row.
+    pub row_still_listed: bool,
+}
+
+/// Why a removal could not be verified. A machine-readable name, never prose:
+/// the caller must be able to branch on it, and a daemon's message is not a
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRemovalRefusal {
+    /// The row is still in the live order after the remove.
+    RowStillListed,
+    /// Processes the session owned are still running.
+    ProcessesSurvived,
+    /// The row was live but no local runtime pid was visible, so there was
+    /// nothing to check the teardown against. The owning daemon is older than
+    /// this one, or does not report the pid at all.
+    RuntimePidUnobservable,
+}
+
+impl SessionRemovalRefusal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RowStillListed => "row_still_listed",
+            Self::ProcessesSurvived => "processes_survived",
+            Self::RuntimePidUnobservable => "runtime_pid_unobservable",
+        }
+    }
+}
+
+/// The answer a `session remove` is allowed to give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRemovalVerdict {
+    pub verified: bool,
+    pub refusal: Option<SessionRemovalRefusal>,
+    /// Processes that were alive before and are gone after.
+    pub reaped: Vec<SessionTeardownProcess>,
+    /// Processes that outlived the teardown.
+    pub still_running: Vec<SessionTeardownProcess>,
+}
+
+/// Decide whether a removal actually happened.
+///
+/// The rule this replaces was `"accepted": true` on any successful ROUND TRIP,
+/// which is transport success and nothing more — it read true while the daemon
+/// itself was saying "no live session for this path", and while the app the
+/// session hosted was still running. Verified means all of: the row left the
+/// live order, every process the session owned is gone, and there was a
+/// runtime pid to check against in the first place. Anything short of that is
+/// `verified: false` with a NAMED refusal and the surviving pids attached, so
+/// an agent cannot truthfully-but-wrongly report a clean exit.
+pub fn verify_session_removal(evidence: &SessionRemovalEvidence<'_>) -> SessionRemovalVerdict {
+    let still_running = evidence.still_running_after.to_vec();
+    let reaped = evidence
+        .observed_before
+        .iter()
+        .filter(|process| !still_running.contains(process))
+        .cloned()
+        .collect::<Vec<_>>();
+    let refusal = if evidence.row_still_listed {
+        Some(SessionRemovalRefusal::RowStillListed)
+    } else if !still_running.is_empty() {
+        Some(SessionRemovalRefusal::ProcessesSurvived)
+    } else if evidence.row_was_live && evidence.runtime_pid_before.is_none() {
+        Some(SessionRemovalRefusal::RuntimePidUnobservable)
+    } else {
+        None
+    };
+    SessionRemovalVerdict {
+        verified: refusal.is_none(),
+        refusal,
+        reaped,
+        still_running,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2616,5 +2798,239 @@ mod tests {
         assert!(inflight_path.exists());
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    // ── Teardown honesty: agent rows name themselves, removal verifies ──────
+
+    /// Every session kind this build knows, so a naming rule cannot be written
+    /// for shells and quietly skip the rest.
+    const EVERY_SESSION_KIND: [SessionKind; 6] = [
+        SessionKind::Shell,
+        SessionKind::SshShell,
+        SessionKind::Codex,
+        SessionKind::CodexLiteLlm,
+        SessionKind::ClaudeCode,
+        SessionKind::Document,
+    ];
+
+    /// The naming contract: an agent-plane row says WHO made it and WHAT FOR,
+    /// and it does so for every kind, named driver or not.
+    #[test]
+    fn an_agent_plane_title_names_its_driver_and_purpose() {
+        for kind in EVERY_SESSION_KIND {
+            let named = agent_plane_session_title(
+                Some("probe-7"),
+                Some("reap leftover app processes"),
+                kind,
+            );
+            assert!(
+                named.starts_with(AGENT_PLANE_TITLE_PREFIX),
+                "an agent row must be findable by a title probe that knows only the plane: {named}"
+            );
+            assert!(
+                named.contains("probe-7"),
+                "the driver's identity must survive into the title: {named}"
+            );
+            assert!(
+                named.contains("reap leftover app processes"),
+                "the purpose must survive into the title: {named}"
+            );
+            assert!(
+                named.contains(crate::session_kind_label(kind)),
+                "the title must say what kind of session it is: {named}"
+            );
+
+            // No `--agent` is still an agent. The request field's contract is
+            // "absent means SOME agent", and the row must say so rather than
+            // fall back to a name a human's session could also have.
+            let anonymous = agent_plane_session_title(None, None, kind);
+            assert!(
+                anonymous.starts_with(AGENT_PLANE_TITLE_PREFIX),
+                "an unnamed driver still gets an agent-plane title: {anonymous}"
+            );
+            assert_ne!(anonymous, named);
+        }
+    }
+
+    /// The title must SURVIVE the copy layer, which discards titles it judges
+    /// generated junk and falls back to the humanized cwd leaf — the very
+    /// label this whole change exists to stop the row wearing. Hostile
+    /// purposes included, because the purpose is caller text.
+    #[test]
+    fn an_agent_plane_title_is_never_thrown_away_as_generated_junk() {
+        let purposes = [
+            None,
+            Some(""),
+            Some("   "),
+            // Ends on a syntax fragment — the copy layer discards these.
+            Some("ship the logs to"),
+            // Almost entirely noise words.
+            Some("the and for with the"),
+            // Question fragment.
+            Some("why the build is slow"),
+            Some("verify\u{7}the\u{1b}teardown"),
+            Some(
+                "an extremely long purpose that goes on and on well past anything a sidebar row \
+                 could ever show a human being reading it",
+            ),
+        ];
+        for kind in EVERY_SESSION_KIND {
+            for agent in [None, Some(""), Some("probe-7"), Some("session")] {
+                for purpose in purposes {
+                    let title = agent_plane_session_title(agent, purpose, kind);
+                    assert!(
+                        !yggterm_core::looks_like_generated_fallback_title(&title),
+                        "the copy layer would discard {title:?} \
+                         (agent {agent:?}, purpose {purpose:?}) and rename the row \
+                         after its cwd, which is the bug"
+                    );
+                    assert!(
+                        title.starts_with(AGENT_PLANE_TITLE_PREFIX),
+                        "title {title:?} lost the agent-plane prefix"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cross-version: `purpose` is new, so a request written by a build that
+    /// never heard of it must still parse, and a request that carries it must
+    /// survive a round trip rather than being silently dropped.
+    #[test]
+    fn a_create_terminal_request_without_a_purpose_still_parses() {
+        let without: AppControlCommand = serde_json::from_str(
+            r#"{"kind":"create_terminal","cwd":"/tmp","session_kind":"shell"}"#,
+        )
+        .expect("a create_terminal from an older build must parse");
+        assert_eq!(
+            without,
+            AppControlCommand::CreateTerminal {
+                machine_key: None,
+                cwd: Some("/tmp".to_string()),
+                title_hint: None,
+                purpose: None,
+                session_kind: Some(SessionKind::Shell),
+                activate: None,
+            }
+        );
+
+        let with = AppControlCommand::CreateTerminal {
+            machine_key: None,
+            cwd: Some("/tmp".to_string()),
+            title_hint: None,
+            purpose: Some("reap leftovers".to_string()),
+            session_kind: Some(SessionKind::Shell),
+            activate: Some(false),
+        };
+        let round_tripped: AppControlCommand =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    fn teardown_process(pid: i32, command: &str) -> SessionTeardownProcess {
+        SessionTeardownProcess {
+            pid,
+            command: command.to_string(),
+        }
+    }
+
+    /// Every way a teardown can fail must produce `verified: false` with a
+    /// NAMED refusal — the whole point being that an agent cannot report a
+    /// clean exit it did not get.
+    #[test]
+    fn a_removal_is_verified_only_when_the_row_and_its_processes_are_gone() {
+        let census = [teardown_process(11, "bash"), teardown_process(12, "an-app")];
+
+        let clean = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: Some(11),
+            observed_before: &census,
+            still_running_after: &[],
+            row_still_listed: false,
+        });
+        assert!(clean.verified);
+        assert_eq!(clean.refusal, None);
+        assert_eq!(clean.reaped, census.to_vec());
+        assert!(clean.still_running.is_empty());
+
+        // The reported incident: the row survived the "removal".
+        let row_alive = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: Some(11),
+            observed_before: &census,
+            still_running_after: &[],
+            row_still_listed: true,
+        });
+        assert!(!row_alive.verified);
+        assert_eq!(
+            row_alive.refusal,
+            Some(SessionRemovalRefusal::RowStillListed)
+        );
+
+        // The other half of the incident: the app under the shell outlived it.
+        let survivors = [teardown_process(12, "an-app")];
+        let app_alive = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: Some(11),
+            observed_before: &census,
+            still_running_after: &survivors,
+            row_still_listed: false,
+        });
+        assert!(!app_alive.verified);
+        assert_eq!(
+            app_alive.refusal,
+            Some(SessionRemovalRefusal::ProcessesSurvived)
+        );
+        assert_eq!(app_alive.still_running, survivors.to_vec());
+        assert_eq!(app_alive.reaped, vec![teardown_process(11, "bash")]);
+
+        // A live row whose runtime nobody local can see (an older daemon owns
+        // it) is UNVERIFIABLE, never clean. This is the cross-version case
+        // that has already failed quietly once.
+        let unobservable = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: None,
+            observed_before: &[],
+            still_running_after: &[],
+            row_still_listed: false,
+        });
+        assert!(!unobservable.verified);
+        assert_eq!(
+            unobservable.refusal,
+            Some(SessionRemovalRefusal::RuntimePidUnobservable)
+        );
+
+        // A row that was never live has no runtime to verify, so the row check
+        // alone decides it — otherwise every stored-row removal reports a
+        // refusal it cannot act on.
+        let stored = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: false,
+            runtime_pid_before: None,
+            observed_before: &[],
+            still_running_after: &[],
+            row_still_listed: false,
+        });
+        assert!(stored.verified);
+        assert_eq!(stored.refusal, None);
+    }
+
+    /// Every refusal must carry a distinct machine-readable name: the caller
+    /// branches on it, and two refusals sharing a name is a silent merge.
+    #[test]
+    fn every_removal_refusal_has_its_own_name() {
+        let refusals = [
+            SessionRemovalRefusal::RowStillListed,
+            SessionRemovalRefusal::ProcessesSurvived,
+            SessionRemovalRefusal::RuntimePidUnobservable,
+        ];
+        let mut names = refusals
+            .iter()
+            .map(|refusal| refusal.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "two refusals share a name: {names:?}");
+        assert!(names.iter().all(|name| !name.is_empty()));
     }
 }

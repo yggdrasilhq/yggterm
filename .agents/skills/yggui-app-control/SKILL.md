@@ -104,8 +104,13 @@ user's own GUI against backgrounded sessions; the user can switch in anytime
 and watch (agent-presence cursor). The enabling verbs:
 
 ```bash
-# Spawn a session WITHOUT switching the user's view (agent probe/work spawns):
-yggterm server app terminal new --kind shell --no-activate
+# Spawn a session WITHOUT switching the user's view (agent probe/work spawns).
+# ALWAYS pass --purpose (and --agent): with no --title the row is named
+# "Agent <identity> <kind>: <purpose>" instead of inheriting the cwd-shaped
+# default, which renders identically to a human's shell in the same directory
+# and makes your row unfindable by any title probe.
+yggterm --agent <id> server app terminal new --kind shell --no-activate \
+  --purpose "what this session is for"
 # Materialize a BACKGROUNDED session's declared web surfaces into the soft
 # stash (created + demoted + leased, never revealed) so web do/read/wait
 # verbs can drive them immediately:
@@ -116,9 +121,19 @@ yggterm server app web read --as readable --session <path>
 yggterm server app web wait --until load:finished --session <path>
 ```
 
+Tear the session down with `app session remove <path>` and **read the verdict,
+not `accepted` alone**: the response carries `verified`, and when it is false a
+named `verified_refusal` (`row_still_listed`, `processes_survived`,
+`runtime_pid_unobservable`) plus `live_processes` (pid + command) for anything
+that outlived the teardown. The removal signals only the PTY child, so an app
+you started under that shell can and does survive — `verified:false` with pids
+is the truth, and reporting "session removed" off a `verified:false` response
+is exactly the lie this contract exists to make impossible. The verb REPORTS
+survivors; it does not kill them, so reap them yourself and re-verify.
+
 Recipe for invisible ychrome automation on a live session: `terminal new
---no-activate` (or target an existing session) → `terminal send <session>`
-to run `ychrome <url>` there → `web ensure --session <session>` →
+--no-activate --purpose ...` (or target an existing session) → `terminal send
+<session>` to run `ychrome <url>` there → `web ensure --session <session>` →
 `do/read/wait`. Pass `--agent <id>` so the user sees your cursor if they
 switch in. ✅ **The Dream §2 seam is CLOSED at 2.12.10: no reveal is needed,
 ever.** The daemon now reads the OSC declare off the PTY itself and keeps the
