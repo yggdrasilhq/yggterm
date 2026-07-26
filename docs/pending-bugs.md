@@ -403,6 +403,96 @@ fix) once the fix is verified live on jojo.
   rebuilt on a shadow that never saw the declare).
 
 
+- **★★★ THE FIFTH FOCUS PATH — IT IS NOT JAVASCRIPT. Root-caused and fixed in
+  code 2026-07-26; NOT YET DEPLOYED (needs a GUI bump).** The user, mid-session:
+  *"the shadow session spawn took focus away from my viewport and this session
+  … it is stealing my focus again and again while working."* Four earlier
+  rounds all found JS thieves, and the guard that came out of round four
+  (`UI_FOCUS_OWNER_SELECTORS` + the source scan) is intact and innocent here —
+  because **this thief never touches the DOM**.
+  **The mechanism.** A native web surface is a WebKitGTK webview parented in the
+  SAME GtkWindow as the shell's own webview. `gtk_widget_grab_focus` on it sets
+  the **GtkWindow's focus widget**, so keyboard focus leaves the shell webview
+  while the window stays active and the shell's `activeElement` stays exactly
+  where it was. Two call sites did it:
+  1. **At birth.** wry's `WebViewAttributes` default is `focused: true`
+     (`vendor/wry/src/lib.rs:853`), which `grab_focus()`es in `new_gtk`
+     (`vendor/wry/src/webkitgtk/mod.rs:385`). Nothing in the tree ever called
+     `with_focused`, so a **headless** `web ensure` surface — created and
+     demoted in the same tick, never revealed, no pixel on screen — took the
+     keyboard the instant it was built. That is the "spawn took focus away".
+  2. **Per verb.** `inject_key` grabbed the focus for every injected keystroke
+     and never gave it back, under a comment asserting the grab was
+     "widget-local — it does not move the seat's global focus on screen". True
+     of the SEAT, false of the TOPLEVEL. `do type` / `do fill` / `fill-vault` /
+     `fill-card` / `totp` all route here; `do click` re-takes it through
+     WebKit's own focus-on-button-press.
+  **The instrument that finally saw it** (every JS-side probe is blind to this,
+  and so is `active_session_path`, which never moved): read
+  `document.hasFocus()` in the shell AND in the surface **at the same moment**.
+  Live on jojo, 16:04: shell `hasFocus:false` / `activeElement`
+  `textarea.xterm-helper-textarea` / `window_focused_at_last_watchdog:true`,
+  while the invisible agent surface reported `hasFocus:true`,
+  `activeElement:INPUT#identityproof`. A surface reporting `hasFocus:true`
+  **falsifies** "the window is simply unfocused" — the window is active and the
+  agent's page owns its keyboard. The user's terminal recorded its last
+  keystroke at 15:47:57 and none for the next 40 minutes
+  (`input_batch_flush_count` frozen at 236). 17 focus-taking verbs ran on that
+  surface between 15:46:42 and 15:59:24, plus the birth grab at 15:45:29.381.
+  **The rule now encoded:** *an agent may BORROW the window's keyboard focus
+  around an injection; it may never keep it, and a surface nobody can see never
+  gets it at all.* `note_focus_owner_before_injection` books the lender,
+  `schedule_focus_giveback` returns it 150 ms after the burst's last event (one
+  give-back per burst, so a multi-key fill still costs the page one `blur`, not
+  one per character), and it refuses to take focus back off any widget the human
+  moved it to meanwhile. `open()` now takes `focused`, which the shell wires to
+  `want_visible`. Locked by
+  `no_web_surface_takes_the_window_keyboard_focus_without_giving_it_back`.
+  ⚠⚠ **It IS keystroke cross-contamination, one direction, CAUGHT LIVE.** A
+  passive `keydown` recorder installed in the agent's page logged three
+  `isTrusted:true` `Escape` presses — 16:09:35.815, 16:09:51.001, 16:23:42.600 —
+  with **no agent verb within ±8 s of any of them** (the agent's last verb ran
+  at 16:05:46). That is the human, pressing Escape at a terminal that had
+  stopped answering, and landing in an invisible a services portal form instead. The
+  other direction is structurally impossible and stays that way: `synth_key`
+  hands the event to the surface widget with `gtk_widget_event`, which never
+  traverses the toplevel's focus chain, so an agent's characters can never
+  reach the user's terminal.
+  ⚠⚠⚠ **AND THE ARBITER DID NOT NOTICE — a second bug, still open.** Real seat
+  input on a surface is supposed to increment the arbiter's counter and refuse
+  the agent's next `do` with `preempted`. Zero `agent_input/preempted` events
+  exist for `local://b556fb1b…` and no verb was refused, across the whole
+  incident. The reason is the **injection-credit ledger leaking across the
+  inter-verb gap**: `grant_injection_credits` books one credit per injected
+  event, `note_seat_input` spends a credit instead of counting a human, and
+  unspent credits are only dropped by `take_seat_input_count` — whose own
+  comment names the hazard exactly ("carrying it forward would let it swallow a
+  LATER real gesture, turning a fix for the agent into a bug for the user") and
+  which the shell nevertheless calls only at the START of the next verb
+  (`web_do_open_lane`'s gate, and between a batch's actions), never at the end
+  of the verb that granted them. `do fill --text "0000000000"` grants a dozen
+  credits (select-all + delete + ten characters) and — because delivery is
+  synchronous, so the lexical `INJECTING_EVENT` flag already suppressed every
+  one of them — leaves the whole dozen sitting there. The user's next dozen
+  real keystrokes are then silently absorbed as "ours". **That is why
+  `0000000000hg` took two of the user's characters into the field with no
+  preempt and no journal**, and it is a live co-browse defect
+  in its own right: on a surface the human is genuinely sharing, their first N
+  keystrokes after any agent verb are invisible to the gate that exists to
+  protect them. Fix direction: expire a credit on a short clock (a credit
+  unspent 250 ms after an injection cannot belong to a synchronous dispatch)
+  instead of holding it until the next verb reads the counter. NOT done here —
+  the ledger is what stops the single-shot `do` defect, and it should not be
+  changed without a live loop to prove the replacement.
+  The other reported corruption — `fill --text "Example Fixture Road"` reporting
+  `chars:19 delivered:true` while the field held `Ja` — is **not explained by
+  either of the above** (17 characters lost, not 2 gained) and stays open; look
+  at the page's controlled-input re-render, not at focus.
+  ⚠ **Focus-safe verbs, for anyone driving a surface over a working human:**
+  `web eval` / `read` / `wait` / `frames` / `screenshot` / `capture-element`
+  never touch GTK focus (guest-JS `element.focus()` sets DOM focus only). Only
+  `do` and the `fill*`/`totp` family take it.
+
 - **★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
   before ever "fixing" a focus steal again.** The user could not type in yedit;
   three previous fixes all missed, because every one of them hardened something
