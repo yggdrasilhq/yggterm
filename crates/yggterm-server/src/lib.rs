@@ -507,6 +507,34 @@ pub fn live_row_close_is_remembered(home_dir: &std::path::Path, session_path: &s
         .blocks(&normalized_live_row_identity(session_path), now)
 }
 
+/// **A genuinely closed row, for a test in ANOTHER crate.** Not compiled into
+/// any shipping binary: it exists only under the `test-support` feature, which
+/// nothing but a `[dev-dependencies]` edge turns on.
+///
+/// `web ensure`'s closed-session refusal lives in `yggterm-shell` and is
+/// CONJUNCTIVE — a dead runtime AND a remembered close. A test over there that
+/// cannot produce the second fact can only ever exercise the half of the rule
+/// that says "allow", which is exactly the shape of lock that ships a dead
+/// refusal. The alternative was for that test to hand-write `removed-rows.json`,
+/// i.e. a second encoding of a format this module owns, that would drift in
+/// silence.
+///
+/// So it goes through [`LiveRowTombstones::record_close`] — the SAME shared
+/// read-modify-write the daemon's own close performs, under the same file lock,
+/// with the same [`normalized_live_row_identity`] fold — and not through
+/// `record`/`save`, which would publish a private snapshot over peers' closes.
+#[cfg(feature = "test-support")]
+pub fn remember_live_row_close_for_test(
+    home_dir: &std::path::Path,
+    session_path: &str,
+) -> anyhow::Result<bool> {
+    crate::live_row_tombstones::LiveRowTombstones::default().record_close(
+        home_dir,
+        &normalized_live_row_identity(session_path),
+        crate::live_row_tombstones::now_secs(),
+    )
+}
+
 /// Does [`YggtermServer::restore_live_session`] re-key this row onto a local
 /// runtime key (`local://<id>`)? One owner of the question — restore asks it of
 /// both the key and the id, and [`restored_live_row_key`] must agree with it or
