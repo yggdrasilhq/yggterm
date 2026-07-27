@@ -369,6 +369,25 @@ presence dialog.
   surface (read/do interleave; the human always preempts). A lease taken while
   the surface is still foreground survives the later foreground→stash transition
   (it is written to the entry, not to the stash timer).
+- **A LEASE MAY NOT OUTLIVE THE ROW IT IS A CLAIM ON (normative, 2026-07-27).**
+  Closing a live session tears down every web surface declared under it — under
+  any equivalent spelling of the session path — which ends the leases with them
+  and drops the headless-create claim. Without this, "surface alive, row absent"
+  was representable and was reached: an agent drove a real page for an hour with
+  no row containing that session id, and its lease went on refusing deploys with
+  `agent_lease_active`. The teardown is journaled as
+  `web_surface/closed_with_session` so an agent can distinguish "the user closed
+  my session" from "the page crashed". It fires only on an EXPLICIT close;
+  surfaces are never pruned against a daemon snapshot, because a preserved-owner
+  row legitimately drops out of one.
+- **`ensure` refuses a closed session (`session_closed`).** Runtime dead AND the
+  row's close remembered in the tombstone plane ⇒ refuse, naming both facts, and
+  tell the agent to create its own session (hence its own visible row). A closed
+  row is never resurrected — the zero-resurrection baseline is not weakened to
+  make an agent's life easier. The two facts come from their owners: the runtime
+  from the session's owner over the socket (a daemon snapshot lies for
+  preserved-owner rows), the close from the deny-list the close itself wrote,
+  read-only. An unreachable owner is `Unknown`, never `Dead`.
 - **Headless surface-create — ✅ BUILT 2026-07-23.** `server app web ensure
   --session <path> [--ttl <secs>]` (`EnsureWebSurface`) marks the session
   headless-wanted; the reconciler's lazy-create branch then materializes its
@@ -472,6 +491,33 @@ the read/capture/lease invariants below apply.
   human is never queued behind the agent. Detection rides the existing
   focus/input signals the shell already tracks; it is not another queue
   participant.
+- **THE PREEMPT MARKER REQUIRES A REVEALED SURFACE (normative, 2026-07-27).**
+  It may only be set from a genuinely user-attributable path: a surface some
+  client has shown. A count on a surface that has never been revealed refuses
+  the verb under its own reason, `seat_input_on_unrevealed_surface`, and sets
+  NOTHING — no preempt flag, no cancelled batch. It was set on an unrowed,
+  unrevealed orphan, so `preempted` ("the user took this surface") was reported
+  about a page the user could not see, click, or have touched; and because the
+  lane is keyed `(session_path, generation)` the verdict was permanent.
+  The count is never discarded: real keystrokes DO reach an invisible page (a
+  borrowed window keyboard focus is one proven route), and swallowing them would
+  turn a live co-browse defect into a designed-in blind spot. The reveal fact has
+  ONE owner — `AppliedWebSurface::ever_revealed`, published in the surface handle
+  — because `stashed` cannot tell "never shown" from "shown, then backgrounded".
+  It is produced in exactly three places, all on that struct: a reconciler create
+  (`created`, revealed iff it is being placed in front of the user), a popup
+  adoption (`adopted_popup`, revealed iff it did not open in the background) and
+  the per-tick latch (`latch_reveal`, off the same visibility the compositor was
+  given, never cleared). Anything that judges the fact — the gate, the batch
+  loop, the publish — is a consumer, and pinning a consumer proves nothing about
+  the three producers.
+- **Injection credits expire (250 ms).** The credit ledger that stops an agent's
+  own injection reading as the human is bounded by a clock as well as by the
+  end-of-verb drop. The drop only runs when the shell reads the counter, which it
+  does at the START of the next verb — so a burst's unspent credits used to sit
+  in the inter-verb gap and silently absorb the user's next keystrokes, with no
+  preempt and no journal. A credit covers one queued GTK delivery, not a wait, so
+  anything unspent 250 ms after its grant is dropped before it can be spent.
 
 ## Agent presence — grid and cursors (slice 3, the most expensive rung)
 
