@@ -31,7 +31,8 @@ fix) once the fix is verified live on jojo.
 ## Standing traps / other open bugs
 
 - **★★ AGENT-SPAWNED TENANTS INSIDE DAEMON-OWNED ROWS ARE IMMORTAL — the leak
-  class behind recurring "mystery heat" (convicted 2026-07-27, user-spotted).**
+  class behind recurring "mystery heat" (convicted 2026-07-27, user-spotted —
+  ⏳ FIXED IN-TREE AT 2.12.17, LIVE VERIFICATION OWED).**
   Seven aged `ssh <fleet-host>` clients (oldest ~5 days) were found hanging
   under `bash -i` shell rows on the integrator host, one of them holding a
   13.6-hour remote `htop` at 0.16 cores on the GUI host — the user's fan paid
@@ -43,81 +44,165 @@ fix) once the fix is verified live on jojo.
   surface accounts for. The session-start ritual now sweeps this class, but a
   sweep repeated every session is an unfixed bug by definition. Product fix,
   three pieces, each respecting the settled row doctrine (rows themselves are
-  never touched):
-  1. **Per-row tenant cost visibility (instrumentation, no policy).** The
-     daemon already reaches each PTY's process tree
-     (`foreground_process_group_leader` / `tcgetpgrp`); expose an on-demand
-     app-control verb reporting, per row: the foreground command, process-tree
-     CPU time, and tenant age. A hot or aged tenant becomes one probe away
-     instead of an ad-hoc `ps` archaeology dig. On-demand only — no background
-     walk, no idle cost.
-  2. **Ownership stamping on headless creates.** The teardown-honesty work
-     already gives agent-created sessions identity-carrying titles; also stamp
-     the creator (pid + host + purpose) into session metadata so provenance is
-     queryable after the creator is long gone.
+  never touched) — **all three are now built (2.12.17)**:
+  1. **Per-row tenant cost visibility (instrumentation, no policy).**
+     `server terminal tenants [<session>]`. ONE `/proc` reading serves every
+     row, on demand: no loop, no cache, no timer, zero idle cost. It reports
+     the foreground command, the whole descendant tree with per-process CPU,
+     and the age of the oldest NON-SHELL tenant (the row's own shell is
+     discounted, or every row looks aged). A row it cannot walk reports a
+     NAMED gap (`preserved_owner_daemon`, `no_local_runtime`,
+     `runtime_not_running`, `root_pid_unavailable`, `root_pid_not_in_proc`,
+     `proc_unreadable`, `not_supported_on_platform`) with **every number left
+     empty** — a faked zero reads as "this row is cheap", which is the lie the
+     verb exists to end. A row whose runtime belongs to an older preserved
+     owner is PROXIED to that daemon rather than referred to it: a referral
+     that the caller must chase by hand is the same archaeology dig this
+     replaces.
+  2. **Ownership stamping on headless creates.** Every agent CLI `terminal new`
+     records the creating pid, this host and an optional `--purpose` into the
+     row's metadata, and the stamp rides the persisted row across a daemon
+     handover (including the preserved-owner adoption import) — so provenance
+     outlives its creator, which is the whole point.
   3. **Pre-declared ephemerality, opt-in at creation.** `terminal new
-     --ephemeral` (with an optional idle TTL) = the agent explicitly declares
-     AT CREATION "reap this session when my owner is gone / after N idle
-     seconds". The reap is graceful (tombstone + trace event), and it is
-     consistent with the requirement-3 ruling because the close is
-     agent-declared up front — an explicit close, scheduled early. The DEFAULT
-     is unchanged: leave the row up, visibility beats tidiness; unmarked and
-     user-created rows are untouchable (the no-reap ruling stands).
+     --ephemeral --ephemeral-owner-pid <pid>` or `--ephemeral-idle-ttl-secs
+     <n>` = the agent explicitly declares AT CREATION "reap this session when
+     my owner is gone / after N idle seconds". **A BARE `--ephemeral` is
+     REFUSED** (`EPHEMERAL_NEEDS_AN_EXPLICIT_RULE`): measured, not reasoned
+     about — under `bash -c "<cli>"` the parent this CLI would have recorded is
+     the wrapper bash, gone in milliseconds, and under `ssh <host> "<cli>"` it
+     is sshd-session, gone at disconnect, so the convenient default armed
+     owner-gone against a corpse and killed the row on the next chore tick. The
+     reap rides the EXISTING background chore tick and closes through the
+     daemon's ONE close path (`close_live_session_row`, tombstone before
+     remove), tracing `ephemeral_owner_gone` / `ephemeral_idle_ttl` — so it is
+     consistent with the requirement-3 ruling: the close is agent-declared up
+     front, an explicit close scheduled early. The DEFAULT is unchanged: leave
+     the row up, visibility beats tidiness; a declaration is write-once and
+     only the agent CLI create path can make one, so unmarked and user-created
+     rows are untouchable (the no-reap ruling stands).
   Non-product half already done: the ritual sweep gained the aged-ssh probe,
   and the twin duty (an interactive probe is exited by the task that opened
   it) is recorded in the fleet memory.
+  ⚠ **LIVE VERIFICATION OWED — this entry stays until all four are done on the
+  live host** (2.12.17 is not deployed; the running daemon has none of this):
+  a `tenants` walk that actually finds an aged `ssh` tenant under a real row
+  and names its age; a create-then-stamp round trip read back after the
+  creating process is gone; ONE real TTL reap observed end to end (declaration
+  → chore tick → tombstone → row gone, with the trace event); and the negative,
+  which is the one that matters most — **unmarked rows, including the user's,
+  untouched across that same tick.**
 
 - **★★★ NOTIFICATION AUDIO IS SILENT IN THE WEBVIEW — PROVEN BY A/B ON THE
-  LIVE HOST, AND THE FIX IS TO LEAVE WEBKIT (2026-07-26, user-reported
+  LIVE HOST, AND THE FIX WAS TO LEAVE WEBKIT (2026-07-26, user-reported
   regression: "I used to hear the double chime when copying or when the agent
-  ended its turn. That is also absent").**
-  **The A/B, same speaker, same sink, minutes apart:**
+  ended its turn. That is also absent" — ⏳ FIXED IN-TREE AT 2.12.17, DEPLOY
+  AND A LISTENING CHECK OWED).**
+  **The A/B that convicted WebKit, same speaker, same sink, minutes apart:**
   | path | result |
   |---|---|
   | WebKit `AudioContext` (the shipped path), `ctx.resume()` added, gains x6, fired seconds after a real user click | **SILENT** |
   | native PCM synthesis → platform sink (`pw-play`) | **AUDIBLE**, user confirmed "I heard double chime just now" |
-  **Everything downstream was verified innocent first:** the Bluetooth sink is
-  the default and connected; a system test tone through it was clearly heard;
-  Yggterm's own sink-inputs were present ON that sink, `Mute: no`, volume
-  100%, `Corked: no`; and PipeWire reported the sink SUSPENDED → **RUNNING**
-  for the webview chime. So WebKit opens a real stream and fills it with
-  silence. Cause not isolated further (autoplay/gesture gating is the leading
-  theory and an agent cannot synthesize a qualifying gesture anyway) — and it
-  does not need to be, because the product does not need WebKit for this.
-  **⇒ Move the notification-audio path to native Rust** (queued as oc O4).
-  That simultaneously fixes: chimes silently dropped when the user is away
-  from the keyboard, the reported ending-clip (a native path can hold a
-  flush tail; the webview closed its context 80 ms after the last note while
-  A2DP holds 100-300 ms), and the impossibility of an AGENT ringing the user.
-  ⚠ **Instrument note:** "the eval returned without error" is not evidence of
-  sound, and neither is a RUNNING sink. The only honest instruments here are
-  the user's ears and an A/B against a known-good native player.
-  **Stopgap already live on the GUI host:** `~/.local/bin/ygg-chime`
-  (`--tone/--repeat/--gap/--volume/--notes/--preroll/--tail`) synthesizes the
-  SAME note table natively — it is both the diagnosis tool and the tune-
-  auditioning surface, and it is how an agent can get the user's attention
-  today. Its note table is the tune to port; the user has confirmed it sounds
-  right.
+  Everything downstream was verified innocent first (default connected sink, a
+  system test tone clearly heard through it, our own sink-inputs present,
+  `Mute: no`, `Corked: no`, and PipeWire reporting the sink SUSPENDED →
+  **RUNNING** for the webview chime). So WebKit opens a real stream and fills
+  it with silence; the autoplay/gesture gate is the leading theory and an agent
+  cannot synthesize a qualifying gesture anyway.
+  **WHAT SHIPPED (in-tree, 2.12.17).** `yggterm server app audio play|tune`
+  renders the chime to PCM in **native Rust** and pipes it to
+  `pw-play`/`paplay`/`aplay` — no webview, no GUI, no daemon — so an AGENT can
+  ring the user, and a chime no longer depends on the user being at the
+  keyboard. ⚠ The verbs are on the **`yggterm` binary, NOT `yggterm-headless`**;
+  a missing player is an ERROR naming every binary it looked for, never a
+  silent success, because silent success is the whole defect class this
+  answers. `yggterm_core::notification_audio` is the ONE owner of the tune —
+  two players now exist, and a tune with two owners becomes two chimes, so the
+  webview script spells neither notes nor envelope and walks the registry's
+  published breakpoints instead.
+  **THE TUNE IS THE MEASURED, USER-APPROVED SPEC** (derived from real cabin-
+  chime recordings by FFT + onset/envelope analysis — **re-measure rather than
+  re-tune**): meaning is carried by PATTERN (one chime = info/success, hi-lo =
+  warning, hi-lo x3 = error); the pair is a descending **minor third** with a
+  **1.03 s** gap, and that slow tempo is most of what makes it calm rather than
+  urgent; the envelope is a **53-point measured table** with a sustain shoulder
+  (still 89% of peak at 150 ms) that no exponential reproduces; the TPDF dither
+  keepalive spans the **whole render**, not just the front, because the tune is
+  mostly silence by duration and a front-only pre-roll leaves every later note
+  exposed to a sleepy A2DP sink; **pre-roll 0.70 s, flush tail 1.10 s**;
+  `--volume` scales the envelope OUTPUT, not the peak fed into it.
+  ⚠ **Instrument note, unchanged and load-bearing:** "the eval returned without
+  error" is not evidence of sound, and neither is a RUNNING sink. The only
+  honest instruments here are the user's ears and an A/B against a known-good
+  native player.
+  **WHAT IS OWED — this entry stays until it is heard.** 2.12.17 is not
+  deployed. After the bump, listen for parity with what was approved: a single
+  that **ends clean** (no resonant aftertaste), a pair that sounds
+  **unhurried**, the error tone's **later pairs unclipped** (the case the
+  whole-render dither exists for), and **half volume = the same shape, quieter**
+  (the exponential model failed exactly here, producing 52% of peak). Also
+  confirm the GUI-side chime is audible on a real user notification, not just
+  the CLI verb.
+  **Not built, deliberately named:** `audio state` (it must report the shell
+  webview's `AudioContext`, which needs an app-control round trip; the chime
+  script already records the data at `window.__yggtermChimeAudio`, the
+  transport is missing) and any `--save` render-to-file. The verb refuses
+  `state` by name rather than answering with native-side facts under a name
+  that promises webview ones.
+  **Until the deploy,** `~/.local/bin/ygg-chime` on the GUI host is still the
+  only way an agent can ring the user; it was the auditioning surface the
+  approved tune was measured on, and the product registry now carries that
+  tune.
 
 
 - **★★ AN AGENT'S TEARDOWN CAN REPORT SUCCESS AND LEAVE BOTH THE ROW AND THE
   APP PROCESS ALIVE (user-reported 2026-07-26 ~23:50, third variant of the
-  same class tonight).** A background agent's final report said "work session
-  removed"; the user still saw the row hours later. Ground truth: the row was
-  live, and the app process it hosted was still running under its `bash -i`,
-  parented by the daemon. Two things made it invisible to search:
+  same class that night — ⏳ BOTH HALVES FIXED IN-TREE AT 2.12.17, LIVE PROOF
+  OWED).** A background agent's final report said "work session removed"; the
+  user still saw the row hours later. Ground truth: the row was live, and the
+  app process it hosted was still running under its `bash -i`, parented by the
+  daemon. Two things made it invisible to search:
   1. **`terminal new --kind shell` names every session "Workspace Shell"**, so
      an agent's scratch row is indistinguishable by title from a human's shell
      — and the campaign record separately flags "Workspace Shell" as a name a
      HUMAN debugging session has used, which makes blind cleanup dangerous.
      ⇒ Give agent-created sessions a title carrying the agent identity and
      purpose (the chip already carries the app profile — the TITLE should too).
+     **FIXED:** creation through the app-control plane — and only that plane,
+     since every human door funnels through `start_local_session_placed` and
+     never reaches it — synthesizes `Agent <identity> <kind>[: <purpose>]` from
+     the request's own `agent` field plus a new `--purpose` flag, parsed
+     identically by both binaries. An explicit `--title` still wins, and the
+     synthesizer asks `looks_like_generated_fallback_title` about its OWN
+     output before shipping it, because a title the copy layer discards falls
+     straight back to the humanized cwd leaf — the exact bug it exists to
+     prevent.
   2. The row's only records marker was the small profile chip, so every
      title-based probe missed it while the user's eyes found it instantly.
-  **Also wanted:** a teardown verb that is verified, not asserted — `session
-  remove` should confirm the runtime is gone (and report the app processes it
-  reaped) so an agent cannot truthfully-but-wrongly claim a clean exit. Pairs
-  with the leased-surface-with-no-row entry: the two failure modes are
+  **Also wanted, and now built:** a teardown verb that is verified, not
+  asserted. `session remove` used to hardcode `"accepted": true` on any
+  successful round trip — transport success and nothing else; it read true
+  while the daemon's own message said "no live session for this path", and true
+  while the PTY teardown (which signals ONLY the direct child, never its
+  descendants) left the hosted app running. It now answers from evidence:
+  census the PTY child's process tree from `/proc` before, re-read the row and
+  re-probe each censused pid after (matched on command name so a recycled pid
+  cannot pose as a survivor, rejecting zombies so a corpse cannot), with a
+  bounded settle so a child still handling the hangup is not misreported. One
+  pure owner, `verify_session_removal`, turns that into
+  `{verified, refusal, reaped, still_running}`, and `verified:false` carries a
+  NAMED refusal: `row_still_listed`, `processes_survived`, or
+  `runtime_pid_unobservable` — the last being the cross-version case the
+  constitution warns about (a row whose runtime belongs to an older preserved
+  owner reports no local pid, and that is **unverifiable, not clean**).
+  Reporting only: the verb does not kill survivors, because escalating to that
+  changes what a removal does to a human's shell and is a separate call.
+  ⚠ **LIVE PROOF OWED (this entry stays until then):** on the live host, TRY TO
+  MAKE IT LIE — remove a session whose shell forked a process that outlives the
+  PTY, and confirm the verb says `verified:false` with `processes_survived` and
+  names them; and confirm an agent-created row wears its own name in the
+  sidebar the user is looking at.
+  Pairs with the leased-surface-with-no-row entry: the two failure modes are
   opposites (invisible surface vs invisible-to-search row), and both are
   fixed by making agent-owned artifacts NAME themselves.
 
@@ -125,7 +210,8 @@ fix) once the fix is verified live on jojo.
 - **★★★ AN UNREVEALED AGENT SURFACE REPORTS `visibilityState: "visible"`, SO
   ITS PAGE ANIMATES AT FULL RATE AND THE GUI COMPOSITES IT — measured
   2026-07-26 night, and this is very likely THE mechanism behind every
-  "agents make the GUI host hot" report in this campaign.**
+  "agents make the GUI host hot" report in this campaign. ⏳ FIXED IN-TREE AT
+  2.12.17; THE LIVE A/B IS OWED AND IS THE ONLY THING THAT CLOSES THIS.**
   Ground truth: a payment-gateway page on a headless, never-revealed surface
   the user cannot even see (no row — see the entry above) reported
   `visibilityState: "visible"` with **1 running animation** (a spinner). Cost,
@@ -139,16 +225,48 @@ fix) once the fix is verified live on jojo.
   tabs cheap. Our unrevealed surfaces claim to be visible, so the page has no
   way to know it is not on screen and paints forever, and the shell composites
   every frame of a surface nobody is looking at.
-  **FIX:** a surface that is not currently revealed on some client must be
-  marked hidden to the web engine (WebKitGTK page visibility / `is_visible`
-  on the webview, plus stopping compositing when nothing displays it), and
-  flip to visible on reveal. Cheap, mechanical, and it should be worth more
-  than every reaper heuristic combined — the reaper was destroying pages to
-  reclaim cost that this makes unnecessary.
+  **THE FIX, AS BUILT.** WebKitGTK derives `document.visibilityState` from
+  **widget mapping** — there is no page-visibility setter on this API — so
+  "hidden to the engine" means "the inner webview is not mapped". Three
+  independent halves each kept that from ever happening, and fixing any one
+  alone would have left the bug alive:
+  1. **Creates were born visible** — `open` ended in an unconditional
+     `show_all()`, so even a headless create was realized and mapped. An
+     unrevealed create now hides the inner view immediately.
+  2. **The headless create demoted but never throttled** — `demote` is a
+     Z-order move, not a visibility one. The reconciler now throttles beside
+     the demote and records `engine_visible:false` in the trace.
+  3. **The reclaim pass could never reach it later, and exempted the leased** —
+     a headless surface is marked stashed in the same breath, so the background
+     plan classified it `Wait` forever; and when reached, `throttle: !leased`
+     exempted every leased surface while `web ensure` leases unconditionally.
+     **A LEASE IS A CLAIM ON EXISTENCE, NOT EVIDENCE OF A VIEWER** — it says the
+     surface must keep existing and nothing about anyone looking at it.
+  **The trap that makes or breaks it:** an unmapped webview silently DROPS
+  synthesized events, and hiding is exactly what unmaps — so this would have
+  turned every `do`/`fill`/`type`/`key` into `surface_not_mapped` on precisely
+  the surfaces agents drive. The engine host therefore **wakes a view it hid for
+  the length of an injection burst and re-hides it after** — borrow-and-give-
+  back with a per-surface re-arm token, the same shape as the keyboard-focus
+  loan, and the same rule that a give-back only takes back what is still ours.
+  If the wake does not map, it is undone and the injection REFUSED: a refusal is
+  honest, a dropped event is not. Visibility gates RENDERING, never the drive
+  path; the audio veto is untouched, and the decision is per GUI process, never
+  a daemon query.
   ⚠ Do NOT "fix" this by navigating agent surfaces to `about:blank` between
   actions — that is the workaround (correct for an agent to do voluntarily,
   and it is now in the agent brief) but it hides the defect and breaks any
-  flow whose page state must survive.
+  flow whose page state must survive. Nothing in the shipped fix navigates:
+  DOM, scroll, JS heap and in-memory bearers survive hiding untouched.
+  ⚠ **THE LIVE A/B THAT CLOSES THIS, owed after the bump** — telemetry alone
+  cannot settle a heat claim: (a) an unrevealed surface reports
+  `visibilityState:"hidden"`; (b) `web do` and `capture-element` both succeed on
+  that SAME still-hidden surface (the wake/re-hide working, not a surface that
+  was quietly revealed); (c) a `/proc` cores delta against the captured 2.12.16
+  baseline (0.241 web + 0.399 GUI against a ~0.5-core idle floor) under the same
+  spinner page; (d) a faithful screenshot across background → reveal, because a
+  page that stops painting while hidden must come back correct; and (e) audio
+  keeps playing on an unmapped view.
 
 - **★★★ A LIVE, LEASED WEB SURFACE CAN EXIST WITH NO ROW — the user cannot see
   or reach an agent that is browsing with their profile (found live
@@ -210,39 +328,35 @@ fix) once the fix is verified live on jojo.
   NOT fall back to a hard-coded `~/.yggterm/vault/agent.sock`: ychrome owns that
   path, and a second copy of it is what goes quietly wrong the day it moves.
 
-- **★★ A HEADLESS AGENT SPAWN MOVES THE SIDEBAR SELECTION (user-reported with
-  pixel proof, 2026-07-26 ~17:55 IST — FIXED IN-TREE, LIVE VERIFICATION
-  PENDING).** `terminal new --no-activate` keeps the VIEWPORT on the user's
-  session (activation contract holds; metadata rail and viewport stayed on
-  the user's own row) but the Live Sessions SELECTED-ROW highlight
-  jumped to the agent-spawned ychrome row (the agent's browsing row, top of
-  the list) while the user's session sat fourth. Selection is a separate
-  state from activation and the row-creation path moved it unconditionally.
-  Related but distinct from the fifth-focus-path keyboard grab (fixed in-tree
-  the same day).
-  **ROOT CAUSE.** The create's hand-back was half a hand-back. The
-  `AppControlCommand::CreateTerminal` arm captured only
-  `(active_session_path, active_view_mode)` before the create, applied the
-  daemon's snapshot — which necessarily marks the NEW session active, so
-  `apply_interactive_snapshot_result` ran `sync_active_session_selection()` and
-  `ensure_active_session_visible()` onto the new row — and then restored *only*
-  `server.restore_active_session`. Selected-row truth (`selection_anchor`,
-  `selected_tree_paths`, `browser.selected_path`, and the persisted
-  `settings.selected_browser_path`) was left standing on the intruder. The
-  sidebar's autoscroll target is the SELECTED path, not the active one, which is
-  why the list scrolled to the agent's row too.
-  **FIX (GUI-only, `crates/yggterm-shell/src/shell.rs`, no daemon or protocol
-  change).** Selection follows ACTIVATION, never creation. The user's view is
-  now captured as ONE value (`PreservedUserView` = active session + view mode +
-  `SidebarSelection`) by `capture_user_view`, gated by
-  `preserved_user_view_for_create(shell, activate)`, and handed back by
-  `restore_user_view`. Both create call sites (local and remote) now go through
-  one `apply_created_terminal_snapshot`, so the two transports cannot drift.
-  A create WITH activation passes `None` and keeps today's behaviour.
-  **STILL OPEN, adjacent:** a `--no-activate` create made while NO session is
-  active (start page showing) still activates the new session, because the
-  hand-back has no path to restore to. Selection is preserved in that case;
-  activation is not.
+- **★★ A `--no-activate` CREATE MADE WHILE NO SESSION IS ACTIVE STILL ACTIVATES
+  THE NEW ROW — the adjacent gap left behind when the sidebar-selection jump was
+  fixed (⏳ FIXED IN-TREE AT 2.12.17, LIVE PROOF OWED).** With the start page
+  showing, an agent's `terminal new --no-activate` pulled the viewport onto the
+  agent's row. Selection was preserved in that case; activation was not.
+  **CAUSE.** The create's hand-back captured the user's view as
+  `Option<(path, view_mode)>`, where `None` meant BOTH "no session was active"
+  and "nothing to hand back" — and the restore read the second meaning, so it
+  no-opped on exactly the case that needed it, leaving the daemon snapshot's
+  activation of the new row standing.
+  **FIX (GUI-only, no daemon or protocol change).** The viewport becomes a
+  NAMED state: `PreservedViewport` is either `StartPage` or
+  `Session { path, view_mode }`, so the outer `Option<PreservedUserView>` is the
+  only thing that still means "this create hands nothing back". The start-page
+  restore goes through the same SSOT setter the viewport history's own
+  `StartPage` entry uses, and `show_start_page_when_no_live_sessions` is forced
+  FALSE rather than restored — while that flag is true, every later snapshot
+  promotes the first live row back to active, which is precisely the row the
+  create was told not to activate, so restoring it would re-open the bug on the
+  next poll. The create response's `null` active path is now true as well as
+  honest: it already reported `null` while the shell had in fact activated the
+  new row.
+  **RESIDUAL, stated rather than hidden:** the hand-back is client-local. The
+  daemon still marks a newly started session active whatever the flag said, so
+  any path that adopts daemon truth wholesale re-adopts the new row. The honest
+  fix for that half is daemon-side.
+  ⚠ **LIVE PROOF OWED at the next bump (a J7 item covers it):** with the GUI on
+  the start page, `terminal new --no-activate` must leave the start page
+  rendered and report a null active path.
 
 - **★★★ `web do` FIDELITY ON RE-RENDERING DOMs — three reproducible defects,
   one family (a live portal filing run, 2026-07-26 ~15:30-16:00 IST, jojo 2.12.15,
@@ -380,8 +494,39 @@ fix) once the fix is verified live on jojo.
        chokepoint is the obvious fix once that answer exists.
 
      **LEVEL (b) — LOSSLESS `SCM_RIGHTS` FD HANDOFF: where it would slot in.**
-     Not built; this is the map so the next session can size it rather than
-     re-survey.
+     ⏳ **INCREMENT 1 IS MERGED (2.12.17); INCREMENT 2 IS NOT BUILT.** Nothing
+     is wired into the handoff yet, so level (b) changes no behaviour today —
+     no PTY has ever moved. The map below is unchanged and is still the sizing
+     document.
+     - **Increment 1, merged — the child handle learns Owned vs Adopted.**
+       `PtyChildHandle` is `Owned(Box<dyn Child>)` vs
+       `Adopted { pid, start_time }`, and every call site is taught which it
+       holds: `is_running()` replaces `try_wait().is_none()` everywhere, because
+       the old shape forced every caller to think in exit statuses, which an
+       adopted child can never supply. Three rules are enforced rather than
+       described — an Adopted child NEVER reports an exit status (fabricating a
+       success would be worse than returning nothing); killing it is explicit,
+       since dropping the master only SIGHUPs the foreground group; and identity
+       is **(pid, start_time)**, never the pid alone, gating SIGNALLING as well
+       as reporting, which is the assertion that actually prevents killing a
+       stranger after PID reuse. Found while building, not in the spike: an
+       adopted child has a ZOMBIE WINDOW nothing reaps on our behalf, so `/proc`
+       state `'Z'` must read as dead or every shutdown path waits out its full
+       timeout on an already-dead process. `ReceivedMasterPty` — the master type
+       `portable_pty` cannot build (`UnixMasterPty` and `PtyFd` are private and
+       `openpty()` always creates a NEW pair) — is in-tree and under test but
+       deliberately unused: `F_DUPFD_CLOEXEC` never plain `dup` (a plain `dup`
+       leaks the master past exec, the slave's hangup never arrives and the
+       shell never sees EOF), `EIO` mapped to EOF exactly as `PtyFd` does, and
+       dropping the writer sends newline + the termios `VEOF` byte so the
+       trait's documented EOF contract still holds. The adoption machinery is
+       Linux-gated **at the variant**, so the module compiles on every target
+       rather than only the one it was written on.
+     - **Increment 2 — the `HotRestart` `sendmsg` wiring — is integrator-gated
+       and NOT built.** Two decisions are already settled and should not be
+       re-litigated when it is: the transcript payload travels BEFORE the fd,
+       and **`sendmsg` success is the commit point** — after it the fd belongs
+       to the successor, so nothing downstream may be recovered by re-sending.
      - **Who owns the fd.** `PtySessionRuntime` in
        `crates/yggterm-server/src/terminal.rs` holds
        `master: Arc<Mutex<Box<dyn MasterPty + Send>>>`, and
@@ -398,6 +543,8 @@ fix) once the fix is verified live on jojo.
        re-parented to init and the successor must fall back to
        `kill(pid, 0)` / `/proc` liveness. **Decide this before writing any
        `sendmsg`** — it is the actual design question, not the ancillary data.
+       ✅ **DECIDED and built in increment 1:** re-parent to init, no lingering
+       reaper, `/proc` liveness keyed on (pid, start_time).
      - **Who owns the scrollback.** The reader thread plus `chunks`,
        `seq`, `retained_bytes` and `spawn_id` on the same struct. The fd alone
        hands over a live terminal with an empty transcript, so the ring has to
@@ -424,14 +571,19 @@ fix) once the fix is verified live on jojo.
        admit `Shell`, and `progressive_migration_session_released` would stop
        being kill-and-re-resume for every kind — which is also what unpins the
        supernumerary daemons that one idle `bash -i` keeps alive forever.
-  2. **THE ROW-ORDER LEDGER WAS WRITE-ONLY ON RESTORE. ⏳ FIXED IN-TREE
-     2026-07-26, LIVE VERIFICATION ON jojo STILL PENDING — it can only be proven
-     by a real daemon bump, so this entry STAYS until the next one.**
-     Verified across the 2.12.15 bump: the ledger was byte-identical before and
-     after (143 entries, the user's curated order intact) and *nothing read it
-     back*. Restored rows land first, adopted live rows are appended after, so
-     the user's two live sessions moved from positions 1-2 to 6-7 and they had
-     to re-curate by hand for the third time in a day.
+  2. **THE ROW-ORDER LEDGER WAS WRITE-ONLY ON RESTORE. ✅ FIXED AND PROVEN LIVE
+     ACROSS THE 2.12.16 DAEMON BUMP — 22 rows before, 22 after, ORDER IDENTICAL,
+     and the pre-swap receipt was written.** That was the maiden constitution
+     deploy and it is the proof this clause asked for; the mechanism below is
+     kept as the record of WHY it holds. Every future bump re-proves it silently
+     through the J-battery, so a bump that scrambles the order is a REGRESSION,
+     not a fresh discovery.
+     The original defect, for the record: verified across the 2.12.15 bump, the
+     ledger was byte-identical before and after (143 entries, the user's curated
+     order intact) and *nothing read it back*. Restored rows land first, adopted
+     live rows are appended after, so the user's two live sessions moved from
+     positions 1-2 to 6-7 and they had to re-curate by hand for the third time
+     in a day.
      What now exists (`crates/yggterm-server/src/row_order_ledger.rs`):
      - **The restore.** `reconcile_order_with_remembered` is the one owner of
        the rule — rows the ledger knows take the ledger's relative order; rows
@@ -457,9 +609,12 @@ fix) once the fix is verified live on jojo.
        `~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json`,
        written by the outgoing daemon on `PrepareUpdateRestart` and by the
        incoming daemon before it imports a row.
-     **To close this entry:** on the next real daemon bump, capture
-     `server app rows` before and after and confirm the order is unchanged, and
-     confirm a `pre-daemon-swap-*` file appeared. Do not close it on unit tests.
+     **How it was closed, and how every bump re-checks it:** capture
+     `server app rows` before and after the swap, confirm the order is
+     unchanged, and confirm a `pre-daemon-swap-*` file appeared. Never on unit
+     tests. (What this entry still does NOT cover: a plain shell's row surviving
+     a bump — that is level (a) above, and it has not been exercised by a real
+     swap yet.)
   3. ✅ **RESURRECTION IS FIXED, PROVEN ACROSS A REAL VERSION BUMP.** 8 closed
      rows, 8 tombstones kept, **0 resurrected**, 0 orphaned processes, and the
      daemon self-retired gracefully in 40 s. Keep this result; it is the
@@ -539,31 +694,45 @@ fix) once the fix is verified live on jojo.
      path (scrollback-preserving screen reconcile), unchanged by this lane.
   8. **AUDIO NOTIFICATIONS NEED A PRE-ROLL.** Bluetooth speakers clip roughly the
      first ~300 ms while the link wakes, so the start of every notification is
-     lost. The user suggested ~150 ms and invited a better figure. **Use ~400 ms
-     of very-low-amplitude noise, not silence** — many A2DP stacks drop or fail
+     lost. The user suggested ~150 ms and invited a better figure. **Use
+     very-low-amplitude noise, not silence** — many A2DP stacks drop or fail
      to prime the link on pure digital silence, so the pre-roll needs a little
      real energy (a dither-level noise floor is enough to be inaudible). Better
      still, make it adaptive: skip the pre-roll when another notification played
      within the last few seconds, since the link is already awake.
 
-     **BUILT, NOT YET LIVE-VERIFIED ON jojo (2026-07-26).** The audio owner is
-     `emit_notification_chime` in `crates/yggterm-shell/src/shell.rs` — a
-     WebAudio graph built in Rust and handed to the webview via
-     `document::eval`. There is no bundled asset and no player process, so the
-     pre-roll is generated noise scheduled on the SAME `AudioContext` and the
-     same `ctx.currentTime` timeline as the chime; gapless by construction, and
-     structurally incapable of racing a second stream. Shipped:
-     400 ms TPDF noise at ~-57 dBFS (`NOTIFICATION_PREROLL_SECONDS`,
-     `NOTIFICATION_PREROLL_PEAK_AMPLITUDE`); an adaptive skip keyed on ONE owner
+     ⚠ **THE DESCRIPTION THAT USED TO STAND HERE IS SUPERSEDED (2026-07-27).**
+     It recorded the first webview implementation — a 400 ms pre-roll on an
+     `AudioContext` the emitter closed 80 ms after the last note. Both of those
+     figures are gone, and so is the premise: **the webview never made a sound
+     at all** (see the notification-audio entry above for the A/B), so the path
+     is now native Rust and the shipped numbers are the MEASURED ones:
+     - **Pre-roll 0.70 s**, flush tail **1.10 s**, TPDF dither at ~-57 dBFS.
+     - **The dither spans the WHOLE render, not just the front.** The tune is
+       mostly silence by duration (1.03 s inside a pair, 2.4 s between pairs),
+       so a front-only pre-roll leaves every later note exposed to a sink that
+       went back to sleep — which is exactly the reported ending-clip. Locked:
+       no 50 ms window of any rendered tone is digitally silent.
+     - **The context is long-lived**, not opened and closed per chime; the
+       closing context was itself part of the clipped-tail report.
+     - The registry `yggterm_core::notification_audio` owns pre-roll, tail and
+       dither for BOTH players, so the native CLI and the webview script cannot
+       drift into two different chimes.
+     **What survives from the old description, still true and still wanted:** the
+     adaptive skip is real in the GUI path — one owner
      (`NOTIFICATION_CHIME_LAST_PLAYED_MS`, written only by the emitter) through
      the pure `notification_preroll_decision(now, last_played)` with a 10 s
-     `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`; and a
+     `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`, plus a
      `notification_sound_preroll {applied, reason, tone, preroll_ms,
-     since_last_ms}` trace row. The pre-roll lives inside the chime script, so
-     a notification with sound off emits neither. **Still to do:** hear it on
-     jojo through the user's Bluetooth speaker (the whole point is a physical
-     A2DP link) and confirm `notification_sound_preroll` in
-     `server trace tail`. Do not close this entry until that is done.
+     since_last_ms}` trace row; and a notification with sound off emits neither
+     chime nor pre-roll. The native CLI takes `--preroll on|off|auto` and `auto`
+     resolves to ON, deliberately: there is no shared state across CLI
+     invocations to remember with, and a wasted pre-roll beats a clipped alert.
+     **Still to do, unchanged:** hear it on jojo through the user's Bluetooth
+     speaker (the whole point is a physical A2DP link) — first note intact on a
+     cold link, later notes intact on a warm one — and confirm
+     `notification_sound_preroll` in `server trace tail`. Do not close this
+     entry until that is done.
 
 - **★★★ USER REQUIREMENTS FOR THE SESSION-ROW LIFECYCLE (stated 2026-07-26, after
   curating the list by hand TWICE).** The user's words: *"A daemon bump and
@@ -571,21 +740,27 @@ fix) once the fix is verified live on jojo.
   this order is supposed to be snapshotted properly. And lastly all the rows not
   connected should die (gracefully is recommended)."*
   1. **A daemon bump must preserve row ORDER and COUNT.** ✅ Verified for a
-     GUI-only restart 2026-07-26: 21 rows, byte-identical order across the swap
-     (snapshot at `~/.yggterm/manual-snapshots/pre-gui-restart-*`). ⚠ **NOT yet
-     verified across a DAEMON bump**, which is the case that actually breaks it —
-     rows are re-imported from peer daemons there. The anchored-placement fix
-     (`import_peer_live_rows_in_order`) is live but has never been exercised by a
-     real daemon swap. **Prove it on the next bump before claiming it.**
+     GUI-only restart 2026-07-26 (21 rows, byte-identical order across the swap,
+     snapshot at `~/.yggterm/manual-snapshots/pre-gui-restart-*`) and ✅ **PROVEN
+     ACROSS A REAL DAEMON BUMP on 2.12.16** — the case that actually breaks it,
+     where rows are re-imported from peer daemons: **22 rows before, 22 after,
+     ORDER IDENTICAL**. The anchored-placement fix
+     (`import_peer_live_rows_in_order`) has now been exercised by a real daemon
+     swap. Every later bump re-proves this silently through the J-battery, so a
+     scramble is a regression to bisect, not a new finding.
+     ⚠ **What is still NOT exercised: a plain shell's row surviving a bump**
+     (level (a) in standing-traps item 1). The 2.12.16 proof says nothing about
+     that half.
   2. **If order is destroyed it must be recoverable from a snapshot.**
-     ⏳ **BUILT IN-TREE 2026-07-26; live verification pending.**
+     ✅ **BUILT AND PROVEN LIVE across the 2.12.16 bump** (order identical, and
+     the pre-swap receipt was written).
      `~/.yggterm/row-order-ledger.json` records order+membership and
-     `removed-rows.json` records closes; nothing RESTORED from them
-     automatically, and an agent had to reconstruct by hand. Both halves now
-     exist — the automatic restore on every handover rebuild pass, and the
-     pre-swap receipt at
+     `removed-rows.json` records closes; the original defect was that nothing
+     RESTORED from them automatically, and an agent had to reconstruct by hand.
+     Both halves now exist and both ran — the automatic restore on every handover
+     rebuild pass, and the pre-swap receipt at
      `~/.yggterm/manual-snapshots/pre-daemon-swap-<unix-secs>-<pid>.json`.
-     See standing-traps item 2 above for the detail and the closing criteria.
+     See standing-traps item 2 above for the mechanism.
   3. ✅ **"All rows not connected should die" — DECIDED by the user
      (2026-07-26, asked directly): "not connected" means rows that were
      explicitly CLOSED — by the user or by an agent.** It does NOT mean
@@ -900,8 +1075,11 @@ fix) once the fix is verified live on jojo.
   rebuilt on a shadow that never saw the declare).
 
 
-- **★★★ THE FIFTH FOCUS PATH — IT IS NOT JAVASCRIPT. Root-caused and fixed in
-  code 2026-07-26; NOT YET DEPLOYED (needs a GUI bump).** The user, mid-session:
+- **★★★ THE FIFTH FOCUS PATH — IT IS NOT JAVASCRIPT. Root-caused 2026-07-26;
+  ✅ THE FOCUS-BORROW FIX IS SHIPPED AND USER-CONFIRMED LIVE ON jojo. What keeps
+  this entry open is the SECOND bug it filed — the injection-credit ledger —
+  plus the unexplained `fill` corruption at the end.**
+  The user, mid-session:
   *"the shadow session spawn took focus away from my viewport and this session
   … it is stealing my focus again and again while working."* Four earlier
   rounds all found JS thieves, and the guard that came out of round four
@@ -945,6 +1123,13 @@ fix) once the fix is verified live on jojo.
   moved it to meanwhile. `open()` now takes `focused`, which the shell wires to
   `want_visible`. Locked by
   `no_web_surface_takes_the_window_keyboard_focus_without_giving_it_back`.
+  ✅ **VERIFIED LIVE AND CONFIRMED BY THE USER** on the deployed GUI: a
+  480-verb agent burst driven against a headless surface while the user worked
+  in their own session, and they felt nothing — no steal, no interruption —
+  with zero focus/select trace events inside the burst windows and screenshots
+  taken across them. The user's own experience is the instrument that settles
+  this one: every JS-side probe is blind to a GtkWindow focus move, which is
+  how four earlier rounds all missed it.
   ⚠⚠ **It IS keystroke cross-contamination, one direction, CAUGHT LIVE.** A
   passive `keydown` recorder installed in the agent's page logged three
   `isTrusted:true` `Escape` presses — 16:09:35.815, 16:09:51.001, 16:23:42.600 —
@@ -955,7 +1140,9 @@ fix) once the fix is verified live on jojo.
   hands the event to the surface widget with `gtk_widget_event`, which never
   traverses the toplevel's focus chain, so an agent's characters can never
   reach the user's terminal.
-  ⚠⚠⚠ **AND THE ARBITER DID NOT NOTICE — a second bug, still open.** Real seat
+  ⚠⚠⚠ **AND THE ARBITER DID NOT NOTICE — the second bug, and the reason this
+  entry is still here. ⏳ FIXED, BUT ON THE UNMERGED LEASED-SURFACE LANE, NOT IN
+  main AT 2.12.17, AND NEVER LIVE-VERIFIED.** Real seat
   input on a surface is supposed to increment the arbiter's counter and refuse
   the agent's next `do` with `preempted`. Zero `agent_input/preempted` events
   exist for `local://b556fb1b…` and no verb was refused, across the whole
@@ -976,11 +1163,19 @@ fix) once the fix is verified live on jojo.
   preempt and no journal**, and it is a live co-browse defect
   in its own right: on a surface the human is genuinely sharing, their first N
   keystrokes after any agent verb are invisible to the gate that exists to
-  protect them. Fix direction: expire a credit on a short clock (a credit
-  unspent 250 ms after an injection cannot belong to a synchronous dispatch)
-  instead of holding it until the next verb reads the counter. NOT done here —
-  the ledger is what stops the single-shot `do` defect, and it should not be
-  changed without a live loop to prove the replacement.
+  protect them.
+  **THE FIX, AS WRITTEN:** credits expire on a short clock. Each credit is
+  recorded with the millisecond it was granted, and anything older than
+  `INJECTION_CREDIT_TTL_MS` (**250 ms**) is dropped before spending — a credit
+  covers ONE injected event GTK may deliver late, not the whole gap until the
+  next verb. The clock is injected at the entry points so the expiry is tested
+  exactly rather than by sleeping. ⚠ **It is NOT in main.** It rides the
+  leased-surface-with-no-row lane, which is still hardening its locks and has
+  not been merged, so nothing in 2.12.17 changes this behaviour — and the
+  ledger's own doc comment in main still says, correctly for main, that nothing
+  here expires on a clock. **Live proof owed after that merge and a bump:** a
+  real co-browse loop where the user types immediately after an agent verb and
+  the arbiter counts every one of their keystrokes.
   The other reported corruption — `fill --text "Sample Fixture Road"` reporting
   `chars:19 delivered:true` while the field held `Ja` — is **not explained by
   either of the above** (17 characters lost, not 2 gained) and stays open; look
