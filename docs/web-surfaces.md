@@ -82,6 +82,78 @@ Backgrounding a session's surface therefore does two separable things:
   life. Media is an absolute veto: a surface WebKit reports as playing audio is
   never destroyed, whatever either clock says.
 
+#### The reclaim domain is per (session, TAB), not per session
+
+Backgrounding used to be a question about SESSIONS, and that left the biggest
+hole in the whole mechanism: every tab of the session the user is looking at was
+exempt forever. A hundred-tab browsing day therefore meant a hundred live WebKit
+web processes for the life of the GUI, however long ago the user had last looked
+at ninety-nine of them. Lazy creation already made a never-visited tab free
+(`web_surface_tab_create_rect`: no webview until someone is shown it, or an agent
+asks for it); nothing ever gave a VISITED one back.
+
+`web_surface_background_candidates` owns the domain now. A realized surface is a
+reclaim candidate unless someone is being SHOWN it:
+
+| Situation | Candidate? | Reason label | Hold |
+|---|---|---|---|
+| Session not active-visible | yes | `session_backgrounded` | `background_hold_secs` |
+| Session shown, tab not on screen | yes | `tab_backgrounded` | `tab_background_hold_secs` |
+| The tab on screen (active tab, or pinned into a live split pane) | **never** | — | — |
+
+Everything else is the SAME machinery: one pressure predicate, one thrash guard,
+one audio veto, one lease arithmetic. The only thing the reason selects is which
+configured hold applies, and both trace events (`native_stash`, `native_close`)
+now carry a `domain` field so a per-tab reclaim is not mistaken for a session
+one.
+
+Three properties that are easy to break and are locked:
+
+- **The session domain is NOT narrowed by the tab exemptions.** A split-pinned
+  tab of a *backgrounded* session is off screen like every other surface that
+  session owns, and reclaiming it is shipped behaviour.
+- **"On screen" agrees with placement.** `web_surface_tab_on_screen` is the
+  state-authoritative twin of `web_surface_tab_place_rect` — it has to be its own
+  function because reclaim runs BEFORE the tick's DOM geometry eval, and it has
+  to give the same answer, or the set that gets painted and the set that gets
+  destroyed disagree about who the user is looking at.
+- **A session whose active tab is unknown yields no candidates.** The pass must
+  never act on a surface it cannot classify.
+
+What a reclaimed tab loses is page state — scroll position, form contents, JS
+heap. What it keeps is its identity: the URL and title live in the tab model and
+on disk (`SavedWebTab`), so selecting it recreates a fresh webview on the same
+page through the ordinary lazy-create path. That is a documented limitation, not
+a bug to be papered over with a session-state FFI.
+
+**Config**, both in `~/.yggterm/web-surface.json`, both in seconds, both read by
+one parser (`web_surface_config_hold_ms`):
+
+```json
+{ "background_hold_secs": 600, "tab_background_hold_secs": 600 }
+```
+
+`tab_background_hold_secs` is the knob a 100-tab day turns down; `0` destroys a
+tab's webview as soon as it leaves the screen.
+
+#### The per-tab instrument
+
+`server app state` → `web_surface_tabs` lists every DESIRED tab joined against
+the realized webview registry: `state` (`visible` / `stashed` / `live` /
+`no_webview`), `stashed_for_ms` (how long it has been off screen — the age the
+hold is read against), `reaps_in_window`, plus `active_tab`, `split_pinned` and
+`leased`. Desired-first on purpose: the registry alone can only list what exists,
+which is the wrong end of the question, since most tabs SHOULD be missing from
+it. `tabs_without_webview` is the number the lane is judged on. The render probe
+carries the same pair per sample (`web_surface_tabs` against
+`web_surface_views` / `web_surface_view_sessions` / `web_surface_contexts`).
+
+⚠ **There is no per-tab RSS, and the payload says so in words.** WebKitGTK pools
+web processes per `WebContext` and every tab of one profile shares that context,
+so bytes are not attributable to a tab. What is attributable is (views,
+contexts) plus the process-level RSS the render probe already samples; any finer
+number would be invented.
+
 Two rules that keep the media veto honest:
 
 - It vetoes **destroy**, never **throttle**. An audible background tab still
@@ -110,11 +182,11 @@ so the decision is readable after the fact.
 #### Where the decision lives, and why it is one function
 
 `web_surface_reclaim_background_pass` is the ONE owner of a reclaim pass. The
-reconcile loop reads `/proc`, reads the configured hold, names its backgrounded
-surfaces and calls it; the pass gathers each surface's reap history and lease,
-asks `web_surface_background_plan`, and applies the answer through a
-`WebSurfaceBackgroundHost` (destroy / stash / demote / throttle / clear-loading /
-trace).
+reconcile loop reads `/proc`, reads both configured holds, builds its candidate
+domain with `web_surface_background_candidates` and calls it; the pass gathers
+each surface's reap history and lease, asks `web_surface_background_plan`, and
+applies the answer through a `WebSurfaceBackgroundHost` (destroy / stash /
+demote / throttle / clear-loading / trace).
 
 That shape is not an aesthetic preference. Round 24 shipped the headroom
 predicate, the treadmill guard and the audio veto with tests that called the new

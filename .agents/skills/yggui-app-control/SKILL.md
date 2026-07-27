@@ -214,6 +214,36 @@ answer is `{item, field, chars, matched}` — a name and a length, never the
 value — and every release leaves one line in `~/.yggterm/vault/audit.log`
 naming FIELDS, never values. Contract: `ychrome/docs/vault.md`.
 
+**Which tabs actually hold a web process — `server app state` →
+`web_surface_tabs`.** Every DESIRED tab joined against the realized webview
+registry, so "a hundred tabs, how many web processes?" is answerable instead of
+guessed:
+
+```bash
+yggterm server app state | jq '.web_surface_tabs
+  | {tabs, views, tabs_without_webview, contexts, per_tab_rss}'
+yggterm server app state | jq '.web_surface_tabs.rows[]
+  | select(.state != "no_webview")'
+```
+
+Per row: `state` (`visible` / `stashed` / `live` / `no_webview`), `webview`,
+`native_id`, `generation`, `ever_revealed`, `stashed_for_ms` (how long it has
+been off screen — the age the reclaim hold is read against), `reaps_in_window`,
+`active_tab`, `split_pinned`, `leased`. Background tabs of the session the user
+is looking at are reclaimed on their own hold now
+(`~/.yggterm/web-surface.json` `tab_background_hold_secs`, default 600 s), and a
+reclaimed tab comes back through the ordinary lazy-create path when it is
+selected — see `docs/web-surfaces.md`.
+
+⚠ **`no_webview` does NOT distinguish "never visited" from "reclaimed"** — after
+the destroy they are the same object with the same cost. `reaps_in_window` is
+the only hint and it forgets after the thrash window.
+
+⚠ **There is no per-tab RSS and you must not synthesize one.** WebKitGTK pools
+web processes per `WebContext`, so bytes are not attributable to a tab; the
+payload says so in `per_tab_rss`. Read (`views`, `contexts`) against the render
+probe's process RSS instead.
+
 **Recovering a dead tab without destroying the session.** `web ensure` probes
 LIVENESS (it round-trips an eval through the content process, because tabs /
 handles / engine flags all stay true over a corpse). Compare
