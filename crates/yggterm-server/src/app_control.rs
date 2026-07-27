@@ -1004,6 +1004,25 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         open: bool,
     },
+    /// Find-in-page on a session's active web-surface tab, through WebKit's own
+    /// find controller. Answers with the ENGINE's match count and the 1-based
+    /// position of the highlighted match (`3/17`).
+    ///
+    /// This is the agent's door onto the same mechanism the Ctrl+F bar drives,
+    /// and it is also that mechanism's test surface: a count that is wrong here
+    /// is wrong on screen.
+    WebSurfaceFind {
+        #[serde(default)]
+        session_path: Option<String>,
+        /// The needle. Required for a search/next/prev; ignored by `close`.
+        #[serde(default)]
+        text: Option<String>,
+        /// `search` (default) | `next` | `prev` | `close`. A string rather than
+        /// an enum because the shell's `web_find::FindStep` is the SSOT for what
+        /// these mean and a second enum on the wire could drift from it.
+        #[serde(default)]
+        step: Option<String>,
+    },
     /// Fill the login form on a session's active web-surface tab from the
     /// local password vault (rbw/Bitwarden). The GUI resolves the page's REAL
     /// origin from the engine (the page cannot lie about it), queries the
@@ -1368,6 +1387,7 @@ impl AppControlCommand {
             Self::WebSurfaceCaptureElement { .. } => "web_surface_capture_element",
             Self::WebSurfaceCookies { .. } => "web_surface_cookies",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
+            Self::WebSurfaceFind { .. } => "web_surface_find",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::WebSurfaceFillVault { .. } => "web_surface_fill_vault",
             Self::WebSurfaceTotp { .. } => "web_surface_totp",

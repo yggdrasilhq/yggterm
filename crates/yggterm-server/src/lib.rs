@@ -20466,6 +20466,31 @@ pub fn run_app_control_web_surface_screenshot(
     Ok(())
 }
 
+/// `server app web find --session <s> --text <t> [--next|--prev|--close]`.
+///
+/// Prints the GUI's answer, whose load-bearing fields are `match_count` (the
+/// ENGINE's number for the page, uncapped) and `position` (1-based, ours —
+/// WebKit never says which match is selected).
+pub fn run_app_control_web_surface_find(
+    session_path: Option<&str>,
+    text: Option<&str>,
+    step: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFind {
+            session_path: session_path.map(str::to_string),
+            text: text.map(str::to_string),
+            step: Some(step.to_string()),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_web_surface_devtools(
     session_path: Option<&str>,
     open: bool,
