@@ -484,7 +484,7 @@ every process that opens it.
 | `protected` | this profile refuses deletion |
 | `display_name` | a label to show instead of the directory name (decoration only; identity, locks and paths still key on the directory name) |
 
-Three rules, each of which has a lock:
+Five rules, each of which has a lock:
 
 1. **Unknown keys survive a rewrite.** `agent_drive` (`ychrome/docs/agent-engine.md`
    §7) is specced into this same file and is written by a different process. A
@@ -498,18 +498,60 @@ Three rules, each of which has a lock:
    releases). The same profile therefore looks the same in the GUI, in the
    daemon and in the next process. Reordering or resizing the table re-assigns
    every derived avatar: treat it as a user-visible change.
-3. **`default` is protected by construction.** Its permanence does not consult
-   the file, so a missing (or hostile) `profile.json` cannot unprotect it.
-   Deletion policy — unsafe name, ephemeral, default, protected — is
-   `web_profile_delete_refusal`, and every refusal carries a sentence the UI
-   shows verbatim.
+3. **A stored avatar is validated on READ, not only on write.** The typed field
+   passes `web_profile_emoji_is_valid`, but by rule 1 this file is written by
+   processes that never saw that predicate, so a `profile.json` this build never
+   wrote can carry a paragraph in `emoji` — and the badge pills are 9.5 px chips.
+   `web_profile_stored_avatar` asks the SAME predicate on the read side and the
+   renderer falls back to the derived default. The foreign bytes still
+   round-trip verbatim: declining to paint a value is not licence to delete
+   another process's write.
+4. **Permanence is a LIST, not a comparison.** `WEB_PROFILE_PERMANENT` (today:
+   `default`) is the only place that says which profiles are permanent, read
+   through `web_profile_is_protected_by_construction`. `web_profile_is_protected`
+   and `web_profile_delete_refusal` both derive from it, and so does the picker's
+   protect toggle — a render site that re-spelled `name == WEB_PROFILE_DEFAULT`
+   would keep offering a verb the delete guard refuses the day a second name
+   joins the list. Permanence does not consult the file, so a missing (or
+   hostile) `profile.json` cannot unprotect it.
+5. **A refusal is NAMED.** Deletion policy — unsafe name, ephemeral, permanent,
+   protected — is `web_profile_delete_refusal`, and every refusal carries a
+   sentence the UI shows verbatim, on the picker's subtitle line
+   (`data-web-picker-notice`). A guard that silently does nothing is
+   indistinguishable from a broken button.
 
 The GUI draws the avatar in three places — the native picker card, the classic
 tab-strip identity pill and the vertical rail's — through ONE function,
 `web_surface_profile_avatar`. The old "first letter on a gradient" avatar is
 gone: it was a second encoding of identity that only the picker implemented, so
 the badges could never match it. Right-clicking a picker card raises the shared
-`ContextMenuOverlay` with *Change avatar…* and the protect toggle.
+`ContextMenuOverlay` with *Change avatar…* and the protect toggle. Right-clicking
+the avatar FIELD is a different gesture: the input stops the card's handler
+without cancelling the event, so WebKit's own Copy/Paste menu opens (the picker
+container is in `NATIVE_CONTEXT_MENU_OWNER_SELECTORS` for exactly that reason,
+and pasting is how a user without an emoji IME enters one).
+
+#### `RowMenuItem::disabled` — shown, dimmed, and inert in BOTH views
+
+The protect toggle on a permanent profile is the first user of `disabled`, but
+the field lives in the SHARED `RowMenuItem` vocabulary, so its contract is
+app-wide and has two enforcement points, neither of them CSS:
+
+- **Mouse:** `ContextMenuOverlay`'s onclick asks `context_menu_item_dispatches`
+  before calling `on_action`. Dispatch-level, not `pointer-events:none` — a
+  styling accident can undo a style, and the refusal must not be a style.
+- **Keyboard (ALT/KeyTip):** `build_keytip_scopes` does not DECLARE a disabled
+  item in the `rowmenu` scope, so no letter resolves to it and the badge painter
+  never paints an accelerator that would do nothing. `dispatch_row_menu_action`
+  is reached only through a declared node, so the terminus stays a single
+  spelling of "run this id".
+
+Dimming is `context_menu_item_style` (every branch emits the identical style key
+set — Dioxus applies `style` property-by-property and never clears a dropped
+key), plus a `data-context-menu-disabled` attribute that both a live probe and
+the stylesheet read: the shared `.yggterm-menu-item:hover` highlight is
+suppressed for a dimmed entry, because a highlight is the strongest "clickable"
+signal the menu has.
 
 ⚠ **ychrome's HTML fallback picker still derives a first letter** (`picker_html`
 in that repo). It is a separate repository and a separate binary; until it is
