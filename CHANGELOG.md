@@ -28,6 +28,18 @@ This file tracks user-visible changes in `yggterm`.
   `~/.yggterm/web-surface.json`, `{"tab_background_hold_secs": 600}` (0 lets a
   tab go the moment you leave it). What a reclaimed tab does not keep is where
   you had scrolled to and anything half-typed into a form on it.
+- **New: browser profiles have emoji avatars, and can be protected from
+  deletion.** Every profile now shows an emoji instead of the first letter of
+  its name, and where a named profile's pill appears above the page it carries
+  that same emoji — so you can tell at a glance which identity a window is
+  browsing as. (The default and temporary profiles show no pill, as before.) A
+  profile you have not customised gets a distinctive emoji picked from its name,
+  and it never changes on its own. Right-click a profile card to choose your
+  own, or to mark the profile protected: a protected profile's delete button is
+  gone, and the default profile can no longer be deleted at all. When a delete
+  is refused you are now told why instead of the button quietly doing nothing.
+  Right-clicking the avatar field itself still gives you the usual Copy/Paste
+  menu, so pasting an emoji works without an emoji keyboard.
 - **New: a session an assistant opens for itself now says so in its name.**
   Until now a scratch session an assistant created was named after the folder
   it opened in, which is exactly how your own terminal in that folder is named
