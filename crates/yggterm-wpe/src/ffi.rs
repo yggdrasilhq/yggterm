@@ -191,7 +191,7 @@ unsafe extern "C" {
     pub(crate) fn glFinish();
     pub(crate) fn glGetError() -> c_uint;
 
-    // WPEWebKit (7)
+    // WPEWebKit (9) + JavaScriptCore (2)
     pub(crate) fn webkit_web_view_backend_new(
         backend: *mut c_void,
         notify: Option<extern "C" fn(*mut c_void)>,
@@ -203,6 +203,29 @@ unsafe extern "C" {
     pub(crate) fn webkit_web_view_get_title(view: *mut c_void) -> *const c_char;
     pub(crate) fn webkit_web_view_get_uri(view: *mut c_void) -> *const c_char;
     pub(crate) fn webkit_web_view_is_loading(view: *mut c_void) -> GBool;
+    /// Async: the result arrives in `callback`, which must call
+    /// [`webkit_web_view_evaluate_javascript_finish`].
+    pub(crate) fn webkit_web_view_evaluate_javascript(
+        view: *mut c_void,
+        script: *const c_char,
+        length: isize,
+        world_name: *const c_char,
+        source_uri: *const c_char,
+        cancellable: *mut c_void,
+        callback: Option<extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    pub(crate) fn webkit_web_view_evaluate_javascript_finish(
+        view: *mut c_void,
+        result: *mut c_void,
+        error: *mut *mut c_void,
+    ) -> *mut c_void;
+
+    // JavaScriptCore (2) — `to_json` rather than `to_string` on purpose: it
+    // gives a typed, machine-readable answer instead of a stringified one, so a
+    // number stays a number across the wire.
+    pub(crate) fn jsc_value_to_json(value: *mut c_void, indent: c_uint) -> *mut c_char;
+    pub(crate) fn jsc_value_is_undefined(value: *mut c_void) -> GBool;
 
     // glib / gobject (5)
     pub(crate) fn g_main_context_iteration(context: *mut c_void, may_block: GBool) -> GBool;
@@ -214,8 +237,10 @@ unsafe extern "C" {
         destroy_data: *mut c_void,
         connect_flags: c_uint,
     ) -> usize;
-    pub(crate) fn g_object_ref(object: *mut c_void) -> *mut c_void;
     pub(crate) fn g_object_unref(object: *mut c_void);
+    pub(crate) fn g_free(mem: *mut c_void);
+    /// A GError is NOT a GObject; unreffing one corrupts the heap.
+    pub(crate) fn g_error_free(error: *mut c_void);
     pub(crate) fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
@@ -224,4 +249,4 @@ pub(crate) type ImageTargetTexture2DOes = extern "C" fn(target: c_uint, image: *
 
 /// The number of foreign functions this crate declares. Locked by a test so the
 /// sizing claim in the spike READMEs cannot drift from the code.
-pub(crate) const FOREIGN_FN_COUNT: usize = 43;
+pub(crate) const FOREIGN_FN_COUNT: usize = 48;

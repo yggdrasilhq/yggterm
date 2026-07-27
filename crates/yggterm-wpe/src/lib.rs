@@ -57,12 +57,16 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub mod agent;
 mod ffi;
 mod frame;
+pub mod json;
+mod png;
 pub mod keysym;
 mod supervisor;
 mod view;
 
+pub use agent::AgentState;
 pub use frame::Frame;
 pub use supervisor::{Supervisor, ViewId, WebProcess, descendants, web_processes};
 pub use view::View;
@@ -76,6 +80,12 @@ pub enum Error {
     ViewCreation(&'static str),
     Readback(&'static str),
     InvalidUri,
+    /// The script contained an interior NUL.
+    InvalidScript,
+    /// The page's JavaScript threw, or the evaluation could not complete.
+    EvalFailed(String),
+    /// An evaluation did not settle before its deadline.
+    EvalTimedOut,
     /// This crate has no keysym for that character. Refused rather than guessed
     /// — a wrong keysym is silently swallowed by WebKit.
     UntypableCharacter(char),
@@ -103,6 +113,9 @@ impl std::fmt::Display for Error {
             Error::ViewCreation(what) => write!(f, "could not create a view: {what}"),
             Error::Readback(what) => write!(f, "frame readback failed: {what}"),
             Error::InvalidUri => write!(f, "the URI contained an interior NUL"),
+            Error::InvalidScript => write!(f, "the script contained an interior NUL"),
+            Error::EvalFailed(msg) => write!(f, "the page's JavaScript failed: {msg}"),
+            Error::EvalTimedOut => write!(f, "the evaluation did not settle before its deadline"),
             Error::UntypableCharacter(ch) => write!(
                 f,
                 "no keysym for {ch:?}; refusing to guess, because a wrong keysym produces an \

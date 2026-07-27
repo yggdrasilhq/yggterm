@@ -185,6 +185,28 @@ impl<'engine> Supervisor<'engine> {
         Ok(())
     }
 
+    /// Evaluate `script` in the view and return its result as JSON.
+    ///
+    /// Owns the pump-and-wait: `webkit_web_view_evaluate_javascript` is async
+    /// and its result only arrives while the main context is iterating, so an
+    /// API that handed back a "pending" would be a footgun. A page that throws
+    /// is [`Error::EvalFailed`] carrying the engine's own message — never a
+    /// silent empty string, which a caller would read as a legitimate "".
+    pub fn eval(&mut self, id: ViewId, script: &str, timeout: Duration) -> Result<String> {
+        self.view_mut(id)?.begin_eval(script)?;
+        let settled = self.pump_until(timeout, |sup| {
+            sup.view(id).is_ok_and(|v| v.eval_settled())
+        });
+        if !settled {
+            return Err(Error::EvalTimedOut);
+        }
+        match self.view_mut(id)?.take_eval_result() {
+            Some(Ok(json)) => Ok(json),
+            Some(Err(message)) => Err(Error::EvalFailed(message)),
+            None => Err(Error::EvalTimedOut),
+        }
+    }
+
     /// Kill a view's web process — a supervision primitive for recovery drills
     /// and for shedding a wedged surface.
     pub fn kill_web_process_of(&self, id: ViewId) -> Result<u32> {
