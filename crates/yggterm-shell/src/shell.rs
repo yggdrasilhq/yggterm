@@ -5826,6 +5826,202 @@ async fn web_surface_edge_motion_reveal_loop(
     }
 }
 
+/// The trace row one download transition writes. One name per transition, so
+/// "how many downloads started and how many of them ended" is answerable from
+/// the trace alone — which is the agent-facing record of downloads until a
+/// listing verb exists.
+fn web_surface_download_trace_name(phase: &dioxus_desktop::SurfaceDownloadPhase) -> &'static str {
+    match phase {
+        dioxus_desktop::SurfaceDownloadPhase::Started => "download_started",
+        dioxus_desktop::SurfaceDownloadPhase::Completed { .. } => "download_completed",
+        dioxus_desktop::SurfaceDownloadPhase::Failed { .. } => "download_failed",
+    }
+}
+
+/// The toast one download transition becomes, on the shell's EXISTING
+/// notification plane (`push_notification` → the toast viewport + the OS
+/// notification, honoring the user's notification settings). No download UI of
+/// its own: a browser that invents a second notification surface for downloads
+/// is a browser with two places to look.
+///
+/// Every branch names the FILE, because a toast that says only "download
+/// complete" makes the user go looking. Completion names the folder it landed
+/// in (the name is already uniquified, so this is exactly what is on disk), and
+/// failure names the ENGINE'S REASON rather than a generic apology.
+fn web_surface_download_toast(
+    event: &dioxus_desktop::SurfaceDownloadEvent,
+) -> (NotificationTone, String, String) {
+    match &event.phase {
+        dioxus_desktop::SurfaceDownloadPhase::Started => (
+            NotificationTone::Info,
+            "Download Started".to_string(),
+            event.file_name.clone(),
+        ),
+        dioxus_desktop::SurfaceDownloadPhase::Completed { .. } => {
+            let folder = event
+                .destination
+                .parent()
+                .map(|parent| parent.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (
+                NotificationTone::Success,
+                "Download Complete".to_string(),
+                if folder.is_empty() {
+                    event.file_name.clone()
+                } else {
+                    format!("{} saved to {}", event.file_name, folder)
+                },
+            )
+        }
+        dioxus_desktop::SurfaceDownloadPhase::Failed { reason } => (
+            NotificationTone::Error,
+            "Download Failed".to_string(),
+            format!("{}: {}", event.file_name, reason),
+        ),
+    }
+}
+
+/// LOCKS for what the user is TOLD about a download.
+///
+/// The transfer itself belongs to the surface host (locked there, against a
+/// real localhost server); what belongs here is the promise that every
+/// transition reaches the user on the shell's existing notification plane and
+/// the trace, naming the file — and, when it fails, naming the ENGINE'S reason
+/// rather than an apology. The drain that carries them lives inside an `async`
+/// reconcile loop no unit test can enter, so the decisions are pure functions
+/// driven directly and the wiring is scanned over PRODUCT lines only.
+#[cfg(test)]
+mod web_surface_download_locks {
+    use super::*;
+
+    fn event(phase: dioxus_desktop::SurfaceDownloadPhase) -> dioxus_desktop::SurfaceDownloadEvent {
+        dioxus_desktop::SurfaceDownloadEvent {
+            surface_id: Some(3),
+            file_name: "quarterly report.pdf".to_string(),
+            destination: std::path::PathBuf::from("/home/u/Downloads/quarterly report.pdf"),
+            url: "https://example.test/q3.pdf".to_string(),
+            phase,
+        }
+    }
+
+    /// A failure the user cannot act on is a failure they will report as "it
+    /// just didn't download". The reason is the engine's own text and it must
+    /// survive into the toast verbatim.
+    #[test]
+    fn a_failed_download_names_the_file_and_the_engines_own_reason() {
+        let (tone, title, message) =
+            web_surface_download_toast(&event(dioxus_desktop::SurfaceDownloadPhase::Failed {
+                reason: "No space left on device".to_string(),
+            }));
+        assert_eq!(tone, NotificationTone::Error);
+        assert_eq!(title, "Download Failed");
+        assert!(
+            message.contains("quarterly report.pdf"),
+            "the failure must name the file: {message}",
+        );
+        assert!(
+            message.contains("No space left on device"),
+            "the failure must carry the engine's reason, not a generic apology: \
+             {message}",
+        );
+    }
+
+    /// "Downloaded" is only useful if it says WHAT and WHERE — the name here is
+    /// already the uniquified one, so this is literally what is on disk.
+    #[test]
+    fn a_completed_download_names_the_file_and_where_it_landed() {
+        let (tone, title, message) = web_surface_download_toast(&event(
+            dioxus_desktop::SurfaceDownloadPhase::Completed { bytes: 2048 },
+        ));
+        assert_eq!(tone, NotificationTone::Success);
+        assert_eq!(title, "Download Complete");
+        assert!(
+            message.contains("quarterly report.pdf") && message.contains("/home/u/Downloads"),
+            "completion must name the file and the folder it landed in: {message}",
+        );
+
+        let (tone, title, message) =
+            web_surface_download_toast(&event(dioxus_desktop::SurfaceDownloadPhase::Started));
+        assert_eq!(tone, NotificationTone::Info);
+        assert_eq!(title, "Download Started");
+        assert!(message.contains("quarterly report.pdf"));
+    }
+
+    /// Three transitions, three trace names. Collapsing any two would make
+    /// "how many downloads started and how many of them ended" unanswerable
+    /// from the trace, which is the only downloads record an agent has.
+    #[test]
+    fn every_transition_writes_its_own_trace_row() {
+        assert_eq!(
+            web_surface_download_trace_name(&dioxus_desktop::SurfaceDownloadPhase::Started),
+            "download_started",
+        );
+        assert_eq!(
+            web_surface_download_trace_name(&dioxus_desktop::SurfaceDownloadPhase::Completed {
+                bytes: 1,
+            }),
+            "download_completed",
+        );
+        assert_eq!(
+            web_surface_download_trace_name(&dioxus_desktop::SurfaceDownloadPhase::Failed {
+                reason: "x".to_string(),
+            }),
+            "download_failed",
+        );
+    }
+
+    /// The WIRING: the reconcile tick must actually drain the host's queue and
+    /// send each event to BOTH planes. A queue nobody drains is a leak that
+    /// tells the user nothing; a drain that only traces leaves a browser whose
+    /// downloads are invisible unless you read a JSONL file.
+    #[test]
+    fn the_reconcile_tick_drains_downloads_into_the_trace_and_the_toasts() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_surface_download_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        let start = product
+            .iter()
+            .position(|line| line.contains("for event in desktop.take_web_surface_downloads() {"))
+            .expect("the reconcile tick no longer drains downloads at all");
+        let indent = product[start].len() - product[start].trim_start().len();
+        let end = product[start + 1..]
+            .iter()
+            .position(|line| line.trim() == "}" && line.len() - line.trim_start().len() == indent)
+            .map(|offset| start + 1 + offset)
+            .expect("unterminated download drain");
+        let drain = product[start..=end].join("\n");
+        assert!(
+            end - start > 10,
+            "the captured drain is too short to be the real one:\n{drain}",
+        );
+        for needle in [
+            "web_surface_download_trace_name(&event.phase),",
+            "append_trace_event(",
+            "\"file_name\": event.file_name,",
+            "\"path\": event.destination.to_string_lossy(),",
+            "let (tone, title, message) = web_surface_download_toast(&event);",
+            "writable.with_mut(|shell| shell.push_notification(tone, title, message));",
+        ] {
+            assert!(
+                drain.contains(needle),
+                "the download drain no longer does `{needle}`:\n{drain}",
+            );
+        }
+    }
+}
+
 async fn web_surface_native_reconcile_loop(
     state: Signal<ShellState>,
     desktop: dioxus::desktop::DesktopContext,
@@ -6812,6 +7008,58 @@ async fn web_surface_native_reconcile_loop(
                     },
                 }),
             );
+        }
+        // Downloads. A link that saves a file did NOTHING in a surface until
+        // now: WebKit asked the embedder for a destination and no one answered,
+        // so the transfer died unmentioned. Each transition gets a trace row
+        // (the agent-readable record) and a toast on the shell's existing
+        // notification plane (the human one).
+        //
+        // The surface that started a transfer may already be gone by the time
+        // it ends — a download outlives its tab on purpose — so an unresolvable
+        // native id is normal here, not a dropped event.
+        for event in desktop.take_web_surface_downloads() {
+            let owner = event.surface_id.and_then(|native_id| {
+                applied
+                    .iter()
+                    .find(|(_, entry)| entry.native_id == native_id)
+                    .map(|(key, _)| key.clone())
+            });
+            let (session_path, tab_id) = match owner {
+                Some((session_path, tab_id)) => {
+                    (Value::String(session_path), Value::from(tab_id))
+                }
+                None => (Value::Null, Value::Null),
+            };
+            let bytes = match &event.phase {
+                dioxus_desktop::SurfaceDownloadPhase::Completed { bytes } => Value::from(*bytes),
+                _ => Value::Null,
+            };
+            let reason = match &event.phase {
+                dioxus_desktop::SurfaceDownloadPhase::Failed { reason } => {
+                    Value::String(reason.clone())
+                }
+                _ => Value::Null,
+            };
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                web_surface_download_trace_name(&event.phase),
+                json!({
+                    "session_path": session_path,
+                    "tab_id": tab_id,
+                    "native_id": event.surface_id,
+                    "url": event.url,
+                    "file_name": event.file_name,
+                    "path": event.destination.to_string_lossy(),
+                    "bytes": bytes,
+                    "reason": reason,
+                }),
+            );
+            let (tone, title, message) = web_surface_download_toast(&event);
+            let mut writable = state;
+            writable.with_mut(|shell| shell.push_notification(tone, title, message));
         }
         // Under-glass input holes: where webviews are ACTUALLY shown this tick
         // (`applied` bounds — the same values just pushed to the host, so the
