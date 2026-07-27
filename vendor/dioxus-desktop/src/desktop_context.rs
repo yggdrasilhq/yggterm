@@ -154,7 +154,7 @@ impl DesktopService {
         url: &str,
         socks_port: Option<u16>,
         profile_dir: Option<&std::path::Path>,
-        userscripts: &[String],
+        userscripts: &[crate::web_surface::SurfaceUserscript],
         adblock_ruleset: Option<&std::path::Path>,
         user_agent: Option<&str>,
         signer_base: Option<&str>,

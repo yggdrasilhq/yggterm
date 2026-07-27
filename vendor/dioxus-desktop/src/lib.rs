@@ -35,8 +35,8 @@ mod web_surface;
 pub use web_surface::{
     CookieRecord, EvalFailure, EvalFailureKind, FindAction, INJECTION_CREDIT_TTL_MS,
     SurfaceCloseRequest, SurfaceDownloadEvent, SurfaceDownloadPhase, SurfaceLiveness,
-    SurfacePopup, grant_injection_credits, grant_injection_credits_at, note_seat_input,
-    note_seat_input_at, take_seat_input_count,
+    SurfacePopup, SurfaceUserscript, grant_injection_credits, grant_injection_credits_at,
+    note_seat_input, note_seat_input_at, take_seat_input_count,
 };
 mod webview;
 
