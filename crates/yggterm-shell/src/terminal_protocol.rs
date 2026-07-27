@@ -120,7 +120,6 @@ pub(crate) enum TerminalJsEvent {
         client_x: f64,
         client_y: f64,
     },
-    ContextMenuClose,
     ClipboardError {
         action: String,
         message: String,
@@ -353,7 +352,6 @@ enum TerminalJsEventWire {
         #[serde(default)]
         client_y: f64,
     },
-    ContextMenuClose,
     ClipboardError {
         action: String,
         message: String,
@@ -539,7 +537,6 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::ContextMenu { client_x, client_y } => {
                 TerminalJsEvent::ContextMenu { client_x, client_y }
             }
-            TerminalJsEventWire::ContextMenuClose => TerminalJsEvent::ContextMenuClose,
             TerminalJsEventWire::ClipboardError { action, message } => {
                 TerminalJsEvent::ClipboardError { action, message }
             }
@@ -744,15 +741,6 @@ mod tests {
             } if (client_x - 42.5).abs() < f64::EPSILON
                 && (client_y - 84.25).abs() < f64::EPSILON
         ));
-    }
-
-    #[test]
-    fn context_menu_close_event_deserializes() {
-        let event: TerminalJsEvent = serde_json::from_value(json!({
-            "kind": "context_menu_close"
-        }))
-        .expect("terminal context-menu close payloads should deserialize");
-        assert!(matches!(event, TerminalJsEvent::ContextMenuClose));
     }
 
     #[test]
