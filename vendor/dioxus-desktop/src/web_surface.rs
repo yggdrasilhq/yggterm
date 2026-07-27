@@ -86,6 +86,71 @@ const CLOSE_SHIM_JS: &str = r#"(function(){
   };
 })();"#;
 
+/// A page's declared THEME COLOR, reported to the host on the same channel the
+/// close shim uses.
+///
+/// WebKitGTK exposes no theme-color signal, and the embedder needs the answer:
+/// every pixel of shell that can ever sit beside a page (the seam a transient
+/// reveal crops open, the flat fill under a webview that has not painted yet)
+/// must be the PAGE's color, or the user sees a bright frame around a dark
+/// site — the white border on YouTube.
+///
+/// Two sources, in the order a browser trusts them: the page's own
+/// `<meta name="theme-color">` (media-query-matched, so a dark-mode page's dark
+/// value wins), then the computed `background-color` of `<body>` / `<html>`.
+/// Reported at document-start-idle, at load, and on any head mutation, because
+/// SPAs (YouTube included) swap their theme-color meta after first paint.
+///
+/// Reports the value VERBATIM as CSS text. Parsing is the shell's job — the
+/// engine layer must not learn what the shell's seam palette looks like.
+const THEME_COLOR_SHIM_JS: &str = r#"(function(){
+  if (window.__yggtermThemeColorShim) { return; }
+  window.__yggtermThemeColorShim = true;
+  let last = null;
+  const declared = () => {
+    const metas = document.querySelectorAll('meta[name="theme-color"]');
+    let fallback = null;
+    for (const meta of metas) {
+      const media = meta.getAttribute('media');
+      const content = (meta.getAttribute('content') || '').trim();
+      if (!content) { continue; }
+      if (!media) { fallback = fallback || content; continue; }
+      try { if (window.matchMedia(media).matches) { return content; } } catch (e) {}
+    }
+    return fallback;
+  };
+  const painted = () => {
+    for (const el of [document.body, document.documentElement]) {
+      if (!el) { continue; }
+      const color = window.getComputedStyle(el).backgroundColor;
+      if (color && color !== 'transparent' && !/^rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)$/.test(color)) {
+        return color;
+      }
+    }
+    return null;
+  };
+  const report = () => {
+    const color = declared() || painted();
+    if (!color || color === last) { return; }
+    last = color;
+    try {
+      window.webkit.messageHandlers.yggtermSurface.postMessage(JSON.stringify({
+        type: 'theme-color',
+        color: String(color),
+      }));
+    } catch (e) {}
+  };
+  const schedule = () => { try { requestAnimationFrame(report); } catch (e) { report(); } };
+  document.addEventListener('DOMContentLoaded', schedule);
+  window.addEventListener('load', schedule);
+  try {
+    new MutationObserver(schedule).observe(document.documentElement, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['content', 'media'],
+    });
+  } catch (e) {}
+  schedule();
+})();"#;
+
 /// A page asking to be closed. Which page is `href` + `script_opened`, said by
 /// the page itself — the channel cannot say (see `CLOSE_SHIM_JS`). `surface_id`
 /// is the surface whose channel it arrived on: the sender, or the sender's
@@ -110,6 +175,7 @@ fn attach_surface_message_channel(
     webview: &wry::WebView,
     surface_id: u64,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+    theme_colors: &Rc<RefCell<HashMap<u64, String>>>,
 ) {
     use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
     use wry::WebViewExtUnix as _;
@@ -120,6 +186,7 @@ fn attach_surface_message_channel(
     // Connect BEFORE registering — WebKit's own documented order, and the order
     // wry's ipc channel uses. Registering first can drop the first message.
     let close_requests = close_requests.clone();
+    let theme_colors = theme_colors.clone();
     manager.connect_script_message_received(Some(SURFACE_MESSAGE_HANDLER), move |_, result| {
         let Some(value) = result.js_value() else {
             return;
@@ -127,6 +194,21 @@ fn attach_surface_message_channel(
         let Ok(message) = serde_json::from_str::<serde_json::Value>(&value.to_string()) else {
             return;
         };
+        // The page's theme color (see `THEME_COLOR_SHIM_JS`). Recorded, never
+        // interpreted: the shell owns what a seam does with it.
+        if message.get("type").and_then(|kind| kind.as_str()) == Some("theme-color") {
+            if let Some(color) = message
+                .get("color")
+                .and_then(|color| color.as_str())
+                .map(str::trim)
+                .filter(|color| !color.is_empty())
+            {
+                theme_colors
+                    .borrow_mut()
+                    .insert(surface_id, color.to_string());
+            }
+            return;
+        }
         if message.get("type").and_then(|kind| kind.as_str()) != Some("close") {
             return;
         }
@@ -1038,7 +1120,21 @@ pub struct WebSurfaceHost {
     /// observe, never consume) that calls this when the pointer enters the
     /// window's top edge zone; the notifier forwards into the shell webview,
     /// which runs its normal reveal logic.
-    edge_motion: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    edge_motion: Rc<RefCell<Option<Rc<dyn Fn(SurfaceRevealEdge)>>>>,
+    /// THE surface WebKit has taken into element fullscreen, or `None`.
+    ///
+    /// One owner for "is a page on the whole screen right now", written only by
+    /// the engine's own `enter-fullscreen`/`leave-fullscreen` signals (see
+    /// `connect_fullscreen_signals`) and read by the shell's reconciler, which
+    /// suppresses every chrome claim against it and gives it the whole window.
+    /// A `Cell<Option<u64>>` and not a per-surface flag because fullscreen is
+    /// singular by construction — two pages cannot own the screen at once, and
+    /// a second encoding of that fact is a second thing that can disagree.
+    fullscreen: Rc<Cell<Option<u64>>>,
+    /// Each surface's last-reported page theme color, verbatim CSS text (see
+    /// `THEME_COLOR_SHIM_JS`). The shell reads it to paint the seam; nothing
+    /// here parses it.
+    theme_colors: Rc<RefCell<HashMap<u64, String>>>,
 }
 
 /// The top-edge motion zone (window coords, logical px) that forwards to the
@@ -1049,37 +1145,140 @@ pub struct WebSurfaceHost {
 /// over a maximized page.
 const GLASS_EDGE_REVEAL_ZONE_PX: f64 = 8.0;
 
-/// Observe pointer motion on a page webview and forward top-edge entry to the
+/// Who owns element-fullscreen after one engine signal.
+///
+/// The whole state machine, as a pure function, because the wiring that calls
+/// it lives inside a GTK signal closure no test can enter. Two rules:
+///
+/// * **Entering always wins.** WebKit emits `enter-fullscreen` for the view
+///   the page called `requestFullscreen()` on, and there is exactly one such
+///   view at a time — a second enter is the engine telling us the owner moved.
+/// * **Leaving is scoped to the owner.** A `leave-fullscreen` from a view that
+///   is NOT the owner (a sibling tab tearing down, a popup closing) must not
+///   drop the owner's fullscreen: that would restore the chrome over a page
+///   still painting full-bleed, which is precisely the border the user sees.
+pub(crate) fn fullscreen_owner_after(current: Option<u64>, id: u64, entering: bool) -> Option<u64> {
+    if entering {
+        Some(id)
+    } else if current == Some(id) {
+        None
+    } else {
+        current
+    }
+}
+
+/// Bind WebKit's element-fullscreen signals for surface `id`.
+///
+/// Both handlers return `false` ON PURPOSE. WebKitGTK's contract is "return
+/// TRUE to stop the default handler": the default handler is the one that
+/// fullscreens the view's TOPLEVEL WINDOW and drives WebKit's own fullscreen
+/// UI (the "press Esc to exit" notice, the Escape key binding that leaves
+/// again). Returning `true` would leave the page believing it is fullscreen
+/// with no window change and no way out but a page-side control. So the
+/// engine keeps its behaviour and this handler only RECORDS who owns the
+/// screen; the shell's reconciler reads that and gives the surface the whole
+/// window instead of its chrome-clamped rect.
+fn connect_fullscreen_signals(
+    webkit: &webkit2gtk::WebView,
+    id: u64,
+    fullscreen: &Rc<Cell<Option<u64>>>,
+) {
+    use webkit2gtk::WebViewExt as _;
+    {
+        let fullscreen = fullscreen.clone();
+        webkit.connect_enter_fullscreen(move |_| {
+            fullscreen.set(fullscreen_owner_after(fullscreen.get(), id, true));
+            false
+        });
+    }
+    {
+        let fullscreen = fullscreen.clone();
+        webkit.connect_leave_fullscreen(move |_| {
+            fullscreen.set(fullscreen_owner_after(fullscreen.get(), id, false));
+            false
+        });
+    }
+}
+
+/// Which window edge a pointer entered over a page.
+///
+/// A page owns its own edges now (no chrome claims a strip while collapsed),
+/// so the shell's DOM hover sensors are UNDER the webview on every edge — not
+/// just the top. This enum is how the engine layer tells the shell which
+/// sensor the pointer would have hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceRevealEdge {
+    Top,
+    Left,
+    Right,
+}
+
+/// Which edge zone a pointer position falls in, in WINDOW coordinates.
+///
+/// Pure so the classification is testable without a GtkWindow. `None` = the
+/// pointer is in the page's interior and no sensor is implicated. Top wins over
+/// the sides at a corner, matching the DOM stacking (the titlebar overlay is
+/// above the sidebars).
+fn surface_reveal_edge_at(
+    x: f64,
+    y: f64,
+    window_width: f64,
+    zone: f64,
+) -> Option<SurfaceRevealEdge> {
+    if y <= zone {
+        Some(SurfaceRevealEdge::Top)
+    } else if x <= zone {
+        Some(SurfaceRevealEdge::Left)
+    } else if window_width > 0.0 && x >= window_width - zone {
+        Some(SurfaceRevealEdge::Right)
+    } else {
+        None
+    }
+}
+
+/// Observe pointer motion on a page webview and forward EDGE entry to the
 /// shell's reveal logic. `Propagation::Proceed` always — the page's own input
-/// is untouched; this only watches. Gated at EVENT time on the glass being
-/// armed (a runtime demotion silences it without disconnecting anything).
-/// Fires on the out→in zone transition only, mirroring `mouseenter`.
+/// is untouched; this only watches. Fires on the out→in transition per edge,
+/// mirroring `mouseenter`.
+///
+/// NOT gated on the glass. It used to be, because under legacy stacking the
+/// reconciler clamped the page away from each collapsed hover sensor and the
+/// shell webview saw the motion itself. That clamp is gone (it WAS the reserved
+/// strip around every page), so on both stackings the sensors live under the
+/// webview and this observer is the only thing that can reach them. Without it,
+/// exact fit would have cost the user the auto-hidden titlebar, tree and rail
+/// over every page — trading one bug for a worse one.
 fn connect_edge_motion_observer(
     webkit: &webkit2gtk::WebView,
     container: &gtk::Fixed,
-    glass: &Rc<RefCell<Option<gtk::Widget>>>,
-    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn(SurfaceRevealEdge)>>>>,
 ) {
-    let glass = glass.clone();
     let edge_motion = edge_motion.clone();
     let container = container.clone();
-    let in_zone = Cell::new(false);
+    let in_zone: Cell<Option<SurfaceRevealEdge>> = Cell::new(None);
     // The webview was just built (unrealized): motion events can still be
     // added. WebKit requests them itself for hover, but do not depend on it.
     webkit.add_events(gdk::EventMask::POINTER_MOTION_MASK);
-    webkit.connect_motion_notify_event(move |_, event| {
-        if glass.borrow().is_some() {
-            let (_, y) = event.position();
-            let window_y = container.margin_top() as f64 + y;
-            let zone = window_y <= GLASS_EDGE_REVEAL_ZONE_PX;
-            if zone && !in_zone.get() {
-                let notify = edge_motion.borrow().clone();
-                if let Some(notify) = notify {
-                    notify();
+    webkit.connect_motion_notify_event(move |view, event| {
+        let (x, y) = event.position();
+        let window_width = view
+            .toplevel()
+            .map(|top| top.allocation().width() as f64)
+            .unwrap_or(0.0);
+        let edge = surface_reveal_edge_at(
+            container.margin_start() as f64 + x,
+            container.margin_top() as f64 + y,
+            window_width,
+            GLASS_EDGE_REVEAL_ZONE_PX,
+        );
+        if let Some(edge) = edge {
+            if in_zone.get() != Some(edge) {
+                if let Some(notify) = edge_motion.borrow().clone() {
+                    notify(edge);
                 }
             }
-            in_zone.set(zone);
         }
+        in_zone.set(edge);
         gtk::glib::Propagation::Proceed
     });
 }
@@ -1795,8 +1994,10 @@ fn build_popup_webview(
     glass: &Rc<RefCell<Option<gtk::Widget>>>,
     surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
-    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn(SurfaceRevealEdge)>>>>,
     backdrop_rgb: &Rc<Cell<Option<(u8, u8, u8)>>>,
+    fullscreen: &Rc<Cell<Option<u64>>>,
+    theme_colors: &Rc<RefCell<HashMap<u64, String>>>,
     popup_id: u64,
     opener: &webkit2gtk::WebView,
     opener_bounds: (i32, i32, i32, i32),
@@ -1831,7 +2032,8 @@ fn build_popup_webview(
         // NO url: WebKit loads the request that asked for this window into the
         // view we hand back. Loading it ourselves would race that navigation.
         .with_related_view(opener.clone())
-        .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true);
+        .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
+        .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true);
     for script in userscripts {
         builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
     }
@@ -1851,17 +2053,20 @@ fn build_popup_webview(
     }
     // A popup replaces the page in the same rect: it needs the same top-edge
     // reveal forward as the page it covers.
-    connect_edge_motion_observer(&webview.webview(), &container, glass, edge_motion);
+    connect_edge_motion_observer(&webview.webview(), &container, edge_motion);
     // Gate 9: notice when the HUMAN takes this popup, so a queued agent batch
     // stops instead of landing behind them.
     connect_seat_input_observer(&webview.webview(), popup_id);
     // Same dialog guard as a page surface: a popup is just as invisible when the
     // surface it covers is stashed.
     connect_script_dialog_guard(&webview.webview(), popup_id);
+    // A popup is a page like any other: a video it fullscreens must fill the
+    // window, not the rect the opener happened to occupy.
+    connect_fullscreen_signals(&webview.webview(), popup_id, fullscreen);
     // `window.close()`: the page's own report (the engine will not tell us), plus
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
-    attach_surface_message_channel(&webview, popup_id, close_requests);
+    attach_surface_message_channel(&webview, popup_id, close_requests, theme_colors);
     let webkit = webview.webview();
     {
         let close_requests = close_requests.clone();
@@ -2061,12 +2266,31 @@ impl WebSurfaceHost {
             downloads_in_flight: Rc::new(RefCell::new(Vec::new())),
             next_transfer_id: Rc::new(Cell::new(1)),
             edge_motion: Rc::new(RefCell::new(None)),
+            fullscreen: Rc::new(Cell::new(None)),
+            theme_colors: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// The surface WebKit currently has in element fullscreen, if any.
+    ///
+    /// The reconciler's one question about fullscreen. It never asks a surface
+    /// "are you fullscreen" — the answer is singular and lives here.
+    pub fn fullscreen_surface(&self) -> Option<u64> {
+        self.fullscreen.get()
+    }
+
+    /// Surface `id`'s last-reported page theme color as CSS text, if the page
+    /// has declared or painted one yet.
+    pub fn page_theme_color(&self, id: u64) -> Option<String> {
+        self.theme_colors.borrow().get(&id).cloned()
     }
 
     /// Install the edge-motion forward target (the shell webview's reveal
     /// hook). Set once at host construction, before any surface opens.
-    pub(crate) fn set_edge_motion_notifier(&self, notify: impl Fn() + 'static) {
+    pub(crate) fn set_edge_motion_notifier(
+        &self,
+        notify: impl Fn(SurfaceRevealEdge) + 'static,
+    ) {
         *self.edge_motion.borrow_mut() = Some(Rc::new(notify));
     }
 
@@ -2295,6 +2519,9 @@ impl WebSurfaceHost {
             // what it hears — and it must hear it from the page, because the
             // engine never says a word.
             .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
+            // ...and every surface reports its THEME COLOR, so no shell pixel
+            // beside the page is ever a color the page did not choose.
+            .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -2331,6 +2558,8 @@ impl WebSurfaceHost {
             let glass = self.glass.clone();
             let edge_motion = self.edge_motion.clone();
             let backdrop_rgb = self.backdrop_rgb.clone();
+            let popup_fullscreen = self.fullscreen.clone();
+            let popup_theme_colors = self.theme_colors.clone();
             let ids = self.next_id.clone();
             let popup_scripts = userscripts.to_vec();
             let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
@@ -2361,6 +2590,8 @@ impl WebSurfaceHost {
                     &close_requests,
                     &edge_motion,
                     &backdrop_rgb,
+                    &popup_fullscreen,
+                    &popup_theme_colors,
                     popup_id,
                     &features.opener.webview,
                     bounds,
@@ -2521,12 +2752,7 @@ impl WebSurfaceHost {
         // shell's titlebar reveal (see `connect_edge_motion_observer`).
         {
             use wry::WebViewExtUnix as _;
-            connect_edge_motion_observer(
-                &webview.webview(),
-                &container,
-                &self.glass,
-                &self.edge_motion,
-            );
+            connect_edge_motion_observer(&webview.webview(), &container, &self.edge_motion);
             // Gate 9: real seat input on this surface preempts any agent batch
             // driving it. Attached here, next to the webview, because only this
             // layer can tell the agent's own injection from the human (the
@@ -2536,11 +2762,14 @@ impl WebSurfaceHost {
             // sibling on its profile) just because nothing is on screen to
             // answer it.
             connect_script_dialog_guard(&webview.webview(), id);
+            // Element fullscreen: the engine says who owns the screen, the
+            // reconciler gives that surface the whole window.
+            connect_fullscreen_signals(&webview.webview(), id, &self.fullscreen);
         }
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
         // the shell's call — a normal tab may not close itself.
-        attach_surface_message_channel(&webview, id, &self.close_requests);
+        attach_surface_message_channel(&webview, id, &self.close_requests, &self.theme_colors);
         {
             use webkit2gtk::WebViewExt as _;
             use wry::WebViewExtUnix as _;
@@ -2698,6 +2927,14 @@ impl WebSurfaceHost {
         // ids are reused, and a stale count would preempt the next agent batch
         // on the new surface for something the user did to the old one.
         forget_seat_input(id);
+        // Same rule for the two facts this surface owned. A destroyed webview
+        // emits no `leave-fullscreen`, so a fullscreen tab that is CLOSED would
+        // otherwise leave the whole chrome suppressed with no page to show for
+        // it; and a stale theme color would paint the next surface on this id
+        // in the dead page's brand.
+        self.fullscreen
+            .set(fullscreen_owner_after(self.fullscreen.get(), id, false));
+        self.theme_colors.borrow_mut().remove(&id);
     }
 
     /// Stash surface `id`: detach its container from the overlay WITHOUT
@@ -4949,6 +5186,179 @@ mod download_locks {
             !entry.contains("webkit2gtk::Download"),
             "the registry holds a `Download` handle again — dropping the last \
              reference to one inside its own signal handler is a use-after-free",
+        );
+    }
+}
+
+/// LOCKS for element fullscreen and the page theme colour — the two facts this
+/// engine layer learns from WebKit that the shell cannot observe for itself.
+///
+/// Neither signal can be raised without a live GtkWindow and a real page, so
+/// the STATE MACHINE is a pure function (`fullscreen_owner_after`) driven
+/// directly, and the WIRING — which signals are connected, which shim is
+/// injected, what a close cleans up — is scanned over PRODUCT lines only.
+#[cfg(test)]
+mod fullscreen_and_theme_locks {
+    use super::*;
+
+    fn product() -> String {
+        super::engine_visibility_locks::product_lines().join("\n")
+    }
+
+    #[test]
+    fn the_scan_is_not_reading_this_test_module() {
+        assert!(
+            !product().contains("the_scan_is_not_reading_this_test_module"),
+            "product_lines stopped skipping test modules — every scan below now self-satisfies"
+        );
+    }
+
+    // Entering always takes ownership: WebKit fullscreens exactly one view, and
+    // a second `enter-fullscreen` is the engine saying the owner moved.
+    #[test]
+    fn entering_fullscreen_takes_ownership_from_whoever_had_it() {
+        assert_eq!(fullscreen_owner_after(None, 7, true), Some(7));
+        assert_eq!(fullscreen_owner_after(Some(3), 7, true), Some(7));
+        assert_eq!(fullscreen_owner_after(Some(7), 7, true), Some(7));
+    }
+
+    // Leaving is SCOPED to the owner. A sibling tab tearing down (or a popup
+    // closing) emits `leave-fullscreen` too, and honouring it would restore the
+    // chrome over a page still painting full-bleed — the border, back again,
+    // for reasons the user could never connect to what they did.
+    #[test]
+    fn only_the_owner_can_end_fullscreen() {
+        assert_eq!(fullscreen_owner_after(Some(7), 7, false), None);
+        assert_eq!(
+            fullscreen_owner_after(Some(7), 3, false),
+            Some(7),
+            "a sibling leaving must not drop the owner's fullscreen"
+        );
+        assert_eq!(fullscreen_owner_after(None, 3, false), None);
+    }
+
+    // The wiring a pure function cannot reach: both signals connected for both
+    // kinds of view, the shim injected for both, and a close that cannot strand
+    // either fact.
+    #[test]
+    fn the_engine_signals_and_the_theme_shim_are_wired_to_every_view() {
+        let product = product();
+        for needle in [
+            // Both signals, and the deliberate `false` return that leaves
+            // WebKit's own fullscreen UI (window fullscreen, the Escape
+            // binding) doing its job.
+            "webkit.connect_enter_fullscreen(move |_| {",
+            "webkit.connect_leave_fullscreen(move |_| {",
+            "fullscreen.set(fullscreen_owner_after(fullscreen.get(), id, true));",
+            "fullscreen.set(fullscreen_owner_after(fullscreen.get(), id, false));",
+            // A normal tab AND a popup both get them.
+            "connect_fullscreen_signals(&webview.webview(), id, &self.fullscreen);",
+            "connect_fullscreen_signals(&webview.webview(), popup_id, fullscreen);",
+            // The theme-colour shim rides the same two builders.
+            ".with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)",
+            // ...and its reports are recorded rather than interpreted.
+            "if message.get(\"type\").and_then(|kind| kind.as_str()) == Some(\"theme-color\") {",
+            // A destroyed webview emits no `leave-fullscreen`, so close must
+            // release both facts itself.
+            ".set(fullscreen_owner_after(self.fullscreen.get(), id, false));",
+            "self.theme_colors.borrow_mut().remove(&id);",
+        ] {
+            assert!(
+                product.contains(needle),
+                "the fullscreen/theme wiring lost a call site: {needle}"
+            );
+        }
+        // Two builders inject the shim (`open` and `build_popup_webview`), and a
+        // page with no shim is a page whose colour we would have to guess.
+        assert_eq!(
+            product
+                .matches(".with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)")
+                .count(),
+            2,
+            "every view that can show a page must report its theme colour"
+        );
+    }
+
+    // With the reserved strip gone, a page covers EVERY hover sensor, so the
+    // observer has to classify all three edges — and it must not fire for the
+    // page's interior, which is where the pointer spends its life.
+    #[test]
+    fn every_auto_hide_edge_is_reachable_over_a_page_and_the_interior_is_not() {
+        let zone = GLASS_EDGE_REVEAL_ZONE_PX;
+        assert_eq!(
+            surface_reveal_edge_at(600.0, 2.0, 1920.0, zone),
+            Some(SurfaceRevealEdge::Top)
+        );
+        assert_eq!(
+            surface_reveal_edge_at(1.0, 500.0, 1920.0, zone),
+            Some(SurfaceRevealEdge::Left)
+        );
+        assert_eq!(
+            surface_reveal_edge_at(1919.0, 500.0, 1920.0, zone),
+            Some(SurfaceRevealEdge::Right)
+        );
+        assert_eq!(surface_reveal_edge_at(600.0, 500.0, 1920.0, zone), None);
+        // A corner belongs to the TOP, matching the DOM stacking (the titlebar
+        // overlay draws above the sidebars).
+        assert_eq!(
+            surface_reveal_edge_at(1.0, 1.0, 1920.0, zone),
+            Some(SurfaceRevealEdge::Top)
+        );
+        // An unknown window width must not manufacture a right-edge reveal at
+        // x = 0, which is the left edge's zone.
+        assert_eq!(
+            surface_reveal_edge_at(600.0, 500.0, 0.0, zone),
+            None,
+            "a width the toplevel would not report must not invent an edge"
+        );
+    }
+
+    // ...and the observer must be armed on BOTH stackings. It used to be gated
+    // on the glass, which was only safe while the legacy path clamped the page
+    // off each sensor — the clamp that WAS the reserved strip.
+    #[test]
+    fn the_edge_observer_is_not_gated_on_the_glass() {
+        let product = product();
+        assert!(
+            product.contains("connect_edge_motion_observer(&webview.webview(), &container, &self.edge_motion);"),
+            "the edge observer must be armed for every page surface"
+        );
+        let body_start = product
+            .find("fn connect_edge_motion_observer(")
+            .expect("the observer exists");
+        let body = &product[body_start..body_start + 2000];
+        assert!(
+            !body.contains("glass"),
+            "the edge observer went back to being glass-gated — under legacy              stacking that leaves every hover sensor unreachable over a page"
+        );
+    }
+
+    // The shim must read the page's DECLARED colour first and only then fall
+    // back to what it painted — a media-matched `theme-color` is the answer a
+    // browser trusts, and a dark-mode page states it there.
+    #[test]
+    fn the_theme_shim_prefers_the_declared_colour_over_the_painted_one() {
+        let declared = THEME_COLOR_SHIM_JS
+            .find("const declared")
+            .expect("the shim declares a theme-color reader");
+        let painted = THEME_COLOR_SHIM_JS
+            .find("const painted")
+            .expect("the shim declares a painted-background reader");
+        assert!(
+            declared < painted,
+            "the readers must be declared in trust order"
+        );
+        assert!(
+            THEME_COLOR_SHIM_JS.contains("declared() || painted()"),
+            "the shim must prefer the page's declared theme-color"
+        );
+        assert!(
+            THEME_COLOR_SHIM_JS.contains("window.matchMedia(media).matches"),
+            "a media-scoped theme-color must be matched, not taken blindly"
+        );
+        assert!(
+            THEME_COLOR_SHIM_JS.contains("new MutationObserver(schedule)"),
+            "an SPA that swaps its theme-color after first paint must be followed"
         );
     }
 }

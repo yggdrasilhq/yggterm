@@ -418,6 +418,63 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// The web surface WebKit currently has in ELEMENT FULLSCREEN, if any.
+    ///
+    /// Written only by the engine's own `enter-fullscreen`/`leave-fullscreen`
+    /// signals. The reconciler reads it to suppress every chrome claim against
+    /// that surface and hand it the whole window; nothing else may decide that
+    /// a page is fullscreen.
+    pub fn web_surface_fullscreen(&self) -> Option<u64> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.fullscreen_surface());
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        None
+    }
+
+    /// Surface `id`'s page theme color as the PAGE declared it (CSS text), if
+    /// it has said anything yet. The seam behind a page is painted from this.
+    pub fn web_surface_page_theme_color(&self, id: u64) -> Option<String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.page_theme_color(id));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
     /// How many distinct engine `WebContext`s currently back the open web
     /// surfaces. With N tabs on one session this must read 1: the context is the
     /// unit of process pool, network process and cookie jar, and one per tab is
