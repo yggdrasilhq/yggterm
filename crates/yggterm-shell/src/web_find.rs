@@ -10,8 +10,10 @@
 //! * the **position cycle** (`3/17` -> `4/17` -> ... -> `1/17`), because
 //!   WebKit's find controller does not expose which match is selected — nobody
 //!   does, so somebody has to count, and it is here;
-//! * the **keyboard-ownership contract**: which keys the bar claims, and the
-//!   promise that it BORROWS focus and gives it back to whoever held it.
+//! * the **keyboard-ownership contract**: which keys the bar claims, the
+//!   promise that it BORROWS focus and gives it back to whoever held it, and
+//!   [`agent_find_admission`] — whether the `web find` verb may touch a bar at
+//!   all, because a bar with the keyboard in it belongs to the person typing.
 //!
 //! Nothing here talks to the engine. The engine call site takes the mask, the
 //! cap and the step from here and returns the engine's number verbatim — so a
@@ -117,10 +119,14 @@ pub fn find_options_for(step: FindStep) -> u32 {
 /// `0` means "no match selected" and is the only value a zero-match page can
 /// hold.
 pub fn advance_position(position: u32, count: u32, step: FindStep) -> u32 {
-    if count == 0 || matches!(step, FindStep::Close) {
+    if count == 0 {
         return 0;
     }
     match step {
+        // Close is the ONLY arm that says "no match is selected"; there is no
+        // second early return saying the same thing, so the two can never
+        // disagree about what a closed bar's position is.
+        FindStep::Close => 0,
         FindStep::Search => 1,
         FindStep::Next => {
             if position >= count {
@@ -136,7 +142,6 @@ pub fn advance_position(position: u32, count: u32, step: FindStep) -> u32 {
                 position - 1
             }
         }
-        FindStep::Close => 0,
     }
 }
 
@@ -217,6 +222,45 @@ pub enum FindRoute {
     NotOurs,
 }
 
+/// What an AGENT-driven find (`server app web find`) is allowed to do to a bar
+/// that may already be on screen.
+///
+/// The verb is a SECOND driver of a bar a human may be holding, and the bar's
+/// focus flag is what the terminal input gate is keyed on
+/// ([`find_bar_blocks_terminal_input`]). So an agent that opened/retargeted a
+/// FOCUSED bar would do three things at once, none of them asked for: rewrite
+/// the query under the user's fingers, drop `bar_focused` while their keyboard
+/// is still in the field, and — because of that flag — REOPEN the PTY gate
+/// underneath, so every letter of the human's search also reaches the shell.
+/// That is verbatim the leak the focus lock exists to forbid, so the verb is
+/// not allowed to reach a bar that holds the keyboard at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentFindAdmission {
+    /// No bar, or a bar nobody is typing in: the verb may open it, retarget it
+    /// and step it.
+    Drive,
+    /// The field has the keyboard. Hands off — this bar is a person's.
+    HumanHoldsTheBar,
+}
+
+/// The refusal an agent is told, verbatim, when it asks to drive a bar a human
+/// is typing in. One string, so the verb's `reason` and the lock that proves the
+/// refusal cannot drift apart.
+pub const AGENT_FIND_REFUSED_HUMAN_HOLDS_THE_BAR: &str =
+    "the find bar on this surface has the keyboard: a person is typing in it. \
+     An agent-driven find may not retarget a focused bar — it would rewrite \
+     their query and reopen the terminal input gate beneath them. Retry when \
+     the field is not focused, or drive `--close` first.";
+
+/// THE admission rule. Reads exactly one fact — does the field hold the
+/// keyboard — because that is the fact the terminal gate is keyed on.
+pub fn agent_find_admission(find: Option<&WebFindState>) -> AgentFindAdmission {
+    match find {
+        Some(find) if find.bar_focused => AgentFindAdmission::HumanHoldsTheBar,
+        _ => AgentFindAdmission::Drive,
+    }
+}
+
 /// Does an open find bar block the terminal beneath from accepting input?
 ///
 /// **Only while its input is focused.** An open-but-unfocused bar (the user
@@ -238,6 +282,13 @@ pub fn find_bar_blocks_terminal_input(bar_focused: bool) -> bool {
 /// `web find` verb reports the recent ring back to the caller, so an agent can
 /// falsify "the find bar stole my focus" from the outside with the same evidence
 /// the unit lock reads.
+///
+/// **A `FocusMoved` is written by the code that ORDERS the move and nowhere
+/// else** — see [`borrow_focus_for_bar`] and [`return_focus_to_lender`]. State
+/// bookkeeping (opening the bar, closing it) does not write one, because a bar
+/// can be opened without the keyboard ever moving: that is exactly what the
+/// agent verb does, and a ledger that announced a focus move on that path would
+/// be a second encoding of focus movement that already disagreed with the DOM.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindTraceEvent {
     /// The bar opened over `session`, borrowing from `origin`.
@@ -277,6 +328,43 @@ impl FindTraceEvent {
     pub fn released_a_key(&self) -> bool {
         matches!(self, FindTraceEvent::KeyReleased { .. })
     }
+}
+
+/// The `reason` on the ONE move the bar makes when it takes the keyboard.
+pub const FIND_FOCUS_BORROW_REASON: &str = "find_bar_open";
+
+/// The `reason` on the ONE move the bar makes when it gives the keyboard back.
+pub const FIND_FOCUS_RETURN_REASON: &str = "find_bar_close";
+
+/// Order the bar's borrow of the keyboard, and record it.
+///
+/// The returned target is what the caller must actually focus — the order and
+/// the ledger entry are produced by the same call, so the published trace
+/// cannot describe a move nobody made, and a mover cannot make one the trace
+/// never saw. The shell's `focus_web_find_input` is the only caller; a path
+/// that opens a bar WITHOUT touching the keyboard (the agent verb) never gets
+/// here and therefore never publishes a focus move.
+#[must_use]
+pub fn borrow_focus_for_bar() -> FindFocusTarget {
+    trace(FindTraceEvent::FocusMoved {
+        to: FindFocusTarget::FindInput,
+        reason: FIND_FOCUS_BORROW_REASON,
+    });
+    FindFocusTarget::FindInput
+}
+
+/// Order the give-back to the recorded lender, and record it. Same contract as
+/// [`borrow_focus_for_bar`]: the caller focuses what this returns, and nothing
+/// else, so "the bar gave the keyboard back to whoever lent it" is one decision
+/// with one witness.
+#[must_use]
+pub fn return_focus_to_lender(origin: &FindFocusOrigin) -> FindFocusTarget {
+    let to = FindFocusTarget::from(origin);
+    trace(FindTraceEvent::FocusMoved {
+        to: to.clone(),
+        reason: FIND_FOCUS_RETURN_REASON,
+    });
+    to
 }
 
 /// How many events the ring keeps. Big enough for a whole open->type->close
@@ -360,15 +448,16 @@ pub fn engine_request_for(
 }
 
 impl WebFindState {
-    /// Open the bar over `session`, borrowing the keyboard from `origin`.
+    /// Open the bar over `session`, recording who the keyboard would be
+    /// borrowed FROM.
+    ///
+    /// This does not move focus and does not claim one was moved: the keyboard
+    /// changes hands only when somebody calls [`borrow_focus_for_bar`], which
+    /// the human's Ctrl+F path does and the agent verb deliberately does not.
     pub fn open(session: &str, origin: FindFocusOrigin) -> WebFindState {
         trace(FindTraceEvent::Opened {
             session: session.to_string(),
             origin: origin.clone(),
-        });
-        trace(FindTraceEvent::FocusMoved {
-            to: FindFocusTarget::FindInput,
-            reason: "find_bar_open",
         });
         WebFindState {
             query: String::new(),
@@ -452,16 +541,15 @@ impl WebFindState {
         });
     }
 
-    /// Close the bar and give the keyboard back to whoever lent it.
+    /// Close the bar and return the lender, so the caller can hand the keyboard
+    /// back.
     ///
-    /// Returns the origin so the caller can perform the actual focus move; the
-    /// trace records the move it is REQUIRED to make, and the focus lock reads
-    /// that the move went to the origin and nowhere else.
+    /// The give-back is not recorded here: it is recorded by
+    /// [`return_focus_to_lender`], which is the call that orders it and the one
+    /// the caller must make. A close that forgot to hand the keyboard back
+    /// would then be VISIBLE in the ledger as a missing move, rather than
+    /// papered over by a bookkeeping entry claiming it happened.
     pub fn close(self, session: &str) -> FindFocusOrigin {
-        trace(FindTraceEvent::FocusMoved {
-            to: FindFocusTarget::from(&self.origin),
-            reason: "find_bar_close",
-        });
         trace(FindTraceEvent::Closed {
             session: session.to_string(),
         });
@@ -788,6 +876,16 @@ mod tests {
         // something to steal.
         let origin = FindFocusOrigin::Terminal(SESSION.to_string());
         let mut state = WebFindState::open(SESSION, origin.clone());
+        // The human's Ctrl+F path takes the keyboard here — the shell's
+        // `focus_web_find_input` calls this and nothing else records a move
+        // (locked in `shell::tests::the_find_focus_ledger_is_written_only_where
+        // _focus_is_actually_moved`).
+        assert_eq!(borrow_focus_for_bar(), FindFocusTarget::FindInput);
+
+        // The flag the terminal gate is keyed on, sampled after every step of
+        // the burst: a bar that dropped it mid-word would reopen the PTY gate
+        // underneath while the keyboard was still in the field.
+        let mut state_focus_flag_held_all_burst = state.bar_focused;
 
         for ch in "yggterm".chars() {
             let key = FindKey::Char(ch.to_string());
@@ -799,6 +897,7 @@ mod tests {
                 state.note_engine_step(step, &query);
                 state.apply_engine_count(step, &query, PLANTED);
             }
+            state_focus_flag_held_all_burst &= state.bar_focused;
         }
         assert_eq!(state.query, NEEDLE);
 
@@ -813,6 +912,7 @@ mod tests {
             FindRoute::Bar(FindKeyAction::Prev)
         );
         state.apply_engine_count(FindStep::Prev, NEEDLE, PLANTED);
+        state_focus_flag_held_all_burst &= state.bar_focused;
 
         // Escape closes.
         assert_eq!(
@@ -823,6 +923,12 @@ mod tests {
         assert_eq!(
             restored, origin,
             "close must return the keyboard to its lender"
+        );
+        // And the shell's `restore_focus_after_web_find` performs exactly that
+        // give-back, through the one call that records it.
+        assert_eq!(
+            return_focus_to_lender(&restored),
+            FindFocusTarget::Terminal(SESSION.to_string())
         );
 
         let events = trace_snapshot();
@@ -842,14 +948,9 @@ mod tests {
             .expect("the burst must contain the open");
         let gave_back_at = events
             .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    FindTraceEvent::FocusMoved {
-                        reason: "find_bar_close",
-                        ..
-                    }
-                )
+            .position(|event| match event {
+                FindTraceEvent::FocusMoved { reason, .. } => *reason == FIND_FOCUS_RETURN_REASON,
+                _ => false,
             })
             .expect("the burst must contain the give-back");
         assert!(
@@ -898,11 +999,16 @@ mod tests {
             "the bar may make exactly two focus moves: borrow, then give back"
         );
 
-        // (d) And while the bar held the keyboard, the terminal's own input
-        // gate was shut — the production predicate, not a restatement of it.
+        // (d) The gate half of "while the bar held the keyboard" is NOT
+        // restated here: `find_bar_blocks_terminal_input` is the identity on
+        // its argument, so asserting it in this file would prove nothing about
+        // the terminal. The real gate lock drives the production predicate with
+        // the bar's flag in it —
+        // `shell::tests::a_focused_find_bar_shuts_the_terminal_input_gate`.
         assert!(
-            find_bar_blocks_terminal_input(true),
-            "a focused find bar must shut the terminal input gate"
+            state_focus_flag_held_all_burst,
+            "the bar's own focus flag dropped mid-burst: the gate beneath would \
+             have reopened while the field still had the keyboard"
         );
     }
 
@@ -927,6 +1033,159 @@ mod tests {
         assert!(
             !find_bar_blocks_terminal_input(false),
             "an open-but-unfocused bar must not wedge terminal input"
+        );
+    }
+
+    // -- LOCK 5: nothing narrows the engine's count, ANYWHERE ---------------
+
+    /// The count the user reads is the engine's number, at every point it is
+    /// handled: the cap it is asked with, and the field it is STORED in.
+    ///
+    /// Locking only the cap (or only the call site that passes it) leaves the
+    /// single writer of the number free to narrow it — `self.match_count =
+    /// count.min(100)` in [`WebFindState::apply_engine_count`] passed the whole
+    /// suite before this lock existed. So the property is asserted where the
+    /// number lives, not merely where it travels.
+    #[test]
+    fn nothing_narrows_the_engines_count_between_the_engine_and_the_bar() {
+        // (a) The cap can never be REACHED, because WebKit reports the cap as
+        // if it were the total. `u32::MAX` is the only value with that
+        // property; 1000 is a lie on any page with 1001 matches.
+        assert_eq!(
+            FIND_MAX_MATCH_COUNT,
+            u32::MAX,
+            "the match cap must be unreachable: WebKit reports the cap AS IF it \
+             were the total, so a finite cap is a page-length-dependent lie \
+             with no 'at least' anywhere in the API"
+        );
+
+        // (b) A page with far more matches than any plausible cap still counts
+        // true through the option mask and cap production actually hands over.
+        let long_page = format!("<body>{}</body>", format!("{NEEDLE} ").repeat(5_000));
+        let long_text = fixture_text(&long_page);
+        assert_eq!(
+            engine_counted_matches(
+                &long_text,
+                NEEDLE,
+                find_options_for(FindStep::Search),
+                FIND_MAX_MATCH_COUNT,
+            ),
+            5_000,
+            "a 5000-match page must report 5000 — any cap between 1 and 4999 \
+             reports itself instead and the bar draws a confident wrong number"
+        );
+
+        // (c) And the SINGLE WRITER of the number the bar draws stores it
+        // verbatim, for every magnitude — this is the clause that a `.min(N)`
+        // inside `apply_engine_count` cannot survive.
+        for count in [0, 1, 17, 99, 100, 101, 999, 1_000, 1_001, 65_536, u32::MAX] {
+            let mut state = WebFindState::open("local://fixture", FindFocusOrigin::Page);
+            state.query = NEEDLE.to_string();
+            state.apply_engine_count(FindStep::Search, NEEDLE, count);
+            assert_eq!(
+                state.match_count, count,
+                "the engine said {count}; the bar must say {count} and never a \
+                 narrowed number of its own"
+            );
+            let position = if count == 0 { 0 } else { 1 };
+            assert_eq!(state.label(), format!("{position}/{count}"));
+        }
+    }
+
+    // -- LOCK 6: an agent may not take a bar a human is holding --------------
+
+    /// The admission rule the `web find` verb obeys.
+    ///
+    /// The verb's own state mutation is locked in
+    /// `shell::tests::an_agent_driven_find_never_takes_a_focused_bar_from_the_human`,
+    /// which drives the real `ShellState` and the real terminal gate. This one
+    /// locks the RULE: focused means hands off, and nothing else does.
+    #[test]
+    fn an_agent_may_not_drive_a_find_bar_that_holds_the_keyboard() {
+        assert_eq!(
+            agent_find_admission(None),
+            AgentFindAdmission::Drive,
+            "no bar at all: the verb is the only driver there is"
+        );
+
+        let lender = FindFocusOrigin::Terminal("local://ws".to_string());
+        let mut human = WebFindState::open("local://ws", lender);
+        human.query = "user needle".to_string();
+        assert!(human.bar_focused, "a bar the human summoned holds the keyboard");
+        assert_eq!(
+            agent_find_admission(Some(&human)),
+            AgentFindAdmission::HumanHoldsTheBar,
+            "an agent-driven find must not reach a bar whose field has the \
+             keyboard: it would rewrite the query under their fingers and \
+             reopen the terminal gate beneath them"
+        );
+
+        // The user clicked away: the bar is on screen, holding nothing.
+        human.bar_focused = false;
+        assert_eq!(
+            agent_find_admission(Some(&human)),
+            AgentFindAdmission::Drive,
+            "an open-but-unfocused bar claims nothing, so there is nothing to \
+             take from anyone"
+        );
+    }
+
+    // -- LOCK 7: the published ledger records only moves that were made ------
+
+    /// Opening a bar is not a focus move, and the ledger must not say it was.
+    ///
+    /// This is the exact divergence that made the verb's published
+    /// `focus_trace` a lie: the agent's cold find opened a bar (never touching
+    /// the keyboard) and the ring nonetheless carried `FocusMoved { to:
+    /// FindInput }`. The move is now recorded by the call that ORDERS it, so
+    /// the two cannot disagree.
+    #[test]
+    fn the_ledger_records_a_focus_move_only_when_one_is_ordered() {
+        trace_clear();
+        // The agent's path: open a bar, leave it unfocused, give it a query.
+        let mut agent = WebFindState::open("local://ws", FindFocusOrigin::Chrome);
+        agent.bar_focused = false;
+        agent.query = "agent needle".to_string();
+        agent.note_engine_step(FindStep::Search, &agent.query);
+        agent.apply_engine_count(FindStep::Search, "agent needle", 3);
+        let moves: Vec<_> = trace_snapshot()
+            .into_iter()
+            .filter(|event| matches!(event, FindTraceEvent::FocusMoved { .. }))
+            .collect();
+        assert!(
+            moves.is_empty(),
+            "nothing moved the keyboard on this path, and the ledger the verb \
+             PUBLISHES must not claim otherwise: {moves:?}"
+        );
+
+        // The human's path: the shell's `focus_web_find_input` orders the
+        // borrow through this call, and that is when the ledger gains a move.
+        trace_clear();
+        assert_eq!(borrow_focus_for_bar(), FindFocusTarget::FindInput);
+        let origin = FindFocusOrigin::Terminal("local://ws".to_string());
+        assert_eq!(
+            return_focus_to_lender(&origin),
+            FindFocusTarget::Terminal("local://ws".to_string()),
+            "the give-back goes to the recorded lender and the caller focuses \
+             what this returns — one decision, one witness"
+        );
+        let moves: Vec<_> = trace_snapshot()
+            .into_iter()
+            .filter(|event| matches!(event, FindTraceEvent::FocusMoved { .. }))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![
+                FindTraceEvent::FocusMoved {
+                    to: FindFocusTarget::FindInput,
+                    reason: FIND_FOCUS_BORROW_REASON,
+                },
+                FindTraceEvent::FocusMoved {
+                    to: FindFocusTarget::Terminal("local://ws".to_string()),
+                    reason: FIND_FOCUS_RETURN_REASON,
+                },
+            ],
+            "the two moves the bar may make, recorded where they are ordered"
         );
     }
 
