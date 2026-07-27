@@ -549,6 +549,40 @@ impl DesktopService {
             .unwrap_or_default()
     }
 
+    /// Drain the download transitions since the last tick — one `Started` and
+    /// exactly one terminal event per transfer. The shell is what turns them
+    /// into toasts and trace rows; the host keeps no history of its own.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_downloads(&self) -> Vec<crate::web_surface::SurfaceDownloadEvent> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_downloads())
+            .unwrap_or_default()
+    }
+
+    /// How many downloads are running right now, across every surface. A
+    /// transfer outlives the tab that started it, so this can be non-zero with
+    /// no surface open.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn web_surface_downloads_in_flight(&self) -> usize {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.downloads_in_flight())
+            .unwrap_or_default()
+    }
+
     /// Take the next native surface id. The HOST allocates them: it is no longer
     /// the only thing that creates surfaces (a popup is born inside a WebKit
     /// signal handler), and two allocators would eventually collide.
