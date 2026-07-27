@@ -3505,6 +3505,29 @@ fn web_surface_background_hold_ms_for(
     configured_hold_ms
 }
 
+/// The default for BOTH holds below. One number, because a backgrounded SESSION
+/// and a background TAB are the same claim at two granularities — "nobody is
+/// being shown this, and has not been for a while" — and two defaults that drift
+/// apart would be two answers to one question.
+const WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS: u64 = 600;
+
+/// Read one `*_secs` hold out of `~/.yggterm/web-surface.json`, the ONE
+/// web-surface knob file (see [`web_surface_config_string`]). One reader for
+/// every hold, so a second knob can never grow a second parse with a different
+/// fallback or a different unit.
+fn web_surface_config_hold_ms(key: &str, default_secs: u64) -> u64 {
+    let default_ms = default_secs.saturating_mul(1000);
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return default_ms;
+    };
+    std::fs::read_to_string(home.join("web-surface.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|config| config.get(key).and_then(Value::as_u64))
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or(default_ms)
+}
+
 fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
     // Under memory pressure, reclaim aggressively regardless of the configured
     // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
@@ -3512,16 +3535,32 @@ fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
     if reclaim_pressured {
         return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
-    let default_ms = 600_000;
-    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
-        return default_ms;
-    };
-    std::fs::read_to_string(home.join("web-surface.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|config| config.get("background_hold_secs").and_then(Value::as_u64))
-        .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or(default_ms)
+    web_surface_config_hold_ms(
+        "background_hold_secs",
+        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
+    )
+}
+
+/// How long a BACKGROUND TAB of a session the user IS looking at stays alive
+/// before its webview is destroyed. `~/.yggterm/web-surface.json`
+/// `{"tab_background_hold_secs": N}`; default 600, 0 = destroy as soon as the
+/// tab leaves the screen.
+///
+/// This is the knob a 100-tab browsing day turns down. Ninety-nine background
+/// tabs of the front session used to hold ninety-nine live WebKit web processes
+/// for the whole life of the GUI; with a hold they cost only the tabs actually
+/// touched inside the window, and a reclaimed tab comes back through the same
+/// lazy-create path a never-visited one does (its URL and title live in the tab
+/// model and on disk — see [`SavedWebTab`] — so what returns is the page, not a
+/// blank).
+fn web_surface_tab_background_hold_ms(reclaim_pressured: bool) -> u64 {
+    if reclaim_pressured {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+    }
+    web_surface_config_hold_ms(
+        "tab_background_hold_secs",
+        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
+    )
 }
 
 /// The engine's live "is this page playing audio" answer, as the reclaim plan
@@ -3537,6 +3576,102 @@ trait WebSurfaceMediaProbe {
     fn is_playing_audio(&self, native_id: u64) -> bool;
 }
 
+/// WHY a realized surface is in this pass's reclaim set.
+///
+/// A label on one object, not a second policy: both kinds run under the SAME
+/// machinery — same pressure predicate, same thrash guard, same audio veto, same
+/// lease arithmetic — and differ only in which configured hold applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum WebSurfaceBackgroundReason {
+    /// The whole SESSION is not active-visible on this client.
+    Session,
+    /// The session IS active-visible; this TAB is not the one on screen.
+    Tab,
+}
+
+impl WebSurfaceBackgroundReason {
+    /// The trace's word for this reason. A `native_close` that cannot say which
+    /// domain reclaimed it leaves the per-tab reclaim invisible in telemetry.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session_backgrounded",
+            Self::Tab => "tab_backgrounded",
+        }
+    }
+}
+
+/// Is this tab the one ON SCREEN for its session?
+///
+/// The state-authoritative twin of [`web_surface_tab_place_rect`]: a split pane
+/// PINNED to this tab wins, otherwise the surface's own page area shows the
+/// ACTIVE tab. It has to be its own function because the reclaim pass runs BEFORE
+/// the tick's DOM geometry eval and so has no rects to test — and it has to agree
+/// with the placement rule exactly, or the set of surfaces that get painted and
+/// the set that get reclaimed disagree about who is on screen. The two are locked
+/// together by `the_on_screen_predicate_agrees_with_the_place_rect_rule`.
+fn web_surface_tab_on_screen(split_pinned: bool, tab_id: u64, active_tab: u64) -> bool {
+    split_pinned || tab_id == active_tab
+}
+
+/// WHICH realized surfaces this tick's reclaim pass may act on — the reclaim
+/// DOMAIN, at (session, tab) granularity.
+///
+/// ⛔ **The gap this closes.** The domain used to be filtered by SESSION alone,
+/// so every tab of the session the user is looking at was exempt forever. A
+/// hundred visited tabs meant a hundred live WebKit web processes for the life of
+/// the GUI, however long ago the user last looked at ninety-nine of them. Lazy
+/// creation already keeps a never-visited tab free; nothing ever gave a VISITED
+/// one back.
+///
+/// A realized surface is a candidate unless someone is being SHOWN it:
+///
+///   - its session is not active-visible ⇒ candidate ([`Session`]). Deliberately
+///     NOT narrowed by the tab exemptions below: a split-pinned tab of a
+///     backgrounded session is off screen like every other surface of that
+///     session, and reclaiming it is shipped behaviour this must not regress;
+///   - its session IS active-visible and it is not the tab on screen ⇒ candidate
+///     ([`Tab`]);
+///   - it IS the tab on screen ⇒ never a candidate. Everything this pass stashes
+///     is hidden from its engine unconditionally, so this exemption is the only
+///     thing standing between the throttle and the page the user is reading.
+///
+/// A session that is active-visible but whose active tab is unknown yields NO
+/// candidates: the pass must never act on a surface it cannot classify.
+///
+/// Leases and audio are NOT exemptions here, and must not become ones. They are
+/// claims the PLAN already honours — a lease only ever extends the hold
+/// ([`web_surface_reap_due`] takes the LATER of the two), audio vetoes the
+/// destroy outright — and encoding them a second time here would be two answers
+/// to one question. Being a candidate is not being reaped.
+///
+/// Pure and sorted: the pass's order (which surface is destroyed first, what the
+/// trace says) must not follow a `HashMap`'s iteration order.
+///
+/// [`Session`]: WebSurfaceBackgroundReason::Session
+/// [`Tab`]: WebSurfaceBackgroundReason::Tab
+fn web_surface_background_candidates(
+    applied_keys: &[(String, u64)],
+    active_visible_sessions: &std::collections::HashSet<String>,
+    active_tab_by_session: &HashMap<String, u64>,
+    split_pinned_tabs: &std::collections::HashSet<(String, u64)>,
+) -> Vec<((String, u64), WebSurfaceBackgroundReason)> {
+    let mut candidates: Vec<((String, u64), WebSurfaceBackgroundReason)> = applied_keys
+        .iter()
+        .filter_map(|key| {
+            let (session, tab_id) = key;
+            if !active_visible_sessions.contains(session.as_str()) {
+                return Some((key.clone(), WebSurfaceBackgroundReason::Session));
+            }
+            let active_tab = active_tab_by_session.get(session.as_str())?;
+            let on_screen =
+                web_surface_tab_on_screen(split_pinned_tabs.contains(key), *tab_id, *active_tab);
+            (!on_screen).then(|| (key.clone(), WebSurfaceBackgroundReason::Tab))
+        })
+        .collect();
+    candidates.sort();
+    candidates
+}
+
 /// One backgrounded surface, as the reclaim policy sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSurfaceBackgroundInput {
@@ -3548,6 +3683,8 @@ struct WebSurfaceBackgroundInput {
     lease_until_ms: Option<u64>,
     /// Reaps of this same surface inside the thrash window.
     recent_reaps: u32,
+    /// Which domain put it here, and therefore which configured hold applies.
+    reason: WebSurfaceBackgroundReason,
 }
 
 /// What one reclaim pass decides for one backgrounded surface.
@@ -3577,6 +3714,10 @@ struct WebSurfaceBackgroundDecision {
     action: WebSurfaceBackgroundAction,
     hold_ms: u64,
     media_active: bool,
+    /// Which domain claimed it (and therefore which configured hold produced
+    /// `hold_ms`). Carried into the trace so per-tab reclaim is answerable from
+    /// telemetry instead of inferred from a session path.
+    reason: WebSurfaceBackgroundReason,
 }
 
 /// One pass's decisions plus the per-pass reading that produced them. The trace
@@ -3602,12 +3743,14 @@ struct WebSurfaceBackgroundPlan {
 /// its backgrounded surfaces, and applies what this returns. Which pressure
 /// reading is consulted and which surface's audio is probed are decided HERE, in
 /// a function a test can drive end to end.
+#[allow(clippy::too_many_arguments)]
 fn web_surface_background_plan(
     now_ms: u64,
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
     configured_hold_ms: u64,
+    configured_tab_hold_ms: u64,
     surfaces: &[WebSurfaceBackgroundInput],
     media: &dyn WebSurfaceMediaProbe,
 ) -> WebSurfaceBackgroundPlan {
@@ -3619,8 +3762,15 @@ fn web_surface_background_plan(
     let decisions = surfaces
         .iter()
         .map(|surface| {
+            // Which configured hold applies is decided HERE, from the domain
+            // that produced the candidate — not by the loop, which would then
+            // hold a policy it cannot be tested on.
+            let configured = match surface.reason {
+                WebSurfaceBackgroundReason::Session => configured_hold_ms,
+                WebSurfaceBackgroundReason::Tab => configured_tab_hold_ms,
+            };
             let hold_ms = web_surface_background_hold_ms_for(
-                configured_hold_ms,
+                configured,
                 reclaim_pressured,
                 surface.recent_reaps,
             );
@@ -3661,6 +3811,7 @@ fn web_surface_background_plan(
                 action,
                 hold_ms,
                 media_active,
+                reason: surface.reason,
             }
         })
         .collect();
@@ -3707,20 +3858,22 @@ trait WebSurfaceBackgroundHost: WebSurfaceMediaProbe {
 ///
 /// Returns the plan so the caller can report it; the caller must not re-derive
 /// anything from it, or the trace could describe a decision that was not taken.
+#[allow(clippy::too_many_arguments)]
 fn web_surface_reclaim_background_pass(
     now_ms: u64,
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
     configured_hold_ms: u64,
-    backgrounded: &[(String, u64)],
+    configured_tab_hold_ms: u64,
+    backgrounded: &[((String, u64), WebSurfaceBackgroundReason)],
     applied: &mut HashMap<(String, u64), AppliedWebSurface>,
     lease_until_ms: &dyn Fn(&(String, u64)) -> Option<u64>,
     host: &mut dyn WebSurfaceBackgroundHost,
 ) -> WebSurfaceBackgroundPlan {
     let inputs: Vec<WebSurfaceBackgroundInput> = backgrounded
         .iter()
-        .filter_map(|key| {
+        .filter_map(|(key, reason)| {
             let entry = applied.get(key)?;
             Some(WebSurfaceBackgroundInput {
                 key: key.clone(),
@@ -3732,6 +3885,7 @@ fn web_surface_reclaim_background_pass(
                 // it again reclaims nothing while costing a fresh web process.
                 // See web_surface_background_hold_ms_for.
                 recent_reaps: web_surface_recent_reaps(key, now_ms),
+                reason: *reason,
             })
         })
         .collect();
@@ -3741,6 +3895,7 @@ fn web_surface_reclaim_background_pass(
         pressure,
         forced_pressure,
         configured_hold_ms,
+        configured_tab_hold_ms,
         &inputs,
         &*host,
     );
@@ -3765,6 +3920,12 @@ fn web_surface_reclaim_background_pass(
                             "tab_id": key.1,
                             "native_id": entry.native_id,
                             "reason": "background_hold_expired",
+                            // WHICH domain reclaimed it: a whole backgrounded
+                            // session, or a background TAB of the session the
+                            // user is looking at. Without this the per-tab
+                            // reclaim is invisible in the trace — every close
+                            // looks like a session close.
+                            "domain": decision.reason.label(),
                             // How many times this surface has been reaped inside
                             // the thrash window. A number that keeps climbing is
                             // the treadmill: reclaim destroying a page that
@@ -3818,6 +3979,7 @@ fn web_surface_reclaim_background_pass(
                         "native_id": decision.native_id,
                         "hold_ms": hold_ms,
                         "detached": detach,
+                        "domain": decision.reason.label(),
                         "reclaim_pressured": reclaim_pressured,
                         "media_active": decision.media_active,
                     }),
@@ -4001,8 +4163,14 @@ mod web_surface_reclaim_locks {
         }
     }
 
-    /// One pass, with the boring arguments defaulted. Returns the plan; the
-    /// caller inspects `applied` and the host for what actually happened.
+    /// A tab hold no session-domain test ever wants to see. If the plan charges
+    /// a `Session` candidate the TAB hold, the assertions below read this number
+    /// instead of the configured one and say so.
+    const TAB_HOLD_SENTINEL_MS: u64 = 13_000;
+
+    /// One pass over surfaces that stand for whole BACKGROUNDED SESSIONS, with
+    /// the boring arguments defaulted. Returns the plan; the caller inspects
+    /// `applied` and the host for what actually happened.
     #[allow(clippy::too_many_arguments)]
     fn run_pass(
         now_ms: u64,
@@ -4013,7 +4181,11 @@ mod web_surface_reclaim_locks {
         leases: &HashMap<(String, u64), u64>,
         host: &mut FakeHost,
     ) -> WebSurfaceBackgroundPlan {
-        let mut backgrounded: Vec<(String, u64)> = applied.keys().cloned().collect();
+        let mut backgrounded: Vec<((String, u64), WebSurfaceBackgroundReason)> = applied
+            .keys()
+            .cloned()
+            .map(|key| (key, WebSurfaceBackgroundReason::Session))
+            .collect();
         backgrounded.sort();
         web_surface_reclaim_background_pass(
             now_ms,
@@ -4021,6 +4193,7 @@ mod web_surface_reclaim_locks {
             pressure,
             false,
             configured_hold_ms,
+            TAB_HOLD_SENTINEL_MS,
             &backgrounded,
             applied,
             &|key| leases.get(key).copied(),
@@ -4430,7 +4603,11 @@ mod web_surface_reclaim_locks {
     #[test]
     fn the_force_override_decides_pressure_on_a_comfortable_machine() {
         let mut applied = one_surface("live::y8-forced", 61, None);
-        let mut backgrounded: Vec<(String, u64)> = applied.keys().cloned().collect();
+        let mut backgrounded: Vec<((String, u64), WebSurfaceBackgroundReason)> = applied
+            .keys()
+            .cloned()
+            .map(|key| (key, WebSurfaceBackgroundReason::Session))
+            .collect();
         backgrounded.sort();
         let mut host = FakeHost::default();
         let comfortable = comfortable();
@@ -4444,6 +4621,7 @@ mod web_surface_reclaim_locks {
             &comfortable,
             true,
             600_000,
+            TAB_HOLD_SENTINEL_MS,
             &backgrounded,
             &mut applied,
             &|_key| None,
@@ -4525,29 +4703,47 @@ mod web_surface_reclaim_locks {
             "the captured call site is too short to be the real one:\n{call_site}"
         );
 
-        for needle in [
-            // The machine, sampled NOW. A hardcoded or defaulted snapshot turns
-            // pressure reclaim off (or on) forever, and no unit test can see it.
-            "&read_memory_pressure_snapshot(),",
-            // The verification override, which is the only way to exercise
-            // reclaim on a healthy machine.
-            "web_surface_force_background_pressure(),",
-            // The user's configured hold, read from ~/.yggterm/web-surface.json.
-            // `false` here is deliberate: the PASS decides pressure, so the
-            // caller must ask for the UNPRESSURED (configured) value.
-            "web_surface_background_hold_ms(false),",
-            // The reconciler's own mirror, mutated in place — a clone would make
-            // every stash and every destroy a no-op.
-            "&mut applied,",
-            // The agent lease, read from the desired-state owner.
-            "web_surface_lease_until_ms(&state, &key.0, key.1)",
-            "&mut host,",
-        ] {
-            assert!(
-                call_site.contains(needle),
-                "the reclaim call site no longer passes `{needle}`:\n{call_site}",
-            );
-        }
+        // EXACT list, not a bag of `contains` needles. A substring needle passes
+        // under an APPEND — a tenth argument, a swapped hold, a second lease
+        // source — and every defect this seam has ever had was an argument the
+        // loop computed differently from what the pass expected.
+        let pass_args: Vec<&str> = product[start + 1..end]
+            .iter()
+            .map(|line| line.trim())
+            .collect();
+        assert_eq!(
+            pass_args,
+            vec![
+                "now_ms,",
+                "under_glass,",
+                // The machine, sampled NOW. A hardcoded or defaulted snapshot
+                // turns pressure reclaim off (or on) forever, and no unit test
+                // can see it.
+                "&read_memory_pressure_snapshot(),",
+                // The verification override, which is the only way to exercise
+                // reclaim on a healthy machine.
+                "web_surface_force_background_pressure(),",
+                // The user's configured SESSION hold, from
+                // ~/.yggterm/web-surface.json. `false` here is deliberate: the
+                // PASS decides pressure, so the caller must ask for the
+                // UNPRESSURED (configured) value.
+                "web_surface_background_hold_ms(false),",
+                // ...and the TAB hold, its own knob. Passing the session hold
+                // twice would silently give background tabs the session
+                // schedule, which is exactly the knob this lane added.
+                "web_surface_tab_background_hold_ms(false),",
+                // The reclaim DOMAIN: (session, tab) candidates with the reason
+                // that produced each one.
+                "&backgrounded,",
+                // The reconciler's own mirror, mutated in place — a clone would
+                // make every stash and every destroy a no-op.
+                "&mut applied,",
+                // The agent lease, read from the desired-state owner.
+                "&|key| web_surface_lease_until_ms(&state, &key.0, key.1),",
+                "&mut host,",
+            ],
+            "the reclaim call site's arguments changed:\n{call_site}",
+        );
 
         // The live host is the other half of the seam: thin, but every line of it
         // is un-mockable, so each engine call is named here.
@@ -4591,17 +4787,42 @@ mod web_surface_reclaim_locks {
         // WHICH surfaces the pass is handed. Every surface it stashes is now
         // hidden to its engine unconditionally, so the ONLY thing standing
         // between the throttle and a page the user is looking at is this
-        // filter. Widen it and the pass blanks the active session.
+        // domain — and since the domain became per-TAB, "the page the user is
+        // looking at" is one TAB of one session, not a whole session. Widen it
+        // and the pass blanks the tab being read.
         let set_start = product
             .iter()
-            .position(|line| line.trim() == "let mut backgrounded: Vec<(String, u64)> = applied")
-            .expect("the reconcile loop no longer builds its backgrounded set here");
-        let set = product[set_start..set_start + 5].join("\n");
-        assert!(
-            set.contains("!active_visible_sessions.contains(session.as_str())"),
-            "the reclaim pass is being handed surfaces that are NOT filtered by \
-             active-visibility — it hides everything it stashes, so this filter is \
-             the only thing keeping it off the revealed session:\n{set}",
+            .position(|line| line.trim() == "let backgrounded = web_surface_background_candidates(")
+            .expect("the reconcile loop no longer builds its reclaim domain here");
+        let set_end = product[set_start..]
+            .iter()
+            .position(|line| line.trim() == ");")
+            .map(|offset| set_start + offset)
+            .expect("unterminated reclaim-domain call");
+        let domain_args: Vec<&str> = product[set_start + 1..set_end]
+            .iter()
+            .map(|line| line.trim())
+            .collect();
+        assert_eq!(
+            domain_args,
+            vec![
+                // The realized surfaces, SORTED — the reap order and the trace
+                // must not follow a HashMap's iteration order.
+                "&applied_keys,",
+                // The session-level visibility authority (ShellState, never the
+                // starvable DOM rect). Still the outer gate.
+                "&active_visible_sessions,",
+                // Which tab each session's page area shows, from the SAME
+                // `desired` the placement loop uses — so the reclaim domain and
+                // the paint cannot disagree about who is on screen.
+                "&active_tab_by_session,",
+                // Tabs pinned into a live split pane: they paint in their own
+                // rect, so they are on screen and are never candidates.
+                "&split_pinned_tabs,",
+            ],
+            "the reclaim domain's inputs changed. It hides everything it stashes, \
+             so a domain built from anything else can hand the pass the very tab \
+             the user is reading",
         );
     }
 
@@ -4690,6 +4911,757 @@ mod web_surface_reclaim_locks {
                 "the headless create no longer does `{needle}`:\n{branch}",
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PER-TAB RECLAIM.
+    //
+    // The reclaim domain used to be filtered by SESSION alone, so every tab of
+    // the session the user is looking at was exempt forever: a hundred visited
+    // tabs meant a hundred live WebKit web processes for the life of the GUI.
+    // These locks drive the SAME pass the loop calls, with the domain built by
+    // the SAME function the loop builds it with, so reverting either the domain
+    // rule or the hold selection changes what they observe.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The page area of a visible surface, and the rect of a pinned split pane.
+    const PAGE_RECT: (i32, i32, i32, i32) = (0, 40, 1280, 760);
+    const PANE_RECT: (i32, i32, i32, i32) = (640, 40, 640, 760);
+
+    /// The URL the TAB MODEL holds for a tab. It lives in `ShellState` (and on
+    /// disk as a [`SavedWebTab`]), not in the webview, which is exactly why a
+    /// reclaimed tab can come back as the same page.
+    fn url_for(tab_id: u64) -> String {
+        format!("https://example.invalid/tab/{tab_id}")
+    }
+
+    fn applied_tab(native_id: u64, tab_id: u64, stashed_at_ms: Option<u64>) -> AppliedWebSurface {
+        let mut entry = applied_surface(native_id, stashed_at_ms);
+        entry.url = url_for(tab_id);
+        entry.visible = stashed_at_ms.is_none();
+        entry
+    }
+
+    /// `(tab_id, native_id, stashed_at_ms)` triples, realized.
+    fn tabs_applied(
+        session: &str,
+        tabs: &[(u64, u64, Option<u64>)],
+    ) -> HashMap<(String, u64), AppliedWebSurface> {
+        tabs.iter()
+            .map(|(tab_id, native_id, stashed)| {
+                (
+                    (session.to_string(), *tab_id),
+                    applied_tab(*native_id, *tab_id, *stashed),
+                )
+            })
+            .collect()
+    }
+
+    /// The reclaim DOMAIN exactly as the reconcile loop builds it, for one
+    /// session. Sorted keys in, candidates out — no test-local filtering, or the
+    /// test would be checking its own arithmetic instead of the rule.
+    fn domain_for(
+        session: &str,
+        applied: &HashMap<(String, u64), AppliedWebSurface>,
+        session_visible: bool,
+        active_tab: u64,
+        pinned: &[u64],
+    ) -> Vec<((String, u64), WebSurfaceBackgroundReason)> {
+        let mut keys: Vec<(String, u64)> = applied.keys().cloned().collect();
+        keys.sort();
+        let visible: std::collections::HashSet<String> = session_visible
+            .then(|| session.to_string())
+            .into_iter()
+            .collect();
+        let mut active_map = HashMap::new();
+        active_map.insert(session.to_string(), active_tab);
+        let pinned_set: std::collections::HashSet<(String, u64)> = pinned
+            .iter()
+            .map(|tab| (session.to_string(), *tab))
+            .collect();
+        web_surface_background_candidates(&keys, &visible, &active_map, &pinned_set)
+    }
+
+    /// One pass over a domain built by [`domain_for`].
+    #[allow(clippy::too_many_arguments)]
+    fn run_domain_pass(
+        now_ms: u64,
+        pressure: &crate::terminal_observe::MemoryPressureSnapshot,
+        session_hold_ms: u64,
+        tab_hold_ms: u64,
+        domain: &[((String, u64), WebSurfaceBackgroundReason)],
+        applied: &mut HashMap<(String, u64), AppliedWebSurface>,
+        leases: &HashMap<(String, u64), u64>,
+        host: &mut FakeHost,
+    ) -> WebSurfaceBackgroundPlan {
+        web_surface_reclaim_background_pass(
+            now_ms,
+            true,
+            pressure,
+            false,
+            session_hold_ms,
+            tab_hold_ms,
+            domain,
+            applied,
+            &|key| leases.get(key).copied(),
+            host,
+        )
+    }
+
+    /// A BACKGROUND TAB of the session the user is looking at is reclaimed on
+    /// the TAB hold — and the tab on screen is not even in the pass's input.
+    ///
+    /// The clocks are chosen so the two holds DISAGREE: 399 s off screen is past
+    /// the 300 s tab hold and short of the 600 s session hold. A plan that
+    /// charges a tab candidate the session hold therefore returns `Wait` and
+    /// destroys nothing, and a domain that never emits tab candidates hands the
+    /// pass an empty list — both show up here as "nothing was reclaimed".
+    #[test]
+    fn a_background_tab_of_the_active_session_is_reclaimed_after_its_hold() {
+        let session = "live::pt1-front";
+        let mut applied = tabs_applied(
+            session,
+            &[
+                (0, 100, None),          // on screen
+                (1, 101, Some(1_000)),   // off screen for 399 s
+                (2, 102, Some(1_000)),
+            ],
+        );
+        let domain = domain_for(session, &applied, true, 0, &[]);
+        assert_eq!(
+            domain,
+            vec![
+                ((session.to_string(), 1), WebSurfaceBackgroundReason::Tab),
+                ((session.to_string(), 2), WebSurfaceBackgroundReason::Tab),
+            ],
+            "the background tabs of the session the user is looking at must be \
+             reclaim candidates, and the tab on screen must not"
+        );
+
+        let mut host = FakeHost::default();
+        let plan = run_domain_pass(
+            400_000,
+            &comfortable(),
+            600_000,
+            300_000,
+            &domain,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert!(
+            !plan.reclaim_pressured,
+            "this is the UNPRESSURED path — the configured tab hold must do the work"
+        );
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .map(|decision| decision.hold_ms)
+                .collect::<Vec<_>>(),
+            vec![300_000, 300_000],
+            "a background TAB must be charged the tab hold, not the session hold"
+        );
+        assert_eq!(
+            host.closed,
+            vec![101, 102],
+            "two background tabs, both long past the tab hold, both reclaimed"
+        );
+        assert!(
+            applied.contains_key(&(session.to_string(), 0)),
+            "the tab on screen must survive"
+        );
+        let closes = host.trace_named("native_close");
+        assert_eq!(closes.len(), 2);
+        assert_eq!(
+            closes[0]["domain"],
+            json!("tab_backgrounded"),
+            "the trace must say WHICH domain reclaimed it, or per-tab reclaim is \
+             invisible in telemetry and every close reads as a session close"
+        );
+    }
+
+    /// THE EXEMPTION. The tab on screen is never a candidate — not reaped, not
+    /// stashed, not demoted, not throttled, and not even ASKED about.
+    ///
+    /// The audio-probe assertion is the sharp one: the plan probes every surface
+    /// it is handed, so an empty probe for the active tab's native id proves the
+    /// pass never saw it at all, rather than that it saw it and let it go.
+    #[test]
+    fn the_active_tab_is_never_a_reclaim_candidate() {
+        let session = "live::pt2-exempt";
+        let mut applied = tabs_applied(
+            session,
+            &[
+                (0, 200, Some(1_000)),
+                (1, 201, Some(1_000)),
+                (2, 202, None), // the tab on screen
+                (3, 203, Some(1_000)),
+            ],
+        );
+        let domain = domain_for(session, &applied, true, 2, &[]);
+        assert_eq!(
+            domain,
+            vec![
+                ((session.to_string(), 0), WebSurfaceBackgroundReason::Tab),
+                ((session.to_string(), 1), WebSurfaceBackgroundReason::Tab),
+                ((session.to_string(), 3), WebSurfaceBackgroundReason::Tab),
+            ],
+            "the active tab leaked into the reclaim domain"
+        );
+
+        let mut host = FakeHost::default();
+        run_domain_pass(
+            400_000,
+            &comfortable(),
+            600_000,
+            300_000,
+            &domain,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert!(
+            applied.contains_key(&(session.to_string(), 2)),
+            "the page the user is reading was destroyed"
+        );
+        assert!(!host.closed.contains(&202));
+        assert!(!host.stashed.contains(&202));
+        assert!(!host.demoted.contains(&202));
+        assert!(
+            !host.throttled.iter().any(|(id, _)| *id == 202),
+            "the pass hides everything it is handed, so throttling the active tab \
+             blanks the page the user is looking at"
+        );
+        assert!(
+            !host.audio_probes.borrow().contains(&202),
+            "the pass probed the active tab's audio, which means it was IN the \
+             candidate set and merely happened not to be due — one clock change \
+             away from blanking the user's page"
+        );
+        assert_eq!(host.closed, vec![200, 201, 203]);
+    }
+
+    /// A tab PINNED into a live split pane paints in its own rect, so it is on
+    /// screen even though it is not the active tab, and it is never reclaimed.
+    ///
+    /// The second half is the regression guard the exemption must NOT buy: a
+    /// pinned tab of a BACKGROUNDED session is off screen like everything else
+    /// that session owns, and reclaiming it is shipped behaviour. An exemption
+    /// written one level too high would quietly immortalize it.
+    #[test]
+    fn a_split_pinned_tab_is_never_reclaimed_but_only_while_its_session_is_shown() {
+        let session = "live::pt3-pinned";
+        let mut applied = tabs_applied(
+            session,
+            &[
+                (0, 300, None),        // the active tab
+                (1, 301, Some(1_000)), // ordinary background tab
+                (3, 303, Some(1_000)), // pinned into a split pane
+            ],
+        );
+        let domain = domain_for(session, &applied, true, 0, &[3]);
+        assert_eq!(
+            domain,
+            vec![((session.to_string(), 1), WebSurfaceBackgroundReason::Tab)],
+            "a split-pinned tab is ON SCREEN in its own pane and must not be a \
+             reclaim candidate"
+        );
+        let mut host = FakeHost::default();
+        run_domain_pass(
+            400_000,
+            &comfortable(),
+            600_000,
+            300_000,
+            &domain,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert_eq!(host.closed, vec![301]);
+        assert!(
+            applied.contains_key(&(session.to_string(), 3)),
+            "the pinned pane's page was destroyed under it"
+        );
+
+        // Same pin, session NOT active-visible: everything the session owns is
+        // off screen, and the SESSION domain must still claim all of it.
+        let mut applied = tabs_applied(
+            session,
+            &[
+                (0, 310, Some(1_000)),
+                (1, 311, Some(1_000)),
+                (3, 313, Some(1_000)),
+            ],
+        );
+        let domain = domain_for(session, &applied, false, 0, &[3]);
+        assert_eq!(
+            domain,
+            vec![
+                ((session.to_string(), 0), WebSurfaceBackgroundReason::Session),
+                ((session.to_string(), 1), WebSurfaceBackgroundReason::Session),
+                ((session.to_string(), 3), WebSurfaceBackgroundReason::Session),
+            ],
+            "the tab exemptions must not narrow the SESSION domain — a pinned tab \
+             of a backgrounded session is off screen like every other surface it \
+             owns, and reclaiming it is shipped behaviour"
+        );
+        let mut host = FakeHost::default();
+        run_domain_pass(
+            700_000,
+            &comfortable(),
+            600_000,
+            300_000,
+            &domain,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        assert_eq!(host.closed, vec![310, 311, 313]);
+    }
+
+    /// THE AUDIO VETO, at tab granularity. "Suppose I have a YouTube playlist
+    /// running in a background TAB while I read another one." The veto is
+    /// absolute against the tab hold exactly as it is against the session hold,
+    /// and it is per surface: the audible tab lives, its silent sibling dies.
+    #[test]
+    fn the_audio_veto_holds_for_a_background_tab_of_the_active_session() {
+        let session = "live::pt4-audible";
+        let mut applied = tabs_applied(
+            session,
+            &[
+                (0, 400, None),        // on screen
+                (1, 401, Some(1_000)), // background, PLAYING
+                (2, 402, Some(1_000)), // background, silent
+            ],
+        );
+        let domain = domain_for(session, &applied, true, 0, &[]);
+        let mut host = FakeHost::with_audible(&[401]);
+        let plan = run_domain_pass(
+            400_000,
+            &comfortable(),
+            600_000,
+            300_000,
+            &domain,
+            &mut applied,
+            &HashMap::new(),
+            &mut host,
+        );
+        let mut probed = host.audio_probes.borrow().clone();
+        probed.sort();
+        assert_eq!(
+            probed,
+            vec![401, 402],
+            "each background tab's audio must be probed by its OWN native id"
+        );
+        assert_eq!(
+            host.closed,
+            vec![402],
+            "the playing tab must survive its hold — invisible is not unwanted"
+        );
+        assert!(applied.contains_key(&(session.to_string(), 1)));
+        let audible = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.native_id == 401)
+            .expect("audible decision");
+        assert!(audible.media_active);
+        assert_eq!(audible.action, WebSurfaceBackgroundAction::Wait);
+    }
+
+    /// THE TREADMILL GUARD, at tab granularity. A background tab that keeps
+    /// being re-created after every reap is demonstrably wanted; reaping it
+    /// again reclaims nothing and pays for a fresh WebKit process each cycle. The
+    /// guard is per (session, tab), so it must recognise the SAME tab across
+    /// incarnations — not the session, or ninety-nine tabs would share one
+    /// counter and the second tab in a busy session would stop being reclaimed
+    /// because the first one thrashed.
+    #[test]
+    fn the_thrash_guard_still_bounds_the_reap_rate_for_tabs() {
+        let session = "live::pt5-treadmill";
+        let base = 950_000_000_u64;
+        let mut closes = Vec::new();
+        let mut holds = Vec::new();
+        for cycle in 0..3_u64 {
+            let now = base + cycle * 6_000;
+            // Something re-creates the tab the moment it dies — the treadmill.
+            let mut applied = tabs_applied(
+                session,
+                &[(0, 500, None), (1, 501 + cycle, Some(now - 5_500))],
+            );
+            let domain = domain_for(session, &applied, true, 0, &[]);
+            let mut host = FakeHost::default();
+            let plan = run_domain_pass(
+                now,
+                &short(),
+                600_000,
+                300_000,
+                &domain,
+                &mut applied,
+                &HashMap::new(),
+                &mut host,
+            );
+            assert!(plan.reclaim_pressured, "the fixture must stay pressured");
+            holds.push(
+                plan.decisions
+                    .iter()
+                    .find(|decision| decision.key.1 == 1)
+                    .expect("the background tab was not decided")
+                    .hold_ms,
+            );
+            closes.push(host.closed.clone());
+        }
+        assert_eq!(
+            holds,
+            vec![
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                // Demonstrably wanted: back to the configured TAB hold.
+                300_000,
+            ],
+            "after {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps in the window the tab has \
+             shown it is wanted and must keep its configured hold"
+        );
+        assert_eq!(
+            closes,
+            vec![vec![501], vec![502], vec![]],
+            "the third cycle must NOT destroy the tab again — that is the treadmill"
+        );
+    }
+
+    /// ONE reconcile tick over one session's tabs, driven through the SAME pure
+    /// functions the loop calls: the reclaim domain, the reclaim pass, the
+    /// placement rule, and the lazy-create rule. Everything the loop does that
+    /// is NOT one of those is FFI.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_tick(
+        now_ms: u64,
+        session: &str,
+        tabs: &[u64],
+        active_tab: u64,
+        pinned: &[u64],
+        session_visible: bool,
+        tab_hold_ms: u64,
+        applied: &mut HashMap<(String, u64), AppliedWebSurface>,
+        next_native_id: &mut u64,
+        host: &mut FakeHost,
+    ) {
+        let domain = domain_for(session, applied, session_visible, active_tab, pinned);
+        if !domain.is_empty() {
+            run_domain_pass(
+                now_ms,
+                &comfortable(),
+                600_000,
+                tab_hold_ms,
+                &domain,
+                applied,
+                &HashMap::new(),
+                host,
+            );
+        }
+        for tab_id in tabs {
+            let key = (session.to_string(), *tab_id);
+            let pinned_rect = pinned.contains(tab_id).then_some(PANE_RECT);
+            let page_rect = session_visible.then_some(PAGE_RECT);
+            let place_rect =
+                web_surface_tab_place_rect(pinned_rect, page_rect, *tab_id, active_tab);
+            let want_visible = place_rect.is_some() && session_visible;
+            if let Some(entry) = applied.get_mut(&key) {
+                if entry.stashed_at_ms.is_some() && want_visible {
+                    // The reveal: re-attach the LIVE webview, page state intact.
+                    entry.stashed_at_ms = None;
+                }
+                entry.visible = want_visible;
+                continue;
+            }
+            // No webview: never visited, or reclaimed. Same door either way, and
+            // that sameness IS the restore path.
+            let Some(rect) = web_surface_tab_create_rect(want_visible, place_rect, false) else {
+                continue;
+            };
+            *next_native_id += 1;
+            let mut entry = applied_tab(*next_native_id, *tab_id, None);
+            entry.bounds = rect;
+            entry.visible = want_visible;
+            applied.insert(key, entry);
+        }
+    }
+
+    /// SELECTING A RECLAIMED TAB BRINGS IT BACK. Its webview was genuinely
+    /// destroyed (the engine was told to close it, and the mirror lost the
+    /// entry), and selecting it recreates a FRESH webview — new native id, not
+    /// stashed, visible — carrying the URL the TAB MODEL holds. That is the
+    /// whole user-facing contract of per-tab reclaim: the tab is still there,
+    /// the page comes back.
+    #[test]
+    fn selecting_a_reclaimed_tab_recreates_its_webview_with_the_saved_url() {
+        let session = "live::pt6-restore";
+        let tabs = [0_u64, 1, 2];
+        let mut applied = HashMap::new();
+        let mut next_native_id = 600_u64;
+        let mut host = FakeHost::default();
+
+        // Visit each tab in turn, so all three are realized.
+        for (index, active) in tabs.iter().enumerate() {
+            reconcile_tick(
+                1_000 + index as u64 * 10,
+                session,
+                &tabs,
+                *active,
+                &[],
+                true,
+                300_000,
+                &mut applied,
+                &mut next_native_id,
+                &mut host,
+            );
+        }
+        assert_eq!(applied.len(), 3, "all three tabs were visited");
+        let reclaimed_native = applied
+            .get(&(session.to_string(), 1))
+            .expect("tab 1 realized")
+            .native_id;
+
+        // Settle on tab 0 and let the tab hold lapse.
+        let mut host = FakeHost::default();
+        reconcile_tick(
+            2_000,
+            session,
+            &tabs,
+            0,
+            &[],
+            true,
+            300_000,
+            &mut applied,
+            &mut next_native_id,
+            &mut host,
+        );
+        reconcile_tick(
+            400_000,
+            session,
+            &tabs,
+            0,
+            &[],
+            true,
+            300_000,
+            &mut applied,
+            &mut next_native_id,
+            &mut host,
+        );
+        assert!(
+            host.closed.contains(&reclaimed_native),
+            "the background tab's webview must actually be DESTROYED — hiding it \
+             gives the machine nothing back"
+        );
+        assert!(
+            !applied.contains_key(&(session.to_string(), 1)),
+            "a reclaimed tab must leave the reconciler's mirror, or it can never be \
+             recreated"
+        );
+        assert_eq!(
+            applied.len(),
+            1,
+            "only the tab on screen keeps a webview: {:?}",
+            applied.keys().collect::<Vec<_>>()
+        );
+
+        // The user clicks tab 1.
+        let mut host = FakeHost::default();
+        reconcile_tick(
+            401_000,
+            session,
+            &tabs,
+            1,
+            &[],
+            true,
+            300_000,
+            &mut applied,
+            &mut next_native_id,
+            &mut host,
+        );
+        let restored = applied
+            .get(&(session.to_string(), 1))
+            .expect("clicking a reclaimed tab must recreate its webview");
+        assert_eq!(
+            restored.url,
+            url_for(1),
+            "the recreated webview must load the URL the tab model holds — that is \
+             what makes a reclaimed tab the same tab"
+        );
+        assert!(restored.visible, "the tab the user clicked must be shown");
+        assert_eq!(restored.stashed_at_ms, None);
+        assert_ne!(
+            restored.native_id, reclaimed_native,
+            "a recreated surface is a NEW incarnation; reusing the old id would let \
+             a pinned agent verb land on a page it never observed"
+        );
+    }
+
+    /// THE NEGATIVE LOCK: lazy creation is not regressed. A hundred saved tabs
+    /// with only the active one ever selected must realize exactly ONE webview —
+    /// forever, not just on the first tick.
+    ///
+    /// This is the half a reclaim lane can silently break: a domain that treats
+    /// "no webview" as "needs a webview", or a create rule that materializes
+    /// every desired tab, turns a hundred rows in the tree into a hundred web
+    /// processes before any hold has a chance to run.
+    #[test]
+    fn a_hundred_saved_tabs_with_one_visited_realize_one_webview() {
+        let session = "live::pt7-hundred";
+        let tabs: Vec<u64> = (0..100).collect();
+        let mut applied = HashMap::new();
+        let mut next_native_id = 700_u64;
+        let mut host = FakeHost::default();
+        for tick in 0..4_u64 {
+            reconcile_tick(
+                1_000 + tick * 400_000,
+                session,
+                &tabs,
+                0,
+                &[],
+                true,
+                300_000,
+                &mut applied,
+                &mut next_native_id,
+                &mut host,
+            );
+            assert_eq!(
+                applied.len(),
+                1,
+                "tick {tick}: 100 saved tabs, one visited — {} webviews were \
+                 realized. Lazy creation is what makes a hundred-tab day free.",
+                applied.len()
+            );
+        }
+        assert_eq!(
+            applied.keys().collect::<Vec<_>>(),
+            vec![&(session.to_string(), 0_u64)]
+        );
+        assert!(
+            host.closed.is_empty(),
+            "nothing was ever created off screen, so nothing should have been \
+             reclaimed: {:?}",
+            host.closed
+        );
+    }
+
+    /// The on-screen predicate and the placement rule are two readings of ONE
+    /// question, taken at two moments (the reclaim pass runs before the tick's
+    /// geometry eval; placement runs after it). If they ever disagree, the set
+    /// of surfaces that get painted and the set that get reclaimed disagree
+    /// about who the user is looking at — and the reclaim side wins, because it
+    /// destroys.
+    #[test]
+    fn the_on_screen_predicate_agrees_with_the_place_rect_rule() {
+        for tab_id in 0..4_u64 {
+            for active_tab in 0..4_u64 {
+                for pinned in [false, true] {
+                    let pinned_rect = pinned.then_some(PANE_RECT);
+                    let placed =
+                        web_surface_tab_place_rect(pinned_rect, Some(PAGE_RECT), tab_id, active_tab);
+                    assert_eq!(
+                        placed.is_some(),
+                        web_surface_tab_on_screen(pinned, tab_id, active_tab),
+                        "placement and the reclaim domain disagree about \
+                         tab={tab_id} active={active_tab} pinned={pinned}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE PER-TAB INSTRUMENT. Desired tabs joined against realized webviews, so
+    /// "a hundred tabs, how many web processes?" is answerable instead of
+    /// guessed — and a tab with NO webview is a row in the listing rather than an
+    /// absence nobody can see.
+    ///
+    /// It also has to be honest about what it cannot attribute: WebKitGTK pools
+    /// web processes per `WebContext`, so there is no per-tab byte count and the
+    /// payload says so in words rather than inventing one.
+    #[test]
+    fn the_per_tab_report_lists_tabs_without_webviews_and_never_invents_rss() {
+        let session = "live::pt8-report";
+        let desired: Vec<WebSurfaceTabDesired> = (0..5_u64)
+            .map(|tab_id| WebSurfaceTabDesired {
+                session_path: session.to_string(),
+                tab_id,
+                active_tab: tab_id == 0,
+                split_pinned: tab_id == 4,
+                leased: tab_id == 3,
+            })
+            .collect();
+        let mut handles = HashMap::new();
+        handles.insert(
+            (session.to_string(), 0_u64),
+            WebSurfaceHandle {
+                native_id: 800,
+                generation: 1,
+                visible: true,
+                stashed_at_ms: None,
+                ever_revealed: true,
+            },
+        );
+        handles.insert(
+            (session.to_string(), 1_u64),
+            WebSurfaceHandle {
+                native_id: 801,
+                generation: 2,
+                visible: false,
+                stashed_at_ms: Some(100_000),
+                ever_revealed: true,
+            },
+        );
+        // Tabs 2, 3 and 4 have NO webview: never visited, or reclaimed.
+
+        let rows = web_surface_tab_report(500_000, &desired, &handles);
+        assert_eq!(rows.len(), 5, "every DESIRED tab must appear, webview or not");
+        assert_eq!(rows[0].state, WebSurfaceTabState::Visible);
+        assert!(rows[0].active_tab);
+        assert_eq!(rows[1].state, WebSurfaceTabState::Stashed);
+        assert_eq!(
+            rows[1].stashed_for_ms,
+            Some(400_000),
+            "how long a tab has been off screen is the age the hold is read \
+             against; without it a listing cannot say which tab is about to go"
+        );
+        for row in &rows[2..] {
+            assert_eq!(
+                row.state,
+                WebSurfaceTabState::NoWebview,
+                "a tab with no webview must be visible IN the listing — that is the \
+                 whole point of joining desired against realized"
+            );
+            assert_eq!(row.stashed_for_ms, None);
+            assert_eq!(row.native_id, None);
+        }
+        assert!(rows[3].leased, "the lease has to survive into the listing");
+        assert!(rows[4].split_pinned);
+
+        let counts = web_surface_applied_counts(&handles, 1);
+        let payload = web_surface_tab_report_json(&rows, counts);
+        assert_eq!(payload["tabs"], json!(5));
+        assert_eq!(payload["views"], json!(2));
+        assert_eq!(payload["tabs_without_webview"], json!(3));
+        assert_eq!(payload["contexts"], json!(1));
+        assert_eq!(payload["view_sessions"], json!(1));
+        assert_eq!(payload["rows"][2]["webview"], json!(false));
+        assert_eq!(payload["rows"][2]["state"], json!("no_webview"));
+        let rss = payload["per_tab_rss"]
+            .as_str()
+            .expect("the payload must SAY that per-tab RSS is unattributable");
+        assert!(
+            rss.contains("unattributable") && rss.contains("WebContext"),
+            "the listing must name what it cannot attribute rather than fabricate \
+             a per-tab byte count: {rss}"
+        );
+        assert!(
+            payload
+                .as_object()
+                .expect("object")
+                .keys()
+                .all(|key| !key.contains("rss_bytes")),
+            "a per-tab byte count appeared; WebKit pools web processes per \
+             WebContext, so any such number is invented"
+        );
     }
 }
 
@@ -5351,17 +6323,37 @@ struct WebSurfaceHandle {
     /// opinion, because a second flag could disagree with this one.
     /// `total - visible` is therefore the count of pages nobody is being shown.
     visible: bool,
-    /// Soft-stashed: alive and addressable, detached from the overlay while
-    /// its session is backgrounded. Sharpens the note below — a PRESENT entry
-    /// can still be one nobody is looking at, and telling those apart is the
-    /// difference between "3 surfaces cost this much" and "3 surfaces cost
-    /// this much while 2 of them are off-screen".
-    stashed: bool,
+    /// WHEN this surface was stashed (soft or hard), or `None` while it is not
+    /// stashed at all. Sharpens the note above — a PRESENT entry can still be one
+    /// nobody is looking at, and telling those apart is the difference between
+    /// "3 surfaces cost this much" and "3 surfaces cost this much while 2 of them
+    /// are off-screen".
+    ///
+    /// The timestamp rather than a bool because the per-tab instrument has to
+    /// answer HOW LONG a surface has been off screen (a tab stashed 9 minutes ago
+    /// is about to be reclaimed; one stashed 2 seconds ago is a tab switch), and
+    /// a separate `stashed: bool` beside it would be a second encoding of
+    /// `stashed_at_ms.is_some()` that could disagree.
+    stashed_at_ms: Option<u64>,
     /// Has this incarnation ever been shown on a client? See
     /// [`AppliedWebSurface::ever_revealed`] — `stashed` cannot answer it,
     /// because a headless surface and a backgrounded once-watched surface are
     /// both stashed.
     ever_revealed: bool,
+}
+
+impl WebSurfaceHandle {
+    /// Is this surface stashed right now? Derived, never stored twice.
+    fn stashed(&self) -> bool {
+        self.stashed_at_ms.is_some()
+    }
+    /// How long this surface has been off screen, or `None` if it is not
+    /// stashed. Saturating, so a clock that steps backwards reads 0 rather than
+    /// wrapping to half a billion years.
+    fn stashed_for_ms(&self, now_ms: u64) -> Option<u64> {
+        self.stashed_at_ms
+            .map(|stashed_at| now_ms.saturating_sub(stashed_at))
+    }
 }
 
 /// Realized web surfaces, counted by what they are DOING. Distinct from
@@ -5373,10 +6365,22 @@ struct WebSurfaceAppliedCounts {
     total: usize,
     visible: usize,
     stashed: usize,
+    /// Distinct SESSIONS those surfaces belong to. `total / sessions` is the
+    /// per-tab realization ratio the per-tab reclaim lane exists to bound: one
+    /// session with a hundred visited tabs used to read `total: 100,
+    /// sessions: 1` forever, because the reclaim domain was filtered by session
+    /// alone and every tab of the front session was exempt.
+    sessions: usize,
     /// Distinct engine `WebContext`s backing those surfaces. The sharing
     /// invariant made readable: N tabs of one session must show `total: N` with
     /// `contexts: 1`. A sample where the two track each other means every tab is
     /// paying for its own process pool, network process and cookie jar.
+    ///
+    /// This is also why there is NO per-tab memory number anywhere in this
+    /// module: WebKitGTK's web processes are pooled per `WebContext`, so the RSS
+    /// a tab is "using" is not attributable to that tab. What is honest is the
+    /// pair (`total`, `contexts`) plus the process-level RSS the render probe
+    /// already samples; a per-tab byte count would be invented.
     contexts: usize,
 }
 
@@ -5384,10 +6388,15 @@ fn web_surface_applied_counts(
     handles: &HashMap<(String, u64), WebSurfaceHandle>,
     contexts: usize,
 ) -> WebSurfaceAppliedCounts {
+    let sessions: std::collections::HashSet<&str> = handles
+        .keys()
+        .map(|(session, _)| session.as_str())
+        .collect();
     WebSurfaceAppliedCounts {
         total: handles.len(),
         visible: handles.values().filter(|handle| handle.visible).count(),
-        stashed: handles.values().filter(|handle| handle.stashed).count(),
+        stashed: handles.values().filter(|handle| handle.stashed()).count(),
+        sessions: sessions.len(),
         contexts,
     }
 }
@@ -5406,6 +6415,205 @@ fn published_web_surface_counts() -> WebSurfaceAppliedCounts {
         .and_then(|registry| registry.lock().ok())
         .map(|handles| web_surface_applied_counts(&handles, contexts))
         .unwrap_or_default()
+}
+
+/// What one tab's webview is DOING, for the per-tab listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceTabState {
+    /// Realized and on screen.
+    Visible,
+    /// Realized and alive, but off screen: soft-stashed (attached, demoted,
+    /// engine-hidden) or hard-stashed (detached). Its hold clock is running.
+    Stashed,
+    /// Realized, not on screen, and not yet stashed — the one-tick window
+    /// between a create and the reclaim pass that classifies it.
+    Live,
+    /// **No webview at all.** Either the tab has never been on screen (lazy
+    /// creation: it is a URL in the tree and nothing else) or its hold expired
+    /// and it was reclaimed. The report does NOT claim to tell those apart,
+    /// because after the destroy they are the same object with the same cost and
+    /// the same restore path; `reaps_in_window` below is the only honest hint,
+    /// and it forgets after [`WEB_SURFACE_THRASH_WINDOW_MS`].
+    NoWebview,
+}
+
+impl WebSurfaceTabState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Stashed => "stashed",
+            Self::Live => "live",
+            Self::NoWebview => "no_webview",
+        }
+    }
+}
+
+/// One tab as the DESIRED state knows it, lifted out of `ShellState` so the join
+/// against the realized registry is testable without a live shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSurfaceTabDesired {
+    session_path: String,
+    tab_id: u64,
+    /// The tab this session's page area shows.
+    active_tab: bool,
+    /// Pinned into a live split pane, so it paints in its own rect regardless of
+    /// `active_tab`.
+    split_pinned: bool,
+    /// An agent's lease is standing on it.
+    leased: bool,
+}
+
+/// One row of the per-tab webview listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSurfaceTabReportRow {
+    session_path: String,
+    tab_id: u64,
+    state: WebSurfaceTabState,
+    native_id: Option<u64>,
+    generation: Option<u64>,
+    ever_revealed: bool,
+    /// How long this tab has been off screen. `None` when it is not stashed.
+    stashed_for_ms: Option<u64>,
+    /// Reaps of this exact (session, tab) inside the thrash window — the
+    /// treadmill counter, per tab.
+    reaps_in_window: u32,
+    active_tab: bool,
+    split_pinned: bool,
+    leased: bool,
+}
+
+/// THE per-tab instrument: every DESIRED tab joined against the REALIZED webview
+/// registry, so "100 tabs, how many web processes?" is answerable without
+/// guessing.
+///
+/// Desired-first on purpose. The registry alone can only list what exists, which
+/// is exactly the wrong end of the question: the whole point of lazy creation and
+/// of per-tab reclaim is that most tabs SHOULD be missing from it, and a listing
+/// that cannot show a tab with no webview cannot show the feature working.
+///
+/// Pure, and takes `now_ms`, so ages are deterministic under test.
+fn web_surface_tab_report(
+    now_ms: u64,
+    desired: &[WebSurfaceTabDesired],
+    handles: &HashMap<(String, u64), WebSurfaceHandle>,
+) -> Vec<WebSurfaceTabReportRow> {
+    let mut rows: Vec<WebSurfaceTabReportRow> = desired
+        .iter()
+        .map(|tab| {
+            let key = (tab.session_path.clone(), tab.tab_id);
+            let handle = handles.get(&key);
+            let state = match handle {
+                None => WebSurfaceTabState::NoWebview,
+                Some(handle) if handle.visible => WebSurfaceTabState::Visible,
+                Some(handle) if handle.stashed() => WebSurfaceTabState::Stashed,
+                Some(_) => WebSurfaceTabState::Live,
+            };
+            WebSurfaceTabReportRow {
+                session_path: tab.session_path.clone(),
+                tab_id: tab.tab_id,
+                state,
+                native_id: handle.map(|handle| handle.native_id),
+                generation: handle.map(|handle| handle.generation),
+                ever_revealed: handle.is_some_and(|handle| handle.ever_revealed),
+                stashed_for_ms: handle.and_then(|handle| handle.stashed_for_ms(now_ms)),
+                reaps_in_window: web_surface_recent_reaps(&key, now_ms),
+                active_tab: tab.active_tab,
+                split_pinned: tab.split_pinned,
+                leased: tab.leased,
+            }
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left.session_path
+            .cmp(&right.session_path)
+            .then(left.tab_id.cmp(&right.tab_id))
+    });
+    rows
+}
+
+/// Why there is no per-tab memory number here, stated in the payload itself so a
+/// reader does not go looking for one. WebKitGTK pools web processes per
+/// `WebContext`, and every tab of one profile shares that context — so the bytes
+/// a tab is "using" are not attributable to the tab. What IS attributable is the
+/// pair (`views`, `contexts`) plus the process-level RSS the render probe
+/// samples; anything finer would be invented.
+const WEB_SURFACE_PER_TAB_RSS_NOTE: &str =
+    "unattributable: WebKitGTK pools web processes per WebContext, so bytes cannot be \
+     split per tab; use views + contexts with the render probe's process RSS";
+
+fn web_surface_tab_report_json(
+    rows: &[WebSurfaceTabReportRow],
+    counts: WebSurfaceAppliedCounts,
+) -> Value {
+    json!({
+        "tabs": rows.len(),
+        "views": counts.total,
+        "views_visible": counts.visible,
+        "views_stashed": counts.stashed,
+        "view_sessions": counts.sessions,
+        "contexts": counts.contexts,
+        // The number the lane is judged on: tabs the user has, minus webviews
+        // they are paying for.
+        "tabs_without_webview": rows
+            .iter()
+            .filter(|row| row.state == WebSurfaceTabState::NoWebview)
+            .count(),
+        "per_tab_rss": WEB_SURFACE_PER_TAB_RSS_NOTE,
+        "rows": rows
+            .iter()
+            .map(|row| json!({
+                "session_path": row.session_path,
+                "tab_id": row.tab_id,
+                "state": row.state.label(),
+                "webview": row.state != WebSurfaceTabState::NoWebview,
+                "native_id": row.native_id,
+                "generation": row.generation,
+                "ever_revealed": row.ever_revealed,
+                "stashed_for_ms": row.stashed_for_ms,
+                "reaps_in_window": row.reaps_in_window,
+                "active_tab": row.active_tab,
+                "split_pinned": row.split_pinned,
+                "leased": row.leased,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The desired half of the per-tab listing, read from `ShellState`.
+fn web_surface_tabs_desired(shell: &ShellState, now_ms: u64) -> Vec<WebSurfaceTabDesired> {
+    let pinned = shell.split_pinned_web_tabs();
+    shell
+        .web_surfaces
+        .iter()
+        .flat_map(|(session_path, surface)| {
+            surface.tabs.iter().map(|tab| WebSurfaceTabDesired {
+                session_path: session_path.clone(),
+                tab_id: tab.id,
+                active_tab: tab.id == surface.active_tab,
+                split_pinned: pinned.contains(&(session_path.clone(), tab.id)),
+                leased: tab.lease_until_ms.is_some_and(|until| now_ms < until),
+            })
+        })
+        .collect()
+}
+
+/// The per-tab listing as app-control sees it (`server app state` →
+/// `web_surface_tabs`).
+fn describe_web_surface_tabs(shell: &ShellState, now_ms: u64) -> Value {
+    let desired = web_surface_tabs_desired(shell, now_ms);
+    let contexts = WEB_SURFACE_CONTEXT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    // Copy the registry out and RELEASE its lock before building the report:
+    // the report reads the reap history, which is a second process-global lock,
+    // and the reconciler takes them in the other order. One nesting is a
+    // deadlock waiting for a bad tick; no nesting is not.
+    let handles: HashMap<(String, u64), WebSurfaceHandle> = WEB_SURFACE_NATIVE_IDS
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .map(|registry| registry.clone())
+        .unwrap_or_default();
+    let rows = web_surface_tab_report(now_ms, &desired, &handles);
+    let counts = web_surface_applied_counts(&handles, contexts);
+    web_surface_tab_report_json(&rows, counts)
 }
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
 /// so a generation identifies an incarnation on its own — a stale handle can
@@ -5463,7 +6671,7 @@ fn publish_web_surface_native_ids(
                     native_id: entry.native_id,
                     generation: entry.generation,
                     visible: entry.visible,
-                    stashed: entry.stashed_at_ms.is_some(),
+                    stashed_at_ms: entry.stashed_at_ms,
                     ever_revealed: entry.ever_revealed,
                 },
             )
@@ -5494,6 +6702,33 @@ fn web_surface_tab_place_rect(
     active_tab: u64,
 ) -> Option<(i32, i32, i32, i32)> {
     pinned_rect.or(if tab_id == active_tab { page_rect } else { None })
+}
+
+/// Does this tab get a webview THIS tick, and at what rect?
+///
+/// **Lazy creation is why a hundred restored tabs cost nothing.** A tab that has
+/// never been on screen has no webview at all — only a row in the tree and a URL
+/// on disk ([`SavedWebTab`]) — so the answer is `None` unless
+///
+///   - someone is being shown it (`want_visible`, which the caller folds from
+///     [`web_surface_tab_place_rect`] plus the session's active-visibility plus
+///     the modal gate), in which case it is created at the rect it will paint at;
+///   - or an AGENT asked for it to exist (`EnsureWebSurface`), in which case it
+///     is born at a canonical offscreen rect and stashed in the same tick: never
+///     revealed, no page hole, reaped on the normal hold/lease clock.
+///
+/// Pure so the negative half of the per-tab reclaim lane is lockable: a hundred
+/// saved tabs with one of them visited must realize exactly ONE webview, and a
+/// reclaimed tab must come back through this same door when it is next selected.
+fn web_surface_tab_create_rect(
+    want_visible: bool,
+    place_rect: Option<(i32, i32, i32, i32)>,
+    headless_wanted: bool,
+) -> Option<(i32, i32, i32, i32)> {
+    if want_visible {
+        return place_rect;
+    }
+    headless_wanted.then_some(WEB_SURFACE_HEADLESS_CREATE_RECT)
 }
 
 /// The ONE writer of native surface webviews: a declarative reconciler that
@@ -5899,6 +7134,7 @@ async fn web_surface_native_reconcile_loop(
         let (
             desired,
             active_visible_sessions,
+            split_pinned_tabs,
             modal_over_viewport,
             global_zoom_factor,
             zoom_overrides,
@@ -5910,6 +7146,7 @@ async fn web_surface_native_reconcile_loop(
                 SurfacePolicyGate,
             )>,
             std::collections::HashSet<String>,
+            std::collections::HashSet<(String, u64)>,
             bool,
             f64,
             HashMap<String, HashMap<String, f32>>,
@@ -5984,6 +7221,10 @@ async fn web_surface_native_reconcile_loop(
                     .cloned()
                     .collect()
             };
+            // Tabs pinned into a live split pane. Read from the SAME peek as the
+            // visibility authority above so the reclaim domain below cannot be
+            // built from two different instants of the shell.
+            let split_pinned_tabs = shell_ref.split_pinned_web_tabs();
             // Global "Web View" / "Ychrome Global" zoom, as a WebKit factor
             // (100% -> 1.0). The fallback for every surface with no per-site
             // override for the host it is on.
@@ -6006,11 +7247,19 @@ async fn web_surface_native_reconcile_loop(
             (
                 desired,
                 active_visible_sessions,
+                split_pinned_tabs,
                 modal_over_viewport,
                 global_zoom_factor,
                 zoom_overrides,
             )
         };
+        // Which tab each session's page area shows, from the SAME `desired` the
+        // placement loop below uses — so "who is on screen" is answered once and
+        // the reclaim domain cannot drift from the paint.
+        let active_tab_by_session: HashMap<String, u64> = desired
+            .iter()
+            .map(|(session_path, active_tab, _, _)| (session_path.clone(), *active_tab))
+            .collect();
         // An open app pane FOLLOWS THE PAGE.
         //
         // The GUI reports the page context (host, live zoom, HTTPS) and the app
@@ -6081,7 +7330,7 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
-        // STASH surfaces of BACKGROUNDED sessions (state-authoritative, no eval).
+        // STASH surfaces nobody is being shown (state-authoritative, no eval).
         // GTK `set_visible(false)` does NOT reliably clear a WebKitGTK surface: the
         // shared compositor won't re-blit a merely-hidden webview (the reload-white
         // pathology) — a hidden surface stays stuck-composited over the revealed
@@ -6090,15 +7339,22 @@ async fn web_surface_native_reconcile_loop(
         // playback) alive, so switch-back is instant instead of a reload. The
         // configurable background hold bounds memory: on expiry the stashed
         // surface is destroyed (recreates lazily against the per-profile jar).
+        //
+        // "Nobody is being shown" is a (session, tab) question, not a session
+        // one: the front session's ninety-nine background tabs are as invisible
+        // as a whole backgrounded session, and they used to be exempt forever.
+        // `web_surface_background_candidates` owns that rule.
         let now_ms = current_millis();
         // Sorted: `applied` is a HashMap, and the trace (and the order surfaces
         // are destroyed in) must not depend on its iteration order.
-        let mut backgrounded: Vec<(String, u64)> = applied
-            .keys()
-            .filter(|(session, _)| !active_visible_sessions.contains(session.as_str()))
-            .cloned()
-            .collect();
-        backgrounded.sort();
+        let mut applied_keys: Vec<(String, u64)> = applied.keys().cloned().collect();
+        applied_keys.sort();
+        let backgrounded = web_surface_background_candidates(
+            &applied_keys,
+            &active_visible_sessions,
+            &active_tab_by_session,
+            &split_pinned_tabs,
+        );
         if !backgrounded.is_empty() {
             // Pressure-triggered reclaim: sample memory headroom once per pass.
             // Under real memory pressure a backgrounded surface is DETACHED
@@ -6125,6 +7381,7 @@ async fn web_surface_native_reconcile_loop(
                 &read_memory_pressure_snapshot(),
                 web_surface_force_background_pressure(),
                 web_surface_background_hold_ms(false),
+                web_surface_tab_background_hold_ms(false),
                 &backgrounded,
                 &mut applied,
                 &|key| web_surface_lease_until_ms(&state, &key.0, key.1),
@@ -6461,14 +7718,13 @@ async fn web_surface_native_reconcile_loop(
                                 .copied(),
                             current_millis(),
                         );
-                    let create_rect = if want_visible {
-                        place_rect
-                    } else if headless_wanted {
-                        Some(WEB_SURFACE_HEADLESS_CREATE_RECT)
-                    } else {
-                        None
-                    };
-                    let Some(rect) = create_rect else {
+                    // Lazy creation, in one decision the negative lock can drive:
+                    // a tab nobody is being shown and no agent asked for gets NO
+                    // webview — which is what keeps a hundred restored tabs (and
+                    // a hundred RECLAIMED ones) free until they are selected.
+                    let Some(rect) =
+                        web_surface_tab_create_rect(want_visible, place_rect, headless_wanted)
+                    else {
                         continue;
                     };
                     // The app's policy has not landed yet. Userscripts only
@@ -12769,6 +14025,31 @@ impl ShellState {
     /// otherwise the surface's own active tab. One owner, so every chrome
     /// tenant that answers "which page is the user on" answers from the
     /// same pane.
+    /// Every web tab PINNED into a live split pane, as `(session, tab)`.
+    ///
+    /// ONE owner for "this tab paints in its own rect": the reclaim domain reads
+    /// it to keep a pinned tab off the candidate list, and the per-tab instrument
+    /// reads it to say why. A pinned pane paints its tab independently of the
+    /// surface's active tab ([[campaign-libyggterm]] Phase 3), so such a tab is
+    /// ON SCREEN even though it is not the active one.
+    ///
+    /// Every group, not just the active one, and deliberately: a split group is
+    /// a layout the user built and it is one group-switch away from being on
+    /// screen. The set is small and user-authored, so the cost of being generous
+    /// is bounded — unlike the tabs this lane is actually after, which are
+    /// unbounded. (This does NOT rescue a pinned tab of a BACKGROUNDED session:
+    /// see [`web_surface_background_candidates`], where the session domain is
+    /// deliberately not narrowed by this exemption.)
+    fn split_pinned_web_tabs(&self) -> std::collections::HashSet<(String, u64)> {
+        self.split_groups
+            .iter()
+            .flat_map(|group| group.members.iter())
+            .filter_map(|member| match member.view {
+                SplitMemberView::Web { tab } => Some((member.session.clone(), tab)),
+                _ => None,
+            })
+            .collect()
+    }
     fn focused_web_tab_id(&self, session_path: &str) -> Option<u64> {
         let group = self.active_split_group()?;
         let focused = focused_pane_index(group, self.server.active_session_path())?;
@@ -24023,6 +25304,10 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderProbeShellContext {
     web_surface_sessions: usize,
+    /// DESIRED tabs across every surface. The denominator the realized counts
+    /// are read against: `web_surface_tabs: 100` with `web_surface_views: 3` is
+    /// the per-tab reclaim working, and `100 / 100` is it broken.
+    web_surface_tabs: usize,
     live_sessions: usize,
     /// The PHYSICAL fact, not `effective_window_focused()`. The CPU number has
     /// to be read against whether a human could actually see the window; the
@@ -24036,6 +25321,11 @@ struct RenderProbeShellContext {
 fn render_probe_shell_context(shell: &ShellState) -> RenderProbeShellContext {
     RenderProbeShellContext {
         web_surface_sessions: shell.web_surfaces.len(),
+        web_surface_tabs: shell
+            .web_surfaces
+            .values()
+            .map(|surface| surface.tabs.len())
+            .sum(),
         live_sessions: shell.server.live_session_views().len(),
         window_focused: shell.window_focused,
         force_foreground: shell.app_control_force_foreground,
@@ -24061,10 +25351,12 @@ fn render_probe_context(
 ) -> Value {
     json!({
         "web_surfaces": shell.web_surface_sessions,
+        "web_surface_tabs": shell.web_surface_tabs,
         "live_sessions": shell.live_sessions,
         "web_surface_views": surfaces.total,
         "web_surface_views_visible": surfaces.visible,
         "web_surface_views_stashed": surfaces.stashed,
+        "web_surface_view_sessions": surfaces.sessions,
         "web_surface_contexts": surfaces.contexts,
         "window_focused": shell.window_focused,
         "force_foreground": shell.force_foreground,
@@ -42138,6 +43430,12 @@ fn describe_app_state_snapshot(
         // Split-view SSOT ([[campaign-split-view-groups]]): groups + which one is
         // active, so the split surface is verifiable headlessly.
         "split_view": split_groups_debug_json(&shell),
+        // PER-TAB webview state: every desired tab joined against the realized
+        // registry, so "100 tabs, how many web processes?" is answerable rather
+        // than guessed. Carries its own honesty note about per-tab RSS — WebKit
+        // pools web processes per WebContext, so bytes are not attributable to a
+        // tab and this listing does not invent them.
+        "web_surface_tabs": describe_web_surface_tabs(&shell, notification_now_ms),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
         "active_session_terminal_foreground_active": snapshot.active_session.as_ref().and_then(|session| session.terminal_foreground_active),
         "active_title": snapshot.active_title.clone(),
@@ -54107,7 +55405,7 @@ mod web_do_verb_tests {
         publish_web_surface_native_ids(&published, 1);
         let handle = web_surface_handle_for("web://latched", 0).expect("published");
         assert!(
-            handle.stashed,
+            handle.stashed(),
             "the surface is backgrounded — the exact case `stashed` cannot answer"
         );
         assert!(
@@ -55884,7 +57182,7 @@ mod web_do_verb_tests {
             native_id: 7,
             generation: 42,
             visible: true,
-            stashed: false,
+            stashed_at_ms: None,
             ever_revealed: true,
         };
         assert!(web_surface_stale_handle(None, handle).is_none());
@@ -112837,7 +114135,7 @@ mod tests {
             native_id,
             generation: native_id,
             visible,
-            stashed,
+            stashed_at_ms: stashed.then_some(1_000),
             ever_revealed: visible,
         };
         let mut handles = HashMap::new();
@@ -112849,6 +114147,11 @@ mod tests {
 
         assert_eq!(counts.total, 3, "two sessions, three realized webviews");
         assert_eq!(counts.visible, 1);
+        assert_eq!(
+            counts.sessions, 2,
+            "three realized webviews across TWO sessions — the per-tab realization \
+             ratio the reclaim domain bounds"
+        );
         assert_eq!(
             counts.stashed, 2,
             "soft-stashed surfaces stay alive and cost CPU; that is the whole point of              counting them apart"
@@ -112887,6 +114190,7 @@ mod tests {
                 total: 3,
                 visible: 1,
                 stashed: 2,
+                sessions: 1,
                 contexts: 1,
             },
         );
@@ -112900,6 +114204,11 @@ mod tests {
         assert_eq!(context.get("web_surface_views"), Some(&json!(3)));
         assert_eq!(context.get("web_surface_views_visible"), Some(&json!(1)));
         assert_eq!(context.get("web_surface_views_stashed"), Some(&json!(2)));
+        assert_eq!(context.get("web_surface_view_sessions"), Some(&json!(1)));
+        // The DESIRED denominator: the app tab is the surface's one tab here, so
+        // one. A 100-tab day reads `web_surface_tabs: 100` against
+        // `web_surface_views: <small>`; the pair is the per-tab reclaim, visible.
+        assert_eq!(context.get("web_surface_tabs"), Some(&json!(1)));
         // The instrument the optimization pass was missing: three webviews on
         // ONE engine context. When these two track each other, every tab is
         // paying for its own process pool, network process and cookie jar.
