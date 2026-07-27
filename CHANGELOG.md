@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.12.18
 
+- **Fixed: right-click menus now close the way you expect.** Clicking anywhere
+  outside a menu closes it, Escape closes it, and a menu whose row disappeared
+  closes itself — previously the only reliable way out was picking an item, and
+  a menu opened at the wrong moment could sit on screen indefinitely.
+- **Fixed: the tab rail's right-click menu stays inside the rail.** It used to
+  extend over the page, where the page always paints on top — so most of the
+  menu was invisible. The classic tab strip's dropdowns now briefly rest the
+  page while they are open, for the same reason.
+- **Fixed: "Continue tabs from last time" now actually continues the page you
+  were on.** The page you browsed in the app's own tab was never saved, so a
+  restart came back on the start page instead of your page. It is saved now,
+  restored into the same tab — and a saved tab list can no longer be emptied
+  by anything except you closing your tabs.
+
 - **New: assistants can drive a headless web page from the command line.**
   `yggterm-headless server wpe <verb>` opens a page, navigates it, clicks,
   types, reads text back and saves a screenshot of it — without a window, a
