@@ -3770,6 +3770,19 @@ fn default_seat_pointer() -> Option<gdk::Device> {
 /// thread when called, so the blocking forward is moved to its own thread and
 /// answers through the async `responder` — a `/fido2/get` blocks up to two
 /// minutes waiting for the presence dialog, which lives on this very thread.
+///
+/// ⚠ THIS IS A CONFUSED-DEPUTY BRIDGE. It carries PAGE-ORIGIN requests to an
+/// endpoint the page could not otherwise reach, so everything it forwards is
+/// attacker-controlled. Two rules keep it honest, and neither may be relaxed:
+///
+///   1. **Only [`FORWARDED_HEADERS`] cross.** The GUI's own credential for an
+///      app's control endpoint (`X-Ychrome-Control`, declared over the PTY
+///      stream) is NOT in that list, and adding it — or a blanket "forward the
+///      page's headers" — would hand every page the GUI's authority over
+///      `POST /action`: vault unlock, credential fill, ad blocking off.
+///   2. **A request target with a control character is refused**, because the
+///      forward below writes it into a request line. A page that could smuggle
+///      a CRLF into the path could append its own headers and forge rule 1 away.
 fn app_control_proxy(base: String, request: Request<Vec<u8>>, responder: RequestAsyncResponder) {
     // A cross-origin fetch from the RP's https page preflights; answer OPTIONS
     // ourselves rather than forwarding it.
@@ -3784,13 +3797,25 @@ fn app_control_proxy(base: String, request: Request<Vec<u8>>, responder: Request
         path.push('?');
         path.push_str(query);
     }
+    if !app_control_target_is_forwardable(&path) {
+        responder.respond(cors_response(
+            400,
+            br#"{"error":"appctl: refused a request target containing a control character"}"#
+                .to_vec(),
+        ));
+        return;
+    }
     let method = request.method().as_str().to_string();
     // Forward only the headers the signer cares about — the bearer token gate and
-    // the content type. Everything else (Origin, Sec-*, etc.) is browser noise.
+    // the content type. Everything else (Origin, Sec-*, etc.) is browser noise,
+    // and the GUI's own control token is deliberately absent: see the rules above.
     let token = request
         .headers()
-        .get("X-Ychrome-Fido2")
+        .get(FORWARDED_HEADERS[0])
         .and_then(|value| value.to_str().ok())
+        // Same rule as the target: a value with a control byte would close the
+        // header line and let the page write the next one itself.
+        .filter(|value| !value.chars().any(char::is_control))
         .map(str::to_string);
     let content_type = request
         .headers()
@@ -3810,6 +3835,20 @@ fn app_control_proxy(base: String, request: Request<Vec<u8>>, responder: Request
         };
         responder.respond(cors_response(status, payload));
     });
+}
+
+/// The ONLY request headers `yggterm-appctl://` carries from a page to an app's
+/// control endpoint. A page holds the signer's bearer token by construction (it
+/// is baked into its own shim userscript), so forwarding it grants nothing the
+/// page did not already have. The GUI's `X-Ychrome-Control` is a different
+/// secret with a different courier (the PTY declare) and must never appear here.
+const FORWARDED_HEADERS: [&str; 2] = ["X-Ychrome-Fido2", "Content-Type"];
+
+/// Is this request target safe to write into a request line? A CR or LF (or any
+/// other control byte) would end the line and let the page write headers of its
+/// own — including the one header this bridge exists to withhold.
+fn app_control_target_is_forwardable(path: &str) -> bool {
+    !path.chars().any(|c| c.is_control())
 }
 
 /// One blocking HTTP request to `base` (`http://host:port`), returning the status
@@ -3839,11 +3878,11 @@ fn forward_to_control(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n"
     );
     if !body.is_empty() || method == "POST" {
-        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        head.push_str(&format!("{}: {content_type}\r\n", FORWARDED_HEADERS[1]));
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     if let Some(token) = token {
-        head.push_str(&format!("X-Ychrome-Fido2: {token}\r\n"));
+        head.push_str(&format!("{}: {token}\r\n", FORWARDED_HEADERS[0]));
     }
     head.push_str("\r\n");
 
@@ -5477,5 +5516,51 @@ mod new_window_door_locks {
              `is_background_open_gesture` — the `create` door and the navigation \
              door asking the question two different ways is how they drift",
         );
+    }
+}
+
+#[cfg(test)]
+mod app_control_bridge_tests {
+    use super::{FORWARDED_HEADERS, app_control_target_is_forwardable};
+
+    /// THE CONFUSED-DEPUTY RULE. `yggterm-appctl://` carries page-origin
+    /// requests to an app's control endpoint, which the page could not reach on
+    /// its own. The GUI's credential for that endpoint (`X-Ychrome-Control`,
+    /// declared over the PTY stream) must never ride along: forwarding it would
+    /// hand every page in the surface the GUI's authority over `POST /action` —
+    /// ychrome's vault unlock, credential fill and ad-blocking switches.
+    ///
+    /// The signer's token IS forwarded, and that grants nothing: every page in
+    /// the profile already holds it, baked into its own shim userscript.
+    #[test]
+    fn the_bridge_never_carries_the_guis_control_token() {
+        assert!(
+            !FORWARDED_HEADERS
+                .iter()
+                .any(|header| header.eq_ignore_ascii_case("X-Ychrome-Control")),
+            "the GUI's control token must not cross the page bridge"
+        );
+        assert_eq!(
+            FORWARDED_HEADERS.len(),
+            2,
+            "the forwarded set is a closed allow-list, not a starting point"
+        );
+    }
+
+    /// The allow-list above is only enforceable if the page cannot write the
+    /// request line itself. A CR/LF in the target would end the line and let it
+    /// append any header it likes — including the one the list withholds.
+    #[test]
+    fn a_request_target_that_could_inject_a_header_is_refused() {
+        assert!(app_control_target_is_forwardable("/fido2/get"));
+        assert!(app_control_target_is_forwardable("/ping?session=env-1&ack=b#0"));
+        assert!(
+            !app_control_target_is_forwardable(
+                "/action\r\nX-Ychrome-Control: forged\r\nX-Ignore: "
+            ),
+            "a CRLF in the target must never reach the request line"
+        );
+        assert!(!app_control_target_is_forwardable("/action\nX-Ychrome-Control: forged"));
+        assert!(!app_control_target_is_forwardable("/action\u{0}"));
     }
 }
