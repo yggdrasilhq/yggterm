@@ -467,9 +467,15 @@ the read/capture/lease invariants below apply.
   The count is never discarded: real keystrokes DO reach an invisible page (a
   borrowed window keyboard focus is one proven route), and swallowing them would
   turn a live co-browse defect into a designed-in blind spot. The reveal fact has
-  ONE owner — the reconciler's `ever_revealed` latch, published in the surface
-  handle — because `stashed` cannot tell "never shown" from "shown, then
-  backgrounded".
+  ONE owner — `AppliedWebSurface::ever_revealed`, published in the surface handle
+  — because `stashed` cannot tell "never shown" from "shown, then backgrounded".
+  It is produced in exactly three places, all on that struct: a reconciler create
+  (`created`, revealed iff it is being placed in front of the user), a popup
+  adoption (`adopted_popup`, revealed iff it did not open in the background) and
+  the per-tick latch (`latch_reveal`, off the same visibility the compositor was
+  given, never cleared). Anything that judges the fact — the gate, the batch
+  loop, the publish — is a consumer, and pinning a consumer proves nothing about
+  the three producers.
 - **Injection credits expire (250 ms).** The credit ledger that stops an agent's
   own injection reading as the human is bounded by a clock as well as by the
   end-of-verb drop. The drop only runs when the shell reads the counter, which it

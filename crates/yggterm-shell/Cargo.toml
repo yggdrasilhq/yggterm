@@ -56,3 +56,11 @@ wry = "0.55.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }
+
+[dev-dependencies]
+# `web ensure`'s closed-session refusal is CONJUNCTIVE: locking it needs a row the
+# user really closed, and the tombstone plane's writer is private to
+# yggterm-server. This edge borrows it (`remember_live_row_close_for_test`)
+# instead of re-encoding `removed-rows.json` on this side, and turns the door on
+# for TESTS only — resolver 2 keeps dev-dependency features out of `cargo build`.
+yggterm-server = { path = "../yggterm-server", features = ["test-support"] }
