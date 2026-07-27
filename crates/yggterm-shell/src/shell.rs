@@ -6555,15 +6555,24 @@ fn web_surface_search_url_from_template(template: &str, query: &str) -> String {
 /// process), so the tabs are too. This is yggterm's own chrome, not an app's
 /// data — the app owns browsing CONFIG (ruleset, userscripts, zoom, UA), yggterm
 /// owns the tabs it renders. See `.agents/skills/libyggterm-surfaces/SKILL.md`.
-fn web_surface_tab_store_path(profile: &str) -> Option<std::path::PathBuf> {
+///
+/// Takes the jar ROOT rather than resolving it, for the same reason the profile
+/// metadata and delete paths do: a lock can exercise the real read/write/guard
+/// against a scratch root without an env var the rest of the test binary would
+/// race on. [`web_surface_profiles_root`] is still the one resolver.
+fn web_surface_tab_store_path_in(
+    root: &std::path::Path,
+    profile: &str,
+) -> Option<std::path::PathBuf> {
     if profile == WEB_SURFACE_TEMP_PROFILE {
         return None;
     }
-    Some(web_surface_profile_dir(profile)?.join("tabs.json"))
+    Some(root.join(profile).join("tabs.json"))
 }
-/// One saved tab. The app tab is never saved (the app supplies it on open), and
-/// no live handle (webview id, ssh forward, socks port) is: those belong to a
-/// run, not to the tree.
+/// One saved tab. No live handle (webview id, ssh forward, socks port) is kept:
+/// those belong to a run, not to the tree. Which tabs get here at all is
+/// [`web_tab_is_saved`]'s single answer — including the one subtle case, the app
+/// tab, which is saved only once the user has taken it off the app's own page.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SavedWebTab {
     url: String,
@@ -6685,8 +6694,8 @@ fn plan_web_tab_restore(
         },
     }
 }
-fn load_web_tab_store(profile: &str) -> WebTabStore {
-    let Some(path) = web_surface_tab_store_path(profile) else {
+fn load_web_tab_store_in(root: &std::path::Path, profile: &str) -> WebTabStore {
+    let Some(path) = web_surface_tab_store_path_in(root, profile) else {
         return WebTabStore::default();
     };
     let mut store = std::fs::read_to_string(path)
@@ -6696,16 +6705,121 @@ fn load_web_tab_store(profile: &str) -> WebTabStore {
     store.reconcile();
     store
 }
-fn save_web_tab_store(profile: &str, store: &WebTabStore) {
-    let Some(path) = web_surface_tab_store_path(profile) else {
-        return;
+/// What a tab-store write is FOR. The empty-overwrite guard judges nothing else,
+/// so every [`ShellState::persist_web_tabs`] call site has to say which it is —
+/// and a new one cannot be added without answering the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebTabSave {
+    /// Something DECIDED to change the tab set or its organization: a tab
+    /// closed (by the ✕, by the rail menu, by a script closing its own tab), a
+    /// tab opened or filed, a folder made, renamed or deleted. An empty set
+    /// arriving this way was AUTHORED — the last tab was closed on purpose —
+    /// and it may replace a saved one.
+    TreeEdit,
+    /// The save only mirrors a model nobody edited: the rehydrate on open, the
+    /// page observer following a URL or title. An empty set arriving this way
+    /// is not a decision, it is an ABSENCE — a restore that came up empty, a
+    /// surface born before its tree was read — and it may not zero a saved
+    /// tree. This is the classification the tab-restore clobber turned on: the
+    /// write that wiped `research/tabs.json` was one of these.
+    Mirror,
+}
+/// What the guard did with one write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebTabStoreWrite {
+    Wrote,
+    /// Refused: an empty tab set would have zeroed a store that still holds
+    /// tabs, and nothing in this save authored the emptiness. Carries what
+    /// stayed on disk, so the trace can name what was preserved.
+    RefusedEmptyOverwrite {
+        tabs: usize,
+        folders: usize,
+    },
+    /// The profile keeps nothing on disk (ephemeral). Nothing written, nothing
+    /// at risk.
+    NoStore,
+}
+/// THE rule: an empty tab set may replace a saved one only when something
+/// decided to empty it.
+///
+/// Pure, because "may this write happen" is the whole safety property and it
+/// must be decidable without a disk. A crash, a restart, a race or a surface
+/// that opened before its tree was read all produce the same shape — a model
+/// holding no user tabs — and none of them is a user closing their last tab.
+fn web_tab_store_write_refused(on_disk_tabs: usize, next_tabs: usize, save: WebTabSave) -> bool {
+    next_tabs == 0 && on_disk_tabs > 0 && save == WebTabSave::Mirror
+}
+/// Write a profile's tab tree, unless that would zero a store nobody asked to
+/// zero.
+///
+/// The refusal is traced (into the home this root belongs to, so a scratch root
+/// traces nowhere near the user's own journal) naming what was preserved: a
+/// silent refusal would be its own kind of data loss report.
+fn save_web_tab_store_in(
+    root: &std::path::Path,
+    profile: &str,
+    store: &WebTabStore,
+    save: WebTabSave,
+) -> WebTabStoreWrite {
+    let Some(path) = web_surface_tab_store_path_in(root, profile) else {
+        return WebTabStoreWrite::NoStore;
     };
+    let on_disk = load_web_tab_store_in(root, profile);
+    if web_tab_store_write_refused(on_disk.tabs.len(), store.tabs.len(), save) {
+        let refused = WebTabStoreWrite::RefusedEmptyOverwrite {
+            tabs: on_disk.tabs.len(),
+            folders: on_disk.folders.len(),
+        };
+        if let Some(home) = root.parent() {
+            append_trace_event(
+                home,
+                "ui",
+                "web_surface",
+                "tab_store_empty_overwrite_refused",
+                json!({
+                    "profile": profile,
+                    "preserved_tabs": on_disk.tabs.len(),
+                    "preserved_folders": on_disk.folders.len(),
+                    "save": "mirror",
+                }),
+            );
+        }
+        return refused;
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(body) = serde_json::to_string_pretty(store) {
         let _ = std::fs::write(path, body);
     }
+    WebTabStoreWrite::Wrote
+}
+/// A page the user was really ON: an http(s) URL. THE predicate for both things
+/// that record where a surface has been — the history journal and the saved tab
+/// tree — so an internal `data:` page (the history view itself) can never be
+/// journalled as a visit or come back as a restored tab.
+fn web_surface_url_is_page(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+/// Does this tab belong in the profile's saved tree?
+///
+/// Every user tab does. The APP TAB (id 0) does too, but only once it is
+/// somewhere the APP did not put it: `app_url` is the URL the app last declared
+/// over OSC, so a tab still sitting on it is the app's own launch page — the app
+/// supplies that again on the next open, and saving it would resurrect a stale
+/// start page as a user tab. Anywhere else is the user's browsing, and for a
+/// plain `ychrome` launch (one tab, the app tab) it is the ENTIRE session:
+/// excluding it is what made "continue where you left off" continue nothing.
+///
+/// Pure so the rule can be exercised without a surface, a profile or a disk.
+fn web_tab_is_saved(tab_id: u64, url: &str, app_url: &str) -> bool {
+    if url.trim().is_empty() {
+        return false;
+    }
+    if tab_id != WEB_TAB_APP_TAB_ID {
+        return true;
+    }
+    url != app_url && web_surface_url_is_page(url)
 }
 /// Per-profile browsing-history file (append-only JSONL `{ts_ms, url, title}`,
 /// written by the native-surface reconciler's page observer). None for the
@@ -6718,7 +6832,7 @@ fn web_surface_history_path(profile: &str) -> Option<std::path::PathBuf> {
     Some(web_surface_profile_dir(profile)?.join("history.jsonl"))
 }
 fn append_web_surface_history(profile: &str, url: &str, title: &str) {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    if !web_surface_url_is_page(url) {
         return;
     }
     let Some(path) = web_surface_history_path(profile) else {
@@ -8571,7 +8685,7 @@ async fn web_surface_native_reconcile_loop(
                                 // (its redirected URL, its title). That is what the
                                 // tree must save, or a restored tab comes back
                                 // wearing the name of the page it started on.
-                                shell.persist_web_tabs(key.0.as_str());
+                                shell.persist_web_tabs(key.0.as_str(), WebTabSave::Mirror);
                                 followable
                             });
                             // Record history keyed on the url, but NEVER pair a
@@ -10729,6 +10843,13 @@ struct ShellState {
     // ychrome pilot). SSOT for the viewport web overlay; entries expire when
     // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
     web_surfaces: HashMap<String, WebSurfaceUiState>,
+    /// The web-profile jar root this shell loads and saves tab stores under,
+    /// resolved ONCE at construction from [`web_surface_profiles_root`] — still
+    /// the one resolver; this only remembers its answer. Held rather than
+    /// re-resolved per save so a lock can point a shell at a scratch root, the
+    /// same reason the profile metadata and delete paths take a root argument.
+    /// `None` = this host has no yggterm home: nothing to load, nothing to save.
+    web_profiles_root: Option<std::path::PathBuf>,
     /// Agent-requested headless materialization (EnsureWebSurface): session ->
     /// wanted-until epoch ms. The reconciler creates the session's surfaces
     /// straight into the soft stash while a request is standing.
@@ -12746,6 +12867,7 @@ impl ShellState {
             session_working_prev: HashMap::new(),
             session_working_confirm_streak: HashMap::new(),
             web_surfaces: HashMap::new(),
+            web_profiles_root: web_surface_profiles_root(),
             web_surface_headless_wanted: HashMap::new(),
             web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
@@ -14000,7 +14122,10 @@ impl ShellState {
         // it is activated, at which point the reconciler creates its webview and
         // resolves its egress like any other tab. So restoring thirty tabs costs
         // thirty rows, not thirty webviews.
-        let store = load_web_tab_store(&profile);
+        let store = match self.web_profiles_root.as_deref() {
+            Some(root) => load_web_tab_store_in(root, &profile),
+            None => WebTabStore::default(),
+        };
         let restore = self.settings.web_surface_restore_tabs;
         let plan = plan_web_tab_restore(store.tabs_to_open(restore), restore, start_page);
         if let Some(saved) = &plan.adopt {
@@ -14080,7 +14205,18 @@ impl ShellState {
         // Write the purge through immediately. A fresh start that only DROPPED
         // the root tabs in memory would resurrect every one of them if the GUI
         // died before the next tab edit.
-        self.persist_web_tabs(session_path);
+        //
+        // A MIRROR, emphatically: this write reflects a model the user has not
+        // touched yet, so if it comes up empty it is an absence and not a
+        // decision. It is the write that zeroes a `tabs.json` when anything
+        // upstream of it goes wrong (a store that failed to parse, a surface
+        // built before its profile was known, an agent opening a one-tab
+        // surface on the user's own profile), which is exactly what the guard
+        // in `save_web_tab_store_in` refuses. The purge itself still happens
+        // whenever something survives it — an all-root store under a fresh
+        // start keeps its rows on disk instead, unseen, rather than being
+        // deleted by a write nobody authored.
+        self.persist_web_tabs(session_path, WebTabSave::Mirror);
         // Vertical mode IS the rail, so a surface opening under a pref that is
         // already on must RAISE it. Toggling the pref opened the rail, but a GUI
         // that started with the pref already true collapsed the tab strip and
@@ -15204,7 +15340,7 @@ impl ShellState {
                 tab.folder = Some(folder_id.to_string());
             }
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     /// Adopt a POPUP a page opened (`window.open`, `target="_blank"`, a
     /// middle/ctrl-click) as a tab of the same session.
@@ -15342,7 +15478,7 @@ impl ShellState {
                     .then(|| candidates[0])
             })?;
         self.web_surface_close_tab(session_path, target);
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
         Some(target)
     }
     /// The ssh target (egress host) of a session by path, for resolving a web
@@ -15389,7 +15525,7 @@ impl ShellState {
         }
         // Closing a FILED tab removes it from the saved tree — a folder must not
         // resurrect a tab the user closed on the next visit.
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     /// Request a reload of the active tab's page (native surface ⟳).
     fn web_surface_reload_active_tab(&mut self, session_path: &str) {
@@ -15650,7 +15786,7 @@ impl ShellState {
         // Filing a tab used to be the only thing that persisted one, which meant
         // a tab you opened and browsed was still saved as the page you started on
         // — or, at the root, not saved at all.
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::Mirror);
         // Tab or surface vanished while the forward resolved: don't leak it.
         if let Some(mut child) = orphaned_forward {
             let _ = child.kill();
@@ -15752,7 +15888,7 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::Mirror);
     }
     /// The viewport overlay view for a live (non-stale) surface: tab strip,
     /// address bar, and per-tab iframe targets.
@@ -15966,10 +16102,21 @@ impl ShellState {
     /// The file is small (URLs and names), and writing it eagerly is what makes
     /// the tree survive a GUI kill, which is the whole promise of a saved folder.
     ///
-    /// The app tab is deliberately NOT saved: it belongs to the app, which
-    /// supplies it on the next `open`. Saving it would resurrect a stale copy of
-    /// the app's start page as a user tab.
-    fn persist_web_tabs(&self, session_path: &str) {
+    /// `save` is the write's provenance, and every call site must state it: it
+    /// is the only thing standing between a surface that came up empty and a
+    /// zeroed tab store (see [`WebTabSave`]).
+    ///
+    /// The app tab's LAUNCH page is still never saved — it belongs to the app,
+    /// which supplies it again on the next `open`, and saving it would resurrect
+    /// a stale start page as a user tab. The page the user NAVIGATED it to is a
+    /// different thing: it is the browsing session, and it is the whole of it
+    /// for the ordinary `ychrome` launch that opens exactly one tab. Dropping it
+    /// is why "continue where you left off" returned a user to a bare start page
+    /// after a GUI kill with a `tabs.json` that had never held anything.
+    fn persist_web_tabs(&self, session_path: &str, save: WebTabSave) {
+        let Some(root) = self.web_profiles_root.clone() else {
+            return;
+        };
         let Some(surface) = self.web_surfaces.get(session_path) else {
             return;
         };
@@ -15981,13 +16128,13 @@ impl ShellState {
             return;
         };
         let active_tab = surface.active_tab;
+        let app_url = surface.osc_url.clone();
         let store = WebTabStore {
             folders: surface.folders.clone(),
             tabs: surface
                 .tabs
                 .iter()
-                .skip(1)
-                .filter(|tab| !tab.url.trim().is_empty())
+                .filter(|tab| web_tab_is_saved(tab.id, &tab.url, &app_url))
                 .map(|tab| SavedWebTab {
                     url: tab.url.clone(),
                     title: tab.title.clone().unwrap_or_default(),
@@ -15997,7 +16144,7 @@ impl ShellState {
                 })
                 .collect(),
         };
-        save_web_tab_store(&profile, &store);
+        save_web_tab_store_in(&root, &profile, &store, save);
     }
     /// A new virtual folder, opened straight into rename — a folder with no name
     /// is not organization, so the tree asks for one at birth (the cwd tree's
@@ -16017,7 +16164,7 @@ impl ShellState {
             return;
         }
         self.web_tab_folder_rename = Some((id, "New folder".to_string()));
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn web_tab_begin_rename(&mut self, folder_id: &str) {
         let name = self
@@ -16053,7 +16200,7 @@ impl ShellState {
         {
             folder.name = name;
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn web_tab_cancel_rename(&mut self) {
         self.web_tab_folder_rename = None;
@@ -16077,7 +16224,7 @@ impl ShellState {
         {
             self.web_tab_folder_rename = None;
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn web_tab_toggle_folder(&mut self, session_path: &str, folder_id: &str) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
@@ -16088,7 +16235,7 @@ impl ShellState {
         {
             folder.collapsed = !folder.collapsed;
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     /// File a tab into a folder, or back to the root with `None`. The app tab
     /// cannot be filed: it is the app's, and it is gone when the app is.
@@ -16112,7 +16259,7 @@ impl ShellState {
                 tab.folder = folder_id;
             }
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     /// Drag state for the tab tree. Mouse-driven, like the cwd tree's (HTML5 DnD
     /// is not what that tree uses, and one drag grammar beats two).
@@ -17037,7 +17184,7 @@ impl ShellState {
         tab.history = vec![url];
         tab.history_index = 0;
         surface.address_draft = None;
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
         Some(new_id)
     }
 
@@ -17161,7 +17308,7 @@ impl ShellState {
         if current == profile {
             return Some(0);
         }
-        self.persist_web_tabs(session_path);
+        self.persist_web_tabs(session_path, WebTabSave::Mirror);
         let surface = self.web_surfaces.get_mut(session_path)?;
         let mut retargeted = 0;
         for tab in &mut surface.tabs {
@@ -107992,7 +108139,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                     let close_path = close_path.clone();
                                     state.with_mut(|shell| {
                                         shell.web_surface_close_tab(&close_path, tab_id);
-                                        shell.persist_web_tabs(&close_path);
+                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
                                     });
                                 }
                             },
@@ -120909,6 +121056,246 @@ mod tests {
             store.tabs_to_open(false).len(),
             0,
             "and being at the root, a fresh start purges it"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // THE TAB-RESTORE LANE — what a restart is allowed to cost the user.
+    //
+    // Live incident (guihost 2.12.18, 2026-07-27): "continue tabs from last time"
+    // ON, profile `research`, a GUI kill mid-browse; ychrome came back on its
+    // brave start page and the khanacademy page the user was reading was gone,
+    // with `research/tabs.json` holding `{"folders":[],"tabs":[]}`. The store
+    // was not clobbered — it had never held anything, because the ONE tab a
+    // plain `ychrome` launch gives you is the APP TAB, and the app tab was
+    // excluded from the saved tree unconditionally. Two rules come out of it:
+    // the page the user browsed to IS the session and must be saved, and a
+    // write nobody authored may never zero a saved tree.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// A shell whose tab stores land in a scratch jar root instead of the
+    /// developer's own `~/.yggterm/web-profiles` — the reason
+    /// `ShellState::web_profiles_root` is held rather than re-resolved per save.
+    fn shell_on_scratch_profiles_root(root: &Path) -> ShellState {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.web_profiles_root = Some(root.to_path_buf());
+        shell.settings.web_surface_restore_tabs = true;
+        shell
+    }
+
+    /// The ordinary `ychrome` launch: no URL of its own, so the app supplies
+    /// its start page and the user gets exactly one tab — the app tab.
+    fn open_ychrome_surface(shell: &mut ShellState, profile: &str, now_ms: u64) {
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://search.brave.com/".to_string(),
+            Some("Brave".to_string()),
+            "https://search.brave.com/".to_string(),
+            None,
+            None,
+            profile.to_string(),
+            false,
+            now_ms,
+        );
+    }
+
+    fn surface_tab_urls(shell: &ShellState) -> Vec<String> {
+        shell
+            .web_surfaces
+            .get("local://ws")
+            .expect("the surface is open")
+            .tabs
+            .iter()
+            .map(|tab| tab.url.clone())
+            .collect()
+    }
+
+    fn saved_urls(root: &Path, profile: &str) -> Vec<String> {
+        load_web_tab_store_in(root, profile)
+            .tabs
+            .into_iter()
+            .map(|tab| tab.url)
+            .collect()
+    }
+
+    // ⚠ LOCK — THE INCIDENT. The page the user browsed to in the app tab is
+    // the browsing session, it is written to the tree, and it comes back after
+    // a GUI kill. Before this lane the store stayed empty and the user landed
+    // on a bare start page with everything they had been reading gone.
+    #[test]
+    fn the_page_the_user_browsed_to_survives_a_gui_kill() {
+        let root = ScratchProfilesRoot::new("restore-app-tab-page");
+        let profile = "research";
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        open_ychrome_surface(&mut shell, profile, 1_000);
+
+        // Sitting on the app's OWN page saves nothing: the app supplies that
+        // again on the next open, and a stale copy of it is not a user tab.
+        assert!(
+            saved_urls(root.path(), profile).is_empty(),
+            "the app's launch page was saved as a user tab"
+        );
+
+        // The user browses. One tab is all a plain launch gives them, so this
+        // navigation IS their session.
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            WEB_TAB_APP_TAB_ID,
+            "https://www.khanacademy.org/badges/copernicus".to_string(),
+            "https://www.khanacademy.org/badges/copernicus".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            saved_urls(root.path(), profile),
+            vec!["https://www.khanacademy.org/badges/copernicus".to_string()],
+            "the page the user was on never reached the tab store, so a restart \
+             had nothing to continue"
+        );
+
+        // The GUI is killed and comes back; the app re-supplies its start page.
+        let mut restarted = shell_on_scratch_profiles_root(root.path());
+        open_ychrome_surface(&mut restarted, profile, 2_000);
+        assert!(
+            surface_tab_urls(&restarted)
+                .iter()
+                .any(|url| url == "https://www.khanacademy.org/badges/copernicus"),
+            "the restored surface came back without the page the user was \
+             reading: {:?}",
+            surface_tab_urls(&restarted)
+        );
+    }
+
+    // ⚠ LOCK — THE GUARD. A save that only MIRRORS a model nobody edited may
+    // not zero a store that still holds tabs. This is the write that ran in the
+    // incident (a surface rehydrating), and it is the same write an agent's
+    // one-tab surface on the user's profile performs.
+    #[test]
+    fn a_mirror_write_of_an_empty_model_never_zeroes_a_saved_tree() {
+        let root = ScratchProfilesRoot::new("restore-guard");
+        let profile = "research";
+        let seeded = WebTabStore {
+            folders: Vec::new(),
+            tabs: vec![
+                saved_tab("https://a.example/", None),
+                saved_tab("https://b.example/", None),
+            ],
+        };
+        assert_eq!(
+            save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit),
+            WebTabStoreWrite::Wrote,
+        );
+
+        // A fresh start (restore OFF) drops the root tabs from the MODEL, so
+        // the rehydrate's own persist writes an empty set.
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        shell.settings.web_surface_restore_tabs = false;
+        open_ychrome_surface(&mut shell, profile, 1_000);
+        assert_eq!(
+            surface_tab_urls(&shell),
+            vec!["https://search.brave.com/".to_string()],
+            "a fresh start opens the app tab alone"
+        );
+        assert_eq!(
+            saved_urls(root.path(), profile),
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string()
+            ],
+            "a surface that came up with no user tabs zeroed the saved tree"
+        );
+
+        // And the refusal says what it kept, rather than failing silently.
+        assert_eq!(
+            save_web_tab_store_in(
+                root.path(),
+                profile,
+                &WebTabStore::default(),
+                WebTabSave::Mirror
+            ),
+            WebTabStoreWrite::RefusedEmptyOverwrite {
+                tabs: 2,
+                folders: 0
+            },
+        );
+    }
+
+    // ⚠ LOCK — THE NEGATIVE. A user who really closes their last tab gets an
+    // empty store: the guard refuses ABSENCE, never a decision. A guard that
+    // cannot tell the two apart would resurrect tabs the user closed.
+    #[test]
+    fn closing_the_last_tab_does_write_an_empty_store() {
+        let root = ScratchProfilesRoot::new("restore-negative");
+        let profile = "research";
+        let seeded = WebTabStore {
+            folders: Vec::new(),
+            tabs: vec![saved_tab("https://a.example/", None)],
+        };
+        save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
+
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        open_ychrome_surface(&mut shell, profile, 1_000);
+        assert_eq!(
+            surface_tab_urls(&shell),
+            vec![
+                "https://search.brave.com/".to_string(),
+                "https://a.example/".to_string()
+            ],
+            "continue-where-you-left-off did not restore the saved tab"
+        );
+
+        shell.web_surface_close_tab("local://ws", 1);
+        assert!(
+            saved_urls(root.path(), profile).is_empty(),
+            "the user closed their last tab and the store kept it anyway: {:?}",
+            saved_urls(root.path(), profile)
+        );
+    }
+
+    // ⚠ LOCK — THE REGRESSION. "Continue where you left off" OFF still means
+    // FILED tabs only: the folders and everything organized into them come
+    // back, the loose session does not, and the purge of the loose ones still
+    // reaches disk whenever anything survives it.
+    #[test]
+    fn a_fresh_start_still_opens_the_filed_tabs_only() {
+        let root = ScratchProfilesRoot::new("restore-off");
+        let profile = "research";
+        let seeded = WebTabStore {
+            folders: vec![WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            }],
+            tabs: vec![
+                saved_tab("https://loose.example/", None),
+                saved_tab("https://filed.example/", Some("f1")),
+            ],
+        };
+        save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
+
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        shell.settings.web_surface_restore_tabs = false;
+        open_ychrome_surface(&mut shell, profile, 1_000);
+        assert_eq!(
+            surface_tab_urls(&shell),
+            vec![
+                "https://search.brave.com/".to_string(),
+                "https://filed.example/".to_string()
+            ],
+            "a fresh start opens the app tab and the FILED tabs"
+        );
+        assert_eq!(
+            saved_urls(root.path(), profile),
+            vec!["https://filed.example/".to_string()],
+            "the loose session should have been purged from disk by the write \
+             that kept the filed tab"
+        );
+        assert_eq!(
+            load_web_tab_store_in(root.path(), profile).folders.len(),
+            1,
+            "the folder is saved organization and never goes with the session"
         );
     }
 
