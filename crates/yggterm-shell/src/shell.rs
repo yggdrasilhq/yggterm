@@ -1058,6 +1058,18 @@ const MENU_SURFACE_CSS: &str = r#"
 [data-yggterm-menu-surface="1"] .yggterm-menu-item:focus-visible {
     box-shadow: inset 0 0 0 1px var(--yggterm-menu-item-focus-ring, rgba(95, 168, 255, 0.28));
 }
+/* A DIMMED entry must not light up under the pointer. The hover highlight is the
+   strongest "this is clickable" signal in the menu, so an inert item that still
+   highlights reads as a button that silently does nothing — the exact confusion
+   `RowMenuItem::disabled` exists to avoid. Keyed on the same
+   `data-context-menu-disabled` attribute the dispatch guard's state writes, so
+   the CSS has no opinion of its own about which items are inert. */
+[data-yggterm-menu-surface="1"] .yggterm-menu-item[data-context-menu-disabled="true"]:hover,
+[data-yggterm-menu-surface="1"] .yggterm-menu-item[data-context-menu-disabled="true"]:focus-visible {
+    background: var(--yggterm-menu-item-background, transparent);
+    color: var(--yggterm-menu-item-color, inherit);
+    box-shadow: none;
+}
 "#;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 #[derive(Debug, Clone)]
@@ -35271,9 +35283,17 @@ fn build_keytip_scopes(
     // The ROW MENU scope (ALT,E) — declared from the very list the mouse menu
     // draws ([`row_menu_items`]), so the two can never disagree about what exists.
     // Empty while no row menu is open, which is the only time it is unreachable.
+    //
+    // ⚠ A DISABLED item is not declared. This is the ALT layer's half of
+    // `RowMenuItem::disabled`: the mouse path refuses a dimmed item at the
+    // dispatch ([`context_menu_item_dispatches`]), and the keyboard path never
+    // gets a letter for it, so neither view can run a verb the other refuses.
+    // Filtering here rather than guarding `dispatch_keytip_node` is deliberate —
+    // an undeclared node has no badge either, so the overlay cannot paint an
+    // accelerator that would do nothing.
     let rowmenu = row_menu
         .iter()
-        .filter(|item| !item.separator)
+        .filter(|item| !item.separator && !item.disabled)
         .map(|item| {
             KeyTipDecl::shell_optional(
                 row_menu_node_key(&item.id),
@@ -86173,15 +86193,7 @@ fn WebSurfacePickerView(
                             if !protected {
                                 button {
                                     "data-web-picker-delete": "{profile}",
-                                    style: format!(
-                                        "position:absolute; top:6px; right:6px; border:none; cursor:pointer; line-height:1; \
-                                         border-radius:8px; font-size:11px; padding:3px 6px; {}",
-                                        if armed {
-                                            "background:#c0392b; color:#fff;".to_string()
-                                        } else {
-                                            format!("background:transparent; color:{foreground}; opacity:0.45;")
-                                        },
-                                    ),
+                                    style: web_picker_delete_button_style(&foreground, armed),
                                     title: if armed {
                                         "Click again to permanently delete this profile's cookies, logins and storage"
                                     } else {
@@ -86228,6 +86240,17 @@ fn WebSurfacePickerView(
                                          background:transparent; color:{foreground}; outline:none;"
                                     ),
                                     value: "{avatar_input}",
+                                    // The picker container is deliberately in
+                                    // `NATIVE_CONTEXT_MENU_OWNER_SELECTORS` so its
+                                    // fields keep WebKit's Copy/Paste menu — and
+                                    // PASTING is how a user without an emoji IME
+                                    // enters an avatar. Stop the card's handler
+                                    // (which prevent_default()s and raises the
+                                    // profile menu) WITHOUT prevent_default()ing
+                                    // ourselves, so the engine's menu still opens.
+                                    oncontextmenu: move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                    },
                                     onclick: move |evt: MouseEvent| {
                                         evt.stop_propagation();
                                         let _ = document::eval(
@@ -86421,6 +86444,23 @@ fn WebSurfacePickerView(
         }
     }
 }
+/// The picker card's ✕, armed and unarmed.
+///
+/// ⚠ BOTH branches emit the IDENTICAL style key set — `background`, `color`
+/// and `opacity` — because Dioxus applies `style` property-by-property and
+/// never clears a key a later render drops. The unarmed chip is dimmed to
+/// `0.45`; when it armed, the old inline expression stopped emitting `opacity`
+/// at all, so the red "delete?" confirmation inherited the 0.45 and painted as
+/// a barely-visible chip at the exact moment it most needed to be read.
+fn web_picker_delete_button_style(foreground: &str, armed: bool) -> String {
+    format!(
+        "position:absolute; top:6px; right:6px; border:none; cursor:pointer; line-height:1; \
+         border-radius:8px; font-size:11px; padding:3px 6px; background:{}; color:{}; opacity:{};",
+        if armed { "#c0392b" } else { "transparent" },
+        if armed { "#fff" } else { foreground },
+        if armed { "1" } else { "0.45" },
+    )
+}
 /// Menu ids for a profile card. Named constants because the builder and the
 /// dispatcher must agree on them, and a typo in either would be a silently
 /// inert menu entry.
@@ -86431,21 +86471,30 @@ const WEB_PROFILE_MENU_UNPROTECT: &str = "web-profile-unprotect";
 /// What a profile card's right-click menu contains — the single source of
 /// truth for it, in the shared [`RowMenuItem`] vocabulary.
 ///
-/// The protect entry is always PRESENT: on the default profile it is disabled
+/// The protect entry is always PRESENT: on a permanent profile it is disabled
 /// rather than absent, so the user learns that the profile is permanent
 /// instead of wondering where the verb went.
+///
+/// WHICH profiles are permanent is CORE's answer, never re-spelled here. The
+/// picker card's ✕ already asks `web_profile_is_protected`; if this menu
+/// compared the name to `WEB_PROFILE_DEFAULT` itself, the day core protects a
+/// second name by construction the card would hide its ✕ while this menu still
+/// offered a live "Protect profile" — the picker-vs-badge divergence this
+/// module exists to delete, wearing a different hat.
 fn web_profile_menu_items(
     profile: &str,
     meta: &yggterm_core::web_profile::ProfileMeta,
 ) -> Vec<RowMenuItem> {
-    let is_default =
-        normalize_web_surface_profile(Some(profile)) == yggterm_core::web_profile::WEB_PROFILE_DEFAULT;
+    let permanent = yggterm_core::web_profile::web_profile_is_protected_by_construction(profile);
     let mut items = vec![RowMenuItem::new(
         WEB_PROFILE_MENU_CHANGE_AVATAR,
         "Change avatar…",
         'a',
     )];
-    if meta.emoji.is_some() {
+    // "Use the default avatar" exists exactly when a stored avatar is what the
+    // card is DRAWING — core decides that too, so a sidecar carrying a value
+    // this build declines to paint does not offer a reset that changes nothing.
+    if yggterm_core::web_profile::web_profile_stored_avatar(meta).is_some() {
         items.push(RowMenuItem::new(
             WEB_PROFILE_MENU_RESET_AVATAR,
             "Use the default avatar",
@@ -86453,7 +86502,7 @@ fn web_profile_menu_items(
         ));
     }
     items.push(RowMenuItem::divider());
-    items.push(if is_default {
+    items.push(if permanent {
         RowMenuItem::new(WEB_PROFILE_MENU_PROTECT, "Protect profile", 'p').disabled()
     } else if meta.protected {
         RowMenuItem::new(WEB_PROFILE_MENU_UNPROTECT, "Unprotect profile", 'p')
@@ -108453,35 +108502,23 @@ fn ContextMenuOverlay(
                             "data-context-menu-action": "{item.id}",
                             "data-context-menu-disabled": "{item.disabled}",
                             class: "yggterm-menu-item",
-                            // ⚠ Dioxus applies `style` PROPERTY BY PROPERTY and
-                            // never clears a key a later render drops, so the
-                            // dimming cannot be an extra key on one branch: every
-                            // branch here emits the identical key set, `opacity`
-                            // and `cursor` included (the sidebar-overlay trap).
-                            style: format!(
-                                "{} opacity:{}; cursor:{};",
-                                if item.destructive {
-                                    context_menu_action_style_destructive(palette)
-                                } else {
-                                    context_menu_action_style(palette, item.emphasized)
-                                },
-                                if item.disabled { "0.42" } else { "1" },
-                                if item.disabled { "default" } else { "pointer" },
-                            ),
+                            style: context_menu_item_style(palette, &item),
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: {
-                                let id = item.id.clone();
-                                let disabled = item.disabled;
+                                let dispatched = item.clone();
                                 let on_action = on_action;
                                 move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     // A dimmed item is inert at the DISPATCH, not
-                                    // just in CSS: `pointer-events` would leave the
-                                    // ALT/KeyTip path able to run it.
-                                    if disabled {
+                                    // just in CSS: `pointer-events:none` would make
+                                    // the refusal a styling accident that any later
+                                    // edit could undo. The keyboard's half of the
+                                    // same refusal is in `build_keytip_scopes`,
+                                    // which never DECLARES a disabled item.
+                                    if !context_menu_item_dispatches(&dispatched) {
                                         return;
                                     }
-                                    on_action.call(id.clone());
+                                    on_action.call(dispatched.id.clone());
                                 }
                             },
                             span {
@@ -112626,6 +112663,36 @@ fn context_menu_action_style_destructive(palette: Palette) -> String {
         false,
     )
 }
+/// The drawn style for ONE [`ContextMenuOverlay`] entry, dimming included.
+///
+/// ⚠ Dioxus applies `style` PROPERTY BY PROPERTY and never clears a key a later
+/// render drops, so the dimming cannot be an extra key on one branch: every
+/// branch here emits the identical key set, `opacity` and `cursor` included
+/// (the sidebar-overlay trap). A named function rather than an inline
+/// `format!` because "shown and dimmed" is an assertable fact, and a fact
+/// spelled inside `rsx!` can only be scanned for, never checked.
+fn context_menu_item_style(palette: Palette, item: &RowMenuItem) -> String {
+    format!(
+        "{} opacity:{}; cursor:{};",
+        if item.destructive {
+            context_menu_action_style_destructive(palette)
+        } else {
+            context_menu_action_style(palette, item.emphasized)
+        },
+        if item.disabled { "0.42" } else { "1" },
+        if item.disabled { "default" } else { "pointer" },
+    )
+}
+/// Whether a click on a drawn menu entry may reach the overlay's `on_action`.
+///
+/// The DISPATCH-level owner of `RowMenuItem::disabled` for the mouse path (the
+/// keyboard path's owner is [`build_keytip_scopes`], which never declares a
+/// disabled item). Separators are here too: they are drawn as `div`s and so
+/// cannot be clicked today, but "a divider is never dispatched" is part of the
+/// same one sentence and belongs in the same place.
+fn context_menu_item_dispatches(item: &RowMenuItem) -> bool {
+    !item.disabled && !item.separator
+}
 fn cancel_confirm_button_style(_palette: Palette) -> String {
     "height:34px; padding:0 16px; border:none; border-radius:12px; background:#5fa8ff; color:#ffffff; \
      font-size:13px; font-weight:500;"
@@ -115034,9 +115101,6 @@ mod tests {
         );
     }
 
-    // Vertical mode IS the rail. A GUI that starts with the pref already on used
-    // to collapse the tab strip and open nothing, so the tabs had NO home — the
-    // invariant this test exists to hold. Caught live, on a restart, not by code
     // ── Web-profile metadata: emoji avatars + protected profiles ───────────
     //
     // The FORMAT and the POLICY live in `yggterm_core::web_profile` (round
@@ -115127,11 +115191,24 @@ mod tests {
             "the product half of shell.rs came out at {} bytes — this scan went blind",
             product.len()
         );
+        // The BARE name, not the `web_profile::`-qualified one: a needle that
+        // requires the module prefix is satisfied by
+        // `use yggterm_core::web_profile::web_profile_avatar;` (a `use` line
+        // ends in `;`, never `(`) followed by any number of unqualified calls.
+        // The bare name is import-proof in the other direction too — no `use`
+        // statement can match a needle that ends in an open paren.
         assert_eq!(
-            product.matches("web_profile::web_profile_avatar(").count(),
+            product.matches("web_profile_avatar(").count(),
             1,
             "the core avatar derivation must have exactly ONE call site in the GUI \
              (`web_surface_profile_avatar`); a second one is a second encoding"
+        );
+        assert_eq!(
+            product.matches("web_profile_stored_avatar(").count(),
+            1,
+            "and exactly one place asks whether the STORED avatar is drawable \
+             (the menu's reset entry); the render path reaches it through \
+             `web_profile_avatar`"
         );
         assert_eq!(
             product.matches("default_web_profile_emoji(").count(),
@@ -115260,6 +115337,16 @@ mod tests {
     /// The shared context menu's contents for a profile card. The default
     /// profile keeps a PROTECT entry that is dimmed rather than missing, so the
     /// menu's shape does not silently depend on which card was clicked.
+    ///
+    /// ⚠ "INERT" IS NOT PROVEN HERE. This test only asserts that the builder
+    /// SETS `disabled`; the full suite once stayed green with the dispatch
+    /// guard deleted from `ContextMenuOverlay`, because nothing exercised the
+    /// component that is supposed to honour the flag. The two halves that
+    /// actually make it inert live in
+    /// [`a_disabled_menu_item_is_inert_at_the_click_dispatch`] (mouse) and
+    /// [`the_alt_layer_never_declares_a_disabled_row_menu_item`] (keyboard).
+    /// WHICH profiles get the dimmed entry is
+    /// [`the_profile_menus_permanence_answer_comes_from_core`].
     #[test]
     fn the_default_profiles_protect_entry_is_shown_and_inert() {
         let plain = yggterm_core::web_profile::ProfileMeta::default();
@@ -115359,6 +115446,455 @@ mod tests {
         );
     }
 
+    /// The product half of `shell.rs`: everything ABOVE the tests section, so a
+    /// needle satisfied by a test's own bytes is impossible.
+    fn shell_product_source() -> &'static str {
+        let source = include_str!("shell.rs");
+        let product = source
+            .split("// SECTION: tests")
+            .next()
+            .expect("shell.rs has a product half above the tests section");
+        assert!(
+            product.len() > 3_000_000,
+            "the product half of shell.rs came out at {} bytes — this scan went blind",
+            product.len()
+        );
+        product
+    }
+
+    /// ONE function's body inside the product half.
+    ///
+    /// Scans are ANCHORED to the function that must carry the mechanism rather
+    /// than run over the whole file: a whole-file `contains` is satisfied by
+    /// the same bytes sitting in a comment 40k lines from the call site, which
+    /// is exactly the "append-proof" hole a source-scan lock is supposed to
+    /// close. Closed on the next column-0 `}` — brace counting went blind on
+    /// this file once and swallowed 90k lines of embedded JS.
+    fn shell_fn_body(anchor: &str) -> &'static str {
+        let product = shell_product_source();
+        let start = product
+            .find(anchor)
+            .unwrap_or_else(|| panic!("the scan lost its anchor {anchor:?}"));
+        let body = &product[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor:?} has no column-0 close"));
+        &body[..end]
+    }
+
+    /// The set of CSS property KEYS a style declares, sorted. Dioxus applies
+    /// `style` property-by-property and never clears a key a later render
+    /// drops, so two states of one element must declare the SAME keys.
+    fn style_property_keys(style: &str) -> Vec<String> {
+        let mut keys: Vec<String> = style
+            .split(';')
+            .filter_map(|decl| decl.split(':').next())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// ⚠ THE DISPATCH-INERTNESS LOCK. `RowMenuItem::disabled` claims the item
+    /// is "shown, dimmed, and inert". Dimming is CSS; INERT is a dispatch
+    /// decision, and before this lock the whole 1440-test suite stayed green
+    /// with the guard deleted from `ContextMenuOverlay`'s onclick — the lock's
+    /// NAME claimed a mechanism no test exercised.
+    ///
+    /// Two halves, because the decision and the wiring fail independently:
+    /// the predicate is unit-called, and the CALL SITE is scanned inside
+    /// `fn ContextMenuOverlay(` itself (field guide §7.1 — a perfectly green
+    /// decision nothing ever asks for).
+    #[test]
+    fn a_disabled_menu_item_is_inert_at_the_click_dispatch() {
+        let live = RowMenuItem::new("web-profile-protect", "Protect profile", 'p');
+        assert!(
+            context_menu_item_dispatches(&live),
+            "an ordinary item runs on click"
+        );
+        assert!(
+            !context_menu_item_dispatches(&live.clone().disabled()),
+            "a dimmed item must never reach the action terminus"
+        );
+        assert!(
+            !context_menu_item_dispatches(&RowMenuItem::divider()),
+            "a divider is drawn, never dispatched"
+        );
+        assert!(
+            context_menu_item_dispatches(
+                &RowMenuItem::new("delete", "Delete…", 'x').destructive()
+            ),
+            "destructive is not disabled — the ✕ menu entry still runs"
+        );
+
+        let overlay = shell_fn_body("fn ContextMenuOverlay(");
+        assert!(
+            overlay.len() > 1_500 && overlay.len() < 20_000,
+            "the ContextMenuOverlay slice is {} bytes — the scan lost its bounds",
+            overlay.len()
+        );
+        assert_eq!(
+            overlay
+                .matches("if !context_menu_item_dispatches(&dispatched) {\n")
+                .count(),
+            1,
+            "the overlay's onclick must ASK the predicate before calling on_action; \
+             without it a dimmed item is dimmed and live"
+        );
+        assert_eq!(
+            overlay.matches("on_action.call(").count(),
+            1,
+            "one action terminus in this component, and it is behind the guard"
+        );
+        let guard = overlay
+            .find("if !context_menu_item_dispatches(&dispatched) {")
+            .expect("the guard is present");
+        let call = overlay
+            .find("on_action.call(")
+            .expect("the terminus is present");
+        assert!(
+            guard < call,
+            "the guard must precede the terminus, not sit after it"
+        );
+    }
+
+    /// ⚠ THE DIMMING LOCK. "Shown and dimmed" was asserted by nobody: the
+    /// style lived inline in `rsx!`, where a fact can only be grepped for.
+    /// Now it is a named function, so the dimming is a VALUE — and both
+    /// branches emit the identical key set, because Dioxus never clears a key
+    /// a later render drops (a `opacity` emitted only while disabled would
+    /// stick to the item forever once it went live).
+    #[test]
+    fn a_disabled_menu_item_is_drawn_dimmed_with_identical_style_keys() {
+        let dark = palette(UiTheme::ZedDark);
+        let live = RowMenuItem::new("web-profile-protect", "Protect profile", 'p');
+        let dimmed = live.clone().disabled();
+        let destructive = RowMenuItem::new("delete", "Delete…", 'x').destructive();
+        let emphasized = RowMenuItem::new("move", "Move Selected Here", 'm').emphasized();
+        for other in [&dimmed, &destructive, &emphasized] {
+            assert_eq!(
+                style_property_keys(&context_menu_item_style(dark, &live)),
+                style_property_keys(&context_menu_item_style(dark, other)),
+                "every menu-item branch must declare the SAME style keys; {:?} diverged",
+                other.id
+            );
+        }
+        let dimmed_style = context_menu_item_style(dark, &dimmed);
+        assert!(
+            dimmed_style.contains("opacity:0.42;"),
+            "a disabled item must READ as disabled: {dimmed_style}"
+        );
+        assert!(
+            dimmed_style.contains("cursor:default;"),
+            "and must not offer the pointer of something clickable: {dimmed_style}"
+        );
+        let live_style = context_menu_item_style(dark, &live);
+        assert!(
+            live_style.contains("opacity:1;") && live_style.contains("cursor:pointer;"),
+            "a live item is fully opaque and clickable: {live_style}"
+        );
+
+        let overlay = shell_fn_body("fn ContextMenuOverlay(");
+        assert_eq!(
+            overlay
+                .matches("style: context_menu_item_style(palette, &item),")
+                .count(),
+            1,
+            "the drawn item must take its style FROM the owner above; an inline \
+             format! there is a second spelling of the dimming"
+        );
+        assert_eq!(
+            overlay
+                .matches("\"data-context-menu-disabled\": \"{item.disabled}\",")
+                .count(),
+            1,
+            "the disabled state must be readable from the DOM — it is how a live \
+             probe (and yggui) can see a dimmed entry without eyes on pixels"
+        );
+        // …and the shared stylesheet must not light it up on hover. `.yggterm-menu-item:hover`
+        // paints the same highlight a live item gets, which is the strongest
+        // "clickable" signal the menu has.
+        assert!(
+            MENU_SURFACE_CSS.contains(
+                "[data-yggterm-menu-surface=\"1\"] .yggterm-menu-item[data-context-menu-disabled=\"true\"]:hover,"
+            ),
+            "a dimmed entry must not take the hover highlight"
+        );
+        let hover = MENU_SURFACE_CSS
+            .find("[data-yggterm-menu-surface=\"1\"] .yggterm-menu-item:hover,")
+            .expect("the live hover rule exists");
+        let dimmed_hover = MENU_SURFACE_CSS
+            .find(
+                "[data-yggterm-menu-surface=\"1\"] .yggterm-menu-item[data-context-menu-disabled=\"true\"]:hover,"
+            )
+            .expect("the dimmed hover rule exists");
+        assert!(
+            dimmed_hover > hover,
+            "the dimmed rule must come AFTER the live one — equal specificity would \
+             otherwise leave the highlight winning by source order"
+        );
+    }
+
+    /// ⚠ THE ALT-LAYER LOCK. `disabled` is part of the SHARED `RowMenuItem`
+    /// vocabulary, so the first sidebar or app-pane menu that sets it would
+    /// have been ALT-dispatchable: `build_keytip_scopes` filtered only
+    /// `!separator`, and `dispatch_row_menu_action` never consulted `disabled`
+    /// on either side. Not exploitable from the picker (it passes
+    /// `KeyTipTree::default()`), which is precisely why it needed a lock
+    /// instead of an argument.
+    ///
+    /// Red when the `!item.disabled` filter comes out of the `rowmenu` scope.
+    #[test]
+    fn the_alt_layer_never_declares_a_disabled_row_menu_item() {
+        let row_menu = vec![
+            RowMenuItem::new("live-verb", "Live verb", 'l'),
+            RowMenuItem::divider(),
+            RowMenuItem::new("dimmed-verb", "Dimmed verb", 'd').disabled(),
+        ];
+        let scopes = build_keytip_scopes(&[], &row_menu);
+        let (_, rowmenu) = scopes
+            .iter()
+            .find(|(scope, _)| *scope == KtScope::RowMenu)
+            .expect("the rowmenu scope exists");
+        let keys: Vec<&str> = rowmenu.iter().map(|decl| decl.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![row_menu_node_key("live-verb")],
+            "only the live verb may be declared: a declared node gets a LETTER and \
+             an ALT chord straight to `dispatch_row_menu_action`, which never \
+             consults `disabled`"
+        );
+        assert!(
+            !keys.contains(&row_menu_node_key("dimmed-verb").as_str()),
+            "a dimmed item must have no keyboard path"
+        );
+        // And the separator stays out, as it always did.
+        assert!(!keys.iter().any(|key| key.ends_with("rowmenu:")));
+    }
+
+    /// ⚠ THE ONE-OWNER-OF-PERMANENCE LOCK. "Protected by construction" belongs
+    /// to `yggterm_core::web_profile::WEB_PROFILE_PERMANENT`. This menu used to
+    /// re-spell it as `normalize(...) == WEB_PROFILE_DEFAULT` — the left
+    /// disjunct of core's own predicate, copied. The card's ✕ asked core; the
+    /// menu asked itself; so the day core protects a second name the card would
+    /// correctly hide its ✕ while the menu still offered a live "Protect
+    /// profile" on the same card.
+    ///
+    /// Behavioural half: the menu's inertness decision follows CORE's list, so
+    /// adding a name to that list moves this menu with it. Scan half: the
+    /// comparison may not come back.
+    #[test]
+    fn the_profile_menus_permanence_answer_comes_from_core() {
+        let plain = yggterm_core::web_profile::ProfileMeta::default();
+        for name in yggterm_core::web_profile::WEB_PROFILE_PERMANENT {
+            let items = web_profile_menu_items(name, &plain);
+            let protect = items
+                .iter()
+                .find(|item| item.id == WEB_PROFILE_MENU_PROTECT)
+                .unwrap_or_else(|| panic!("{name:?} still shows the protect verb"));
+            assert!(
+                protect.disabled,
+                "{name:?} is permanent by construction in core, so the menu's toggle \
+                 must be inert — the menu may not have its own opinion about which \
+                 profiles are permanent"
+            );
+            assert!(
+                !items
+                    .iter()
+                    .any(|item| item.id == WEB_PROFILE_MENU_UNPROTECT),
+                "{name:?} must never offer an UNPROTECT the delete guard will refuse"
+            );
+            // The card's ✕ and this menu must agree, which is the whole point.
+            assert!(
+                yggterm_core::web_profile::web_profile_is_protected(name, &plain),
+                "{name:?}: card and menu disagree about protection"
+            );
+        }
+        for ordinary in ["work", "personal", "banking"] {
+            assert!(
+                !yggterm_core::web_profile::web_profile_is_protected_by_construction(ordinary),
+                "{ordinary:?} is not on core's permanent list — this lock is testing \
+                 the wrong names"
+            );
+            assert!(
+                web_profile_menu_items(ordinary, &plain)
+                    .iter()
+                    .any(|item| item.id == WEB_PROFILE_MENU_PROTECT && !item.disabled),
+                "{ordinary:?} keeps a LIVE protect toggle"
+            );
+        }
+
+        let menu = shell_fn_body("fn web_profile_menu_items(");
+        assert!(
+            menu.len() > 300 && menu.len() < 4_000,
+            "the web_profile_menu_items slice is {} bytes — the scan lost its bounds",
+            menu.len()
+        );
+        assert_eq!(
+            menu.matches("web_profile_is_protected_by_construction(profile)")
+                .count(),
+            1,
+            "the menu asks CORE whether the profile is permanent, exactly once"
+        );
+        assert_eq!(
+            menu.matches("WEB_PROFILE_DEFAULT").count(),
+            0,
+            "the menu may not name the default profile at all: naming it is how the \
+             policy got a second encoding in the first place"
+        );
+    }
+
+    /// ⚠ THE NAMED-REFUSAL LOCK. "A refused delete now names its reason where
+    /// the picker subtitle sits" was a shipped claim with zero coverage: no
+    /// test mentioned `picker_notice` at all. A guard that silently does
+    /// nothing is indistinguishable from a broken button, so the wiring from
+    /// `WebProfileDeleteRefusal::reason()` to the subtitle line is the
+    /// user-visible half of the whole protection feature.
+    ///
+    /// Behaviour first (the refusal really carries a sentence), then the four
+    /// wires inside `fn WebSurfacePickerView(` that put it on screen.
+    #[test]
+    fn a_refused_delete_names_its_reason_where_the_subtitle_sits() {
+        let root = ScratchProfilesRoot::new("named-refusal");
+        root.seed_jar("work");
+        update_web_surface_profile_meta_in(root.path(), "work", |meta| meta.protected = true)
+            .expect("mark protected");
+        let refusal = delete_web_surface_profile_in(root.path(), "work")
+            .expect_err("a protected profile refuses");
+        assert!(
+            refusal.reason().len() > 12 && refusal.reason().contains("protected"),
+            "the refusal must carry a SENTENCE the picker can show: {:?}",
+            refusal.reason()
+        );
+
+        let picker = shell_fn_body("fn WebSurfacePickerView(");
+        assert!(
+            picker.len() > 8_000 && picker.len() < 40_000,
+            "the picker slice is {} bytes — the scan lost its bounds",
+            picker.len()
+        );
+        assert_eq!(
+            picker
+                .matches("picker_notice.set(Some(refusal.reason().to_string()));")
+                .count(),
+            1,
+            "the ✕'s Err arm must put the NAMED reason on the notice line, not \
+             swallow it"
+        );
+        assert_eq!(
+            picker
+                .matches("\"data-web-picker-notice\": \"{picker_notice().is_some()}\",")
+                .count(),
+            1,
+            "the notice line must be readable from the DOM so a live probe can see \
+             a refusal without eyes on pixels"
+        );
+        assert_eq!(
+            picker
+                .matches("if let Some(notice) = picker_notice() {\n")
+                .count(),
+            1,
+            "the subtitle line must RENDER the notice; storing it and drawing the \
+             stock subtitle is the silent no-op with extra steps"
+        );
+        assert!(
+            picker.contains("\"{notice}\""),
+            "and the reason itself has to reach the DOM as text"
+        );
+        // Every branch of that line declares the same keys (Dioxus applies
+        // `style` property-by-property), so a refusal that clears leaves no red.
+        assert_eq!(
+            picker
+                .matches("\"font-size:13px; color:{}; opacity:{};\",")
+                .count(),
+            1,
+            "the notice line's colour AND opacity are declared on every branch"
+        );
+        // The avatar field's refusal lands on the same line — one place the
+        // picker says why, not one per verb.
+        assert_eq!(picker.matches("picker_notice.set(Some(").count(), 5);
+    }
+
+    /// ⚠ THE ARMED-CHIP LOCK (the Dioxus property-by-property trap). The armed
+    /// branch used to emit `background;color` while the unarmed branch emitted
+    /// `background;color;opacity:0.45` — and Dioxus never clears a dropped key,
+    /// so the red "delete?" confirmation inherited 0.45 and painted as a
+    /// barely-visible chip at the one moment it most needed to be read.
+    #[test]
+    fn the_pickers_armed_delete_chip_keeps_the_unarmed_style_keys() {
+        let armed = web_picker_delete_button_style("#e6e6e6", true);
+        let unarmed = web_picker_delete_button_style("#e6e6e6", false);
+        assert_eq!(
+            style_property_keys(&armed),
+            style_property_keys(&unarmed),
+            "armed and unarmed must declare the SAME style keys or the dropped one \
+             lingers: armed={armed} unarmed={unarmed}"
+        );
+        assert!(
+            armed.contains("opacity:1;") && armed.contains("background:#c0392b;"),
+            "the armed chip is a full-strength red confirmation: {armed}"
+        );
+        assert!(
+            unarmed.contains("opacity:0.45;") && unarmed.contains("background:transparent;"),
+            "the unarmed ✕ stays a quiet affordance: {unarmed}"
+        );
+        assert_eq!(
+            shell_fn_body("fn WebSurfacePickerView(")
+                .matches("style: web_picker_delete_button_style(&foreground, armed),")
+                .count(),
+            1,
+            "the card's ✕ must take its style from the owner above, not re-spell it \
+             inline where the key sets can drift again"
+        );
+    }
+
+    /// The avatar field keeps WebKit's own Copy/Paste menu. Pasting is how a
+    /// user without an emoji IME enters an avatar (the validator even tolerates
+    /// a pasted trailing newline for that reason) — but the field is a child of
+    /// the card, whose `oncontextmenu` `prevent_default()`s and raises the
+    /// profile menu, so a right-click inside the input opened the profile menu
+    /// instead of Paste. The picker container is in
+    /// `NATIVE_CONTEXT_MENU_OWNER_SELECTORS` precisely so this cannot happen.
+    #[test]
+    fn the_avatar_field_keeps_its_native_paste_menu() {
+        assert!(
+            NATIVE_CONTEXT_MENU_OWNER_SELECTORS.contains("[data-yggterm-web-picker]"),
+            "the picker owns its native menu — that is the premise of this lock"
+        );
+        let picker = shell_fn_body("fn WebSurfacePickerView(");
+        let field_start = picker
+            .find("\"data-web-picker-avatar-input\":")
+            .expect("the avatar field is present");
+        let field_end = picker[field_start..]
+            .find("oninput:")
+            .expect("the avatar field has an oninput");
+        // CODE only: the comment above the handler explains what it must NOT
+        // do, and a scan that reads comments is a scan that can be satisfied
+        // (or broken) by prose.
+        let field: String = picker[field_start..field_start + field_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            field.contains("oncontextmenu: move |evt: MouseEvent| {"),
+            "the avatar field must handle its own right-click: {field}"
+        );
+        assert!(
+            field.contains("evt.stop_propagation();"),
+            "…by stopping the card's handler: {field}"
+        );
+        assert!(
+            !field.contains("prevent_default"),
+            "…and NOT by cancelling the event, which is what suppresses the \
+             engine's Paste menu: {field}"
+        );
+    }
+
+    // Vertical mode IS the rail. A GUI that starts with the pref already on used
+    // to collapse the tab strip and open nothing, so the tabs had NO home — the
+    // invariant this test exists to hold. Caught live, on a restart, not by code
     // review.
     #[test]
     fn a_surface_opening_under_vertical_tabs_raises_the_rail() {

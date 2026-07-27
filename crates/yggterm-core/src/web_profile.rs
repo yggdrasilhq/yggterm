@@ -107,26 +107,62 @@ pub fn default_web_profile_emoji(profile: &str) -> &'static str {
     WEB_PROFILE_AVATAR_EMOJI[index]
 }
 
+/// The stored avatar, if the file holds one this build is willing to DRAW.
+///
+/// The sidecar is written by processes that never saw
+/// [`web_profile_emoji_is_valid`] (`ychrome`, the agent engine — `agent_drive`
+/// is specced into this same file), so validity has to be asked on the READ
+/// side too. Asking it here rather than in [`ProfileMeta::from_json`] is
+/// deliberate: the foreign bytes still round-trip verbatim through
+/// [`ProfileMeta::to_json`], so a value this build declines to paint is
+/// preserved rather than silently deleted on the next avatar edit.
+///
+/// One predicate, both directions: the typed field and the badge ask the same
+/// question, so "what may be an avatar" cannot be answered two ways.
+pub fn web_profile_stored_avatar(meta: &ProfileMeta) -> Option<&str> {
+    let stored = meta.emoji.as_deref()?.trim();
+    web_profile_emoji_is_valid(stored).then_some(stored)
+}
+
 /// THE avatar for a profile — the one function every render site calls.
 ///
-/// A stored [`ProfileMeta::emoji`] wins; otherwise the deterministic default
-/// IS the answer. There is no third branch: the old "first letter on a
-/// hardcoded gradient" fallback is gone, because a fallback that only some
-/// surfaces implement is how the picker and the badge came to disagree.
+/// A stored [`ProfileMeta::emoji`] wins *when it is one this build will draw*;
+/// otherwise the deterministic default IS the answer. There is no third
+/// branch: the old "first letter on a hardcoded gradient" fallback is gone,
+/// because a fallback that only some surfaces implement is how the picker and
+/// the badge came to disagree.
 pub fn web_profile_avatar(profile: &str, meta: &ProfileMeta) -> String {
-    match meta.emoji.as_deref().map(str::trim) {
-        Some(emoji) if !emoji.is_empty() => emoji.to_string(),
-        _ => default_web_profile_emoji(profile).to_string(),
+    match web_profile_stored_avatar(meta) {
+        Some(emoji) => emoji.to_string(),
+        None => default_web_profile_emoji(profile).to_string(),
     }
 }
 
-/// Whether a profile refuses deletion.
+/// Profiles this build protects BY CONSTRUCTION — permanent no matter what any
+/// `profile.json` says, or does not say.
 ///
-/// `default` is protected BY CONSTRUCTION: the answer does not consult the
-/// file, so deleting `~/.yggterm/web-profiles/default/profile.json` (or never
-/// having written one) cannot unprotect it.
+/// The LIST is the owner, not the comparison. A surface that wants to know
+/// "is this profile permanent?" calls
+/// [`web_profile_is_protected_by_construction`]; re-spelling
+/// `name == WEB_PROFILE_DEFAULT` at a render site is the second encoding this
+/// module exists to refuse, because the day a second name joins this list the
+/// re-speller keeps offering a verb the guard will refuse.
+pub const WEB_PROFILE_PERMANENT: [&str; 1] = [WEB_PROFILE_DEFAULT];
+
+/// Whether a profile is permanent regardless of its file.
+///
+/// The answer never consults the sidecar, so deleting
+/// `~/.yggterm/web-profiles/default/profile.json` (or never having written
+/// one) cannot unprotect it.
+pub fn web_profile_is_protected_by_construction(profile: &str) -> bool {
+    let name = normalize_web_profile(Some(profile));
+    WEB_PROFILE_PERMANENT.contains(&name.as_str())
+}
+
+/// Whether a profile refuses deletion: permanent by construction, or marked
+/// protected by its owner.
 pub fn web_profile_is_protected(profile: &str, meta: &ProfileMeta) -> bool {
-    normalize_web_profile(Some(profile)) == WEB_PROFILE_DEFAULT || meta.protected
+    web_profile_is_protected_by_construction(profile) || meta.protected
 }
 
 /// Why a delete was refused. Every variant carries a sentence the UI can show
@@ -172,7 +208,7 @@ pub fn web_profile_delete_refusal(
     if web_profile_is_ephemeral(trimmed) {
         return Some(WebProfileDeleteRefusal::Ephemeral);
     }
-    if trimmed == WEB_PROFILE_DEFAULT {
+    if web_profile_is_protected_by_construction(trimmed) {
         return Some(WebProfileDeleteRefusal::DefaultProfile);
     }
     if web_profile_is_protected(trimmed, meta) {
@@ -676,6 +712,107 @@ mod tests {
             web_profile_avatar("work", &blank),
             default_web_profile_emoji("work"),
             "a blank stored avatar falls back to the derived default, not to empty"
+        );
+    }
+
+    /// ⚠ THE READ-SIDE AVATAR LOCK. The write path validates what the user
+    /// TYPES, but this sidecar is written by other processes too (`agent_drive`
+    /// is specced into the very same file), so a `profile.json` this build
+    /// never wrote can carry a paragraph, a newline, or a 4 kB string in
+    /// `emoji`. The badge pills are 9.5 px chips; whatever reaches them has to
+    /// have passed the SAME predicate the typed field passes.
+    ///
+    /// Red when `web_profile_avatar` goes back to `Some(emoji) if
+    /// !emoji.is_empty()`.
+    #[test]
+    fn a_foreign_sidecar_cannot_paint_an_arbitrary_string_into_a_badge() {
+        for hostile in [
+            "avatars are not sentences and this one is a paragraph",
+            "🦊🚀🐧🦉",
+            "line\nbreak",
+            "\u{0}",
+            "   ",
+            &"🦊".repeat(20),
+        ] {
+            let meta = ProfileMeta::from_json(
+                &serde_json::json!({ "emoji": hostile }).to_string(),
+            );
+            assert_eq!(
+                web_profile_stored_avatar(&meta),
+                None,
+                "{hostile:?} is not something this build will draw"
+            );
+            assert_eq!(
+                web_profile_avatar("work", &meta),
+                default_web_profile_emoji("work"),
+                "an unpaintable stored avatar falls back to the derived default, \
+                 never into a 9.5px badge: {hostile:?}"
+            );
+        }
+        // …and the foreign bytes are PRESERVED, not deleted: declining to paint
+        // a value is not licence to destroy another process's write.
+        let scratch = ScratchProfileDir::new("foreign-avatar");
+        std::fs::write(
+            ProfileMeta::path_in(scratch.path()),
+            r#"{"emoji": "not an emoji at all", "agent_drive": "deny"}"#,
+        )
+        .expect("seed a foreign sidecar");
+        let mut meta = ProfileMeta::read(scratch.path());
+        meta.protected = true;
+        meta.write(scratch.path()).expect("rewrite");
+        let body = std::fs::read_to_string(ProfileMeta::path_in(scratch.path())).expect("read back");
+        assert!(
+            body.contains("not an emoji at all"),
+            "the foreign avatar must survive a rewrite it did not cause: {body}"
+        );
+        assert!(body.contains("deny"), "and so must the agent policy: {body}");
+        // A value this build DOES draw still wins.
+        let good = ProfileMeta::from_json(r#"{"emoji": "🐧"}"#);
+        assert_eq!(web_profile_stored_avatar(&good), Some("🐧"));
+        assert_eq!(web_profile_avatar("work", &good), "🐧");
+    }
+
+    /// ⚠ THE PERMANENCE-IS-A-LIST LOCK. "Protected by construction" has ONE
+    /// owner: [`WEB_PROFILE_PERMANENT`], read through
+    /// [`web_profile_is_protected_by_construction`]. Every other answer in the
+    /// crate — the protection predicate, the delete guard — is derived from it,
+    /// so protecting a second name is one edit and every surface follows.
+    #[test]
+    fn permanence_is_one_list_and_every_answer_derives_from_it() {
+        for name in WEB_PROFILE_PERMANENT {
+            assert!(
+                web_profile_is_protected_by_construction(name),
+                "{name:?} is on the permanent list"
+            );
+            // No sidecar, an unprotecting sidecar — neither can change it.
+            assert!(web_profile_is_protected(name, &ProfileMeta::default()));
+            assert!(web_profile_is_protected(
+                name,
+                &ProfileMeta::from_json(r#"{"protected": false}"#)
+            ));
+            assert_eq!(
+                web_profile_delete_refusal(name, &ProfileMeta::default()),
+                Some(WebProfileDeleteRefusal::DefaultProfile),
+                "{name:?} refuses deletion by construction"
+            );
+            // Normalization is upstream of the list, so the whitespace and the
+            // bare spelling are one profile.
+            assert!(web_profile_is_protected_by_construction(&format!(" {name} ")));
+        }
+        for ordinary in ["work", "personal", "banking", "lane-c-not-permanent"] {
+            assert!(
+                !web_profile_is_protected_by_construction(ordinary),
+                "{ordinary:?} is an ordinary profile"
+            );
+            assert!(!web_profile_is_protected(ordinary, &ProfileMeta::default()));
+            assert_eq!(
+                web_profile_delete_refusal(ordinary, &ProfileMeta::default()),
+                None
+            );
+        }
+        assert!(
+            WEB_PROFILE_PERMANENT.contains(&WEB_PROFILE_DEFAULT),
+            "the default profile is permanent"
         );
     }
 
