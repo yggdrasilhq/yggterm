@@ -82,6 +82,7 @@ use crate::theme_contract::{
     shell_full_window_css_blur_enabled, shell_live_blur_supported,
 };
 use crate::ui_telemetry::{append_ui_telemetry_event, ui_telemetry_should_record};
+use crate::web_find;
 use crate::window_icon;
 use crate::xterm_gate_metrics::{GateKind, GateMetrics};
 
@@ -1215,6 +1216,14 @@ struct WebSurfaceUiState {
     /// OSC "open" that clears this. The forward child (remote sessions) is
     /// killed by the same close/sweep/replace paths as tab forwards.
     picker: Option<WebSurfacePickerState>,
+    /// The open find bar (Ctrl+F), or `None` for no bar. One per SURFACE, not
+    /// per tab: the bar sits in the surface's chrome and always searches
+    /// whichever tab is active, exactly like the address bar above it.
+    ///
+    /// Owns the query, the engine's match count, the position the label shows,
+    /// and — the part that matters most — who held the keyboard when it opened,
+    /// so closing can hand it straight back. See `web_find`.
+    find: Option<web_find::WebFindState>,
 }
 #[derive(Debug, Clone)]
 struct WebSurfacePickerState {
@@ -3066,6 +3075,25 @@ struct WebSurfaceOverlayView {
     /// tab strip, address bar and page frame in it — this is what stops a dark
     /// terminal theme from framing a light page in a near-black border.
     chrome_appearance: WebChromeAppearance,
+    /// The open find bar (Ctrl+F), or `None` for no bar.
+    find: Option<WebFindBarView>,
+}
+/// What the find bar draws. A projection of `web_find::WebFindState` — the
+/// state itself never reaches the render, so the component cannot invent a
+/// position or a count of its own.
+#[derive(Debug, Clone, PartialEq)]
+struct WebFindBarView {
+    /// The field's text.
+    query: String,
+    /// `3/17`, straight from `web_find::WebFindState::label`.
+    label: String,
+    /// Zero matches for a non-empty query: the field goes red, exactly as every
+    /// browser's find bar does, and next/prev go inert.
+    no_matches: bool,
+    /// The field holds the keyboard. While this is true the bar owns keys and
+    /// the terminal beneath does not accept input; while it is false the bar
+    /// claims nothing at all.
+    focused: bool,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -10601,6 +10629,11 @@ struct ActiveTerminalInputPolicySignature {
     /// A live web surface covers the active terminal: keystrokes belong to
     /// the overlay (address bar / iframe), never the xterm textarea.
     web_surface_active: bool,
+    /// The find bar (Ctrl+F) over that surface holds the keyboard. Narrower
+    /// than `web_surface_active` on purpose: a surface being up does not stop
+    /// the terminal typing, but a FOCUSED find field does — and an open but
+    /// unfocused one does not (`web_find::find_bar_blocks_terminal_input`).
+    web_find_bar_focused: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinuxWindowChromeApplySignature {
@@ -11571,6 +11604,11 @@ struct TerminalCanvasSnapshot {
     titlebar_session_menu_open: bool,
     titlebar_overflow_menu_open: bool,
     tree_rename_active: bool,
+    /// The find bar (Ctrl+F) over the active web surface holds the keyboard, so
+    /// the terminal beneath must not take the mount's initial programmatic
+    /// focus. A bool, derived from the overlay the render already carries — the
+    /// slim snapshot stays slim.
+    web_find_bar_focused: bool,
 }
 
 impl TerminalCanvasSnapshot {
@@ -11592,6 +11630,7 @@ impl TerminalCanvasSnapshot {
             titlebar_session_menu_open: snapshot.titlebar_session_menu_open,
             titlebar_overflow_menu_open: snapshot.titlebar_overflow_menu_open,
             tree_rename_active: snapshot.tree_rename_path.is_some(),
+            web_find_bar_focused: snapshot_web_find_bar_focused(snapshot),
         }
     }
 }
@@ -14033,6 +14072,7 @@ impl ShellState {
                 address_suggestion_index: None,
                 osc_url: url,
                 picker: None,
+                find: None,
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -14127,6 +14167,7 @@ impl ShellState {
                     control_url,
                     forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
                 }),
+                find: None,
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -15359,6 +15400,145 @@ impl ShellState {
             }
         }
     }
+    // -- find-in-page (Ctrl+F) ------------------------------------------------
+    //
+    // The bar's whole state lives on the surface (`WebSurfaceUiState::find`) and
+    // its RULES live in `web_find`. These methods are the only writers, so the
+    // question "is the find bar holding the keyboard" has exactly one answer.
+
+    /// Is a find bar open on `session_path` with its input focused? THE
+    /// predicate the terminal input gate consults — an open-but-unfocused bar
+    /// claims nothing (`web_find::find_bar_blocks_terminal_input`).
+    fn web_find_focused(&self, session_path: &str) -> bool {
+        self.web_surfaces
+            .get(session_path)
+            .and_then(|surface| surface.find.as_ref())
+            .map(|find| web_find::find_bar_blocks_terminal_input(find.bar_focused))
+            .unwrap_or(false)
+    }
+    /// Is a find bar focused on the session that currently owns the viewport?
+    /// The gate is asked per terminal host, and only the ACTIVE session's bar
+    /// can be over a terminal.
+    fn active_web_find_focused(&self) -> bool {
+        self.server
+            .active_session_path()
+            .map(|path| self.web_find_focused(path))
+            .unwrap_or(false)
+    }
+    /// Open the find bar, borrowing the keyboard from `origin`. Idempotent: a
+    /// second Ctrl+F on an open bar re-focuses it rather than forgetting who
+    /// lent the keyboard in the first place.
+    fn open_web_find(&mut self, session_path: &str, origin: web_find::FindFocusOrigin) -> bool {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return false;
+        };
+        match surface.find.as_mut() {
+            Some(find) => find.bar_focused = true,
+            None => surface.find = Some(web_find::WebFindState::open(session_path, origin)),
+        }
+        true
+    }
+    /// Prepare this surface for an AGENT-driven find step (`server app web
+    /// find`), or refuse because a person is typing in the bar.
+    ///
+    /// THE one place the verb may mutate find state, and the reason it exists
+    /// as its own method: the verb is a second driver of a bar a human may be
+    /// holding, and doing `open` + `unfocus` + `set query` inline at the verb
+    /// left the agent able to unfocus a focused bar — which drops
+    /// `bar_focused`, and with it REOPENS the terminal input gate underneath
+    /// while the user's keyboard is still in the field. The admission rule is
+    /// `web_find::agent_find_admission`; this method only obeys it.
+    fn begin_agent_web_find(
+        &mut self,
+        session_path: &str,
+        text: Option<&str>,
+    ) -> Result<(), String> {
+        match web_find::agent_find_admission(
+            self.web_surfaces
+                .get(session_path)
+                .and_then(|surface| surface.find.as_ref()),
+        ) {
+            web_find::AgentFindAdmission::HumanHoldsTheBar => {
+                return Err(web_find::AGENT_FIND_REFUSED_HUMAN_HOLDS_THE_BAR.to_string());
+            }
+            web_find::AgentFindAdmission::Drive => {}
+        }
+        if !self.open_web_find(session_path, web_find::FindFocusOrigin::Chrome) {
+            return Err(format!("no web surface on {session_path}"));
+        }
+        // An agent-driven bar is NOT focused: it must never take the keyboard
+        // from the person sitting in front of the machine.
+        self.set_web_find_focus(session_path, false);
+        if let Some(text) = text {
+            self.set_web_find_query(session_path, text.to_string());
+        }
+        Ok(())
+    }
+    /// Close the bar and return the keyboard to whoever lent it. Returns that
+    /// lender so the caller can perform the actual focus move — this method
+    /// never decides where focus belongs, it only remembers.
+    fn close_web_find(&mut self, session_path: &str) -> Option<web_find::FindFocusOrigin> {
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        let find = surface.find.take()?;
+        Some(find.close(session_path))
+    }
+    /// The field's text changed (incremental search). Returns the engine request
+    /// this implies, or `None` when there is nothing to ask.
+    fn set_web_find_query(
+        &mut self,
+        session_path: &str,
+        query: String,
+    ) -> Option<(web_find::FindStep, String)> {
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        let find = surface.find.as_mut()?;
+        find.query = query;
+        find.engine_request(web_find::FindStep::Search)
+    }
+    /// Whether the field holds the keyboard right now. Written by the input's
+    /// own focus/blur, because the DOM is the truth about DOM focus.
+    fn set_web_find_focus(&mut self, session_path: &str, focused: bool) {
+        if let Some(find) = self
+            .web_surfaces
+            .get_mut(session_path)
+            .and_then(|surface| surface.find.as_mut())
+        {
+            find.bar_focused = focused;
+        }
+    }
+    /// The engine request for a step (search/next/prev/close).
+    ///
+    /// Asked through `web_find::engine_request_for` rather than off the bar
+    /// directly, because a CLOSE must reach the engine even when the bar is
+    /// already gone: the teardown is synchronous and the engine call is not, so
+    /// the two orderings both have to end with `search_finish`.
+    fn web_find_step_request(
+        &self,
+        session_path: &str,
+        step: web_find::FindStep,
+    ) -> Option<(web_find::FindStep, String)> {
+        web_find::engine_request_for(
+            self.web_surfaces
+                .get(session_path)
+                .and_then(|surface| surface.find.as_ref()),
+            step,
+        )
+    }
+    /// Fold the engine's count in. `count` is the engine's number, verbatim.
+    fn apply_web_find_count(
+        &mut self,
+        session_path: &str,
+        step: web_find::FindStep,
+        query: &str,
+        count: u32,
+    ) -> Option<(u32, u32)> {
+        let find = self
+            .web_surfaces
+            .get_mut(session_path)?
+            .find
+            .as_mut()?;
+        find.apply_engine_count(step, query, count);
+        Some((find.position, find.match_count))
+    }
     /// Address-bar edit state for the active tab (None = show the tab URL).
     /// Any draft change resets the dropdown selection — the row list is about
     /// to change under it.
@@ -15667,6 +15847,12 @@ impl ShellState {
                 session_path,
                 &web_surface_tab_host_label(&active.url),
             ),
+            find: surface.find.as_ref().map(|find| WebFindBarView {
+                query: find.query.clone(),
+                label: find.label(),
+                no_matches: !find.query.is_empty() && find.match_count == 0,
+                focused: find.bar_focused,
+            }),
         })
     }
     /// Write the ENGINE's loading truth onto a tab. The ONE writer of
@@ -60291,6 +60477,197 @@ async fn web_surface_screenshot_for(
     }
 }
 
+/// The engine verb for a find step. The one place the shell's `FindStep` and
+/// the engine bridge's `FindAction` meet — see `web_find::FindStep`.
+fn find_action_for(step: web_find::FindStep) -> dioxus::desktop::FindAction {
+    match step {
+        web_find::FindStep::Search => dioxus::desktop::FindAction::Search,
+        web_find::FindStep::Next => dioxus::desktop::FindAction::Next,
+        web_find::FindStep::Prev => dioxus::desktop::FindAction::Previous,
+        web_find::FindStep::Close => dioxus::desktop::FindAction::Close,
+    }
+}
+/// Run ONE find step against a session's live web surface and fold the engine's
+/// count back into the bar.
+///
+/// THE one path: the Ctrl+F bar's incremental search, its next/prev buttons, and
+/// the `server app web find` verb an agent drives all come through here, so a
+/// human and an agent can never be told different numbers about the same page.
+///
+/// Returns `(position, match_count)` — the position is ours (WebKit never says
+/// which match is selected), the count is the ENGINE'S, verbatim.
+async fn run_web_find_step(
+    state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    step: web_find::FindStep,
+) -> Result<(String, u32, u32), String> {
+    let (session, native_id) = resolve_live_web_surface(&state, session_path)?;
+    let request = {
+        let shell = state.peek();
+        shell.web_find_step_request(&session, step)
+    };
+    // An empty field asks the engine for nothing, and reports the honest 0/0
+    // rather than a stale count from the letter before.
+    let Some((step, query)) = request else {
+        return Ok((session, 0, 0));
+    };
+    {
+        let shell = state.peek();
+        if let Some(find) = shell
+            .web_surfaces
+            .get(&session)
+            .and_then(|surface| surface.find.as_ref())
+        {
+            find.note_engine_step(step, &query);
+        }
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<u32, String>>();
+    desktop.find_in_web_surface(
+        native_id,
+        &query,
+        find_action_for(step),
+        web_find::find_options_for(step),
+        web_find::FIND_MAX_MATCH_COUNT,
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    )?;
+    let count = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(count))) => count,
+        Ok(Ok(Err(reason))) => return Err(reason),
+        Ok(Err(_)) => return Err("find callback dropped (surface destroyed?)".to_string()),
+        Err(_) => return Err("engine did not report a match count within 10s".to_string()),
+    };
+    let mut writable = state;
+    let folded = writable.with_mut(|shell| shell.apply_web_find_count(&session, step, &query, count));
+    let (position, match_count) = folded.unwrap_or((0, count));
+    Ok((session, position, match_count))
+}
+/// THE close: the engine's `search_finish` AND the bar's teardown, which hands
+/// the keyboard back to whoever lent it.
+///
+/// One function for both callers — the UI's Escape / ✕ and the agent's
+/// `--close` — because a close that does only one of the two halves is a bug
+/// that would otherwise have to be avoided twice: half a close leaves either a
+/// page painted yellow with no bar to explain it, or a user whose keyboard
+/// types nowhere.
+///
+/// Teardown runs FIRST and synchronously (the bar leaves the screen and the
+/// keyboard goes back the instant Escape lands); the engine call follows and
+/// still reaches `search_finish`, because `web_find::engine_request_for` yields
+/// a Close even with no bar left in the state.
+async fn close_web_find_everywhere(
+    mut state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    session_path: &str,
+) -> WebFindCloseOutcome {
+    let lender = state.with_mut(|shell| shell.close_web_find(session_path));
+    let tore_down_a_bar = lender.is_some();
+    if let Some(origin) = lender {
+        restore_focus_after_web_find(origin);
+    }
+    let engine =
+        run_web_find_step(state, desktop, Some(session_path), web_find::FindStep::Close).await;
+    WebFindCloseOutcome {
+        engine,
+        tore_down_a_bar,
+    }
+}
+/// What a close did: what the engine said, and whether there was a bar on
+/// screen to tear down (there need not be — an agent may close a search it
+/// opened on a surface whose bar is already gone, and `search_finish` still has
+/// to happen).
+struct WebFindCloseOutcome {
+    engine: Result<(String, u32, u32), String>,
+    tore_down_a_bar: bool,
+}
+/// App-control: find-in-page on a session's active web-surface tab.
+///
+/// `--close` is BOTH halves of closing, via `close_web_find_everywhere` — the
+/// same function the bar's own Escape uses, so the keyboard goes back to the
+/// recorded lender whichever of the two closes it.
+///
+/// A non-close step goes through `ShellState::begin_agent_web_find`, which
+/// REFUSES a bar whose field holds the keyboard: the person typing in it owns
+/// it, and taking it would reopen the terminal gate beneath them.
+///
+/// `--close` is deliberately NOT refused on a focused bar: ending a search is
+/// the one thing that always leaves the keyboard somewhere well-defined, and it
+/// leaves it exactly where the bar borrowed it from. Refusing here would mean
+/// an agent could neither drive a bar nor get rid of it.
+async fn web_surface_find_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    text: Option<&str>,
+    step: web_find::FindStep,
+) -> Value {
+    // Opening on demand is what makes this a verb an agent can call cold: there
+    // may be no bar on screen at all. The agent is not a keyboard owner, so it
+    // borrows from nobody — `Chrome` is the honest origin, and closing gives the
+    // keyboard back exactly where it already was.
+    let session = match resolve_live_web_surface(state, session_path) {
+        Ok((session, _)) => session,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    if !matches!(step, web_find::FindStep::Close) {
+        let mut writable = *state;
+        if let Err(reason) = writable.with_mut(|shell| shell.begin_agent_web_find(&session, text)) {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "step": step.as_verb(),
+                "reason": reason,
+                "focus_trace": web_find_trace_json(),
+            });
+        }
+    }
+    let (outcome, closed) = if matches!(step, web_find::FindStep::Close) {
+        let close = close_web_find_everywhere(*state, desktop.clone(), &session).await;
+        (close.engine, close.tore_down_a_bar)
+    } else {
+        (
+            run_web_find_step(*state, desktop.clone(), Some(&session), step).await,
+            false,
+        )
+    };
+    match outcome {
+        Ok((session, position, match_count)) => json!({
+            "accepted": true,
+            "session_path": session,
+            "step": step.as_verb(),
+            "query": text.unwrap_or_default(),
+            "match_count": match_count,
+            "position": position,
+            "label": web_find::position_label(position, match_count),
+            "closed": closed,
+            // The recent focus ledger — the bounded ring, not only this call —
+            // so an agent can falsify "the find bar stole my keyboard" from the
+            // outside with the same evidence the unit lock reads. Every entry
+            // in it is a move some code ORDERED; opening a bar without touching
+            // the keyboard (what this verb does) adds none.
+            "focus_trace": web_find_trace_json(),
+        }),
+        Err(reason) => json!({
+            "accepted": false,
+            "session_path": session,
+            "step": step.as_verb(),
+            "reason": reason,
+            "focus_trace": web_find_trace_json(),
+        }),
+    }
+}
+/// The find bar's focus ledger as JSON. Reported by the verb so focus theft is
+/// falsifiable from outside the process.
+fn web_find_trace_json() -> Value {
+    Value::Array(
+        web_find::trace_snapshot()
+            .into_iter()
+            .map(|event| Value::String(format!("{event:?}")))
+            .collect(),
+    )
+}
 /// App-control: open/close the WebKit inspector on a session's active
 /// web-surface tab.
 fn web_surface_devtools_for(
@@ -65501,6 +65878,45 @@ async fn process_pending_app_control_requests(
                 }),
             }
         }
+        AppControlCommand::WebSurfaceFind {
+            session_path,
+            text,
+            step,
+        } => {
+            let step_name = step.as_deref().unwrap_or("search");
+            let result = match web_find::FindStep::from_verb(step_name) {
+                Some(step) => {
+                    web_surface_find_for(
+                        &state,
+                        &desktop,
+                        session_path.as_deref(),
+                        text.as_deref(),
+                        step,
+                    )
+                    .await
+                }
+                None => json!({
+                    "accepted": false,
+                    "reason": format!(
+                        "unknown find step {step_name:?} (search | next | prev | close)"
+                    ),
+                }),
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
         AppControlCommand::WebSurfaceDevtools { session_path, open } => {
             let result = web_surface_devtools_for(&state, &desktop, session_path.as_deref(), open);
             AppControlResponse {
@@ -70645,6 +71061,42 @@ fn app() -> Element {
                     state.with_mut(|shell| shell.set_search_focus(true));
                     focus_search_input(true);
                     return;
+                }
+                // Ctrl+F — find in page. Claimed HERE, at the layer the omnibox
+                // claims keys, and NOT in `keytip::DEFAULT_ACCELERATORS`: a bare
+                // Ctrl+<letter> belongs to the PTY (`assert_accels_pty_safe`),
+                // so a global Ctrl+F would eat readline's forward-char in every
+                // terminal in the app. It is only a browser key when a browser
+                // owns the viewport, which is exactly the condition below.
+                if is_accel
+                    && !evt.modifiers().contains(Modifiers::SHIFT)
+                    && !evt.modifiers().contains(Modifiers::ALT)
+                    && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("f"))
+                {
+                    // The lender: whoever holds the keyboard right now. A
+                    // terminal that is typing-ready is the one that gets it back
+                    // on Escape; a page or chrome lender is given back by
+                    // blurring and nothing more.
+                    let opened = state.with_mut(|shell| {
+                        let session = shell.server.active_session_path()?.to_string();
+                        // A picker-phase surface has no page to search.
+                        let overlay =
+                            shell.web_surface_overlay_for_session(&session, current_millis())?;
+                        if overlay.picker_control_url.is_some() {
+                            return None;
+                        }
+                        let origin = if shell.terminal_input_override_active {
+                            web_find::FindFocusOrigin::Terminal(session.clone())
+                        } else {
+                            web_find::FindFocusOrigin::Page
+                        };
+                        shell.open_web_find(&session, origin).then_some(session)
+                    });
+                    if opened.is_some() {
+                        evt.prevent_default();
+                        focus_web_find_input();
+                        return;
+                    }
                 }
                 // The bare "/" search hotkey is GONE (user call 2026-07-23): a
                 // plain printable key stole real typing whenever the
@@ -81573,6 +82025,7 @@ fn TerminalCanvas(
                         snapshot.titlebar_overflow_menu_open,
                     ),
                     snapshot.tree_rename_active,
+                    snapshot.web_find_bar_focused,
                 ),
                 pinned_grid,
             ));
@@ -86563,6 +87016,7 @@ fn TerminalCanvas(
                                                             shell.titlebar_overflow_menu_open,
                                                         ),
                                                         shell.tree_rename_path.is_some(),
+                                                        shell.active_web_find_focused(),
                                                     ),
                                                     !app_control_backgrounded
                                                         && terminal_initial_programmatic_focus(
@@ -86579,6 +87033,7 @@ fn TerminalCanvas(
                                                             shell.titlebar_overflow_menu_open,
                                                         ),
                                                         shell.tree_rename_path.is_some(),
+                                                        shell.active_web_find_focused(),
                                                     ),
                                                 )
                                             },
@@ -88519,6 +88974,20 @@ fn TerminalCanvas(
                                 foreground: web_chrome_fg.clone(),
                                 background: web_chrome_bg.clone(),
                                 compact: false,
+                            }
+                        }
+                        // Find bar (Ctrl+F). Drawn in BOTH tab modes — the
+                        // omnibox may move to the rail, but find belongs over
+                        // the page it is searching. Its flow row shrinks the
+                        // `[data-ws-page]` rect below, so the native surface
+                        // follows it down instead of being covered by it.
+                        if let Some(find) = web_overlay.find.clone() {
+                            WebFindBar {
+                                state,
+                                session_path: web_surface_session_path.clone(),
+                                find,
+                                foreground: web_chrome_fg.clone(),
+                                background: web_chrome_bg.clone(),
                             }
                         }
                         // Page area placeholder: the actual page is a NATIVE
@@ -92666,6 +93135,19 @@ fn remote_resume_input_ready_for_snapshot(shell: &ShellState, snapshot: &RenderS
         }),
     }
 }
+/// Is the active surface's find bar holding the keyboard, as of this snapshot?
+///
+/// Read off the overlay view rather than kept as a second snapshot field: the
+/// overlay is already the render's projection of `WebSurfaceUiState::find`, so
+/// there is one owner of the answer and no way for two copies to disagree.
+fn snapshot_web_find_bar_focused(snapshot: &RenderSnapshot) -> bool {
+    snapshot
+        .active_web_surface_overlay
+        .as_ref()
+        .and_then(|overlay| overlay.find.as_ref())
+        .map(|find| web_find::find_bar_blocks_terminal_input(find.focused))
+        .unwrap_or(false)
+}
 fn active_terminal_input_policy_signature(
     shell: &ShellState,
 ) -> ActiveTerminalInputPolicySignature {
@@ -92704,6 +93186,7 @@ fn active_terminal_input_policy_signature(
         app_control_backgrounded: shell.app_control_backgrounded,
         remote_resume_input_ready,
         web_surface_active,
+        web_find_bar_focused: shell.active_web_find_focused(),
     }
 }
 /// Last `(allow_input, focus_input, gates…)` tuple written to the trace, so the
@@ -92792,6 +93275,7 @@ fn apply_active_terminal_input_policy(
         signature.window_focused,
         signature.terminal_input_override_active,
         signature.app_control_backgrounded,
+        signature.web_find_bar_focused,
     );
     if !signature.remote_resume_input_ready {
         allow_input = false;
@@ -93218,6 +93702,7 @@ fn terminal_should_accept_input(
     command_mode_active: bool,
     titlebar_transient_open: bool,
     tree_rename_active: bool,
+    web_find_bar_focused: bool,
 ) -> bool {
     active_view_mode == WorkspaceViewMode::Terminal
         && active_session_path == Some(session_path)
@@ -93225,6 +93710,11 @@ fn terminal_should_accept_input(
         && !command_mode_active
         && !titlebar_transient_open
         && !tree_rename_active
+        // A FOCUSED find bar holds the keyboard; an open-but-unfocused one holds
+        // nothing (`web_find::find_bar_blocks_terminal_input`). Without this
+        // clause every letter typed into the find field would ALSO reach the PTY
+        // underneath, which is the leak the focus lock exists to forbid.
+        && !web_find::find_bar_blocks_terminal_input(web_find_bar_focused)
 }
 fn titlebar_transient_focus_blocking(
     titlebar_new_menu_open: bool,
@@ -93243,6 +93733,7 @@ fn terminal_initial_programmatic_focus(
     command_mode_active: bool,
     titlebar_transient_open: bool,
     tree_rename_active: bool,
+    web_find_bar_focused: bool,
 ) -> bool {
     !is_remote_resume_session
         && terminal_should_accept_input(
@@ -93253,6 +93744,7 @@ fn terminal_initial_programmatic_focus(
             command_mode_active,
             titlebar_transient_open,
             tree_rename_active,
+            web_find_bar_focused,
         )
         && right_panel_allows_terminal_autofocus(right_panel_mode)
 }
@@ -93274,6 +93766,7 @@ fn terminal_runtime_input_policy(
     window_focused: bool,
     terminal_input_override_active: bool,
     app_control_backgrounded: bool,
+    web_find_bar_focused: bool,
 ) -> (bool, bool) {
     let right_panel_allows_input =
         terminal_input_override_active || right_panel_allows_terminal_input(right_panel_mode);
@@ -93285,6 +93778,7 @@ fn terminal_runtime_input_policy(
         command_mode_active,
         titlebar_transient_open,
         tree_rename_active,
+        web_find_bar_focused,
     );
     let window_can_accept_input =
         (window_focused || terminal_input_override_active) && !app_control_backgrounded;
@@ -106739,6 +107233,52 @@ fn RightRail(
         }
     }
 }
+/// The web chrome's input-pill border. Named because the find bar swaps it for
+/// a danger tint on a no-match query and the two must otherwise be the SAME
+/// pill — a find field that is a different shape from the address field above it
+/// reads as two products stapled together.
+const WEB_CHROME_INPUT_BORDER: &str = "rgba(127,127,127,0.35)";
+/// The danger tint (`#ef4444`, the shell's one red) at pill-border strength.
+const WEB_CHROME_INPUT_BORDER_NO_MATCH: &str = "rgba(239,68,68,0.55)";
+/// The web chrome's small glyph button: transparent, theme-foreground, dimmed
+/// when inert. ONE definition, worn by the omnibox's back/forward/reload/history
+/// cluster and by the find bar's prev/next/close — see the reuse doctrine.
+fn web_chrome_icon_button_style(foreground: &str, enabled: bool) -> String {
+    format!(
+        "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
+        foreground,
+        if enabled { "pointer" } else { "default" },
+        if enabled { "0.85" } else { "0.3" },
+    )
+}
+/// The pill's box sizing, as its callers need it: the omnibox fills its bar (or
+/// its own line in the ~300px rail), the find pill is capped so the `3/17` and
+/// the buttons keep the right edge they are anchored to. A PARAMETER rather
+/// than something a caller appends, because appending `flex:` to the returned
+/// string emits the same property twice in one style attribute.
+const WEB_CHROME_INPUT_FLEX_FILL: &str = "1 1 auto";
+const WEB_CHROME_INPUT_FLEX_FILL_COMPACT: &str = "1 1 100%";
+const WEB_CHROME_INPUT_FLEX_FIND: &str = "0 1 240px";
+/// The web chrome's input pill. `compact` is the ~300px rail variant (the
+/// omnibox's Zen home, where the field drops onto its own line); `border` and
+/// `flex` are the only things a caller may vary.
+///
+/// ONE format string, no branch: the key set is therefore identical by
+/// construction, not by a promise a later edit can break — the Dioxus trap
+/// where a dropped key never clears (a compact-only `order` / `margin-top`
+/// would stay applied after a re-render that no longer emits it).
+fn web_chrome_input_style(foreground: &str, compact: bool, border: &str, flex: &str) -> String {
+    let (order, margin_top, padding, radius, font_size) = if compact {
+        ("9", "4px", "6px 12px", "12px", "12px")
+    } else {
+        ("0", "0", "5px 14px", "14px", "12.5px")
+    };
+    format!(
+        "flex:{flex}; order:{order}; min-width:0; margin-top:{margin_top}; padding:{padding}; \
+         border-radius:{radius}; border:1px solid {border}; background:rgba(127,127,127,0.12); \
+         color:{foreground}; font-size:{font_size}; outline:none;",
+    )
+}
 /// The browser omnibox with its navigation controls: back / forward / reload,
 /// the address input (Chrome-style inline history completion + a keyboard-driven
 /// suggestion dropdown), and the history-viewer button. ONE implementation for
@@ -106779,14 +107319,7 @@ fn WebOmniboxBar(
     } else {
         0
     };
-    let nav_button_style = |enabled: bool| {
-        format!(
-            "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
-            foreground,
-            if enabled { "pointer" } else { "default" },
-            if enabled { "0.85" } else { "0.3" },
-        )
-    };
+    let nav_button_style = |enabled: bool| web_chrome_icon_button_style(&foreground, enabled);
     let back_style = nav_button_style(back_target.is_some());
     let forward_style = nav_button_style(forward_target.is_some());
     let reload_style = nav_button_style(true);
@@ -106801,18 +107334,16 @@ fn WebOmniboxBar(
              overflow:hidden; max-height:60px;",
         )
     };
-    let input_style = if compact {
-        format!(
-            "flex:1 1 100%; order:9; min-width:0; margin-top:4px; padding:6px 12px; border-radius:12px; \
-             border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.12); color:{foreground}; \
-             font-size:12px; outline:none;",
-        )
-    } else {
-        format!(
-            "flex:1 1 auto; min-width:0; padding:5px 14px; border-radius:14px; border:1px solid rgba(127,127,127,0.35); \
-             background:rgba(127,127,127,0.12); color:{foreground}; font-size:12.5px; outline:none;",
-        )
-    };
+    let input_style = web_chrome_input_style(
+        &foreground,
+        compact,
+        WEB_CHROME_INPUT_BORDER,
+        if compact {
+            WEB_CHROME_INPUT_FLEX_FILL_COMPACT
+        } else {
+            WEB_CHROME_INPUT_FLEX_FILL
+        },
+    );
     rsx! {
         div {
             style: "{bar_style}",
@@ -107060,6 +107591,281 @@ fn WebOmniboxBar(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+/// The find bar's input. One bar at a time — only the ACTIVE session's surface
+/// draws chrome — so a stable constant id is the whole addressing scheme, the
+/// same shape `SEARCH_INPUT_ID` uses for the titlebar search.
+const WEB_FIND_INPUT_ID: &str = "yggterm-web-find-input";
+/// Put the keyboard in the find field, and claim the UI focus window so the
+/// terminal's own reclaim loops do not yank it straight back out.
+///
+/// This BORROWS: `close_web_find` hands the keyboard back to the recorded
+/// origin, which is what keeps Ctrl+F out of the five focus-theft classes this
+/// product has already paid for.
+///
+/// The borrow is ORDERED (and thereby recorded) by
+/// `web_find::borrow_focus_for_bar`. That call is what puts a `FocusMoved` in
+/// the ledger the `web find` verb publishes — so the ledger describes moves
+/// this function actually makes, and a path that opens a bar without moving the
+/// keyboard cannot publish one.
+fn focus_web_find_input() {
+    let target = web_find::borrow_focus_for_bar();
+    debug_assert_eq!(target, web_find::FindFocusTarget::FindInput);
+    clear_sidebar_keyboard_owner();
+    let _ = document::eval(&format!(
+        r#"
+        (() => {{
+          const claim = () => {{
+            try {{
+              window.__yggtermUiFocusClaimUntilMs = Math.max(
+                Number(window.__yggtermUiFocusClaimUntilMs || 0),
+                Date.now() + 2200
+              );
+            }} catch (_error) {{}}
+          }};
+          const run = () => {{
+            const input = document.getElementById({WEB_FIND_INPUT_ID:?});
+            if (!input || typeof input.focus !== 'function') {{ return false; }}
+            claim();
+            input.focus({{ preventScroll: true }});
+            if (typeof input.select === 'function') {{ input.select(); }}
+            return document.activeElement === input;
+          }};
+          claim();
+          if (run()) {{ return; }}
+          window.requestAnimationFrame(run);
+          window.setTimeout(run, 0);
+          window.setTimeout(run, 32);
+          window.setTimeout(run, 96);
+        }})();
+        "#
+    ));
+}
+/// Give the keyboard back to whoever lent it when the bar closes.
+///
+/// The bar never DECIDES where focus belongs — `origin` was recorded at open
+/// time and this only replays it. A terminal lender gets its input re-enabled
+/// and refocused; a page or chrome lender gets the field blurred and nothing
+/// else, because the shell has no business reaching into a native webview's
+/// focus and the click that follows will do it correctly.
+///
+/// The target comes from `web_find::return_focus_to_lender`, which is also what
+/// writes the give-back into the published ledger: the move this function makes
+/// and the move the trace reports are produced by the same call, so a close
+/// that skipped the give-back would show up as a MISSING entry rather than be
+/// papered over by bookkeeping.
+fn restore_focus_after_web_find(origin: web_find::FindFocusOrigin) {
+    let target = web_find::return_focus_to_lender(&origin);
+    let _ = document::eval(&format!(
+        r#"
+        (() => {{
+          try {{
+            const input = document.getElementById({WEB_FIND_INPUT_ID:?});
+            if (input && typeof input.blur === 'function') {{ input.blur(); }}
+            window.__yggtermUiFocusClaimUntilMs = 0;
+          }} catch (_error) {{}}
+        }})();
+        "#
+    ));
+    if let web_find::FindFocusTarget::Terminal(session_path) = target {
+        refocus_terminal_session_input(&session_path);
+    }
+}
+/// The bar's own close (Escape, ✕). Both halves live in
+/// `close_web_find_everywhere`, which the agent verb's `--close` also calls —
+/// one close, so "finish the search AND hand the keyboard back" cannot be got
+/// half-right on one of the two paths.
+fn close_web_find_bar(state: Signal<ShellState>, session_path: String) {
+    let desktop = window();
+    spawn(async move {
+        let _ = close_web_find_everywhere(state, desktop, &session_path).await;
+    });
+}
+/// Run one find step for the bar and let the render pick up the new count.
+fn drive_web_find_bar(state: Signal<ShellState>, session_path: String, step: web_find::FindStep) {
+    let desktop = window();
+    spawn(async move {
+        let _ = run_web_find_step(state, desktop, Some(&session_path), step).await;
+    });
+}
+/// The find bar (Ctrl+F) over a web surface: field, `3/17`, prev, next, close.
+///
+/// **Where it sits and why it is not absolutely positioned.** It is a slim row
+/// in normal flow directly above the page, with its contents pushed to the
+/// right — the top-right anchor every browser puts a find bar at. An absolutely
+/// positioned overlay would be INVISIBLE under legacy stacking, where a native
+/// child webview paints above the shell's DOM; the flow-push is the idiom the
+/// omnibox dropdown already uses, and it shrinks the `[data-ws-page]` rect so
+/// the native surface follows it down. One mechanism, both stackings.
+///
+/// **Styling is the omnibox's, literally** — `web_chrome_input_style` and
+/// `web_chrome_icon_button_style`, the same functions the address bar above it
+/// wears. The only thing this bar varies is the pill's border on a no-match
+/// query — a VALUE, not a key: `web_chrome_input_style` emits its key set from
+/// a single unbranched format string, so the Dioxus property-by-property trap
+/// (a key one branch emits and another drops stays applied forever) has no way
+/// in.
+#[component]
+fn WebFindBar(
+    state: Signal<ShellState>,
+    session_path: String,
+    find: WebFindBarView,
+    foreground: String,
+    background: String,
+) -> Element {
+    let has_matches = !find.no_matches && !find.query.is_empty();
+    let border = if find.no_matches {
+        WEB_CHROME_INPUT_BORDER_NO_MATCH
+    } else {
+        WEB_CHROME_INPUT_BORDER
+    };
+    // The pill, narrowed: a find field is not an address field, and letting it
+    // grow to the full width would push the label and buttons off the right
+    // edge it is supposed to be anchored to. The narrowing is the helper's
+    // `flex` parameter, not an appended property, so the style attribute never
+    // carries `flex` twice.
+    let input_style = web_chrome_input_style(
+        &foreground,
+        false,
+        border,
+        WEB_CHROME_INPUT_FLEX_FIND,
+    );
+    let step_style = web_chrome_icon_button_style(&foreground, has_matches);
+    let close_style = web_chrome_icon_button_style(&foreground, true);
+    let label_style = format!(
+        "color:{foreground}; opacity:0.7; font-size:12px; font-variant-numeric:tabular-nums; \
+         white-space:nowrap; flex:0 0 auto; padding:0 2px;",
+    );
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; align-items:center; justify-content:flex-end; gap:4px; \
+                 padding:4px 10px; background:{background}; user-select:none; overflow:hidden; \
+                 max-height:44px;",
+            ),
+            // Under glass the chrome DOM draws over pages but its INPUT region
+            // is the shell's; declaring the bar a cover is what makes its
+            // buttons clickable instead of falling through to the page.
+            "data-covers-web-surface": "web-find",
+            input {
+                id: "{WEB_FIND_INPUT_ID}",
+                style: "{input_style}",
+                value: "{find.query}",
+                spellcheck: "false",
+                autocomplete: "off",
+                placeholder: "Find in page",
+                onfocus: {
+                    let session_path = session_path.clone();
+                    move |_| {
+                        state.with_mut(|shell| shell.set_web_find_focus(&session_path, true));
+                    }
+                },
+                onblur: {
+                    let session_path = session_path.clone();
+                    move |_| {
+                        // The bar owns keys ONLY while its input is focused: the
+                        // instant the user clicks away, the terminal beneath is
+                        // typing-ready again and the bar claims nothing.
+                        state.with_mut(|shell| shell.set_web_find_focus(&session_path, false));
+                    }
+                },
+                oninput: {
+                    let session_path = session_path.clone();
+                    move |evt: FormEvent| {
+                        let value = evt.value();
+                        let asked = state.with_mut(|shell| {
+                            shell.set_web_find_query(&session_path, value)
+                        });
+                        // Incremental: every keystroke re-searches from the top,
+                        // which is what makes the count follow the query.
+                        if asked.is_some() {
+                            drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Search);
+                        } else {
+                            // An emptied field: finish the search so the page's
+                            // highlights go with the text that made them.
+                            drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Close);
+                        }
+                    }
+                },
+                onkeydown: {
+                    let session_path = session_path.clone();
+                    move |evt: KeyboardEvent| {
+                        let shift = evt.modifiers().contains(Modifiers::SHIFT);
+                        let key = match evt.key() {
+                            Key::Enter if shift => web_find::FindKey::ShiftEnter,
+                            Key::Enter => web_find::FindKey::Enter,
+                            Key::Escape => web_find::FindKey::Escape,
+                            Key::Character(text) => web_find::FindKey::Char(text),
+                            other => web_find::FindKey::Other(format!("{other}")),
+                        };
+                        // THE router. Every key the bar sees goes through
+                        // `web_find::route_key` — the same function the focus
+                        // lock drives — so "the bar claims keys only while its
+                        // input is focused" is one rule with one implementation,
+                        // not a rule and a separate `match` that could drift
+                        // from it.
+                        let route = state
+                            .peek()
+                            .web_surfaces
+                            .get(&session_path)
+                            .and_then(|surface| surface.find.as_ref())
+                            .map(|find| find.route_key(&key))
+                            .unwrap_or(web_find::FindRoute::NotOurs);
+                        match route {
+                            web_find::FindRoute::Bar(web_find::FindKeyAction::Next) => {
+                                evt.prevent_default();
+                                drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Next);
+                            }
+                            web_find::FindRoute::Bar(web_find::FindKeyAction::Prev) => {
+                                evt.prevent_default();
+                                drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Prev);
+                            }
+                            web_find::FindRoute::Bar(web_find::FindKeyAction::Close) => {
+                                evt.prevent_default();
+                                close_web_find_bar(state, session_path.clone());
+                            }
+                            // A claimed character is the FIELD's to type — the
+                            // verdict says the key is ours, and letting the
+                            // input consume it natively is how it becomes text.
+                            // `oninput` picks it up from there.
+                            web_find::FindRoute::Bar(web_find::FindKeyAction::Type(_))
+                            | web_find::FindRoute::NotOurs => {}
+                        }
+                    }
+                },
+            }
+            span { style: "{label_style}", "{find.label}" }
+            button {
+                style: "{step_style}",
+                title: "Previous match (Shift+Enter)",
+                disabled: !has_matches,
+                onclick: {
+                    let session_path = session_path.clone();
+                    move |_| drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Prev)
+                },
+                "↑"
+            }
+            button {
+                style: "{step_style}",
+                title: "Next match (Enter)",
+                disabled: !has_matches,
+                onclick: {
+                    let session_path = session_path.clone();
+                    move |_| drive_web_find_bar(state, session_path.clone(), web_find::FindStep::Next)
+                },
+                "↓"
+            }
+            button {
+                style: "{close_style}",
+                title: "Close find bar (Escape)",
+                onclick: {
+                    let session_path = session_path.clone();
+                    move |_| close_web_find_bar(state, session_path.clone())
+                },
+                "✕"
             }
         }
     }
@@ -117178,6 +117984,7 @@ mod tests {
                 address_suggestion_index: None,
                 osc_url: "https://app".to_string(),
                 picker: None,
+                find: None,
             },
         );
     }
@@ -117927,6 +118734,516 @@ mod tests {
             "these grab the toplevel's keyboard focus for a web surface and never \
              give it back — the agent may BORROW the focus around an injection \
              ({BORROW} + {RETURN}), never keep it: {thieves:?}"
+        );
+    }
+
+    // ========================================================================
+    // Find-in-page (Ctrl+F) — the mechanism locks.
+    //
+    // The pure half (option mask, cap, position cycle, keyboard ownership) is
+    // locked in `web_find`'s own tests. These three lock the SHELL half: that
+    // the engine bridge really drives WebKit's find controller, that this crate
+    // hands it the policy `web_find` owns, and that a focused find bar shuts the
+    // terminal's input gate.
+    // ========================================================================
+
+    /// The engine bridge drives WebKit's own find controller — all five doors —
+    /// and `search_finish` is on the CLOSE path, which is the call that drops
+    /// the highlights.
+    ///
+    /// Scanned rather than enumerated by hand, and scanned INSIDE `pub fn find`
+    /// rather than across the whole file: a `search_next` in a comment, or a new
+    /// helper appended below that happens to mention these names, must not be
+    /// able to satisfy the lock.
+    #[test]
+    fn the_find_bridge_drives_webkits_own_find_controller() {
+        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        let body = HOST
+            .split("pub fn find(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// One cookie as the engine layer knows it.").next())
+            .expect("the surface host must define `pub fn find(`");
+        // The close path is the one that clears, so it is asserted FIRST and
+        // inside the CLOSE branch: deleting `search_finish` from that branch
+        // must fail with the clause that names the property, not with the
+        // generic door list two screens further down.
+        let close_branch = body
+            .split("if matches!(action, FindAction::Close) || text.is_empty() {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("`find` must have an explicit close branch");
+        assert!(
+            close_branch.contains("controller.search_finish()"),
+            "closing the find bar must call `search_finish` — that call, and \
+             nothing else, is what drops the engine's highlights"
+        );
+        for door in [
+            ".find_controller()",
+            "controller.search(",
+            "controller.search_next()",
+            "controller.search_previous()",
+            "controller.search_finish()",
+            "controller.count_matches(",
+            "controller.connect_counted_matches(",
+        ] {
+            assert!(
+                body.contains(door),
+                "`web_surface::find` must go through WebKit's find controller: \
+                 missing {door} (a JS/regex re-implementation would be a second \
+                 encoding of what a match IS, and could not highlight at all)"
+            );
+        }
+    }
+
+    /// This crate hands the engine the policy `web_find` owns, and nothing of
+    /// its own: the option mask by function, the cap by constant.
+    ///
+    /// The needle is anchored to `run_web_find_step`'s body, so a literal
+    /// appended anywhere else in this 150k-line file cannot pass it.
+    #[test]
+    fn the_shell_hands_the_engine_web_finds_policy_and_never_its_own() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("async fn run_web_find_step(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// App-control: find-in-page").next())
+            .expect("shell.rs must define `run_web_find_step`");
+        assert!(
+            body.contains("web_find::find_options_for(step)"),
+            "the find step must carry `web_find`'s option mask (case-insensitive \
+             + wrap-around), not a mask assembled at the call site"
+        );
+        assert!(
+            body.contains("web_find::FIND_MAX_MATCH_COUNT"),
+            "the count must be UNCAPPED via `web_find::FIND_MAX_MATCH_COUNT` — \
+             WebKit reports the cap as if it were the total, so any local cap \
+             turns the match count into a lie"
+        );
+        assert!(
+            !body.contains("min(") && !body.contains("clamp("),
+            "the engine's count must reach the report verbatim; this function \
+             may not narrow it"
+        );
+    }
+
+    /// The count survives the SHELL's fold, at every magnitude.
+    ///
+    /// The scan above proves the cap travels to the engine by name; it cannot
+    /// see the fold. `WebFindState::apply_engine_count` — the single writer of
+    /// the number the bar draws and the verb reports — took a `.min(100)` with
+    /// the whole suite green before this lock and its `web_find` twin existed.
+    #[test]
+    fn the_shell_folds_the_engines_count_in_without_narrowing_it() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        seed_web_surface(&mut shell, "local://ws");
+        assert!(shell.open_web_find("local://ws", web_find::FindFocusOrigin::Page));
+        shell.set_web_find_query("local://ws", "ygg".to_string());
+        for count in [0u32, 17, 100, 101, 1_000, 1_001, 4_000_000_000] {
+            let position = u32::from(count > 0);
+            assert_eq!(
+                shell.apply_web_find_count("local://ws", web_find::FindStep::Search, "ygg", count),
+                Some((position, count)),
+                "the engine said {count} matches; the shell must report {count} \
+                 and never a narrowed number of its own — a cap reported as a \
+                 total is the exact lie `FIND_MAX_MATCH_COUNT` exists to refuse"
+            );
+        }
+    }
+
+    /// Every step name the CLI can put on the wire is one `web_find` can parse.
+    ///
+    /// The seam is three crates wide — `apps/yggterm` writes a string, the
+    /// app-control command carries it, `web_find::FindStep::from_verb` reads it
+    /// — and a mismatch fails as "unknown find step" for a flag the usage text
+    /// advertises. Read out of the CLI's own mapping table so renaming a flag
+    /// there cannot quietly outrun the parser here.
+    #[test]
+    fn every_find_step_the_cli_can_emit_parses() {
+        const CLI: &str = include_str!("../../../apps/yggterm/src/main.rs");
+        let table = CLI
+            .split("let steps: Vec<&str> = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("the `web find` step table moved; fix this scanner, do not delete it");
+        let emitted: Vec<&str> = table
+            .split('"')
+            .filter(|piece| {
+                !piece.is_empty()
+                    && !piece.starts_with("--")
+                    && piece.chars().all(|ch| ch.is_ascii_lowercase())
+            })
+            .collect();
+        assert!(
+            emitted.len() >= 3,
+            "the scanner lost its anchor: found {emitted:?} in the CLI step table"
+        );
+        // `search` is the default the CLI uses when no step flag is present, so
+        // it is on the wire too even though the table does not name it.
+        for name in emitted.iter().copied().chain(std::iter::once("search")) {
+            assert!(
+                web_find::FindStep::from_verb(name).is_some(),
+                "the CLI can emit find step {name:?} and `web_find` cannot parse it"
+            );
+        }
+        // And the round trip holds, so the verb echoes back what it was asked.
+        for step in [
+            web_find::FindStep::Search,
+            web_find::FindStep::Next,
+            web_find::FindStep::Prev,
+            web_find::FindStep::Close,
+        ] {
+            assert_eq!(web_find::FindStep::from_verb(step.as_verb()), Some(step));
+        }
+        assert_eq!(web_find::FindStep::from_verb("wander"), None);
+    }
+
+    /// THE focus lock's shell half: a FOCUSED find bar shuts the terminal input
+    /// gate, and an open-but-unfocused one does not.
+    ///
+    /// The burst-level lock (open -> type -> close leaves no terminal-directed
+    /// focus or key event) lives next to the mechanism, in
+    /// `web_find::tests::the_find_bar_never_touches_the_terminal_beneath_during_a_burst`.
+    /// This one guards the seam: the gate must actually CONSULT the bar.
+    #[test]
+    fn a_focused_find_bar_shuts_the_terminal_input_gate() {
+        let open_unfocused = terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            open_unfocused,
+            "an open-but-unfocused find bar must NOT wedge terminal input — a \
+             find bar that eats the keyboard for as long as it is on screen is \
+             worse than no find bar"
+        );
+        let focused = terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !focused,
+            "while the find field holds the keyboard the terminal beneath must \
+             not accept input, or every letter typed into the field also reaches \
+             the PTY"
+        );
+        // And the same clause reaches the two policies built on top of it.
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            &RightPanelMode::Hidden,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                &RightPanelMode::Hidden,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+            ),
+            (false, false),
+            "a focused find bar must shut both halves of the runtime policy"
+        );
+    }
+
+    /// Opening the bar records WHO lent the keyboard, and closing hands it back
+    /// to exactly that lender — through the shell's own state, not the module's.
+    #[test]
+    fn the_shell_gives_the_keyboard_back_to_whoever_lent_it() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        seed_web_surface(&mut shell, "local://ws");
+
+        let lender = web_find::FindFocusOrigin::Terminal("local://ws".to_string());
+        assert!(shell.open_web_find("local://ws", lender.clone()));
+        assert!(
+            shell.web_find_focused("local://ws"),
+            "a bar the user just summoned holds the keyboard"
+        );
+        // A second Ctrl+F must re-focus, never re-record the lender: by then the
+        // lender IS the find field, and recording that would strand the keyboard.
+        assert!(shell.open_web_find("local://ws", web_find::FindFocusOrigin::Chrome));
+        assert_eq!(shell.close_web_find("local://ws"), Some(lender));
+        assert!(
+            !shell.web_find_focused("local://ws"),
+            "a closed bar holds nothing"
+        );
+        assert!(
+            shell.close_web_find("local://ws").is_none(),
+            "closing twice must not invent a second lender"
+        );
+    }
+
+    /// THE agent-verb lock: `server app web find` may not take a find bar out
+    /// of a human's hands.
+    ///
+    /// The bypass this exists for, verbatim: the verb's non-close branch ran
+    /// `open` + `unfocus` + `set query` unconditionally, so an agent running
+    /// `server app web find --text <t>` while a person typed in the bar left
+    /// their keyboard in the field, dropped `bar_focused`, and — because the
+    /// terminal gate is keyed on exactly that flag — flipped
+    /// `terminal_should_accept_input` from false to TRUE. Every subsequent
+    /// letter of the human's search would also have reached the PTY: the leak
+    /// `a_focused_find_bar_shuts_the_terminal_input_gate` names in its own
+    /// message, arriving from the other side.
+    ///
+    /// Driven through the production `ShellState` and the production gate
+    /// predicate, not through `web_find` alone — that module was already
+    /// locked, and the bypass lived in the seam.
+    #[test]
+    fn an_agent_driven_find_never_takes_a_focused_bar_from_the_human() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        seed_web_surface(&mut shell, "local://ws");
+
+        let gate = |shell: &ShellState| {
+            terminal_should_accept_input(
+                WorkspaceViewMode::Terminal,
+                Some("local://ws"),
+                "local://ws",
+                false,
+                false,
+                false,
+                false,
+                shell.active_web_find_focused(),
+            )
+        };
+        let query = |shell: &ShellState| {
+            shell
+                .web_surfaces
+                .get("local://ws")
+                .and_then(|surface| surface.find.as_ref())
+                .map(|find| find.query.clone())
+        };
+
+        // A person hit Ctrl+F over a terminal and is typing in the field.
+        let lender = web_find::FindFocusOrigin::Terminal("local://ws".to_string());
+        assert!(shell.open_web_find("local://ws", lender.clone()));
+        shell.set_web_find_query("local://ws", "user needle".to_string());
+        assert!(shell.active_web_find_focused());
+        assert!(
+            !gate(&shell),
+            "the premise: with the field focused the terminal gate is SHUT"
+        );
+
+        // The agent's verb arrives mid-word. The HARM is asserted before the
+        // refusal message, so a verb that ignores the rule fails on what it did
+        // to the person typing, not on a string.
+        let refused = shell.begin_agent_web_find("local://ws", Some("agent needle"));
+
+        // Nothing of the human's bar moved.
+        assert!(
+            shell.active_web_find_focused(),
+            "the agent's find unfocused a bar the human was typing in"
+        );
+        assert!(
+            !gate(&shell),
+            "the agent's find reopened the terminal input gate under a focused \
+             find bar — from here every letter typed into the field also \
+             reaches the PTY"
+        );
+        assert_eq!(
+            query(&shell).as_deref(),
+            Some("user needle"),
+            "the agent's find rewrote the human's query under their fingers"
+        );
+        let route = shell
+            .web_surfaces
+            .get("local://ws")
+            .and_then(|surface| surface.find.as_ref())
+            .map(|find| find.route_key(&web_find::FindKey::Char("a".to_string())));
+        assert_eq!(
+            route,
+            Some(web_find::FindRoute::Bar(web_find::FindKeyAction::Type(
+                "a".to_string()
+            ))),
+            "the human's next keystroke must still belong to the bar"
+        );
+        assert_eq!(
+            refused.as_ref().err().map(String::as_str),
+            Some(web_find::AGENT_FIND_REFUSED_HUMAN_HOLDS_THE_BAR),
+            "and the verb must SAY it refused, in the one refusal string, so an \
+             agent learns why instead of reading a silently wrong count"
+        );
+        assert_eq!(
+            shell.close_web_find("local://ws"),
+            Some(lender),
+            "and the lender the bar would give the keyboard back to is intact"
+        );
+
+        // With nobody in the field the verb DOES drive: a cold surface, and an
+        // open-but-unfocused bar, are both the agent's to use.
+        assert!(shell.begin_agent_web_find("local://ws", Some("agent needle")).is_ok());
+        assert_eq!(query(&shell).as_deref(), Some("agent needle"));
+        assert!(
+            !shell.active_web_find_focused(),
+            "an agent-driven bar never holds the keyboard"
+        );
+        assert!(
+            gate(&shell),
+            "and because it holds nothing, the terminal beneath is typing-ready"
+        );
+        assert!(shell.begin_agent_web_find("local://ws", Some("second needle")).is_ok());
+        assert_eq!(query(&shell).as_deref(), Some("second needle"));
+    }
+
+    /// The verb reaches the find state ONLY through the two owners: the
+    /// admission rule for a non-close step, and the one close for `--close`.
+    ///
+    /// Anchored to each function's own body slice, so neither a `use` line nor
+    /// anything appended elsewhere in this 150k-line file can satisfy it.
+    #[test]
+    fn the_find_verb_goes_through_the_admission_rule_and_the_one_close() {
+        let source = include_str!("shell.rs");
+        let verb = source
+            .split("async fn web_surface_find_for(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// The find bar's focus ledger as JSON.").next())
+            .expect("shell.rs must define `web_surface_find_for`");
+        assert!(
+            verb.contains("shell.begin_agent_web_find("),
+            "a non-close find step must go through `begin_agent_web_find`, the \
+             one place that consults `web_find::agent_find_admission` before \
+             touching a bar somebody may be typing in"
+        );
+        for forbidden in [
+            "shell.open_web_find(",
+            "shell.set_web_find_focus(",
+            "shell.set_web_find_query(",
+            "shell.close_web_find(",
+        ] {
+            assert!(
+                !verb.contains(forbidden),
+                "the verb must not reach find state directly ({forbidden}) — \
+                 that is how it came to unfocus a human's bar and reopen the \
+                 terminal gate beneath them"
+            );
+        }
+        assert!(
+            verb.contains("close_web_find_everywhere("),
+            "`--close` must go through the one close that does BOTH halves"
+        );
+
+        let close = source
+            .split("async fn close_web_find_everywhere(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// What a close did:").next())
+            .expect("shell.rs must define `close_web_find_everywhere`");
+        assert!(
+            close.contains("shell.close_web_find(session_path)"),
+            "the close must tear the bar down"
+        );
+        assert!(
+            close.contains("restore_focus_after_web_find(origin)"),
+            "the close must REPLAY the recorded lender — a close that finishes \
+             the engine search and never hands the keyboard back leaves the \
+             user typing into nothing, and the agent's `--close` is the path \
+             that used to throw the lender away"
+        );
+        assert!(
+            close.contains("web_find::FindStep::Close"),
+            "and it must ask the engine to `search_finish`, or the highlights \
+             outlive the bar that made them"
+        );
+
+        let bar_close = source
+            .split("fn close_web_find_bar(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// Run one find step for the bar").next())
+            .expect("shell.rs must define `close_web_find_bar`");
+        assert!(
+            bar_close.contains("close_web_find_everywhere("),
+            "Escape and ✕ must close through the same function the verb does, \
+             or the two paths can disagree about what closing means"
+        );
+    }
+
+    /// The published `focus_trace` describes moves the shell ACTUALLY makes.
+    ///
+    /// The bypass: `WebFindState::open` wrote `FocusMoved { to: FindInput }` as
+    /// bookkeeping, so an agent-driven find — which never touches the keyboard
+    /// — published a ledger claiming it had; meanwhile the two functions that
+    /// really move DOM focus wrote nothing. One owner now: the move is recorded
+    /// by the call that ORDERS it, and those calls live in the movers.
+    #[test]
+    fn the_find_focus_ledger_is_written_only_where_focus_is_actually_moved() {
+        let source = include_str!("shell.rs");
+        let borrow = source
+            .split("fn focus_web_find_input() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// Give the keyboard back to whoever lent it").next())
+            .expect("shell.rs must define `focus_web_find_input`");
+        assert!(
+            borrow.contains("web_find::borrow_focus_for_bar()"),
+            "the function that puts the keyboard in the find field must ORDER \
+             the borrow through `web_find`, which is what records it"
+        );
+        let restore = source
+            .split("fn restore_focus_after_web_find(origin: web_find::FindFocusOrigin) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// The bar's own close").next())
+            .expect("shell.rs must define `restore_focus_after_web_find`");
+        assert!(
+            restore.contains("web_find::return_focus_to_lender(&origin)"),
+            "the give-back must be ordered through `web_find`, so a close that \
+             skipped it is a MISSING ledger entry rather than a claimed one"
+        );
+        // Assembled from halves so this scanner cannot match its own needle.
+        let event = format!("FindTraceEvent::{}Moved", "Focus");
+        assert!(
+            !source.contains(&event),
+            "the shell must not construct focus-move events of its own: two \
+             writers of the same ledger is how it came to describe a move \
+             nobody made"
+        );
+
+        const POLICY: &str = include_str!("web_find.rs");
+        let open = POLICY
+            .split("pub fn open(session: &str, origin: FindFocusOrigin) -> WebFindState {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// Route one keystroke.").next())
+            .expect("web_find.rs must define `WebFindState::open`");
+        assert!(
+            !open.contains("FocusMoved"),
+            "opening a bar is not a focus move: the agent verb opens one \
+             without ever touching the keyboard, and a ledger entry here is \
+             exactly the lie that made `focus_trace` untrustworthy"
+        );
+        let close = POLICY
+            .split("pub fn close(self, session: &str) -> FindFocusOrigin {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// The `3/17` the bar draws.").next())
+            .expect("web_find.rs must define `WebFindState::close`");
+        assert!(
+            !close.contains("FocusMoved"),
+            "tearing the bar out of the state is not the give-back; the mover \
+             records that, and only if it happens"
         );
     }
 
@@ -122887,6 +124204,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(terminal_initial_programmatic_focus(
             WorkspaceViewMode::Terminal,
@@ -122894,6 +124212,7 @@ mod tests {
             "local://shell",
             false,
             &RightPanelMode::Metadata,
+            false,
             false,
             false,
             false,
@@ -122909,6 +124228,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_initial_programmatic_focus(
             WorkspaceViewMode::Terminal,
@@ -122916,6 +124236,7 @@ mod tests {
             "local://shell",
             false,
             &RightPanelMode::Hidden,
+            false,
             false,
             false,
             false,
@@ -122931,6 +124252,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_initial_programmatic_focus(
             WorkspaceViewMode::Terminal,
@@ -122942,6 +124264,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_initial_programmatic_focus(
             WorkspaceViewMode::Terminal,
@@ -122949,6 +124272,19 @@ mod tests {
             "local://shell",
             false,
             &RightPanelMode::Hidden,
+            true,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            &RightPanelMode::Hidden,
+            false,
             true,
             false,
             false,
@@ -122961,19 +124297,9 @@ mod tests {
             false,
             &RightPanelMode::Hidden,
             false,
-            true,
-            false,
-            false,
-        ));
-        assert!(!terminal_initial_programmatic_focus(
-            WorkspaceViewMode::Terminal,
-            Some("local://shell"),
-            "local://shell",
-            false,
-            &RightPanelMode::Hidden,
-            false,
             false,
             true,
+            false,
             false,
         ));
     }
@@ -122987,11 +124313,13 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
             Some("local://shell"),
             "local://shell",
+            false,
             false,
             false,
             false,
@@ -123005,6 +124333,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
@@ -123014,6 +124343,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
@@ -123023,6 +124353,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
@@ -123030,6 +124361,7 @@ mod tests {
             "local://shell",
             false,
             true,
+            false,
             false,
             false,
         ));
@@ -123043,6 +124375,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
@@ -123052,6 +124385,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         ));
         assert!(!terminal_should_accept_input(
             WorkspaceViewMode::Terminal,
@@ -123060,6 +124394,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
         ));
     }
@@ -123078,6 +124413,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             ),
             (true, true)
         );
@@ -123092,6 +124428,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -123113,6 +124450,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             ),
             (true, true)
         );
@@ -123129,6 +124467,7 @@ mod tests {
                 true,
                 true,
                 false,
+                false,
             ),
             (true, true)
         );
@@ -123143,6 +124482,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -123161,6 +124501,7 @@ mod tests {
                 true,
                 true,
                 false,
+                false,
             ),
             (true, true)
         );
@@ -123176,6 +124517,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
             ),
             (false, false)
@@ -123191,6 +124533,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -123205,6 +124548,7 @@ mod tests {
                 Some("local://shell"),
                 "local://shell",
                 &RightPanelMode::Hidden,
+                false,
                 false,
                 false,
                 false,
@@ -123366,6 +124710,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
             ),
             (true, true)
         );
@@ -123381,6 +124726,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             ),
             (false, false)
@@ -123401,6 +124747,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
             ),
             (false, false)
         );
@@ -123417,6 +124764,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
             ),
             (false, false),
             "app-control background must beat focus override so smoke windows cannot keep consuming terminal input/read budget while lowered"

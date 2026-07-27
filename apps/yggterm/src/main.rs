@@ -65,7 +65,8 @@ use yggterm_server::{
     run_app_control_web_surface_close, run_app_control_web_surface_cookies,
     run_app_control_web_surface_devtools, run_app_control_web_surface_do,
     run_app_control_web_surface_eval, run_app_control_web_surface_fill,
-    run_app_control_web_surface_fill_vault, run_app_control_web_surface_frames,
+    run_app_control_web_surface_fill_vault, run_app_control_web_surface_find,
+    run_app_control_web_surface_frames,
     run_app_control_web_surface_lease, run_app_control_web_surface_read,
     run_app_control_web_surface_reload, run_app_control_web_surface_screenshot,
     run_app_control_web_surface_totp, run_app_control_web_surface_wait, run_attach, run_daemon,
@@ -1293,6 +1294,10 @@ const WEB_ACTIONS: &[(&str, &str)] = &[
     (
         "devtools",
         "  yggterm server app web devtools [--close] [--session <path>]\n",
+    ),
+    (
+        "find",
+        "  yggterm server app web find --text <needle> [--next|--prev|--close] [--session <path>]\n    find-in-page through WebKit's own find controller — the same mechanism the\n    Ctrl+F bar drives, so what this reports is what the user sees.\n    answers {match_count, position, label} — the count is the ENGINE's and is\n    UNCAPPED (a capped count is reported as if it were the total), the position\n    is 1-based and wraps. case-insensitive. --close finishes the search, which\n    is what clears the highlights, and closes any bar the user had open.\n",
     ),
     ("code", ""),
     ("capture", ""),
@@ -3554,6 +3559,40 @@ fn main() -> Result<()> {
                     "devtools" => {
                         let open = !args.iter().any(|arg| arg == "--close");
                         run_app_control_web_surface_devtools(session_path, open, timeout_ms)
+                    }
+                    "find" => {
+                        // Find-in-page through WebKit's own find controller —
+                        // the agent's door onto the Ctrl+F bar's mechanism:
+                        //   web find --text <needle> [--next|--prev|--close]
+                        // Answers with `match_count` (the ENGINE's number for
+                        // the page, uncapped) and `position` (1-based, wrapping)
+                        // so `3/17` is readable without a screenshot.
+                        //
+                        // A step flag is exclusive: asking for two at once is a
+                        // typo, and guessing which one was meant is how a test
+                        // surface starts lying.
+                        let steps: Vec<&str> = [("--next", "next"), ("--prev", "prev"), ("--previous", "prev"), ("--close", "close")]
+                            .into_iter()
+                            .filter(|(flag, _)| args.iter().any(|arg| arg == flag))
+                            .map(|(_, step)| step)
+                            .collect();
+                        let step = match steps.as_slice() {
+                            [] => "search",
+                            [only] => only,
+                            _ => anyhow::bail!(
+                                "web find takes at most one of --next / --prev / --close"
+                            ),
+                        };
+                        let text = cli_flag_value(&args, "--text").or_else(|| {
+                            cli_positional_args(&args, 4).into_iter().next()
+                        });
+                        if text.is_none() && step != "close" {
+                            anyhow::bail!(
+                                "web find needs --text <needle> (or a positional needle); \
+                                 only --close may omit it"
+                            );
+                        }
+                        run_app_control_web_surface_find(session_path, text, step, timeout_ms)
                     }
                     "fill" => {
                         let entry = cli_flag_value(&args, "--entry");

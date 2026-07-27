@@ -802,6 +802,45 @@ impl DesktopService {
         }
     }
 
+    /// Find-in-page on an open web surface, through WebKit's own find
+    /// controller. The callback carries the engine's match count for `text`, or
+    /// the reason it could not answer.
+    ///
+    /// `options` / `max_match_count` are the caller's (the shell's `web_find`
+    /// module owns find policy); this layer only carries them across.
+    pub fn find_in_web_surface(
+        &self,
+        id: u64,
+        text: &str,
+        action: crate::web_surface::FindAction,
+        options: u32,
+        max_match_count: u32,
+        callback: impl FnOnce(Result<u32, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.find(id, text, action, options, max_match_count, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, text, action, options, max_match_count, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// What is actually true about a web surface right now: present, mapped,
     /// and whether the engine believes its content process is answering. All
     /// three are UI-process properties, so a caller must still round-trip an
