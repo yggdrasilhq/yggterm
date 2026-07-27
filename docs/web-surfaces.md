@@ -120,21 +120,46 @@ Three properties that are easy to break and are locked:
 - **A session whose active tab is unknown yields no candidates.** The pass must
   never act on a surface it cannot classify.
 
+The domain is only as good as its two inputs, and both have owners of their own
+because both were, briefly, derivations inside the async reconcile loop that no
+test could reach:
+
+- **`web_surface_active_tab_by_session`** — which tab each session's page area
+  shows, read from the same `desired` snapshot the placement loop iterates. This
+  is what identifies the ONE tab per visible session that is exempt. Answer `0`
+  for every session and the pass demote+throttles the tab the user is reading
+  (with a zero hold, destroys it) while the genuine background tabs become exempt
+  forever — the bug this section exists to fix, restored, with the page under the
+  user's eyes hidden from its engine as a bonus. The argument name at the call
+  site is unchanged by such a mutation, so the seam needs a behavioural lock, not
+  a structural one.
+- **`ShellState::split_pinned_web_tabs`** — the ONE answer to "this tab paints in
+  its own pane", read by the reclaim domain and by the per-tab instrument.
+  Emptying it makes a visibly painted pane a candidate: stash + throttle on the
+  tick, unstash on the next, a churn on a pane the user is looking at, plus a
+  wrong `split_pinned` column in the listing.
+
 What a reclaimed tab loses is page state — scroll position, form contents, JS
 heap. What it keeps is its identity: the URL and title live in the tab model and
 on disk (`SavedWebTab`), so selecting it recreates a fresh webview on the same
 page through the ordinary lazy-create path. That is a documented limitation, not
 a bug to be papered over with a session-state FFI.
 
-**Config**, both in `~/.yggterm/web-surface.json`, both in seconds, both read by
-one parser (`web_surface_config_hold_ms`):
+**Config**, both in `~/.yggterm/web-surface.json`, both in seconds, one file
+reader (`web_surface_config_raw`) and one parser (`web_surface_config_hold_ms`,
+pure — it takes the config body, so which KEY a hold reads and what it falls back
+to are answerable by a test instead of by the test machine's `$HOME`):
 
 ```json
 { "background_hold_secs": 600, "tab_background_hold_secs": 600 }
 ```
 
 `tab_background_hold_secs` is the knob a 100-tab day turns down; `0` destroys a
-tab's webview as soon as it leaves the screen.
+tab's webview as soon as it leaves the screen. They are two knobs, not one
+wearing two names: each hold ignores the other's key, and that is locked in both
+directions — a tab hold that quietly read `background_hold_secs` would make the
+documented knob do nothing while every behavioural test still passed, because
+those are handed holds as arguments.
 
 #### The per-tab instrument
 
