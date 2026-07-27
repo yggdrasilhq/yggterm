@@ -898,3 +898,67 @@ via `WebKitWebViewSessionState` — the only mechanism that changes the order of
 magnitude; a process-model policy that reads the machine (process-per-site is
 harmful on a 14 GB laptop and free on a large-memory server); and an instrument
 that can see a tab at all.
+
+## Downloads (2026-07-27)
+
+Until this, a download link **did nothing**: WebKit asked the embedder where to
+put the file (`decide-destination`), nobody answered, and the transfer was
+dropped without a word. That is a hard blocker for using ychrome as the main
+browser, so downloads now have a plane — and, like every other concept here,
+exactly one owner.
+
+**Where a file goes** is decided by `download_destination` in
+`vendor/dioxus-desktop/src/web_surface.rs` and by nothing else:
+`$HOME/Downloads` (created if missing; deliberately not `XDG_DOWNLOAD_DIR`,
+which is unset under a bare compositor and would move the folder depending on
+how the GUI was launched), a SANITIZED basename, and a uniquified name.
+
+- **Sanitize** because the suggested name is attacker-controlled
+  (`Content-Disposition: filename=...`). Path separators are cut to the last
+  segment (`../../.ssh/authorized_keys` → `authorized_keys`, backslashes too —
+  the name may come from a Windows server), leading dots are stripped so a
+  download cannot become a dotfile, control characters (NUL included, which
+  would truncate the path at the syscall) go, and an empty result falls back to
+  a fixed name rather than to anything derived from the URL.
+- **Uniquify, never overwrite**: `report.pdf`, then `report (1).pdf`. Multi-dot
+  names keep their whole extension (`archive (1).tar.gz`).
+
+**Connected once per `WebContext`, not per webview.** `download-started` is a
+signal on the CONTEXT, and the tabs of one session share a context — connecting
+per surface would decide one transfer once per tab. The vendored wry's own
+default download handler is switched OFF (`download_started_handler: None`) for
+the same reason: it computed its own destination with `PathBuf::push`, which a
+`../../` name walks straight out of, and it returned `true` from
+`decide-destination` — so leaving it in place would have put a second,
+unsanitized policy on the same signal, and the unsanitized one would win. The
+cost of that switch is that a webview WITHOUT this plumbing (the shell's own
+window) no longer downloads at all, which is the honest state: it never
+surfaced a download to the user anyway.
+
+**The failure reason is the ENGINE'S.** `failed` carries a `GError` and fires
+before `finished`; the reason is parked and the single terminal event is emitted
+from `finished`, so a transfer can never produce both a completion and a
+failure. A failure also SWEEPS THE PArecordsAL: WebKitGTK writes straight to the
+destination (no `.part` staging), so a transfer that dies halfway leaves a
+truncated file with the right name and the wrong contents — a download
+masquerading as complete.
+
+**A download outlives its tab.** A running transfer holds its `WebContext`
+(`DownloadInFlight`), which is also what keeps `prune_contexts` — which sweeps
+on `strong_count == 1` — from taking the network process out from under it.
+WebKitGTK has no "detach" verb, so *outliving the surface* is spelled as an
+owner that outlives it. If the engine gives up anyway when the view is
+destroyed, that arrives as `failed` and the partial is swept; the third outcome,
+a truncated file under the full name, is ruled out either way.
+
+**What the user and the agent see.** The shell drains the queue each reconcile
+tick and sends every transition to the two planes it already has: a toast
+through `push_notification` (started names the file; completion names the file
+and the folder; failure names the file and the engine's reason) and a trace row
+per transition — `download_started`, `download_completed` (with `bytes`),
+`download_failed` (with `reason`), all carrying `file_name`, `path`, `url` and
+the owning session/tab when the surface is still alive. No downloads UI of its
+own: a browser with two places to look is a browser you have to be taught. A
+`server app downloads` listing verb is the natural next step for agents — the
+trace answers "what happened" but not "what is running right now"
+(`web_surface_downloads_in_flight` is the count that verb would report).
