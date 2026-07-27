@@ -419,3 +419,90 @@ unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
+
+/// LOCK: the agent buries itself when the supervisor that spawned it dies.
+///
+/// Found live, not theorised (increment 3): a daemon killed with
+/// `SIGKILL` left the agent and its whole `WPEWebProcess` tree alive, holding a
+/// socket that had already been unlinked. Nothing could reach it, no later
+/// daemon could see it, and no supervision verb knew it existed — an immortal
+/// tenant by construction. The daemon's `Drop` covers an orderly exit and can
+/// never cover a shot process, so the mechanism has to live in the agent.
+///
+/// This spawns the agent under a SHELL, kills the shell, and requires the agent
+/// to be gone. A separate test from the verb-plane one because it deliberately
+/// destroys its own agent.
+///
+/// MUTATION that turns this red: delete the `watch_for_an_orphaning_supervisor()`
+/// call in `main`. The agent then outlives its supervisor forever, which is the
+/// state this was written from.
+#[test]
+fn an_orphaned_agent_exits_instead_of_outliving_its_supervisor() {
+    let socket = format!(
+        "/tmp/yggterm-wpe-orphan-{}-{}.sock",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
+    let _ = std::fs::remove_file(&socket);
+
+    // A shell stands in for the daemon: it spawns the agent, prints its pid,
+    // and then waits. Killing the shell reparents the agent to init — exactly
+    // what a SIGKILLed daemon does.
+    let mut supervisor = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} {socket} & echo $! ; wait",
+            env!("CARGO_BIN_EXE_yggterm-wpe-agent")
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the stand-in supervisor");
+
+    let mut pid_line = String::new();
+    BufReader::new(supervisor.stdout.take().expect("supervisor stdout"))
+        .read_line(&mut pid_line)
+        .expect("read the agent pid");
+    let agent_pid: i32 = pid_line.trim().parse().expect("the agent's pid");
+
+    // Wait until it is actually serving, so this cannot pass by killing an
+    // agent that never came up.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent never bound {socket}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        unsafe { libc_kill(agent_pid, 0) },
+        0,
+        "the agent should be alive before its supervisor dies",
+    );
+
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+
+    // The watcher polls every 2s; give it a few cycles before believing it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut buried = false;
+    while Instant::now() < deadline {
+        if unsafe { libc_kill(agent_pid, 0) } != 0 {
+            buried = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if !buried {
+        // Do not leave the leak behind for the next run to inherit.
+        unsafe { libc_kill(agent_pid, 9) };
+    }
+    assert!(
+        buried,
+        "agent {agent_pid} outlived its supervisor — an unreachable WebKit tree on an \
+         unlinked socket is exactly the immortal tenant this locks",
+    );
+    let _ = std::fs::remove_file(&socket);
+    eprintln!("[test] orphan: agent {agent_pid} buried itself with its supervisor");
+}

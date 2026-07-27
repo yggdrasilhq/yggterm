@@ -71,6 +71,7 @@ fn main() -> ExitCode {
     };
 
     let mut state = AgentState::new(&engine);
+    watch_for_an_orphaning_supervisor();
     eprintln!("yggterm-wpe-agent: ready on {socket_path}");
 
     // Connections are served ONE AT A TIME, deliberately. The engine is a
@@ -84,6 +85,47 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Exit when the supervisor that spawned us goes away.
+///
+/// **Observed, not theorised** (increment 3, on a live host): a daemon killed with
+/// `SIGKILL` left this process and its whole `WPEWebProcess` tree alive, holding
+/// a socket that had already been unlinked — unreachable, unkillable by any
+/// later daemon, and invisible to every supervision verb. The daemon's own
+/// `Drop` covers an orderly exit and can cover nothing else, because a process
+/// that is shot runs no cleanup. So the only mechanism that actually closes the
+/// leak lives here.
+///
+/// `getppid()` rather than `PR_SET_PDEATHSIG`: the daemon spawns us from a
+/// short-lived per-connection request thread, and `PDEATHSIG` fires on the
+/// death of the spawning THREAD — it would kill this agent seconds after it
+/// came up, every time. Reparenting, by contrast, happens only when the
+/// supervising PROCESS is gone.
+///
+/// The watcher touches no GLib state (the engine's main context stays
+/// single-threaded and this thread only reads a pid and exits), and it is a
+/// no-op for a hand-launched agent until its launcher exits — which is also the
+/// right answer there.
+fn watch_for_an_orphaning_supervisor() {
+    // SAFETY: `getppid` takes no arguments, touches no memory and cannot fail.
+    unsafe extern "C" {
+        fn getppid() -> i32;
+    }
+    let supervisor = unsafe { getppid() };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let current = unsafe { getppid() };
+            if current != supervisor {
+                eprintln!(
+                    "yggterm-wpe-agent: supervisor {supervisor} is gone (reparented to \
+                     {current}); exiting rather than outliving it"
+                );
+                std::process::exit(0);
+            }
+        }
+    });
 }
 
 fn serve(state: &mut AgentState, stream: UnixStream) {

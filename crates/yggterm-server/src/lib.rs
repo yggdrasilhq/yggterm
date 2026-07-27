@@ -23,6 +23,11 @@ pub mod session_tenancy;
 pub mod transcript_view;
 mod row_order_ledger;
 mod terminal;
+// Lane-A increment 3: the daemon's client for the WPE agent verb plane. The
+// agent is a SPAWNED BINARY, never a crate dependency — `yggterm-wpe` needs the
+// WPE dev stack to build, and linking it would make that stack a prerequisite
+// for building this workspace on every machine.
+pub mod wpe_agent;
 
 // The arm matrix is a TEST artifact (harness spec §8 phase 2): it locks every
 // agent CLI × locality against one table, so a change that touches one arm
@@ -90,6 +95,7 @@ pub use daemon::{
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
+    wpe_agent_control, wpe_verb,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
