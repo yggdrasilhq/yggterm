@@ -1525,6 +1525,11 @@ fn web_surface_profile_meta_in(
 /// once synced, ychrome's own picker); this is the GUI's single call site into
 /// it — see `the_gui_derives_a_profile_avatar_in_exactly_one_place`.
 fn web_surface_profile_avatar(profile: &str) -> String {
+    if yggterm_core::web_profile::web_profile_is_ephemeral(profile) {
+        // The Temporary jar has no profile directory and one fixed glyph —
+        // the picker card and the switcher must speak the same symbol.
+        return "⏲".to_string();
+    }
     yggterm_core::web_profile::web_profile_avatar(profile, &web_surface_profile_meta(profile))
 }
 /// The surface-level identity pill's text: the same avatar the picker card
@@ -88180,7 +88185,7 @@ fn TerminalCanvas(
                                                     evt,
                                                 );
                                             },
-                                            "{web_profile_avatar(&profile)} {web_profile_display_name(&profile)} ⌄"
+                                            "{web_surface_profile_badge_label(&profile)} ⌄"
                                         }
                                     }
                                 }
@@ -107011,7 +107016,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                             evt,
                                         );
                                     },
-                                    "{web_profile_avatar(&profile)} {web_profile_display_name(&profile)} ⌄"
+                                    "{web_surface_profile_badge_label(&profile)} ⌄"
                                 }
                             }
                         }
@@ -110323,20 +110328,6 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
 
 // ===== the ychrome PROFILE switcher (both surfaces) =====
 
-/// The switcher's avatar accessor — a thin adapter over the ONE owner
-/// (`web_surface_profile_avatar` → `yggterm_core::web_profile`), plus the
-/// ephemeral jar's fixed glyph. Both anchor sites and the menu builder call
-/// ONLY this.
-fn web_profile_avatar(profile: &str) -> String {
-    if yggterm_core::web_profile::web_profile_is_ephemeral(profile) {
-        // The picker's Temporary card already speaks this glyph; the dropdown
-        // must not invent a second symbol for one identity. (The ephemeral jar
-        // has no profile directory, so ProfileMeta has nothing to say here.)
-        return "⏲".to_string();
-    }
-    web_surface_profile_avatar(profile)
-}
-
 /// A profile's display name. The ephemeral jar is "Temporary" everywhere the
 /// user meets it (the picker card, this dropdown) — "temp" is the wire name.
 fn web_profile_display_name(profile: &str) -> String {
@@ -110378,7 +110369,7 @@ fn web_profile_switcher_menu_items(profiles: &[String], current: &str) -> Vec<Ro
                 format!("webprofile:{profile}"),
                 format!(
                     "{}  {}{}",
-                    web_profile_avatar(profile),
+                    web_surface_profile_avatar(profile),
                     web_profile_display_name(profile),
                     if profile == current { "  ✓" } else { "" },
                 ),
@@ -118604,35 +118595,10 @@ mod tests {
             "destructive is not disabled — the ✕ menu entry still runs"
         );
 
-        let overlay = shell_fn_body("fn ContextMenuOverlay(");
-        assert!(
-            overlay.len() > 1_500 && overlay.len() < 20_000,
-            "the ContextMenuOverlay slice is {} bytes — the scan lost its bounds",
-            overlay.len()
-        );
-        assert_eq!(
-            overlay
-                .matches("if !context_menu_item_dispatches(&dispatched) {\n")
-                .count(),
-            1,
-            "the overlay's onclick must ASK the predicate before calling on_action; \
-             without it a dimmed item is dimmed and live"
-        );
-        assert_eq!(
-            overlay.matches("on_action.call(").count(),
-            1,
-            "one action terminus in this component, and it is behind the guard"
-        );
-        let guard = overlay
-            .find("if !context_menu_item_dispatches(&dispatched) {")
-            .expect("the guard is present");
-        let call = overlay
-            .find("on_action.call(")
-            .expect("the terminus is present");
-        assert!(
-            guard < call,
-            "the guard must precede the terminus, not sit after it"
-        );
+        // The overlay's click-path scan (guard before the single terminus,
+        // disabled yields no id) is owned by
+        // `a_disabled_item_is_inert_and_styles_with_the_same_keys_as_the_others`
+        // — one scan, one spelling, so the two lanes' locks cannot drift.
     }
 
     /// ⚠ THE DIMMING LOCK. "Shown and dimmed" was asserted by nobody: the
@@ -118656,19 +118622,25 @@ mod tests {
                 other.id
             );
         }
+        // The dimming is carried by the shared engine's Inert tone: the item
+        // COLOR at 0.42 alpha, and no hover tint (hover feedback on something
+        // unclickable is a lie about the affordance). Values, not keys — the
+        // key sets are identical by the loop above.
         let dimmed_style = context_menu_item_style(dark, &dimmed);
-        assert!(
-            dimmed_style.contains("opacity:0.42;"),
-            "a disabled item must READ as disabled: {dimmed_style}"
-        );
-        assert!(
-            dimmed_style.contains("cursor:default;"),
-            "and must not offer the pointer of something clickable: {dimmed_style}"
-        );
         let live_style = context_menu_item_style(dark, &live);
+        assert_ne!(dimmed_style, live_style, "disabled must READ differently");
         assert!(
-            live_style.contains("opacity:1;") && live_style.contains("cursor:pointer;"),
-            "a live item is fully opaque and clickable: {live_style}"
+            dimmed_style.contains("0.42"),
+            "a disabled item must READ as disabled (dimmed color): {dimmed_style}"
+        );
+        assert!(
+            dimmed_style.contains("--yggterm-menu-item-hover-background:transparent;"),
+            "a disabled item must not light up on hover: {dimmed_style}"
+        );
+        assert!(
+            !live_style.contains("0.42")
+                && !live_style.contains("--yggterm-menu-item-hover-background:transparent;"),
+            "a live item is fully readable and takes the hover tint: {live_style}"
         );
 
         let overlay = shell_fn_body("fn ContextMenuOverlay(");
@@ -157557,7 +157529,7 @@ mod webtabs_menu_switcher_locks {
         assert!(
             current
                 .label
-                .starts_with(&web_profile_avatar(WEB_SURFACE_TEMP_PROFILE)),
+                .starts_with(&web_surface_profile_avatar(WEB_SURFACE_TEMP_PROFILE)),
             "every row wears its avatar: {}",
             current.label
         );
@@ -157979,11 +157951,17 @@ mod webtabs_menu_switcher_locks {
                 .any(|line| line.trim() == "on_action.call(id);"),
             "the dispatch must use the id the guard yielded, not the item's own"
         );
+        // The overlay takes its style from ONE owner; the owner is where the
+        // disabled tone must be reachable from. Two hops, both pinned: the
+        // overlay calls the owner (asserted in
+        // `a_disabled_menu_item_is_drawn_dimmed_with_identical_style_keys`),
+        // and the owner branches to the disabled tone.
+        let (osty, esty) = function_body_lines(&product, "fn context_menu_item_style(");
         assert!(
-            overlay
+            product[osty..=esty]
                 .iter()
                 .any(|line| line.contains("context_menu_action_style_disabled(palette)")),
-            "the disabled tone must be drawn"
+            "the disabled tone must be drawn (via the style owner)"
         );
     }
 
@@ -158003,11 +157981,17 @@ mod webtabs_menu_switcher_locks {
             "row order must not depend on directory order"
         );
 
-        // The avatar accessor's fallback (lane C's `ProfileMeta` will replace the
-        // body, not the contract).
-        assert_eq!(web_profile_avatar("work"), "W");
-        assert_eq!(web_profile_avatar(WEB_SURFACE_TEMP_PROFILE), "⏲");
-        assert_eq!(web_profile_avatar(""), "·");
+        // The avatar comes from THE owner (`web_surface_profile_avatar` →
+        // core `ProfileMeta`): the switcher cannot drift from the picker
+        // because they call the same function — asserted structurally by
+        // `the_gui_derives_a_profile_avatar_in_exactly_one_place`. Here:
+        // the derived default is what core says, and temp keeps its glyph.
+        assert_eq!(
+            web_surface_profile_avatar("a-switcher-probe-no-jar"),
+            yggterm_core::web_profile::default_web_profile_emoji("a-switcher-probe-no-jar"),
+        );
+        assert_eq!(web_surface_profile_avatar(WEB_SURFACE_TEMP_PROFILE), "⏲");
+        assert!(!web_surface_profile_avatar("").is_empty());
         assert_eq!(web_profile_display_name("work"), "work");
         assert_eq!(
             web_profile_display_name(WEB_SURFACE_TEMP_PROFILE),
