@@ -35692,6 +35692,12 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         // meant for the menu falls through to the page under it.
         || snapshot.web_tab_context_menu.is_some()
         || snapshot.web_profile_switcher.is_some()
+        // A contributed rail row's menu is a floating menu like any other. It
+        // was the one mount left out of this list, which over a NATIVE web
+        // surface made its outside-click dismissal unreachable — the click
+        // landed on the page instead of the backdrop, so the menu could not be
+        // dismissed at all on the one surface that draws above all DOM.
+        || snapshot.app_pane_context_menu.is_some()
         || snapshot.pending_delete.is_some()
         || snapshot.pending_classic_tabs_switch
         || snapshot.copy_edit_dialog.is_some()
@@ -101563,6 +101569,19 @@ fn terminal_eval_script_with_canvas_renderer(
         // event because the document surface is a SIBLING of the host, not a
         // child. Same shape as the fourth-focus-path bug: a host-wide handler
         // that never learned the document surface exists.
+        //
+        // The SHELL'S OWN FLOATING MENU is the same class of cover. While a
+        // `ContextMenuOverlay` is up, its full-window backdrop is what the
+        // pointer actually hits — but this capture listener is pure GEOMETRY,
+        // so without the backdrop in this list it would still claim every
+        // right-click inside the terminal's rect, `stopPropagation()` it during
+        // the DOCUMENT CAPTURE phase (which ends the dispatch before the target
+        // and bubble phases ever run) and open the terminal's own menu. The
+        // backdrop's `oncontextmenu` dismissal and the menu surface's guard
+        // would both be unreachable code over the largest region of the window
+        // — the very defect class (`pointer-events:none` made a handler
+        // unreachable) the dismissal owner was written to remove — and the user
+        // would be left with TWO menus and two stacked backdrops on screen.
         const terminalSecondaryIsCoveredBySurface = (event) => {{
             try {{
                 if (
@@ -101572,7 +101591,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     return true;
                 }}
                 const target = event && event.target;
-                if (target && target.closest && target.closest('[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker]')) {{
+                if (target && target.closest && target.closest('[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker], [data-yggterm-menu-backdrop], [data-context-menu]')) {{
                     return true;
                 }}
             }} catch (_error) {{}}
@@ -160676,5 +160695,526 @@ mod menu_dismissal_locks {
             !chrome_transient_over_viewport(&gone),
             "an empty menu must not keep the input cover over the page"
         );
+    }
+
+    // ======================================================================
+    // LOCK 6 — the backdrop's RIGHT-CLICK is reachable over the terminal.
+    //
+    // The locks above pin the backdrop's handlers as SOURCE. Source is blind to
+    // reachability, which is exactly how `pointer-events:none` survived: the
+    // handler was there, spelled correctly, and could never run. The terminal
+    // host's document-level CAPTURE listener is the second way to make the same
+    // handler unreachable — it claims a right-click by GEOMETRY (inside the
+    // host rect) and `stopPropagation()`s during capture, which ends the
+    // dispatch before the target and bubble phases the backdrop's listener
+    // lives in.
+    // ======================================================================
+
+    /// The generated terminal script's covered-by-surface allow-list must name
+    /// the menu backdrop and the menu surface. Delete either selector and this
+    /// goes red — and with it, a right-click anywhere over the terminal's rect
+    /// stops dismissing the open menu and opens a SECOND one instead.
+    #[test]
+    fn a_right_click_on_the_menu_backdrop_is_not_stolen_by_the_terminal() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+
+        // Anchored on the funnel itself, both ends, so an allow-list appended
+        // anywhere else in the script cannot satisfy this.
+        const FUNNEL: &str = "const terminalSecondaryIsCoveredBySurface = (event) => {";
+        let start = script
+            .find(FUNNEL)
+            .expect("the covered-by-surface funnel moved — move this lock with it");
+        let tail = &script[start..];
+        let end = tail
+            .find("\n        };")
+            .expect("the covered-by-surface funnel never closes at its own indent");
+        let funnel = &tail[..end];
+
+        for selector in [
+            // The menu's own two markers: the full-window backdrop the pointer
+            // actually hits, and the menu box itself.
+            "[data-yggterm-menu-backdrop]",
+            "[data-context-menu]",
+            // …and the three that were already there, so the addition did not
+            // displace a covering surface's right-click.
+            "[data-document-surface]",
+            "[data-ws-overlay]",
+            "[data-yggterm-web-picker]",
+        ] {
+            assert!(
+                funnel.contains(selector),
+                "the terminal must stand down for {selector}; without it the \
+                 backdrop's oncontextmenu is unreachable code over the terminal \
+                 rect — the same defect class as pointer-events:none:\n{funnel}"
+            );
+        }
+
+        // The funnel is consulted, and standing down means standing down
+        // ENTIRELY: no preventDefault, no stopPropagation, so the event survives
+        // capture and reaches the backdrop's bubble-phase listener.
+        let squeezed: String = script.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("if(terminalSecondaryIsCoveredBySurface(event)){returnfalse;}"),
+            "the secondary-button funnel must consult the allow-list and return \
+             WITHOUT touching the event"
+        );
+        assert!(
+            squeezed.contains("stopTerminalSecondaryEvent(event);"),
+            "the anchor: the terminal still swallows the right-clicks it DOES own"
+        );
+
+        // The selectors have to name markers the overlay actually draws.
+        let product = product_source();
+        let overlay = overlay_lines(&product);
+        for marker in [
+            "\"data-yggterm-menu-backdrop\": \"1\",",
+            "\"data-context-menu\": \"1\",",
+        ] {
+            assert!(
+                overlay.iter().any(|line| line.contains(marker)),
+                "the allow-list names {marker}, so the overlay must draw it"
+            );
+        }
+    }
+
+    // ======================================================================
+    // LOCK 7 — Escape's terminus is RUN, not read.
+    // ======================================================================
+
+    /// A shell that can raise every one of the four shell-owned menus, on a
+    /// TERMINAL viewport so the keyboard giveback has somewhere to go.
+    ///
+    /// Its trace home is this lane's own temp dir: running the terminus resyncs
+    /// the terminal input policy, which appends an event trace, and a lock has
+    /// no business writing into the shared fixture home.
+    fn shell_with_every_menu_available() -> (ShellState, BrowserRow) {
+        let mut shell =
+            super::webtabs_menu_switcher_locks::shell_with_surface(&[("https://a/", None)]);
+        shell.bootstrap.settings_path =
+            std::env::temp_dir().join("yggterm-menu-dismissal-locks/settings.json");
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/doomed.jsonl",
+        ]));
+        let row = shell
+            .browser
+            .all_rows()
+            .into_iter()
+            .find(|row| row.kind == BrowserRowKind::Session && row.full_path.contains("doomed"))
+            .expect("the fixture tree has one session row");
+        (shell, row)
+    }
+
+    fn app_pane_menu_actions() -> Vec<AppPaneRowAction> {
+        vec![AppPaneRowAction {
+            action: "rename".into(),
+            label: "Rename".into(),
+            title: String::new(),
+        }]
+    }
+
+    /// Open exactly one menu of each kind, one shell at a time. Returned in the
+    /// order [`ShellMenu`] declares, so a new variant that nobody opens here
+    /// fails the exhaustiveness assertion below rather than passing silently.
+    fn each_menu_opened_alone() -> Vec<(ShellMenu, ShellState)> {
+        let mut cases = Vec::new();
+
+        let (mut shell, _row) = shell_with_every_menu_available();
+        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Strip, (8.0, 9.0));
+        cases.push((ShellMenu::WebProfile, shell));
+
+        let (mut shell, _row) = shell_with_every_menu_available();
+        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (8.0, 9.0));
+        cases.push((ShellMenu::WebTab, shell));
+
+        let (mut shell, row) = shell_with_every_menu_available();
+        shell.open_context_menu(row, (8.0, 9.0));
+        cases.push((ShellMenu::Row, shell));
+
+        let (mut shell, _row) = shell_with_every_menu_available();
+        shell.open_app_pane_context_menu(
+            "notes".to_string(),
+            "a".to_string(),
+            "A".to_string(),
+            app_pane_menu_actions(),
+            (8.0, 9.0),
+        );
+        cases.push((ShellMenu::AppPane, shell));
+
+        for (expected, shell) in &cases {
+            assert_eq!(
+                shell.top_menu(),
+                Some(*expected),
+                "the fixture's premise: exactly this menu is up, alone"
+            );
+        }
+        cases
+    }
+
+    /// Run `body` with a live `Signal<ShellState>` over `shell`, inside a Dioxus
+    /// runtime. [`dismiss_top_menu`] writes through a signal and schedules the
+    /// giveback through another, so the only honest way to test it is to RUN it
+    /// — a lock that reads the string `dismiss_top_menu(state);` out of the key
+    /// bridge stays green while the terminus is gutted to `false`.
+    fn with_live_shell<R>(shell: ShellState, body: impl FnOnce(Signal<ShellState>) -> R) -> R {
+        let dom = dioxus_core::VirtualDom::new(|| rsx! {});
+        dom.in_runtime(|| {
+            // A SCOPE has to be current, not merely a runtime: the terminus ends
+            // in `document::eval`, which resolves the document off the current
+            // scope's context and unwraps the scope stack to find it.
+            let runtime = dioxus_core::Runtime::current();
+            runtime.in_scope(ScopeId::ROOT, || {
+                let state = Signal::new_in_scope(shell, ScopeId::ROOT);
+                body(state)
+            })
+        })
+    }
+
+    /// THE Escape lock, end to end: every one of the four menus is opened
+    /// against a real `ShellState`, the terminus is DRIVEN, and the menu is
+    /// gone AND the keyboard is back afterwards.
+    ///
+    /// Gut `dismiss_top_menu` to `{ let _ = state; false }`, or cut the
+    /// `overlay_focus_giveback_session(…)` tail off `dismiss_menu`, and this
+    /// goes red.
+    #[test]
+    fn the_escape_terminus_closes_every_menu_and_hands_the_keyboard_back() {
+        let cases = each_menu_opened_alone();
+        assert_eq!(
+            cases.len(),
+            4,
+            "every ShellMenu variant must be driven here; a fifth menu with no \
+             case is a dismissal path nothing observes"
+        );
+
+        for (menu, shell) in cases {
+            with_live_shell(shell, |mut state| {
+                state.with_mut(|shell| {
+                    shell.terminal_input_override_active = false;
+                });
+                assert_eq!(
+                    state.with(|shell| shell.top_menu()),
+                    Some(menu),
+                    "{menu:?}: the premise"
+                );
+                assert!(
+                    dismiss_top_menu(state),
+                    "{menu:?}: Escape had a menu to close and must say so — the \
+                     `false` half is what lets the key fall through to the terminal"
+                );
+                assert_eq!(
+                    state.with(|shell| shell.top_menu()),
+                    None,
+                    "{menu:?}: the terminus must actually DISMISS it"
+                );
+                assert!(
+                    state.with(|shell| shell.terminal_input_override_active),
+                    "{menu:?}: …and hand the keyboard back to the terminal it \
+                     borrowed it from"
+                );
+            });
+        }
+    }
+
+    /// The other half of the same terminus: nothing open ⇒ nothing dismissed,
+    /// nothing armed, and the caller learns the key is still the terminal's.
+    #[test]
+    fn the_escape_terminus_refuses_a_menu_less_shell() {
+        let (shell, _row) = shell_with_every_menu_available();
+        with_live_shell(shell, |mut state| {
+            state.with_mut(|shell| {
+                shell.terminal_input_override_active = false;
+            });
+            assert_eq!(state.with(|shell| shell.top_menu()), None);
+            assert!(
+                !dismiss_top_menu(state),
+                "with no menu up the terminus must decline, or Escape stops \
+                 reaching the PTY"
+            );
+            assert!(
+                !state.with(|shell| shell.terminal_input_override_active),
+                "…and must not seize the keyboard on a gesture it refused"
+            );
+        });
+    }
+
+    /// The giveback is CONDITIONAL, driven the same way: a rendered viewport
+    /// owns its own focus, so dismissing a menu over it must close the menu and
+    /// touch nothing else.
+    #[test]
+    fn a_dismissal_over_a_rendered_viewport_gives_no_keyboard_back() {
+        let (mut shell, row) = shell_with_every_menu_available();
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+        shell.open_context_menu(row, (8.0, 9.0));
+        with_live_shell(shell, |mut state| {
+            state.with_mut(|shell| {
+                shell.terminal_input_override_active = false;
+            });
+            assert!(dismiss_top_menu(state));
+            assert_eq!(state.with(|shell| shell.top_menu()), None);
+            assert!(
+                !state.with(|shell| shell.terminal_input_override_active),
+                "a rendered viewport owns its own focus; yanking it to a terminal \
+                 that is not on screen would be the theft, not the giveback"
+            );
+        });
+    }
+
+    // ======================================================================
+    // LOCK 8 — the DOM marker and the dispatcher name the same menu.
+    // ======================================================================
+
+    /// `render_top_menu` is what decides whether the JS bridge intercepts
+    /// Escape at all, and `ShellState::top_menu` is what Rust then closes. One
+    /// case per variant, against a real snapshot of a real shell: hard-wire any
+    /// slot of `render_top_menu` to `false` and the marker stops being rendered
+    /// for that menu — the bridge never fires and Escape does nothing.
+    #[test]
+    fn the_menu_marker_names_exactly_the_menu_the_terminus_would_close() {
+        let (shell, _row) = shell_with_every_menu_available();
+        assert_eq!(
+            render_top_menu(&shell.snapshot()),
+            None,
+            "no menu, no marker — this is how a menu-less terminal keeps Escape"
+        );
+        assert_eq!(render_top_menu(&shell.snapshot()), shell.top_menu());
+
+        for (menu, shell) in each_menu_opened_alone() {
+            assert_eq!(
+                render_top_menu(&shell.snapshot()),
+                Some(menu),
+                "{menu:?}: the render pass must mark the menu it is drawing"
+            );
+            assert_eq!(
+                render_top_menu(&shell.snapshot()),
+                shell.top_menu(),
+                "{menu:?}: the marker the bridge reads and the menu the terminus \
+                 closes must be the same menu"
+            );
+        }
+
+        // …and the marker really is drawn from that function, with an arm for
+        // every variant.
+        let product = product_source();
+        let marker = product
+            .iter()
+            .position(|line| line.contains("\"data-yggterm-menu-open\": match top_menu {"))
+            .expect("the menu marker moved — move this lock with it");
+        assert_eq!(
+            product[marker - 2].trim(),
+            "if let Some(top_menu) = render_top_menu(&snapshot) {",
+            "the marker must be gated on the render-side precedence, not on a \
+             second reading of the raw fields"
+        );
+        let arms = product[marker + 1..marker + 5].join("\n");
+        for arm in [
+            "ShellMenu::WebProfile => \"web-profile\",",
+            "ShellMenu::WebTab => \"web-tab\",",
+            "ShellMenu::Row => \"row\",",
+            "ShellMenu::AppPane => \"app-pane\",",
+        ] {
+            assert!(
+                arms.contains(arm),
+                "every menu must name itself in the marker: {arm} is missing:\n{arms}"
+            );
+        }
+    }
+
+    /// The modal marker is the menu marker's twin and had the same untested
+    /// shape: `render_top_modal` was referenced by no test at all. Same lock,
+    /// one case per `TopModal`.
+    #[test]
+    fn the_modal_marker_names_exactly_the_dialog_the_dispatcher_would_answer() {
+        let (shell, _row) = shell_with_every_menu_available();
+        assert_eq!(render_top_modal(&shell.snapshot()), None);
+        assert_eq!(render_top_modal(&shell.snapshot()), shell.top_modal());
+
+        let cases: Vec<(TopModal, Box<dyn Fn(&mut ShellState)>)> = vec![
+            (
+                TopModal::Fido2,
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_fido2 = Some(PendingFido2Dialog {
+                        session_path: "local://ws".to_string(),
+                        request_id: "r1".to_string(),
+                        rp_id: "example.test".to_string(),
+                        account: "a".to_string(),
+                        accounts: Vec::new(),
+                        ceremony: "get".to_string(),
+                        origin: "https://example.test".to_string(),
+                    });
+                }),
+            ),
+            (
+                TopModal::Delete,
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_delete = Some(PendingDeleteDialog {
+                        document_paths: Vec::new(),
+                        group_paths: Vec::new(),
+                        session_paths: Vec::new(),
+                        ssh_machine_keys: Vec::new(),
+                        labels: Vec::new(),
+                        hard_delete: false,
+                        live_session_close: false,
+                        live_session_bulk_close: false,
+                        live_session_unkept_paths: Vec::new(),
+                    });
+                }),
+            ),
+            (
+                TopModal::CopyEdit,
+                Box::new(|shell: &mut ShellState| {
+                    shell.copy_edit_dialog = Some(CopyEditDialog {
+                        field: CopyEditField::Title,
+                        session_path: "local://ws".to_string(),
+                        session_id: String::new(),
+                        cwd: String::new(),
+                        title: String::new(),
+                        value: String::new(),
+                    });
+                }),
+            ),
+            (
+                TopModal::ClassicTabsSwitch,
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_classic_tabs_switch = true;
+                }),
+            ),
+        ];
+        for (modal, arm) in cases {
+            let (mut shell, _row) = shell_with_every_menu_available();
+            arm(&mut shell);
+            assert_eq!(
+                render_top_modal(&shell.snapshot()),
+                Some(modal),
+                "{modal:?}: the render pass must mark the dialog it is drawing"
+            );
+            assert_eq!(
+                render_top_modal(&shell.snapshot()),
+                shell.top_modal(),
+                "{modal:?}: the marker the bridge reads and the dialog the key \
+                 dispatcher answers must be the same dialog"
+            );
+        }
+
+        let product = product_source();
+        let marker = product
+            .iter()
+            .position(|line| line.contains("\"data-yggterm-modal-open\": match top_modal {"))
+            .expect("the modal marker moved — move this lock with it");
+        assert_eq!(
+            product[marker - 2].trim(),
+            "if let Some(top_modal) = render_top_modal(&snapshot) {",
+            "the modal marker must be gated on the render-side precedence too"
+        );
+    }
+
+    // ======================================================================
+    // LOCK 9 — the row menu is DRAWN from the resolved anchor.
+    // ======================================================================
+
+    /// `a_row_that_leaves_the_tree_takes_its_menu_with_it` proves the SNAPSHOT
+    /// drops a dead anchor. That is one layer above where the menu is drawn: the
+    /// mount used to read `shell.context_menu_row` straight off the live state,
+    /// which restores the stuck-menu regression in full while every liveness
+    /// lock stays green. So the mount's source is pinned here, and the raw field
+    /// is declared unreadable outside the resolver that owns it.
+    #[test]
+    fn the_row_menu_is_drawn_from_the_resolved_anchor_not_the_raw_field() {
+        let product = product_source();
+
+        let definitions: Vec<&String> = product
+            .iter()
+            .filter(|line| line.trim_start().starts_with("let context_menu_overlay ="))
+            .collect();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "one binding feeds the row menu's mount; found {}",
+            definitions.len()
+        );
+        assert_eq!(
+            definitions[0].trim(),
+            "let context_menu_overlay = snapshot.context_menu_row.clone();",
+            "the row menu must be DRAWN from the resolved snapshot value. Reading \
+             the live `shell.context_menu_row` here re-ships the stuck menu: the \
+             snapshot drops an anchor that left the tree, the mount draws it \
+             anyway, and every liveness lock stays green"
+        );
+
+        let mount = product
+            .iter()
+            .position(|line| line.contains("if let Some(row) = context_menu_overlay.clone()"))
+            .expect("the row menu's mount moved — move this lock with it");
+        assert_eq!(
+            product[mount + 1].trim(),
+            "ContextMenuOverlay {",
+            "…and that binding is what the shared overlay is mounted on"
+        );
+
+        // The same audit for the other three mounts: every one reads the
+        // SNAPSHOT field, never the live shell.
+        for anchor in [
+            "if let Some(menu) = snapshot.app_pane_context_menu.clone()",
+            "if let Some(menu) = snapshot.web_tab_context_menu.clone()",
+            "if let Some(switcher) = snapshot.web_profile_switcher.clone()",
+        ] {
+            assert_eq!(
+                product.iter().filter(|line| line.contains(anchor)).count(),
+                1,
+                "{anchor} must be the ONE mount guard for its menu"
+            );
+        }
+
+        // …and nothing in the product READS the raw field. Writes
+        // (`shell.context_menu_row = None;`) are how the closers work; a read
+        // (`.clone()`, `.as_ref()`, `.is_some()`) outside `impl ShellState` is a
+        // second answer to "which row is the menu on".
+        let raw_reads: Vec<&String> = product
+            .iter()
+            .filter(|line| line.contains("shell.context_menu_row."))
+            .collect();
+        assert!(
+            raw_reads.is_empty(),
+            "the raw anchor has ONE reader — `ShellState::live_context_menu_row`, \
+             through `self`. These read it directly: {raw_reads:?}"
+        );
+    }
+
+    // ======================================================================
+    // LOCK 10 — every floating menu covers the viewport for INPUT.
+    // ======================================================================
+
+    /// A native web surface draws above ALL DOM, so a menu whose backdrop is not
+    /// declared over the viewport has its outside-click dismissal land on the
+    /// PAGE — unreachable again, by a different route. The contributed rail
+    /// row's menu was the one mount missing from this list.
+    #[test]
+    fn every_floating_menu_holds_the_input_cover_over_the_viewport() {
+        let (base, _row) = shell_with_every_menu_available();
+        assert!(
+            !chrome_transient_over_viewport(&base.snapshot()),
+            "the premise: nothing is up"
+        );
+
+        for (menu, shell) in each_menu_opened_alone() {
+            assert!(
+                chrome_transient_over_viewport(&shell.snapshot()),
+                "{menu:?}: an open menu MUST hold the full-window input cover, or \
+                 over a native web surface its outside-click dismissal never \
+                 reaches the backdrop"
+            );
+        }
+
+        // …and it is released again by the terminus, for every one of them.
+        for (menu, shell) in each_menu_opened_alone() {
+            with_live_shell(shell, |state| {
+                assert!(dismiss_top_menu(state));
+                assert!(
+                    !state.with(|shell| chrome_transient_over_viewport(&shell.snapshot())),
+                    "{menu:?}: an invisible full-window cover outliving its menu IS \
+                     the hang the user killed the GUI over"
+                );
+            });
+        }
     }
 }
