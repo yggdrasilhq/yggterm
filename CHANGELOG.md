@@ -14,6 +14,20 @@ This file tracks user-visible changes in `yggterm`.
   has not been set up for this, every command answers plainly that the piece is
   not installed and where to get it, rather than failing in a confusing way.
 
+- **Fixed: a hundred browser tabs no longer means a hundred browser processes.**
+  Tabs you were not looking at inside the session you *were* looking at used to
+  keep their page alive for as long as the app ran, however long ago you had
+  last opened them — so a heavy browsing day only ever added weight to the
+  machine. A background tab now goes quiet like a background session does, and
+  after ten minutes off screen it hands its memory back; clicking it brings the
+  page straight back from the address it was on. Nothing that is on screen is
+  touched: not the tab you are reading, not a tab you have pinned into a split
+  pane, and not a tab playing audio — a playlist you started in another tab
+  keeps playing. Tabs you have never opened still cost nothing at all, exactly
+  as before. The ten minutes is yours to change:
+  `~/.yggterm/web-surface.json`, `{"tab_background_hold_secs": 600}` (0 lets a
+  tab go the moment you leave it). What a reclaimed tab does not keep is where
+  you had scrolled to and anything half-typed into a form on it.
 - **New: a session an assistant opens for itself now says so in its name.**
   Until now a scratch session an assistant created was named after the folder
   it opened in, which is exactly how your own terminal in that folder is named
