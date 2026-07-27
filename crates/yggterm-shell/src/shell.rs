@@ -11076,8 +11076,18 @@ struct ShellState {
     /// row draws the drop line; release commits. `None` over a non-reorderable
     /// row, which makes the release a no-op rather than a guess.
     app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
-    /// The classic strip's overflow menu (the tabs that live in folders) is open.
-    web_tab_overflow_open: bool,
+    /// The user's raw TOGGLE of the classic strip's overflow menu (the tabs that
+    /// live in folders).
+    ///
+    /// Never read this directly — read [`ShellState::web_tab_overflow_open`],
+    /// which gates it on the affordance still being on screen. The dropdown
+    /// hangs over pure page, so it is only visible because it is a `top_modal`
+    /// that STASHES every web surface while it is up; and the button that
+    /// toggles it, like the menu itself, exists only while some tab is filed. A
+    /// stale true therefore unmaps the whole browsing area with no visible cause
+    /// and no visible way back — see
+    /// [`ShellState::web_tab_overflow_affordance_present`].
+    web_tab_overflow_toggled: bool,
     tree_rename_path: Option<String>,
     tree_rename_depth: Option<usize>,
     tree_rename_value: String,
@@ -12900,7 +12910,7 @@ impl ShellState {
             web_tab_drop_target: None,
             app_pane_row_drag: None,
             app_pane_row_drop_target: None,
-            web_tab_overflow_open: false,
+            web_tab_overflow_toggled: false,
             tree_rename_path: None,
             tree_rename_depth: None,
             tree_rename_input_focused_once: false,
@@ -13806,7 +13816,11 @@ impl ShellState {
             web_tab_drop_target: self.web_tab_drop_target.clone(),
             app_pane_row_drag: self.app_pane_row_drag.clone(),
             app_pane_row_drop_target: self.app_pane_row_drop_target.clone(),
-            web_tab_overflow_open: self.web_tab_overflow_open,
+            // The GATED reader, never the raw toggle: the render pass, the modal
+            // precedence and the transient cover all read this one snapshot
+            // field, so none of them can believe in a menu the strip is not
+            // drawing.
+            web_tab_overflow_open: self.web_tab_overflow_open(),
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
             tree_rename_input_focused_once: self.tree_rename_input_focused_once,
@@ -15155,7 +15169,7 @@ impl ShellState {
             // …and so are the classic strip's two dropdowns, for the same
             // reason and with no geometry available to dodge it.
             strip_dropdown_over_viewport(
-                self.web_tab_overflow_open,
+                self.web_tab_overflow_open(),
                 self.web_profile_switcher
                     .as_ref()
                     .map(|switcher| switcher.anchor),
@@ -15917,10 +15931,59 @@ impl ShellState {
         self.pending_classic_tabs_switch = false;
     }
     fn toggle_web_tab_overflow(&mut self) {
-        self.web_tab_overflow_open = !self.web_tab_overflow_open;
+        self.web_tab_overflow_toggled = !self.web_tab_overflow_toggled;
     }
     fn close_web_tab_overflow(&mut self) {
-        self.web_tab_overflow_open = false;
+        self.web_tab_overflow_toggled = false;
+    }
+    /// Is the classic strip actually DRAWING the folder-overflow affordance?
+    ///
+    /// THE gate on [`ShellState::web_tab_overflow_toggled`], and the reason
+    /// there is no list of reset call sites to keep in step: the button and the
+    /// dropdown both render inside `(!filed.is_empty()).then(…)` on the ACTIVE
+    /// session's surface, inside the classic strip (vertical-tabs mode collapses
+    /// that strip to `max-height:0`), inside the Terminal view mode that mounts
+    /// the web overlay at all. Ask the same question the render asks and the
+    /// flag cannot outlive its affordance on ANY path — a tab unfiled, the last
+    /// filed tab closed, a folder deleted, the session switched away, the view
+    /// mode flipped, the surface torn down.
+    fn web_tab_overflow_affordance_present(&self) -> bool {
+        self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && !self.settings.web_surface_vertical_tabs
+            && self.active_web_surface().is_some_and(|surface| {
+                // A surface still in its profile picker draws no tab strip: its
+                // viewport is the GUI-native chooser.
+                surface.picker.is_none() && surface.tabs.iter().any(|tab| tab.folder.is_some())
+            })
+    }
+    /// THE reader of "is the folder-overflow dropdown open". One owner, because
+    /// this flag is a `top_modal`: every reader that disagreed with the strip
+    /// about it would be unmapping the user's browsing area for a menu that is
+    /// not on screen.
+    fn web_tab_overflow_open(&self) -> bool {
+        self.web_tab_overflow_toggled && self.web_tab_overflow_affordance_present()
+    }
+    /// Dismiss the STRIP-anchored dropdowns — exactly the set
+    /// [`strip_dropdown_over_viewport`] calls a modal, asked through that same
+    /// predicate, and nothing else.
+    ///
+    /// The profile switcher is ONE state slot with TWO anchors, and only the
+    /// strip anchor is a modal. An Escape (or a backdrop click) aimed at a strip
+    /// dropdown must not reach across and dismiss a RAIL-anchored switcher the
+    /// user opened separately — that switcher never received the key, is not
+    /// over the viewport, and has its own closer. The overflow menu has only the
+    /// strip anchor, so it always closes.
+    fn close_strip_anchored_dropdowns(&mut self) {
+        let switcher_is_strip_anchored = strip_dropdown_over_viewport(
+            false,
+            self.web_profile_switcher
+                .as_ref()
+                .map(|switcher| switcher.anchor),
+        );
+        self.close_web_tab_overflow();
+        if switcher_is_strip_anchored {
+            self.close_web_profile_switcher();
+        }
     }
     fn confirm_classic_tabs_switch(&mut self) {
         self.pending_classic_tabs_switch = false;
@@ -33949,10 +34012,17 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
 /// leaves the terminal exactly as a strip dropdown closed by a click does.
 /// Both closers are idempotent, so the caller does not have to know which of the
 /// two dropdowns was open.
+///
+/// STRIP-ANCHORED ONLY — exactly the set [`strip_dropdown_over_viewport`] calls
+/// a modal, and asked through that same predicate. The profile switcher is ONE
+/// state slot with two anchors, and the rail's anchor is deliberately not a
+/// modal: an Escape (or a backdrop click) aimed at the strip's overflow menu
+/// must not reach across and dismiss a rail switcher the user opened separately.
+/// The overflow menu itself has only the strip anchor, so it closes
+/// unconditionally.
 fn close_strip_dropdowns(mut state: Signal<ShellState>) {
     let active_terminal_session = state.with_mut(|shell| {
-        shell.close_web_tab_overflow();
-        shell.close_web_profile_switcher();
+        shell.close_strip_anchored_dropdowns();
         overlay_focus_giveback_session(
             shell.server.active_view_mode(),
             shell.server.active_session_path(),
@@ -43704,10 +43774,12 @@ const CONTEXT_MENU_WIDTH_PX: f64 = 224.0;
 const CONTEXT_MENU_HEIGHT_PX: f64 = 420.0;
 /// Gap between a menu and each edge of whatever it is clamped inside.
 const CONTEXT_MENU_MARGIN_PX: f64 = 12.0;
-/// The narrowest a BANDED menu may be squeezed to. `RAIL_MIN_WIDTH` (240) minus
-/// the two margins is 216, so the floor never bites on a real rail; it exists so
-/// a degenerate band cannot produce a zero-width or negative box.
-const CONTEXT_MENU_MIN_BAND_WIDTH_PX: f64 = 150.0;
+/// The narrowest a BANDED menu may be squeezed to. The rail's ON-SCREEN width
+/// is `rail_width × the UI zoom`, and the narrowest that gets is the 240px
+/// minimum rail at the zoom control's 50% floor — 120 on screen, 96 after the
+/// two margins. So the floor still never bites on a real rail; it exists so a
+/// degenerate band cannot produce a zero-width or negative box.
+const CONTEXT_MENU_MIN_BAND_WIDTH_PX: f64 = 96.0;
 /// The natural minimum box, so a two-item menu is not a sliver. Border-box, like
 /// the max — see [`context_menu_surface_style`].
 const CONTEXT_MENU_MIN_BOX_PX: f64 = 200.0;
@@ -43725,14 +43797,35 @@ fn context_menu_width(band: Option<ContextMenuBand>) -> f64 {
     (band.right - band.left - 2.0 * CONTEXT_MENU_MARGIN_PX)
         .clamp(CONTEXT_MENU_MIN_BAND_WIDTH_PX, CONTEXT_MENU_WIDTH_PX)
 }
+/// The UI zoom as a FACTOR (1.0 = 100%), from the ONE percent owner —
+/// `zoom_percent_f32(ui_font_size, 14.0)`, the same expression
+/// [`sidebar_panel_outer_style`] is handed for its `zoom:{}%`.
+fn ui_zoom_factor(ui_font_size: f32) -> f64 {
+    zoom_percent_f32(ui_font_size, 14.0) as f64 / 100.0
+}
 /// The RAIL's band: the strip of window the right-hand rail occupies, in window
 /// CSS px. ONE derivation, read by every mount that raises a menu from the rail
 /// (the WebTabs rows and folders, the rail profile badge, a contributed app-pane
 /// row) — the rail is docked/revealed flush to the window's right edge, and the
 /// shell's 6px frame inset is absorbed by the placement margin.
-fn rail_context_menu_band(window_width: f64, rail_width: f64) -> ContextMenuBand {
+///
+/// `rail_width` is the AUTHORED width; the rail's element carries `width:{}px`
+/// and `zoom:{}%` TOGETHER ([`sidebar_panel_outer_style`]), so the strip it
+/// actually occupies in the window's coordinate space is the product. The menu
+/// overlay is mounted at the shell root and carries no zoom of its own, so it is
+/// drawn in unzoomed window CSS px — band the menu to the authored number and at
+/// the UI-zoom control's 50% floor the band claims twice the rail there is, which
+/// puts a right-anchored menu straight back over the page. That is the reported
+/// clipping bug, reachable from a shipped control.
+fn rail_context_menu_band(window_width: f64, rail_width: f64, ui_zoom: f64) -> ContextMenuBand {
+    let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
+        ui_zoom
+    } else {
+        1.0
+    };
+    let on_screen_width = (rail_width * zoom).max(0.0);
     ContextMenuBand {
-        left: (window_width - rail_width).max(0.0),
+        left: (window_width - on_screen_width).max(0.0),
         right: window_width,
     }
 }
@@ -71036,8 +71129,11 @@ fn app() -> Element {
     // The RAIL's band, derived once, handed to the mounts whose menus are raised
     // from the rail. See [`ContextMenuBand`]: in legacy stacking anything that
     // spills out of the rail is eaten by the native page beside it.
-    let context_menu_rail_band =
-        rail_context_menu_band(context_menu_window_size.0, snapshot.rail_width as f64);
+    let context_menu_rail_band = rail_context_menu_band(
+        context_menu_window_size.0,
+        snapshot.rail_width as f64,
+        ui_zoom_factor(snapshot.settings.ui_font_size),
+    );
     let titlebar_snapshot = snapshot.clone();
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
@@ -88693,8 +88789,10 @@ fn TerminalCanvas(
     let web_surface_profile_badge =
         state.with(|shell| shell.web_surface_session_profile(&session.session_path));
     // The classic strip's folder-overflow menu. GUI-only state, read here so the
-    // strip renders it without reaching back into the signal mid-tree.
-    let web_tab_overflow_open = state.with(|shell| shell.web_tab_overflow_open);
+    // strip renders it without reaching back into the signal mid-tree — through
+    // the GATED reader, which is the same question this strip's own
+    // `(!filed.is_empty())` guard asks.
+    let web_tab_overflow_open = state.with(|shell| shell.web_tab_overflow_open());
     // Address-bar/back/forward navigations honor the same egress rule as OSC
     // opens: loopback URLs on a remote session resolve through the session
     // host's sshd.
@@ -89033,6 +89131,25 @@ fn TerminalCanvas(
                                             "🗂 {filed.len()} ⌄"
                                         }
                                         if overflow_open {
+                                            // CLICK-OUTSIDE. This dropdown was
+                                            // the one member of the stash set
+                                            // with no way out but its own
+                                            // button — and it UNMAPS the page
+                                            // while it is up, so "no way out"
+                                            // reads as a blank browsing area.
+                                            // A REAL backdrop: the
+                                            // ContextMenuOverlay's is
+                                            // `pointer-events:none` and
+                                            // therefore not hit-testable, so
+                                            // reusing that component would have
+                                            // bought the same nothing.
+                                            div {
+                                                "data-ws-tab-overflow-backdrop": "1",
+                                                style: "position:fixed; inset:0; z-index:59; background:transparent;",
+                                                onclick: move |_| {
+                                                    close_strip_dropdowns(state);
+                                                },
+                                            }
                                             div {
                                                 "data-ws-tab-overflow-menu": "1",
                                                 style: format!(
@@ -89274,8 +89391,20 @@ fn WebSurfacePickerView(
     // of the subtitle. Never a silent no-op.
     let mut picker_notice = use_signal(|| None::<String>);
     let _ = profiles_refresh();
-    let window_inner = use_window().inner_size();
-    let menu_window_size = (window_inner.width as f64, window_inner.height as f64);
+    let picker_window = use_window();
+    let picker_window_inner = picker_window.inner_size();
+    // PHYSICAL px → CSS px, the SAME conversion the shell's render site makes
+    // for the other four mounts. A menu anchors at `evt.client_coordinates()`,
+    // which is CSS; feeding `inner_size()` raw placed this card menu as if the
+    // window were `scale_factor`× larger, so on a HiDPI host a menu raised near
+    // the right or bottom edge never flipped and was drawn past the viewport.
+    let menu_window_size = window_css_size(
+        (
+            picker_window_inner.width as f64,
+            picker_window_inner.height as f64,
+        ),
+        picker_window.scale_factor(),
+    );
     // Name + metadata together: the ✕ has to know whether the profile is
     // protected, and the card has to know its avatar, and both must be the
     // truth on disk at this render rather than a remembered one.
@@ -89626,6 +89755,16 @@ fn WebSurfacePickerView(
                         ContextMenuOverlay {
                             position,
                             window_size: menu_window_size,
+                            // NO BAND, and the reason is structural rather than
+                            // a preference: the picker IS the viewport. It is
+                            // GUI-native DOM with no native webview behind it
+                            // (`picker_control_url` is what excludes a picker
+                            // surface from the under-glass host), so there is
+                            // nothing that composites above this menu and every
+                            // window pixel it may be clamped to is DOM the
+                            // shell paints. Window clamping is the whole
+                            // answer here.
+                            band: None,
                             palette,
                             items: web_profile_menu_items(&menu_profile_name, &menu_meta),
                             menu_title: menu_profile_name.clone(),
@@ -118227,6 +118366,28 @@ mod tests {
         );
     }
 
+    /// …plus a folder with one tab FILED into it, which is what makes the
+    /// classic strip draw its folder-overflow affordance at all. Built by hand
+    /// rather than through `web_surface_new_tab` / `web_tab_move_to_folder`,
+    /// because those persist — and this surface is on the "default" profile,
+    /// i.e. the developer's real tab store.
+    fn seed_web_surface_with_filed_tab(shell: &mut ShellState, session_path: &str) {
+        seed_web_surface(shell, session_path);
+        let Some(surface) = shell.web_surfaces.get_mut(session_path) else {
+            return;
+        };
+        surface.folders.push(WebTabFolder {
+            id: "f1".to_string(),
+            name: "Work".to_string(),
+            collapsed: false,
+        });
+        let mut filed = surface.tabs[0].clone();
+        filed.id = 1;
+        filed.folder = Some("f1".to_string());
+        surface.tabs.push(filed);
+        surface.next_tab_id = 2;
+    }
+
     // Phase 5 §5: the ping URL widens with the routing session + the batch ack,
     // both omitted (bare /ping) for a pre-Phase-5 app, and query-encoded.
     #[test]
@@ -124109,7 +124270,12 @@ mod tests {
             (
                 "web_tab_overflow_open",
                 Box::new(|shell: &mut ShellState| {
-                    shell.web_tab_overflow_open = true;
+                    // Through the affordance, not the raw flag: the dropdown
+                    // exists only while a tab is filed, and the flag is gated on
+                    // exactly that (see
+                    // `a_folder_overflow_dropdown_cannot_outlive_its_affordance`).
+                    seed_web_surface_with_filed_tab(shell, "local://ws");
+                    shell.toggle_web_tab_overflow();
                 }),
             ),
             (
@@ -132631,7 +132797,7 @@ mod tests {
         // the menu's left edge at 1100-90-224 = 786 — 22px INTO the page rect,
         // which in legacy stacking is the clipped slice the user photographed.
         // The band pulls it back inside the rail.
-        let rail = rail_context_menu_band(1100.0, 292.0);
+        let rail = rail_context_menu_band(1100.0, 292.0, 1.0);
         let banded =
             context_menu_placement((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0), Some(rail));
         assert_eq!(banded.left, None);
@@ -160164,7 +160330,7 @@ mod webtabs_menu_switcher_locks {
     fn a_rail_row_menu_is_placed_fully_inside_the_rail_band() {
         let window = (1600.0, 900.0);
         let rail_width = SIDE_RAIL_WIDTH as f64;
-        let band = rail_context_menu_band(window.0, rail_width);
+        let band = rail_context_menu_band(window.0, rail_width, 1.0);
         let width = context_menu_width(Some(band));
 
         // Every column of the rail: hard against the right edge, just past the
@@ -160223,7 +160389,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn a_narrow_rail_narrows_the_menu_in_the_placement_and_in_the_box() {
         let window = (1280.0, 800.0);
-        let band = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64);
+        let band = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         assert_eq!(
             width,
@@ -160268,7 +160434,7 @@ mod webtabs_menu_switcher_locks {
         // A rail with room gets the full design width from the same owner, and
         // an unbanded menu is unchanged.
         assert_eq!(
-            context_menu_width(Some(rail_context_menu_band(window.0, 400.0))),
+            context_menu_width(Some(rail_context_menu_band(window.0, 400.0, 1.0))),
             CONTEXT_MENU_WIDTH_PX,
         );
         assert_eq!(context_menu_width(None), CONTEXT_MENU_WIDTH_PX);
@@ -160281,6 +160447,38 @@ mod webtabs_menu_switcher_locks {
             CONTEXT_MENU_MIN_BAND_WIDTH_PX,
         );
     }
+
+    /// EVERY `ContextMenuOverlay` mount in the product, by the guard that raises
+    /// it, with the band it must name.
+    ///
+    /// ONE list, read by BOTH mount invariants (the band and the CSS-px window
+    /// feed). A mount enumerated by one lock and forgotten by the other is
+    /// exactly how the picker's mount slipped through the first cut: it named no
+    /// band AND was fed physical px, and neither lock could see it.
+    const CONTEXT_MENU_MOUNTS: [(&str, &str); 5] = [
+        (
+            "if let Some(menu) = snapshot.web_tab_context_menu.clone()",
+            "band: Some(context_menu_rail_band),",
+        ),
+        (
+            "if let Some(menu) = snapshot.app_pane_context_menu.clone()",
+            "band: Some(context_menu_rail_band),",
+        ),
+        (
+            "if let Some(row) = context_menu_overlay.clone()",
+            "band: None,",
+        ),
+        (
+            "if let Some(switcher) = snapshot.web_profile_switcher.clone()",
+            "band: match switcher.anchor {",
+        ),
+        // The FIFTH mount — the profile picker's card menu, in its own
+        // component with its own window handle.
+        (
+            "if let Some((menu_profile_name, position)) = profile_menu()",
+            "band: None,",
+        ),
+    ];
 
     /// Which menus are banded is decided AT THE MOUNT, and there is exactly one
     /// derivation of the rail band. A global "is a web surface open" sniff would
@@ -160300,24 +160498,35 @@ mod webtabs_menu_switcher_locks {
              with the rail the user is actually looking at"
         );
 
-        for (guard, expected) in [
-            (
-                "if let Some(menu) = snapshot.web_tab_context_menu.clone()",
-                "band: Some(context_menu_rail_band),",
-            ),
-            (
-                "if let Some(menu) = snapshot.app_pane_context_menu.clone()",
-                "band: Some(context_menu_rail_band),",
-            ),
-            (
-                "if let Some(row) = context_menu_overlay.clone()",
-                "band: None,",
-            ),
-            (
-                "if let Some(switcher) = snapshot.web_profile_switcher.clone()",
-                "band: match switcher.anchor {",
-            ),
-        ] {
+        // ENUMERATION, not four hardcoded guards. Dioxus defaults an
+        // `Option<T>` prop to None, so a mount that names no band COMPILES and
+        // is silently unbanded — the picker's did for the whole first cut.
+        // Counting the mounts and counting the `band:` lines makes a sixth mount
+        // (or a deleted `band:` line) land here instead of on the user.
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.trim() == "ContextMenuOverlay {")
+                .count(),
+            CONTEXT_MENU_MOUNTS.len(),
+            "a ContextMenuOverlay mount this lock does not enumerate is a mount \
+             whose band and whose window units nobody decided"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| {
+                    line.trim_start().starts_with("band:")
+                        // …the prop DECLARATION, not a mount.
+                        && !line.contains("Option<ContextMenuBand>")
+                })
+                .count(),
+            CONTEXT_MENU_MOUNTS.len(),
+            "every mount must SAY what band it is in; a missing `band:` line is \
+             not a decision, it is Dioxus's default"
+        );
+
+        for (guard, expected) in CONTEXT_MENU_MOUNTS {
             let at = product
                 .iter()
                 .position(|line| line.contains(guard))
@@ -160360,7 +160569,17 @@ mod webtabs_menu_switcher_locks {
     /// nothing.
     #[test]
     fn a_strip_dropdown_stashes_the_legacy_page_and_a_rail_menu_does_not() {
-        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        // One loose tab and one FILED tab: the overflow dropdown's affordance
+        // exists only while something is in a folder, and the flag that opens it
+        // is gated on exactly that (see
+        // `a_folder_overflow_dropdown_cannot_outlive_its_affordance`).
+        let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", Some("f1"))]);
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface is live")
+            .folders
+            .push(folder("f1", "Work", false));
         assert!(!shell.has_modal_over_viewport());
 
         shell.open_web_profile_switcher(
@@ -160446,6 +160665,343 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
+    /// A surface with one FILED tab, i.e. the only state in which the classic
+    /// strip draws its folder-overflow affordance. `f1` is a real folder because
+    /// the rest of the tab tree's vocabulary needs one to exist.
+    fn shell_with_filed_tab() -> ShellState {
+        let mut shell = shell_with_surface(&[("https://filed/", Some("f1"))]);
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface is live")
+            .folders
+            .push(folder("f1", "Work", false));
+        shell
+    }
+
+    /// The folder-overflow flag is a `top_modal`, so while it is true EVERY web
+    /// surface is unmapped. Its affordance — the `🗂 n ⌄` button AND the menu —
+    /// renders only inside `(!filed.is_empty())` on the ACTIVE session's surface
+    /// in the classic strip. A flag that outlives that is a browsing area gone
+    /// blank with no visible cause and no visible way back: the button that
+    /// would toggle it off left with the filed tabs.
+    ///
+    /// Every way the affordance can leave the screen, through the production
+    /// verb that takes it away.
+    #[test]
+    fn a_folder_overflow_dropdown_cannot_outlive_its_affordance() {
+        // Sanity: with the affordance on screen the flag means what it says.
+        let mut shell = shell_with_filed_tab();
+        shell.toggle_web_tab_overflow();
+        assert!(shell.has_modal_over_viewport());
+        assert_eq!(shell.top_modal(), Some(TopModal::StripDropdown));
+
+        let filed_tab_id = shell
+            .web_surfaces
+            .get("local://ws")
+            .expect("surface is live")
+            .tabs
+            .iter()
+            .find(|tab| tab.folder.is_some())
+            .expect("one filed tab")
+            .id;
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut ShellState)>)> = vec![
+            // The filed set empties — the button and the menu both vanish with
+            // it, because they only ever rendered inside `!filed.is_empty()`.
+            (
+                "the last filed tab is moved back to the root",
+                Box::new(move |shell: &mut ShellState| {
+                    shell.web_tab_move_to_folder("local://ws", filed_tab_id, None);
+                }),
+            ),
+            (
+                "the last filed tab is closed",
+                Box::new(move |shell: &mut ShellState| {
+                    shell.web_surface_close_tab("local://ws", filed_tab_id);
+                }),
+            ),
+            (
+                "the folder holding it is deleted",
+                Box::new(|shell: &mut ShellState| {
+                    shell.web_tab_delete_folder("local://ws", "f1");
+                }),
+            ),
+            // The strip itself leaves: vertical mode collapses it to
+            // `max-height:0`, so the affordance is not on screen either.
+            (
+                "the tabs move to the rail",
+                Box::new(|shell: &mut ShellState| {
+                    shell.settings.web_surface_vertical_tabs = true;
+                }),
+            ),
+            // The whole overlay leaves.
+            (
+                "the view mode switches away from the terminal",
+                Box::new(|shell: &mut ShellState| {
+                    shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+                }),
+            ),
+            (
+                "the session switches away",
+                Box::new(|shell: &mut ShellState| {
+                    shell.server.show_start_page();
+                }),
+            ),
+            (
+                "the surface is torn down",
+                Box::new(|shell: &mut ShellState| {
+                    shell.close_web_surface("local://ws");
+                }),
+            ),
+        ];
+
+        for (name, take_the_affordance_away) in cases {
+            let mut shell = shell_with_filed_tab();
+            shell.toggle_web_tab_overflow();
+            assert!(shell.has_modal_over_viewport(), "{name}: setup");
+            take_the_affordance_away(&mut shell);
+            assert!(
+                !shell.has_modal_over_viewport(),
+                "{name}: the strip draws no overflow affordance now, so a flag \
+                 still claiming the dropdown is open would unmap every web \
+                 surface with nothing on screen to explain it"
+            );
+            assert_eq!(shell.top_modal(), None, "{name}: …and nothing is on top");
+            assert!(
+                !chrome_transient_over_viewport(&shell.snapshot()),
+                "{name}: …and the render pass agrees — the cover is for a menu \
+                 that is being drawn"
+            );
+            assert!(
+                !shell.snapshot().web_tab_overflow_open,
+                "{name}: …including the snapshot the strip itself renders from"
+            );
+        }
+    }
+
+    /// The one member of the stash set that had no way out but its own button.
+    /// It UNMAPS the page while it is up, so "click somewhere else" has to work
+    /// — and the `ContextMenuOverlay` this could otherwise have reused is
+    /// `pointer-events:none` at its root, i.e. not hit-testable, so it would
+    /// have bought nothing.
+    #[test]
+    fn the_folder_overflow_dropdown_can_be_dismissed_by_clicking_away() {
+        // The MECHANISM the backdrop drives, run: the strip-anchored closer
+        // gives the page back.
+        let mut shell = shell_with_filed_tab();
+        shell.toggle_web_tab_overflow();
+        assert!(shell.has_modal_over_viewport());
+        shell.close_strip_anchored_dropdowns();
+        assert!(
+            !shell.has_modal_over_viewport(),
+            "a click outside must give the browsing area back"
+        );
+
+        // …and the backdrop that carries it EXISTS, is hit-testable, and is that
+        // one call and nothing else. Compared WHOLE: a handler that still names
+        // the verb inside `if false { … }` walks past every substring needle.
+        let product = product_source();
+        assert_eq!(
+            handler_body(&product, "data-ws-tab-overflow-backdrop", "onclick:"),
+            "onclick:move|_|{close_strip_dropdowns(state);},",
+            "the overflow dropdown's click-outside must be the ONE strip closer"
+        );
+        let at = product
+            .iter()
+            .position(|line| line.contains("data-ws-tab-overflow-backdrop"))
+            .expect("the backdrop moved — move this lock with it");
+        let style = product[at..at + 3].join("\n");
+        assert!(
+            style.contains("position:fixed; inset:0;"),
+            "a backdrop that does not cover the window catches no click:\n{style}"
+        );
+        assert!(
+            !style.contains("pointer-events:none"),
+            "…and one that is not hit-testable catches none either — that is \
+             exactly why reusing ContextMenuOverlay's root would not have \
+             worked:\n{style}"
+        );
+        // It sits UNDER the menu it dismisses, or it eats the menu's own clicks.
+        assert!(
+            style.contains("z-index:59;"),
+            "the backdrop must sit under the dropdown's z-index:60:\n{style}"
+        );
+    }
+
+    /// ONE state slot, TWO anchors — and only the STRIP anchor is a modal. An
+    /// Escape (or a backdrop click) aimed at a strip dropdown must not reach
+    /// across and dismiss a RAIL-anchored switcher: that switcher is placed
+    /// inside DOM chrome, never received the key, and has its own closer.
+    #[test]
+    fn dismissing_a_strip_dropdown_leaves_a_rail_anchored_switcher_alone() {
+        let mut shell = shell_with_filed_tab();
+        shell.toggle_web_tab_overflow();
+        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Rail, (1500.0, 40.0));
+        assert!(shell.has_modal_over_viewport(), "the strip dropdown is the modal");
+
+        shell.close_strip_anchored_dropdowns();
+        assert!(
+            shell.web_profile_switcher.is_some(),
+            "the RAIL switcher was never over the viewport and never got the \
+             Escape; closing it here dismisses a menu the user is still using"
+        );
+        assert!(
+            !shell.has_modal_over_viewport(),
+            "…and the strip dropdown that DID get it is gone"
+        );
+
+        // The strip anchor, by contrast, is exactly what this closer is for.
+        let mut shell = shell_with_filed_tab();
+        shell.open_web_profile_switcher(
+            "local://ws",
+            WebProfileSwitcherAnchor::Strip,
+            (820.0, 90.0),
+        );
+        shell.close_strip_anchored_dropdowns();
+        assert!(shell.web_profile_switcher.is_none());
+        assert!(!shell.has_modal_over_viewport());
+
+        // The keyboard route reads the SAME owner, so Escape and the backdrop
+        // cannot scope differently.
+        let product = product_source();
+        let body = function_body(&product, "fn close_strip_dropdowns(");
+        assert!(
+            body.contains("shell.close_strip_anchored_dropdowns();"),
+            "the keyboard dismissal must go through the one strip-scoped \
+             closer:\n{body}"
+        );
+        assert!(
+            !body.contains("shell.close_web_profile_switcher();"),
+            "…and must not close the switcher itself, which is how a rail \
+             anchor got swept up:\n{body}"
+        );
+    }
+
+    /// The rail's band must follow the rail the user is LOOKING at.
+    /// `sidebar_panel_outer_style` puts `width:{rail_width}px` and `zoom:{}%` on
+    /// the SAME element, so the strip of window the rail occupies is the
+    /// product; the menu overlay is mounted at the shell root with no zoom of
+    /// its own, so it is drawn in unzoomed window px. Band to the authored width
+    /// and at the UI-zoom control's 50% floor the band claims twice the rail
+    /// there is — the reported clipping bug, back, from a shipped control.
+    #[test]
+    fn the_rail_band_follows_the_rail_the_user_is_looking_at_under_ui_zoom() {
+        let window = (1600.0, 900.0);
+        let rail_width = SIDE_RAIL_WIDTH as f64;
+        // The floor the zoom control allows: `clamp_zoom_value_for_base(v, 14.0)`
+        // bottoms out at 14 × 0.5 = 7, which `zoom_percent_f32` calls 50%.
+        assert_eq!(clamp_zoom_value_for_base(1.0, 14.0), 7.0);
+        let zoom = ui_zoom_factor(7.0);
+        assert_eq!(zoom, 0.5);
+        let on_screen = rail_width * zoom;
+
+        let band = rail_context_menu_band(window.0, rail_width, zoom);
+        assert_eq!(
+            band.left,
+            window.0 - on_screen,
+            "the band is the rail's ON-SCREEN strip, not its authored width"
+        );
+        let width = context_menu_width(Some(band));
+        for click_x in [window.0 - 4.0, window.0 - 60.0, band.left + 3.0] {
+            let placement = context_menu_placement(
+                (click_x, 300.0),
+                window,
+                (width, CONTEXT_MENU_HEIGHT_PX),
+                Some(band),
+            );
+            let (left, right) = drawn_x(placement, window.0, width);
+            assert!(
+                left >= window.0 - on_screen,
+                "at 50% UI zoom the rail is only {on_screen}px wide on screen; a \
+                 menu raised at x={click_x} starts at {left}, {}px inside the page",
+                window.0 - on_screen - left,
+            );
+            assert!(right <= window.0, "…and still inside the window: {right}");
+        }
+
+        // The regression this lock exists for: the UNZOOMED width, which is what
+        // `snapshot.rail_width` is.
+        let unzoomed = rail_context_menu_band(window.0, rail_width, 1.0);
+        let unzoomed_width = context_menu_width(Some(unzoomed));
+        let (left, _) = drawn_x(
+            context_menu_placement(
+                (window.0 - 60.0, 300.0),
+                window,
+                (unzoomed_width, CONTEXT_MENU_HEIGHT_PX),
+                Some(unzoomed),
+            ),
+            window.0,
+            unzoomed_width,
+        );
+        assert!(
+            left < window.0 - on_screen,
+            "a band derived from the authored rail width puts the menu at {left}, \
+             {}px inside the page rect at 50% zoom",
+            window.0 - on_screen - left,
+        );
+
+        // 100% is the identity, so nothing about the default host moved…
+        assert_eq!(
+            rail_context_menu_band(window.0, rail_width, ui_zoom_factor(14.0)),
+            unzoomed,
+        );
+        // …and a nonsense zoom cannot mint a zero-width band.
+        assert_eq!(rail_context_menu_band(window.0, rail_width, 0.0), unzoomed);
+        assert_eq!(
+            rail_context_menu_band(window.0, rail_width, f64::NAN),
+            unzoomed
+        );
+        // The narrowest rail at the lowest zoom still holds a real menu: 240 ×
+        // 0.5 = 120 on screen, 96 after the margins, which is where the floor is
+        // set — so the floor never bites and the box never crosses the band.
+        let narrowest = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, zoom);
+        let narrow_width = context_menu_width(Some(narrowest));
+        assert_eq!(narrow_width, CONTEXT_MENU_MIN_BAND_WIDTH_PX);
+        let (left, right) = drawn_x(
+            context_menu_placement(
+                (window.0 - 4.0, 300.0),
+                window,
+                (narrow_width, CONTEXT_MENU_HEIGHT_PX),
+                Some(narrowest),
+            ),
+            window.0,
+            narrow_width,
+        );
+        assert!(left >= narrowest.left && right <= narrowest.right);
+        assert!(
+            context_menu_surface_style(
+                palette(UiTheme::ZedDark),
+                "right:12px; top:100px;",
+                "none",
+                narrow_width,
+            )
+            .contains(&format!("max-width:{narrow_width}px;")),
+            "the drawn box follows the squeeze too, or the band bounds nothing"
+        );
+
+        // …and the render site actually hands the zoom over, from the ONE owner.
+        let product = product_source();
+        let at = product
+            .iter()
+            .position(|line| line.contains("let context_menu_rail_band = rail_context_menu_band("))
+            .expect("the render site's band derivation moved — move this lock with it");
+        let call = product[at..at + 5].join("\n");
+        assert!(
+            call.contains("ui_zoom_factor(snapshot.settings.ui_font_size),"),
+            "the band must be derived at the zoom the rail is drawn at:\n{call}"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("ui_zoom_factor("))
+                .count(),
+            2,
+            "one definition + one use; a second derivation of the UI zoom could \
+             disagree with the `zoom:{{}}%` the rail actually carries"
+        );
+    }
+
     /// The placement math is unit-consistent. `desktop.inner_size()` is PHYSICAL
     /// px and a menu's anchor is CSS px; comparing them directly is a silent
     /// no-op at scale 1 and a menu placed off-screen at scale 2.
@@ -160460,7 +161016,7 @@ mod webtabs_menu_switcher_locks {
         // The consequence: on a scale-2 host a click at the CSS right edge still
         // flips to a right anchor and still lands inside the rail.
         let window = window_css_size((2560.0, 1600.0), 2.0);
-        let band = rail_context_menu_band(window.0, SIDE_RAIL_WIDTH as f64);
+        let band = rail_context_menu_band(window.0, SIDE_RAIL_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         let placement = context_menu_placement(
             (window.0 - 8.0, 700.0),
@@ -160482,7 +161038,7 @@ mod webtabs_menu_switcher_locks {
             (window.0 - 8.0, 700.0),
             (2560.0, 1600.0),
             (width, CONTEXT_MENU_HEIGHT_PX),
-            Some(rail_context_menu_band(2560.0, SIDE_RAIL_WIDTH as f64)),
+            Some(rail_context_menu_band(2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
         );
         assert!(
             unconverted.left.expect("no flip happened") > window.0,
@@ -160490,21 +161046,58 @@ mod webtabs_menu_switcher_locks {
              CSS viewport's right edge ({window:?})"
         );
 
-        // One definition + ONE conversion at the render site.
+        // The invariant is "NO placement call site is fed physical px" — NOT
+        // "the file contains exactly one conversion". Counting conversions was
+        // the wrong shape: the picker's mount lives in a different component
+        // with its own window handle, so converting it (the fix) ADDS a
+        // conversion, and a count would have gone red on the repair while
+        // staying green on the divergence. Enumerate the mounts instead, from
+        // the same one list the band lock reads.
         let product = product_source();
-        assert!(
-            product
+        let mut feeds: Vec<String> = Vec::new();
+        for (guard, _) in CONTEXT_MENU_MOUNTS {
+            let at = product
                 .iter()
-                .any(|line| line.contains("let context_menu_window_size = window_css_size(")),
-            "the render site must convert once, in one place"
-        );
+                .position(|line| line.contains(guard))
+                .unwrap_or_else(|| panic!("{guard} moved — move this lock with it"));
+            let feed_line = product[at..]
+                .iter()
+                .find(|line| line.trim_start().starts_with("window_size:"))
+                .unwrap_or_else(|| panic!("{guard}'s mount feeds no window_size"));
+            let feed = feed_line
+                .trim()
+                .trim_start_matches("window_size:")
+                .trim()
+                .trim_end_matches(',')
+                .to_string();
+            assert!(
+                !feed.contains("inner_size"),
+                "{guard}'s mount is fed `{feed}` — `inner_size()` is PHYSICAL px \
+                 and a menu anchors in CSS px"
+            );
+            if !feeds.contains(&feed) {
+                feeds.push(feed);
+            }
+        }
+        assert!(!feeds.is_empty());
+        for feed in &feeds {
+            assert!(
+                product
+                    .iter()
+                    .any(|line| line.contains(&format!("let {feed} = window_css_size("))),
+                "`{feed}` is handed to a placement, so it must be the CSS px the \
+                 ONE conversion produces — not a raw window size"
+            );
+        }
+        // …and every conversion in the file IS one of those bindings (plus the
+        // definition), so a stray third conversion has to justify itself here.
         assert_eq!(
             product
                 .iter()
                 .filter(|line| line.contains("window_css_size("))
                 .count(),
-            2,
-            "a second conversion could disagree about what a window pixel is"
+            feeds.len() + 1,
+            "one definition + exactly one conversion per placement feed: {feeds:?}"
         );
     }
 }
