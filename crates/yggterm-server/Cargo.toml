@@ -8,6 +8,9 @@ license = "GPL-3.0-or-later"
 [features]
 default = []
 ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
+# Cross-crate test doors only (see `remember_live_row_close_for_test`). Turned on
+# by a `[dev-dependencies]` edge, so it is absent from every shipping binary.
+test-support = []
 
 [dependencies]
 anyhow.workspace = true
