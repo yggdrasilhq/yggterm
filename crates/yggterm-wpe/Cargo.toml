@@ -1,0 +1,24 @@
+# DELIBERATELY NOT A WORKSPACE MEMBER (empty [workspace] detaches it).
+#
+# Building this crate requires libwpewebkit-2.0-dev + libwpebackend-fdo-1.0-dev
+# + libGLESv2 on the host. Adding it to the root `members` list would make those
+# packages a hard prerequisite for building ANYTHING in the repo, on every fleet
+# machine — including the GUI host, which has no reason to carry them yet. The
+# crate has no consumers, so nothing is lost by keeping it standalone until
+# increment 2 decides how to gate it (feature flag vs documented prerequisite).
+[workspace]
+
+[package]
+name = "yggterm-wpe"
+version = "0.1.0"
+edition = "2021"
+description = "Headless WPE WebKit engine for yggterm's agent surfaces (Lane A)"
+
+# No dependencies, on purpose. The FFI floor is hand-written: Debian ships no
+# .gir for WPE, so gir-based generation is not executable here, and the surface
+# is small enough that bindgen would cost more than it saves. See
+# docs/spikes/wpe-lane-a/README.md.
+[dependencies]
+
+[profile.release]
+debug = 0
