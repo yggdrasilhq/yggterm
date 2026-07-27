@@ -7009,11 +7009,13 @@ async fn web_surface_native_reconcile_loop(
                 }),
             );
         }
-        // Downloads. A link that saves a file did NOTHING in a surface until
-        // now: WebKit asked the embedder for a destination and no one answered,
-        // so the transfer died unmentioned. Each transition gets a trace row
-        // (the agent-readable record) and a toast on the shell's existing
-        // notification plane (the human one).
+        // Downloads. A link that saves a file used to be INVISIBLE, not inert:
+        // wry's own default handler answered WebKit's `decide-destination` with
+        // a path it guessed itself (`dirs::download_dir()`, or the GUI's CWD
+        // when `XDG_DOWNLOAD_DIR` is unset) under the server's raw suggested
+        // name, and told nobody — no toast, no trace row, nothing to notice.
+        // Each transition now gets a trace row (the agent-readable record) and
+        // a toast on the shell's existing notification plane (the human one).
         //
         // The surface that started a transfer may already be gone by the time
         // it ends — a download outlives its tab on purpose — so an unresolvable

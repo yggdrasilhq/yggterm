@@ -901,11 +901,21 @@ that can see a tab at all.
 
 ## Downloads (2026-07-27)
 
-Until this, a download link **did nothing**: WebKit asked the embedder where to
-put the file (`decide-destination`), nobody answered, and the transfer was
-dropped without a word. That is a hard blocker for using ychrome as the main
-browser, so downloads now have a plane — and, like every other concept here,
-exactly one owner.
+Until this, a download **landed somewhere else, silently** — and getting the
+archaeology right matters, because this file is the record. wry's
+`WebViewAttributes::default()` carried `download_started_handler:
+Some(Box::new(|_, _| true))`, `attach_handlers` registered it on the shared
+context unconditionally, and its `decide-destination` computed the path itself:
+`dirs::download_dir().unwrap_or_else(current_dir)` followed by
+`PathBuf::push(suggested)`. So under a bare compositor, where
+`XDG_DOWNLOAD_DIR` is unset, a downloaded file went to **the GUI's working
+directory**, under whatever name the server asked for (`../../x` walks straight
+out of a `push`), with no toast, no trace row and nothing anywhere to say a
+transfer had happened. The transfer was never dropped on the floor; it was
+**unowned and unannounced**, which is worse, because there was nothing to
+notice. That is a hard blocker for using ychrome as the main browser, so
+downloads now have a plane — and, like every other concept here, exactly one
+owner.
 
 **Where a file goes** is decided by `download_destination` in
 `vendor/dioxus-desktop/src/web_surface.rs` and by nothing else:
@@ -921,7 +931,12 @@ how the GUI was launched), a SANITIZED basename, and a uniquified name.
   would truncate the path at the syscall) go, and an empty result falls back to
   a fixed name rather than to anything derived from the URL.
 - **Uniquify, never overwrite**: `report.pdf`, then `report (1).pdf`. Multi-dot
-  names keep their whole extension (`archive (1).tar.gz`).
+  names keep their whole extension (`archive (1).tar.gz`). "Taken" is
+  `symlink_metadata`, not `Path::exists`: `exists` FOLLOWS links and answers
+  `false` for a **dangling** one, so a symlink planted at
+  `~/Downloads/report.pdf` and pointing outside would have read as a free name
+  and the write would have landed through it — the traversal `sanitize` exists
+  to prevent, arriving by the other door.
 
 **Connected once per `WebContext`, not per webview.** `download-started` is a
 signal on the CONTEXT, and the tabs of one session share a context — connecting
@@ -943,13 +958,34 @@ destination (no `.part` staging), so a transfer that dies halfway leaves a
 truncated file with the right name and the wrong contents — a download
 masquerading as complete.
 
+**The sweep is gated on OWNERSHIP**, and that gate is load-bearing rather than
+decorative. Because `decide-destination` sets `set_allow_overwrite(false)`,
+"the destination already exists" is a first-class WebKit failure — and it is
+exactly the failure in which the file at the destination is *somebody else's*:
+a sibling transfer that decided the same name in the same main-loop turn (the
+uniquifier reads the directory, and WebKit does not create the file until after
+`decide-destination` returns), or any other process that wrote it in that
+window. An unconditional `remove_file` would delete a stranger's file on the one
+path where the failure MEANS a stranger's file. So the engine's own
+`created-destination` signal — which fires when and only when WebKit created the
+file it is about to write — parks a flag, and only that flag lets the sweep run.
+This is the single place in the plane where a bug destroys data instead of
+misplacing it.
+
 **A download outlives its tab.** A running transfer holds its `WebContext`
-(`DownloadInFlight`), which is also what keeps `prune_contexts` — which sweeps
-on `strong_count == 1` — from taking the network process out from under it.
-WebKitGTK has no "detach" verb, so *outliving the surface* is spelled as an
+(`DownloadInFlight`), which is also what keeps the context sweep
+(`retain_held_contexts`, all `prune_contexts` does — an entry survives while
+anyone besides the map holds it) from taking the network process out from under
+it. WebKitGTK has no "detach" verb, so *outliving the surface* is spelled as an
 owner that outlives it. If the engine gives up anyway when the view is
 destroyed, that arrives as `failed` and the partial is swept; the third outcome,
-a truncated file under the full name, is ruled out either way.
+a truncated file under the full name, is ruled out either way. The rule is
+driven, not just scanned: a lock builds the registry entry, drops the tab's
+hold, runs the sweep and finds the engine still standing — then drops the
+transfer's hold and finds the next sweep taking it. What that lock does **not**
+prove is the engine half: no real WebKit transfer has been observed continuing
+past its view's destruction, because that needs a display. It is on the
+live-proof list below.
 
 **What the user and the agent see.** The shell drains the queue each reconcile
 tick and sends every transition to the two planes it already has: a toast
@@ -962,3 +998,18 @@ own: a browser with two places to look is a browser you have to be taught. A
 `server app downloads` listing verb is the natural next step for agents — the
 trace answers "what happened" but not "what is running right now"
 (`web_surface_downloads_in_flight` is the count that verb would report).
+
+**Not live-proven, and here is exactly what that means.** Every DECISION in this
+section is driven end to end by a lock — the destination against a real
+localhost server answering with a real `Content-Disposition`, the directory
+policy by calling `downloads_dir()` itself under a `HOME` the lock owns and an
+`XDG_DOWNLOAD_DIR` decoy it plants, the failure path against a real transfer
+killed mid-flight, the ownership gate and the detach rule against the
+production functions. What has never been observed firing is the ENGINE side:
+`decide-destination`, `created-destination`, `failed` and `finished` need a
+display and a WebKit process, and the wiring that hands our decisions to them is
+locked by anchored source scans over product lines only. Live proof still owed
+on guihost: click a real download link in a surface, screenshot the toast, confirm
+the file and the three trace rows, then kill the network mid-transfer and
+confirm no partial survives — and confirm a transfer continues after its tab is
+closed.
