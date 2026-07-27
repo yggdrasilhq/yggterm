@@ -153,6 +153,10 @@ common server commands:
 }
 
 fn print_server_help() {
+    // The verb list is READ from the client module rather than spelled here:
+    // the agent owns the vocabulary, and a hand-copied list in help text is a
+    // second encoding that drifts silently the first time a verb is added.
+    let wpe_verbs = yggterm_server::wpe_agent::KNOWN_VERBS.join(", ");
     println!(
         "usage:
   yggterm-headless server daemon
@@ -164,6 +168,10 @@ fn print_server_help() {
   yggterm-headless server terminal write <session> (--data <data>|--stdin)
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm-headless server terminal tenants [<session>]
+  yggterm-headless server wpe <verb> [--key value ...]
+    verbs: {wpe_verbs}
+    (the agent owns this list; an unknown verb is refused by the agent itself)
+  yggterm-headless server wpe agent <status|restart|stop>
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
@@ -400,6 +408,70 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// `default_endpoint` (our own version's socket), or a headless binary newer
 /// than the running daemon spawns a rival that cold-restores `server-state.json`
 /// and resurrects closed sessions.
+/// `server wpe <verb> [--key value ...]` and `server wpe agent <action>`.
+///
+/// A thin proxy on purpose. Everything after the verb is passed to the agent as
+/// it was typed (numbers coerced only for the keys the protocol declares
+/// numeric), and the answer is printed verbatim. The CLI is not a second place
+/// where the verb vocabulary lives.
+///
+/// **The exit code is part of the contract**: a typed failure prints its JSON
+/// and exits non-zero, so an agent scripting this can branch on `$?` rather
+/// than re-parsing the outcome it just received.
+fn run_server_wpe(store: &SessionStore, args: &[String]) -> Result<()> {
+    use yggterm_server::wpe_agent::{WpeOutcome, params_from_flags};
+
+    // The plane lives INSIDE the daemon (it owns the agent process), so unlike
+    // the read-only diagnostics this needs a daemon to exist.
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+
+    if args[0] == "agent" {
+        let action = args
+            .get(1)
+            .map(String::as_str)
+            .context("usage: server wpe agent <status|restart|stop>")?;
+        return match yggterm_server::wpe_agent_control(&endpoint, action)? {
+            Ok(report) => {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            Err(outcome) => {
+                print_wpe_failure("agent", &outcome)?;
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let verb = args[0].as_str();
+    let params = params_from_flags(&args[1..]).map_err(|message| anyhow::anyhow!(message))?;
+    match yggterm_server::wpe_verb(&endpoint, verb, params)? {
+        WpeOutcome::Answer { response } => {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        outcome => {
+            print_wpe_failure(verb, &outcome)?;
+            std::process::exit(1);
+        }
+    }
+}
+
+/// One printer for every failure arm, so the shape a script parses does not
+/// depend on which way the plane failed.
+fn print_wpe_failure(verb: &str, outcome: &yggterm_server::wpe_agent::WpeOutcome) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": false,
+            "verb": verb,
+            "summary": outcome.summary(),
+            "failure": outcome,
+        }))?
+    );
+    Ok(())
+}
+
 fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
     yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
 }
@@ -1223,6 +1295,9 @@ fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "wpe" {
+        return run_server_wpe(&store, &args[2..]);
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
         ensure_local_server_ready_for_cli(&store)?;

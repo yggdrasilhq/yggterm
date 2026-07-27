@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **New: assistants can drive a headless web page from the command line.**
+  `yggterm-headless server wpe <verb>` opens a page, navigates it, clicks,
+  types, reads text back and saves a screenshot of it — without a window, a
+  display, or a browser on your screen. It runs in its own process, so a page
+  that crashes cannot take yggterm down with it, and a slow page cannot make
+  yggterm stop answering everything else. `server wpe agent status` says
+  whether that process is running and, if it stopped, why. On a machine that
+  has not been set up for this, every command answers plainly that the piece is
+  not installed and where to get it, rather than failing in a confusing way.
+
 - **New: a session an assistant opens for itself now says so in its name.**
   Until now a scratch session an assistant created was named after the folder
   it opened in, which is exactly how your own terminal in that folder is named

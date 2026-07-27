@@ -2121,6 +2121,23 @@ pub enum ServerRequest {
         #[serde(default)]
         terminal_profile: Option<TerminalIdentityColorProfile>,
     },
+    /// Lane-A: one verb on the WPE agent verb plane, PROXIED.
+    ///
+    /// `verb` and `params` travel to `yggterm-wpe-agent` verbatim. The daemon
+    /// deliberately does not enumerate the vocabulary — the agent owns it (see
+    /// [`crate::wpe_agent`]), so a verb added there works the day it lands and
+    /// an unknown one is refused by the agent in its own words instead of by a
+    /// stale copy living here.
+    Wpe {
+        verb: String,
+        #[serde(default)]
+        params: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Lane-A supervision: `status` | `restart` | `stop` on the agent PROCESS.
+    /// Distinct from the `restart` VERB, which restarts one web view.
+    WpeAgent {
+        action: String,
+    },
     Shutdown,
 }
 
@@ -2226,6 +2243,23 @@ pub enum ServerResponse {
         owner_server_pid: u32,
         target_server_version: Option<String>,
         runtime_keys: Vec<String>,
+    },
+    /// The WPE plane's answer, TYPED. Carried as an outcome rather than
+    /// collapsed into `Ack`/`Error` because the caller's next move differs per
+    /// arm: provision a binary, restart the agent, retry, or fix the request.
+    ///
+    /// ⚠ A NAMED FIELD, not a newtype. `ServerResponse` is internally tagged
+    /// `kind` and so is `WpeOutcome`; a newtype variant flattens the inner tag
+    /// into the outer object, so every answer went out with TWO `kind` fields
+    /// and every client failed to parse it. Nesting under a field is what keeps
+    /// the two tags from colliding — see the wire round-trip lock in
+    /// `tests/wpe_agent_client.rs`.
+    Wpe { outcome: crate::wpe_agent::WpeOutcome },
+    /// What supervision knows about the agent process. Nested for the same
+    /// reason as `Wpe`: a report field named `kind` must never be able to
+    /// shadow the variant tag.
+    WpeAgent {
+        report: crate::wpe_agent::WpeAgentReport,
     },
     Error {
         message: String,
@@ -2377,7 +2411,17 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // changes nothing. The shadow client is the agent's default probe
         // surface, and this verb exists precisely for an agent to audit what
         // its predecessors left running.
-        | ServerRequest::TerminalTenants { .. } => ShadowAccess::Allow,
+        | ServerRequest::TerminalTenants { .. }
+        // The Lane-A WPE plane is HEADLESS and AGENT-ONLY: no PTY, no row, no
+        // shared view, nothing of the user's. It exists FOR agents, and an
+        // agent's surface IS the shadow client — denying it here would make the
+        // plane unreachable by its only audience, which is not a safety
+        // property, just a dead feature. Supervision rides along for the same
+        // reason: a plane a shadow may drive but may never restart is a plane
+        // that dies on its first crash with no way back, which is precisely the
+        // "visible dead surface with no recovery" the doctrine forbids.
+        | ServerRequest::Wpe { .. }
+        | ServerRequest::WpeAgent { .. } => ShadowAccess::Allow,
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
@@ -8095,6 +8139,18 @@ impl DaemonRuntime {
                     }),
                 }
             }
+            // Unreachable by construction: `daemon_request_response` answers the
+            // Lane-A plane BEFORE taking the runtime lock, precisely so a slow
+            // verb cannot hold `DaemonRuntime`. Listed rather than wildcarded so
+            // the exhaustive match still forces every future variant to be
+            // classified, and answered rather than panicked so a future caller
+            // that routes one here learns why instead of killing the request
+            // thread.
+            ServerRequest::Wpe { .. } | ServerRequest::WpeAgent { .. } => ServerResponse::Error {
+                message: "the WPE plane is answered outside the runtime lock; this request \
+                          reached the runtime handler, which means it was routed wrongly"
+                    .to_string(),
+            },
         };
         if trace_request {
             append_trace_event(
@@ -9679,6 +9735,8 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::TerminalTenants { .. } => "terminal_tenants",
         ServerRequest::DeclareSessionTenancy { .. } => "declare_session_tenancy",
+        ServerRequest::Wpe { .. } => "wpe",
+        ServerRequest::WpeAgent { .. } => "wpe_agent",
         ServerRequest::ReorderLiveSessions { .. } => "reorder_live_sessions",
         ServerRequest::RowOrderLedgerReport { .. } => "row_order_ledger_report",
         ServerRequest::AcquireProfileWriteLock { .. } => "acquire_profile_write_lock",
@@ -11202,6 +11260,49 @@ pub fn terminal_tenants(
         ServerResponse::TerminalTenants { rows, degraded } => Ok((rows, degraded)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal tenants response: {:?}", other),
+    }
+}
+
+/// Run one WPE verb through the daemon's agent plane.
+///
+/// The outcome is returned rather than flattened into `Result`: every arm of
+/// [`crate::wpe_agent::WpeOutcome`] is a different instruction to the caller,
+/// and collapsing "this host has no agent binary" into the same `Err` as "the
+/// selector matched three elements" throws away the only useful part.
+pub fn wpe_verb(
+    endpoint: &ServerEndpoint,
+    verb: &str,
+    params: serde_json::Map<String, serde_json::Value>,
+) -> Result<crate::wpe_agent::WpeOutcome> {
+    match send_request(
+        endpoint,
+        &ServerRequest::Wpe {
+            verb: verb.to_string(),
+            params,
+        },
+    )? {
+        ServerResponse::Wpe { outcome } => Ok(outcome),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected wpe response: {:?}", other),
+    }
+}
+
+/// Supervise the agent process: `status` | `restart` | `stop`.
+pub fn wpe_agent_control(
+    endpoint: &ServerEndpoint,
+    action: &str,
+) -> Result<std::result::Result<crate::wpe_agent::WpeAgentReport, crate::wpe_agent::WpeOutcome>> {
+    match send_request(
+        endpoint,
+        &ServerRequest::WpeAgent {
+            action: action.to_string(),
+        },
+    )? {
+        ServerResponse::WpeAgent { report } => Ok(Ok(report)),
+        // A restart that could not bring an agent up.
+        ServerResponse::Wpe { outcome } => Ok(Err(outcome)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected wpe agent response: {:?}", other),
     }
 }
 
@@ -13389,6 +13490,34 @@ fn daemon_queue_remote_machine_refresh(
     response
 }
 
+/// Supervision of the agent PROCESS: `status` | `restart` | `stop`.
+///
+/// `restart` is the ONLY thing that clears a death latch — an agent that dies
+/// stays visibly dead until somebody says otherwise, because an invisible
+/// respawn loop is strictly worse than a visible dead surface.
+fn daemon_wpe_agent_control(action: &str) -> ServerResponse {
+    let mut plane = crate::wpe_agent::plane_lock();
+    match action {
+        "status" => ServerResponse::WpeAgent {
+            report: plane.report(),
+        },
+        "stop" => ServerResponse::WpeAgent {
+            report: plane.stop_agent(),
+        },
+        "restart" => match plane.restart_agent() {
+            Ok(report) => ServerResponse::WpeAgent { report },
+            // A restart that could not bring an agent up answers with the
+            // typed reason (NotProvisioned / StartFailed), not a bare error.
+            Err(outcome) => ServerResponse::Wpe { outcome },
+        },
+        other => ServerResponse::Error {
+            message: format!(
+                "unknown wpe agent action {other:?} (expected status, restart or stop)"
+            ),
+        },
+    }
+}
+
 fn daemon_request_response(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     request: ServerRequest,
@@ -13419,6 +13548,25 @@ fn daemon_request_response(
     }
     if let ServerRequest::RefreshRemoteMachine { machine_key } = request {
         return daemon_queue_remote_machine_refresh(runtime, machine_key, request_name);
+    }
+    // The Lane-A plane is answered WITHOUT the runtime lock, deliberately.
+    //
+    // A WPE verb can honestly take tens of seconds (a page that paints slowly,
+    // a 30s default deadline), and `DaemonRuntime` is held for the whole of
+    // `handle_request` — so routing WPE through it would deafen the daemon to
+    // every other client for the duration. That is not hypothetical: one
+    // `terminal_ensure` held this loop 30.7s on 2026-06-11 and the user watched
+    // a shadow the whole time (see `preserved_owner_unreachable_until_ms`).
+    //
+    // Nothing here needs the runtime: the plane owns a process and a socket,
+    // touches no session, no row and no PTY, and serializes itself by `&mut`.
+    if let ServerRequest::Wpe { verb, params } = request {
+        return ServerResponse::Wpe {
+            outcome: crate::wpe_agent::plane_lock().verb(&verb, params),
+        };
+    }
+    if let ServerRequest::WpeAgent { action } = request {
+        return daemon_wpe_agent_control(&action);
     }
     let mut runtime = lock_daemon_runtime(runtime, "handle_request");
     let home_dir = runtime.store.home_dir().to_path_buf();
@@ -14736,6 +14884,17 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         // response is read instead of false-negatived. See
         // [[finding-hot-update-interrupts-remote-sessions]].
         | ServerRequest::HotRestart { .. } => DAEMON_LONG_REQUEST_IO_TIMEOUT_MS,
+        // A WPE verb carries its OWN deadline, and the daemon cannot answer
+        // before the agent does. So this client's budget is derived from the
+        // SAME `timeout_ms` the agent will honour rather than from a fixed
+        // constant — otherwise a legitimately slow page produces a false "no
+        // answer from the daemon" on a request the daemon is still honestly
+        // waiting on. The arithmetic lives in one place (`wpe_agent`) so the
+        // three deadlines cannot drift into a race.
+        ServerRequest::Wpe { params, .. } => crate::wpe_agent::client_io_timeout_ms(params),
+        // `restart` waits out a full WebKit bring-up, which outlasts the 10s
+        // default; see `agent_control_io_timeout_ms`.
+        ServerRequest::WpeAgent { .. } => crate::wpe_agent::agent_control_io_timeout_ms(),
         _ => DAEMON_REQUEST_IO_TIMEOUT_MS,
     }
 }
@@ -21684,12 +21843,11 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 2.12.17: `ServerRequest`/`ServerResponse` gained
-        // `TerminalTenants` (on-demand per-row tenant accounting) and
-        // `DeclareSessionTenancy` (creator stamp + opt-in ephemerality), the
-        // wire half of the immortal-tenant fix.
-        const STAMPED_AT_VERSION: &str = "2.12.17";
-        const STAMPED_SHAPE_HASH: u64 = 0xb8cbc10a04de7f46;
+        // Re-stamped for 2.12.18: `ServerRequest`/`ServerResponse` gained `Wpe`
+        // (one proxied verb on the Lane-A agent plane) and `WpeAgent`
+        // (supervision of the agent process), the wire half of increment 3.
+        const STAMPED_AT_VERSION: &str = "2.12.18";
+        const STAMPED_SHAPE_HASH: u64 = 0xb77cb20cd04d626f;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
