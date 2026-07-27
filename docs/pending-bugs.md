@@ -2063,22 +2063,39 @@ fix) once the fix is verified live on guihost.
 
 ## Deployed live on guihost, faithful-gesture confirmation pending
 
-- **Middle-click a link in a web surface → new tab (2.10.15, c6542edc).** Root
-  cause found + fixed: the surface's WebView wired no `new_window_req_handler`, so
-  WebKit's `create` signal (middle-click, ctrl/cmd-click, `target="_blank"`,
-  `window.open`) returned a null widget and the link was dropped. Now routed into
-  yggterm's tab model — background tab for middle/ctrl-click, foreground for
-  `window.open`/`_blank`; egress + profile inherited. Unit-tested on the tab-model
-  half. Kept GUI-only (no protocol bump) so it deploys against a running
-  same-version daemon with no changeover. **Deployed to guihost 2026-07-11** via a
-  GUI-only restart (new `~/.local/bin/yggterm` build, SIGTERM+relaunch, the three
-  live daemons untouched — verified same PIDs before/after; new GUI pid confirmed
-  answering app-control). **Still pending:** a FAITHFUL confirmation, which needs a
-  real middle-click — the Xvfb harness is native-surface-blind, app-control clicks
-  never reach a child webview, WebKitGTK blocks synthetic `window.open` (no user
-  gesture), and guihost's Wayland input injection is unreliable (ydotoold). Ask the
-  user to middle-click a link in a ychrome surface; confirm via the
-  `web_surface / new_tab_from_link` trace event.
+- **Middle-click a link in a web surface → new tab.** **The 2.10.15 entry that
+  used to sit here claimed this was fixed; it never was, and the claim survived
+  fifteen releases because nobody could take the faithful pixel that would have
+  falsified it.** What 2.10.15 (c6542edc) actually shipped was the
+  `new_window_req_handler`, which fixes `window.open` and `target="_blank"` — and
+  nothing else. WebKit raises its `create` signal for a NEW_WINDOW_ACTION only, so
+  a middle-click on a plain `<a href>` with no `target` never reached that
+  handler at all: it arrived as an ordinary navigation of the current frame, and
+  with no navigation handler installed on a web surface (`web_surface.rs` never
+  called `with_navigation_handler`, and wry only connected `decide-policy` when
+  one was set) there was nobody listening. The click did NOTHING.
+  - **Now built (lane `lane/dev/middle-click`, GUI-only, no protocol bump):** wry
+    gained a `link_gesture_handler` and the `decide-policy` connection is hoisted
+    above the navigation-handler gate, so the gesture is tested whether or not an
+    embedder wants a navigation policy; a handled gesture answers
+    `webkit_policy_decision_ignore`, which is what keeps the opener page put. The
+    surface host queues a `SurfaceLinkOpen` (no webview — there is none to hand
+    back) and the shell's reconcile loop OPENS the tab with the same
+    `open_command_tab` + `navigate_web_surface_tab` pair the `open_tab` command
+    uses, never the popup-adopt path (whose `effective_url == url` would leave
+    the tab blank). Trace event: `web_surface / new_tab_from_link`. Adjacent
+    one-liner fixed in the same lane: `build_popup_webview` installed no
+    new-window handler, so a `target="_blank"` INSIDE an adopted popup was
+    silently dropped one level down; both doors are now installed on popups too.
+  - **Still pending, and this is the same gap that let the false claim stand:** a
+    FAITHFUL confirmation, which needs a real middle-click. The Xvfb harness is
+    native-surface-blind, app-control clicks never reach a child webview,
+    WebKitGTK blocks synthetic `window.open` (no user gesture), and guihost's
+    Wayland input injection is unreliable (ydotoold). Ask the user to
+    middle-click a link in a ychrome surface; confirm via the
+    `web_surface / new_tab_from_link` trace event. **Do not mark this fixed on
+    unit tests again** — the locks prove the wiring, not that WebKit delivers a
+    middle-click as a `LinkClicked` NavigationAction on this engine build.
 
 ## Diagnostics available
 
