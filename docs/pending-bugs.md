@@ -30,6 +30,19 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★ THE SUPERVISOR DIES WITH ITS CHILD — confirmed twice in one day (jojo,
+  2.12.18, 2026-07-27, ~17:15 and ~23:10).** `kill -TERM <gui-child>` is the
+  documented GUI-swap recipe ("the supervisor relaunches the new binary"), but
+  both times the `yggterm --supervise` parent exited WITH the child and nothing
+  relaunched — the desktop went GUI-less until a manual
+  `setsid yggterm --supervise` with the desktop env re-exported. Round 26
+  recorded the recipe working, so either a regression or the supervisor treats
+  a TERM'd child as deliberate shutdown. Find the supervisor's child-exit
+  policy: a child that exits on SIGTERM during a binary swap must be
+  relaunched; only a supervisor-addressed TERM is a shutdown order. Recovery
+  recipe that works, verbatim: read WAYLAND/XDG/DBUS env off a live desktop
+  process → `setsid ~/.local/bin/yggterm --supervise </dev/null &`.
+
 - **★★ `web ensure` MINTS ONE WEB PROCESS PER TAB, revealed or not (measured on
   jojo, 2.12.17, 2026-07-27 — J8a).** The docs promise "thirty rows, not thirty
   webviews", and the RESTORE path honors it (a never-selected restored tab has
