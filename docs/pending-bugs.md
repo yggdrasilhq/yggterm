@@ -30,6 +30,40 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ REMOTE-CC `session remove` REPORTS `verified:true` WHILE THE REMOTE AGENT
+  KEEPS RUNNING (found + reproduced end-to-end on jojo, 2.12.17, 2026-07-27).**
+  Removing a `remote-cc://` row reaps only the LOCAL ssh client and still
+  answers a clean verified removal:
+  ```
+  verified:true   live_processes:[]   row_still_listed:false
+  reaped_processes:[{"command":"ssh","pid":<local ssh client>}]
+  ```
+  The remote agent process was still alive on the remote host 90 s later, with
+  no row anywhere pointing at it. **Root cause, and it is not a race:** the
+  orphan's parent is the REMOTE host's own `yggterm-headless server daemon` —
+  the remote runtime is deliberately daemon-owned so it survives ssh drops, so
+  the local remove never asks the remote daemon to close its runtime. The remote
+  daemon is left holding a live runtime for a row that no longer exists.
+  **Why this one matters:** the teardown-honesty contract says a report must be
+  verified or honestly refuse, and the LOCAL path already implements it
+  perfectly — a local agent row removal names every pid it killed (shell, agent,
+  and the agent's own MCP children) and a local shell removal names the tenant
+  it reaped. The remote path simply does not cross the machine boundary, yet
+  claims the same verification. Fix: proxy the close to the owning remote daemon
+  and verify there, or refuse with a named reason when the remote half cannot be
+  confirmed. **Never report `verified:true` for work done on only one side of an
+  ssh hop.** Repro + evidence: jojo queue §DONE "J7 step 4 / Defect B".
+
+- **`server app open` on a REMOVED row times out instead of naming the reason
+  (minor, jojo 2.12.17, 2026-07-27).** Opening a deleted session path correctly
+  does NOT resurrect the row and correctly leaves the active session untouched
+  (no select/activate events fire), but the CLI answers
+  `Error: timed out waiting for app open to settle …`. Compare `web ensure` on
+  the same class of dead path, which is exemplary: `accepted:false`,
+  `reason:"session_closed"`, `row_close_remembered:true`, plus prose naming why
+  and what to do instead. Make `app open` refuse in that shape rather than
+  time out.
+
 - **★★ AGENT-SPAWNED TENANTS INSIDE DAEMON-OWNED ROWS ARE IMMORTAL — the leak
   class behind recurring "mystery heat" (convicted 2026-07-27, user-spotted —
   ⏳ FIXED IN-TREE AT 2.12.17, LIVE VERIFICATION OWED).**
