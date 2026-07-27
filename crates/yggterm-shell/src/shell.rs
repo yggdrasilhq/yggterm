@@ -1292,6 +1292,13 @@ struct WebSurfaceTab {
     /// both tab homes. A tab with no webview yet (restored, never activated) is
     /// never loading — it is a URL in the tree until it is selected.
     loading: bool,
+    /// This tab's page theme color, verbatim as the page declared it (its
+    /// `<meta name="theme-color">`, else its painted body background). Written
+    /// from the ENGINE by the native-surface reconciler — the only place that
+    /// hears the page — and read by the render to paint the seam around the
+    /// page. `None` = the page has said nothing yet. Not persisted: it is a
+    /// property of the loaded document, not of the tab.
+    theme_color: Option<String>,
     /// Wall-clock ms after which an AGENT's claim on this surface lapses
     /// (`web lease --ttl`). A backgrounded surface is normally reaped once the
     /// background hold expires; a lease keeps it alive so long-running
@@ -3075,6 +3082,14 @@ struct WebSurfaceOverlayView {
     /// tab strip, address bar and page frame in it — this is what stops a dark
     /// terminal theme from framing a light page in a near-black border.
     chrome_appearance: WebChromeAppearance,
+    /// The ACTIVE tab's page theme color, exactly as the page declared it —
+    /// `<meta name="theme-color">`, else its painted body background — reported
+    /// by the engine layer and recorded by the reconciler. `None` = the page
+    /// has said nothing yet.
+    ///
+    /// The seam behind and beside the page is painted from this
+    /// ([`web_surface_seam_css`]), so a dark site is never framed in white.
+    page_theme_color: Option<String>,
     /// The open find bar (Ctrl+F), or `None` for no bar.
     find: Option<WebFindBarView>,
 }
@@ -3354,6 +3369,10 @@ struct AppliedWebSurface {
     /// observing in-page navigation (address bar follow, tab title, history).
     page_url: String,
     page_title: String,
+    /// Last engine-reported page THEME COLOR — the poll baseline for the seam.
+    /// Same edge discipline as `loading`: only a change is written through, so
+    /// a page sitting still costs no re-render.
+    page_theme_color: Option<String>,
     /// Which incarnation of this (session, tab) the webview is. Bumped on every
     /// CREATE, never reused, published in the handle so an agent can tell that
     /// the surface it addressed was destroyed and rebuilt underneath it (F3).
@@ -3408,6 +3427,7 @@ impl AppliedWebSurface {
             // light would stick on — it starts off instead.)
             loading: want_visible,
             page_title: String::new(),
+            page_theme_color: None,
             generation: next_web_surface_generation(),
         }
     }
@@ -3441,6 +3461,7 @@ impl AppliedWebSurface {
             ever_revealed: !background,
             loading: true,
             page_title: String::new(),
+            page_theme_color: None,
             generation: next_web_surface_generation(),
         }
     }
@@ -4375,6 +4396,7 @@ mod web_surface_reclaim_locks {
             loading: false,
             page_url: String::new(),
             page_title: String::new(),
+            page_theme_color: None,
             generation: 1,
         }
     }
@@ -7687,48 +7709,297 @@ fn under_glass_paint_holes_css(holes: &[(i32, i32, i32, i32)]) -> Option<String>
     ))
 }
 
+/// ONE auto-hide chrome edge's claim on the viewport, as sampled from the DOM.
+///
+/// `px` is how far in from that edge the chrome currently reaches, and it is
+/// ZERO whenever the chrome is not revealed — a collapsed hover sensor claims
+/// nothing. That is the exact-fit rule: with no chrome revealed, the page rect
+/// IS the viewport rect and there is no strip of shell anywhere around it.
+///
+/// `pinned` is the ergonomics rule. A claim held by a GESTURE (a context menu
+/// on a sidebar row, a rename field, a resize drag, KeyTips) is going to stand
+/// for as long as the user works in it, so it may legitimately RESIZE the page.
+/// A claim that is merely a HOVER is transient by construction, and resizing a
+/// native webview for it costs a full WebKit relayout of the page every time
+/// the pointer brushes an edge — which is what the user saw as the whole site
+/// re-flowing on hover. A transient claim TRANSLATES the page instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebSurfaceChromeClaim {
+    px: i32,
+    pinned: bool,
+}
+
+impl WebSurfaceChromeClaim {
+    /// Parse one `[px, pinned]` pair as the geometry eval reports it. A
+    /// negative or absent width is no claim — never a nudge in the wrong
+    /// direction.
+    fn from_sample(sample: Option<&Value>) -> Self {
+        let Some(entry) = sample.and_then(Value::as_array) else {
+            return Self::default();
+        };
+        Self {
+            px: entry
+                .first()
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, i32::MAX as i64) as i32,
+            pinned: entry.get(1).and_then(Value::as_i64).unwrap_or(0) != 0,
+        }
+    }
+    /// The part of this claim that RESIZES the page (pinned chrome only).
+    fn resize_px(self) -> i32 {
+        if self.pinned { self.px } else { 0 }
+    }
+    /// The part of this claim that TRANSLATES the page (transient reveals).
+    fn translate_px(self) -> i32 {
+        if self.pinned { 0 } else { self.px }
+    }
+}
+
+/// What the shell's chrome is claiming of the viewport this tick, per edge.
+///
+/// The bottom edge has no auto-hide chrome, so there is no bottom claim — and
+/// no placeholder field for one, because a field nothing writes is a second
+/// answer waiting to diverge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebSurfaceChromeClaims {
+    top: WebSurfaceChromeClaim,
+    left: WebSurfaceChromeClaim,
+    right: WebSurfaceChromeClaim,
+}
+
+impl WebSurfaceChromeClaims {
+    fn from_sample(sample: Option<&Value>) -> Self {
+        let Some(map) = sample else {
+            return Self::default();
+        };
+        Self {
+            top: WebSurfaceChromeClaim::from_sample(map.get("top")),
+            left: WebSurfaceChromeClaim::from_sample(map.get("left")),
+            right: WebSurfaceChromeClaim::from_sample(map.get("right")),
+        }
+    }
+    /// FULLSCREEN SUPPRESSES EVERY CLAIM.
+    ///
+    /// A page on the whole screen owns every pixel of the window, including
+    /// the ones the titlebar reveal, the sidebar reveal and the rail reveal
+    /// would otherwise take — and including the reveal SENSORS, since a claim
+    /// of zero is what stops the page being clamped away from an edge. This is
+    /// the difference between "the video got bigger" and fullscreen: WebKit's
+    /// own fullscreen only ever fills the rect we gave the surface, so if any
+    /// chrome still claims, the borders survive into fullscreen (the third
+    /// symptom).
+    fn under_fullscreen(self, fullscreen: bool) -> Self {
+        if fullscreen { Self::default() } else { self }
+    }
+    /// Is anything claimed at all? The revealed-nothing state.
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Where a web surface's native webview actually goes.
+///
+/// `raw` is the `[data-ws-page]` placeholder rect exactly as the DOM laid it
+/// out — docked, in-flow chrome has already shrunk it there, which is why a
+/// docked sidebar needs no claim. `viewport` is the window's CSS px size.
+///
+/// Three rules, in order:
+///
+/// 1. **Fullscreen is the whole window.** Not the placeholder, not the
+///    placeholder grown by the claims — the window. The DOM under a fullscreen
+///    page is irrelevant; the page owns the screen.
+/// 2. **Pinned claims RESIZE.** The rect is clamped inside them, the page
+///    reflows once, and it stays that way for as long as the gesture holds.
+/// 3. **Transient claims TRANSLATE.** Same width, same height, moved origin —
+///    so the far edge crops off-window for the duration of the hover and
+///    WebKit is never asked to re-lay-out the document. Translating rather
+///    than resizing is the whole reveal-ergonomics fix.
+fn web_surface_place_page_rect(
+    raw: (i32, i32, i32, i32),
+    viewport: (i32, i32),
+    claims: WebSurfaceChromeClaims,
+    fullscreen: bool,
+) -> (i32, i32, i32, i32) {
+    // Rule 1 — fullscreen. The claims are suppressed FIRST and the base rect
+    // becomes the window, so the two rules below run against an empty claim set
+    // and are no-ops by construction: there is no path on which a revealed
+    // titlebar or rail can move a fullscreen page.
+    let claims = claims.under_fullscreen(fullscreen);
+    let base = if fullscreen {
+        (0, 0, viewport.0.max(1), viewport.1.max(1))
+    } else {
+        raw
+    };
+    if claims.is_empty() {
+        // EXACT FIT. Nothing is revealed, so the page IS the laid-out rect,
+        // arithmetic untouched — a page with no chrome over it has no inset,
+        // no strip and no border anywhere.
+        return (base.0, base.1, base.2.max(1), base.3.max(1));
+    }
+    let (mut left, mut top, mut width, mut height) = base;
+    // Rule 2 — pinned chrome resizes.
+    let resize_top = claims.top.resize_px();
+    if top < resize_top {
+        height -= resize_top - top;
+        top = resize_top;
+    }
+    let resize_left = claims.left.resize_px();
+    if left < resize_left {
+        width -= resize_left - left;
+        left = resize_left;
+    }
+    let resize_right_edge = viewport.0 - claims.right.resize_px();
+    if left + width > resize_right_edge {
+        width = resize_right_edge - left;
+    }
+    // Rule 3 — transient reveals translate. Size is untouched BY CONSTRUCTION:
+    // these two lines may only ever move the origin.
+    top += claims.top.translate_px();
+    left += claims.left.translate_px() - claims.right.translate_px();
+    (left, top, width.max(1), height.max(1))
+}
+
+/// The seam fallback: the color the shell paints beside a page that has not
+/// said what color it is yet.
+///
+/// DARK, deliberately and permanently. A white seam is the bright frame around
+/// a dark site the user photographed; a dark seam against a light page reads
+/// as a window edge, while a white seam against a dark page reads as damage.
+/// Recorded in DESIGN.md under the web-surface seam rule.
+const WEB_SURFACE_SEAM_FALLBACK_RGB: (u8, u8, u8) = (0x11, 0x12, 0x15);
+
+/// The seam color: what the shell paints anywhere it can be seen beside a page.
+///
+/// "Anywhere" is the viewport frame wrapper, the page placeholder itself, and
+/// the native fill under a webview that has not painted its first frame — one
+/// color for all three, because the user reads them as one surface and any
+/// disagreement between them IS the border they reported.
+///
+/// The PAGE decides. `page_theme_color` is what the page declared (its
+/// `<meta name="theme-color">`, else its painted body background), reported by
+/// the engine layer verbatim; if it parses, it is used exactly. Only when the
+/// page has said NOTHING YET — the first frames of a fresh tab, which is
+/// precisely when a seam is most visible — does the fallback apply.
+fn web_surface_seam_rgb(page_theme_color: Option<&str>) -> (u8, u8, u8) {
+    page_theme_color
+        .and_then(parse_css_rgb_color)
+        .unwrap_or(WEB_SURFACE_SEAM_FALLBACK_RGB)
+}
+
+/// The same answer as CSS text, for the render pass.
+fn web_surface_seam_css(page_theme_color: Option<&str>) -> String {
+    let (r, g, b) = web_surface_seam_rgb(page_theme_color);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Parse the two CSS color shapes a page can hand back: `#rgb`/`#rrggbb` (what
+/// a `theme-color` meta carries) and `rgb()`/`rgba()` (what `getComputedStyle`
+/// returns). Anything else — a named color, `oklch()`, a gradient — is not a
+/// flat fill this can honestly reproduce, and returns `None` so the caller
+/// falls back rather than guessing.
+fn parse_css_rgb_color(value: &str) -> Option<(u8, u8, u8)> {
+    let value = value.trim();
+    if let Some(hex) = value.strip_prefix('#') {
+        let hex = hex.trim();
+        let byte = |slice: &str| u8::from_str_radix(slice, 16).ok();
+        return match hex.len() {
+            3 | 4 => {
+                let mut digits = hex.chars();
+                let mut next = || {
+                    let digit = digits.next()?;
+                    let pair: String = [digit, digit].iter().collect();
+                    byte(&pair)
+                };
+                Some((next()?, next()?, next()?))
+            }
+            6 | 8 => Some((
+                byte(hex.get(0..2)?)?,
+                byte(hex.get(2..4)?)?,
+                byte(hex.get(4..6)?)?,
+            )),
+            _ => None,
+        };
+    }
+    let lowered = value.to_ascii_lowercase();
+    let body = lowered
+        .strip_prefix("rgba(")
+        .or_else(|| lowered.strip_prefix("rgb("))?
+        .strip_suffix(')')?;
+    let mut parts = body
+        .split([',', '/', ' '])
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let mut channel = || -> Option<u8> {
+        let part = parts.next()?;
+        let value: f64 = if let Some(percent) = part.strip_suffix('%') {
+            percent.parse::<f64>().ok()? * 255.0 / 100.0
+        } else {
+            part.parse::<f64>().ok()?
+        };
+        Some(value.round().clamp(0.0, 255.0) as u8)
+    };
+    Some((channel()?, channel()?, channel()?))
+}
+
 /// The reconciler's per-tick geometry + visibility oracle, as one script:
 /// page/pinned rects (placement AND under-glass input holes ride the same
 /// sample — the SSOT rule), `data-covers-web-surface` rects, and the
 /// under-glass transparency-chain maintenance. Tripwire-tested.
 const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
-    // LEGACY stacking only: the auto-hiding titlebar is a floating
-    // DOM overlay, and a legacy native webview paints above ALL
-    // DOM — so the webview must be CLAMPED below the titlebar's
-    // live bottom edge (the reveal dips the page). UNDER GLASS the
-    // chrome draws OVER the page, so the page is never clamped:
-    // a titlebar reveal is an input-region cover update
-    // (data-covers-web-surface + the synchronous cover push), not
-    // a geometry change — the [data-ws-page] rect must be
-    // IDENTICAL before/during/after a reveal (F.1 acceptance 2).
+    // THIS EVAL SAMPLES; IT DOES NOT DECIDE. It reports the raw
+    // laid-out rects plus what each auto-hide chrome edge is
+    // CLAIMING, and `web_surface_place_page_rect` (Rust) turns that
+    // into where the native webview goes. One owner for the
+    // placement rule, in a function a test can drive — the clamp
+    // that used to live here could only be judged by eye.
+    //
+    // A claim is ZERO unless the chrome is actually REVEALED. The
+    // clamp this replaces measured the COLLAPSED element too, so a
+    // 6px hover sensor on each edge stood permanently between the
+    // page and the window: the reserved strip in the user's
+    // screenshot. Collapsed chrome claims nothing and the page owns
+    // its own edges; the reveal over a page comes from the vendored
+    // host's edge-motion observer, not from a reserved strip.
+    //
+    // UNDER GLASS nothing is ever claimed: the chrome draws OVER
+    // the page, so a reveal is an input-region cover update
+    // (data-covers-web-surface + the synchronous cover push), not a
+    // geometry change — the [data-ws-page] rect must be IDENTICAL
+    // before/during/after a reveal (F.1 acceptance 2).
     const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';
-    const tb = underGlass ? null : document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
-    const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
-    // Same treatment for the auto-hidden SIDEBARS: a revealed overlay sidebar is
-    // floating DOM, so a legacy native webview must be clamped BESIDE it or the
-    // reveal is invisible over a page. Collapsed, only the 6px sensor is claimed
-    // — which is what keeps the sensor hoverable over a web surface at all.
-    const clampSide = (selector, edge) => {
-        if (underGlass) { return 0; }
+    const claim = (selector, revealedAttr, revealedValue, pinAttr, measure) => {
+        if (underGlass) { return [0, 0]; }
         const el = document.querySelector(selector);
-        if (!el) { return 0; }
+        if (!el) { return [0, 0]; }
+        if (el.getAttribute(revealedAttr) !== revealedValue) { return [0, 0]; }
         const r = el.getBoundingClientRect();
-        if (r.width < 1) { return 0; }
-        return edge === 'left'
-            ? Math.max(0, Math.round(r.right))
-            : Math.max(0, Math.round(window.innerWidth - r.left));
+        if (r.width < 1 || r.height < 1) { return [0, 0]; }
+        return [
+            Math.max(0, Math.round(measure(r))),
+            el.getAttribute(pinAttr) === '1' ? 1 : 0,
+        ];
     };
-    const clampLeft = clampSide('[data-sidebar-auto-hide="true"]', 'left');
-    const clampRight = clampSide('[data-yggui-side-rail-auto-hide="1"]', 'right');
-    const clampBox = (r) => {
-        const top = Math.max(Math.round(r.top), clampTop);
-        const left = Math.max(Math.round(r.left), clampLeft);
-        const right = Math.min(Math.round(r.right), Math.round(window.innerWidth) - clampRight);
-        return [left, top, right - left, Math.round(r.bottom) - top];
+    // [px, pinned] per edge. `pinned` = the reveal is held by a GESTURE
+    // (context menu, rename, drag, resize, KeyTips) rather than by the
+    // pointer merely resting on the edge — Rust resizes for the first
+    // and translates for the second.
+    const chrome = {
+        top: claim('[data-yggterm-titlebar="1"]', 'data-titlebar-revealed', 'true',
+                   'data-titlebar-autohide-pin', (r) => r.bottom),
+        left: claim('[data-sidebar-auto-hide="true"]', 'data-sidebar-autohide-revealed', 'true',
+                    'data-sidebar-autohide-pin', (r) => r.right),
+        right: claim('[data-yggui-side-rail-auto-hide="1"]', 'data-yggui-side-rail-autohide-revealed', '1',
+                     'data-yggui-side-rail-autohide-pin', (r) => window.innerWidth - r.left),
+    };
+    const rawBox = (r) => {
+        const left = Math.round(r.left);
+        const top = Math.round(r.top);
+        return [left, top, Math.round(r.right) - left, Math.round(r.bottom) - top];
     };
     const out = {};
     for (const el of document.querySelectorAll('[data-ws-page]')) {
-        const [left, top, width, height] = clampBox(el.getBoundingClientRect());
+        const [left, top, width, height] = rawBox(el.getBoundingClientRect());
         if (width > 1 && height > 1) {
             out[el.getAttribute('data-ws-page') || ''] = [left, top, width, height];
         }
@@ -7738,7 +8009,7 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // webview regardless of the surface's active tab.
     const pinned = [];
     for (const el of document.querySelectorAll('[data-ws-pinned-session]')) {
-        const box = clampBox(el.getBoundingClientRect());
+        const box = rawBox(el.getBoundingClientRect());
         if (box[2] > 1 && box[3] > 1) {
             pinned.push([
                 el.getAttribute('data-ws-pinned-session') || '',
@@ -7768,7 +8039,13 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // under-glass hole is F.0.1 work: render-time conditional styling from
     // a snapshot flag + a single owner for app background painting. This
     // eval SAMPLES ONLY.
-    dioxus.send({pages: out, pinned: pinned, covers: covers});
+    dioxus.send({
+        pages: out,
+        pinned: pinned,
+        covers: covers,
+        chrome: chrome,
+        viewport: [Math.round(window.innerWidth), Math.round(window.innerHeight)],
+    });
 })();"#;
 
 /// F.1 synchronous cover push (T8). The tick's geometry eval samples covers
@@ -7861,25 +8138,54 @@ async fn web_surface_cover_push_loop(desktop: dioxus::desktop::DesktopContext) {
     }
 }
 
-/// F.1 reveal trigger, shell half (T9). The vendored host observes pointer
-/// motion on page webviews and calls `window.__yggtermGlassEdgeMotion` when
-/// the pointer enters the window's top edge zone — the zone the shell's own
-/// 6px hover sensor can no longer see once the titlebar clamp is gone (the
-/// hole owns that input). Each firing runs the SAME reveal the titlebar's
-/// mouseenter runs; collapse still happens via the titlebar's own
-/// mouseleave (the revealed titlebar is a cover, so the shell owns its
-/// pointer stream).
+/// Which auto-hidden edge an engine-reported page-edge motion belongs to.
+///
+/// The name the vendored host sends, resolved once. An unknown name is `None`
+/// rather than a default edge: forwarding a right-edge motion to the titlebar
+/// would flash chrome the user never went near.
+fn web_surface_reveal_edge_from_name(name: &str) -> Option<SidebarEdge> {
+    match name {
+        "left" => Some(SidebarEdge::Left),
+        "right" => Some(SidebarEdge::Right),
+        _ => None,
+    }
+}
+
+/// Reveal trigger, shell half. The vendored host observes pointer motion on
+/// page webviews and calls `window.__yggtermGlassEdgeMotion('<edge>')` when the
+/// pointer enters a window edge zone — the zones the shell's own 6px hover
+/// sensors cannot see, because the page now runs flush to the viewport and sits
+/// over every one of them.
+///
+/// All THREE auto-hidden edges, not just the titlebar: exact fit removed the
+/// reserved strip that used to keep the left and right sensors uncovered, so
+/// without this a hidden tree or rail would be unreachable over any page.
+/// Each firing runs the SAME reveal the panel's own `mouseenter` runs; collapse
+/// still happens via the panel's `mouseleave` (a revealed panel is a cover, so
+/// the shell owns its pointer stream from then on).
 async fn web_surface_edge_motion_reveal_loop(
     state: Signal<ShellState>,
-    hovered: Signal<bool>,
-    lingering: Signal<bool>,
-    linger_generation: Signal<u64>,
+    titlebar: AutoHideSignals,
+    left_sidebar: AutoHideSignals,
+    right_rail: AutoHideSignals,
 ) {
     loop {
-        let mut eval = document::eval("window.__yggtermGlassEdgeMotion = () => dioxus.send(1);");
-        while eval.recv::<i32>().await.is_ok() {
-            if state.peek().settings.auto_hide_titlebar {
-                autohide_reveal(hovered, lingering, linger_generation);
+        let mut eval =
+            document::eval("window.__yggtermGlassEdgeMotion = (edge) => dioxus.send(edge);");
+        while let Ok(edge) = eval.recv::<String>().await {
+            match web_surface_reveal_edge_from_name(&edge) {
+                // The tree and the rail are auto-hidden exactly when they are
+                // closed — there is no separate setting to consult, so the
+                // reveal is unconditional and the panel's own mode decides
+                // whether anything visible happens.
+                Some(SidebarEdge::Left) => left_sidebar.reveal(),
+                Some(SidebarEdge::Right) => right_rail.reveal(),
+                // The titlebar auto-hides only when the user asked it to.
+                None => {
+                    if state.peek().settings.auto_hide_titlebar {
+                        titlebar.reveal();
+                    }
+                }
             }
         }
         // Channel died (webview reload): rebind the hook.
@@ -8140,14 +8446,25 @@ async fn web_surface_native_reconcile_loop(
                 json!({ "active": under_glass }),
             );
         }
-        if under_glass {
-            let backdrop = terminal_theme_by_name(&state.peek().effective_terminal_theme_name())
-                .and_then(|theme| yggui::hex_to_rgb(&theme.palette.background));
-            if let Some(rgb) = backdrop
-                && last_backdrop != Some(rgb)
-            {
-                last_backdrop = Some(rgb);
-                desktop.set_web_surface_backdrop_color(rgb.0, rgb.1, rgb.2);
+        // The native fill under every surface container — what shows in the
+        // instant between a webview being placed and its first frame landing.
+        //
+        // It used to be armed ONLY under glass, and painted the terminal
+        // theme's background. Legacy stacking left it unset, which is why a
+        // freshly-placed page flashed the GTK default (white) before painting.
+        // Now it is the SEAM, on both stackings: the ACTIVE web surface's page
+        // theme colour when there is one, else the seam fallback (dark), so
+        // there is no moment and no stacking mode in which white backs a page.
+        {
+            let backdrop = web_surface_seam_rgb(
+                state
+                    .peek()
+                    .active_web_surface_page_theme_color()
+                    .as_deref(),
+            );
+            if last_backdrop != Some(backdrop) {
+                last_backdrop = Some(backdrop);
+                desktop.set_web_surface_backdrop_color(backdrop.0, backdrop.1, backdrop.2);
             }
         }
         // Desired: (session, active_tab,
@@ -8426,10 +8743,12 @@ async fn web_surface_native_reconcile_loop(
         // Geometry + visibility oracle: the placeholder rect of every web
         // surface page area currently laid out (CSS px == wry logical px).
         let mut eval = document::eval(WEB_SURFACE_GEOMETRY_EVAL_JS);
-        let (rects, pinned_rects, cover_rects): (
+        let (rects, pinned_rects, cover_rects, chrome_claims, viewport_size): (
             HashMap<String, (i32, i32, i32, i32)>,
             HashMap<(String, u64), (i32, i32, i32, i32)>,
             Vec<(i32, i32, i32, i32)>,
+            WebSurfaceChromeClaims,
+            (i32, i32),
         ) = match tokio::time::timeout(Duration::from_millis(1500), eval.recv::<Value>()).await {
             Ok(Ok(value)) => {
                 let parse_rect = |rect: &Value| -> Option<(i32, i32, i32, i32)> {
@@ -8481,7 +8800,19 @@ async fn web_surface_native_reconcile_loop(
                             .collect()
                     })
                     .unwrap_or_default();
-                (pages, pinned, covers)
+                // What the shell's own chrome is claiming this tick, and the
+                // window it is claiming it OF. The placement rule reads both;
+                // the eval decides neither.
+                let chrome = WebSurfaceChromeClaims::from_sample(value.get("chrome"));
+                let axis = |index: usize| {
+                    value
+                        .get("viewport")
+                        .and_then(Value::as_array)
+                        .and_then(|size| size.get(index))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0) as i32
+                };
+                (pages, pinned, covers, chrome, (axis(0), axis(1)))
             }
             _ => {
                 // Eval blind (webview busy / not yet ready): backgrounded-session
@@ -8495,19 +8826,39 @@ async fn web_surface_native_reconcile_loop(
                 continue;
             }
         };
+        // WHICH surface, if any, WebKit has taken into element fullscreen —
+        // the engine's own answer (`enter-fullscreen`/`leave-fullscreen`), read
+        // once per tick. Nothing else in the shell may decide this.
+        let fullscreen_native_id = desktop.web_surface_fullscreen();
         for (session_path, active_tab, tabs, policy_gate) in desired {
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
+                // Is THIS tab the one on the whole screen? A fullscreen surface
+                // exists by construction (WebKit only fullscreens a live view),
+                // so an un-applied tab is never it.
+                let tab_fullscreen = fullscreen_native_id.is_some()
+                    && applied.get(&key).map(|entry| entry.native_id) == fullscreen_native_id;
                 // Where THIS tab's webview paints: a split pane PINNED to it
                 // wins (split-tabs); else the surface's own page area iff the
-                // tab is active ([[campaign-libyggterm]] Phase 3).
+                // tab is active ([[campaign-libyggterm]] Phase 3) — and then
+                // the placement rule turns that raw rect into the applied one
+                // (chrome claims resize or translate it; fullscreen replaces it
+                // with the whole window).
                 let place_rect = web_surface_tab_place_rect(
                     pinned_rects.get(&(session_path.clone(), tab_id)).copied(),
                     rect,
                     tab_id,
                     active_tab,
-                );
+                )
+                .map(|raw| {
+                    web_surface_place_page_rect(
+                        raw,
+                        viewport_size,
+                        chrome_claims,
+                        tab_fullscreen,
+                    )
+                });
                 // Visibility is gated on ShellState's active-visible authority in
                 // addition to the (starvable) DOM rect: a stale rect returned for
                 // a session that is no longer active-visible must not keep its
@@ -8635,6 +8986,21 @@ async fn web_surface_native_reconcile_loop(
                             let mut writable = state;
                             writable.with_mut(|shell| {
                                 shell.set_web_tab_loading(&key.0, key.1, page_loading);
+                            });
+                        }
+                        // The PAGE's own colour, from the page's own report
+                        // (see the engine layer's theme-color shim). Same edge
+                        // discipline as the loading light: a page sitting still
+                        // costs no re-render, and a page that changes its
+                        // theme-color mid-session (SPAs do, YouTube included)
+                        // repaints the seam without a reload.
+                        let page_theme_color =
+                            desktop.web_surface_page_theme_color(entry.native_id);
+                        if entry.page_theme_color != page_theme_color {
+                            entry.page_theme_color = page_theme_color.clone();
+                            let mut writable = state;
+                            writable.with_mut(|shell| {
+                                shell.set_web_tab_theme_color(&key.0, key.1, page_theme_color);
                             });
                         }
                         if url_changed || title_changed {
@@ -14147,6 +14513,7 @@ impl ShellState {
             profile: profile.clone(),
             folder: None,
             loading: true,
+            theme_color: None,
             lease_until_ms: None,
             script_opened: false,
         };
@@ -14207,6 +14574,7 @@ impl ShellState {
                 // A restored tab has no webview until it is selected, so nothing
                 // is loading in it.
                 loading: false,
+                theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
             });
@@ -14317,6 +14685,7 @@ impl ShellState {
             profile: "default".to_string(),
             folder: None,
             loading: false,
+            theme_color: None,
             lease_until_ms: None,
             script_opened: false,
         };
@@ -15381,6 +15750,7 @@ impl ShellState {
                 profile,
                 folder: None,
                 loading: false,
+                theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
             });
@@ -15457,6 +15827,7 @@ impl ShellState {
             folder: None,
             // WebKit began the load the moment it made the view.
             loading: true,
+            theme_color: None,
             lease_until_ms: None,
             // A script opened it, so a script may close it.
             script_opened: true,
@@ -16041,6 +16412,9 @@ impl ShellState {
                 session_path,
                 &web_surface_tab_host_label(&active.url),
             ),
+            // The ACTIVE tab's own colour: switching tabs repaints the seam,
+            // because the seam belongs to the page on screen and to no other.
+            page_theme_color: active.theme_color.clone(),
             find: surface.find.as_ref().map(|find| WebFindBarView {
                 query: find.query.clone(),
                 label: find.label(),
@@ -16058,6 +16432,23 @@ impl ShellState {
             && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
             tab.loading = loading;
+        }
+    }
+    /// Write the PAGE's declared theme color onto a tab. Twin of
+    /// [`ShellState::set_web_tab_loading`] and the ONE writer of
+    /// `WebSurfaceTab::theme_color`: the reconciler calls it on a real edge
+    /// (the engine reported a different color), so the seam can never disagree
+    /// with the page.
+    fn set_web_tab_theme_color(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        theme_color: Option<String>,
+    ) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.theme_color = theme_color;
         }
     }
     /// Ask for a vertical-tabs mode change — the entry point for every control
@@ -16196,6 +16587,18 @@ impl ShellState {
     fn active_web_surface_has_folders(&self) -> bool {
         self.active_web_surface()
             .is_some_and(|surface| !surface.folders.is_empty())
+    }
+    /// The page theme colour of the tab the user is looking at, if a web
+    /// surface is what the active session is showing and its page has declared
+    /// one. The native backdrop under every surface container is painted from
+    /// it — the same seam the DOM containers take, so the two cannot disagree.
+    fn active_web_surface_page_theme_color(&self) -> Option<String> {
+        let surface = self.active_web_surface()?;
+        surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == surface.active_tab)
+            .and_then(|tab| tab.theme_color.clone())
     }
     /// The active session, if a web surface is what it is showing. Every tab-tree
     /// mutation routes through this: the tree edits the surface the user is
@@ -36120,6 +36523,12 @@ impl AutoHideSignals {
         } else {
             self.handle_mouse_leave();
         }
+    }
+    /// Is keyboard focus inside the panel right now? A focused field is a
+    /// standing reason to keep the panel open, exactly like a gesture pin —
+    /// which is why the placement rule counts it as one.
+    fn focus_within_active(self) -> bool {
+        (self.focus_within)()
     }
     fn revealed(self, auto_hide_enabled: bool, pinned: bool) -> bool {
         autohide_revealed(
@@ -57214,6 +57623,7 @@ mod web_do_verb_tests {
                 loading: false,
                 page_url: String::new(),
                 page_title: String::new(),
+                page_theme_color: None,
                 generation: native_id,
             }
         }
@@ -69942,9 +70352,9 @@ fn app() -> Element {
     if !web_surface_edge_motion_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(web_surface_edge_motion_reveal_loop(
             state,
-            titlebar_autohide_hovered,
-            titlebar_autohide_lingering,
-            titlebar_autohide_linger_generation,
+            titlebar_autohide,
+            left_sidebar_autohide,
+            right_rail_autohide,
         ));
     }
     let keytip_alt_tap_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
@@ -71476,11 +71886,20 @@ fn app() -> Element {
     // with no settings toggle of its own (user direction 2026-07-21). Closed
     // means "reveal on hover, over the viewport", not "gone".
     let left_sidebar_auto_hide = !snapshot.sidebar_open;
+    // Split out so the DOM can say WHY the panel is open: a gesture pin (this)
+    // or a hover. `focus_within` counts as a pin for the same reason the
+    // gestures do — a settings field being typed into is not a hover.
+    let left_sidebar_pinned = (sidebar_autohide_pinned(&snapshot)
+        || left_sidebar_autohide.focus_within_active())
+        && left_sidebar_auto_hide;
     let left_sidebar_revealed = left_sidebar_autohide.revealed(
         left_sidebar_auto_hide,
         sidebar_autohide_pinned(&snapshot),
     ) && left_sidebar_auto_hide;
     let right_rail_auto_hide = snapshot.right_panel_mode == RightPanelMode::Hidden;
+    let right_rail_pinned = (rail_autohide_pinned(&snapshot)
+        || right_rail_autohide.focus_within_active())
+        && right_rail_auto_hide;
     let right_rail_revealed = right_rail_autohide
         .revealed(right_rail_auto_hide, rail_autohide_pinned(&snapshot))
         && right_rail_auto_hide;
@@ -72206,6 +72625,13 @@ fn app() -> Element {
                         "data-yggterm-titlebar": "1",
                         "data-titlebar-auto-hide-enabled": if titlebar_auto_hide_enabled { "true" } else { "false" },
                         "data-titlebar-revealed": if titlebar_revealed { "true" } else { "false" },
+                        // Is the reveal held by a GESTURE (a titlebar menu, a
+                        // focused search field, KeyTips) rather than by the
+                        // pointer resting on the edge? A pinned reveal is going
+                        // to stand, so a page beside it may RESIZE; a transient
+                        // hover only ever TRANSLATES the page
+                        // (`web_surface_place_page_rect`).
+                        "data-titlebar-autohide-pin": if titlebar_reveal_pinned { "1" } else { "0" },
                         "data-titlebar-hover-active": if titlebar_autohide_hovered() { "true" } else { "false" },
                         // F.1: a REVEALED auto-hide titlebar floats over the
                         // page hole, so it declares itself a cover — the
@@ -72620,6 +73046,7 @@ fn app() -> Element {
                         snapshot: sidebar_snapshot,
                         autohide: left_sidebar_autohide,
                         autohide_revealed: left_sidebar_revealed,
+                        autohide_pinned: left_sidebar_pinned,
                         on_prev_search_row: move |_| {
                             if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
                                 spawn_open_session_row(state, row);
@@ -72857,6 +73284,7 @@ fn app() -> Element {
                             snapshot: metadata_snapshot,
                             autohide: right_rail_autohide,
                             autohide_revealed: right_rail_revealed,
+                            autohide_pinned: right_rail_pinned,
                             on_start_rail_resize: move |client_x: f64| {
                                 state.with_mut(|shell| shell.start_rail_resize(client_x))
                             },
@@ -74490,6 +74918,10 @@ fn Sidebar(
     /// Is the hidden sidebar currently revealed as an overlay? Computed by the
     /// shell so the web-surface cover/clamp sees the same answer the DOM does.
     autohide_revealed: bool,
+    /// Is that reveal PINNED by a gesture (`sidebar_autohide_pinned`) rather
+    /// than by the pointer alone? Stamped into the DOM so the page-placement
+    /// rule can tell a standing claim from a transient one.
+    autohide_pinned: bool,
     rename_depth: Option<usize>,
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
@@ -74578,6 +75010,11 @@ fn Sidebar(
             "data-sidebar-open": if snapshot.sidebar_open { "true" } else { "false" },
             "data-sidebar-auto-hide": if auto_hide { "true" } else { "false" },
             "data-sidebar-autohide-revealed": if auto_hide && autohide_revealed { "true" } else { "false" },
+            // Reveal held by a GESTURE (row context menu, rename field, drag,
+            // resize drag, KeyTips) rather than by hover — the page beside a
+            // pinned reveal may RESIZE, a hover only TRANSLATES it
+            // (`web_surface_place_page_rect`).
+            "data-sidebar-autohide-pin": if auto_hide && autohide_pinned { "1" } else { "0" },
             // A revealed overlay sidebar floats over the page hole, so it
             // declares itself a cover — under glass the shell's input region
             // gets its rect back, and the legacy native-webview path clamps the
@@ -89059,18 +89496,42 @@ fn TerminalCanvas(
         .as_ref()
         .map(|colors| colors.chrome_fg.clone())
         .unwrap_or_else(|| theme.foreground.clone());
-    // The viewport frame (shell fill + host chrome) follows the surface too, so a
-    // web page is not framed in the dark terminal theme. A terminal is unchanged
-    // (`web_chrome` is None → these keep `theme.background`).
+    // THE SEAM: every container that can ever be seen BEHIND or BESIDE the page
+    // — the frame wrapper, the page placeholder, the fill under a webview that
+    // has not painted yet — is this one colour, taken from the page itself.
+    // A single owner, because two of them disagreeing IS the border.
+    let web_surface_seam = web_surface_seam_css(
+        web_surface_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.page_theme_color.as_deref()),
+    );
+    // The viewport frame (shell fill + host chrome) follows the PAGE, not the
+    // app's light/dark chrome appearance: `frame_bg` for Light is `#f4f4f2`,
+    // which is the near-white strip the user photographed around a dark
+    // YouTube. The CHROME (`web_chrome_bg`/`web_chrome_fg` — tab strip,
+    // omnibox) keeps the appearance, because it carries text that has to stay
+    // legible; only the surfaces that BACK THE PAGE take the seam. A terminal
+    // is unchanged (`web_chrome` is None → these keep `theme.background`).
     let terminal_shell_background = if web_chrome.is_some() {
-        web_frame_bg.clone()
+        web_surface_seam.clone()
     } else {
         terminal_shell_background
+    };
+    // ...and the frame wrapper's ROUNDED corners go with it. A legacy native
+    // webview cannot be corner-clipped, so a radius here only ever cut four
+    // wedges of shell out from under a square page — visible as light corners
+    // on a dark site. Exact fit means the wrapper is the page's rectangle.
+    // Same key set in both branches (the Dioxus style-key trap): this is one
+    // value substituted into an unchanged format string.
+    let terminal_shell_radius = if web_chrome.is_some() {
+        "0px".to_string()
+    } else {
+        terminal_shell_radius
     };
     let terminal_host_chrome = if web_chrome.is_some() {
         format!(
             "border-radius:{}; box-shadow:none !important; outline:none !important; background:{};",
-            terminal_frame.host_radius, web_frame_bg,
+            terminal_frame.host_radius, web_surface_seam,
         )
     } else {
         terminal_host_chrome
@@ -89177,7 +89638,9 @@ fn TerminalCanvas(
                          --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-muted:{}; --yggterm-term-cursor-text:{}; \
                          --yggterm-term-font-smoothing:{}; --yggterm-term-moz-font-smoothing:{};",
                         terminal_shell_padding,
-                        web_frame_bg,
+                        // The seam, not the chrome fill: this host box is what
+                        // shows through wherever the page has not painted.
+                        web_surface_seam,
                         terminal_host_pointer_events,
                         terminal_host_visibility,
                         terminal_host_chrome,
@@ -89253,7 +89716,10 @@ fn TerminalCanvas(
                         "data-ws-overlay": "1",
                         style: format!(
                             "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
-                            terminal_web_overlay_inset, web_frame_bg, terminal_web_overlay_radius,
+                            // The seam again: this panel's own fill is only ever
+                            // visible in the page area, so it must be the page's
+                            // colour and not the chrome's.
+                            terminal_web_overlay_inset, web_surface_seam, terminal_web_overlay_radius,
                         ),
                         // The tab loading dot's blink, declared where it is drawn.
                         style { "{STATUS_DOT_BLINK_CSS}" }
@@ -89629,20 +90095,34 @@ fn TerminalCanvas(
                         // surface paints; no rect (session switched away, start
                         // page, other view mode) hides the surface.
                         div {
-                            // LEGACY: inset + rounded to MATCH the terminal
-                            // viewport frame (`.yggterm-term-focused`: margin
-                            // 4px, radius 10px). A legacy native child webview
-                            // paints the full container box and cannot be
-                            // clipped by CSS border-radius, so the margin is
-                            // what tucks its square corners inside the frame
-                            // ([[campaign-libyggterm]] #10 — the interim
-                            // inset). UNDER GLASS the margin is cleared
-                            // (WEB_UNDER_GLASS_CSS margin:0): the page fills
-                            // the frame edge-to-edge and the app-background
-                            // layer's ROUNDED paint hole molds its corners
-                            // (WEB_UNDER_GLASS_CORNER_RADIUS_PX) — the F.1
-                            // molded frame, no inset gap.
-                            style: "flex:1 1 auto; min-height:0; margin:4px; border-radius:10px; background:#ffffff;",
+                            // EXACT FIT. No margin, no radius, no white.
+                            //
+                            // This div used to carry a 4px margin and a 10px
+                            // radius to MATCH the terminal viewport frame, plus
+                            // a `#ffffff` fill. All three were visible damage on
+                            // a web surface and none of them bought anything: a
+                            // legacy native child webview paints its full
+                            // container box and CANNOT be clipped by CSS
+                            // border-radius, so the radius was a fiction at the
+                            // page's corners and the margin was a 4px strip of
+                            // shell around every page — the white border the
+                            // user photographed on YouTube, together with the
+                            // white fill showing through wherever the page had
+                            // not painted. The terminal frame is a TERMINAL
+                            // affordance (DESIGN.md, web-surface seam rule): a
+                            // browser page runs flush to the viewport edges,
+                            // exactly as the overlay panel around it already
+                            // does (`terminal_web_overlay_inset` = 0px).
+                            //
+                            // The fill is the SEAM colour — the page's own
+                            // declared theme colour, dark when the page has not
+                            // said yet — so the one moment this rect is visible
+                            // (before the webview's first frame) is a moment
+                            // that looks like the page, not like a hole.
+                            style: format!(
+                                "flex:1 1 auto; min-height:0; margin:0; border-radius:0; background:{};",
+                                web_surface_seam,
+                            ),
                             "data-ws-page": "{web_surface_session_path}",
                         }
                     }
@@ -107704,6 +108184,11 @@ fn RightRail(
     autohide: AutoHideSignals,
     /// Is the hidden rail currently revealed as an overlay?
     autohide_revealed: bool,
+    /// Is that reveal PINNED by something standing (a modal the rail launched,
+    /// KeyTips, keyboard focus in it) rather than by hover? Stamped into the
+    /// DOM so the page-placement rule can tell a standing claim from a
+    /// transient one.
+    autohide_pinned: bool,
     /// Begin a rail-width drag (client x at grab). Mirrors the tree's resize.
     on_start_rail_resize: EventHandler<f64>,
     on_endpoint_change: EventHandler<String>,
@@ -107830,6 +108315,7 @@ fn RightRail(
             visible: visible,
             auto_hide: !visible,
             revealed: autohide_revealed && !visible,
+            pinned: autohide_pinned && !visible,
             outer_style: outer_style,
             content_style: content_style,
             reveal: rail_reveal,
@@ -118746,6 +119232,7 @@ mod tests {
                     profile: "default".to_string(),
                     folder: None,
                     loading: false,
+                    theme_color: None,
                     lease_until_ms: None,
                     script_opened: false,
                 }],
@@ -124734,20 +125221,23 @@ mod tests {
             "the geometry eval SAMPLES ONLY — no DOM mutation, ever \
              (incident-f0-transparency-chain-app-wide-break)"
         );
-        // F.1: the clamp is DEAD under glass (the titlebar floats over the
-        // page as a cover; the page rect must not move on reveal) and ALIVE
-        // in legacy stacking (dipping the page is the only visible reveal
-        // there). Both halves are load-bearing — losing the underGlass gate
-        // re-introduces the reveal reflow; losing clampTop breaks legacy.
+        // F.1: chrome CLAIMS are dead under glass (the chrome floats over the
+        // page as a cover; the page rect must not move on reveal) and alive in
+        // legacy stacking (moving the page is the only visible reveal there).
+        // Both halves are load-bearing — losing the underGlass gate
+        // re-introduces the reveal reflow; losing the claim breaks legacy.
         assert!(
             js.contains("const underGlass = document.documentElement.getAttribute('data-under-glass') === '1';"),
-            "the clamp must be gated on the under-glass stamp"
+            "the claims must be gated on the under-glass stamp"
         );
         assert!(
-            js.contains("underGlass ? null"),
-            "under glass the titlebar is never sampled for a clamp"
+            js.contains("if (underGlass) { return [0, 0]; }"),
+            "under glass no chrome edge may claim anything"
         );
-        assert!(js.contains("clampTop"), "legacy keeps the clamp");
+        assert!(
+            js.contains("chrome: chrome,"),
+            "legacy keeps the claims, and they ride the same send as the rects"
+        );
     }
 
     // F.1 T8 tripwire: the synchronous cover observer must sample the SAME
@@ -126185,20 +126675,22 @@ mod tests {
         assert!(rail_autohide_pinned_flags(true, false));
         assert!(rail_autohide_pinned_flags(false, true));
     }
-    // A revealed overlay is floating DOM, and a LEGACY native webview paints
-    // above all DOM — so the page must be clamped beside it or the reveal is
-    // invisible over a ychrome page. Collapsed, only the sensor is claimed.
+    // The geometry eval SAMPLES both auto-hide edges and the titlebar, and
+    // reports each as a `[px, pinned]` claim keyed on the element's REVEALED
+    // stamp. Not behavioural (see `docs/agent-field-guide.md` §7.1 on source
+    // scans) — it exists so that moving the sample brings someone here. What
+    // the claims MEAN is locked by `web_surface_immersion_locks`, which runs
+    // the code.
     #[test]
-    fn web_surface_geometry_eval_clamps_both_sidebar_edges() {
+    fn web_surface_geometry_eval_samples_every_chrome_edge() {
         for needle in [
-            "'[data-sidebar-auto-hide=\"true\"]'",
-            "'[data-yggui-side-rail-auto-hide=\"1\"]'",
-            "const clampLeft",
-            "const clampRight",
+            "'[data-yggterm-titlebar=\"1\"]', 'data-titlebar-revealed'",
+            "'[data-sidebar-auto-hide=\"true\"]', 'data-sidebar-autohide-revealed'",
+            "'[data-yggui-side-rail-auto-hide=\"1\"]', 'data-yggui-side-rail-autohide-revealed'",
         ] {
             assert!(
                 WEB_SURFACE_GEOMETRY_EVAL_JS.contains(needle),
-                "geometry eval lost its sidebar clamp: {needle}"
+                "geometry eval lost a chrome-edge sample: {needle}"
             );
         }
     }
@@ -162894,5 +163386,287 @@ mod menu_dismissal_locks {
                 );
             });
         }
+    }
+}
+
+/// LOCKS for the page-as-a-first-class-citizen rules (lane E, immersion).
+///
+/// The three symptoms these hold shut, in the user's words: a dark page framed
+/// by white strips; the whole page re-flowing every time a hover reveals a
+/// panel; and player fullscreen keeping the borders.
+///
+/// The placement rule is a pure function BECAUSE the loop that calls it holds a
+/// live `DesktopContext` and cannot be entered by a test (field guide §7.1). So
+/// every claim below is made by running `web_surface_place_page_rect` — the
+/// same function the reconciler calls, with the same argument shapes the
+/// reconciler builds — and the residual wiring (which sample feeds it, what the
+/// render paints, which signals arm fullscreen) is scanned over PRODUCT lines
+/// only, with a self-check that the scan is not reading this module.
+#[cfg(test)]
+mod web_surface_immersion_locks {
+    use super::*;
+
+    /// The window, and a page laid out to fill it exactly.
+    const VIEWPORT: (i32, i32) = (1920, 1080);
+    const FULL_PAGE: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+
+    fn claim(px: i32, pinned: bool) -> WebSurfaceChromeClaim {
+        WebSurfaceChromeClaim { px, pinned }
+    }
+
+    fn shell_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shell.rs"))
+            .expect("shell.rs is readable")
+    }
+
+    fn product(source: &str) -> String {
+        yggterm_core::agent_cli::product_lines(source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // The trap every scanning lock in this repo must disarm: if `product_lines`
+    // stopped skipping this module, the needles below would be satisfied by
+    // their own text and the scans would be worthless.
+    #[test]
+    fn the_scan_is_not_reading_this_test_module() {
+        let scanned = product(&shell_source());
+        assert!(
+            !scanned.contains("the_scan_is_not_reading_this_test_module"),
+            "product_lines stopped skipping this module — every scan below now self-satisfies"
+        );
+    }
+
+    // -- LOCK 1 -- EXACT FIT: revealed nothing => the page rect IS the viewport
+    // rect. No margin, no strip, no reserved sensor lane on either edge.
+    #[test]
+    fn with_no_chrome_revealed_the_page_is_the_whole_viewport() {
+        let placed = web_surface_place_page_rect(
+            FULL_PAGE,
+            VIEWPORT,
+            WebSurfaceChromeClaims::default(),
+            false,
+        );
+        assert_eq!(
+            placed, FULL_PAGE,
+            "a page with nothing revealed over it must occupy the entire viewport"
+        );
+    }
+
+    // The specific regression: the old clamp measured the COLLAPSED auto-hide
+    // elements, so each 6px hover sensor stood permanently between page and
+    // window. A collapsed edge reports a ZERO claim, and a zero claim must move
+    // nothing whether it calls itself pinned or not.
+    #[test]
+    fn a_collapsed_hover_sensor_reserves_no_strip_on_either_edge() {
+        for edge in ["left", "right", "top"] {
+            let mut claims = WebSurfaceChromeClaims::default();
+            match edge {
+                "left" => claims.left = claim(0, false),
+                "right" => claims.right = claim(0, false),
+                _ => claims.top = claim(0, true),
+            }
+            assert_eq!(
+                web_surface_place_page_rect(FULL_PAGE, VIEWPORT, claims, false),
+                FULL_PAGE,
+                "the collapsed {edge} sensor reserved a strip"
+            );
+        }
+    }
+
+    // -- LOCK 2 -- REVEAL ERGONOMICS: a TRANSIENT reveal translates the page.
+    // Same width, same height, moved origin - WebKit is never asked to re-lay
+    // out the document for a hover.
+    #[test]
+    fn a_transient_reveal_translates_the_page_and_never_resizes_it() {
+        for (edge, expected) in [
+            ("left", (320, 0, 1920, 1080)),
+            ("right", (-320, 0, 1920, 1080)),
+            ("top", (0, 40, 1920, 1080)),
+        ] {
+            let mut claims = WebSurfaceChromeClaims::default();
+            match edge {
+                "left" => claims.left = claim(320, false),
+                "right" => claims.right = claim(320, false),
+                _ => claims.top = claim(40, false),
+            }
+            let placed = web_surface_place_page_rect(FULL_PAGE, VIEWPORT, claims, false);
+            assert_eq!(
+                (placed.2, placed.3),
+                (FULL_PAGE.2, FULL_PAGE.3),
+                "the {edge} hover RESIZED the page - that is the full relayout the user reported"
+            );
+            assert_eq!(
+                placed, expected,
+                "the {edge} hover did not translate the page by its claim"
+            );
+        }
+    }
+
+    // The counterpart, and the reason the distinction exists at all: a claim
+    // held by a GESTURE is going to stand, so it may legitimately resize.
+    #[test]
+    fn a_pinned_reveal_resizes_the_page_rather_than_cropping_it() {
+        let claims = WebSurfaceChromeClaims {
+            left: claim(320, true),
+            ..WebSurfaceChromeClaims::default()
+        };
+        assert_eq!(
+            web_surface_place_page_rect(FULL_PAGE, VIEWPORT, claims, false),
+            (320, 0, 1600, 1080),
+            "a pinned sidebar must resize the page, not translate it off-window"
+        );
+        let claims = WebSurfaceChromeClaims {
+            right: claim(320, true),
+            top: claim(40, true),
+            ..WebSurfaceChromeClaims::default()
+        };
+        assert_eq!(
+            web_surface_place_page_rect(FULL_PAGE, VIEWPORT, claims, false),
+            (0, 40, 1600, 1040),
+            "pinned top + right chrome must resize both axes"
+        );
+    }
+
+    // -- LOCK 3 -- TRUE FULLSCREEN: every chrome claim is suppressed, and the
+    // page takes the ENTIRE window - not the placeholder, not the placeholder
+    // grown by the claims. This is exactly the third symptom: WebKit's own
+    // fullscreen fills only the rect we gave the surface, so a surviving claim
+    // survives into fullscreen as a border.
+    #[test]
+    fn fullscreen_suppresses_every_chrome_claim() {
+        let everything = WebSurfaceChromeClaims {
+            top: claim(40, false),
+            left: claim(320, true),
+            right: claim(280, false),
+        };
+        assert_eq!(
+            everything.under_fullscreen(true),
+            WebSurfaceChromeClaims::default(),
+            "fullscreen must suppress EVERY chrome claim"
+        );
+        assert!(everything.under_fullscreen(true).is_empty());
+        assert_eq!(
+            everything.under_fullscreen(false),
+            everything,
+            "suppression may not leak into the non-fullscreen case"
+        );
+    }
+
+    #[test]
+    fn a_fullscreen_page_fills_the_window_whatever_the_chrome_claims() {
+        let everything = WebSurfaceChromeClaims {
+            top: claim(40, false),
+            left: claim(320, true),
+            right: claim(280, true),
+        };
+        // A page laid out in a corner of the viewport (split pane, inset
+        // placeholder) still takes the whole window in fullscreen.
+        for raw in [FULL_PAGE, (400, 120, 900, 500), (0, 40, 1600, 1040)] {
+            assert_eq!(
+                web_surface_place_page_rect(raw, VIEWPORT, everything, true),
+                (0, 0, VIEWPORT.0, VIEWPORT.1),
+                "fullscreen did not fill the window from raw rect {raw:?}"
+            );
+        }
+    }
+
+    // -- LOCK 4 -- LEAVING fullscreen restores the EXACT prior rect. The rect
+    // is recomputed from the same sample every tick, so "restore" is the
+    // property that the fullscreen pass is not destructive: the inputs that
+    // placed the page before it went fullscreen place it identically after.
+    #[test]
+    fn leaving_fullscreen_restores_the_exact_prior_rect() {
+        let claims = WebSurfaceChromeClaims {
+            top: claim(40, false),
+            left: claim(320, true),
+            ..WebSurfaceChromeClaims::default()
+        };
+        let raw = (0, 0, 1920, 1080);
+        let before = web_surface_place_page_rect(raw, VIEWPORT, claims, false);
+        let during = web_surface_place_page_rect(raw, VIEWPORT, claims, true);
+        let after = web_surface_place_page_rect(raw, VIEWPORT, claims, false);
+        assert_ne!(before, during, "fullscreen must actually change the rect");
+        assert_eq!(
+            after, before,
+            "leaving fullscreen must restore the exact prior rect"
+        );
+    }
+
+    // -- LOCK 5 -- SEAM: the colour behind and beside a page comes from the
+    // PAGE, and the fallback is DARK. No white may ever back a page.
+    #[test]
+    fn the_seam_is_the_pages_own_colour_with_a_dark_fallback() {
+        // Declared theme-color, verbatim.
+        assert_eq!(web_surface_seam_rgb(Some("#0f0f0f")), (0x0f, 0x0f, 0x0f));
+        assert_eq!(web_surface_seam_rgb(Some("#282828ff")), (0x28, 0x28, 0x28));
+        assert_eq!(web_surface_seam_rgb(Some("#abc")), (0xaa, 0xbb, 0xcc));
+        // A computed body background, as `getComputedStyle` hands it back.
+        assert_eq!(web_surface_seam_rgb(Some("rgb(15, 15, 15)")), (15, 15, 15));
+        assert_eq!(
+            web_surface_seam_rgb(Some("rgba(255, 255, 255, 0.5)")),
+            (255, 255, 255)
+        );
+        // A light page gets its own light colour - the rule is "the page
+        // decides", not "always dark".
+        assert_eq!(web_surface_seam_css(Some("#ffffff")), "#ffffff");
+        // Nothing said yet, or something this cannot honestly reproduce.
+        for unsaid in [None, Some("oklch(0.2 0 0)"), Some("rebeccapurple"), Some("")] {
+            let (r, g, b) = web_surface_seam_rgb(unsaid);
+            assert_eq!(
+                (r, g, b),
+                WEB_SURFACE_SEAM_FALLBACK_RGB,
+                "an undeclared theme colour must fall back to the seam fallback"
+            );
+            // THE claim: the fallback is DARK. Mutating it to white reddens
+            // here, which is what "no white may ever back a page" means for the
+            // one case the page has not answered.
+            let luminance = 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
+            assert!(
+                luminance < 64.0,
+                "the seam fallback is not dark ({r},{g},{b} -> luminance {luminance:.1}) - a light \
+                 fallback is the white frame around a dark site"
+            );
+        }
+    }
+
+    // -- WIRING -- the residual seams a pure function cannot reach.
+    //
+    // Each needle is a PRODUCTION call site, so reverting the wiring reddens
+    // this even though the pure functions above still pass. Not behavioural on
+    // its own; it is the "the call site moved, come look" tripwire.
+    #[test]
+    fn the_placement_rule_is_wired_to_the_reconciler_and_the_render() {
+        let scanned = product(&shell_source());
+        for needle in [
+            // The reconciler places every tab through the rule...
+            "web_surface_place_page_rect(",
+            // ...with the engine's own fullscreen answer, not a shell guess.
+            "let fullscreen_native_id = desktop.web_surface_fullscreen();",
+            // ...and the claims the eval sampled, not a re-derivation.
+            "WebSurfaceChromeClaims::from_sample(value.get(\"chrome\"))",
+            // The page placeholder is exact-fit: no margin, no radius, and its
+            // fill is the seam rather than white.
+            "\"flex:1 1 auto; min-height:0; margin:0; border-radius:0; background:{};\",",
+            // The seam has ONE owner, and the native backdrop shares it.
+            "let web_surface_seam = web_surface_seam_css(",
+            "let backdrop = web_surface_seam_rgb(",
+            // The pin stamps the claim sampler reads.
+            "\"data-titlebar-autohide-pin\": if titlebar_reveal_pinned",
+            "\"data-sidebar-autohide-pin\": if auto_hide && autohide_pinned",
+        ] {
+            assert!(
+                scanned.contains(needle),
+                "the immersion wiring lost its call site: {needle}"
+            );
+        }
+        // And what must NOT be there any more: the placeholder's white fill and
+        // its 4px inset were the border itself.
+        assert!(
+            !scanned.contains("margin:4px; border-radius:10px; background:#ffffff;"),
+            "the page placeholder's inset + white fill came back"
+        );
     }
 }

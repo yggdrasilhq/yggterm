@@ -54,6 +54,12 @@ pub fn SideRailShell(
     visible: bool,
     auto_hide: bool,
     revealed: bool,
+    /// Is the reveal held by something STANDING (a modal the rail launched,
+    /// KeyTips, keyboard focus inside it) rather than by the pointer resting on
+    /// the edge? Stamped into the DOM as `data-yggui-side-rail-autohide-pin`,
+    /// which is what lets a host place a native surface beside the rail without
+    /// reflowing it for every hover.
+    pinned: bool,
     /// Fully-formed outer + content styles, authored by the host so the left
     /// tree and the right rail share ONE geometry helper (`sidebar_panel_*`).
     /// The host emits a FIXED property key set across every mode; the rail must
@@ -74,6 +80,7 @@ pub fn SideRailShell(
             "data-yggui-side-rail-visible": if visible { "1" } else { "0" },
             "data-yggui-side-rail-auto-hide": if auto_hide { "1" } else { "0" },
             "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
+            "data-yggui-side-rail-autohide-pin": if pinned { "1" } else { "0" },
             "data-covers-web-surface": if revealed { "sidebar-right" },
             style: outer_style,
             onmousedown: |evt| evt.stop_propagation(),

@@ -655,19 +655,29 @@ impl WebviewInstance {
                     .webview()
                     .set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
             }
-            // F.1 reveal forward: page-webview top-edge motion calls into the
-            // shell webview's reveal hook (installed by the shell's edge-motion
-            // listener loop; a missing hook is a no-op). GTK main thread only —
-            // motion events and run_javascript both live there.
+            // Reveal forward: page-webview EDGE motion calls into the shell
+            // webview's reveal hook (installed by the shell's edge-motion
+            // listener loop; a missing hook is a no-op). All three auto-hide
+            // edges, because with the page running flush to the viewport the
+            // shell's own hover sensors are under the webview on every one of
+            // them. GTK main thread only — motion events and run_javascript
+            // both live there.
             {
                 use webkit2gtk::WebViewExt as _;
                 use wry::WebViewExtUnix as _;
                 let shell_webkit = desktop_context.webview.webview();
-                host.set_edge_motion_notifier(move || {
+                host.set_edge_motion_notifier(move |edge| {
                     let cancellable: Option<&gtk::gio::Cancellable> = None;
+                    let edge = match edge {
+                        crate::web_surface::SurfaceRevealEdge::Top => "top",
+                        crate::web_surface::SurfaceRevealEdge::Left => "left",
+                        crate::web_surface::SurfaceRevealEdge::Right => "right",
+                    };
                     #[allow(deprecated)]
                     shell_webkit.run_javascript(
-                        "window.__yggtermGlassEdgeMotion && window.__yggtermGlassEdgeMotion();",
+                        &format!(
+                            "window.__yggtermGlassEdgeMotion && window.__yggtermGlassEdgeMotion('{edge}');"
+                        ),
                         cancellable,
                         |_| {},
                     );
