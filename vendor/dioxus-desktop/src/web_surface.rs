@@ -435,15 +435,24 @@ mod adblock {
 // Downloads
 // ---------------------------------------------------------------------------
 //
-// A link that downloads used to do NOTHING in a surface: wry's own download
-// hooks were never registered, so `decide-destination` went unanswered and
-// WebKit dropped the transfer on the floor. The whole plane lives here, and
-// deliberately in ONE place:
+// What a download used to do in a surface, stated correctly because this
+// comment is the record: it LANDED SOMEWHERE ELSE, silently. wry's
+// `WebViewAttributes::default()` carried `download_started_handler:
+// Some(Box::new(|_, _| true))`, `attach_handlers` registered it on the shared
+// context, and its `decide-destination` computed the path itself —
+// `dirs::download_dir().unwrap_or_else(current_dir)` and then
+// `PathBuf::push(suggested)`. So under a bare compositor, where
+// `XDG_DOWNLOAD_DIR` is unset, the file went to the GUI's CWD, under the
+// server's raw suggested name (`../../x` walks straight out of a `push`), with
+// no toast, no trace row, and nothing anywhere to say a transfer had happened.
+// The transfer was never "dropped on the floor" — it was UNOWNED AND
+// UNANNOUNCED, which is worse, because there was nothing to notice.
+//
+// The whole plane now lives here, and deliberately in ONE place:
 //
 //   * the DESTINATION is decided by `download_destination` and nothing else —
-//     wry's default handler (which pushed the raw suggested filename onto
-//     `~/Downloads` with `PathBuf::push`, so `../../x` escaped) is switched off
-//     in the vendored wry, so this is the only policy on the signal;
+//     wry's default handler (see above) is switched off in the vendored wry, so
+//     this is the only policy on the signal;
 //   * the plumbing is connected ONCE PER `WebContext`, not per webview, because
 //     the tabs of one session SHARE a context and `download-started` is a
 //     context signal — N connections would decide one transfer N times;
@@ -519,7 +528,13 @@ pub struct SurfaceDownloadEvent {
 /// destroyed, that arrives as `failed` and `finish_download_transfer` SWEEPS
 /// THE PArecordsAL. What is ruled out either way is the third outcome — a
 /// truncated file left sitting under the full name.
-struct DownloadInFlight {
+///
+/// The type parameter exists ONLY so this entry can be DRIVEN in a test: a real
+/// `WebContext` needs a display and a network process, which no test on this
+/// host has, and a rule that can only be source-scanned is a rule nobody can
+/// prove. `Rc` cannot tell a stand-in from an engine, and neither can
+/// `retain_held_contexts`, which is the point.
+struct DownloadInFlight<C = RefCell<WebContext>> {
     /// Monotonic, host-local. Identity here is deliberately NOT the `Download`
     /// object: WebKit owns that, and dropping the last reference to one inside
     /// its own signal handler is a use-after-free waiting to happen. No handle
@@ -527,7 +542,25 @@ struct DownloadInFlight {
     /// remote control.
     id: u64,
     /// The engine that must not die under the transfer.
-    _ctx: Rc<RefCell<WebContext>>,
+    _ctx: Rc<C>,
+}
+
+/// THE context sweep rule, and the whole detach policy in one line: an engine
+/// survives while ANYONE besides the map itself holds it.
+///
+/// The map's own entry is a strong ref, so "nobody wants this any more" is
+/// `strong_count == 1`. Holders are live surfaces — and RUNNING DOWNLOADS, via
+/// `DownloadInFlight`. That second kind of holder is how "closing the tab does
+/// not truncate the file" is spelled: with the tab gone but a transfer running,
+/// the count is still 2, the sweep leaves the network process standing, and the
+/// engine is taken by the NEXT sweep after the transfer releases it.
+///
+/// Free and generic rather than inline in `prune_contexts` so the rule can be
+/// DRIVEN by a test instead of only source-scanned: a real `WebContext` needs a
+/// display this host does not have, and `Rc` cannot tell a stand-in from an
+/// engine.
+fn retain_held_contexts<K: Eq + std::hash::Hash, C>(contexts: &mut HashMap<K, Rc<C>>) {
+    contexts.retain(|_, ctx| Rc::strong_count(ctx) > 1);
 }
 
 /// `$HOME/Downloads`, created if missing.
@@ -607,12 +640,26 @@ fn split_download_name(file_name: &str) -> (&str, &str) {
     }
 }
 
+/// "Is this name already taken?" — THE production answer, and deliberately not
+/// `Path::exists`.
+///
+/// `Path::exists` FOLLOWS symlinks, so it answers `false` for a DANGLING one: a
+/// symlink at `~/Downloads/report.pdf` pointing at `~/.ssh/authorized_keys`
+/// (which does not exist yet) reads as a free name, the uniquifier hands it to
+/// the engine, and the write lands OUTSIDE the downloads directory — undoing
+/// the whole point of `sanitize_download_file_name`. `symlink_metadata` does not
+/// follow, so anything at the name at all — file, directory, live link, dangling
+/// link — counts as taken and the transfer uniquifies past it.
+fn download_name_is_taken(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 /// The collision policy: NEVER overwrite. `x.txt` taken ⇒ `x (1).txt`, then
 /// `x (2).txt`, ... — the idiom every browser uses, and the one a user reading
 /// their downloads folder can decode without being told.
 ///
 /// `exists` is injected so the rule is a pure function of the directory's
-/// contents; production passes `Path::exists`.
+/// contents; production passes `download_name_is_taken` and so does every lock.
 fn unique_download_path(dir: &Path, file_name: &str, exists: &dyn Fn(&Path) -> bool) -> PathBuf {
     let candidate = dir.join(file_name);
     if !exists(&candidate) {
@@ -650,6 +697,19 @@ fn download_destination(dir: &Path, suggested: &str, exists: &dyn Fn(&Path) -> b
 /// leaves a truncated file with the right name, the right icon and the wrong
 /// contents — a file that MASQUERADES AS COMPLETE. Deleting it is what makes
 /// the failed event the whole truth.
+///
+/// THE SWEEP IS GATED ON OWNERSHIP, and this is not a nicety. Because
+/// `decide-destination` sets `set_allow_overwrite(false)`, "the destination
+/// already exists" is a FIRST-CLASS engine failure — and in exactly that
+/// failure the file sitting at `destination` is not ours: another transfer
+/// decided the same name in the same main-loop turn (the uniquifier reads the
+/// directory, and WebKit does not create the file until after
+/// `decide-destination` returns), or another process wrote it in that window.
+/// Sweeping unconditionally would delete a stranger's file on the one code path
+/// where the failure MEANS a stranger's file. `destination_was_created`
+/// carries the engine's own answer — WebKit's `created-destination` signal,
+/// which fires when and only when it created the file it is about to write —
+/// so this deletes a partial only when there is a partial of ours to delete.
 fn finish_download_transfer(
     surface_id: Option<u64>,
     url: String,
@@ -657,16 +717,19 @@ fn finish_download_transfer(
     destination: PathBuf,
     bytes: u64,
     failure: Option<String>,
+    destination_was_created: bool,
 ) -> SurfaceDownloadEvent {
     let phase = match failure {
         Some(reason) => {
-            if let Err(error) = std::fs::remove_file(&destination) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        ?error,
-                        ?destination,
-                        "web surface: partial download could not be swept"
-                    );
+            if destination_was_created {
+                if let Err(error) = std::fs::remove_file(&destination) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            ?error,
+                            ?destination,
+                            "web surface: partial download could not be swept"
+                        );
+                    }
                 }
             }
             SurfaceDownloadPhase::Failed { reason }
@@ -711,6 +774,9 @@ fn surface_id_for_view(
 ///   * `decide-destination` answers with our path and returns `true` (handled).
 ///     Nothing else is connected to it in this process — the vendored wry's
 ///     default handler is switched off — so the answer is unambiguous;
+///   * `created-destination` fires when the ENGINE created the file. That is
+///     the only trustworthy answer to "is the thing at this path ours?", and
+///     the failure sweep is gated on it — see `finish_download_transfer`;
 ///   * `failed` fires BEFORE `finished` and carries the reason; `finished`
 ///     always fires. So the reason is parked and the single terminal event is
 ///     emitted from `finished`, which is why a transfer can never produce both
@@ -758,6 +824,19 @@ fn connect_download_plumbing(
         let landed = Rc::new(RefCell::new(None::<(String, PathBuf)>));
         // Parked by `failed`, consumed by `finished`.
         let failure = Rc::new(RefCell::new(None::<String>));
+        // Did WE create the file at the destination? Only the engine knows, and
+        // it says so: `created-destination` fires when WebKit has created the
+        // file it is about to write into. Without this the failure sweep would
+        // delete whatever is at the destination — and the canonical
+        // `set_allow_overwrite(false)` failure is precisely "something else is
+        // already there".
+        let created_destination = Rc::new(Cell::new(false));
+        download.connect_created_destination({
+            let created_destination = created_destination.clone();
+            move |_download, _path| {
+                created_destination.set(true);
+            }
+        });
 
         download.connect_decide_destination({
             let events = events.clone();
@@ -765,9 +844,8 @@ fn connect_download_plumbing(
             let url = url.clone();
             move |download, suggested_filename| {
                 let dir = downloads_dir();
-                let destination = download_destination(&dir, suggested_filename, &|path| {
-                    path.exists()
-                });
+                let destination =
+                    download_destination(&dir, suggested_filename, &download_name_is_taken);
                 // Belt to the uniquifier's braces: even if the name were taken
                 // between the check and the open, the engine must not clobber.
                 download.set_allow_overwrite(false);
@@ -804,6 +882,7 @@ fn connect_download_plumbing(
             let in_flight = in_flight.clone();
             let landed = landed.clone();
             let failure = failure.clone();
+            let created_destination = created_destination.clone();
             move |download| {
                 let (file_name, destination) = landed.borrow().clone().unwrap_or_else(|| {
                     let path = download
@@ -823,6 +902,7 @@ fn connect_download_plumbing(
                     destination,
                     download.received_data_length(),
                     failure.borrow_mut().take(),
+                    created_destination.get(),
                 ));
                 // Release the engine hold OUTSIDE this handler: dropping the
                 // last reference to the download (or to its context) while
@@ -2331,9 +2411,14 @@ impl WebSurfaceHost {
         // Downloads, wired to the ENGINE this surface runs on. Once per context
         // — `download-started` is a context signal and the tabs of one session
         // share a context, so connecting per surface would decide one transfer
-        // once per tab. Without this a download link does nothing at all:
-        // WebKit asks for a destination, no one answers, and the transfer is
-        // dropped on the floor.
+        // once per tab.
+        //
+        // This call is the ONLY download policy in the process: the vendored
+        // wry's default `download_started_handler` is switched off precisely so
+        // that is true (before that it answered `decide-destination` itself,
+        // saving to `dirs::download_dir()` — or, unset, the GUI's CWD — under
+        // the server's raw suggested name, and telling nobody). So without this
+        // call nothing answers, and a download link does nothing at all.
         if context_is_new {
             use webkit2gtk::WebViewExt as _;
             use wry::WebViewExtUnix as _;
@@ -2474,10 +2559,11 @@ impl WebSurfaceHost {
     /// "the file finishes even though the tab is gone" is spelled: the sweep
     /// finds `strong_count > 1` and leaves the engine standing until the
     /// transfer ends, then the next sweep takes it.
+    ///
+    /// The rule itself is `retain_held_contexts`, which is where it can be
+    /// driven; this method is the host's borrow around it and nothing more.
     fn prune_contexts(&self) {
-        self.contexts
-            .borrow_mut()
-            .retain(|_, ctx| Rc::strong_count(ctx) > 1);
+        retain_held_contexts(&mut self.contexts.borrow_mut());
     }
 
     /// How many distinct `WebContext`s are alive right now.
@@ -3958,15 +4044,26 @@ mod engine_visibility_locks {
 /// display and an engine, which no test on this host has; so the split is the
 /// one this file already uses for engine-side mechanisms: the DECISIONS are
 /// driven end to end here — against a real localhost server answering with a
-/// real `Content-Disposition`, and against a real transfer killed mid-flight —
-/// and the WIRING that hands those decisions to WebKit is scanned out of the
-/// product source.
+/// real `Content-Disposition`, against a real transfer killed mid-flight,
+/// against `downloads_dir()` itself under a `HOME` a lock owns (in a child
+/// process, since the environment is process-global and these run eight at a
+/// time), and against the real sweep rule with a real registry entry — and the
+/// WIRING that hands those decisions to WebKit is scanned out of the product
+/// source.
 #[cfg(test)]
 mod download_locks {
     use super::engine_visibility_locks::{body_of, product_lines};
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Set on the CHILD half of the directory-policy lock: seeing it means
+    /// "print what `downloads_dir()` decided and stop", which is how a test can
+    /// own `HOME` without racing the seven other test threads.
+    const DOWNLOADS_DIR_PROBE_VAR: &str = "YGGTERM_DOWNLOADS_DIR_PROBE";
+
+    /// How the child's answer is picked out of libtest's own output.
+    const DOWNLOADS_DIR_PROBE_PREFIX: &str = "yggterm-downloads-dir-probe: ";
 
     /// A scratch directory that stands in for `~/Downloads` for one test.
     struct ScratchDir(PathBuf);
@@ -4099,9 +4196,7 @@ mod download_locks {
         assert_eq!(fetched.body, body, "the fixture served its whole body");
 
         let destination =
-            download_destination(dir.path(), &fetched.suggested_filename, &|path| {
-                path.exists()
-            });
+            download_destination(dir.path(), &fetched.suggested_filename, &download_name_is_taken);
         std::fs::write(&destination, &fetched.body).expect("engine writes to the destination");
 
         assert_eq!(
@@ -4133,9 +4228,7 @@ mod download_locks {
         let fetched = fetch(&url);
         assert_eq!(fetched.suggested_filename, "../../../../etc/passwd");
         let destination =
-            download_destination(dir.path(), &fetched.suggested_filename, &|path| {
-                path.exists()
-            });
+            download_destination(dir.path(), &fetched.suggested_filename, &download_name_is_taken);
         assert_eq!(
             destination,
             dir.path().join("passwd"),
@@ -4190,7 +4283,7 @@ mod download_locks {
         let first = dir.path().join("report.pdf");
         std::fs::write(&first, b"the original").expect("pre-place the first download");
 
-        let second = download_destination(dir.path(), "report.pdf", &|path| path.exists());
+        let second = download_destination(dir.path(), "report.pdf", &download_name_is_taken);
         assert_eq!(
             second,
             dir.path().join("report (1).pdf"),
@@ -4203,7 +4296,7 @@ mod download_locks {
             "the file already on disk must be untouched",
         );
 
-        let third = download_destination(dir.path(), "report.pdf", &|path| path.exists());
+        let third = download_destination(dir.path(), "report.pdf", &download_name_is_taken);
         assert_eq!(
             third,
             dir.path().join("report (2).pdf"),
@@ -4215,7 +4308,7 @@ mod download_locks {
         let archive = dir.path().join("archive.tar.gz");
         std::fs::write(&archive, b"x").expect("pre-place an archive");
         assert_eq!(
-            download_destination(dir.path(), "archive.tar.gz", &|path| path.exists()),
+            download_destination(dir.path(), "archive.tar.gz", &download_name_is_taken),
             dir.path().join("archive (1).tar.gz"),
         );
 
@@ -4223,7 +4316,7 @@ mod download_locks {
         let plain = dir.path().join("LICENSE");
         std::fs::write(&plain, b"x").expect("pre-place a plain file");
         assert_eq!(
-            download_destination(dir.path(), "LICENSE", &|path| path.exists()),
+            download_destination(dir.path(), "LICENSE", &download_name_is_taken),
             dir.path().join("LICENSE (1)"),
         );
     }
@@ -4254,11 +4347,10 @@ mod download_locks {
         );
 
         let destination =
-            download_destination(dir.path(), &fetched.suggested_filename, &|path| {
-                path.exists()
-            });
+            download_destination(dir.path(), &fetched.suggested_filename, &download_name_is_taken);
         // What the engine has already done by the time it gives up: a partial
-        // file sitting at the destination.
+        // file sitting at the destination, which it told us it created
+        // (`created-destination`) before it started writing.
         std::fs::write(&destination, &fetched.body).expect("partial on disk");
         assert!(destination.exists());
 
@@ -4269,6 +4361,7 @@ mod download_locks {
             destination.clone(),
             fetched.body.len() as u64,
             Some("Error reading from the underlying stream".to_string()),
+            true,
         );
 
         assert_eq!(
@@ -4290,10 +4383,211 @@ mod download_locks {
         // transfer that ENDED WELL keeps its file and reports its size.
         let good = dir.path().join("good.iso");
         std::fs::write(&good, b"complete").expect("finished download");
-        let event =
-            finish_download_transfer(Some(7), url, "good.iso".to_string(), good.clone(), 8, None);
+        let event = finish_download_transfer(
+            Some(7),
+            url,
+            "good.iso".to_string(),
+            good.clone(),
+            8,
+            None,
+            true,
+        );
         assert_eq!(event.phase, SurfaceDownloadPhase::Completed { bytes: 8 });
         assert!(good.exists(), "a completed download must keep its file");
+    }
+
+    /// THE OWNERSHIP GATE on the sweep, which is the one place in this plane
+    /// where a bug DESTROYS DATA rather than misplacing it.
+    ///
+    /// `decide-destination` sets `set_allow_overwrite(false)`, so "the
+    /// destination already exists" is a first-class WebKit failure — and it is
+    /// exactly the failure in which the file at the destination is SOMEBODY
+    /// ELSE'S: a sibling transfer that decided the same name in the same
+    /// main-loop turn (the uniquifier reads the directory, and WebKit does not
+    /// create the file until after `decide-destination` returns), or any other
+    /// process that wrote it in that window. A sweep that fires on every
+    /// failure deletes that file.
+    ///
+    /// The engine answers the question itself — `created-destination` fires
+    /// when and only when WebKit created the file — and that answer is what
+    /// gates the `remove_file`.
+    #[test]
+    fn a_failure_sweeps_only_a_file_this_transfer_created() {
+        let dir = ScratchDir::new("ownership");
+
+        // Somebody else's file, at the name this transfer wanted. The transfer
+        // never got as far as `created-destination`, so it never owned it.
+        let theirs = dir.path().join("report.pdf");
+        std::fs::write(&theirs, b"someone else's report").expect("pre-place a stranger's file");
+        let event = finish_download_transfer(
+            Some(4),
+            "https://example.test/report.pdf".to_string(),
+            "report.pdf".to_string(),
+            theirs.clone(),
+            0,
+            Some("Cannot determine destination URI".to_string()),
+            false,
+        );
+        assert_eq!(
+            event.phase,
+            SurfaceDownloadPhase::Failed {
+                reason: "Cannot determine destination URI".to_string(),
+            },
+        );
+        assert!(
+            theirs.exists(),
+            "a failed download deleted a file it never created — the \
+             `allow_overwrite(false)` failure mode means the file at the \
+             destination belongs to someone else",
+        );
+        assert_eq!(
+            std::fs::read(&theirs).expect("the stranger's file"),
+            b"someone else's report",
+            "the stranger's file was replaced rather than left alone",
+        );
+
+        // And the other direction, so the gate cannot simply be "never sweep":
+        // a partial THIS transfer created is still swept.
+        let ours = dir.path().join("ours.iso");
+        std::fs::write(&ours, b"half a").expect("our own partial");
+        let event = finish_download_transfer(
+            Some(4),
+            "https://example.test/ours.iso".to_string(),
+            "ours.iso".to_string(),
+            ours.clone(),
+            6,
+            Some("Error reading from the underlying stream".to_string()),
+            true,
+        );
+        assert!(matches!(event.phase, SurfaceDownloadPhase::Failed { .. }));
+        assert!(
+            !ours.exists(),
+            "the partial this transfer created must still be swept — otherwise \
+             a truncated file masquerades as a complete download",
+        );
+    }
+
+    /// THE DIRECTORY POLICY, driven for real. `downloads_dir()` itself is
+    /// called — not a scratch dir injected past it — under a `HOME` this test
+    /// owns, with `XDG_DOWNLOAD_DIR` pointed at a decoy.
+    ///
+    /// In a CHILD PROCESS, because the environment is process-global and this
+    /// binary runs its tests eight at a time: mutating `HOME` in-process would
+    /// be a race against every other test in the crate. The child is this same
+    /// test binary, re-entered on this same test name, which is why the
+    /// function it prints is the production one and not a copy of the rule.
+    #[test]
+    fn the_downloads_directory_is_home_downloads_and_ignores_xdg_download_dir() {
+        // The child half: say what production decided, and stop.
+        if std::env::var_os(DOWNLOADS_DIR_PROBE_VAR).is_some() {
+            println!("{DOWNLOADS_DIR_PROBE_PREFIX}{}", downloads_dir().display());
+            return;
+        }
+
+        let home = ScratchDir::new("home");
+        let decoy = ScratchDir::new("xdg-decoy");
+        // Derived, not spelled: a renamed module or test must not silently turn
+        // this lock into a no-op that "passes" because nothing matched.
+        let test_name = format!(
+            "{}::the_downloads_directory_is_home_downloads_and_ignores_xdg_download_dir",
+            module_path!()
+                .split_once("::")
+                .map(|(_crate_name, path)| path)
+                .expect("this test lives inside a module"),
+        );
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("this test binary's own path"),
+        )
+        .args(["--exact", "--nocapture", "--test-threads=1", &test_name])
+        .env(DOWNLOADS_DIR_PROBE_VAR, "1")
+        .env("HOME", home.path())
+        .env("XDG_DOWNLOAD_DIR", decoy.path())
+        .output()
+        .expect("re-run this test as a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run this test (filter drift?):\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // `--nocapture` interleaves the print with libtest's own progress line,
+        // so the answer is found mid-line and read to the end of it.
+        let decided = stdout
+            .split_once(DOWNLOADS_DIR_PROBE_PREFIX)
+            .map(|(_, rest)| rest.lines().next().unwrap_or_default().trim())
+            .filter(|answer| !answer.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("the child printed no decision:\n{stdout}"));
+
+        assert_eq!(
+            decided,
+            home.path().join(DOWNLOADS_DIR_NAME),
+            "downloads must land in $HOME/Downloads",
+        );
+        assert!(
+            decided.is_dir(),
+            "the downloads directory must be CREATED when missing — a policy \
+             that names a directory nobody made fails at the first `open`",
+        );
+        assert!(
+            !decided.starts_with(decoy.path()),
+            "XDG_DOWNLOAD_DIR was honoured: the downloads folder now moves \
+             depending on how the GUI was launched, which is the exact \
+             non-determinism this policy refuses",
+        );
+    }
+
+    /// `Path::exists` FOLLOWS symlinks, so a DANGLING one reads as a free name.
+    /// A symlink planted at `~/Downloads/report.pdf` pointing outside the
+    /// directory would then be handed to the engine as the destination and the
+    /// write would land wherever it points — the traversal that
+    /// `sanitize_download_file_name` exists to prevent, arriving by the other
+    /// door.
+    #[test]
+    fn a_dangling_symlink_at_the_name_is_still_a_taken_name() {
+        let dir = ScratchDir::new("symlink");
+        let outside = dir.path().join("not-created-yet-outside");
+        let planted = dir.path().join("report.pdf");
+        std::os::unix::fs::symlink(&outside, &planted).expect("plant a dangling symlink");
+        assert!(
+            !planted.exists(),
+            "the fixture is wrong: a dangling symlink must read as absent to \
+             `Path::exists`, which is the whole hazard",
+        );
+        assert!(
+            planted.symlink_metadata().is_ok(),
+            "the fixture is wrong: the link itself must be on disk",
+        );
+
+        assert!(
+            download_name_is_taken(&planted),
+            "a dangling symlink is a name that is TAKEN — writing to it writes \
+             through it, outside the downloads directory",
+        );
+        // The damage, driven: take the path the policy returns and write to it
+        // exactly as the engine would.
+        let landed = download_destination(dir.path(), "report.pdf", &download_name_is_taken);
+        std::fs::write(&landed, b"payload").expect("the engine writes to the destination");
+        assert!(
+            !outside.exists(),
+            "the download was written THROUGH the planted symlink and landed at \
+             {}, outside the downloads directory (destination was {})",
+            outside.display(),
+            landed.display(),
+        );
+        assert_eq!(
+            landed,
+            dir.path().join("report (1).pdf"),
+            "the uniquifier must step past a planted symlink, not hand the \
+             engine a path that resolves outside the downloads directory",
+        );
+
+        // A live symlink is taken too, for the same reason and by the same rule.
+        let target = dir.path().join("real.bin");
+        std::fs::write(&target, b"x").expect("link target");
+        let live = dir.path().join("linked.bin");
+        std::os::unix::fs::symlink(&target, &live).expect("plant a live symlink");
+        assert!(download_name_is_taken(&live));
     }
 
     /// The WIRING. Every decision above is worth nothing if WebKit is never
@@ -4314,8 +4608,9 @@ mod download_locks {
         let open = body_of(&product, "pub fn open(");
         assert!(
             open.contains("if context_is_new {") && open.contains("connect_download_plumbing("),
-            "surfaces no longer register download handlers — a download link does \
-             nothing at all without this",
+            "`open` no longer connects the download plumbing: with the vendored \
+             wry's default handler switched off, nothing in this process answers \
+             `decide-destination` and a download link does nothing at all",
         );
 
         // 2. The destination answer: our policy, our path, and `true` so the
@@ -4324,10 +4619,22 @@ mod download_locks {
         for needle in [
             "context.connect_download_started(move |_context, download| {",
             "download.connect_decide_destination({",
-            "let destination = download_destination(&dir, suggested_filename, &|path| {",
+            // The DIRECTORY, at the call site — swapping this for any other
+            // path is the mutation the destination locks cannot see, because
+            // they are handed a directory rather than choosing one.
+            "let dir = downloads_dir();",
+            // ...and the TAKEN test, which is `symlink_metadata` and not
+            // `Path::exists` for the dangling-symlink reason.
+            "download_destination(&dir, suggested_filename, &download_name_is_taken);",
             "download.set_allow_overwrite(false);",
             "download.set_destination(&destination.to_string_lossy());",
             "phase: SurfaceDownloadPhase::Started,",
+            // OWNERSHIP of the destination file, straight from the engine: what
+            // gates the failure sweep, so a failure never deletes a file this
+            // transfer did not create.
+            "download.connect_created_destination({",
+            "created_destination.set(true);",
+            "created_destination.get(),",
             // The failure REASON, taken from the engine's own error.
             "*failure.borrow_mut() = Some(error.to_string());",
             // Exactly one terminal event, through the one function that decides
@@ -4364,6 +4671,37 @@ mod download_locks {
             !wry.contains("download_started_handler: Some(Box::new(|_, _| true)),"),
             "wry's upstream allow-everything download handler has returned",
         );
+        // The re-arm is an OR (`webkitgtk/mod.rs`: register if EITHER handler
+        // is some), so a default COMPLETED handler would put wry's whole
+        // download path back on the context even with the started one off.
+        assert!(
+            wry.contains("      download_completed_handler: None,\n"),
+            "wry now defaults a download COMPLETED handler, which re-arms its \
+             own `register_download_handler` — a second policy on one signal by \
+             the other door",
+        );
+
+        // 5. POPUPS are covered by the same one policy, with no wiring of their
+        //    own: a popup is built RELATED to its opener, and a related view
+        //    shares the opener's `WebKitWebContext` — which is where
+        //    `download-started` is connected. If either half drifts, a download
+        //    started from a `target="_blank"` window silently has no policy.
+        let popup = body_of(&product, "fn build_popup_webview(");
+        assert!(
+            popup.contains(".with_related_view(opener.clone())"),
+            "a popup is no longer built RELATED to its opener, so it gets a \
+             fresh context — and the download plumbing, which is connected per \
+             context, does not cover it",
+        );
+        let wry_gtk = include_str!("../../wry/src/webkitgtk/mod.rs");
+        assert!(
+            wry_gtk.contains(
+                "if let Some(related_view) = &pl_attrs.related_view {\n      \
+                 builder = builder.related_view(related_view);"
+            ),
+            "wry no longer builds a related view from `related_view`, so a \
+             popup would not share its opener's context",
+        );
 
         // 4. The read side exists and DRAINS — a queue nobody empties is a leak
         //    that also tells the user nothing. Anchored to the signature's own
@@ -4377,17 +4715,74 @@ mod download_locks {
         );
     }
 
-    /// The in-flight registry is what makes "closing the tab does not truncate
-    /// the file" true, and `prune_contexts` is what would otherwise take the
-    /// engine away. The rule is one line, and it is the whole detach policy.
+    /// THE DETACH RULE, DRIVEN — the tab closes mid-transfer and the engine is
+    /// still standing afterwards.
+    ///
+    /// The production registry entry (`DownloadInFlight`) and the production
+    /// sweep (`retain_held_contexts`, which is all `prune_contexts` does) are
+    /// the ones under test. The only stand-in is the thing being kept alive: a
+    /// real `WebContext` needs a display and a network process this host does
+    /// not have, and `Rc::strong_count` — the entire mechanism — cannot tell a
+    /// stand-in from an engine.
+    ///
+    /// What this does NOT prove, stated so nobody reads more into it: no real
+    /// WebKit transfer has ever been observed continuing past its view's
+    /// destruction. That half is the engine's, needs a display, and is listed
+    /// as live proof still owed.
     #[test]
     fn a_running_download_keeps_its_engine_alive_after_the_tab_is_gone() {
-        let product = product_lines();
-        let prune = body_of(&product, "fn prune_contexts(");
+        // The engine, as three holders see it: the host's context map, the tab
+        // that opened it, and the transfer it started.
+        let engine = Rc::new(RefCell::new(String::from("session-a engine")));
+        let mut contexts: HashMap<String, Rc<RefCell<String>>> = HashMap::new();
+        contexts.insert("session-a".to_string(), engine.clone());
+        let tab_hold = engine.clone();
+        let mut in_flight: Vec<DownloadInFlight<RefCell<String>>> = vec![DownloadInFlight {
+            id: 1,
+            _ctx: engine.clone(),
+        }];
+        drop(engine);
+
+        // Steady state: a tab, a transfer, one engine.
+        retain_held_contexts(&mut contexts);
+        assert_eq!(contexts.len(), 1, "the sweep took a context still in use");
+
+        // THE TAB CLOSES, mid-transfer. This is the whole case.
+        drop(tab_hold);
+        retain_held_contexts(&mut contexts);
+        assert_eq!(
+            contexts.len(),
+            1,
+            "the engine was swept out from under a running download — closing \
+             the tab now truncates the file",
+        );
+        let held = contexts.get("session-a").expect("the engine is still mapped");
+        assert_eq!(
+            Rc::strong_count(held),
+            2,
+            "the only holders left must be the map and the transfer itself",
+        );
+
+        // The transfer ends and releases its hold; the NEXT sweep takes the
+        // engine, exactly as it did before downloads existed.
+        in_flight.clear();
+        retain_held_contexts(&mut contexts);
         assert!(
-            prune.contains("retain(|_, ctx| Rc::strong_count(ctx) > 1)"),
-            "the context sweep no longer counts holders, so a download in flight \
-             can have its network process swept out from under it",
+            contexts.is_empty(),
+            "an engine nobody holds must not outlive its last holder — the \
+             download hold is a LIFETIME, not immortality",
+        );
+
+        // And the sweep the host runs is this rule and not a second spelling of
+        // it: `prune_contexts` is the borrow around it and nothing more.
+        let product = product_lines();
+        assert!(
+            product.join("\n").contains(
+                "fn prune_contexts(&self) {\n        \
+                 retain_held_contexts(&mut self.contexts.borrow_mut());\n    }"
+            ),
+            "the host's context sweep no longer goes through the rule under \
+             test, so what is proven above is no longer what runs",
         );
 
         // The registry entry holds the context strongly (that IS the hold) and
@@ -4395,15 +4790,15 @@ mod download_locks {
         // WebKit's).
         let source = product.join("\n");
         let start = source
-            .find("struct DownloadInFlight {")
-            .expect("`DownloadInFlight` is gone");
+            .find("struct DownloadInFlight<C = RefCell<WebContext>> {")
+            .expect("`DownloadInFlight` is gone, or no longer defaults to the engine type");
         let end = source[start..]
             .find("\n}\n")
             .map(|offset| start + offset)
             .expect("unterminated `DownloadInFlight`");
         let entry = &source[start..end];
         assert!(
-            entry.contains("_ctx: Rc<RefCell<WebContext>>,"),
+            entry.contains("_ctx: Rc<C>,"),
             "an in-flight download no longer holds its engine: closing the tab \
              now truncates the file",
         );
