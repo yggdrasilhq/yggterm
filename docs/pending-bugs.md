@@ -43,6 +43,11 @@ fix) once the fix is verified live on jojo.
   tab-model-only until revealed/selected (the restore path's exact rule), plus
   a live-webview LRU budget so no path can pile past a cap. Evidence:
   `~/.local/share/ygg-j8-baseline/` on jojo.
+  **CONFIRMED STILL OPEN on 2.12.18 (jojo, 2026-07-27 — J8b):** 25 tabs seeded
+  and `ensure`d on a surface that was never revealed → **27 GUI web processes
+  before anything was shown**. The per-tab hold governs background tabs of a
+  session the user IS looking at, so it never fires here; the mint-time spike is
+  untouched by the reclaim lane. Lazy-ensure is the outstanding half.
 
 - **★★ A SECOND VIEWER DOUBLES EVERY WEBVIEW, AND `session remove` STRANDS THE
   SHADOW'S SET FOREVER (jojo, 2.12.17, 2026-07-27 — J8a).** Webviews are
@@ -53,6 +58,12 @@ fix) once the fix is verified live on jojo.
   them. Same family as the remote-cc entry below: the teardown verifies one
   side and claims the whole. Fix: the remove path must sweep every client's
   applied set for the session, or refuse with the shadow named.
+  **REPRODUCES on 2.12.18 (jojo, 2026-07-27 — J8b).** Two fixture sessions
+  removed, both `verified:true` with reaped pids named: the GUI fell to **1**
+  webview while the shadow kept **3** (952 MB total) for rows that existed
+  nowhere; `shadow-client.sh stop` freed them (4 → 1, 952 → 495 MB). Smaller
+  only because per-tab reclaim had already collapsed most of the set — the
+  defect itself is unchanged.
 
 - **GUI process died mid-J8a with 51 webviews applied (jojo, 2.12.17 GUI 27779
   → fresh 325652 at 12:17:22, 2026-07-27). Cause UNDETERMINED** — no panic in
@@ -70,6 +81,26 @@ fix) once the fix is verified live on jojo.
   `YGGTERM_BIN=$HOME/.local/bin/yggterm scripts/shadow-client.sh …`. Fix: the
   script must refuse a headless binary (probe `--version` output) or default
   to the GUI binary path explicitly.
+  **STILL OPEN on 2.12.18 (jojo, 2026-07-27 — J8b):** `/proc/<shell>/environ`
+  of a daemon-owned row still carries `YGGTERM_BIN=/home/user/.local/bin/yggterm-headless`.
+  ⚠ Verify this one from `/proc`, not from `echo $YGGTERM_BIN` after an `unset`
+  in the same shell — that self-polluted probe reads "fixed" and is a lie.
+
+- **The profile PICKER CARD is unreachable from the agent control plane (jojo,
+  2.12.18, 2026-07-27 — J8b).** 2.12.18's avatar/permanence verbs — "Change
+  avatar…", "Use the default avatar", "Protect profile" (disabled reason
+  *"default is always protected"*) — live only on the picker card's row menu
+  (`web_profile_menu_items`, ids `web-profile-change-avatar` /
+  `web-profile-protect`). Nothing an agent can drive reaches that surface: the
+  rail/strip badge opens the profile SWITCHER menu (`webprofile:<name>` entries
+  only), a sidebar profile chip opens the shared session row menu,
+  `server app command list` carries **0** profile/avatar commands, and
+  `server app start-page` reports no profile cards. Consequence: the avatar
+  PERSISTENCE contract — a "Change avatar…" write must preserve unknown sidecar
+  keys such as `agent_drive` — **could not be live-verified at all**, and it is
+  the one clause of the 2.12.18 maiden-run checklist with no live proof. Fix:
+  give the picker an addressable entry point (a command-plane id, or a
+  documented route), or expose the avatar/protect writes as `server app` verbs.
 
 - **`WebKitNetworkProcess` accumulates per profile churn (jojo, 2026-07-27 —
   J8a: 3 → 10 across one baseline run).** One network process per WebContext
