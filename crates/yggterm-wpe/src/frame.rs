@@ -50,6 +50,40 @@ impl Frame {
             .unwrap_or([0, 0, 0, 0])
     }
 
+    /// A sub-rectangle, clamped to the frame.
+    ///
+    /// `None` when the rectangle does not overlap the frame at all — an
+    /// element scrolled out of view or of zero size, which is a real answer and
+    /// not an error.
+    pub fn crop(&self, x: i32, y: i32, width: u32, height: u32) -> Option<Frame> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let x0 = x.max(0) as u32;
+        let y0 = y.max(0) as u32;
+        let x1 = ((x + width as i32).max(0) as u32).min(self.width);
+        let y1 = ((y + height as i32).max(0) as u32).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for row in y0..y1 {
+            let start = ((row * self.width + x0) * 4) as usize;
+            rgba.extend_from_slice(&self.rgba[start..start + (w * 4) as usize]);
+        }
+        Some(Frame {
+            width: w,
+            height: h,
+            rgba,
+        })
+    }
+
+    /// Encode as PNG.
+    pub fn to_png(&self) -> Vec<u8> {
+        crate::png::encode_rgba(&self.rgba, self.width, self.height)
+    }
+
     /// A frame of nothing — every byte zero.
     ///
     /// The compositor exports one of these BEFORE the page paints, and it is
@@ -170,6 +204,32 @@ mod tests {
         assert_eq!(frame.pixel(2, 1), Some([1, 2, 3, 4]));
         assert_eq!(frame.pixel(3, 0), None, "x out of range");
         assert_eq!(frame.pixel(0, 2), None, "y out of range");
+    }
+
+    #[test]
+    fn crop_clamps_to_the_frame_and_reports_a_miss_honestly() {
+        let frame = solid(10, 10, [7, 8, 9, 255]);
+        let inner = frame.crop(2, 2, 4, 4).expect("inside");
+        assert_eq!((inner.width(), inner.height()), (4, 4));
+        // A rect hanging off the edge is CLAMPED, not refused: an element half
+        // off-screen still has a visible part worth capturing.
+        let clipped = frame.crop(8, 8, 100, 100).expect("overlaps");
+        assert_eq!((clipped.width(), clipped.height()), (2, 2));
+        // No overlap at all is None — a real answer for an element scrolled out
+        // of view, not an error.
+        assert!(frame.crop(50, 50, 4, 4).is_none());
+        assert!(frame.crop(-20, 0, 4, 4).is_none());
+        assert!(frame.crop(0, 0, 0, 5).is_none(), "zero width");
+    }
+
+    #[test]
+    fn a_crop_carries_the_right_pixels() {
+        let mut frame = solid(4, 4, [0, 0, 0, 255]);
+        // Mark (1,1) so the crop's origin is checkable.
+        let i = ((1 * 4 + 1) * 4) as usize;
+        frame.rgba[i] = 255;
+        let crop = frame.crop(1, 1, 2, 2).expect("inside");
+        assert_eq!(crop.pixel(0, 0), Some([255, 0, 0, 255]));
     }
 
     #[test]

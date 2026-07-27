@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>AGENT-FIXTURE</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#ff0000;font:14px system-ui}
+  #box{position:absolute;left:20px;top:30px;width:40px;height:30px;background:#0000ff}
+</style>
+</head><body>
+<button id="go">Go</button>
+<p id="out">idle</p>
+<input id="field" value="">
+<div class="dup">one</div><div class="dup">two</div>
+<div id="box"></div>
+<script>
+  // The page reports in TEXT for the DOM verbs and in COLOUR for the readback,
+  // so both assertion instruments work against the same fixture.
+  document.getElementById('go').addEventListener('click', function () {
+    document.getElementById('out').textContent = 'clicked';
+    document.body.style.background = '#00ff00';
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'x') { document.getElementById('field').value = 'typed-x'; }
+  });
+</script>
+</body></html>
