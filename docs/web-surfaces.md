@@ -471,6 +471,51 @@ profile → the surface's `WebContext` is rebuilt, per host-owned profiles). Thi
 also fixes the old no-arg case: ychrome no longer emits `about:blank`, which
 `web_surface_url_scheme_allowed` rejects (only http/https pass).
 
+### Profile metadata: `web-profiles/<name>/profile.json`
+
+A profile's jar carries an optional sidecar, `profile.json`. Its ONE owner is
+`yggterm_core::web_profile::ProfileMeta` — format, defaults and policy — for the
+same reason `normalize_web_profile` lives there: a profile means one thing to
+every process that opens it.
+
+| key | meaning |
+| --- | --- |
+| `emoji` | the owner's chosen avatar. Absent ⇒ derived, see below |
+| `protected` | this profile refuses deletion |
+| `display_name` | a label to show instead of the directory name (decoration only; identity, locks and paths still key on the directory name) |
+
+Three rules, each of which has a lock:
+
+1. **Unknown keys survive a rewrite.** `agent_drive` (`ychrome/docs/agent-engine.md`
+   §7) is specced into this same file and is written by a different process. A
+   blind overwrite from the GUI would silently re-grant agent driving on a
+   profile whose owner denied it, so every write is a read-modify-write through
+   `ProfileMeta`, which round-trips keys this build has never heard of.
+2. **The default avatar is derived, never stored.** It is FNV-1a over the
+   *normalized* name, modulo a curated 48-emoji table
+   (`WEB_PROFILE_AVATAR_EMOJI`) — no clock, no randomness, no enumeration order,
+   and no `DefaultHasher` (whose output is not guaranteed stable across Rust
+   releases). The same profile therefore looks the same in the GUI, in the
+   daemon and in the next process. Reordering or resizing the table re-assigns
+   every derived avatar: treat it as a user-visible change.
+3. **`default` is protected by construction.** Its permanence does not consult
+   the file, so a missing (or hostile) `profile.json` cannot unprotect it.
+   Deletion policy — unsafe name, ephemeral, default, protected — is
+   `web_profile_delete_refusal`, and every refusal carries a sentence the UI
+   shows verbatim.
+
+The GUI draws the avatar in three places — the native picker card, the classic
+tab-strip identity pill and the vertical rail's — through ONE function,
+`web_surface_profile_avatar`. The old "first letter on a gradient" avatar is
+gone: it was a second encoding of identity that only the picker implemented, so
+the badges could never match it. Right-clicking a picker card raises the shared
+`ContextMenuOverlay` with *Change avatar…* and the protect toggle.
+
+⚠ **ychrome's HTML fallback picker still derives a first letter** (`picker_html`
+in that repo). It is a separate repository and a separate binary; until it is
+synced to `ProfileMeta`, a profile can look one way in yggterm's native picker
+and another in ychrome's standalone one.
+
 ### A control endpoint is not a webview URL
 
 The GUI fetches a control endpoint **itself**, over a hand-rolled `TcpStream`.
