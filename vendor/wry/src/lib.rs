@@ -679,7 +679,10 @@ struct WebViewAttributes<'a> {
   /// parameter can be used to set the download location by assigning a new path to it, the assigned path _must_ be
   /// absolute. The closure returns a `bool` to allow or deny the download.
   ///
-  /// [`Self::default()`] sets a handler allowing all downloads to match browser behavior.
+  /// yggterm: [`Self::default()`] leaves this UNSET (upstream defaults to a
+  /// handler that allows every download). Downloads are owned by the embedder's
+  /// own `download-started` plumbing on the `WebContext`; see the comment in
+  /// `impl Default for WebViewAttributes`.
   pub download_started_handler: Option<Box<dyn FnMut(String, &mut PathBuf) -> bool + 'static>>,
 
   /// A download completion handler to manage downloads that have finished.
@@ -834,7 +837,22 @@ impl Default for WebViewAttributes<'_> {
       ipc_handler: None,
       drag_drop_handler: None,
       navigation_handler: None,
-      download_started_handler: Some(Box::new(|_, _| true)),
+      // yggterm: NO default download handler. Upstream installs one here that
+      // accepts every download and computes the destination itself, inside
+      // `register_download_handler` — `dirs::download_dir().push(suggested)`,
+      // which a suggested name like `../../.ssh/authorized_keys` walks straight
+      // out of. It is also registered PER WEBVIEW BUILD on a context that
+      // yggterm SHARES between the tabs of one session, so N tabs meant N
+      // `decide-destination` handlers racing for one transfer.
+      //
+      // Downloads in this workspace are owned by exactly one place —
+      // `web_surface::connect_download_plumbing`, connected ONCE per
+      // `WebContext` on WebKit's own `download-started` — so that the
+      // destination policy, the progress events and the failure REASON (a
+      // `GError`, which the wry callback shape cannot carry) all have a single
+      // owner. Leaving this `Some(..)` would put a second, unsanitized policy
+      // on the same signal.
+      download_started_handler: None,
       download_completed_handler: None,
       new_window_req_handler: None,
       clipboard: false,
@@ -1278,7 +1296,8 @@ impl<'a> WebViewBuilder<'a> {
   /// parameter can be used to set the download location by assigning a new path to it, the assigned path _must_ be
   /// absolute. The closure returns a `bool` to allow or deny the download.
   ///
-  /// By default a handler that allows all downloads is set to match browser behavior.
+  /// yggterm: there is NO default handler (upstream sets one that allows all
+  /// downloads); see `WebViewAttributes::download_started_handler`.
   pub fn with_download_started_handler(
     mut self,
     download_started_handler: impl FnMut(String, &mut PathBuf) -> bool + 'static,
