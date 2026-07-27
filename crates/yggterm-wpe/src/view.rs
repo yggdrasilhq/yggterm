@@ -1,6 +1,6 @@
 //! One headless web view: its backend, its `WebKitWebView`, and its last frame.
 
-use std::ffi::{CString, c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 
 use crate::ffi::{self, FdoEglClient, ImageTargetTexture2DOes};
@@ -46,6 +46,14 @@ pub(crate) struct ViewState {
     /// The generation the current `last_frame` was painted under.
     pub(crate) last_frame_generation: u64,
     pub(crate) painted_count: u64,
+    /// `Some(Ok(json))` / `Some(Err(message))` once an eval completes; `None`
+    /// while one is in flight or none has been issued.
+    pub(crate) eval_result: Option<std::result::Result<String, String>>,
+    pub(crate) eval_in_flight: bool,
+    /// The view this state belongs to. The async callback uses THIS rather than
+    /// the `source_object` GLib hands it: we own this pointer and know it is a
+    /// WebKitWebView, which the callback parameter only promises by convention.
+    pub(crate) web_view: *mut c_void,
 }
 
 impl ViewState {
@@ -107,6 +115,53 @@ extern "C" fn on_web_process_terminated(_view: *mut c_void, _reason: c_int, data
     state.web_process_terminated = true;
 }
 
+/// GAsyncReadyCallback for `webkit_web_view_evaluate_javascript`.
+extern "C" fn on_eval_done(_source: *mut c_void, result: *mut c_void, data: *mut c_void) {
+    let state = unsafe { &mut *(data as *mut ViewState) };
+    state.eval_in_flight = false;
+
+    let mut error: *mut c_void = ptr::null_mut();
+    let value = unsafe {
+        ffi::webkit_web_view_evaluate_javascript_finish(state.web_view, result, &mut error)
+    };
+    if value.is_null() {
+        // GError layout is { GQuark domain (u32); gint code (i32); gchar
+        // *message }, so the message pointer sits one 64-bit slot in.
+        let message = unsafe {
+            if error.is_null() {
+                "evaluate_javascript failed with no GError".to_string()
+            } else {
+                let msg_ptr = *(error as *const *const c_char).add(1);
+                crate::cstr(msg_ptr)
+            }
+        };
+        state.eval_result = Some(Err(message));
+        if !error.is_null() {
+            // g_error_free, NOT g_object_unref: a GError is a plain struct, and
+            // unreffing it corrupts the heap.
+            unsafe { ffi::g_error_free(error) };
+        }
+        return;
+    }
+
+    // `undefined` has no JSON representation; report it as JSON null rather
+    // than as an empty string, which a caller would read as "".
+    let json = unsafe {
+        if ffi::jsc_value_is_undefined(value) != 0 {
+            "null".to_string()
+        } else {
+            let raw = ffi::jsc_value_to_json(value, 0);
+            let text = crate::cstr(raw);
+            if !raw.is_null() {
+                ffi::g_free(raw as *mut c_void);
+            }
+            text
+        }
+    };
+    unsafe { ffi::g_object_unref(value) };
+    state.eval_result = Some(Ok(json));
+}
+
 extern "C" fn on_load_changed(_view: *mut c_void, event: c_int, data: *mut c_void) {
     let state = unsafe { &mut *(data as *mut ViewState) };
     if event == ffi::WEBKIT_LOAD_FINISHED {
@@ -144,6 +199,9 @@ impl View {
             document_generation: 0,
             last_frame_generation: 0,
             painted_count: 0,
+            eval_result: None,
+            eval_in_flight: false,
+            web_view: ptr::null_mut(),
         });
         let state_ptr = state.as_mut() as *mut ViewState as *mut c_void;
 
@@ -178,6 +236,7 @@ impl View {
                 return Err(Error::ViewCreation("webkit_web_view_new returned NULL"));
             }
 
+            state.web_view = web_view;
             connect(web_view, "web-process-terminated", on_web_process_terminated as *mut c_void, state_ptr);
             connect(web_view, "load-changed", on_load_changed as *mut c_void, state_ptr);
 
@@ -290,6 +349,40 @@ impl View {
     /// affected view ONLY.
     pub fn web_process_terminated(&self) -> bool {
         self.state.web_process_terminated
+    }
+
+    /// Begin evaluating `script` in the page. The result lands asynchronously;
+    /// pump until [`Self::take_eval_result`] returns something.
+    ///
+    /// Not public: an async call that needs the caller to pump is a footgun, so
+    /// [`crate::Supervisor::eval`] owns the pump-and-wait and is the only way in.
+    pub(crate) fn begin_eval(&mut self, script: &str) -> Result<()> {
+        let c_script = CString::new(script).map_err(|_| Error::InvalidScript)?;
+        self.state.eval_result = None;
+        self.state.eval_in_flight = true;
+        let state_ptr = self.state.as_mut() as *mut ViewState as *mut c_void;
+        unsafe {
+            ffi::webkit_web_view_evaluate_javascript(
+                self.web_view,
+                c_script.as_ptr(),
+                -1,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                Some(on_eval_done),
+                state_ptr,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn eval_settled(&self) -> bool {
+        self.state.eval_result.is_some()
+    }
+
+    pub(crate) fn take_eval_result(&mut self) -> Option<std::result::Result<String, String>> {
+        self.state.eval_in_flight = false;
+        self.state.eval_result.take()
     }
 
     /// Click at `(x, y)` in view coordinates.
