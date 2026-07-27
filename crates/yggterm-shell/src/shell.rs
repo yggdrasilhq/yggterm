@@ -1452,8 +1452,8 @@ fn kill_control_forward(contribution: &SidebarContributionState) {
 /// ephemeral "temp" (it gets its own card).
 fn enumerate_web_surface_profiles() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    if let Ok(home) = yggterm_core::resolve_yggterm_home()
-        && let Ok(entries) = std::fs::read_dir(home.join("web-profiles"))
+    if let Some(root) = web_surface_profiles_root()
+        && let Ok(entries) = std::fs::read_dir(root)
     {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
@@ -1473,22 +1473,114 @@ fn enumerate_web_surface_profiles() -> Vec<String> {
     names.dedup();
     names
 }
-/// Delete a host-owned web-profile jar (cookies, logins, storage) from the
-/// picker UI. The name goes through the same sanitizer the open path uses, so
-/// a hostile value can never escape `~/.yggterm/web-profiles/`; the reserved
-/// ephemeral profile has no jar to delete. Returns whether a jar was removed.
-fn delete_web_surface_profile(profile: &str) -> bool {
+/// A host-owned profile's `profile.json` metadata. Missing file ⇒ defaults —
+/// the overwhelmingly common case, and never an error.
+///
+/// Deliberately a plain read on every call rather than a memo: the sidecar is
+/// well under a page, the render sites that ask are the picker and the two
+/// surface badges (a handful of reads per snapshot tick), and a cache is one
+/// more place the on-disk truth and the drawn truth could diverge.
+fn web_surface_profile_meta(profile: &str) -> yggterm_core::web_profile::ProfileMeta {
+    match web_surface_profiles_root() {
+        Some(root) => web_surface_profile_meta_in(&root, profile),
+        None => yggterm_core::web_profile::ProfileMeta::default(),
+    }
+}
+/// The GUI host's profile jar root. The `_in` variants below take it as an
+/// argument so the metadata and delete PATHS — guard included — can be
+/// exercised against a scratch root without an env var the rest of the test
+/// binary would race on.
+fn web_surface_profiles_root() -> Option<std::path::PathBuf> {
+    yggterm_core::resolve_yggterm_home()
+        .ok()
+        .map(|home| home.join("web-profiles"))
+}
+fn web_surface_profile_meta_in(
+    root: &std::path::Path,
+    profile: &str,
+) -> yggterm_core::web_profile::ProfileMeta {
     let normalized = normalize_web_surface_profile(Some(profile));
-    if normalized != profile.trim() || normalized == WEB_SURFACE_TEMP_PROFILE {
-        return false;
+    if normalized == WEB_SURFACE_TEMP_PROFILE {
+        return yggterm_core::web_profile::ProfileMeta::default();
     }
-    let Some(dir) = web_surface_profile_dir(&normalized) else {
-        return false;
+    yggterm_core::web_profile::ProfileMeta::read(&root.join(normalized))
+}
+/// THE avatar for a profile, for every yggterm surface that draws one.
+///
+/// The picker card, the classic strip badge and the vertical rail badge all
+/// come through here, so "what does profile X look like" has one answer. The
+/// derivation itself belongs to `yggterm-core` (shared with the daemon and,
+/// once synced, ychrome's own picker); this is the GUI's single call site into
+/// it — see `the_gui_derives_a_profile_avatar_in_exactly_one_place`.
+fn web_surface_profile_avatar(profile: &str) -> String {
+    yggterm_core::web_profile::web_profile_avatar(profile, &web_surface_profile_meta(profile))
+}
+/// The surface-level identity pill's text: the same avatar the picker card
+/// draws, then the profile name. One function for both badge homes (classic
+/// strip and vertical rail) so the two can never drift apart.
+fn web_surface_profile_badge_label(profile: &str) -> String {
+    format!("{} {profile}", web_surface_profile_avatar(profile))
+}
+/// Persist a change to a profile's metadata, preserving every key this build
+/// does not know (`agent_drive` is specced into the same file). Read-modify-
+/// write through `ProfileMeta` — never a blind overwrite.
+fn update_web_surface_profile_meta(
+    profile: &str,
+    edit: impl FnOnce(&mut yggterm_core::web_profile::ProfileMeta),
+) -> Result<(), String> {
+    let Some(root) = web_surface_profiles_root() else {
+        return Err("this host has no yggterm home to write a profile into".to_string());
     };
-    if !dir.is_dir() {
-        return false;
+    update_web_surface_profile_meta_in(&root, profile, edit)
+}
+fn update_web_surface_profile_meta_in(
+    root: &std::path::Path,
+    profile: &str,
+    edit: impl FnOnce(&mut yggterm_core::web_profile::ProfileMeta),
+) -> Result<(), String> {
+    let normalized = normalize_web_surface_profile(Some(profile));
+    if normalized != profile.trim() {
+        return Err("that is not a profile name this host can edit".to_string());
     }
-    std::fs::remove_dir_all(&dir).is_ok()
+    if normalized == WEB_SURFACE_TEMP_PROFILE {
+        return Err("the temporary profile keeps nothing on disk".to_string());
+    }
+    let dir = root.join(&normalized);
+    let mut meta = yggterm_core::web_profile::ProfileMeta::read(&dir);
+    edit(&mut meta);
+    meta.write(&dir).map_err(|err| err.to_string())
+}
+/// Delete a host-owned web-profile jar (cookies, logins, storage) from the
+/// picker UI.
+///
+/// The whole policy — unsafe name, ephemeral, default, protected — belongs to
+/// `yggterm_core::web_profile::web_profile_delete_refusal`; this function owns
+/// only the filesystem half. `Err` carries the NAMED refusal so the UI can say
+/// why rather than doing nothing; `Ok(false)` means the policy allowed it and
+/// there was simply no jar on disk.
+fn delete_web_surface_profile(
+    profile: &str,
+) -> Result<bool, yggterm_core::web_profile::WebProfileDeleteRefusal> {
+    let Some(root) = web_surface_profiles_root() else {
+        return Ok(false);
+    };
+    delete_web_surface_profile_in(&root, profile)
+}
+fn delete_web_surface_profile_in(
+    root: &std::path::Path,
+    profile: &str,
+) -> Result<bool, yggterm_core::web_profile::WebProfileDeleteRefusal> {
+    let meta = web_surface_profile_meta_in(root, profile);
+    // THE guard. Nothing below this line may run for a refused profile — the
+    // next statement is a recursive delete.
+    if let Some(refusal) = yggterm_core::web_profile::web_profile_delete_refusal(profile, &meta) {
+        return Err(refusal);
+    }
+    let dir = root.join(normalize_web_surface_profile(Some(profile)));
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    Ok(std::fs::remove_dir_all(&dir).is_ok())
 }
 /// Minimal loopback HTTP GET (fire the request, drain the response) against a
 /// picker control endpoint — `http://127.0.0.1:<port>/...`, possibly the local
@@ -2338,6 +2430,7 @@ impl AppPaneContextMenu {
                 destructive: false,
                 emphasized: false,
                 separator: false,
+                disabled: false,
             })
             .collect()
     }
@@ -4873,8 +4966,7 @@ fn web_surface_tab_store_path(profile: &str) -> Option<std::path::PathBuf> {
     if profile == WEB_SURFACE_TEMP_PROFILE {
         return None;
     }
-    let home = yggterm_core::resolve_yggterm_home().ok()?;
-    Some(home.join("web-profiles").join(profile).join("tabs.json"))
+    Some(web_surface_profile_dir(profile)?.join("tabs.json"))
 }
 /// One saved tab. The app tab is never saved (the app supplies it on open), and
 /// no live handle (webview id, ssh forward, socks port) is: those belong to a
@@ -5030,8 +5122,7 @@ fn web_surface_history_path(profile: &str) -> Option<std::path::PathBuf> {
     if profile == WEB_SURFACE_TEMP_PROFILE {
         return None;
     }
-    let home = yggterm_core::resolve_yggterm_home().ok()?;
-    Some(home.join("web-profiles").join(profile).join("history.jsonl"))
+    Some(web_surface_profile_dir(profile)?.join("history.jsonl"))
 }
 fn append_web_surface_history(profile: &str, url: &str, title: &str) {
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -6971,9 +7062,7 @@ fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
     if profile == WEB_SURFACE_TEMP_PROFILE {
         return None;
     }
-    yggterm_core::resolve_yggterm_home()
-        .ok()
-        .map(|home| home.join("web-profiles").join(profile))
+    web_surface_profiles_root().map(|root| root.join(profile))
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
@@ -85529,6 +85618,7 @@ fn TerminalCanvas(
                                 control_url: picker_control_url,
                                 foreground: web_chrome_fg.clone(),
                                 background: web_frame_bg.clone(),
+                                palette: snapshot.palette,
                             }
                         }
                     } else {
@@ -85774,7 +85864,10 @@ fn TerminalCanvas(
                                         "align-self:center; {}",
                                         session_row_badge_style(&web_chrome_fg)
                                     ),
-                                    "{profile}"
+                                    // The picker's avatar, in the pill. One
+                                    // derivation for both — see
+                                    // `web_surface_profile_badge_label`.
+                                    {web_surface_profile_badge_label(&profile)}
                                 }
                             }
                             // Standard libyggterm app chrome (top-right
@@ -85901,16 +85994,43 @@ fn TerminalCanvas(
 /// choosing GETs `/open?url=&profile=` on the app's control endpoint, whose
 /// handler re-emits the real OSC "open".
 #[component]
-fn WebSurfacePickerView(control_url: String, foreground: String, background: String) -> Element {
+fn WebSurfacePickerView(
+    control_url: String,
+    foreground: String,
+    background: String,
+    /// Drawn chrome for the card's right-click menu — the picker raises the
+    /// SAME [`ContextMenuOverlay`] the cwd tree and contributed rails raise.
+    palette: Palette,
+) -> Element {
     let mut new_profile_input = use_signal(String::new);
     let mut submitted = use_signal(|| false);
     // Two-step delete arm: the profile whose ✕ was clicked once. A second ✕
     // click deletes the jar; clicking anything else disarms.
     let mut pending_delete = use_signal(|| None::<String>);
-    // Bumped after a deletion so the (disk-enumerated) card list re-renders.
+    // Bumped after a deletion (or a metadata edit) so the disk-enumerated card
+    // list — names AND avatars — re-renders from the new truth on disk.
     let mut profiles_refresh = use_signal(|| 0u32);
+    // The card whose context menu is open, and where it was raised.
+    let mut profile_menu = use_signal(|| None::<(String, (f64, f64))>);
+    // The card whose avatar is being typed, and what has been typed so far.
+    let mut avatar_edit = use_signal(|| None::<String>);
+    let mut avatar_input = use_signal(String::new);
+    // A refusal (bad avatar, unwritable jar, protected profile) shown in place
+    // of the subtitle. Never a silent no-op.
+    let mut picker_notice = use_signal(|| None::<String>);
     let _ = profiles_refresh();
-    let profiles = enumerate_web_surface_profiles();
+    let window_inner = use_window().inner_size();
+    let menu_window_size = (window_inner.width as f64, window_inner.height as f64);
+    // Name + metadata together: the ✕ has to know whether the profile is
+    // protected, and the card has to know its avatar, and both must be the
+    // truth on disk at this render rather than a remembered one.
+    let profiles = enumerate_web_surface_profiles()
+        .into_iter()
+        .map(|name| {
+            let meta = web_surface_profile_meta(&name);
+            (name, meta)
+        })
+        .collect::<Vec<_>>();
     // Profile-first (Chrome-like): the picker ONLY chooses identity. The URL
     // is typed later in the surface's address bar — an empty url in the /open
     // GET lands the chosen profile on ychrome's start page. No URL input here:
@@ -85949,14 +86069,19 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
         }
         choose_new(name);
     };
-    let muted = format!("color:{foreground}; opacity:0.6;");
     let card_style = format!(
         "position:relative; display:flex; flex-direction:column; align-items:center; gap:9px; padding:18px 10px 14px; \
          width:118px; border:1px solid rgba(127,127,127,0.35); border-radius:14px; cursor:pointer; \
          background:rgba(127,127,127,0.10); color:{foreground}; font-size:13px;"
     );
+    // The avatar is an EMOJI now, so the circle stops being a coloured chip
+    // that needs white text on it and becomes the same translucent surface the
+    // card itself uses. The old first-letter-on-a-gradient avatar is gone
+    // entirely — it was a second, letter-shaped encoding of identity that only
+    // the picker implemented, so the badges could never match it.
     let avatar_style = "width:46px; height:46px; border-radius:50%; display:grid; place-items:center; \
-         font-size:20px; font-weight:600; color:#fff; background:linear-gradient(135deg,#6c8cff,#9a6bff);";
+         font-size:24px; line-height:1; background:rgba(127,127,127,0.16); \
+         box-shadow:inset 0 0 0 1px rgba(127,127,127,0.30);";
     rsx! {
         div {
             style: format!(
@@ -85968,63 +86093,189 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                 div {
                     style: "display:flex; flex-direction:column; gap:6px;",
                     div { style: "font-size:22px; font-weight:600;", "Choose a profile" }
+                    // Subtitle, or the last refusal. A guard that silently does
+                    // nothing is indistinguishable from a broken button, so a
+                    // named reason takes this line until the next action.
                     div {
-                        style: format!("font-size:13px; {muted}"),
-                        if submitted() { "Opening…" } else { "Each profile keeps its own cookies and logins." }
+                        "data-web-picker-notice": "{picker_notice().is_some()}",
+                        // Every branch emits the SAME style keys (the Dioxus
+                        // property-by-property trap): only the colour changes.
+                        style: format!(
+                            "font-size:13px; color:{}; opacity:{};",
+                            if picker_notice().is_some() { "#c23f4d" } else { foreground.as_str() },
+                            if picker_notice().is_some() { "1" } else { "0.6" },
+                        ),
+                        if let Some(notice) = picker_notice() {
+                            "{notice}"
+                        } else if submitted() {
+                            "Opening…"
+                        } else {
+                            "Each profile keeps its own cookies and logins. Right-click a profile to change its avatar."
+                        }
                     }
                 }
                 div {
                     style: "display:flex; flex-wrap:wrap; gap:14px; justify-content:center;",
-                    for profile in profiles {
+                    for (profile , meta) in profiles {
+                        {
+                            let protected = yggterm_core::web_profile::web_profile_is_protected(&profile, &meta);
+                            let avatar = web_surface_profile_avatar(&profile);
+                            let editing = avatar_edit().as_deref() == Some(profile.as_str());
+                            let armed = pending_delete().as_deref() == Some(profile.as_str());
+                            let card_profile = profile.clone();
+                            let menu_profile_name = profile.clone();
+                            let delete_profile = profile.clone();
+                            let commit_profile = profile.clone();
+                            rsx! {
                         div {
                             key: "picker-{profile}",
+                            "data-web-picker-profile": "{profile}",
+                            "data-web-picker-avatar": "{avatar}",
+                            "data-web-picker-protected": "{protected}",
                             style: card_style.clone(),
                             onclick: {
-                                let profile = profile.clone();
                                 let mut choose_profile = choose_profile.clone();
                                 move |_| {
+                                    // Any click that is not a second ✕ or the
+                                    // avatar field disarms the transient states
+                                    // first — never open a profile by accident
+                                    // while dismissing something.
                                     if pending_delete().is_some() {
                                         pending_delete.set(None);
                                         return;
                                     }
-                                    choose_profile(profile.clone())
+                                    if avatar_edit().is_some() {
+                                        avatar_edit.set(None);
+                                        return;
+                                    }
+                                    choose_profile(card_profile.clone())
                                 }
                             },
-                            button {
-                                style: format!(
-                                    "position:absolute; top:6px; right:6px; border:none; cursor:pointer; line-height:1; \
-                                     border-radius:8px; font-size:11px; padding:3px 6px; {}",
-                                    if pending_delete().as_deref() == Some(profile.as_str()) {
-                                        "background:#c0392b; color:#fff;".to_string()
-                                    } else {
-                                        format!("background:transparent; color:{foreground}; opacity:0.45;")
-                                    },
-                                ),
-                                title: if pending_delete().as_deref() == Some(profile.as_str()) {
-                                    "Click again to permanently delete this profile's cookies, logins and storage"
-                                } else {
-                                    "Delete profile"
-                                },
-                                onclick: {
-                                    let profile = profile.clone();
-                                    move |evt: MouseEvent| {
-                                        evt.stop_propagation();
-                                        if pending_delete().as_deref() == Some(profile.as_str()) {
-                                            let _ = delete_web_surface_profile(&profile);
-                                            pending_delete.set(None);
-                                            profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                            // Right-click raises the SHARED context menu (avatar
+                            // + protection). Same component the cwd tree uses.
+                            oncontextmenu: {
+                                move |evt: MouseEvent| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    let coords = evt.client_coordinates();
+                                    pending_delete.set(None);
+                                    picker_notice.set(None);
+                                    profile_menu.set(Some((
+                                        menu_profile_name.clone(),
+                                        (coords.x, coords.y),
+                                    )));
+                                }
+                            },
+                            // A protected profile has NO ✕ at all. The affordance
+                            // is absent rather than dimmed because the two-click
+                            // arm has no meaningful armed state when the second
+                            // click can only refuse.
+                            if !protected {
+                                button {
+                                    "data-web-picker-delete": "{profile}",
+                                    style: format!(
+                                        "position:absolute; top:6px; right:6px; border:none; cursor:pointer; line-height:1; \
+                                         border-radius:8px; font-size:11px; padding:3px 6px; {}",
+                                        if armed {
+                                            "background:#c0392b; color:#fff;".to_string()
                                         } else {
-                                            pending_delete.set(Some(profile.clone()));
+                                            format!("background:transparent; color:{foreground}; opacity:0.45;")
+                                        },
+                                    ),
+                                    title: if armed {
+                                        "Click again to permanently delete this profile's cookies, logins and storage"
+                                    } else {
+                                        "Delete profile"
+                                    },
+                                    onclick: {
+                                        move |evt: MouseEvent| {
+                                            evt.stop_propagation();
+                                            if pending_delete().as_deref() == Some(delete_profile.as_str()) {
+                                                // The guard lives in core and answers
+                                                // for every caller; a refusal is SHOWN,
+                                                // never swallowed.
+                                                match delete_web_surface_profile(&delete_profile) {
+                                                    Ok(_) => picker_notice.set(None),
+                                                    Err(refusal) => {
+                                                        picker_notice.set(Some(refusal.reason().to_string()));
+                                                    }
+                                                }
+                                                pending_delete.set(None);
+                                                profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                                            } else {
+                                                picker_notice.set(None);
+                                                pending_delete.set(Some(delete_profile.clone()));
+                                            }
                                         }
-                                    }
-                                },
-                                if pending_delete().as_deref() == Some(profile.as_str()) { "delete?" } else { "✕" }
+                                    },
+                                    if armed { "delete?" } else { "✕" }
+                                }
                             }
                             span {
                                 style: avatar_style,
-                                {profile.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()}
+                                "{avatar}"
                             }
-                            span { "{profile}" }
+                            if editing {
+                                input {
+                                    r#type: "text",
+                                    "data-web-picker-avatar-input": "{profile}",
+                                    placeholder: "emoji",
+                                    autocomplete: "off",
+                                    spellcheck: "false",
+                                    style: format!(
+                                        "width:100%; padding:4px 6px; font-size:15px; text-align:center; \
+                                         border:1px solid rgba(127,127,127,0.4); border-radius:8px; \
+                                         background:transparent; color:{foreground}; outline:none;"
+                                    ),
+                                    value: "{avatar_input}",
+                                    onclick: move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        let _ = document::eval(
+                                            r#"
+                                            const input = document.querySelector('[data-web-picker-avatar-input]');
+                                            if (input && typeof input.focus === 'function') {
+                                                input.focus({ preventScroll: true });
+                                            }
+                                            "#,
+                                        );
+                                    },
+                                    oninput: move |evt| avatar_input.set(evt.value()),
+                                    onkeydown: {
+                                        move |evt: KeyboardEvent| {
+                                            match evt.key() {
+                                                Key::Enter => {
+                                                    let typed = avatar_input();
+                                                    if !yggterm_core::web_profile::web_profile_emoji_is_valid(&typed) {
+                                                        picker_notice.set(Some(
+                                                            "an avatar is one emoji (two at most) — no spaces".to_string(),
+                                                        ));
+                                                        return;
+                                                    }
+                                                    let chosen = typed.trim().to_string();
+                                                    match update_web_surface_profile_meta(
+                                                        &commit_profile,
+                                                        move |meta| meta.emoji = Some(chosen),
+                                                    ) {
+                                                        Ok(()) => picker_notice.set(None),
+                                                        Err(err) => picker_notice.set(Some(err)),
+                                                    }
+                                                    avatar_edit.set(None);
+                                                    profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                                                }
+                                                Key::Escape => {
+                                                    avatar_edit.set(None);
+                                                    picker_notice.set(None);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    },
+                                }
+                            } else {
+                                span { "{profile}" }
+                            }
+                        }
+                            }
                         }
                     }
                     div {
@@ -86106,8 +86357,110 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                     }
                 }
             }
+            // The card's right-click menu. REUSED, not reinvented: the same
+            // ContextMenuOverlay the cwd tree and contributed rails raise, fed
+            // the same RowMenuItem vocabulary.
+            if let Some((menu_profile_name, position)) = profile_menu() {
+                {
+                    let menu_meta = web_surface_profile_meta(&menu_profile_name);
+                    let action_profile = menu_profile_name.clone();
+                    rsx! {
+                        ContextMenuOverlay {
+                            position,
+                            window_size: menu_window_size,
+                            palette,
+                            items: web_profile_menu_items(&menu_profile_name, &menu_meta),
+                            menu_title: menu_profile_name.clone(),
+                            keytip_tree: KeyTipTree::default(),
+                            alt_overlay_active: false,
+                            alt_overlay_sequence: String::new(),
+                            on_close: move |_| profile_menu.set(None),
+                            on_action: {
+                                move |id: String| {
+                                    profile_menu.set(None);
+                                    picker_notice.set(None);
+                                    match id.as_str() {
+                                        WEB_PROFILE_MENU_CHANGE_AVATAR => {
+                                            avatar_input.set(String::new());
+                                            avatar_edit.set(Some(action_profile.clone()));
+                                            // The field only just mounted; focus it
+                                            // once the re-render commits, the same
+                                            // way the new-profile field does.
+                                            let _ = document::eval(
+                                                "setTimeout(() => { const el = document.querySelector('[data-web-picker-avatar-input]'); if (el) { el.focus(); if (el.select) { el.select(); } } }, 60);",
+                                            );
+                                        }
+                                        WEB_PROFILE_MENU_RESET_AVATAR => {
+                                            if let Err(err) = update_web_surface_profile_meta(
+                                                &action_profile,
+                                                |meta| meta.emoji = None,
+                                            ) {
+                                                picker_notice.set(Some(err));
+                                            }
+                                            profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                                        }
+                                        WEB_PROFILE_MENU_PROTECT | WEB_PROFILE_MENU_UNPROTECT => {
+                                            let protect = id == WEB_PROFILE_MENU_PROTECT;
+                                            if let Err(err) = update_web_surface_profile_meta(
+                                                &action_profile,
+                                                move |meta| meta.protected = protect,
+                                            ) {
+                                                picker_notice.set(Some(err));
+                                            }
+                                            pending_delete.set(None);
+                                            profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            }
         }
     }
+}
+/// Menu ids for a profile card. Named constants because the builder and the
+/// dispatcher must agree on them, and a typo in either would be a silently
+/// inert menu entry.
+const WEB_PROFILE_MENU_CHANGE_AVATAR: &str = "web-profile-change-avatar";
+const WEB_PROFILE_MENU_RESET_AVATAR: &str = "web-profile-reset-avatar";
+const WEB_PROFILE_MENU_PROTECT: &str = "web-profile-protect";
+const WEB_PROFILE_MENU_UNPROTECT: &str = "web-profile-unprotect";
+/// What a profile card's right-click menu contains — the single source of
+/// truth for it, in the shared [`RowMenuItem`] vocabulary.
+///
+/// The protect entry is always PRESENT: on the default profile it is disabled
+/// rather than absent, so the user learns that the profile is permanent
+/// instead of wondering where the verb went.
+fn web_profile_menu_items(
+    profile: &str,
+    meta: &yggterm_core::web_profile::ProfileMeta,
+) -> Vec<RowMenuItem> {
+    let is_default =
+        normalize_web_surface_profile(Some(profile)) == yggterm_core::web_profile::WEB_PROFILE_DEFAULT;
+    let mut items = vec![RowMenuItem::new(
+        WEB_PROFILE_MENU_CHANGE_AVATAR,
+        "Change avatar…",
+        'a',
+    )];
+    if meta.emoji.is_some() {
+        items.push(RowMenuItem::new(
+            WEB_PROFILE_MENU_RESET_AVATAR,
+            "Use the default avatar",
+            'd',
+        ));
+    }
+    items.push(RowMenuItem::divider());
+    items.push(if is_default {
+        RowMenuItem::new(WEB_PROFILE_MENU_PROTECT, "Protect profile", 'p').disabled()
+    } else if meta.protected {
+        RowMenuItem::new(WEB_PROFILE_MENU_UNPROTECT, "Unprotect profile", 'p')
+    } else {
+        RowMenuItem::new(WEB_PROFILE_MENU_PROTECT, "Protect profile", 'p')
+    });
+    items
 }
 struct TerminalFrameStyle {
     padding: &'static str,
@@ -104274,7 +104627,9 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             "data-ws-rail-profile-badge": "{profile}",
                             title: "ychrome profile: {profile}",
                             style: session_row_badge_style(palette.accent),
-                            "{profile}"
+                            // Identical to the classic strip badge and to the
+                            // picker card: one derivation, three homes.
+                            {web_surface_profile_badge_label(&profile)}
                         }
                     }
                     button {
@@ -107137,6 +107492,11 @@ struct RowMenuItem {
     emphasized: bool,
     /// A divider: drawn, never badged, never dispatched.
     separator: bool,
+    /// Shown, dimmed, and inert: the verb exists for this noun but not in this
+    /// state (protecting the default profile, which is protected already).
+    /// Hiding it instead would make the menu's shape depend on state, which is
+    /// how a user learns a verb exists by accident.
+    disabled: bool,
 }
 impl RowMenuItem {
     fn new(id: impl Into<String>, label: impl Into<String>, hint: char) -> Self {
@@ -107147,6 +107507,7 @@ impl RowMenuItem {
             destructive: false,
             emphasized: false,
             separator: false,
+            disabled: false,
         }
     }
     fn hinted(id: impl Into<String>, label: impl Into<String>, hint: Option<char>) -> Self {
@@ -107157,6 +107518,7 @@ impl RowMenuItem {
             destructive: false,
             emphasized: false,
             separator: false,
+            disabled: false,
         }
     }
     fn destructive(mut self) -> Self {
@@ -107167,6 +107529,11 @@ impl RowMenuItem {
         self.emphasized = true;
         self
     }
+    /// Draw it, dim it, never dispatch it.
+    fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
     fn divider() -> Self {
         Self {
             id: String::new(),
@@ -107175,6 +107542,7 @@ impl RowMenuItem {
             destructive: false,
             emphasized: false,
             separator: true,
+            disabled: false,
         }
     }
 }
@@ -108083,18 +108451,36 @@ fn ContextMenuOverlay(
                         button {
                             key: "item-{item.id}",
                             "data-context-menu-action": "{item.id}",
+                            "data-context-menu-disabled": "{item.disabled}",
                             class: "yggterm-menu-item",
-                            style: if item.destructive {
-                                context_menu_action_style_destructive(palette)
-                            } else {
-                                context_menu_action_style(palette, item.emphasized)
-                            },
+                            // ⚠ Dioxus applies `style` PROPERTY BY PROPERTY and
+                            // never clears a key a later render drops, so the
+                            // dimming cannot be an extra key on one branch: every
+                            // branch here emits the identical key set, `opacity`
+                            // and `cursor` included (the sidebar-overlay trap).
+                            style: format!(
+                                "{} opacity:{}; cursor:{};",
+                                if item.destructive {
+                                    context_menu_action_style_destructive(palette)
+                                } else {
+                                    context_menu_action_style(palette, item.emphasized)
+                                },
+                                if item.disabled { "0.42" } else { "1" },
+                                if item.disabled { "default" } else { "pointer" },
+                            ),
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: {
                                 let id = item.id.clone();
+                                let disabled = item.disabled;
                                 let on_action = on_action;
                                 move |evt: MouseEvent| {
                                     evt.stop_propagation();
+                                    // A dimmed item is inert at the DISPATCH, not
+                                    // just in CSS: `pointer-events` would leave the
+                                    // ALT/KeyTip path able to run it.
+                                    if disabled {
+                                        return;
+                                    }
                                     on_action.call(id.clone());
                                 }
                             },
@@ -114651,6 +115037,328 @@ mod tests {
     // Vertical mode IS the rail. A GUI that starts with the pref already on used
     // to collapse the tab strip and open nothing, so the tabs had NO home — the
     // invariant this test exists to hold. Caught live, on a restart, not by code
+    // ── Web-profile metadata: emoji avatars + protected profiles ───────────
+    //
+    // The FORMAT and the POLICY live in `yggterm_core::web_profile` (round
+    // trip, determinism, the delete guard) and are locked there. These locks
+    // are about the GUI's half: that the three render sites share ONE
+    // derivation, that the picker's ✕ obeys the guard, and that the shared
+    // context menu says the right thing for the default profile.
+
+    /// A scratch profile jar ROOT that removes itself. The `_in` variants of
+    /// the metadata/delete functions exist precisely so these locks never
+    /// touch `$YGGTERM_HOME` — a test that set that env var would race every
+    /// other test in this binary, and a mutation red-proof of the delete guard
+    /// would aim `remove_dir_all` at the user's real jars.
+    struct ScratchProfilesRoot(PathBuf);
+
+    impl ScratchProfilesRoot {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "yggterm-web-profiles-{tag}-{}-{}",
+                std::process::id(),
+                current_millis()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create scratch profiles root");
+            Self(root)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        /// A jar with something in it, so a wrongful delete is VISIBLE.
+        fn seed_jar(&self, profile: &str) -> PathBuf {
+            let jar = self.0.join(profile);
+            fs::create_dir_all(&jar).expect("create scratch jar");
+            fs::write(jar.join("cookies.sqlite"), b"logged in").expect("seed jar contents");
+            jar
+        }
+    }
+
+    impl Drop for ScratchProfilesRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// ⚠ THE SINGLE-DERIVATION LOCK (values). The picker card's avatar and the
+    /// surface badge's avatar are the same string for the same profile,
+    /// because they come from the same function. Before this lane the picker
+    /// derived a letter and the badges derived nothing at all, so the two
+    /// surfaces described one identity two ways.
+    #[test]
+    fn the_picker_card_and_the_surface_badge_derive_one_avatar() {
+        // A name with no jar anywhere on this host: the answer is the derived
+        // default, on both surfaces.
+        let profile = "lane-c-avatar-probe-no-jar";
+        let card = web_surface_profile_avatar(profile);
+        assert_eq!(
+            card,
+            yggterm_core::web_profile::default_web_profile_emoji(profile),
+            "with no metadata the card shows the deterministic default"
+        );
+        assert_eq!(
+            web_surface_profile_badge_label(profile),
+            format!("{card} {profile}"),
+            "the badge pill is the SAME avatar plus the name"
+        );
+        for other in ["work", "personal", "default", "banking"] {
+            assert!(
+                web_surface_profile_badge_label(other)
+                    .starts_with(&web_surface_profile_avatar(other)),
+                "badge and card disagree for {other:?}"
+            );
+        }
+    }
+
+    /// ⚠ THE ONE-CALL-SITE LOCK. Counted, never `contains`: a substring needle
+    /// is satisfied by the FIRST occurrence and says nothing about a second
+    /// derivation appended beside it. The GUI may reach the core derivation
+    /// exactly once, and the dead letter-avatar encoding may not come back.
+    #[test]
+    fn the_gui_derives_a_profile_avatar_in_exactly_one_place() {
+        let source = include_str!("shell.rs");
+        let product = source
+            .split("// SECTION: tests")
+            .next()
+            .expect("shell.rs has a product half above the tests section");
+        assert!(
+            product.len() > 3_000_000,
+            "the product half of shell.rs came out at {} bytes — this scan went blind",
+            product.len()
+        );
+        assert_eq!(
+            product.matches("web_profile::web_profile_avatar(").count(),
+            1,
+            "the core avatar derivation must have exactly ONE call site in the GUI \
+             (`web_surface_profile_avatar`); a second one is a second encoding"
+        );
+        assert_eq!(
+            product.matches("default_web_profile_emoji(").count(),
+            0,
+            "render sites must ask `web_surface_profile_avatar`, which honours a \
+             chosen emoji; reaching for the DEFAULT directly ignores the owner's choice"
+        );
+        assert!(
+            !product.contains("c.to_uppercase().to_string()).unwrap_or_default()"),
+            "the first-letter avatar is dead — it was a second, letter-shaped encoding \
+             of identity that only the picker implemented"
+        );
+        assert!(
+            !product.contains("linear-gradient(135deg,#6c8cff,#9a6bff);\"; }"),
+            "the letter avatar's gradient chip must not linger as an avatar style"
+        );
+        // Every badge home goes through the shared label builder. Counting BOTH
+        // sides means an appended badge that renders `{profile}` raw is red.
+        let badge_markers = product.matches("\"data-ws-profile-badge\"").count()
+            + product.matches("\"data-ws-rail-profile-badge\"").count();
+        assert_eq!(badge_markers, 2, "the profile badge has exactly two homes");
+        assert_eq!(
+            product
+                .matches("{web_surface_profile_badge_label(&profile)}")
+                .count(),
+            badge_markers,
+            "every profile badge must render the shared label; one of them is \
+             drawing the bare name"
+        );
+    }
+
+    /// ⚠ THE PROTECTED-DELETE LOCK, GUI half. The picker's ✕ goes through the
+    /// core guard, so a protected profile's jar SURVIVES the second click and
+    /// the refusal comes back NAMED (the picker paints it where the subtitle
+    /// is). Mutating the guard away in `delete_web_surface_profile_in` turns
+    /// this red — and, because the root is a scratch dir, red is all it turns.
+    #[test]
+    fn a_protected_profile_refuses_the_pickers_delete_and_keeps_its_jar() {
+        let root = ScratchProfilesRoot::new("protected");
+        let jar = root.seed_jar("work");
+        update_web_surface_profile_meta_in(root.path(), "work", |meta| meta.protected = true)
+            .expect("mark protected");
+
+        let refusal = delete_web_surface_profile_in(root.path(), "work")
+            .expect_err("a protected profile must refuse deletion");
+        assert_eq!(
+            refusal,
+            yggterm_core::web_profile::WebProfileDeleteRefusal::Protected
+        );
+        assert!(
+            refusal.reason().contains("protected"),
+            "the refusal must NAME itself so the picker can say why; got {:?}",
+            refusal.reason()
+        );
+        assert!(
+            jar.join("cookies.sqlite").exists(),
+            "the refusal must be a refusal, not a slower delete"
+        );
+
+        // Unprotecting is the whole point of the toggle: the same jar goes.
+        update_web_surface_profile_meta_in(root.path(), "work", |meta| meta.protected = false)
+            .expect("unprotect");
+        assert_eq!(
+            delete_web_surface_profile_in(root.path(), "work"),
+            Ok(true),
+            "an unprotected profile deletes"
+        );
+        assert!(!jar.exists(), "the jar is gone");
+    }
+
+    /// ⚠ THE DEFAULT-IS-PERMANENT LOCK, GUI half. With NO `profile.json` in
+    /// the jar — the state of every profile that never opened this menu — the
+    /// default still refuses.
+    #[test]
+    fn the_default_profile_is_undeletable_from_the_picker_with_no_sidecar() {
+        let root = ScratchProfilesRoot::new("default-permanent");
+        let jar = root.seed_jar("default");
+        assert!(
+            !jar.join(yggterm_core::web_profile::WEB_PROFILE_META_FILE)
+                .exists(),
+            "this lock is about the NO-metadata case"
+        );
+        assert_eq!(
+            delete_web_surface_profile_in(root.path(), "default"),
+            Err(yggterm_core::web_profile::WebProfileDeleteRefusal::DefaultProfile)
+        );
+        assert!(jar.join("cookies.sqlite").exists(), "the jar must survive");
+    }
+
+    /// ⚠ THE UNKNOWN-KEY LOCK, GUI half. Changing an avatar from the picker is
+    /// a read-modify-write of a file another process also writes: `agent_drive`
+    /// is specced into this very sidecar. A blind overwrite here would re-grant
+    /// agent driving on a profile whose owner denied it.
+    #[test]
+    fn changing_an_avatar_preserves_the_agent_drive_policy() {
+        let root = ScratchProfilesRoot::new("agent-drive");
+        let jar = root.seed_jar("banking");
+        fs::write(
+            jar.join(yggterm_core::web_profile::WEB_PROFILE_META_FILE),
+            br#"{"agent_drive": "deny"}"#,
+        )
+        .expect("seed an agent-drive denial");
+
+        update_web_surface_profile_meta_in(root.path(), "banking", |meta| {
+            meta.emoji = Some("🐧".to_string())
+        })
+        .expect("set the avatar");
+
+        let reread = web_surface_profile_meta_in(root.path(), "banking");
+        assert_eq!(reread.emoji.as_deref(), Some("🐧"));
+        assert_eq!(
+            reread
+                .unknown_keys()
+                .get("agent_drive")
+                .and_then(|value| value.as_str()),
+            Some("deny"),
+            "an avatar edit must not touch the agent policy"
+        );
+        assert_eq!(
+            yggterm_core::web_profile::web_profile_avatar("banking", &reread),
+            "🐧",
+            "and the chosen avatar is what the surfaces now draw"
+        );
+    }
+
+    /// The shared context menu's contents for a profile card. The default
+    /// profile keeps a PROTECT entry that is dimmed rather than missing, so the
+    /// menu's shape does not silently depend on which card was clicked.
+    #[test]
+    fn the_default_profiles_protect_entry_is_shown_and_inert() {
+        let plain = yggterm_core::web_profile::ProfileMeta::default();
+        let default_items = web_profile_menu_items("default", &plain);
+        let protect = default_items
+            .iter()
+            .find(|item| item.id == WEB_PROFILE_MENU_PROTECT)
+            .expect("the default profile still shows the protect verb");
+        assert!(
+            protect.disabled,
+            "the default profile is protected by construction; the toggle must be inert"
+        );
+        assert!(
+            !default_items
+                .iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_UNPROTECT),
+            "the default profile must never offer an UNPROTECT it cannot honour"
+        );
+
+        let work = web_profile_menu_items("work", &plain);
+        assert!(
+            work.iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_PROTECT && !item.disabled),
+            "an ordinary profile's protect toggle is live"
+        );
+
+        // Built by mutation, not struct-update: `ProfileMeta::extra` is private
+        // on purpose so no crate can construct one that forgot the unknown keys.
+        let mut protected = plain.clone();
+        protected.protected = true;
+        let protected_items = web_profile_menu_items("work", &protected);
+        assert!(
+            protected_items
+                .iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_UNPROTECT && !item.disabled),
+            "a protected profile offers the way back"
+        );
+        assert!(
+            !protected_items
+                .iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_PROTECT),
+            "protect and unprotect are one toggle, never both at once"
+        );
+
+        // "Use the default avatar" only exists when there IS a stored one.
+        assert!(
+            !work
+                .iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_RESET_AVATAR)
+        );
+        let mut chosen = plain.clone();
+        chosen.emoji = Some("🐧".to_string());
+        assert!(
+            web_profile_menu_items("work", &chosen)
+                .iter()
+                .any(|item| item.id == WEB_PROFILE_MENU_RESET_AVATAR)
+        );
+        // Change-avatar is unconditional — it is the menu's reason to exist.
+        for items in [&default_items, &work] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.id == WEB_PROFILE_MENU_CHANGE_AVATAR)
+            );
+        }
+    }
+
+    /// The picker's ✕ is ABSENT on a protected card, not merely refused: the
+    /// two-click arm has no meaningful armed state when the second click can
+    /// only refuse. Counted so an appended second delete button is red too.
+    #[test]
+    fn the_pickers_delete_affordance_is_guarded_by_the_protection_predicate() {
+        let source = include_str!("shell.rs");
+        let product = source
+            .split("// SECTION: tests")
+            .next()
+            .expect("shell.rs has a product half above the tests section");
+        assert_eq!(
+            product.matches("\"data-web-picker-delete\"").count(),
+            1,
+            "the picker has exactly one delete affordance"
+        );
+        assert!(
+            product.contains(
+                "                            if !protected {\n\
+                 \x20                               button {\n\
+                 \x20                                   \"data-web-picker-delete\": \"{profile}\","
+            ),
+            "the delete affordance must sit inside the `if !protected` guard"
+        );
+        assert_eq!(
+            product
+                .matches("web_profile::web_profile_is_protected(&profile, &meta)")
+                .count(),
+            1,
+            "the card asks the core predicate for protection, and asks it once"
+        );
+    }
+
     // review.
     #[test]
     fn a_surface_opening_under_vertical_tabs_raises_the_rail() {
