@@ -73,7 +73,15 @@ Build each only when an app truly needs it.
    pane); `RightPanelMode::Vault` and `::AppSidebar` both DELETED 2026-07-10.
    Protocol below.
 4. **Chooser / identity surface** — a picker before launch (profile, workspace,
-   vault account). SHIPPED for ychrome's no-arg profile picker.
+   vault account). SHIPPED for ychrome's no-arg profile picker. What a chosen
+   identity LOOKS like (its avatar) and whether it may be deleted are NOT the
+   picker's to decide: `yggterm_core::web_profile` owns `profile.json` —
+   `web_profile_avatar`, `web_profile_is_protected_by_construction`,
+   `web_profile_delete_refusal` — so the picker card and every surface badge
+   drawn later cannot disagree. See `docs/web-surfaces.md` §"Profile metadata"
+   before adding a field to that file: unknown keys must survive a rewrite
+   (`agent_drive` lives there too), and a stored avatar is validated on READ
+   because another process wrote it.
 
 ## Transport: OSC 7717 on the terminal byte stream
 
