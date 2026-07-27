@@ -2,7 +2,7 @@
 
 This file tracks user-visible changes in `yggterm`.
 
-## Unreleased
+## 2.12.18
 
 - **New: assistants can drive a headless web page from the command line.**
   `yggterm-headless server wpe <verb>` opens a page, navigates it, clicks,

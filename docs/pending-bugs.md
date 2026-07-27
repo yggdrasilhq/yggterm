@@ -30,6 +30,53 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ `web ensure` MINTS ONE WEB PROCESS PER TAB, revealed or not (measured on
+  jojo, 2.12.17, 2026-07-27 — J8a).** The docs promise "thirty rows, not thirty
+  webviews", and the RESTORE path honors it (a never-selected restored tab has
+  no webview) — but one `web ensure` on a declared surface builds a
+  `WebKitWebProcess` for EVERY tab, on a surface never revealed and never
+  visited. The law is exactly linear: processes = tabs + 2, ~108 MB RSS /
+  18.4 MB PSS per webview (PSS floor, trivial static fixture), so 100 tabs =
+  102 processes / ~11.4 GB RSS in one call. 2.12.18's per-tab reclaim drains
+  the pile after the hold (5 s under pressure), but the MINT-time spike is
+  unbounded. Fix: ensure mints the ACTIVE tab's webview only; the rest stay
+  tab-model-only until revealed/selected (the restore path's exact rule), plus
+  a live-webview LRU budget so no path can pile past a cap. Evidence:
+  `~/.local/share/ygg-j8-baseline/` on jojo.
+
+- **★★ A SECOND VIEWER DOUBLES EVERY WEBVIEW, AND `session remove` STRANDS THE
+  SHADOW'S SET FOREVER (jojo, 2.12.17, 2026-07-27 — J8a).** Webviews are
+  per-CLIENT: revealing a 10-tab surface on a shadow client built a second full
+  set (11 more processes). Then `session remove` answered `verified:true`,
+  reaped the ACTIVE client's webviews, and left the shadow's **21 webviews
+  (2.3 GB)** alive with no row anywhere — only `shadow-client.sh stop` freed
+  them. Same family as the remote-cc entry below: the teardown verifies one
+  side and claims the whole. Fix: the remove path must sweep every client's
+  applied set for the session, or refuse with the shadow named.
+
+- **GUI process died mid-J8a with 51 webviews applied (jojo, 2.12.17 GUI 27779
+  → fresh 325652 at 12:17:22, 2026-07-27). Cause UNDETERMINED** — no panic in
+  the trace, no readable OOM record; the 50-webview ramp stage had completed
+  one minute earlier, so the correlation is owned, not proven. The daemon
+  never blinked and every row survived (the constitution held). Watch item:
+  if a fresh GUI dies again near a large applied-webview count, this becomes
+  the top entry; the webview budget above is the mitigation either way.
+
+- **`scripts/shadow-client.sh` is broken for every in-session agent (jojo,
+  2026-07-27 — J8a).** The daemon exports `YGGTERM_BIN=<yggterm-headless>`
+  into rows it owns; the script defaults through `YGGTERM_BIN`, so inside any
+  daemon-owned row it launches the headless binary and dies with "only
+  supports server subcommands". Workaround, verbatim:
+  `YGGTERM_BIN=$HOME/.local/bin/yggterm scripts/shadow-client.sh …`. Fix: the
+  script must refuse a headless binary (probe `--version` output) or default
+  to the GUI binary path explicitly.
+
+- **`WebKitNetworkProcess` accumulates per profile churn (jojo, 2026-07-27 —
+  J8a: 3 → 10 across one baseline run).** One network process per WebContext
+  is the design; contexts for torn-down profiles are not always reaped with
+  their last webview. Small (network processes are lighter than web
+  processes), but it is a leak shape — audit `web_context_key` retirement.
+
 - **★★ REMOTE-CC `session remove` REPORTS `verified:true` WHILE THE REMOTE AGENT
   KEEPS RUNNING (found + reproduced end-to-end on jojo, 2.12.17, 2026-07-27).**
   Removing a `remote-cc://` row reaps only the LOCAL ssh client and still
