@@ -36,6 +36,10 @@ mod terminal_write_bridge;
 mod terminal_write_policy;
 mod theme_contract;
 mod ui_telemetry;
+// Find-in-page: the option mask, the match cap, the position cycle and the
+// keyboard-ownership contract shared by the Ctrl+F bar, the `web find` verb and
+// the engine bridge in `vendor/dioxus-desktop/src/web_surface.rs`.
+mod web_find;
 mod window_icon;
 mod xterm_gate_metrics;
 
