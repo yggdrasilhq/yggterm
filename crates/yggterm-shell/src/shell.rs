@@ -9826,6 +9826,12 @@ enum MainZoomTarget {
 /// session owns the viewport — ychrome/libyggterm apps carry no view toggle
 /// ([`active_session_offers_view_toggle`]), so a present surface wins over the
 /// underlying Terminal view mode.
+///
+/// A surface still in its PROFILE PICKER is not one of those: the picker is
+/// GUI-native DOM and there is no native page to zoom (the reconciler skips
+/// picker surfaces for exactly that reason). It answers `None` here because
+/// `active_web_surface_profile` is the ONE identity accessor and that accessor
+/// withholds an identity nobody has chosen yet.
 fn active_main_zoom_target(snapshot: &RenderSnapshot) -> MainZoomTarget {
     if snapshot.active_web_surface_profile.is_some() {
         return MainZoomTarget::WebSurface;
@@ -11456,12 +11462,17 @@ impl ShellState {
             selected_path,
             selected_row,
             active_session,
-            active_web_surface_profile: active_session_path.as_deref().and_then(|path| {
-                self.web_surfaces
-                    .get(path)
-                    .and_then(|surface| surface.tabs.first())
-                    .map(|app_tab| app_tab.profile.clone())
-            }),
+            // THE one accessor for "what identity is this surface", shared with
+            // the classic strip badge, the dropdown's ✓ and the switch's no-op
+            // check. A surface still in its profile PICKER has not chosen one,
+            // so it answers `None` here — and a rail badge that would have said
+            // "default" over an undecided surface (and opened nothing when
+            // clicked, because the opener reads the same accessor) is not drawn
+            // at all. A private copy of this question is how the badge and the
+            // dropdown came to disagree.
+            active_web_surface_profile: active_session_path
+                .as_deref()
+                .and_then(|path| self.web_surface_session_profile(path)),
             active_web_surface_app_name: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_app_name(path)),
@@ -11485,20 +11496,16 @@ impl ShellState {
                     })
                     .collect()
             },
+            // The cwd tree's row chip. SAME identity accessor as the two badges
+            // — the third surface may be quieter, but it may not answer a
+            // different question — filtered by the ONE owner of that
+            // deliberate difference, [`web_profile_earns_row_badge`].
             web_surface_profiles: self
                 .web_surfaces
-                .iter()
-                .filter(|(_, surface)| surface.picker.is_none())
-                .filter_map(|(path, surface)| {
-                    surface
-                        .tabs
-                        .first()
-                        .map(|app_tab| app_tab.profile.clone())
-                        .filter(|profile| {
-                            !profile.is_empty()
-                                && profile != "default"
-                                && profile != WEB_SURFACE_TEMP_PROFILE
-                        })
+                .keys()
+                .filter_map(|path| {
+                    self.web_surface_session_profile(path)
+                        .filter(|profile| web_profile_earns_row_badge(profile))
                         .map(|profile| (path.clone(), profile))
                 })
                 .collect(),
@@ -13757,7 +13764,7 @@ impl ShellState {
         tab_id: u64,
         folder_id: Option<String>,
     ) {
-        if tab_id == 0 {
+        if tab_id == WEB_TAB_APP_TAB_ID {
             return;
         }
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
@@ -13776,7 +13783,7 @@ impl ShellState {
     /// Drag state for the tab tree. Mouse-driven, like the cwd tree's (HTML5 DnD
     /// is not what that tree uses, and one drag grammar beats two).
     fn web_tab_start_drag(&mut self, tab_id: u64) {
-        if tab_id != 0 {
+        if tab_id != WEB_TAB_APP_TAB_ID {
             self.web_tab_drag = Some(tab_id);
         }
     }
@@ -14659,7 +14666,17 @@ impl ShellState {
     /// same folder. It gets its own history — a duplicate is a fresh visit, not
     /// a fork of somebody else's back button — and it takes the front, which is
     /// what "duplicate" means to a user who wants two of something to compare.
+    ///
+    /// The APP TAB is not duplicable, for the same reason it is not closable
+    /// ([`ShellState::web_surface_close_tab`]) and not filable
+    /// ([`ShellState::web_tab_move_to_folder`]): it is the app process's own
+    /// page, and a copy of it would be a PERSISTED user tab
+    /// ([`ShellState::persist_web_tabs`] deliberately never saves tabs[0]) that
+    /// resurrects a stale start page on the next visit.
     fn web_surface_duplicate_tab(&mut self, session_path: &str, tab_id: u64) -> Option<u64> {
+        if tab_id == WEB_TAB_APP_TAB_ID {
+            return None;
+        }
         let source = self
             .web_surfaces
             .get(session_path)?
@@ -14688,6 +14705,70 @@ impl ShellState {
         surface.address_draft = None;
         self.persist_web_tabs(session_path);
         Some(new_id)
+    }
+
+    /// Run a rail-menu action against this shell. Returns whether it was fully
+    /// handled here.
+    ///
+    /// THE terminus for every verb the menu offers except the split, which
+    /// needs the Dioxus `Signal` (it opens a pane and spawns). Because the work
+    /// lives here and not inside the event closure, "what the label counted"
+    /// and "what actually happened" can be compared by a test with no Dioxus
+    /// runtime at all — which is precisely the coverage a call-site source
+    /// needle cannot give: a needle sees the planner being CALLED, not its
+    /// answer being USED.
+    ///
+    /// The close arms take EXACTLY [`web_tab_menu_close_plan`]'s set, re-run
+    /// against live state so a tab opened while the menu sat open is included
+    /// and one closed meanwhile is simply absent. There is no second list here.
+    fn apply_web_tab_menu_action(&mut self, session_path: &str, action: &WebTabMenuAction) -> bool {
+        match action {
+            // Closing the one tab you clicked needs no announcement; a BULK
+            // close names its number, in the same words the label used.
+            WebTabMenuAction::CloseTab(_) => {
+                let scope = self.web_tab_scope_rows_for_session(session_path);
+                self.web_surface_close_tabs(session_path, &web_tab_menu_close_plan(&scope, action));
+            }
+            WebTabMenuAction::CloseOtherTabs(_) | WebTabMenuAction::CloseFolderTabs(_) => {
+                let scope = self.web_tab_scope_rows_for_session(session_path);
+                let closed = self
+                    .web_surface_close_tabs(session_path, &web_tab_menu_close_plan(&scope, action));
+                if closed > 0 {
+                    self.push_notification(
+                        NotificationTone::Info,
+                        "Tabs Closed",
+                        format!("Closed {}.", web_tab_count_phrase(closed, "tab")),
+                    );
+                }
+            }
+            WebTabMenuAction::DuplicateTab(tab_id) => {
+                self.web_surface_duplicate_tab(session_path, *tab_id);
+            }
+            WebTabMenuAction::MoveToFolder(tab_id, folder) => {
+                self.web_tab_move_to_folder(session_path, *tab_id, folder.clone());
+            }
+            WebTabMenuAction::MoveToNewFolder(tab_id) => {
+                // Born named: `web_tab_new_folder` opens the rename inline, the
+                // cwd tree's grammar for a folder that does not exist yet.
+                self.web_tab_new_folder(session_path);
+                let folder = self
+                    .web_surfaces
+                    .get(session_path)
+                    .and_then(|surface| surface.folders.last())
+                    .map(|folder| folder.id.clone());
+                if let Some(folder) = folder {
+                    self.web_tab_move_to_folder(session_path, *tab_id, Some(folder));
+                }
+            }
+            WebTabMenuAction::RenameFolder(folder_id) => self.web_tab_begin_rename(folder_id),
+            WebTabMenuAction::ToggleFolder(folder_id) => {
+                self.web_tab_toggle_folder(session_path, folder_id)
+            }
+            // Not this shell's to run: a split opens a PANE, which needs the
+            // signal and a spawn. The dispatcher takes it from here.
+            WebTabMenuAction::SplitWithActiveTab(_) => return false,
+        }
+        true
     }
 
     // ===== the ychrome PROFILE switcher =====
@@ -86173,16 +86254,12 @@ fn TerminalCanvas(
                                                 session_row_badge_style(&web_chrome_fg)
                                             ),
                                             onclick: move |evt: MouseEvent| {
-                                                evt.stop_propagation();
-                                                let coords = evt.client_coordinates();
-                                                let badge_path = badge_path.clone();
-                                                state.with_mut(|shell| {
-                                                    shell.open_web_profile_switcher(
-                                                        &badge_path,
-                                                        WebProfileSwitcherAnchor::Strip,
-                                                        (coords.x, coords.y),
-                                                    );
-                                                });
+                                                open_web_profile_switcher_from_event(
+                                                    state,
+                                                    &badge_path,
+                                                    WebProfileSwitcherAnchor::Strip,
+                                                    evt,
+                                                );
                                             },
                                             "{web_profile_avatar(&profile)} {web_profile_display_name(&profile)} ⌄"
                                         }
@@ -104618,17 +104695,12 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     // verbs it carries (close others, duplicate, file, split)
                     // existed already and had no entry point here.
                     oncontextmenu: move |evt: MouseEvent| {
-                        evt.prevent_default();
-                        evt.stop_propagation();
-                        let coords = evt.client_coordinates();
-                        let menu_path = menu_path.clone();
-                        state.with_mut(|shell| {
-                            shell.open_web_tab_context_menu(
-                                &menu_path,
-                                WebTabMenuTarget::Tab(tab_id),
-                                (coords.x, coords.y),
-                            );
-                        });
+                        open_web_tab_menu_from_event(
+                            state,
+                            &menu_path,
+                            WebTabMenuTarget::Tab(tab_id),
+                            evt,
+                        );
                     },
                     actions: rsx! {
                         button {
@@ -104723,16 +104795,12 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                         session_row_badge_style(palette.accent),
                                     ),
                                     onclick: move |evt: MouseEvent| {
-                                        evt.stop_propagation();
-                                        let coords = evt.client_coordinates();
-                                        let badge_path = badge_path.clone();
-                                        state.with_mut(|shell| {
-                                            shell.open_web_profile_switcher(
-                                                &badge_path,
-                                                WebProfileSwitcherAnchor::Rail,
-                                                (coords.x, coords.y),
-                                            );
-                                        });
+                                        open_web_profile_switcher_from_event(
+                                            state,
+                                            &badge_path,
+                                            WebProfileSwitcherAnchor::Rail,
+                                            evt,
+                                        );
                                     },
                                     "{web_profile_avatar(&profile)} {web_profile_display_name(&profile)} ⌄"
                                 }
@@ -104897,17 +104965,12 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                     oncontextmenu: {
                                         let (menu_path, menu_id) = (menu_path.clone(), menu_id.clone());
                                         move |evt: MouseEvent| {
-                                            evt.prevent_default();
-                                            evt.stop_propagation();
-                                            let coords = evt.client_coordinates();
-                                            let (menu_path, menu_id) = (menu_path.clone(), menu_id.clone());
-                                            state.with_mut(|shell| {
-                                                shell.open_web_tab_context_menu(
-                                                    &menu_path,
-                                                    WebTabMenuTarget::Folder(menu_id),
-                                                    (coords.x, coords.y),
-                                                );
-                                            });
+                                            open_web_tab_menu_from_event(
+                                                state,
+                                                &menu_path,
+                                                WebTabMenuTarget::Folder(menu_id.clone()),
+                                                evt,
+                                            );
                                         }
                                     },
                                     span {
@@ -107678,6 +107741,24 @@ impl RowMenuItem {
         }
     }
 }
+/// What a click on a menu item DISPATCHES — `None` when the item is inert.
+///
+/// THE guard, as a value rather than as a shape inside an event closure: a
+/// disabled item cannot reach [`ContextMenuOverlay`]'s `on_action` because
+/// there is no id to call it with. A guard spelled inside the closure could be
+/// gutted while still LOOKING like a guard (`if is_disabled { (); }`), and a
+/// source needle that only matches the `if` would never notice; this one is
+/// exercised by a test that calls it.
+///
+/// A separator is not clickable either — it is drawn in the other branch, and
+/// dispatching its empty id would be dispatching nothing.
+fn context_menu_click_action(item: &RowMenuItem) -> Option<String> {
+    if item.disabled || item.separator {
+        return None;
+    }
+    Some(item.id.clone())
+}
+
 /// The KeyTip node key for a row-menu item (`rowmenu:<id>`), so the resolver and
 /// [`dispatch_keytip_node`] agree on one identity per item.
 fn row_menu_node_key(id: &str) -> String {
@@ -107849,7 +107930,17 @@ fn web_tab_menu_items(
             } else {
                 close_others
             });
-            items.push(RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd'));
+            // The app tab is the APP, not a page to copy: a duplicate of it
+            // would be an ordinary user tab, and user tabs are persisted — the
+            // menu would mint the stale start-page row `persist_web_tabs`
+            // deliberately refuses to save. Greyed and saying so, like the
+            // other two app-tab verbs.
+            let duplicate = RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd');
+            items.push(if tab.is_app_tab {
+                duplicate.disabled("the app's own tab is the app, not a page to copy")
+            } else {
+                duplicate
+            });
             let split = RowMenuItem::new("webtab-split", "Split with active tab", 's');
             items.push(if tab_id == active_tab_id {
                 split.disabled("this IS the active tab")
@@ -107987,6 +108078,39 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
     }
 }
 
+/// The tabs a menu action CLOSES — the whole answer, for every close verb the
+/// menu offers, and the only derivation of it.
+///
+/// [`web_tab_menu_items`] counts this to write the label; the dispatch
+/// ([`ShellState::apply_web_tab_menu_action`]) takes exactly this and nothing
+/// else. A re-derivation at the call site is how "Close 2 other tabs" comes to
+/// close five, which is the bulk-close dishonesty the user forbade outright —
+/// so the call site owns no list at all, it owns a call to this.
+///
+/// The app tab is never in a close plan, on any verb: it is the app's own page
+/// and closing it is the ⏻/Ctrl+C path, not a tab verb's business.
+fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -> Vec<u64> {
+    match action {
+        WebTabMenuAction::CloseTab(tab_id) => tabs
+            .iter()
+            .filter(|(id, _)| id == tab_id && *id != WEB_TAB_APP_TAB_ID)
+            .map(|(id, _)| *id)
+            .collect(),
+        WebTabMenuAction::CloseOtherTabs(tab_id) => web_tab_close_others_targets(tabs, *tab_id),
+        WebTabMenuAction::CloseFolderTabs(folder_id) => {
+            web_tab_folder_close_targets(tabs, folder_id)
+        }
+        // Not a close verb. An empty plan is the honest answer, and the arm
+        // that runs it never asks.
+        WebTabMenuAction::DuplicateTab(_)
+        | WebTabMenuAction::MoveToFolder(_, _)
+        | WebTabMenuAction::MoveToNewFolder(_)
+        | WebTabMenuAction::SplitWithActiveTab(_)
+        | WebTabMenuAction::RenameFolder(_)
+        | WebTabMenuAction::ToggleFolder(_) => Vec::new(),
+    }
+}
+
 // ===== the ychrome PROFILE switcher (both surfaces) =====
 
 /// SEAM — lane C (`lane/dev/profile-meta`) is adding
@@ -108020,6 +108144,26 @@ fn web_profile_display_name(profile: &str) -> String {
     } else {
         profile.to_string()
     }
+}
+
+/// Does a session ROW in the cwd tree wear a profile chip?
+///
+/// THE ONE OWNER of the deliberate difference between the three surfaces that
+/// draw a profile. The rail header badge and the classic strip badge are the
+/// switcher's ENTRY POINTS and therefore draw for every identity — a switcher
+/// you cannot reach because you never chose a profile is not a switcher. The
+/// cwd tree's chip is a LABEL beside a session title in a long list, so it
+/// speaks only when the identity says something the row does not already:
+/// "default" is the absence of a choice, and the ephemeral jar wears its ⏲ on
+/// the surface itself.
+///
+/// All three read the SAME identity ([`ShellState::web_surface_session_profile`]);
+/// only this predicate is allowed to make one of them quieter, and it is
+/// spelled here once.
+fn web_profile_earns_row_badge(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile != yggterm_core::web_profile::WEB_PROFILE_DEFAULT
+        && profile != WEB_SURFACE_TEMP_PROFILE
 }
 
 /// The profile dropdown's rows: avatar + name, current one marked. ONE builder
@@ -108620,9 +108764,59 @@ fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) 
     }
 }
 
+/// A rail row's RIGHT-CLICK, from the raw event to the open menu. THE handler
+/// for both row kinds — a tab row and a folder row differ only in the target
+/// they name.
+///
+/// The rows do not spell this themselves on purpose. A handler that spells its
+/// own opener can be wrapped (`if false { … }`) or emptied while the call-site
+/// COUNT stays at two, which is exactly the bypass a "two rows call the opener"
+/// source needle cannot see. With one handler the rows' bodies are a single
+/// call each, and a lock can pin that body whole.
+fn open_web_tab_menu_from_event(
+    mut state: Signal<ShellState>,
+    session_path: &str,
+    target: WebTabMenuTarget,
+    evt: MouseEvent,
+) {
+    // The native WebKit menu must not also open, and the row's own click must
+    // not select the row out from under the menu.
+    evt.prevent_default();
+    evt.stop_propagation();
+    let coords = evt.client_coordinates();
+    let session_path = session_path.to_string();
+    state.with_mut(|shell| {
+        shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y));
+    });
+}
+
+/// A profile badge's CLICK, from the raw event to the open dropdown. THE
+/// handler for BOTH anchor sites (the rail header badge and the classic strip
+/// badge), for the same reason the rail rows share one: a badge that spells its
+/// own opener can be neutered while the call-site count stays at two, and then
+/// "two anchors, one menu" is true of the state slot and false of the buttons.
+fn open_web_profile_switcher_from_event(
+    mut state: Signal<ShellState>,
+    session_path: &str,
+    anchor: WebProfileSwitcherAnchor,
+    evt: MouseEvent,
+) {
+    evt.stop_propagation();
+    let coords = evt.client_coordinates();
+    let session_path = session_path.to_string();
+    state.with_mut(|shell| {
+        shell.open_web_profile_switcher(&session_path, anchor, (coords.x, coords.y));
+    });
+}
+
 /// Run a WebTabs-rail menu item. The mouse's ONE terminus, and it dispatches
 /// nothing the pure router ([`web_tab_menu_action`]) did not resolve — so an id
 /// that reaches here is an id the menu actually offered on that row.
+///
+/// It owns NO verb of its own. Every action runs in
+/// [`ShellState::apply_web_tab_menu_action`], where a headless test can compare
+/// what a label counted against what actually closed; the one thing that cannot
+/// live there is the split, which needs this `Signal` to open a pane.
 fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabContextMenu, id: String) {
     let Some(action) = web_tab_menu_action(&menu.target, &id) else {
         state.with_mut(|shell| shell.close_web_tab_context_menu());
@@ -108630,80 +108824,13 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
     };
     let session_path = menu.session_path.clone();
     state.with_mut(|shell| shell.close_web_tab_context_menu());
-    match action {
-        WebTabMenuAction::CloseTab(tab_id) => {
-            state.with_mut(|shell| {
-                shell.web_surface_close_tab(&session_path, tab_id);
-            });
-        }
-        WebTabMenuAction::CloseOtherTabs(tab_id) => {
-            state.with_mut(|shell| {
-                // The SAME planner the label counted with. Recomputed against
-                // live state rather than trusted from the click, so a tab opened
-                // while the menu sat open is included and one closed meanwhile
-                // is simply absent — but never the clicked tab, by construction.
-                let scope = shell.web_tab_scope_rows_for_session(&session_path);
-                let targets = web_tab_close_others_targets(&scope, tab_id);
-                let closed = shell.web_surface_close_tabs(&session_path, &targets);
-                if closed > 0 {
-                    shell.push_notification(
-                        NotificationTone::Info,
-                        "Tabs Closed",
-                        format!("Closed {}.", web_tab_count_phrase(closed, "tab")),
-                    );
-                }
-            });
-        }
-        WebTabMenuAction::DuplicateTab(tab_id) => {
-            state.with_mut(|shell| {
-                shell.web_surface_duplicate_tab(&session_path, tab_id);
-            });
-        }
-        WebTabMenuAction::MoveToFolder(tab_id, folder) => {
-            state.with_mut(|shell| {
-                shell.web_tab_move_to_folder(&session_path, tab_id, folder);
-            });
-        }
-        WebTabMenuAction::MoveToNewFolder(tab_id) => {
-            state.with_mut(|shell| {
-                // Born named: `web_tab_new_folder` opens the rename inline, the
-                // cwd tree's grammar for a folder that does not exist yet.
-                shell.web_tab_new_folder(&session_path);
-                let folder = shell
-                    .web_surfaces
-                    .get(&session_path)
-                    .and_then(|surface| surface.folders.last())
-                    .map(|folder| folder.id.clone());
-                if let Some(folder) = folder {
-                    shell.web_tab_move_to_folder(&session_path, tab_id, Some(folder));
-                }
-            });
-        }
-        WebTabMenuAction::SplitWithActiveTab(tab_id) => {
-            // The EXISTING intra-tab split, which had no UI entry until now:
-            // pane 0 stays the session's surface, pane 1 is pinned to this tab.
-            split_web_tab_into_pane(state, &session_path, tab_id, SplitAxis::SideBySide);
-        }
-        WebTabMenuAction::RenameFolder(folder_id) => {
-            state.with_mut(|shell| shell.web_tab_begin_rename(&folder_id));
-        }
-        WebTabMenuAction::ToggleFolder(folder_id) => {
-            state.with_mut(|shell| shell.web_tab_toggle_folder(&session_path, &folder_id));
-        }
-        WebTabMenuAction::CloseFolderTabs(folder_id) => {
-            state.with_mut(|shell| {
-                let scope = shell.web_tab_scope_rows_for_session(&session_path);
-                let targets = web_tab_folder_close_targets(&scope, &folder_id);
-                let closed = shell.web_surface_close_tabs(&session_path, &targets);
-                if closed > 0 {
-                    shell.push_notification(
-                        NotificationTone::Info,
-                        "Tabs Closed",
-                        format!("Closed {}.", web_tab_count_phrase(closed, "tab")),
-                    );
-                }
-            });
-        }
+    if state.with_mut(|shell| shell.apply_web_tab_menu_action(&session_path, &action)) {
+        return;
+    }
+    if let WebTabMenuAction::SplitWithActiveTab(tab_id) = action {
+        // The EXISTING intra-tab split, which had no UI entry until now:
+        // pane 0 stays the session's surface, pane 1 is pinned to this tab.
+        split_web_tab_into_pane(state, &session_path, tab_id, SplitAxis::SideBySide);
     }
 }
 
@@ -109232,19 +109359,21 @@ fn ContextMenuOverlay(
                             },
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: {
-                                let id = item.id.clone();
-                                let is_disabled = item.disabled;
+                                let item = item.clone();
                                 let on_action = on_action;
                                 move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     // A disabled item swallows the click and
                                     // leaves the menu open: the reason is in the
                                     // label, and dismissing on a refusal would
-                                    // hide it the instant the user asked.
-                                    if is_disabled {
+                                    // hide it the instant the user asked. The
+                                    // guard is `context_menu_click_action`, which
+                                    // a test can run — an inert item yields no id,
+                                    // so there is nothing to call `on_action` with.
+                                    let Some(id) = context_menu_click_action(&item) else {
                                         return;
-                                    }
-                                    on_action.call(id.clone());
+                                    };
+                                    on_action.call(id);
                                 }
                             },
                             span {
@@ -153424,21 +153553,69 @@ mod webtabs_menu_switcher_locks {
         product
     }
 
-    /// The product lines of ONE `fn`/`#[component] fn`, from its signature to the
-    /// next top-level close. Anchored at BOTH ends, so appending anything after
-    /// the function cannot make a needle pass and deleting a call cannot leave
-    /// one satisfied by a neighbour.
-    fn function_body(product: &[String], signature: &str) -> String {
+    /// The product lines of ONE `fn`/`#[component] fn`, from its signature to
+    /// the close brace at the SIGNATURE'S OWN indentation. Anchored at BOTH
+    /// ends, so appending anything after the function cannot make a needle pass
+    /// and deleting a call cannot leave one satisfied by a neighbour.
+    ///
+    /// The indentation anchor matters: an `impl` method's body ends at
+    /// `    }`, not at a column-0 `}`, and matching column 0 swallowed the rest
+    /// of the impl block (≈6,900 lines) — a "function" lock that was really an
+    /// impl-block lock, and would have broken for reasons in a neighbour.
+    fn function_body_lines(product: &[String], signature: &str) -> (usize, usize) {
         let start = product
             .iter()
             .position(|line| line.trim_start().starts_with(signature))
             .unwrap_or_else(|| panic!("{signature} moved — move this lock with it"));
+        let indent = &product[start][..product[start].len() - product[start].trim_start().len()];
+        let close = format!("{indent}}}");
         let end = product[start + 1..]
             .iter()
-            .position(|line| line == "}")
+            .position(|line| *line == close)
             .map(|offset| start + 1 + offset)
-            .unwrap_or_else(|| panic!("{signature} has no top-level close brace"));
+            .unwrap_or_else(|| panic!("{signature} has no close brace at its own indent"));
+        (start, end)
+    }
+
+    fn function_body(product: &[String], signature: &str) -> String {
+        let (start, end) = function_body_lines(product, signature);
         product[start..=end].join("\n")
+    }
+
+    /// The EXACT body of a named `rsx!` event handler, whitespace squeezed out,
+    /// from the `name:` line to its matching close brace.
+    ///
+    /// Compared WHOLE, and that is the point. The bypass this exists to catch is
+    /// a handler that still exists, still names its verb and still counts as a
+    /// call site while doing NOTHING — `if false { … }` around the body walks
+    /// past every substring needle and every call-site count. Only "this handler
+    /// is this one call and nothing else" sees it.
+    fn handler_body(product: &[String], anchor: &str, handler: &str) -> String {
+        let anchor_at = product
+            .iter()
+            .position(|line| line.contains(anchor))
+            .unwrap_or_else(|| panic!("{anchor} moved — move this lock with it"));
+        let start = product[anchor_at..]
+            .iter()
+            .position(|line| line.trim_start().starts_with(handler))
+            .map(|offset| anchor_at + offset)
+            .unwrap_or_else(|| panic!("{anchor}'s element has no {handler} handler"));
+        let mut depth = 0i64;
+        let mut end = None;
+        for (offset, line) in product[start..].iter().enumerate() {
+            depth += line.matches('{').count() as i64;
+            depth -= line.matches('}').count() as i64;
+            if depth <= 0 && offset > 0 {
+                end = Some(start + offset);
+                break;
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("{anchor}'s {handler} handler never closes"));
+        product[start..=end]
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
     }
 
     fn tab(id: u64, label: &str, folder: Option<&str>, active: bool) -> WebSurfaceOverlayTabView {
@@ -153460,6 +153637,12 @@ mod webtabs_menu_switcher_locks {
             collapsed,
         }
     }
+
+    /// A profile name no human has a jar for. The switch tests leave a surface
+    /// standing on whatever they switched TO, and any persisting call after that
+    /// writes `~/.yggterm/web-profiles/<name>/tabs.json` — so the name they
+    /// switch to must never be one the developer actually browses under.
+    const LOCK_FIXTURE_PROFILE: &str = "yggterm-lock-fixture";
 
     /// A live web surface on the EPHEMERAL profile, so nothing in this module
     /// reads or writes the user's real tab store. Each `(url, folder)` becomes a
@@ -153496,6 +153679,36 @@ mod webtabs_menu_switcher_locks {
             tab.folder = folder_id.map(|id| id.to_string());
         }
         shell
+    }
+
+    /// A surface still in its PROFILE PICKER: ychrome was launched with no
+    /// `--profile`, the viewport is the GUI-native picker, and the identity of
+    /// this surface is not yet a fact.
+    fn shell_with_picker_surface() -> ShellState {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.upsert_web_surface_picker(
+            "local://ws",
+            "http://127.0.0.1:1/choose".to_string(),
+            None,
+            1_000,
+        );
+        shell
+    }
+
+    /// Put a live surface on a named identity WITHOUT going through the switch —
+    /// `switch_web_surface_profile` persists, and a persist under a real profile
+    /// name would write into the developer's own jar.
+    fn retarget_in_place(shell: &mut ShellState, profile: &str) {
+        for tab in &mut shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .tabs
+        {
+            tab.profile = profile.to_string();
+        }
     }
 
     // ======================================================================
@@ -153574,23 +153787,53 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// And the rail's rows actually WIRE it: both row kinds call the opener.
+    /// And the rail's rows actually WIRE it — the whole handler, not a call
+    /// site somewhere inside one.
+    ///
+    /// A count of `open_web_tab_context_menu(` inside `WebTabsRailBody` is
+    /// satisfied by a handler wrapped in `if false { … }`: the spelling is
+    /// there, the count is two, and right-click does nothing. So each row's
+    /// `oncontextmenu` is pinned WHOLE, and it is one call to the ONE shared
+    /// handler — which is itself covered by the behavioural locks on
+    /// `open_web_tab_context_menu`.
     #[test]
     fn both_rail_row_kinds_open_the_menu() {
         let product = product_source();
-        let rail = function_body(&product, "fn WebTabsRailBody(");
-        assert!(
-            rail.contains("WebTabMenuTarget::Tab(tab_id)"),
-            "the rail's TAB rows no longer raise the row menu"
-        );
-        assert!(
-            rail.contains("WebTabMenuTarget::Folder(menu_id)"),
-            "the rail's FOLDER rows no longer raise the row menu"
+        assert_eq!(
+            handler_body(&product, "\"data-web-tab-row\"", "oncontextmenu:"),
+            "oncontextmenu:move|evt:MouseEvent|{open_web_tab_menu_from_event(state,\
+             &menu_path,WebTabMenuTarget::Tab(tab_id),evt,);},",
+            "a rail TAB row's right-click must BE the opener call — nothing around \
+             it, nothing instead of it"
         );
         assert_eq!(
-            rail.matches("shell.open_web_tab_context_menu(").count(),
-            2,
-            "exactly two rail row kinds raise the menu (tab + folder)"
+            handler_body(&product, "\"data-web-tab-folder-collapsed\"", "oncontextmenu:"),
+            "oncontextmenu:{let(menu_path,menu_id)=(menu_path.clone(),menu_id.clone());\
+             move|evt:MouseEvent|{open_web_tab_menu_from_event(state,&menu_path,\
+             WebTabMenuTarget::Folder(menu_id.clone()),evt,);}},",
+            "a rail FOLDER row's right-click must BE the opener call"
+        );
+        // …and there is exactly ONE place the two of them go through, so the
+        // behaviour above is proven once for both rows.
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("shell.open_web_tab_context_menu("))
+                .count(),
+            1,
+            "one handler owns the rail's right-click; a row that opened the menu \
+             itself would be a second wiring nothing pins"
+        );
+        let shared = function_body(&product, "fn open_web_tab_menu_from_event(");
+        assert!(
+            shared.contains("evt.prevent_default();"),
+            "the native WebKit menu must not also open:\n{shared}"
+        );
+        assert!(
+            shared.contains(
+                "shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y))"
+            ),
+            "the shared handler must raise the menu at the pointer:\n{shared}"
         );
     }
 
@@ -153744,19 +153987,165 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// The dispatch uses THAT planner and THAT closer, not a private
-    /// re-derivation that could count one thing and close another.
+    /// THE lock the review demanded: what the menu ACTUALLY closes equals what
+    /// its label counted — proven by running the dispatch's own terminus, not by
+    /// reading that a planner is called somewhere near it.
+    ///
+    /// The bypass this exists to catch: keep `web_tab_close_others_targets(…)`
+    /// exactly where it was and shadow its answer with `scope.iter().map(…)`.
+    /// The planner is still called, the needle is still satisfied, and "Close 2
+    /// other tabs" closes every tab in the surface including the app's own.
+    #[test]
+    fn the_menu_closes_exactly_the_tabs_its_label_counted() {
+        let mut shell = shell_with_surface(&[
+            ("https://a/", None),
+            ("https://b/", None),
+            ("https://c/", None),
+            ("https://filed-a/", Some("f1")),
+            ("https://filed-b/", Some("f1")),
+        ]);
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5],
+            "app tab + five user tabs"
+        );
+
+        // The LABEL's number, from the menu the user is looking at.
+        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        assert_eq!(
+            shell
+                .snapshot()
+                .web_tab_menu_items
+                .iter()
+                .find(|item| item.id == "webtab-close-others")
+                .map(|item| item.label.clone()),
+            Some("Close 2 other tabs".to_string()),
+        );
+
+        // The ACTION, through the same terminus the mouse reaches.
+        let action = web_tab_menu_action(&WebTabMenuTarget::Tab(1), "webtab-close-others")
+            .expect("the item the menu drew routes");
+        assert!(
+            shell.apply_web_tab_menu_action("local://ws", &action),
+            "a close is fully handled in the shell"
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 4, 5],
+            "exactly the two the label counted went — the app tab, the clicked \
+             tab and the folder's tabs all survive"
+        );
+
+        // A FOLDER's "Close N tabs", same rule.
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Folder("f1".to_string()),
+            (0.0, 0.0),
+        );
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(folder("f1", "Work", false));
+        assert_eq!(
+            shell
+                .snapshot()
+                .web_tab_menu_items
+                .iter()
+                .find(|item| item.id == "webfolder-close-tabs")
+                .map(|item| item.label.clone()),
+            Some("Close 2 tabs".to_string()),
+        );
+        let action =
+            web_tab_menu_action(&WebTabMenuTarget::Folder("f1".to_string()), "webfolder-close-tabs")
+                .expect("the folder item routes");
+        assert!(shell.apply_web_tab_menu_action("local://ws", &action));
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "a folder's close takes its filed tabs and nothing else"
+        );
+
+        // "Close tab" is the same one planner: the app tab is never in a plan,
+        // so the greyed item could not close it even if a click reached it.
+        assert_eq!(
+            web_tab_menu_close_plan(
+                &shell.web_tab_scope_rows_for_session("local://ws"),
+                &WebTabMenuAction::CloseTab(WEB_TAB_APP_TAB_ID),
+            ),
+            Vec::<u64>::new(),
+        );
+        assert!(shell.apply_web_tab_menu_action(
+            "local://ws",
+            &WebTabMenuAction::CloseTab(WEB_TAB_APP_TAB_ID)
+        ));
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the app tab is not a tab verb's to close"
+        );
+        assert!(shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::CloseTab(1)));
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![0],
+        );
+    }
+
+    /// The dispatch owns NO list of its own. Every verb runs in the shell
+    /// terminus above (which the test above executes), and the only thing left
+    /// in the event path is the split, which needs the signal.
     #[test]
     fn the_close_others_arm_uses_the_shared_planner() {
         let product = product_source();
         let dispatch = function_body(&product, "fn dispatch_web_tab_menu_action(");
         assert!(
-            dispatch.contains("web_tab_close_others_targets(&scope, tab_id)"),
-            "Close other tabs must close exactly what the label counted:\n{dispatch}"
+            dispatch.contains("shell.apply_web_tab_menu_action(&session_path, &action)"),
+            "the mouse's terminus must be the shell's, or the two can disagree:\n{dispatch}"
         );
-        assert!(
-            dispatch.contains("web_tab_folder_close_targets(&scope, &folder_id)"),
-            "a folder's close must take exactly what its label counted:\n{dispatch}"
+        for private in [
+            "web_tab_scope_rows_for_session",
+            "web_tab_close_others_targets",
+            "web_tab_folder_close_targets",
+            "web_tab_menu_close_plan",
+            "web_surface_close_tab",
+        ] {
+            assert!(
+                !dispatch.contains(private),
+                "the dispatch must not derive or close a tab list of its own \
+                 ({private}) — a second derivation is how a label counts two and \
+                 the verb takes five:\n{dispatch}"
+            );
+        }
+        // And the planner IS the label's: one function, both readers.
+        let items = function_body(&product, "fn web_tab_menu_items(");
+        assert!(items.contains("web_tab_close_others_targets(&scope, tab_id)"));
+        assert!(items.contains("web_tab_folder_close_targets(&scope, folder_id)"));
+        let apply = function_body(&product, "fn apply_web_tab_menu_action(");
+        assert_eq!(
+            apply.matches("web_tab_menu_close_plan(&scope, action)").count(),
+            2,
+            "both close arms take the plan, and nothing else:\n{apply}"
         );
     }
 
@@ -153818,16 +154207,43 @@ mod webtabs_menu_switcher_locks {
     /// evidence the call site is the real verb and not a re-implementation.
     #[test]
     fn the_split_arm_calls_split_web_tab_into_pane() {
+        // BEHAVIOURAL half: the shell terminus refuses the split and touches
+        // nothing, which is what hands it to the signal path below. If it
+        // silently "handled" it, the split would become a no-op that no source
+        // read could see.
+        let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", None)]);
+        let before: Vec<u64> = shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect();
+        assert!(
+            !shell.apply_web_tab_menu_action(
+                "local://ws",
+                &WebTabMenuAction::SplitWithActiveTab(2)
+            ),
+            "a split is not the shell's to run alone — it opens a pane"
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            before,
+            "and it must not half-do it on the way past"
+        );
+
+        // SOURCE half: the one verb that stayed in the event path is the split,
+        // and it drives the EXISTING intra-tab split mechanism. Behavioural
+        // coverage stops here because `split_web_tab_into_pane` needs a live
+        // `Signal<ShellState>` and a Dioxus runtime (it spawns).
         let product = product_source();
         let dispatch = function_body(&product, "fn dispatch_web_tab_menu_action(");
         let arm = dispatch
-            .split("WebTabMenuAction::SplitWithActiveTab(tab_id) =>")
+            .split("if let WebTabMenuAction::SplitWithActiveTab(tab_id) = action {")
             .nth(1)
             .expect("the split arm exists");
-        let arm = arm
-            .split("WebTabMenuAction::RenameFolder")
-            .next()
-            .expect("the split arm ends at the next arm");
         assert!(
             arm.contains(
                 "split_web_tab_into_pane(state, &session_path, tab_id, SplitAxis::SideBySide)"
@@ -153981,18 +154397,18 @@ mod webtabs_menu_switcher_locks {
             .collect();
 
         let retargeted = shell
-            .switch_web_surface_profile("local://ws", "work")
+            .switch_web_surface_profile("local://ws", LOCK_FIXTURE_PROFILE)
             .expect("the surface exists");
         assert_eq!(retargeted, 4, "app tab + three user tabs all move together");
 
         let surface = &shell.web_surfaces["local://ws"];
         assert!(
-            surface.tabs.iter().all(|tab| tab.profile == "work"),
+            surface.tabs.iter().all(|tab| tab.profile == LOCK_FIXTURE_PROFILE),
             "every tab of one surface shares one identity"
         );
         assert_eq!(
             shell.web_surface_session_profile("local://ws").as_deref(),
-            Some("work"),
+            Some(LOCK_FIXTURE_PROFILE),
         );
 
         // TAB SET RULE: the tabs are KEPT — same ids, same URLs, same folders,
@@ -154039,7 +154455,7 @@ mod webtabs_menu_switcher_locks {
 
         // Choosing the profile you are already on is a no-op, not a teardown.
         assert_eq!(
-            shell.switch_web_surface_profile("local://ws", "work"),
+            shell.switch_web_surface_profile("local://ws", LOCK_FIXTURE_PROFILE),
             Some(0),
         );
     }
@@ -154151,13 +154567,39 @@ mod webtabs_menu_switcher_locks {
             "the dropdown is the SHARED overlay component, not a second menu"
         );
 
+        // EXACTLY TWO ANCHORS, and each one's click IS the opener call — pinned
+        // whole, because a count of `open_web_profile_switcher(` inside the two
+        // badges is satisfied by a handler wrapped in `if false { … }`: the
+        // badge is still a button, still counted, and clicking it does nothing.
+        assert_eq!(
+            handler_body(&product, "\"data-ws-rail-profile-badge\"", "onclick:"),
+            "onclick:move|evt:MouseEvent|{open_web_profile_switcher_from_event(state,\
+             &badge_path,WebProfileSwitcherAnchor::Rail,evt,);},",
+            "the rail badge's click must BE the opener call"
+        );
+        assert_eq!(
+            handler_body(&product, "\"data-ws-profile-badge\"", "onclick:"),
+            "onclick:move|evt:MouseEvent|{open_web_profile_switcher_from_event(state,\
+             &badge_path,WebProfileSwitcherAnchor::Strip,evt,);},",
+            "the classic strip badge's click must BE the opener call"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("open_web_profile_switcher_from_event("))
+                .count(),
+            3,
+            "one shared handler + exactly two anchor sites (rail header badge, \
+             classic strip badge)"
+        );
         assert_eq!(
             product
                 .iter()
                 .filter(|line| line.contains("shell.open_web_profile_switcher("))
                 .count(),
-            2,
-            "exactly two anchor sites raise the dropdown (rail header badge, classic strip badge)"
+            1,
+            "one handler opens the dropdown; a badge that opened it itself would \
+             be a second wiring nothing pins"
         );
         // …and they are the two badges, each marked so a live probe can tell them
         // apart without reading this file.
@@ -154454,16 +154896,71 @@ mod webtabs_menu_switcher_locks {
             keys(context_menu_action_style_destructive(palette)),
             standard,
         );
+        assert_eq!(
+            keys(context_menu_action_style(palette, true)),
+            standard,
+            "the EMPHASIZED tone is a fourth branch — the profile dropdown's ✓ row \
+             draws through it, so it is under the same rule"
+        );
+
+        // THE INERTNESS ITSELF, run rather than read. `if is_disabled {` was a
+        // spelling a mutation could keep while replacing its body with `();` —
+        // every greyed item then dispatched on click and the needle stayed
+        // green. The guard is a function now, so this calls it.
+        let enabled = RowMenuItem::new("webtab-close", "Close tab", 'c');
+        assert_eq!(
+            context_menu_click_action(&enabled),
+            Some("webtab-close".to_string()),
+            "a live item dispatches its own id"
+        );
+        assert_eq!(
+            context_menu_click_action(&enabled.clone().disabled("this is the app's own tab")),
+            None,
+            "a disabled item's click carries NO id — there is nothing to dispatch \
+             with, which is what makes it inert"
+        );
+        assert_eq!(
+            context_menu_click_action(&RowMenuItem::divider()),
+            None,
+            "a divider is not a verb"
+        );
 
         let product = product_source();
-        let overlay = function_body(&product, "fn ContextMenuOverlay(");
-        assert!(
-            overlay.contains("if is_disabled {"),
-            "a disabled item's click must not reach the dispatcher:\n{overlay}"
+        let (start, end) = function_body_lines(&product, "fn ContextMenuOverlay(");
+        let overlay = &product[start..=end];
+        // …and the overlay's click reaches `on_action` through THAT guard and no
+        // other way: one call, and the id it passes is the one the guard yielded.
+        let guard = overlay
+            .iter()
+            .position(|line| {
+                line.trim() == "let Some(id) = context_menu_click_action(&item) else {"
+            })
+            .expect("the overlay's click must ask the guard for an id");
+        assert_eq!(
+            overlay[guard + 1].trim(),
+            "return;",
+            "an item with no id must return — anything else is a click that \
+             continues past the guard"
+        );
+        assert_eq!(
+            overlay
+                .iter()
+                .filter(|line| line.contains("on_action.call("))
+                .count(),
+            1,
+            "exactly one dispatch site, and it is the guarded one"
         );
         assert!(
-            overlay.contains("context_menu_action_style_disabled(palette)"),
-            "the disabled tone must be drawn:\n{overlay}"
+            overlay
+                .iter()
+                .any(|line| line.trim() == "on_action.call(id);"),
+            "the dispatch must use the id the guard yielded, not the item's own"
+        );
+        assert!(
+            overlay
+                .iter()
+                .any(|line| line.contains("context_menu_action_style_disabled(palette)")),
+            "the disabled tone must be drawn"
         );
     }
 
@@ -154511,6 +155008,194 @@ mod webtabs_menu_switcher_locks {
         assert!(chrome_transient_over_viewport(&shell.snapshot()));
         shell.close_web_profile_switcher();
         assert!(!chrome_transient_over_viewport(&shell.snapshot()));
+    }
+
+    // ======================================================================
+    // The app tab is the APP — on every verb, not just the two that had a
+    // guard.
+    // ======================================================================
+
+    /// A duplicate of the app tab would be an ordinary USER tab, and user tabs
+    /// are persisted — so the menu would mint exactly the stale start-page row
+    /// [`ShellState::persist_web_tabs`] refuses to save. The item is greyed and
+    /// says why, AND the verb itself refuses: an inert item is a UI promise, and
+    /// the promise has to hold at the mechanism too.
+    #[test]
+    fn the_app_tab_cannot_be_duplicated() {
+        let tabs = vec![tab(0, "app", None, true), tab(1, "page", None, false)];
+        let duplicate = web_tab_menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(0))
+            .into_iter()
+            .find(|item| item.id == "webtab-duplicate")
+            .expect("the duplicate item is drawn, inert");
+        assert!(
+            duplicate.disabled,
+            "the app's own tab is the app, not a page to copy"
+        );
+        assert!(
+            duplicate.label.contains("not a page to copy"),
+            "a greyed item must SAY why: {}",
+            duplicate.label
+        );
+        assert!(
+            duplicate.hint.is_none(),
+            "a chord must never reach a verb the mouse cannot"
+        );
+        assert!(
+            !web_tab_menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(1))
+                .into_iter()
+                .find(|item| item.id == "webtab-duplicate")
+                .expect("a user tab CAN be duplicated")
+                .disabled,
+        );
+
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        let before = shell.web_surfaces["local://ws"].tabs.len();
+        assert_eq!(
+            shell.web_surface_duplicate_tab("local://ws", WEB_TAB_APP_TAB_ID),
+            None,
+            "the verb refuses the app tab, not only the menu row"
+        );
+        // …including through the dispatch's own terminus, which is where a
+        // click that got past a greyed row would arrive.
+        assert!(shell.apply_web_tab_menu_action(
+            "local://ws",
+            &WebTabMenuAction::DuplicateTab(WEB_TAB_APP_TAB_ID)
+        ));
+        assert_eq!(
+            shell.web_surfaces["local://ws"].tabs.len(),
+            before,
+            "no tab was minted from the app's page"
+        );
+    }
+
+    // ======================================================================
+    // ONE answer to "what identity is this surface on", for all THREE badge
+    // surfaces.
+    // ======================================================================
+
+    /// The rail header badge, the classic strip badge and the cwd tree's row
+    /// chip all read [`ShellState::web_surface_session_profile`]. A private copy
+    /// of that question is how the rail came to draw "default" over a surface
+    /// whose owner said `None` — a switcher button on an undecided surface that
+    /// opened nothing when clicked, because the opener read the other answer.
+    #[test]
+    fn one_accessor_answers_what_profile_a_surface_is_on() {
+        // PICKER PHASE: the identity is not a fact yet, so NOBODY draws a badge
+        // and the dropdown cannot be opened.
+        let mut picking = shell_with_picker_surface();
+        assert_eq!(picking.web_surface_session_profile("local://ws"), None);
+        let snapshot = picking.snapshot();
+        assert_eq!(
+            snapshot.active_web_surface_profile, None,
+            "the rail badge must not name an identity the surface has not chosen"
+        );
+        assert_eq!(snapshot.web_surface_profiles.get("local://ws"), None);
+        picking.open_web_profile_switcher(
+            "local://ws",
+            WebProfileSwitcherAnchor::Rail,
+            (0.0, 0.0),
+        );
+        assert!(
+            picking.snapshot().web_profile_switcher.is_none(),
+            "an undecided surface has nothing to switch FROM"
+        );
+
+        // DECIDED: one identity, and every reader says it.
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        retarget_in_place(&mut shell, LOCK_FIXTURE_PROFILE);
+        let owner = shell.web_surface_session_profile("local://ws");
+        assert_eq!(owner.as_deref(), Some(LOCK_FIXTURE_PROFILE));
+        assert_eq!(
+            shell.snapshot().active_web_surface_profile,
+            owner,
+            "the rail badge reads the owner, not a copy of the question"
+        );
+        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Strip, (0.0, 0.0));
+        assert_eq!(
+            shell
+                .snapshot()
+                .web_profile_switcher
+                .map(|switcher| switcher.current_profile),
+            owner,
+            "the dropdown's ✓ sits on the same identity the badge names"
+        );
+
+        // …and each badge is DRAWN from that answer, so `None` is a badge that
+        // is absent rather than a badge that says nothing.
+        let product = product_source();
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert!(
+            rail.contains("let overlay_profile = snapshot.active_web_surface_profile.clone();"),
+            "the rail badge must read the snapshot's one identity field:\n"
+        );
+        assert!(
+            rail.contains("if let Some(profile) = overlay_profile.clone() {"),
+            "the rail badge must be absent when there is no identity"
+        );
+        assert!(
+            product.iter().any(|line| {
+                line.contains("state.with(|shell| shell.web_surface_session_profile(")
+            }),
+            "the classic strip badge must read the accessor itself, not a copy"
+        );
+    }
+
+    /// The THIRD surface — the cwd tree's row chip — reads that same identity
+    /// and differs only where ONE named predicate says it may.
+    #[test]
+    fn the_row_chip_is_quieter_than_the_badges_by_one_named_rule() {
+        // The rule itself: a chip beside a session title speaks only when the
+        // identity says something. The badges have no such filter — they are the
+        // switcher's entry points.
+        assert!(web_profile_earns_row_badge("research"));
+        assert!(!web_profile_earns_row_badge(
+            yggterm_core::web_profile::WEB_PROFILE_DEFAULT
+        ));
+        assert!(!web_profile_earns_row_badge(WEB_SURFACE_TEMP_PROFILE));
+        assert!(!web_profile_earns_row_badge(""));
+
+        // On a surface the rule says nothing about: badge yes, chip no — one
+        // identity, one stated difference.
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        retarget_in_place(
+            &mut shell,
+            yggterm_core::web_profile::WEB_PROFILE_DEFAULT,
+        );
+        let snapshot = shell.snapshot();
+        assert_eq!(
+            snapshot.active_web_surface_profile.as_deref(),
+            Some(yggterm_core::web_profile::WEB_PROFILE_DEFAULT),
+            "the switcher's entry point draws for EVERY identity, default included"
+        );
+        assert_eq!(snapshot.web_surface_profiles.get("local://ws"), None);
+
+        retarget_in_place(&mut shell, LOCK_FIXTURE_PROFILE);
+        let snapshot = shell.snapshot();
+        assert_eq!(
+            snapshot.active_web_surface_profile.as_deref(),
+            Some(LOCK_FIXTURE_PROFILE),
+        );
+        assert_eq!(
+            snapshot.web_surface_profiles.get("local://ws").map(String::as_str),
+            Some(LOCK_FIXTURE_PROFILE),
+            "a chosen identity is worth a chip, and it is the SAME string"
+        );
+
+        // …and the snapshot builder owns no second reading of the question.
+        let product = product_source();
+        let snapshot_fn = function_body(&product, "fn snapshot(");
+        assert_eq!(
+            snapshot_fn
+                .matches("self.web_surface_session_profile(path)")
+                .count(),
+            2,
+            "the rail badge's field and the row-chip map must both come from the \
+             ONE accessor:\n{snapshot_fn}"
+        );
+        assert!(
+            !snapshot_fn.contains("map(|app_tab| app_tab.profile.clone())"),
+            "a private 'what profile is this' derivation is back in the snapshot"
+        );
     }
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
