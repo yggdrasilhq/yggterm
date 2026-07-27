@@ -452,6 +452,26 @@ pub struct SurfacePopup {
     pub background: bool,
 }
 
+/// What a find request asks WebKit's find controller to do — the engine half of
+/// the shell's `web_find::FindStep`.
+///
+/// Two names for one idea is the price of the crate boundary: a vendored
+/// dioxus-desktop cannot depend on `yggterm-shell`, so the shell owns find
+/// POLICY (the option mask, the match cap, the position cycle) and maps into
+/// this at the one call site. The mapping is total and exhaustive in both
+/// directions, so neither side can grow a case the other cannot express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindAction {
+    /// A fresh search: highlight every match and select the first.
+    Search,
+    /// Move the selection to the next match of the CURRENT search.
+    Next,
+    /// Move it to the previous one.
+    Previous,
+    /// End the search — `search_finish`, which is what drops the highlights.
+    Close,
+}
+
 /// Owns the main window's `gtk::Overlay` and the set of live surface webviews.
 /// Held (Linux only) on `DesktopService`; driven from the shell via the
 /// `open_web_surface` / `web_surface_*` methods on `DesktopContext`.
@@ -2308,6 +2328,129 @@ impl WebSurfaceHost {
             surface.webview.close_devtools();
         }
         Ok(surface.webview.is_devtools_open())
+    }
+
+    /// Find-in-page on surface `id`, through WebKit's OWN find controller.
+    ///
+    /// `webkit_web_view_get_find_controller` + `search` / `search_next` /
+    /// `search_previous` / `search_finish` + the `counted-matches` signal —
+    /// exactly the five doors Epiphany's find bar drives, reached through the
+    /// safe `webkit2gtk` binding that already ships them (`FindControllerExt`).
+    /// This module drops to `webkit2gtk::ffi` only where the safe binding has no
+    /// door at all (see `mod adblock`, which says so in its own header); adding
+    /// a hand-rolled `extern "C"` block for symbols the binding already declares
+    /// would be a SECOND declaration of the same ABI, free to drift from wry's.
+    ///
+    /// A JavaScript/regex re-implementation was never on the table: it would be
+    /// a second encoding of "what counts as a match" that could disagree with
+    /// the engine's own highlights, and it could not highlight at all.
+    ///
+    /// **The count is asynchronous and the callback is the only answer.**
+    /// `count_matches` returns immediately and the number arrives later on
+    /// `counted-matches`; the handler is one-shot (disconnected from inside its
+    /// own emission, which GObject keeps the closure alive for) and a watchdog
+    /// disconnects it if the engine never speaks, so an unanswered find can
+    /// neither hang the caller nor accumulate handlers on the controller.
+    ///
+    /// `options` and `max_match_count` come from the shell's `web_find` module,
+    /// which is the single owner of find POLICY (case-insensitivity, wrap, and
+    /// the cap that decides whether a reported count is the truth). This layer
+    /// hands the engine whatever it is given and returns the engine's number
+    /// verbatim.
+    ///
+    /// Nothing here touches the keyboard: the find controller moves the
+    /// SELECTION, not the focus, so the borrow-and-give-back protocol
+    /// (`note_focus_owner_before_injection` / `schedule_focus_giveback`) has
+    /// nothing to protect on this path.
+    pub fn find(
+        &self,
+        id: u64,
+        text: &str,
+        action: FindAction,
+        options: u32,
+        max_match_count: u32,
+        callback: impl FnOnce(Result<u32, String>) + 'static,
+    ) -> Result<(), String> {
+        use gtk::glib::prelude::ObjectExt as _;
+        use webkit2gtk::{FindControllerExt as _, WebViewExt as _};
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        let webkit = {
+            use wry::WebViewExtUnix;
+            surface.webview.webview()
+        };
+        let controller = webkit
+            .find_controller()
+            .ok_or("engine gave this webview no find controller")?;
+
+        // Closing (and an emptied field, which means the same thing) is
+        // synchronous and has no count: `search_finish` is the call that DROPS
+        // the highlights, and a bar that closes without it leaves the page
+        // painted yellow with nothing on screen to explain why.
+        if matches!(action, FindAction::Close) || text.is_empty() {
+            controller.search_finish();
+            callback(Ok(0));
+            return Ok(());
+        }
+
+        // The ENGINE is the source of truth for what it is currently searching.
+        // A `next` whose text has moved on (the user typed another letter, or a
+        // reload wiped the controller) must restart rather than step whatever
+        // the controller still holds.
+        let engine_text = controller
+            .search_text()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let same_query = engine_text == text;
+
+        let pending: Rc<RefCell<Option<Box<dyn FnOnce(Result<u32, String>)>>>> =
+            Rc::new(RefCell::new(Some(Box::new(callback))));
+        let handler: Rc<RefCell<Option<gtk::glib::SignalHandlerId>>> =
+            Rc::new(RefCell::new(None));
+        {
+            let pending = pending.clone();
+            let handler_slot = handler.clone();
+            let signal = controller.connect_counted_matches(move |controller, count| {
+                if let Some(signal) = handler_slot.borrow_mut().take() {
+                    controller.disconnect(signal);
+                }
+                if let Some(answer) = pending.borrow_mut().take() {
+                    answer(Ok(count));
+                }
+            });
+            *handler.borrow_mut() = Some(signal);
+        }
+        {
+            // The watchdog: a content process that died mid-count would
+            // otherwise leave the caller waiting and the handler connected
+            // forever. Longer than the shell's own await so the engine's answer
+            // wins whenever there is one.
+            let pending = pending.clone();
+            let handler_slot = handler.clone();
+            let controller = controller.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(12), move || {
+                if let Some(signal) = handler_slot.borrow_mut().take() {
+                    controller.disconnect(signal);
+                }
+                if let Some(answer) = pending.borrow_mut().take() {
+                    answer(Err("engine never reported a match count".to_string()));
+                }
+            });
+        }
+
+        match action {
+            FindAction::Search => controller.search(text, options, max_match_count),
+            FindAction::Next if same_query => controller.search_next(),
+            FindAction::Previous if same_query => controller.search_previous(),
+            // Direction is `search_previous`'s job, never the option mask's:
+            // BACKWARDS plus search_previous double-reverses.
+            FindAction::Next | FindAction::Previous => {
+                controller.search(text, options, max_match_count)
+            }
+            FindAction::Close => unreachable!("handled above"),
+        }
+        controller.count_matches(text, options, max_match_count);
+        Ok(())
     }
 
     /// One cookie as the engine layer knows it.
