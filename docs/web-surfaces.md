@@ -555,6 +555,48 @@ OSC (same class as OSC 777 fake notifications) — e.g. `cat`ing a crafted file
 opens a surface pointing at an attacker URL. The surface is visibly labeled
 with its URL and one keypress (Ctrl+C) removes it.
 
+### The app control token: a page must not be able to drive an app's pane (2026-07-27)
+
+`yggterm-appctl://` is registered on every surface's `WebContext` and proxies to
+that session's app control endpoint (`app_control_proxy`, vendored
+`web_surface.rs`). It exists for the passkey shim — a userscript in the RP's page
+POSTing `/fido2/get` — but it is a **generic proxy**, so page JS could address
+any route on that endpoint. ychrome gated only `/fido2/get|create`, which left
+`POST /action` open to every page in the surface: ad blocking off, userscripts
+deleted, identity switched, and a vault `fill` whose reply is an `eval` the GUI
+injects **into the requesting page** — a plaintext credential handed to whoever
+asked.
+
+The contract, GUI side (the app side is `ychrome/docs/protocol.md`, which owns
+the route table and the refusal semantics; this half owns how the GUI proves who
+it is):
+
+- The `sidebar ; declare` OSC carries `control_token`. It is the ONE secret a
+  declare may carry, because the PTY stream is exactly the channel a page cannot
+  read — the same provenance as the passkey `request_id` behind `/fido2/grant`.
+- It is stored on `SidebarContributionState` and read ONLY through
+  `sidebar_control_token()` — a second accessor beside `sidebar_control_url()`,
+  because the url is quoted into traces all over `shell.rs` and a token
+  travelling with it would end up in one of them. It is set-if-present, so a
+  ping never clears it, and REFRESHED by every declare that carries one: an app
+  daemon that respawned onto the same port mints a new token, and the url
+  identity check would not notice.
+- **Every** request the GUI makes to an app's control endpoint presents it as
+  `X-Ychrome-Control`; the app decides per route whether it demands one. The two
+  credential-free calls are named in `the_settings_panes_action_presents_the_declared_token`:
+  the picker's `/open` (a different server) and the pre-contribution liveness
+  probe.
+- The appctl bridge forwards a **closed allow-list** of page headers
+  (`FORWARDED_HEADERS` = `X-Ychrome-Fido2`, `Content-Type`) and refuses a request
+  target or token value containing a control character, so a page can neither
+  send the control header nor smuggle one through a CRLF in the request line.
+  The signer's token IS forwarded and grants nothing: every page in the profile
+  already holds it, baked into its own shim userscript.
+
+This closes the WEB boundary only. A same-uid process on the app's host can
+reach the vault socket directly and always could; that was never this endpoint's
+threat model.
+
 ## Profile picker (no-arg `ychrome`)
 
 `ychrome` with no URL serves a **profile picker** instead of opening a blank
