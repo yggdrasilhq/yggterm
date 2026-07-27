@@ -330,6 +330,25 @@ proven red and restored.** If you touch this family, re-run them: the script
 shape is in the round-25 report, and a lock nobody re-proves decays into the
 thing this section is about.
 
+**Two traps in the structural half itself**, both found the hard way on the
+leased-surface-row lane:
+
+- **A source scan judges the FILE, not the binary under test.** It reads
+  `shell.rs` from `CARGO_MANIFEST_DIR` at *runtime*, so a mutation reddens it
+  with no compile at all, and a rewording that behaves identically reddens it
+  too. That is fine for its actual job — "the call site moved, come look" — and
+  worthless as evidence about behaviour. Keep such a lock to ONE needle, say in
+  its doc comment that it is not behavioural, and make every claim about what
+  the code DOES with a test that runs the code. A five-needle version of one of
+  these was read as a behavioural lock by its own report; the arm it "locked"
+  could be neutered by shadowing a local, with all five needles still present.
+- **`product_lines` recognizes the literal `#[cfg(test)]` and nothing else.**
+  Write `#[cfg(all(test, unix))]` on a test module and the scan stops skipping
+  it, so the module's own assertions satisfy the needles it is looking for. Use
+  `#[cfg(test)] mod foo { #![cfg(unix)] … }` instead. The self-check that
+  catches this (`the scan is reading this test module`) belongs in every lock
+  that greps.
+
 ### 7.2 Never run several workflow lanes on `main` in one checkout
 
 Three fix lanes were pointed at `main` in the same working tree. Two edited
