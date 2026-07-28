@@ -30,6 +30,50 @@ fix) once the fix is verified live on guihost.
 
 ## Standing traps / other open bugs
 
+- **★★ THE DAEMON'S ENVIRONMENT IS FROZEN AT LAUNCH AND POISONS EVERY SESSION IT
+  EVER SPAWNS — including across hot-restarts (oc, 2.12.18, 2026-07-28).**
+  Observed: on oc, `claude` in every yggterm-launched session died with
+  `Failed to authenticate. API Error: 403 ... Received Model Group=vercel/maa/deepseek-v4-pro`
+  — a retired custom-gateway config the user had already deleted from
+  `~/.profile` and `~/.bashrc`. Editing the rc files changed nothing, because
+  the rc files are not on the launch path at all.
+
+  Mechanism, all three links confirmed in the source:
+  1. `~/.profile` used to `. ~/.claude_code_env`, which exported
+     `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_*_MODEL`. The
+     daemon (PID 2397674, started Jul 27 17:09) captured that env at exec time
+     and is orphaned to PID 1. The user deleted the file the next morning; the
+     running daemon kept its copy.
+  2. `terminal.rs::shell_command()` builds `bash -c '<launch_command>'` — a
+     **non-interactive, non-login** shell that never sources `~/.bashrc` or
+     `~/.profile`. It calls `env_remove` only for
+     `terminal_identity_env_removals()` (the TERM/appearance keys). Everything
+     else is inherited from the daemon verbatim.
+  3. `lib.rs::spawn_daemon_process_from_executable()` (the hot-restart spawn
+     path) does no `env_clear`/`env_remove` either — so a hot-restart *copies
+     the stale environment onto its own successor*. Once a daemon is poisoned,
+     the poison is immortal on that host; only a full daemon death breaks it,
+     which the constitution forbids while sessions are live.
+
+  Net effect: any variable exported in whatever shell first started the daemon
+  becomes permanent, invisible, host-wide configuration for every agent CLI
+  yggterm launches, and the user has no rc-file edit that can reach it.
+
+  **Worked around, not fixed.** oc's `~/.claude/settings.json` now carries an
+  `env` block pinning `ANTHROPIC_BASE_URL` back to `https://api.anthropic.com`
+  and blanking the rest; Claude Code's settings `env` beats the inherited
+  process env (verified by running `claude` under the daemon's exact
+  `/proc/<pid>/environ` — the poisoned `ANTHROPIC_BASE_URL` is still inherited
+  and the call still authenticates through the subscription). That is a
+  Claude-Code-specific patch on one host; it does nothing for codex, for other
+  vars, or for the next host that catches this.
+
+  **The real fix is a design call, not yet made:** should the session-spawn
+  environment be re-derived from the user's login shell (allowlist) rather than
+  inherited from the daemon, and should hot-restart re-exec its successor with a
+  fresh environment instead of copying its own? guihost and dev daemons are
+  currently clean, so this is latent everywhere, live nowhere.
+
 - **★★ `web ensure` MINTS ONE WEB PROCESS PER TAB, revealed or not (measured on
   guihost, 2.12.17, 2026-07-27 — J8a).** The docs promise "thirty rows, not thirty
   webviews", and the RESTORE path honors it (a never-selected restored tab has
