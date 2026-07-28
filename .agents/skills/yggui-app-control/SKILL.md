@@ -299,31 +299,13 @@ or a DOM object; the page is FINE. `webview_unreachable` = nobody answered;
 run `web ensure`. Those two used to share one string and the ambiguity cost a
 field run ten minutes.
 
-⚠ **`js_result_unsupported` is OVERLOADED AGAIN — a third condition wears it
-(live-caught 2026-07-28, guihost, CLI+GUI both 2.12.18).** A dead content-process
-bridge answers `js_result_unsupported` for scripts that cannot possibly trip the
-documented cause:
-
-```text
-web eval --stdin  '1+1'            -> js_result_unsupported     # a NUMBER
-web eval --stdin  '"hello"'        -> js_result_unsupported     # a STRING
-web read --as text|forms           -> js_result_unsupported
-web frames                         -> js_result_unsupported
-web await 'return document.title'  -> await_kickoff_failed      # the honest one
-web screenshot --session           -> snapshot error
-```
-
-…while `web ensure` reported the surface healthy (`accepted:true`,
-`rebuilt_from_daemon_declare:true`, `healed:true`). **Triage rule: probe with a
-trivial script (`1+1`) first. If THAT is refused, the channel is broken, not
-your script** — the documented mapping will tell you the page is fine and it is
-lying. Only `await` refused honestly. This third case needs its own code
-(`bridge_unreachable` or similar); until it has one, the trivial-script probe is
-the only reliable discriminator. Filed:
-`bug-class-web-eval-bridge-dead-all-pages` in memory, and site-lore
-`dash.cloudflare.com` slug `headless-eval-bridge-down`. Likewise `accepted` (the injector ran), `resolved.*`
-(what the DOM said about the node) and `delivered` (what the page's listener
-saw) are three different questions — a `do click` reports all three.
+⚠ **Before reading any refusal, check a webview exists.**
+`server app state | jq .web_surface_tabs` — `views: 0` / `contexts: 0` means
+no content process anywhere, so every verb fails and its error string is noise.
+Note `web ensure` can answer `healed: true` about the declare/tab while no
+view is realized; that pair misleads badly. Probe with `eval '1+1'`: if a
+trivial script is refused, go look at `web_surface_tabs` rather than at your
+script.
 
 **Version mismatch is now honest.** App-control is a filesystem dropbox, so CLI
 and GUI must be swapped together; a verb this GUI does not implement answers
