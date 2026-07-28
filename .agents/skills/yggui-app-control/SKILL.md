@@ -109,8 +109,18 @@ and watch (agent-presence cursor). The enabling verbs:
 # "Agent <identity> <kind>: <purpose>" instead of inheriting the cwd-shaped
 # default, which renders identically to a human's shell in the same directory
 # and makes your row unfindable by any title probe.
-yggterm --agent <id> server app terminal new --kind shell --no-activate \
-  --purpose "what this session is for"
+#
+# ⚠ --agent is a TRAILING flag on the subcommand, NOT a global prefix.
+# `yggterm --agent <id> server app terminal new ...` produces EMPTY OUTPUT
+# (corrected 2026-07-28 — the global form was documented here and is wrong).
+yggterm server app terminal new --kind shell --no-activate \
+  --purpose "what this session is for" --agent <id>
+
+# ⚠ Sleep ~3s before the first `terminal send`. Sending into a session whose
+# shell has not finished starting is SILENTLY SWALLOWED: the send still answers
+# accepted:true with a byte count, no process appears, and the failure surfaces
+# far away as `web ensure` reporting "the daemon has no web-surface declare
+# (a plain shell, or the app already closed its surface)".
 # Materialize a BACKGROUNDED session's declared web surfaces into the soft
 # stash (created + demoted + leased, never revealed) so web do/read/wait
 # verbs can drive them immediately:
@@ -287,7 +297,31 @@ yggterm server app state | jq .agent_leases
 **Reading a refusal.** `js_result_unsupported` = your script returned a Promise
 or a DOM object; the page is FINE. `webview_unreachable` = nobody answered;
 run `web ensure`. Those two used to share one string and the ambiguity cost a
-field run ten minutes. Likewise `accepted` (the injector ran), `resolved.*`
+field run ten minutes.
+
+⚠ **`js_result_unsupported` is OVERLOADED AGAIN — a third condition wears it
+(live-caught 2026-07-28, jojo, CLI+GUI both 2.12.18).** A dead content-process
+bridge answers `js_result_unsupported` for scripts that cannot possibly trip the
+documented cause:
+
+```text
+web eval --stdin  '1+1'            -> js_result_unsupported     # a NUMBER
+web eval --stdin  '"hello"'        -> js_result_unsupported     # a STRING
+web read --as text|forms           -> js_result_unsupported
+web frames                         -> js_result_unsupported
+web await 'return document.title'  -> await_kickoff_failed      # the honest one
+web screenshot --session           -> snapshot error
+```
+
+…while `web ensure` reported the surface healthy (`accepted:true`,
+`rebuilt_from_daemon_declare:true`, `healed:true`). **Triage rule: probe with a
+trivial script (`1+1`) first. If THAT is refused, the channel is broken, not
+your script** — the documented mapping will tell you the page is fine and it is
+lying. Only `await` refused honestly. This third case needs its own code
+(`bridge_unreachable` or similar); until it has one, the trivial-script probe is
+the only reliable discriminator. Filed:
+`bug-class-web-eval-bridge-dead-all-pages` in memory, and site-lore
+`dash.cloudflare.com` slug `headless-eval-bridge-down`. Likewise `accepted` (the injector ran), `resolved.*`
 (what the DOM said about the node) and `delivered` (what the page's listener
 saw) are three different questions — a `do click` reports all three.
 
