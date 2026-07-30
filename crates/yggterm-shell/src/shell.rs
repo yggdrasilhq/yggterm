@@ -1619,7 +1619,10 @@ fn delete_web_surface_profile_in(
 /// end of an ssh forward. Hand-rolled over TcpStream: matches ychrome's
 /// dep-light control server; no HTTP client dependency for one GET.
 fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
-    control_request(url, None).map(|_| ())
+    // The PICKER's own server, not an app's control endpoint: no contribution,
+    // no declare, no token. `None` here is the absence of a credential, not a
+    // forgotten one.
+    control_request(url, None, None).map(|_| ())
 }
 
 /// One request against a libyggterm app's loopback control endpoint, returning
@@ -1632,20 +1635,33 @@ fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
 ///
 /// `url` must ALREADY be GUI-reachable (`resolve_control_endpoint_url` has
 /// turned a remote loopback into the local end of an `ssh -L` forward).
-fn control_request(url: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
-    control_request_with_timeout(url, body, Duration::from_secs(10))
+///
+/// `token` is the contribution's declared control token, sent as
+/// `X-Ychrome-Control`. THE RULE, one line so it cannot drift: every request to
+/// an APP's control endpoint carries the token that app declared; the app
+/// decides per route whether it demands one. Without it the app cannot tell the
+/// GUI from a page in one of its own surfaces — the control port is reachable
+/// from page JS through the `yggterm-appctl://` bridge — and `POST /action`
+/// (vault unlock, credential fill, ad blocking off) would be open to the web.
+fn control_request(
+    url: &str,
+    body: Option<&serde_json::Value>,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    control_request_with_timeout(url, body, token, Duration::from_secs(10))
 }
 
 /// The liveness ping's short fuse: a suspended app's listener still ACCEPTS
 /// (kernel backlog) but never answers, so an unbudgeted read would stall a
 /// whole poll tick. 1500ms loses at most part of one tick to a dead endpoint.
-fn control_ping_request(url: &str) -> Result<serde_json::Value, String> {
-    control_request_with_timeout(url, None, Duration::from_millis(1500))
+fn control_ping_request(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    control_request_with_timeout(url, None, token, Duration::from_millis(1500))
 }
 
 fn control_request_with_timeout(
     url: &str,
     body: Option<&serde_json::Value>,
+    token: Option<&str>,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     use std::io::{Read as _, Write as _};
@@ -1660,16 +1676,25 @@ fn control_request_with_timeout(
         .map_err(|error| format!("connect {host}:{port}: {error}"))?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
+    // An empty declared token is a PRE-GATE app (its register reply had none):
+    // sending `X-Ychrome-Control:` empty would be indistinguishable from a wrong
+    // token to a gated app, so an absent credential is sent as absent.
+    let auth = match token.filter(|token| !token.is_empty()) {
+        Some(token) => format!("X-Ychrome-Control: {token}\r\n"),
+        None => String::new(),
+    };
     let request = match body {
         Some(body) => {
             let payload = body.to_string();
             format!(
                 "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                 Content-Length: {}\r\n{auth}Connection: close\r\n\r\n{payload}",
                 payload.len(),
             )
         }
-        None => format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        None => {
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n")
+        }
     };
     stream
         .write_all(request.as_bytes())
@@ -1787,6 +1812,16 @@ struct SidebarContributionState {
     /// is not routing-aware, so its ping omits `?session=` and it can receive no
     /// commands.
     env_id: Option<String>,
+    /// The app's bearer token for the GUI-only routes on its own control
+    /// endpoint (`X-Ychrome-Control`). Declared over the PTY stream, which is
+    /// the point: a page in one of the app's surfaces can reach the control port
+    /// through the `yggterm-appctl://` bridge but cannot read a PTY, so this is
+    /// what tells the app that a `POST /action` came from the settings pane and
+    /// not from the page. Empty ⇒ a pre-gate app that declared none; the GUI
+    /// then sends no header and the app answers as it always did.
+    ///
+    /// NEVER trace this, never put it in a schema, never let it reach a webview.
+    control_token: String,
     /// The last command batch this contribution's ping DRAINED. Sent as
     /// `?ack=<batch_id>` on the next ping so the daemon can retire it
     /// (at-least-once delivery; the GUI dedups entries by id globally). `None`
@@ -9840,6 +9875,7 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
         appearance_version,
         document_version,
         env_id,
+        control_token,
         ..
     }) = decoded
     else {
@@ -9886,7 +9922,10 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
     let (probe_url, probe_target) = (control_url.clone(), ssh_target.clone());
     let reachable = task::spawn_blocking(move || {
         let (effective, forward) = resolve_control_endpoint_url(&probe_url, probe_target.as_deref());
-        let alive = control_ping_request(&build_control_ping_url(&effective, None, None)).is_ok();
+        // Liveness only, before any contribution exists — so there is no
+        // declared token yet, and none is needed: `/ping`'s stamps are open.
+        let alive =
+            control_ping_request(&build_control_ping_url(&effective, None, None), None).is_ok();
         // The probe's own forward is dropped here; the rebuild opens the one it
         // keeps. Leaving this one alive would leak an `ssh -L` per probe.
         drop(forward);
@@ -9922,6 +9961,7 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
             appearance_version,
             document_version,
             env_id,
+            control_token,
         },
         SidebarDeclareSource::DaemonReplay,
         now_ms as u64,
@@ -9941,6 +9981,9 @@ struct SidebarDeclare {
     appearance_version: Option<String>,
     document_version: Option<String>,
     env_id: Option<String>,
+    /// The app's control-endpoint credential. Travels with the declare and stops
+    /// there — it is stored on the contribution and never traced.
+    control_token: Option<String>,
 }
 
 /// Where a declare came from. Only the trace cares — but it cares a lot: a rail
@@ -9997,6 +10040,7 @@ async fn apply_sidebar_declare(
         appearance_version,
         document_version,
         env_id,
+        control_token,
     } = declare;
     let mut state = state;
     let (known, mut refetch) = state.with_mut(|shell| {
@@ -10030,6 +10074,7 @@ async fn apply_sidebar_declare(
                 appearance_version.clone(),
                 document_version.clone(),
                 env_id.clone(),
+                control_token.clone(),
                 now_ms,
                 None,
             )
@@ -10061,6 +10106,7 @@ async fn apply_sidebar_declare(
                 appearance_version.clone(),
                 document_version.clone(),
                 env_id.clone(),
+                control_token.clone(),
                 now_ms,
                 Some((
                     control_url.clone(),
@@ -14598,6 +14644,7 @@ impl ShellState {
         appearance_version: Option<String>,
         document_version: Option<String>,
         env_id: Option<String>,
+        control_token: Option<String>,
         now_ms: u64,
         // (declared url, GUI-reachable resolved url, forward child). Only
         // supplied when this declare CREATES the contribution.
@@ -14632,6 +14679,14 @@ impl ShellState {
             // aware app names itself, it stays named for the contribution's life.
             if env_id.is_some() {
                 existing.env_id = env_id;
+            }
+            // The control token is set-if-present for the same reason, and
+            // REFRESHED on every declare that carries one: a respawned app
+            // daemon mints a new token, and if it happened to re-bind the same
+            // port the url identity check would not notice. A stale token means
+            // every pane fetch and every action 403s until the session ends.
+            if let Some(control_token) = control_token.filter(|token| !token.is_empty()) {
+                existing.control_token = control_token;
             }
             // A changed stamp means the app's rules or userscripts changed on
             // its own host: drop what we hold and refetch. An unchanged stamp
@@ -14716,6 +14771,7 @@ impl ShellState {
                 document_loaded: false,
                 document_attempts: 0,
                 env_id,
+                control_token: control_token.unwrap_or_default(),
                 acked_command_batch: None,
                 last_seen_ms: now_ms,
             },
@@ -14963,6 +15019,9 @@ impl ShellState {
             document_version,
             // A ping never changes the routing identity — it is declare-owned;
             // set-if-present in the upsert keeps the stored env_id intact.
+            None,
+            // Nor the control token: it is minted by the app's daemon and only
+            // ever reaches us on a declare. Same set-if-present rule.
             None,
             now_ms,
             None,
@@ -15412,6 +15471,19 @@ impl ShellState {
             .map(str::to_string)
             .and_then(|path| self.web_surface_host_label(&path));
         Some((pane_id.clone(), host))
+    }
+    /// The token that session's app declared for its control endpoint's
+    /// GUI-only routes. Empty (or absent) ⇒ send no credential; see
+    /// [`SidebarContributionState::control_token`].
+    ///
+    /// Deliberately a SECOND accessor rather than a field on the url: the url is
+    /// quoted into traces and error strings all over this file, and a token that
+    /// travelled with it would end up in one of them.
+    fn sidebar_control_token(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .map(|contribution| contribution.control_token.clone())
+            .filter(|token| !token.is_empty())
     }
     fn sidebar_control_url(&self, session_path: &str) -> Option<String> {
         self.sidebar_contributions
@@ -26688,7 +26760,8 @@ async fn sidebar_endpoint_ping_tick(
     trace_home: std::path::PathBuf,
     tick: u64,
 ) {
-    let targets: Vec<(String, String, Option<String>, Option<String>)> = state.with(|shell| {
+    let targets: Vec<(String, String, Option<String>, Option<String>, String)> =
+        state.with(|shell| {
         let active = shell.sidebar_reads_live_path();
         let mut targets = Vec::new();
         if let Some(active) = active.as_ref()
@@ -26699,6 +26772,7 @@ async fn sidebar_endpoint_ping_tick(
                 contribution.control_url.clone(),
                 contribution.env_id.clone(),
                 contribution.acked_command_batch.clone(),
+                contribution.control_token.clone(),
             ));
         }
         // The background sweep: every 4th tick, ping the other live
@@ -26714,18 +26788,20 @@ async fn sidebar_endpoint_ping_tick(
                     contribution.control_url.clone(),
                     contribution.env_id.clone(),
                     contribution.acked_command_batch.clone(),
+                    contribution.control_token.clone(),
                 ));
             }
         }
-        targets
-    });
-    for (session_path, control_url, env_id, ack_batch) in targets {
+            targets
+        });
+    for (session_path, control_url, env_id, ack_batch, control_token) in targets {
         spawn(ping_and_apply_contribution(
             state,
             session_path,
             control_url,
             env_id,
             ack_batch,
+            control_token,
             trace_home.clone(),
         ));
     }
@@ -26740,10 +26816,19 @@ async fn ping_and_apply_contribution(
     control_url: String,
     env_id: Option<String>,
     ack_batch: Option<String>,
+    // The app's control token. The ping's LIVENESS half needs no credential (an
+    // app must be able to tell a pre-gate GUI it is alive), but its COMMAND
+    // half does: the drain is a mutation, and the control port is page-reachable
+    // through the appctl bridge, so an app that gates it withholds the batch
+    // from anyone who cannot prove they are the GUI.
+    control_token: String,
     trace_home: std::path::PathBuf,
 ) {
     let ping_url = build_control_ping_url(&control_url, env_id.as_deref(), ack_batch.as_deref());
-    let Ok(Ok(reply)) = task::spawn_blocking(move || control_ping_request(&ping_url)).await
+    let Ok(Ok(reply)) = task::spawn_blocking(move || {
+        control_ping_request(&ping_url, Some(control_token.as_str()))
+    })
+    .await
     else {
         return;
     };
@@ -53209,13 +53294,14 @@ fn web_surface_stale_handle(
 /// the local end of an `ssh -L`), so it runs on `spawn_blocking` — never the UI
 /// event loop. `seq` guards against a slow reply overwriting a newer schema.
 async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, seq: u64) {
-    let control_url = {
+    let (control_url, control_token) = {
         let shell = state.read();
-        shell
-            .server
-            .active_session_path()
-            .map(str::to_string)
-            .and_then(|path| shell.sidebar_control_url(&path))
+        let path = shell.server.active_session_path().map(str::to_string);
+        (
+            path.as_deref().and_then(|path| shell.sidebar_control_url(path)),
+            path.as_deref()
+                .and_then(|path| shell.sidebar_control_token(path)),
+        )
     };
     let Some(control_url) = control_url else {
         state.with_mut(|shell| {
@@ -53260,7 +53346,7 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
     if !query.is_empty() {
         url = format!("{url}?{}", query.join("&"));
     }
-    let fetched = task::spawn_blocking(move || control_request(&url, None))
+    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
     match fetched.and_then(|value| {
@@ -53291,8 +53377,9 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
     let Some((pane_id, control_url)) = target else {
         return;
     };
+    let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_pane_schema_url(&control_url, &pane_id);
-    let fetched = task::spawn_blocking(move || control_request(&url, None))
+    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("document schema fetch panicked: {error}")));
     match fetched.and_then(|value| {
@@ -53319,10 +53406,11 @@ async fn document_pane_run_action(
     action: String,
     value: Option<String>,
 ) {
-    let (control_url, mut values, value_keys) = {
+    let (control_url, control_token, mut values, value_keys) = {
         let shell = state.read();
         (
             shell.sidebar_control_url(&session_path),
+            shell.sidebar_control_token(&session_path),
             shell.document_pane_values_json(&session_path),
             shell.document_pane_value_keys_json(&session_path),
         )
@@ -53349,9 +53437,10 @@ async fn document_pane_run_action(
     // into another's.
     let body =
         json!({ "pane": pane_id, "action": action, "values": values, "value_keys": value_keys });
-    let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
-        .await
-        .unwrap_or_else(|error| Err(format!("document action panicked: {error}")));
+    let replied =
+        task::spawn_blocking(move || control_request(&url, Some(&body), control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("document action panicked: {error}")));
     let reply = match replied.and_then(|value| {
         if value.is_null() {
             return Ok(AppPaneActionReply::default());
@@ -53403,8 +53492,9 @@ async fn app_policy_fetch(
     let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
         return;
     };
+    let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_policy_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None))
+    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("policy fetch panicked: {error}")));
     match fetched.and_then(|value| {
@@ -53472,8 +53562,9 @@ async fn app_zoom_fetch(
     let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
         return;
     };
+    let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_zoom_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None))
+    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("zoom fetch panicked: {error}")));
     match fetched {
@@ -53524,8 +53615,9 @@ async fn app_appearance_fetch(
     let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
         return;
     };
+    let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_appearance_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None))
+    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("appearance fetch panicked: {error}")));
     match fetched {
@@ -53582,7 +53674,7 @@ fn resolve_fido2_dialog(
     approved: bool,
     credential_id: Option<String>,
 ) {
-    let control_url = state.with_mut(|shell| {
+    let (control_url, control_token) = state.with_mut(|shell| {
         // Clear it whichever way the user answered, so a second click can't
         // double-POST and the modal closes immediately.
         if shell
@@ -53592,7 +53684,10 @@ fn resolve_fido2_dialog(
         {
             shell.pending_fido2 = None;
         }
-        shell.sidebar_control_url(&dialog.session_path)
+        (
+            shell.sidebar_control_url(&dialog.session_path),
+            shell.sidebar_control_token(&dialog.session_path),
+        )
     });
     let Some(control_url) = control_url else {
         // The app's contribution expired between the request and the answer;
@@ -53610,7 +53705,10 @@ fn resolve_fido2_dialog(
         "credential_id": credential_id,
     });
     spawn(async move {
-        let _ = task::spawn_blocking(move || control_request(&url, Some(&body))).await;
+        let _ = task::spawn_blocking(move || {
+            control_request(&url, Some(&body), control_token.as_deref())
+        })
+        .await;
     });
 }
 
@@ -53659,12 +53757,15 @@ async fn app_pane_run_action_with_order(
     value: Option<String>,
     order: Option<Vec<String>>,
 ) {
-    let (control_url, mut values, value_keys, host, live_zoom, secure, prefs) = {
+    let (control_url, control_token, mut values, value_keys, host, live_zoom, secure, prefs) = {
         let shell = state.read();
         let active = shell.server.active_session_path().map(str::to_string);
         let control = active
             .as_deref()
             .and_then(|path| shell.sidebar_control_url(path));
+        let control_token = active
+            .as_deref()
+            .and_then(|path| shell.sidebar_control_token(path));
         let host = active
             .as_deref()
             .and_then(|path| shell.web_surface_host_label(path));
@@ -53707,7 +53808,16 @@ async fn app_pane_run_action_with_order(
                 }
             }
         }
-        (control, values, value_keys, host, live_zoom, secure, prefs)
+        (
+            control,
+            control_token,
+            values,
+            value_keys,
+            host,
+            live_zoom,
+            secure,
+            prefs,
+        )
     };
     let Some(control_url) = control_url else {
         return;
@@ -53744,9 +53854,10 @@ async fn app_pane_run_action_with_order(
     let url = app_pane_action_url(&control_url);
     let body =
         json!({ "pane": pane_id, "action": action, "values": values, "value_keys": value_keys });
-    let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
-        .await
-        .unwrap_or_else(|error| Err(format!("action panicked: {error}")));
+    let replied =
+        task::spawn_blocking(move || control_request(&url, Some(&body), control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("action panicked: {error}")));
     let reply = match replied.and_then(|value| {
         if value.is_null() {
             return Ok(AppPaneActionReply::default());
@@ -83936,6 +84047,7 @@ fn TerminalCanvas(
                                 appearance_version,
                                 document_version,
                                 env_id,
+                                control_token,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -83972,6 +84084,7 @@ fn TerminalCanvas(
                                                 appearance_version: appearance_version.clone(),
                                                 document_version: document_version.clone(),
                                                 env_id: env_id.clone(),
+                                                control_token: control_token.clone(),
                                             },
                                             SidebarDeclareSource::TerminalStream {
                                                 claimed_session: claimed_session.clone(),
@@ -118905,6 +119018,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             declared_ms,
             Some((
                 "http://127.0.0.1:1/".to_string(),
@@ -118929,6 +119043,7 @@ mod tests {
             None,
             None,
             Some(env_id.to_string()),
+            None,
             1_100,
             None,
         );
@@ -119215,6 +119330,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             stale_at + 100,
             None,
         );
@@ -119313,6 +119429,7 @@ mod tests {
             }],
             None,
             Some("yedit".to_string()),
+            None,
             None,
             None,
             None,
@@ -120687,6 +120804,7 @@ mod tests {
             Vec::new(),
             None,
             Some("yedit".to_string()),
+            None,
             None,
             None,
             None,
@@ -129708,6 +129826,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             now_ms,
             Some((
                 "http://127.0.0.1:1".to_string(),
@@ -129747,6 +129866,7 @@ mod tests {
             None,
             None,
             Some(document_version.to_string()),
+            None,
             None,
             now_ms,
             Some((
@@ -129867,6 +129987,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 now_ms,
                 Some((
                 "http://127.0.0.1:1".to_string(),
@@ -129875,6 +129996,217 @@ mod tests {
             )),
             )
             .policy
+    }
+
+    // -----------------------------------------------------------------------
+    // THE APP CONTROL TOKEN — the GUI's half.
+    //
+    // An app's control endpoint is reachable from page JS through the
+    // `yggterm-appctl://` bridge, so the app cannot tell the settings pane from
+    // a page unless the GUI proves who it is. The proof is a token the app
+    // declares over the PTY stream (which a page cannot read) and the GUI
+    // presents as `X-Ychrome-Control`.
+    // -----------------------------------------------------------------------
+
+    /// Stand in for an app's control endpoint: answer `{}` and hand the raw
+    /// request bytes back. Real socket, real `control_request` — the header is
+    /// the whole point, and a test that asserted on a formatted string instead
+    /// of the wire would prove nothing about what the app receives.
+    fn capture_control_request(
+        body: Option<serde_json::Value>,
+        token: Option<&str>,
+    ) -> (String, Result<serde_json::Value, String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake app");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the GUI connects");
+            let mut raw = vec![0u8; 4096];
+            let read = stream.read(&mut raw).unwrap_or(0);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            String::from_utf8_lossy(&raw[..read]).into_owned()
+        });
+        let url = format!("http://127.0.0.1:{port}/action");
+        let replied = control_request(&url, body.as_ref(), token);
+        (handle.join().expect("the fake app answered"), replied)
+    }
+
+    #[test]
+    fn the_gui_presents_its_control_token_on_an_app_endpoint_request() {
+        let (wire, replied) = capture_control_request(
+            Some(json!({"pane": "settings", "action": "reload-surface"})),
+            Some("tok-abc123"),
+        );
+        assert!(replied.is_ok(), "the request must still complete: {replied:?}");
+        assert!(
+            wire.contains("X-Ychrome-Control: tok-abc123\r\n"),
+            "the pane's POST must carry the declared token, got:\n{wire}"
+        );
+        assert!(
+            wire.starts_with("POST /action HTTP/1.1\r\n"),
+            "and it is still a POST to the action route:\n{wire}"
+        );
+        assert!(
+            wire.contains(r#"{"action":"reload-surface","pane":"settings"}"#),
+            "the body must survive the extra header:\n{wire}"
+        );
+
+        // A GET carries it too: `/pane/<id>` lists vault item names and is
+        // GUI-only for exactly that reason.
+        let (wire, _) = capture_control_request(None, Some("tok-abc123"));
+        assert!(wire.starts_with("GET /action HTTP/1.1\r\n"));
+        assert!(wire.contains("X-Ychrome-Control: tok-abc123\r\n"), "{wire}");
+    }
+
+    /// A PRE-GATE app declares no token. Sending an empty header would be
+    /// indistinguishable from a wrong one to a gated app; an absent credential
+    /// is sent as absent, and the picker's own server (no contribution at all)
+    /// is never handed a credential it has no use for.
+    #[test]
+    fn no_declared_token_means_no_header_at_all() {
+        for token in [None, Some("")] {
+            let (wire, replied) = capture_control_request(None, token);
+            assert!(replied.is_ok());
+            assert!(
+                !wire.contains("X-Ychrome-Control"),
+                "an absent token must not become an empty header: {token:?}\n{wire}"
+            );
+        }
+    }
+
+    /// The declare is the token's only courier, and a re-declare must REFRESH
+    /// it: an app whose daemon respawned mints a new token, and if it happened
+    /// to re-bind the same port the url-identity check would not notice. A stale
+    /// token means every pane fetch and every action 403s for the session's life.
+    #[test]
+    fn the_declared_control_token_is_stored_and_refreshed_but_never_cleared() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://app"));
+        declare_with_token(&mut shell, "local://app", Some("tok-1"), 1_000);
+        assert_eq!(
+            shell.sidebar_control_token("local://app").as_deref(),
+            Some("tok-1")
+        );
+
+        declare_with_token(&mut shell, "local://app", Some("tok-2"), 2_000);
+        assert_eq!(
+            shell.sidebar_control_token("local://app").as_deref(),
+            Some("tok-2"),
+            "a re-declare carrying a NEW token must replace the stored one"
+        );
+
+        // A ping passes None (the token is declare-owned) and must not clear it.
+        shell
+            .apply_sidebar_ping("local://app", None, None, None, None, None, 3_000)
+            .expect("a ping for a held contribution reports refetches");
+        assert_eq!(
+            shell.sidebar_control_token("local://app").as_deref(),
+            Some("tok-2"),
+            "a ping must never clear the token — every action after it would 403"
+        );
+
+        // A pre-gate app declares none: no token, and the accessor says so
+        // rather than handing back an empty string that would ship as a header.
+        declare_with_token(&mut shell, "local://old", None, 1_000);
+        assert_eq!(shell.sidebar_control_token("local://old"), None);
+        assert_eq!(shell.sidebar_control_token("local://never-declared"), None);
+    }
+
+    /// The token is a secret in a file whose traces quote control urls freely.
+    /// The declare's audit event names the endpoint, the panes and the stamps —
+    /// and must not name the credential.
+    #[test]
+    fn the_control_token_never_reaches_the_declare_trace() {
+        let source = include_str!("shell.rs");
+        let payload = source
+            .split("            \"sidebar_contribution\",\n            \"declare\",")
+            .nth(1)
+            .and_then(|rest| rest.split("\n        );").next())
+            .expect("the declare trace event is present");
+        assert!(
+            !payload.contains("control_token"),
+            "the declare's trace payload must never carry the token:\n{payload}"
+        );
+    }
+
+
+    /// THE CALL-SITE RULE, held where it is easiest to break: every request the
+    /// GUI makes to an APP's control endpoint presents that app's declared
+    /// token. The settings pane's action is the one this lane exists for — it
+    /// is what a page reaching `POST /action` through the appctl bridge would
+    /// have been driving — so it is anchored by name, and the whole product half
+    /// is swept for a call that forgot.
+    ///
+    /// Exactly two token-less calls are legitimate, and both are named below.
+    #[test]
+    fn the_settings_panes_action_presents_the_declared_token() {
+        let action = shell_fn_body("async fn app_pane_run_action_with_order");
+        assert!(
+            action.contains("control_request(&url, Some(&body), control_token.as_deref())"),
+            "the settings pane's action must present the app's control token"
+        );
+        assert!(
+            action.contains("shell.sidebar_control_token(path)"),
+            "and it must read that token from the session's own contribution"
+        );
+
+        let product = shell_product_source();
+        assert_eq!(
+            product.matches("control_request(&url, None, None)").count(),
+            0,
+            "an app-endpoint GET dropped the token"
+        );
+        assert_eq!(
+            product
+                .matches("control_request(&url, Some(&body), None)")
+                .count(),
+            0,
+            "an app-endpoint POST dropped the token"
+        );
+        // The picker's `/open` is a DIFFERENT server with no contribution and
+        // no declare, and the rebuild probe pings an endpoint before any
+        // contribution exists. Those two are the only credential-free calls.
+        assert_eq!(
+            product.matches("control_request(url, None, None)").count(),
+            1,
+            "the picker's control GET is the only token-less control_request"
+        );
+        assert_eq!(
+            product.matches("control_ping_request(").count(),
+            3,
+            "one definition and two call sites: the contribution ping (tokened) \
+             and the pre-contribution liveness probe (not)"
+        );
+        assert!(
+            product.contains("control_ping_request(&ping_url, Some(control_token.as_str()))"),
+            "the contribution's ping must present the token, or the app withholds \
+             its command batch and a routed open_tab is silently lost"
+        );
+    }
+    fn declare_with_token(
+        shell: &mut ShellState,
+        session: &str,
+        control_token: Option<&str>,
+        now_ms: u64,
+    ) {
+        shell.upsert_sidebar_contribution(
+            session,
+            Vec::new(),
+            None,
+            Some("Ychrome".to_string()),
+            None,
+            None,
+            None,
+            None,
+            control_token.map(str::to_string),
+            now_ms,
+            Some((
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )),
+        );
     }
 
     // Every launcher surface (titlebar `+`, cwd-tree context menu, start page)
