@@ -386,6 +386,15 @@ impl DesktopService {
         }
     }
 
+    /// Hand keyboard focus to a page webview — the GIVE-BACK half of the
+    /// ALT-layer focus loan (the tap notifier grabs focus for the shell; when
+    /// the KeyTips layer closes over a revealed surface, focus returns here).
+    pub fn web_surface_focus(&self, id: u64) {
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.focus(id);
+        }
+    }
+
     /// Step surface `id` back through the ENGINE's history.
     pub fn web_surface_go_back(&self, id: u64) {
         #[cfg(not(any(
@@ -888,7 +897,14 @@ impl DesktopService {
     }
 
     /// Re-attach a stashed web surface at the given bounds and show it.
-    pub fn unstash_web_surface(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+    pub fn unstash_web_surface(
+        &self,
+        id: u64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
             target_os = "macos",

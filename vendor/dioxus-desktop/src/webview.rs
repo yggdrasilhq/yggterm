@@ -683,6 +683,27 @@ impl WebviewInstance {
                     );
                 });
             }
+            // The ALT KeyTips tap, from a page webview that owns the keyboard.
+            // Order matters inside the notifier: focus FIRST (the chord keys
+            // that follow the tap must land on the shell root; the give-back
+            // happens on the reconcile loop's alt-overlay close edge), THEN the
+            // tap, so the overlay opens with the keyboard already home.
+            {
+                use gtk::prelude::WidgetExt as _;
+                use webkit2gtk::WebViewExt as _;
+                use wry::WebViewExtUnix as _;
+                let shell_webkit = desktop_context.webview.webview();
+                host.set_alt_tap_notifier(move || {
+                    let cancellable: Option<&gtk::gio::Cancellable> = None;
+                    shell_webkit.grab_focus();
+                    #[allow(deprecated)]
+                    shell_webkit.run_javascript(
+                        "window.__yggtermAltTapFromHost && window.__yggtermAltTapFromHost();",
+                        cancellable,
+                        |_| {},
+                    );
+                });
+            }
             desktop_context.install_web_surface_host(host);
         }
 

@@ -8745,6 +8745,9 @@ async fn web_surface_native_reconcile_loop(
     // Dioxus's render domain, like the `data-under-glass` stamp itself — so
     // re-renders never fight it and this loop is its ONE writer.
     let mut last_paint_holes: Option<String> = None;
+    // The ALT overlay flag as of the previous tick — the give-back edge below
+    // fires only on open→closed, never steady-state.
+    let mut last_alt_overlay_active = false;
     loop {
         let under_glass = desktop.web_surface_under_glass();
         if last_under_glass != Some(under_glass) {
@@ -9966,6 +9969,25 @@ async fn web_surface_native_reconcile_loop(
                     });
                 }
             }
+        }
+        // ALT-layer focus loan, the GIVE-BACK half. The host's tap notifier
+        // grabbed keyboard focus for the shell so chord keys land on the root;
+        // when the overlay CLOSES (dispatch, Escape, or a second tap) over a
+        // revealed page, the keyboard goes home to that page. Edge-triggered
+        // on the overlay flag so a user who closes the layer while a terminal
+        // is active costs nothing (host focus refuses unshown surfaces).
+        {
+            let alt_overlay_active = state.read().alt_overlay_active;
+            if last_alt_overlay_active && !alt_overlay_active {
+                let revealed: Option<u64> = applied
+                    .values()
+                    .find(|entry| entry.visible && entry.stashed_at_ms.is_none())
+                    .map(|entry| entry.native_id);
+                if let Some(native_id) = revealed {
+                    desktop.web_surface_focus(native_id);
+                }
+            }
+            last_alt_overlay_active = alt_overlay_active;
         }
         // Slice 4.1b — end-of-tick write-lock release. `applied` is now the
         // final surface set for this tick (all closes/stash-expiries/recreates
@@ -38896,6 +38918,19 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ tap: true }); }
   }, true);
   window.addEventListener('blur', function(){ armed = false; }, true);
+  // The HOST's tap relay: a clean ALT tap detected at the GTK level on a
+  // focused PAGE webview — this window's listeners are deaf there (§13.1, one
+  // level up: the focused-web-surface-eats-the-tap defect), so the vendored
+  // host observes the tap on the page widget itself and calls back in here.
+  // Same modal guard as the DOM detector, and the SAME message, so both doors
+  // land on the one Rust terminus (keytip_apply_bridge_message). The host has
+  // already handed keyboard focus to this webview before calling (the chord
+  // keys that follow must land on the root); the give-back to the page runs
+  // on the overlay's close edge in the reconcile loop.
+  window.__yggtermAltTapFromHost = function(){
+    if (modalOpen()) { return; }
+    if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ tap: true }); }
+  };
   // --- KeyTip floating-badge painter (§9): central assignment in Rust (each
   // interactable carries data-keytip-tip = its assigned letter while the overlay
   // is up), local painting here. Badges are their own little blocks in a
@@ -165159,6 +165194,48 @@ mod menu_dismissal_locks {
         assert_eq!(shell.top_menu(), Some(ShellMenu::Row));
         shell.close_context_menu();
         assert_eq!(shell.top_menu(), None);
+    }
+
+    /// The ALT layer must open from a focused PAGE webview too (§13.1, one
+    /// level up): the vendored host detects the clean tap at the GTK level and
+    /// calls the relay in this webview. The relay must exist, keep the modal
+    /// guard, and post the SAME `{tap:true}` message as the DOM detector — two
+    /// doors, one Rust terminus. The give-back half must run on the reconcile
+    /// loop's overlay close edge, through the host focus verb.
+    #[test]
+    fn the_host_alt_tap_relay_opens_the_layer_and_focus_goes_home_on_close() {
+        let relay = ALT_TAP_LISTENER_JS_TEMPLATE
+            .split("window.__yggtermAltTapFromHost = function(){")
+            .nth(1)
+            .expect("the bridge must define the host tap relay")
+            .split("};")
+            .next()
+            .expect("the relay closes");
+        assert!(
+            relay.contains("if (modalOpen()) { return; }"),
+            "the relay keeps the DOM detector's modal guard — a dialog on \
+             screen owns the keyboard"
+        );
+        assert!(
+            relay.contains("window.__yggtermAltTapSend({ tap: true });"),
+            "the relay posts the same message as the DOM detector, so both \
+             doors land on keytip_apply_bridge_message"
+        );
+
+        let product = product_source();
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("if last_alt_overlay_active && !alt_overlay_active {")),
+            "the give-back must be edge-triggered on the overlay closing"
+        );
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("desktop.web_surface_focus(native_id);")),
+            "closing the layer over a revealed page must hand the keyboard \
+             back to that page through the host focus verb"
+        );
     }
 
     /// The marker is rendered iff a menu is drawn, and the JS bridge intercepts
