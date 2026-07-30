@@ -35418,6 +35418,22 @@ fn queue_copy_edit_for_active_session(mut state: Signal<ShellState>, field: Copy
 /// appear while the user is typing, and approving it releases a credential — a
 /// stray Enter must never be able to do that. Escape declines it (dismissing is
 /// always safe); approval stays an explicit gesture.
+/// The keyboard contract each top modal actually honours, for the visible
+/// hint bar — ONE table beside the dispatcher so the promise on screen and
+/// the behaviour in [`modal_key_dispatch`] cannot drift. `Enter` is listed
+/// only where the dispatcher ACTS on it: Fido2 and strip dropdowns swallow
+/// it deliberately, and advertising a key that does nothing is the exact
+/// species of lie the ALT layer exists to end (spec §12.3).
+fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
+    match top {
+        TopModal::Fido2 => &[("Esc", "dismiss")],
+        TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
+        TopModal::CopyEdit => &[("Enter", "save"), ("Esc", "cancel")],
+        TopModal::ClassicTabsSwitch => &[("Enter", "switch"), ("Esc", "cancel")],
+        TopModal::StripDropdown => &[("Esc", "close")],
+    }
+}
+
 fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
     let Some(top) = state.with(|shell| shell.top_modal()) else {
         return false;
@@ -74513,6 +74529,32 @@ fn app() -> Element {
                         },
                         "data-keytip-exempt": "modal-marker",
                         style: "display:none;",
+                    }
+                    // §12.3's VISIBLE half: the dialog keys have worked at the
+                    // modal boundary since 2026-07-22, but nothing on screen
+                    // SAID so, and an affordance the user cannot see does not
+                    // exist (user-reported: "modals not showing any key menu").
+                    // One bar, one owner: the labels come from the SAME
+                    // precedence and the `modal_key_hints` table beside the
+                    // dispatcher, so the bar can never promise a key the
+                    // dispatcher swallows.
+                    div {
+                        "data-yggterm-modal-key-hints": "1",
+                        "data-keytip-exempt": "modal-key-hints",
+                        style: format!(
+                            "position:fixed; bottom:18px; left:50%; transform:translateX(-50%); z-index:410; \
+                             display:flex; align-items:center; gap:12px; height:24px; padding:0 14px; border-radius:999px; \
+                             background:rgba(95,168,255,0.16); box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42); \
+                             color:{}; font-size:11px; font-weight:700; letter-spacing:0.3px; pointer-events:none; \
+                             white-space:nowrap;",
+                            snapshot.palette.accent,
+                        ),
+                        for (key, action) in modal_key_hints(top_modal).iter() {
+                            span {
+                                span { style: "font-weight:800;", "{key}" }
+                                span { style: "opacity:0.62;", " {action}" }
+                            }
+                        }
                     }
                 }
                 // The MENU marker, the modal marker's twin. Escape has to close a
@@ -165597,6 +165639,48 @@ mod menu_dismissal_locks {
         assert_eq!(shell.top_menu(), Some(ShellMenu::Row));
         shell.close_context_menu();
         assert_eq!(shell.top_menu(), None);
+    }
+
+    /// §12.3's visible half: the modal hint bar may only promise keys the
+    /// dispatcher ACTS on — Fido2 and strip dropdowns swallow Enter
+    /// deliberately, so advertising it there would be a lie on screen. The
+    /// table is one owner beside the dispatcher; the bar must consume it from
+    /// the same precedence block as the modal marker.
+    #[test]
+    fn the_modal_hint_bar_promises_exactly_what_the_dispatcher_honours() {
+        for (modal, enter_advertised) in [
+            (TopModal::Fido2, false),
+            (TopModal::Delete, true),
+            (TopModal::CopyEdit, true),
+            (TopModal::ClassicTabsSwitch, true),
+            (TopModal::StripDropdown, false),
+        ] {
+            let hints = modal_key_hints(modal);
+            assert_eq!(
+                hints.iter().any(|(key, _)| *key == "Enter"),
+                enter_advertised,
+                "Enter may be advertised exactly where modal_key_dispatch acts on it"
+            );
+            assert!(
+                hints.iter().any(|(key, _)| *key == "Esc"),
+                "every top modal dismisses with Esc and must say so"
+            );
+        }
+
+        let product = product_source();
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("\"data-yggterm-modal-key-hints\": \"1\",")),
+            "the visible hint bar must render beside the modal marker"
+        );
+        assert!(
+            product.iter().any(|line| {
+                line.contains("for (key, action) in modal_key_hints(top_modal).iter() {")
+            }),
+            "the bar must consume the ONE table beside the dispatcher — a second \
+             spelling of the key list is the drift this lock exists to refuse"
+        );
     }
 
     /// The ALT layer must open from a focused PAGE webview too (§13.1, one
