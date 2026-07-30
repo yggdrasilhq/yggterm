@@ -52,8 +52,8 @@ use x11_dl::xlib::*;
 pub use web_context::WebContextImpl;
 
 use crate::{
-  proxy::ProxyConfig, web_context::WebContext, Error, NewWindowFeatures, NewWindowOpener,
-  NewWindowResponse, PageLoadEvent, Rect, Result, WebViewAttributes, RGBA,
+  proxy::ProxyConfig, web_context::WebContext, Error, InitializationScript, NewWindowFeatures,
+  NewWindowOpener, NewWindowResponse, PageLoadEvent, Rect, Result, WebViewAttributes, RGBA,
 };
 
 use self::web_context::WebContextExt;
@@ -371,8 +371,8 @@ impl InnerWebView {
     w.init("Object.defineProperty(window, 'ipc', { value: Object.freeze({ postMessage: function(x) { window.webkit.messageHandlers['ipc'].postMessage(x) } }) })", true)?;
 
     // Initialize scripts
-    for init_script in attributes.initialization_scripts {
-      w.init(&init_script.script, init_script.for_main_frame_only)?;
+    for init_script in &attributes.initialization_scripts {
+      w.init_script(init_script)?;
     }
 
     // Run pending webview.eval() scripts once webview loads.
@@ -783,23 +783,62 @@ impl InnerWebView {
     Ok(())
   }
 
+  /// A bootstrap shim: every page, the page's own world. What wry itself needs
+  /// for the ipc bridge.
   fn init(&self, js: &str, for_main_only: bool) -> Result<()> {
-    if let Some(manager) = self.webview.user_content_manager() {
-      let script = UserScript::new(
-        js,
-        if for_main_only {
-          UserContentInjectedFrames::TopFrame
-        } else {
-          UserContentInjectedFrames::AllFrames
-        },
-        UserScriptInjectionTime::Start,
-        &[],
-        &[],
-      );
-      manager.add_script(&script);
-    } else {
+    self.init_script(&InitializationScript {
+      script: js.to_string(),
+      for_main_frame_only: for_main_only,
+      allow_list: Vec::new(),
+      block_list: Vec::new(),
+      world_name: None,
+    })
+  }
+
+  /// Register one user script with all of its placement facts.
+  ///
+  /// `allow_list` and `world_name` used to be hardcoded to "every URL" and "the
+  /// page's world" here, and `block_list` to "exclude nothing" — the FFI has
+  /// always taken all three, and the constructor for the world has been in the
+  /// bindings since 2.22. Threading them through is what turns wry's
+  /// initialization scripts into a userscript plane: `@match` becomes
+  /// engine-side matching (a YouTube script costs nothing on any other tab),
+  /// `@exclude-match` becomes engine-side exclusion (a script never fires on a
+  /// page its author ruled out), and `@world` becomes real isolation (the page
+  /// can no longer read or clobber a script's globals).
+  fn init_script(&self, script: &InitializationScript) -> Result<()> {
+    let Some(manager) = self.webview.user_content_manager() else {
       return Err(Error::InitScriptError);
-    }
+    };
+    let frames = if script.for_main_frame_only {
+      UserContentInjectedFrames::TopFrame
+    } else {
+      UserContentInjectedFrames::AllFrames
+    };
+    // `&[&str]` is what the binding takes, and it borrows from the lists.
+    let allow_list: Vec<&str> = script.allow_list.iter().map(String::as_str).collect();
+    let block_list: Vec<&str> = script.block_list.iter().map(String::as_str).collect();
+    // There is no world NAME for the page's own world — `new_for_world` always
+    // resolves a name to an isolated world, so "page world" is the other
+    // constructor, not a special string.
+    let user_script = match &script.world_name {
+      Some(world) => UserScript::for_world(
+        &script.script,
+        frames,
+        UserScriptInjectionTime::Start,
+        world,
+        &allow_list,
+        &block_list,
+      ),
+      None => UserScript::new(
+        &script.script,
+        frames,
+        UserScriptInjectionTime::Start,
+        &allow_list,
+        &block_list,
+      ),
+    };
+    manager.add_script(&user_script);
     Ok(())
   }
 
