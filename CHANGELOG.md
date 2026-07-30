@@ -4,17 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-- **Fixed: keyboard scrolling works on app-shell sites, and scrolling is
+- **Fixed: keyboard scrolling works on app-shell sites, and page scrolling is
   smooth.** PageUp/PageDown/Home/End/Space did nothing on pages that pin the
   page itself and scroll an inner pane (most modern web apps): the engine only
   scrolls the focused element's ancestors, and the real scroller is not one of
   them. The browser surface now pages the pane you are reading — and stands
-  down wherever the page, a text box, or a widget owns the key, so Space in a
-  chat box or on a button behaves exactly as before. The engine's smooth
-  scrolling is also on now, so wheel and key scrolls glide instead of jumping.
-- **Fixed: the mouse back/forward buttons and Alt+Left/Right navigate.** Both
-  traverse the engine's own history — the same history the toolbar back and
-  forward buttons drive.
+  down wherever the page, a text box (shadow-DOM text fields included), or a
+  widget owns the key, so Space in a chat box or on a button behaves exactly
+  as before. The engine's smooth scrolling is also on for browser pages, so
+  wheel and key scrolls glide instead of jumping; the terminal deliberately
+  keeps its own scrolling untouched.
+- **Fixed: Alt+Left/Right navigate.** They traverse the engine's own history —
+  the same history the toolbar back and forward buttons drive.
+- **The mouse back/forward buttons (8/9) are wired to that same history**, and
+  an engine bug that silently ate a press landing over empty space is fixed on
+  the way. This half has no live proof yet — it still needs verification on a
+  real desktop before it counts as fixed.
 
 ## 2.12.18
 
