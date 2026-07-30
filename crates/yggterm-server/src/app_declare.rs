@@ -27,6 +27,23 @@ use serde::{Deserialize, Serialize};
 
 /// `ESC ] 7717 ;` — the start of a libyggterm control sequence.
 const OSC_PREFIX: &str = "\x1b]7717;";
+/// The wire spelling of a web-surface `open` declare, up to its payload.
+pub const WEB_SURFACE_OPEN_SEQUENCE: &str = "\x1b]7717;web-surface;open;";
+/// What an attach replay serves in its place: the SAME bytes with the action
+/// `seen` — deliberately the same length as `open`, so the rewrite never moves
+/// a byte and retained chunk boundaries stay exactly where they were.
+///
+/// Why the rewrite exists: the daemon CONSUMES a declare the moment it arrives
+/// ([`AppDeclareLog`] retains the latest state), but the raw bytes stay in the
+/// retained chunk ring as scrollback transcript, and a cursor-0 attach replays
+/// that ring. Served verbatim, the run's original `open` re-executes LAUNCH
+/// intent against a client that is merely re-attaching — the client cannot
+/// tell a replayed `open` from a live one (live incident 2026-07-23: a
+/// retained-scrollback replay delivered a stale declare before the fresh one).
+/// `seen` says what the daemon knows: this app declared, and the declare was
+/// already consumed — liveness, not intent. A client maps it to a re-attach; a
+/// plain terminal ignores it like every other unknown OSC.
+pub const WEB_SURFACE_SEEN_SEQUENCE: &str = "\x1b]7717;web-surface;seen;";
 /// A partial sequence longer than this is junk (a real declare is a URL, a
 /// title and a handful of pane labels), so the scanner drops it rather than
 /// growing a buffer on a stream that happens to contain the prefix bytes.
@@ -72,6 +89,12 @@ fn retention_for(verb: &str, action: &str) -> Retention {
     match (verb, action) {
         ("web-surface", "open" | "heartbeat") => Retention::Store,
         ("web-surface", "close") => Retention::Clear,
+        // `seen` is minted by the daemon itself at attach-replay serve time
+        // ([`WEB_SURFACE_SEEN_SEQUENCE`]) — never an app's own word. It exists
+        // only in SERVED copies, never in the ring this scanner reads, so this
+        // arm is defensive: an app that emits it anyway must not overwrite the
+        // record's live action with a word that means "already consumed".
+        ("web-surface", "seen") => Retention::Ignore,
         // A picker is a native prompt awaiting a human choice, not a surface
         // that can be rebuilt behind their back.
         ("web-surface", "pick") => Retention::Ignore,
@@ -188,6 +211,46 @@ fn parse_declare_body(body: &str) -> Option<AppDeclareMessage> {
         action: action.to_string(),
         payload,
     })
+}
+
+/// Must a cursor-0 attach replay neutralize retained web-surface `open`
+/// declares, given the retained record's CURRENT action for the verb?
+///
+/// - `Some("heartbeat")` — the run outlived its launch (a live app re-declares
+///   every ~4s), so any `open` in the replayed tail is consumed history: YES.
+/// - `None` — no record. Either nothing ever declared (then the tail holds no
+///   `open` and the rewrite is a no-op) or a `close` cleared it, in which case
+///   an `open` in the tail belongs to a FINISHED run — equally history: YES.
+/// - `Some("open")` — the app launched within the last heartbeat interval and
+///   the replayed `open` IS the current declare: NO, serve it verbatim. This
+///   is the same deterministic sliver rule the GUI's retained-declare rebuild
+///   applies (a record whose latest action is `open` classifies as a launch).
+///
+/// Catch-up reads (cursor > 0) are OUT of this policy on purpose: they deliver
+/// bytes this client has never consumed, so an `open` there carries the same
+/// launch intent it would have carried live (e.g. an app launched while the
+/// session was backgrounded).
+pub fn attach_replay_neutralizes_web_surface_open(record_action: Option<&str>) -> bool {
+    record_action != Some("open")
+}
+
+/// Rewrite every consumed web-surface `open` in a replayed stream to `seen`.
+///
+/// Returns `None` when the stream holds no such sequence (the overwhelmingly
+/// common case — the caller keeps its original bytes untouched). The swap is
+/// same-length by construction ([`WEB_SURFACE_SEEN_SEQUENCE`]), so the result
+/// is byte-for-byte the same size and every original index keeps its meaning —
+/// the caller may re-slice it at the original chunk boundaries.
+pub fn rewrite_consumed_web_surface_opens(stream: &str) -> Option<(String, usize)> {
+    const _: () = assert!(WEB_SURFACE_OPEN_SEQUENCE.len() == WEB_SURFACE_SEEN_SEQUENCE.len());
+    if !stream.contains(WEB_SURFACE_OPEN_SEQUENCE) {
+        return None;
+    }
+    let count = stream.matches(WEB_SURFACE_OPEN_SEQUENCE).count();
+    Some((
+        stream.replace(WEB_SURFACE_OPEN_SEQUENCE, WEB_SURFACE_SEEN_SEQUENCE),
+        count,
+    ))
 }
 
 /// The latest declare per verb for ONE session.
@@ -313,6 +376,69 @@ mod tests {
             serde_json::json!({"session": "s", "rp_id": "example.test"}),
         ));
         assert!(messages.is_empty());
+    }
+
+    // The daemon's own attach-serve word must never become retained state: a
+    // `seen` fed back (a hostile or confused app echoing it) would overwrite
+    // the record's live action with "already consumed".
+    #[test]
+    fn a_seen_action_is_never_retained() {
+        let mut scanner = AppDeclareScanner::new();
+        let messages = scanner.scan(&osc(
+            "web-surface",
+            "seen",
+            serde_json::json!({"session": "s", "url": "https://example.test/"}),
+        ));
+        assert!(messages.is_empty(), "`seen` is not an app's word to say");
+    }
+
+    // The replay-neutralization policy, exactly: a record still on `open` is
+    // the just-launched sliver and serves verbatim; everything else (a
+    // heartbeating run, a cleared record) is consumed history.
+    #[test]
+    fn only_a_record_still_on_open_keeps_the_replayed_open_verbatim() {
+        assert!(attach_replay_neutralizes_web_surface_open(Some("heartbeat")));
+        assert!(attach_replay_neutralizes_web_surface_open(None));
+        assert!(!attach_replay_neutralizes_web_surface_open(Some("open")));
+    }
+
+    // The rewrite is a same-length action swap and nothing else: every other
+    // byte — heartbeats, closes, ordinary output — is untouched, and a stream
+    // with no consumed open reports None so the caller keeps its bytes.
+    #[test]
+    fn the_open_rewrite_swaps_only_the_action_and_never_moves_a_byte() {
+        let payload = serde_json::json!({"session": "s", "url": "https://example.test/"});
+        let stream = format!(
+            "hello\r\n{}world{}\r\n{}",
+            osc("web-surface", "open", payload.clone()),
+            osc("web-surface", "heartbeat", payload.clone()),
+            osc("web-surface", "open", payload),
+        );
+        let (rewritten, count) =
+            rewrite_consumed_web_surface_opens(&stream).expect("two opens to rewrite");
+        assert_eq!(count, 2);
+        assert_eq!(
+            rewritten.len(),
+            stream.len(),
+            "the swap must be same-length so chunk boundaries keep their meaning"
+        );
+        assert!(!rewritten.contains(WEB_SURFACE_OPEN_SEQUENCE));
+        assert_eq!(
+            rewritten.matches(WEB_SURFACE_SEEN_SEQUENCE).count(),
+            2,
+            "both consumed opens serve as seen"
+        );
+        assert!(
+            rewritten.contains("\x1b]7717;web-surface;heartbeat;"),
+            "a heartbeat is already liveness and serves verbatim"
+        );
+        assert!(rewritten.starts_with("hello\r\n") && rewritten.contains("world"));
+
+        assert_eq!(
+            rewrite_consumed_web_surface_opens("plain output, no declares"),
+            None,
+            "a stream without a consumed open keeps its original bytes"
+        );
     }
 
     #[test]
