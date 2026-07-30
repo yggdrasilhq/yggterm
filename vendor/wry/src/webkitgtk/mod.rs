@@ -738,19 +738,22 @@ impl InnerWebView {
       script: js.to_string(),
       for_main_frame_only: for_main_only,
       allow_list: Vec::new(),
+      block_list: Vec::new(),
       world_name: None,
     })
   }
 
-  /// Register one user script with all four of its placement facts.
+  /// Register one user script with all of its placement facts.
   ///
   /// `allow_list` and `world_name` used to be hardcoded to "every URL" and "the
-  /// page's world" here — the FFI has always taken both, and the constructor for
-  /// the second one has been in the bindings since 2.22. Threading them through
-  /// is what turns wry's initialization scripts into a userscript plane:
-  /// `@match` becomes engine-side matching (a YouTube script costs nothing on
-  /// any other tab) and `@world` becomes real isolation (the page can no longer
-  /// read or clobber a script's globals).
+  /// page's world" here, and `block_list` to "exclude nothing" — the FFI has
+  /// always taken all three, and the constructor for the world has been in the
+  /// bindings since 2.22. Threading them through is what turns wry's
+  /// initialization scripts into a userscript plane: `@match` becomes
+  /// engine-side matching (a YouTube script costs nothing on any other tab),
+  /// `@exclude-match` becomes engine-side exclusion (a script never fires on a
+  /// page its author ruled out), and `@world` becomes real isolation (the page
+  /// can no longer read or clobber a script's globals).
   fn init_script(&self, script: &InitializationScript) -> Result<()> {
     let Some(manager) = self.webview.user_content_manager() else {
       return Err(Error::InitScriptError);
@@ -760,8 +763,9 @@ impl InnerWebView {
     } else {
       UserContentInjectedFrames::AllFrames
     };
-    // `&[&str]` is what the binding takes, and it borrows from `allow_list`.
+    // `&[&str]` is what the binding takes, and it borrows from the lists.
     let allow_list: Vec<&str> = script.allow_list.iter().map(String::as_str).collect();
+    let block_list: Vec<&str> = script.block_list.iter().map(String::as_str).collect();
     // There is no world NAME for the page's own world — `new_for_world` always
     // resolves a name to an isolated world, so "page world" is the other
     // constructor, not a special string.
@@ -772,14 +776,14 @@ impl InnerWebView {
         UserScriptInjectionTime::Start,
         world,
         &allow_list,
-        &[],
+        &block_list,
       ),
       None => UserScript::new(
         &script.script,
         frames,
         UserScriptInjectionTime::Start,
         &allow_list,
-        &[],
+        &block_list,
       ),
     };
     manager.add_script(&user_script);
