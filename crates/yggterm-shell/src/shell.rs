@@ -12090,6 +12090,12 @@ struct ShellState {
     /// The live session JUMP MODE highlight (`ALT,J`): the path the cursor is on
     /// while the Live list is being walked, `None` when jump mode is not up.
     alt_jump_path: Option<String>,
+    /// The DERIVED KeyTip map (§12.2 at the overlay boundary): tip → the walk's
+    /// `data-keytip-derived-id` stamp, assigned through the one ladder when the
+    /// overlay opened. An overlay-open snapshot — cleared with the overlay — and
+    /// consulted only when a chord letter misses the registry tree, so a
+    /// declared letter can never be shadowed (§6: declared beats derived).
+    alt_derived_tips: std::collections::BTreeMap<String, String>,
     /// The ALT+ KeyTips keymap in force (Excel-familiar defaults ∪ the user's
     /// `~/.yggterm/keymap.json` overrides). SSOT for the letters; the registry
     /// (`command_registry`) is SSOT for the command structure. See
@@ -14022,6 +14028,7 @@ impl ShellState {
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_jump_path: None,
+            alt_derived_tips: std::collections::BTreeMap::new(),
             keymap,
             keytip_config,
             keymap_editor_open: false,
@@ -25210,6 +25217,10 @@ impl ShellState {
     fn activate_alt_overlay(&mut self) {
         self.alt_overlay_active = true;
         self.alt_overlay_sequence.clear();
+        // A fresh open starts with a fresh derivation: the bridge re-runs the
+        // walk on the open edge, and until its answer lands no letter from a
+        // PREVIOUS open may dispatch (§12.2 — derivation is per-open).
+        self.alt_derived_tips.clear();
         self.titlebar_new_menu_open = false;
         self.titlebar_session_menu_open = false;
         self.titlebar_overflow_menu_open = false;
@@ -25217,6 +25228,10 @@ impl ShellState {
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
         self.alt_overlay_sequence.clear();
+        // The derived map is an overlay-open snapshot; it dies with the overlay
+        // (§12.2). The DOM stamps are the bridge's half, removed on the same
+        // close edge by __yggtermKeytipClearDerived.
+        self.alt_derived_tips.clear();
         // Jump mode lives inside the overlay: dismissing the overlay ends it. The
         // selection it moved STAYS where the cursor left it — the same contract as
         // arrow-navigating the sidebar, so "here" is never surprising.
@@ -39085,6 +39100,117 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
 /// land on the root `onkeydown` (which can `prevent_default`) instead of a
 /// focused terminal's helper textarea — otherwise a chord letter would both walk
 /// the overlay AND get typed into the PTY.
+/// §12.2's inversion, achieved at the OVERLAY boundary: the ONE definition of
+/// "visible interactable", shared by the derive pass (overlay open) and the §12
+/// audit verb. Component-level declaration is the spec's eventual home, but it
+/// is blocked on a component layer that does not exist (§12.2) — until then the
+/// walk derives coverage from the same DOM the user sees, at snapshot time.
+///
+/// - `mode === 'derive'`: collect every visible interactable that is neither
+///   DECLARED (`data-keytip-node` on itself or on a child marker — declared
+///   beats derived, §6) nor per-element EXEMPT, stamp each with a stable
+///   `data-keytip-derived-id="d<N>"` (N = document order), and return the
+///   `{id,label}` list the bridge posts to the one Rust terminus.
+/// - `mode === 'audit'`: count instead of skip — the §12.1-corrected THREE
+///   numbers (reachable / excused / orphan), plus the subtree-exemption police:
+///   an exempt stamp on a NON-interactable container that holds interactables
+///   is a violation in its own right (§12.1 — an exempt SUBTREE is forbidden).
+///
+/// SCOPE RULE (§4): while a top modal is up (`[data-yggterm-modal-open]`) the
+/// walk confines itself to that modal's subtree (`[data-yggterm-modal-root]`,
+/// matched by kind) — that is what puts badges INSIDE modals (§12.3). Exemption
+/// is tested per-ELEMENT ONLY (`hasAttribute`, never `closest`).
+const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
+  var KT_SEL = 'button, [role=button], a[href], input, select, textarea, [data-keytip-clickable]';
+  window.__yggtermKeytipClearDerived = function(){
+    document.querySelectorAll('[data-keytip-derived-id]').forEach(function(el){
+      el.removeAttribute('data-keytip-derived-id');
+      if (!el.hasAttribute('data-keytip-node')) { el.removeAttribute('data-keytip-tip'); }
+    });
+  };
+  window.__yggtermKeytipWalk = function(mode){
+    function visibleInteractable(el){
+      if (el.disabled) { return false; }
+      if (!el.getClientRects().length) { return false; }
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) { return false; }
+      var cs = window.getComputedStyle(el);
+      if (cs && (cs.visibility === 'hidden' || cs.display === 'none'
+                 || parseFloat(cs.opacity || '1') === 0 || cs.pointerEvents === 'none')) { return false; }
+      return true;
+    }
+    function labelOf(el){
+      return (el.getAttribute('aria-label') || el.textContent.trim()
+              || el.getAttribute('placeholder') || el.getAttribute('title') || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+    var scope = 'root';
+    var root = document;
+    var marker = document.querySelector('[data-yggterm-modal-open]');
+    if (marker) {
+      var kind = marker.getAttribute('data-yggterm-modal-open') || '';
+      var modalRoot = document.querySelector('[data-yggterm-modal-root="' + kind + '"]');
+      if (modalRoot) { root = modalRoot; scope = 'modal:' + kind; }
+    }
+    var all = Array.prototype.slice.call(root.querySelectorAll(KT_SEL)).filter(visibleInteractable);
+    if (mode === 'derive') {
+      window.__yggtermKeytipClearDerived();
+      var derive = [];
+      all.forEach(function(el){
+        if (el.hasAttribute('data-keytip-node')) { return; }
+        if (el.querySelector('[data-keytip-node]')) { return; }
+        if (el.hasAttribute('data-keytip-exempt')) { return; }
+        var id = 'd' + derive.length;
+        el.setAttribute('data-keytip-derived-id', id);
+        derive.push({ id: id, label: labelOf(el) });
+      });
+      return { scope: scope, derive: derive };
+    }
+    // Audit mode: the SAME classification, counted instead of skipped.
+    var reachableDeclared = 0, reachableDerived = 0;
+    var excusedEntries = [], derivedEntries = [], orphans = [];
+    all.forEach(function(el){
+      if (el.hasAttribute('data-keytip-node')) { reachableDeclared++; return; }
+      if (el.querySelector('[data-keytip-node]')) { reachableDeclared++; return; }
+      if (el.hasAttribute('data-keytip-exempt')) {
+        excusedEntries.push({ scope: scope, label: labelOf(el),
+          reason: el.getAttribute('data-keytip-exempt') || '(no reason)' });
+        return;
+      }
+      reachableDerived++;
+      derivedEntries.push({ scope: scope, label: labelOf(el) });
+    });
+    // The subtree-exemption police (§12.1: forbidden outright). A stamp on a
+    // NON-interactable container that holds interactables is a hiding place;
+    // under the per-element walk it excuses nothing, so it can only mislead.
+    var subtreeExemptStamps = [];
+    Array.prototype.slice.call(root.querySelectorAll('[data-keytip-exempt]')).forEach(function(el){
+      if (el.matches(KT_SEL)) { return; }
+      if (el.querySelector(KT_SEL)) {
+        subtreeExemptStamps.push({ tag: el.tagName.toLowerCase(),
+          reason: el.getAttribute('data-keytip-exempt') || '(no reason)' });
+      }
+    });
+    return {
+      scope: scope,
+      visible_interactables: all.length,
+      reachable: reachableDeclared + reachableDerived,
+      reachable_declared: reachableDeclared,
+      reachable_derived: reachableDerived,
+      excused: excusedEntries.length,
+      excused_entries: excusedEntries.slice(0, 300),
+      orphan_count: orphans.length,
+      orphans: orphans.slice(0, 300),
+      subtree_exempt_stamps: subtreeExemptStamps.slice(0, 300),
+      violations: orphans.length + subtreeExemptStamps.length,
+      derived: derivedEntries.slice(0, 300)
+    };
+  };
+})();"#;
+/// The §12 audit's invocation: the SAME walk the derive pass runs (one owner,
+/// [`KEYTIP_INTERACTABLE_WALK_JS`]), in count-instead-of-skip mode. Kept beside
+/// the walk so the audit can never grow a second definition of "interactable".
+const KEYTIPS_AUDIT_INVOCATION_JS: &str = "return window.__yggtermKeytipWalk ? window.__yggtermKeytipWalk('audit') : { error: 'keytip_walk_not_installed' };";
 /// The clean-ALT-tap detector, installed below the webview's keyboard focus. A
 /// capture-phase keydown/keyup pair on `window` runs the tap state machine
 /// ENTIRELY in the page, so it fires no matter which element (shell chrome, or a
@@ -39263,14 +39389,17 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     document.querySelectorAll('[data-keytip-tip]').forEach(function(marker){
       var tip = (marker.getAttribute('data-keytip-tip') || '').trim();
       if (!tip){ return; }
-      var host = marker.parentElement || marker;
+      // A DECLARED marker is a child span inside its interactable, so the badge
+      // anchors to the parent; a DERIVED stamp (§12.2) sits on the interactable
+      // itself, so the marker IS the host. Minimal extension, same painter.
+      var host = marker.hasAttribute('data-keytip-derived-id') ? marker : (marker.parentElement || marker);
       var r = host.getBoundingClientRect();
       if (r.width < 1 || r.height < 1){ return; }
       // A host scrolled out of its container (a sidebar row above the fold) still
       // has a box — an off-screen one. Without this its badge would be clamped
       // back into view and float over unrelated chrome, pointing at nothing.
       if (r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth){ return; }
-      var node = marker.getAttribute('data-keytip-node') || tip;
+      var node = marker.getAttribute('data-keytip-node') || marker.getAttribute('data-keytip-derived-id') || tip;
       var id = 'ktb__' + node;
       var b = document.getElementById(id);
       if (!b){ b = document.createElement('div'); b.id = id; c.appendChild(b); }
@@ -39284,7 +39413,29 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     var cont = document.getElementById(KT_CONT);
     if (cont){ Array.prototype.slice.call(cont.children).forEach(function(ch){ if (!live[ch.id]){ ch.remove(); } }); }
   }
-  window.setInterval(ktPaint, 90);
+  // §12.2 at the overlay boundary: on the overlay's OPEN edge run the ONE
+  // interactable walk (window.__yggtermKeytipWalk) in derive mode and post the
+  // collected {id,label} list to the one Rust terminus — Rust assigns letters
+  // through the one ladder and stamps data-keytip-tip back, which the painter
+  // above then paints with zero new render code. Re-runs on EVERY open
+  // (dynamic UIs; the walk removes stale stamps before restamping). On the
+  // CLOSE edge the derived stamps go with the overlay — the Rust map's half of
+  // that clear lives in clear_alt_overlay, same edge, each owner its own half.
+  var ktLastOverlayOpen = false;
+  function ktDeriveEdge(){
+    var open = overlayOpen();
+    if (open && !ktLastOverlayOpen && window.__yggtermKeytipWalk) {
+      try {
+        var report = window.__yggtermKeytipWalk('derive');
+        if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ derive: report.derive }); }
+      } catch (_e) {}
+    }
+    if (!open && ktLastOverlayOpen && window.__yggtermKeytipClearDerived) {
+      try { window.__yggtermKeytipClearDerived(); } catch (_e) {}
+    }
+    ktLastOverlayOpen = open;
+  }
+  window.setInterval(function(){ ktDeriveEdge(); ktPaint(); }, 90);
 })();"#;
 /// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
 /// generated from the EFFECTIVE accelerators (shipping defaults + the user's
@@ -39302,10 +39453,15 @@ fn keytip_accel_js_array(config: &KeymapConfig) -> String {
         .collect();
     format!("[{}]", entries.join(","))
 }
-/// The fully-assembled bridge script (ALT tap + chord walk + accelerators + badge
-/// painter), with the accelerator set baked in.
+/// The fully-assembled bridge script (interactable walk + ALT tap + chord walk +
+/// accelerators + badge painter), with the accelerator set baked in. The walk
+/// rides the same install loop so the audit verb and the derive edge always see
+/// the one `window.__yggtermKeytipWalk`, reinstalled after a webview reload.
 fn keytip_bridge_js(config: &KeymapConfig) -> String {
-    ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array(config))
+    format!(
+        "{KEYTIP_INTERACTABLE_WALK_JS}\n{}",
+        ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array(config))
+    )
 }
 /// Refresh the LIVE accelerator intercept set in the page after a rebind, without
 /// re-installing the listeners. Without this the JS would keep intercepting the
@@ -39388,6 +39544,32 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         dismiss_top_menu(state);
         return;
     }
+    // §12.2: the walk's overlay-open report — the visible interactables that
+    // carry no declaration and no per-element exemption. Assign them letters
+    // through the ONE ladder and stamp the letters back for the §9 painter.
+    if let Some(derive) = msg.get("derive").and_then(|value| value.as_array()) {
+        let elements: Vec<(String, String)> = derive
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(|value| value.as_str())?;
+                // The walk stamps `d<N>` and nothing else; refuse anything that
+                // is not that shape so the stamp lookups stay literal.
+                if !(id.starts_with('d')
+                    && id.len() > 1
+                    && id[1..].chars().all(|c| c.is_ascii_digit()))
+                {
+                    return None;
+                }
+                let label = entry
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                Some((id.to_string(), label.to_string()))
+            })
+            .collect();
+        apply_derived_keytips(state, &elements);
+        return;
+    }
     let Some(key) = msg.get("key").and_then(|value| value.as_str()) else {
         return;
     };
@@ -39443,6 +39625,131 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             }
         }
     }
+}
+/// §12.2's Rust half: assign the walk's collected elements their letters and
+/// stamp them back. The assignment is [`derive_keytips_for_elements`] — the one
+/// ladder — and the stamps are `data-keytip-tip`, which the EXISTING §9 painter
+/// paints with zero new render code. The map is stored on [`ShellState`] and
+/// dies with the overlay.
+fn apply_derived_keytips(mut state: Signal<ShellState>, elements: &[(String, String)]) {
+    let assignments = {
+        let shell = state.read();
+        // The overlay closed before the walk answered — a stale report must not
+        // stamp letters onto a layer that is no longer up.
+        if !shell.alt_overlay_active {
+            return;
+        }
+        let tree = shell.snapshot().keytip_tree;
+        derive_keytips_for_elements(&tree, &shell.alt_overlay_sequence, elements)
+    };
+    state.with_mut(|shell| {
+        // Replace wholesale: the report is the complete derivation for THIS
+        // open; merging with a previous open's map could dispatch a dead stamp.
+        shell.alt_derived_tips.clear();
+        for (id, tip) in &assignments {
+            shell.alt_derived_tips.insert(tip.clone(), id.clone());
+        }
+    });
+    let mut script = String::new();
+    for (id, tip) in &assignments {
+        // Both halves are machine-generated ([a-z0-9] by construction — the id
+        // shape is enforced at the bridge terminus, the tip comes from the
+        // ladder), so embedding them literally is safe.
+        script.push_str(&format!(
+            "var el{id} = document.querySelector('[data-keytip-derived-id=\"{id}\"]'); \
+             if (el{id}) {{ el{id}.setAttribute('data-keytip-tip', '{tip_upper}'); }}\n",
+            tip_upper = tip.to_ascii_uppercase(),
+        ));
+    }
+    if !script.is_empty() {
+        let _ = document::eval(&script);
+    }
+}
+/// Derived (snapshot-time) letter assignment — §12.2 achieved at the overlay
+/// boundary. ONE assigner: a phantom head re-claims every letter the registry
+/// already owns in the scope the overlay is showing (declared beats derived,
+/// §6), then the walk's elements ladder through the same [`keytip::assign_scope`]
+/// as every declaration — title letter, then a–z, then digits (§5). Pure and
+/// deterministic: elements arrive in document order and the ladder is pure, so
+/// the same DOM always yields the same letters.
+fn derive_keytips_for_elements(
+    tree: &KeyTipTree,
+    sequence: &str,
+    elements: &[(String, String)],
+) -> Vec<(String, String)> {
+    // An invalid prefix means the overlay is not showing a resolvable scope;
+    // derive nothing rather than guess an exclusion set.
+    let Some(scope_tips) = tree.tips_at(sequence) else {
+        return Vec::new();
+    };
+    // Exclude the FIRST char of every claimed tip: a bare letter, a group
+    // letter, and a future two-letter tip's prefix all make that char
+    // unavailable to derivation.
+    let mut taken: Vec<char> = scope_tips
+        .iter()
+        .filter_map(|tip| tip.chars().next())
+        .collect();
+    taken.sort_unstable();
+    taken.dedup();
+    // Phantom claimants (App origin so a reserved letter is claimed VERBATIM —
+    // an Origin::Shell phantom would be denied 'n' at root and exclude the
+    // wrong letter) followed by the derived elements, hint-less so they take
+    // the pure ladder.
+    let mut decls: Vec<KeyTipDecl> = taken
+        .iter()
+        .map(|&letter| {
+            KeyTipDecl::app(
+                format!("__registry-taken:{letter}"),
+                String::new(),
+                Some(letter),
+                Target::Run,
+            )
+        })
+        .collect();
+    for (id, label) in elements {
+        decls.push(KeyTipDecl::app(
+            format!("derived:{id}"),
+            label.clone(),
+            None,
+            Target::Run,
+        ));
+    }
+    let assigned = keytip::assign_scope(
+        &KtScope::App("derived".to_string()),
+        &decls,
+        &KeymapConfig::default(),
+    );
+    let mut used: std::collections::BTreeSet<String> =
+        taken.iter().map(|letter| letter.to_string()).collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for node in assigned {
+        if let keytip::AssignedNode::Leaf { key, tip, .. } = node {
+            let Some(id) = key.strip_prefix("derived:") else {
+                continue;
+            };
+            // Once singles are exhausted the ladder's last resort can repeat a
+            // letter, and a repeated letter cannot dispatch unambiguously: the
+            // first claimant (document order) keeps it, the rest go unbadged.
+            // (§5 step 7 — two-letter tips — is not implemented anywhere yet.)
+            if !used.insert(tip.clone()) {
+                continue;
+            }
+            out.push((id.to_string(), tip));
+        }
+    }
+    out
+}
+/// The dispatch seam for a chord letter the REGISTRY tree does not know
+/// (§12.2): the letter is answered by the derived map — the overlay-open
+/// snapshot assignment — or by nobody. Registry resolution always ran first
+/// (this is only consulted on [`ChordResolution::Invalid`]), so a declared
+/// letter can never be shadowed by a derived one. Pure, so the lock drives it
+/// with a fake map.
+fn resolve_registry_miss(
+    derived: &std::collections::BTreeMap<String, String>,
+    ch: char,
+) -> Option<String> {
+    derived.get(ch.to_ascii_lowercase().to_string().as_str()).cloned()
 }
 /// `~/.yggterm/keymap.json` — the directly-editable ALT+ keymap override file.
 fn keymap_config_path() -> Option<std::path::PathBuf> {
@@ -39904,7 +40211,24 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
             });
         }
         ChordResolution::Run(key) => dispatch_keytip_node(state, &key),
-        ChordResolution::Invalid => state.with_mut(|shell| shell.clear_alt_overlay()),
+        ChordResolution::Invalid => {
+            // §12.2: a letter the registry tree does not know may still be a
+            // DERIVED tip — the snapshot assignment made when this overlay
+            // opened. Registry resolution ran first (it produced the Invalid),
+            // so a declared letter is never shadowed. A letter matching neither
+            // dismisses exactly as before.
+            let derived_target = resolve_registry_miss(&state.read().alt_derived_tips, ch);
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            if let Some(id) = derived_target {
+                // The id shape was enforced at the bridge terminus (`d<N>`), so
+                // the selector is literal. Focus-then-click: click activates a
+                // button, focus is the useful half for an input/select.
+                let _ = document::eval(&format!(
+                    "var el = document.querySelector('[data-keytip-derived-id=\"{id}\"]'); \
+                     if (el) {{ if (el.focus) {{ el.focus(); }} el.click(); }}"
+                ));
+            }
+        }
     }
 }
 /// Run a container-opening node's side effect (a `Descend` target) without
@@ -65322,6 +65646,35 @@ async fn refresh_runtime_status_for_app_control(
         }),
     }
 }
+/// Evaluate a `return`-style script body in the MAIN webview and answer with
+/// `{result}` / `{error}` — the one wrapper behind `DomEval` AND the §12
+/// `KeytipsAudit` verb, so the two cannot drift on error/timeout semantics.
+async fn dom_eval_for_app_control(script: &str) -> Value {
+    let wrapped = format!(
+        r#"
+        (async () => {{
+          let result;
+          try {{
+            result = await (async () => {{ {script} }})();
+          }} catch (error) {{
+            dioxus.send({{ dom_eval_error: String(error) }});
+            return;
+          }}
+          try {{
+            dioxus.send(result === undefined ? null : result);
+          }} catch (_error) {{
+            dioxus.send({{ dom_eval_error: "unserializable result" }});
+          }}
+        }})();
+        "#
+    );
+    let mut eval = document::eval(&wrapped);
+    match tokio::time::timeout(Duration::from_millis(3000), eval.recv::<Value>()).await {
+        Ok(Ok(value)) => json!({ "result": value }),
+        Ok(Err(error)) => json!({ "error": error.to_string() }),
+        Err(_) => json!({ "error": "dom_eval_timeout" }),
+    }
+}
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -66529,39 +66882,52 @@ async fn process_pending_app_control_requests(
                 respond(payload, error)
             }
         }
-        AppControlCommand::DomEval { script } => {
-            let wrapped = format!(
-                r#"
-                (async () => {{
-                  let result;
-                  try {{
-                    result = await (async () => {{ {script} }})();
-                  }} catch (error) {{
-                    dioxus.send({{ dom_eval_error: String(error) }});
-                    return;
-                  }}
-                  try {{
-                    dioxus.send(result === undefined ? null : result);
-                  }} catch (_error) {{
-                    dioxus.send({{ dom_eval_error: "unserializable result" }});
-                  }}
-                }})();
-                "#
-            );
-            let mut eval = document::eval(&wrapped);
-            let data = match tokio::time::timeout(Duration::from_millis(3000), eval.recv::<Value>())
-                .await
-            {
-                Ok(Ok(value)) => json!({ "result": value }),
-                Ok(Err(error)) => json!({ "error": error.to_string() }),
-                Err(_) => json!({ "error": "dom_eval_timeout" }),
-            };
+        AppControlCommand::DomEval { script } => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(dom_eval_for_app_control(&script).await),
+            error: None,
+        },
+        AppControlCommand::KeytipsAudit => {
+            // The §12 audit: the SAME interactable walk the ALT overlay's
+            // derive pass runs (KEYTIP_INTERACTABLE_WALK_JS, one owner), in
+            // count-instead-of-skip mode. Handled HERE — beside the walk —
+            // so the audit and the derivation can never grow two definitions
+            // of "visible interactable".
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
                 completed_at_ms: current_millis() as u128,
                 output_path: None,
-                data: Some(data),
+                data: Some(dom_eval_for_app_control(KEYTIPS_AUDIT_INVOCATION_JS).await),
+                error: None,
+            }
+        }
+        AppControlCommand::SetKeytipsOverlay { open } => {
+            // Thin verbs on the EXISTING overlay terminus — the same
+            // activate/clear pair the clean ALT tap drives (§12's live-proof
+            // instrument). Opening here also fires the bridge's open-edge
+            // derive walk, exactly as a user tap would.
+            state.with_mut(|shell| {
+                if open {
+                    shell.activate_alt_overlay();
+                } else {
+                    shell.clear_alt_overlay();
+                }
+            });
+            sleep(Duration::from_millis(40)).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_keytips_overlay",
+                    "open": open,
+                    "alt_overlay_active": state.read().alt_overlay_active,
+                })),
                 error: None,
             }
         }
@@ -74380,6 +74746,7 @@ fn app() -> Element {
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: false,
                         alt_overlay_sequence: String::new(),
+                        modal_root: None,
                         on_close: move |_| {
                             dismiss_menu(state, ShellMenu::AppPane);
                         },
@@ -74417,6 +74784,7 @@ fn app() -> Element {
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: snapshot.alt_overlay_active,
                         alt_overlay_sequence: snapshot.alt_overlay_sequence.clone(),
+                        modal_root: None,
                         on_close: move |_| {
                             dismiss_menu(state, ShellMenu::Row);
                         },
@@ -74445,6 +74813,7 @@ fn app() -> Element {
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: false,
                         alt_overlay_sequence: String::new(),
+                        modal_root: None,
                         on_close: move |_| {
                             dismiss_menu(state, ShellMenu::WebTab);
                         },
@@ -74481,6 +74850,14 @@ fn app() -> Element {
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: false,
                         alt_overlay_sequence: String::new(),
+                        // Anchored on the classic STRIP this dropdown IS the
+                        // strip-dropdown top modal (`render_top_modal`), so it
+                        // names itself as the §4 walk root; rail-anchored it is
+                        // an ordinary menu and stamps nothing.
+                        modal_root: match switcher.anchor {
+                            WebProfileSwitcherAnchor::Strip => Some("strip-dropdown".to_string()),
+                            WebProfileSwitcherAnchor::Rail => None,
+                        },
                         on_close: move |_| {
                             dismiss_menu(state, ShellMenu::WebProfile);
                         },
@@ -75139,10 +75516,10 @@ fn Titlebar(
                             }
                             button {
                                 "data-titlebar-session-button": "1",
-                                // Active-session affordance: its details open with
-                                // ALT,D (metadata) and its title renames on double-
-                                // click, so it needs no ALT badge of its own (§12).
-                                "data-keytip-exempt": "active-session-menu",
+                                // The old `active-session-menu` exemption is
+                                // dissolved (§12.2): ALT,D reaches the details
+                                // too, but a visible interactable gets its own
+                                // derived letter rather than an alias-excuse.
                                 title: if titlebar_session_menu_open { "Close session details" } else { "Session details" },
                                 style: format!(
                                     "display:flex; align-items:center; gap:8px; width:100%; height:{}px; padding:0 12px; border:none; \
@@ -75334,8 +75711,9 @@ fn Titlebar(
                                     // The invisible click target that focuses the
                                     // search field; also anchors the ALT,S badge
                                     // (`search.focus` replaced the bare "/").
+                                    // DECLARED — so it needs no exemption; the old
+                                    // redundant "search" stamp is gone (§12.1).
                                     "data-keytip-node": keytip_node_id("search.focus"),
-                                    "data-keytip-exempt": "search",
                                     style: format!(
                                         "position:absolute; inset:0; z-index:2; border:none; background:transparent; cursor:text; padding:0; margin:0; \
                                          opacity:{}; pointer-events:{};",
@@ -75369,10 +75747,13 @@ fn Titlebar(
                                         // pattern.
                                         key: "titlebar-search-input-{snapshot.search_value_epoch}",
                                         id: SEARCH_INPUT_ID,
-                                        // Focus-search is ALT,S (`search.focus`) and
-                                        // Ctrl+Shift+P; the input itself needs no
-                                        // ALT badge (§12 exempt).
-                                        "data-keytip-exempt": "search",
+                                        // Per-ELEMENT exemption with its reason
+                                        // (§12.1): the declared `search.focus`
+                                        // activator overlays this exact box and
+                                        // already focuses it, so a second derived
+                                        // letter here would badge one affordance
+                                        // twice.
+                                        "data-keytip-exempt": "aliased-by-search.focus",
                                         r#type: "text",
                                         initial_value: "{snapshot.search_query}",
                                         placeholder: "{search_placeholder}",
@@ -75404,7 +75785,9 @@ fn Titlebar(
                                     if !snapshot.search_query.is_empty() {
                                         button {
                                             "data-titlebar-search-clear": "1",
-                                            "data-keytip-exempt": "search",
+                                            // A distinct affordance (clear ≠ focus):
+                                            // derived by the overlay-open walk, the
+                                            // old blanket "search" stamp is gone.
                                             title: "Clear search (Esc)",
                                             style: format!(
                                                 "z-index:3; border:none; background:transparent; cursor:pointer; \
@@ -77614,9 +77997,10 @@ fn SidebarRow(
             div {
                 id: "{sidebar_row_dom_id(&row.full_path)}",
                 "data-sidebar-row-path": "{row.full_path}",
-                // Unbounded list: navigated, not badged (§8). Exempt covers the
-                // row's own count/toggle children via the audit's ancestor check.
-                "data-keytip-exempt": "list-item",
+                // Unbounded list: navigated, not badged (§8). The row is a div
+                // outside the walk's interactable selector, so it needs no
+                // stamp; a subtree stamp here is forbidden (§12.1) — any
+                // interactable CHILD carries its own per-element exemption.
                 "data-sidebar-row-kind": "Separator",
                 "data-sidebar-row-label": "{row.label}",
                 "data-sidebar-row-depth": "{row.depth}",
@@ -77809,9 +78193,11 @@ fn SidebarRow(
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
             "data-sidebar-row-path": "{row.full_path}",
-            // Unbounded list: navigated, not badged (§8). The ALT layer acts on the
-            // FOCUSED row; the exempt covers the row's count/toggle children too.
-            "data-keytip-exempt": "list-item",
+            // Unbounded list: navigated, not badged (§8). The ALT layer acts on
+            // the FOCUSED row. The row is a div outside the walk's interactable
+            // selector, so it needs no stamp; a subtree stamp here is forbidden
+            // (§12.1) — the close/expander buttons carry their own per-element
+            // "list-item" exemptions instead.
             "data-sidebar-row-kind": "{row_kind_label}",
             "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
@@ -78160,6 +78546,10 @@ fn SidebarRow(
                 if show_live_close {
                     button {
                         "data-sidebar-live-session-close": "1",
+                        // Per-element (§12.1), reason "list-item": a per-row
+                        // affordance of an unbounded list (§8) — reached via the
+                        // focused row's menu (ALT,E), never badged per row.
+                        "data-keytip-exempt": "list-item",
                         title: "Close terminal",
                         style: live_session_close_button_style(palette, selected),
                         onmousedown: |evt| {
@@ -78199,6 +78589,11 @@ fn SidebarRow(
                 } else if row.kind == BrowserRowKind::Group {
                     button {
                         "data-sidebar-group-expander": "1",
+                        // Per-element (§12.1), reason "list-item": one per group
+                        // row of an unbounded list (§8) — arrows expand/collapse
+                        // the focused row, so badging every chevron would flood
+                        // the overlay.
+                        "data-keytip-exempt": "list-item",
                         "data-sidebar-row-toggle-target": "expander",
                         "data-sidebar-group-expanded": if row.expanded { "true" } else { "false" },
                         title: if row.expanded { "Collapse folder" } else { "Expand folder" },
@@ -90908,6 +91303,12 @@ fn TerminalCanvas(
                                             }
                                             div {
                                                 "data-ws-tab-overflow-menu": "1",
+                                                // §4 scope root: render_top_modal
+                                                // reports this dropdown as the
+                                                // strip-dropdown modal, so the
+                                                // overlay-open walk confines
+                                                // derivation to it while it is up.
+                                                "data-yggterm-modal-root": "strip-dropdown",
                                                 style: format!(
                                                     "position:absolute; top:100%; right:0; z-index:60; min-width:230px; max-height:340px; \
                                                      overflow-y:auto; padding:6px; border-radius:10px; background:{}; color:{}; \
@@ -91541,6 +91942,7 @@ fn WebSurfacePickerView(
                             keytip_tree: KeyTipTree::default(),
                             alt_overlay_active: false,
                             alt_overlay_sequence: String::new(),
+                            modal_root: None,
                             on_close: move |_| profile_menu.set(None),
                             on_action: {
                                 move |id: String| {
@@ -112496,9 +112898,9 @@ fn DaemonMetadataGroup(
         MetadataGroup { title: "Daemon".to_string(), entries, palette }
         button {
             "data-daemon-hot-restart-button": "1",
-            // Deep daemon/dev affordance in the metadata rail, not top-level chrome:
-            // exempt from the KeyTip orphan audit (§12).
-            "data-keytip-exempt": "daemon-control",
+            // A real interactable is a keyboard target (§12.2): the old
+            // `daemon-control` exemption is dissolved and this button is
+            // derived by the overlay-open walk.
             style: format!(
                 "display:inline-flex; align-items:center; justify-content:center; min-height:30px; \
                  margin-bottom:8px; padding:0 12px; border:none; border-radius:10px; background:{}; \
@@ -112759,13 +113161,11 @@ fn SettingsRailBody(
         RailScrollBody {
             content: rsx!{
             div {
-                // A Tab-navigable configuration surface reached by ALT,G: toggles,
-                // steppers, text inputs, and theme/notification selectors. Its
-                // widgets are form controls, exempt from per-widget ALT badges
-                // (§12). NOTE: the spec's richer Settings->theme keytip sub-scope
-                // (§4, ALT,G,T,<letter>) is tracked future work and will REPLACE
-                // this blanket exemption for the theme area when built.
-                "data-keytip-exempt": "settings-panel",
+                // §12.2's inversion dissolved the old blanket
+                // `data-keytip-exempt="settings-panel"` (§12.1: an exempt
+                // SUBTREE is forbidden): the panel's controls are now DERIVED
+                // by the overlay-open walk, so each visible widget gets its own
+                // letter with no per-widget declaration.
                 style: "display:flex; flex-direction:column; gap:12px; padding-bottom:8px;",
             ChromeBehaviorSettingsSection {
                 palette: snapshot.palette,
@@ -113016,9 +113416,8 @@ fn NotificationsRailBody(
     rsx! {
         RailHeader { title: "Notifications".to_string(), color: snapshot.palette.text.to_string() }
         div {
-            // A notifications list + its single Clear-All action: list is navigated
-            // (§8), Clear-All is Tab-reachable — exempt (§12). Panel opens via ALT,L.
-            "data-keytip-exempt": "notifications-panel",
+            // The old `notifications-panel` subtree exemption is dissolved
+            // (§12.1/§12.2): Clear All is derived by the overlay-open walk.
             style: "padding:0 16px 8px 16px; display:flex; justify-content:flex-end;",
             button {
                 style: chip_style(snapshot.palette, false),
@@ -113063,9 +113462,9 @@ fn ConnectRailBody(
         RailScrollBody {
             content: rsx!{
             div {
-            // The whole Connect surface is a Tab/Enter-driven SSH form + guide,
-            // reached by ALT,C: exempt from per-widget ALT badges (§12).
-            "data-keytip-exempt": "connect-form",
+            // The old `connect-form` subtree exemption is dissolved (§12.1/
+            // §12.2): the form's fields and buttons are derived by the
+            // overlay-open walk.
             style: "display:flex; flex-direction:column; gap:10px;",
             div {
                 style: "display:flex; flex-direction:column; gap:10px; padding-bottom:10px;",
@@ -114886,6 +115285,11 @@ fn ContextMenuOverlay(
     keytip_tree: KeyTipTree,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// §4 scope root, when this mount IS a top MODAL (`render_top_modal`): the
+    /// classic strip's profile dropdown passes `"strip-dropdown"` so the
+    /// overlay-open walk confines derivation to this menu while it is up.
+    /// `None` (every other mount) stamps nothing that matches a modal kind.
+    modal_root: Option<String>,
     on_close: EventHandler<MouseEvent>,
     /// Run the item with this id. One terminus for the mouse and the ALT layer
     /// alike ([`dispatch_row_menu_action`]) — neither can reach an action the
@@ -114952,6 +115356,7 @@ fn ContextMenuOverlay(
             div {
                 "data-context-menu": "1",
                 "data-yggterm-menu-surface": "1",
+                "data-yggterm-modal-root": modal_root.clone().unwrap_or_default(),
                 style: format!("{} pointer-events:auto;", context_menu_surface_style(palette, &placement_style, menu_blur, menu_width)),
                 onmousedown: |evt| evt.stop_propagation(),
                 onmouseup: |evt| evt.stop_propagation(),
@@ -115146,6 +115551,8 @@ fn CopyEditOverlay(
     rsx! {
         div {
             "data-copy-edit-overlay": "1",
+            // §4 scope root — see the delete overlay's stamp.
+            "data-yggterm-modal-root": "copy-edit",
             style: format!(
                 "position:fixed; inset:0; z-index:96; display:flex; align-items:center; justify-content:center; \
                  background:rgba(230,239,248,0.26); backdrop-filter:{}; -webkit-backdrop-filter:{};",
@@ -115262,6 +115669,8 @@ fn ClassicTabsSwitchOverlay(
     rsx! {
         div {
             "data-classic-tabs-overlay": "1",
+            // §4 scope root — see the delete overlay's stamp.
+            "data-yggterm-modal-root": "classic-tabs-switch",
             style: format!(
                 "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; \
                  background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
@@ -115336,6 +115745,10 @@ fn DeleteConfirmOverlay(
     rsx! {
         div {
             "data-delete-confirm-overlay": "1",
+            // §4 scope root: while this is the top modal, the overlay-open walk
+            // confines derivation to this subtree — badges INSIDE the modal.
+            // Value matches the `data-yggterm-modal-open` marker's kind.
+            "data-yggterm-modal-root": "delete",
             style: format!(
                 "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; \
                  background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
@@ -115464,6 +115877,8 @@ fn Fido2PresenceOverlay(
     rsx! {
         div {
             "data-fido2-overlay": "1",
+            // §4 scope root — see the delete overlay's stamp.
+            "data-yggterm-modal-root": "fido2",
             style: format!(
                 "position:fixed; inset:0; z-index:96; display:flex; align-items:center; justify-content:center; \
                  background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
@@ -166518,6 +166933,418 @@ mod menu_dismissal_locks {
 /// forward, so the name→panel dispatch and the sampler's revealed-gate are
 /// locked here too.
 ///
+/// §12.2's inversion at the OVERLAY boundary (docs/alt-keytips.md), locked.
+///
+/// The shape under lock: ONE JS walk (`KEYTIP_INTERACTABLE_WALK_JS`) defines
+/// "visible interactable" for BOTH the derive pass and the §12 audit; the
+/// bridge runs it on the overlay's OPEN edge and posts `{derive}` to the one
+/// Rust terminus; Rust assigns letters through the ONE ladder
+/// (`keytip::assign_scope`, registry letters excluded — §6 declared beats
+/// derived), stamps `data-keytip-tip` back for the §9 painter, and answers a
+/// registry-miss chord letter from the derived map. The map and the stamps die
+/// with the overlay. Exemption is per-ELEMENT with a NAMED reason — a subtree
+/// stamp is forbidden outright (§12.1).
+#[cfg(test)]
+mod keytips_inversion_locks {
+    use super::*;
+
+    fn product_source() -> Vec<String> {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod keytips_inversion_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        product
+    }
+
+    fn function_body(product: &[String], signature: &str) -> String {
+        let start = product
+            .iter()
+            .position(|line| line.trim_start().starts_with(signature))
+            .unwrap_or_else(|| panic!("{signature} moved — move this lock with it"));
+        let indent = &product[start][..product[start].len() - product[start].trim_start().len()];
+        let close = format!("{indent}}}");
+        let end = product[start + 1..]
+            .iter()
+            .position(|line| *line == close)
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("{signature} has no close brace at its own indent"));
+        product[start..=end].join("\n")
+    }
+
+    /// LOCK 1 — the ONE walk owns "visible interactable", and its decision
+    /// lines hold: the spec'd selector; declared credit (self, then the child
+    /// badge marker — the shipped pattern) BEFORE the exemption test, in BOTH
+    /// modes, so a wired control can never read as excused; exemption tested
+    /// per-ELEMENT only (`hasAttribute`, never `closest` — §12.1 forbids the
+    /// subtree escape hatch the old audit had); the §4 modal confinement; the
+    /// derived-id stamping; and the §12.1-corrected THREE audit numbers.
+    #[test]
+    fn the_walk_owns_visible_interactable_and_tests_exemption_per_element_only() {
+        let walk = KEYTIP_INTERACTABLE_WALK_JS;
+        assert!(
+            walk.contains(
+                "var KT_SEL = 'button, [role=button], a[href], input, select, textarea, [data-keytip-clickable]';"
+            ),
+            "the interactable selector is the walk's one definition"
+        );
+        assert!(
+            !walk.contains(".closest("),
+            "exemption is per-element (§12.1): the walk must never consult an ancestor's stamp"
+        );
+        // Derive mode: declared (self, then descendant marker) precedes exempt.
+        let derive_self = walk
+            .find("if (el.hasAttribute('data-keytip-node')) { return; }")
+            .expect("derive mode credits a self-declared element first");
+        let derive_child = walk
+            .find("if (el.querySelector('[data-keytip-node]')) { return; }")
+            .expect("derive mode credits a child badge marker (the shipped pattern)");
+        let derive_exempt = walk
+            .find("if (el.hasAttribute('data-keytip-exempt')) { return; }")
+            .expect("derive mode skips a per-element exemption");
+        assert!(
+            derive_self < derive_child && derive_child < derive_exempt,
+            "declared beats exempt in derive mode — the §12.1 ordering, kept"
+        );
+        // Audit mode: the same order, counted instead of skipped.
+        let audit_self = walk
+            .find("if (el.hasAttribute('data-keytip-node')) { reachableDeclared++; return; }")
+            .expect("audit mode counts a self-declared element");
+        let audit_child = walk
+            .find("if (el.querySelector('[data-keytip-node]')) { reachableDeclared++; return; }")
+            .expect("audit mode counts a child badge marker");
+        let audit_exempt = walk
+            .find("if (el.hasAttribute('data-keytip-exempt')) {\n        excusedEntries.push")
+            .expect("audit mode lists a per-element exemption with its reason");
+        assert!(
+            audit_self < audit_child && audit_child < audit_exempt,
+            "declared beats exempt in audit mode too — one classification, two modes"
+        );
+        // §4 scope rule: a top modal confines the walk to its subtree.
+        assert!(
+            walk.contains("document.querySelector('[data-yggterm-modal-open]')"),
+            "the walk reads the modal marker Rust renders from render_top_modal"
+        );
+        assert!(
+            walk.contains(r#"document.querySelector('[data-yggterm-modal-root="' + kind + '"]')"#),
+            "the walk roots itself at the marker's KIND — that is what badges modals inside"
+        );
+        // The derived stamp: stable, document-order.
+        assert!(
+            walk.contains("var id = 'd' + derive.length;")
+                && walk.contains("el.setAttribute('data-keytip-derived-id', id);"),
+            "each collected element gets the stable d<N> stamp"
+        );
+        // The §12.1-corrected report: three numbers plus the subtree police.
+        for key in [
+            "reachable:",
+            "excused:",
+            "orphan_count:",
+            "subtree_exempt_stamps:",
+            "violations:",
+        ] {
+            assert!(
+                walk.contains(key),
+                "the audit report must carry `{key}` (§12.1's three numbers + the police)"
+            );
+        }
+        // The audit verb runs THIS walk — one owner for both modes.
+        assert!(
+            KEYTIPS_AUDIT_INVOCATION_JS.contains("__yggtermKeytipWalk('audit')"),
+            "the audit invocation names the one walk"
+        );
+        let product = product_source();
+        assert!(
+            product.iter().any(|line| {
+                line.contains("dom_eval_for_app_control(KEYTIPS_AUDIT_INVOCATION_JS)")
+            }),
+            "the KeytipsAudit verb must evaluate the one invocation, not its own script"
+        );
+    }
+
+    /// LOCK 2 — the derivation seam is the ONE ladder. Given a labels list, the
+    /// letters come from `assign_scope` (title letter, then a–z — §5), registry
+    /// letters in the open scope are excluded (§6: declared beats derived), the
+    /// output is deterministic and duplicate-free, and an invalid chord prefix
+    /// derives nothing.
+    #[test]
+    fn derived_letters_come_from_the_one_ladder_and_exclude_registry_letters() {
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &[]);
+        let root_tips: std::collections::BTreeSet<String> =
+            tree.tips_at("").expect("root resolves").into_iter().collect();
+        assert!(
+            root_tips.contains("b"),
+            "fixture sanity: sidebar.toggle's 'b' is a root registry letter"
+        );
+        let elements = vec![
+            ("d0".to_string(), "Brightness".to_string()),
+            ("d1".to_string(), "Clear All".to_string()),
+            ("d2".to_string(), "Clear session".to_string()),
+        ];
+        let first = derive_keytips_for_elements(&tree, "", &elements);
+        let second = derive_keytips_for_elements(&tree, "", &elements);
+        assert_eq!(first, second, "invariant 1: same input, same letters");
+        assert_eq!(first.len(), 3, "every element gets a letter while the pool lasts");
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, tip) in &first {
+            assert!(
+                !root_tips.contains(tip),
+                "derived tip `{tip}` for {id} shadows a declared root letter"
+            );
+            assert!(seen.insert(tip.clone()), "derived tip `{tip}` assigned twice");
+        }
+        // The ladder's title step, observable: "Brightness" wants 'b', the
+        // registry owns 'b' (sidebar.toggle), so it falls to the NEXT title
+        // letter — 'r' (free at root forever: reserved letters are barred to
+        // shell chrome by invariant 4, and derivation may use them).
+        assert_eq!(first[0].0, "d0");
+        assert_eq!(first[0].1, "r", "Brightness: b taken -> next title letter r");
+        // Same-title collision inside the derivation, isolated from the live
+        // registry: an empty root scope, two identical labels — the second
+        // claimant ladders past the first's letter instead of colliding.
+        let empty = KeyTipTree::build(&[(KtScope::Root, vec![])], &KeymapConfig::default());
+        let twins = vec![
+            ("d0".to_string(), "Alpha".to_string()),
+            ("d1".to_string(), "Alpha".to_string()),
+        ];
+        let assigned = derive_keytips_for_elements(&empty, "", &twins);
+        assert_eq!(
+            assigned,
+            vec![
+                ("d0".to_string(), "a".to_string()),
+                ("d1".to_string(), "l".to_string()),
+            ],
+            "two Alphas: first takes 'a', second falls to the next title letter"
+        );
+        // An invalid prefix derives nothing rather than guessing a scope.
+        assert!(derive_keytips_for_elements(&tree, "zz", &elements).is_empty());
+    }
+
+    /// LOCK 3 — chord dispatch: a letter the registry tree does not know is
+    /// resolved against the DERIVED map, and only there; a letter matching
+    /// neither no-ops (dismisses) exactly as before. The production seam is
+    /// `feed_alt_overlay_char`'s Invalid arm — remove the derived consult there
+    /// and this goes red.
+    #[test]
+    fn a_registry_miss_resolves_against_the_derived_map() {
+        let mut derived = std::collections::BTreeMap::new();
+        derived.insert("r".to_string(), "d0".to_string());
+        assert_eq!(resolve_registry_miss(&derived, 'r').as_deref(), Some("d0"));
+        assert_eq!(
+            resolve_registry_miss(&derived, 'R').as_deref(),
+            Some("d0"),
+            "chord letters are case-folded"
+        );
+        assert_eq!(
+            resolve_registry_miss(&derived, 'z'),
+            None,
+            "a letter matching neither registry nor derived stays a plain miss"
+        );
+        let product = product_source();
+        let body = function_body(&product, "fn feed_alt_overlay_char(");
+        assert!(
+            body.contains("resolve_registry_miss("),
+            "the Invalid arm must consult the derived map:\n{body}"
+        );
+        assert!(
+            body.contains("data-keytip-derived-id") && body.contains("el.click();"),
+            "a derived hit must dispatch by the walk's own stamp:\n{body}"
+        );
+    }
+
+    /// LOCK 4 — the derived map and the stamps die with the overlay: Rust's
+    /// half in `clear_alt_overlay` (and a fresh `activate` starts empty), the
+    /// DOM's half on the bridge's close edge through the walk's clear.
+    #[test]
+    fn overlay_close_clears_the_derived_map_and_the_stamps() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://active");
+        let mut shell = ShellState::new(bootstrap);
+        shell.activate_alt_overlay();
+        shell
+            .alt_derived_tips
+            .insert("r".to_string(), "d0".to_string());
+        shell.clear_alt_overlay();
+        assert!(
+            shell.alt_derived_tips.is_empty(),
+            "closing the overlay must clear the derived map"
+        );
+        shell
+            .alt_derived_tips
+            .insert("r".to_string(), "d0".to_string());
+        shell.activate_alt_overlay();
+        assert!(
+            shell.alt_derived_tips.is_empty(),
+            "a fresh open must not inherit a previous open's map"
+        );
+        // The stamps' half: edge-triggered in the bridge, one clear owner.
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .contains("if (!open && ktLastOverlayOpen && window.__yggtermKeytipClearDerived)"),
+            "the bridge must clear the stamps on the overlay's CLOSE edge"
+        );
+        assert!(
+            KEYTIP_INTERACTABLE_WALK_JS.contains("el.removeAttribute('data-keytip-derived-id');")
+                && KEYTIP_INTERACTABLE_WALK_JS.contains("el.removeAttribute('data-keytip-tip');"),
+            "the clear removes both the id stamp and the painted tip"
+        );
+    }
+
+    /// LOCK 5 — the derive pass is wired end to end through ONE terminus: the
+    /// bridge walks on the OPEN edge and posts `{derive}`; the one bridge
+    /// dispatcher hands it to `apply_derived_keytips`; that derives through the
+    /// one assigner and stamps `data-keytip-tip`; the EXISTING §9 painter
+    /// paints derived stamps by anchoring to the element itself.
+    #[test]
+    fn the_open_edge_derives_through_the_one_terminus_and_the_one_painter() {
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("window.__yggtermKeytipWalk('derive')"),
+            "the open edge runs the one walk in derive mode"
+        );
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .contains("window.__yggtermAltTapSend({ derive: report.derive });"),
+            "the report rides the SAME sender as every other bridge message"
+        );
+        let product = product_source();
+        let bridge = function_body(&product, "fn keytip_apply_bridge_message(");
+        assert!(
+            bridge.contains("msg.get(\"derive\")"),
+            "the one bridge terminus must handle the derive message:\n{bridge}"
+        );
+        assert!(
+            bridge.contains("apply_derived_keytips(state, &elements);"),
+            "…and hand it to the derivation applier:\n{bridge}"
+        );
+        let apply = function_body(&product, "fn apply_derived_keytips(");
+        assert!(
+            apply.contains("derive_keytips_for_elements(")
+                && apply.contains("data-keytip-tip"),
+            "the applier assigns through the seam and stamps the painter's attribute:\n{apply}"
+        );
+        let seam = function_body(&product, "fn derive_keytips_for_elements(");
+        assert!(
+            seam.contains("keytip::assign_scope(")
+                && seam.contains("tree.tips_at(sequence)"),
+            "the seam is the ONE assigner with the registry letters excluded:\n{seam}"
+        );
+        // The painter's minimal extension: a derived stamp anchors to itself.
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains(
+                "marker.hasAttribute('data-keytip-derived-id') ? marker : (marker.parentElement || marker)"
+            ),
+            "the ONE painter anchors a derived stamp to the interactable itself"
+        );
+        // The assembled bridge carries the walk — audit and derive share it.
+        let script = keytip_bridge_js(&KeymapConfig::default());
+        assert!(
+            script.contains("window.__yggtermKeytipWalk = function(mode)"),
+            "the walk rides the bridge install loop"
+        );
+    }
+
+    /// LOCK 6 — §4's scope rule has both halves: every kind the modal MARKER
+    /// can name has a WALK ROOT stamped on that modal's subtree, so the
+    /// overlay-open walk can always confine itself to the top modal.
+    #[test]
+    fn every_modal_marker_kind_names_a_walk_root() {
+        let product = product_source();
+        let marker_at = product
+            .iter()
+            .position(|line| line.contains("\"data-yggterm-modal-open\": match top_modal {"))
+            .expect("the modal marker renders from render_top_modal");
+        let marker_block = product[marker_at..marker_at + 8].join("\n");
+        for kind in [
+            "fido2",
+            "delete",
+            "copy-edit",
+            "classic-tabs-switch",
+            "strip-dropdown",
+        ] {
+            assert!(
+                marker_block.contains(&format!("\"{kind}\"")),
+                "the marker match must still name `{kind}` — if the vocabulary \
+                 changed, move the walk roots with it"
+            );
+            let attr = format!("\"data-yggterm-modal-root\": \"{kind}\"");
+            let via_prop = format!("Some(\"{kind}\".to_string())");
+            assert!(
+                product
+                    .iter()
+                    .any(|line| line.contains(&attr) || line.contains(&via_prop)),
+                "modal kind `{kind}` has no walk root — its subtree cannot be \
+                 badged while it is the top modal (§4)"
+            );
+        }
+    }
+
+    /// LOCK 7 — the dissolved subtree exemptions stay dissolved (§12.1), and
+    /// every remaining `data-keytip-exempt` stamp carries a reason from the
+    /// NAMED allowed set. A legitimate new exemption adds its reason HERE, with
+    /// its justification — never a widened predicate.
+    #[test]
+    fn exemption_is_per_element_and_every_reason_is_named() {
+        let product = product_source();
+        for dissolved in [
+            "settings-panel",
+            "notifications-panel",
+            "connect-form",
+            "daemon-control",
+            "active-session-menu",
+            "search",
+        ] {
+            let stamp = format!("\"data-keytip-exempt\": \"{dissolved}\"");
+            assert!(
+                !product.iter().any(|line| line.contains(&stamp)),
+                "the `{dissolved}` exemption was dissolved (§12.1/§12.2) and must not return"
+            );
+        }
+        // The allowed per-element reasons, each individually justified:
+        // - modal-marker / menu-marker: display:none state markers, not
+        //   interactables at all; the stamp is self-documentation.
+        // - modal-key-hints: the pointer-events:none dialog-keys bar.
+        // - list-item: a per-row affordance of an unbounded list (§8 — lists
+        //   are navigated, not badged; the row menu reaches it).
+        // - aliased-by-search.focus: the search input, focused by the DECLARED
+        //   search.focus activator overlaying the same box.
+        let allowed = [
+            "modal-marker",
+            "modal-key-hints",
+            "menu-marker",
+            "list-item",
+            "aliased-by-search.focus",
+        ];
+        for line in product
+            .iter()
+            .filter(|line| line.contains("\"data-keytip-exempt\":"))
+        {
+            assert!(
+                allowed
+                    .iter()
+                    .any(|reason| line.contains(&format!("\"data-keytip-exempt\": \"{reason}\""))),
+                "unnamed exemption reason — add it to the allowed set WITH its \
+                 justification, or derive the element: {line}"
+            );
+        }
+    }
+}
+
 /// The placement rule is a pure function BECAUSE the loop that calls it holds a
 /// live `DesktopContext` and cannot be entered by a test (field guide §7.1). So
 /// every claim below is made by running `web_surface_place_page_rect` — the
