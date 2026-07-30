@@ -131537,6 +131537,50 @@ mod tests {
             "the expensive half must be scheduled on the coalesced trailing edge"
         );
 
+        // 1b. The schedule itself must actually DEFER. Review demonstrated
+        //     that a schedule body running the sync synchronously (rAF
+        //     deferral deleted, flush called inline) reintroduces the exact
+        //     per-event drag stall while every other assertion here stays
+        //     green. So pin the trailing edge inside the schedule body: it
+        //     must request an animation frame, it must never run the deferred
+        //     work inline, and its ONLY flush invocation must live inside the
+        //     deferred callback — a second (synchronous) flush call is the
+        //     stall coming back through the front door.
+        let schedule_body = script
+            .split("const schedulePrimarySelectionSync = () => {")
+            .nth(1)
+            .expect("the schedule body exists");
+        let schedule_body = &schedule_body[..schedule_body
+            .find("const handlePrimarySelectionSyncPointerDown")
+            .expect("the schedule body precedes the pointer-down flush handler")];
+        assert!(
+            schedule_body.contains("window.requestAnimationFrame("),
+            "the schedule must defer to an animation frame — a synchronous schedule body reintroduces the per-event drag stall"
+        );
+        assert!(
+            !schedule_body.contains("runPrimarySelectionSync("),
+            "the schedule must never run the deferred sync inline"
+        );
+        assert!(
+            !schedule_body.contains("recordPrimarySelectionFromXterm("),
+            "the schedule must never serialize the selection inline"
+        );
+        assert_eq!(
+            schedule_body.matches("flushPrimarySelectionSync(").count(),
+            1,
+            "the schedule body may invoke the flush exactly once — inside the deferred callback"
+        );
+        let deferred_callback_at = schedule_body
+            .find("const flushScheduledPrimarySelectionSync = () => {")
+            .expect("the schedule wraps its flush in a deferred callback");
+        let schedule_flush_at = schedule_body
+            .find("flushPrimarySelectionSync(")
+            .expect("the deferred callback flushes the pending sync");
+        assert!(
+            deferred_callback_at < schedule_flush_at,
+            "the schedule's only flush call must live inside the deferred callback, never inline"
+        );
+
         // 2. The trailing-edge flush performs the full deferred work.
         let flush_body = script
             .split("const runPrimarySelectionSync = (reason) => {")
@@ -131604,11 +131648,21 @@ mod tests {
             "pending flushes must land before the live re-record so the live selection wins"
         );
 
-        // 5. The cross-host flush hook rides the host entry, and the cleanup
-        //    cancels any scheduled sync so it can never fire against a
-        //    disposed terminal.
+        // 5. The cross-host flush hook rides the host entry, and the
+        //    dispose-time cleanup cancels any scheduled sync AND drops the
+        //    pending flag so a deferred sync can never fire against a
+        //    disposed terminal. A bare contains() on the cancel call alone
+        //    was vacuous — flushPrimarySelectionSync also calls the canceller
+        //    (with an if-return between cancel and reset), so the needle here
+        //    is the ADJACENT cancel + pending-reset pair, which only the
+        //    dispose site has.
         assert!(script.contains("flushPrimarySelectionSync,"));
-        assert!(script.contains("cancelScheduledPrimarySelectionSync();"));
+        assert!(
+            script.contains(
+                "cancelScheduledPrimarySelectionSync();\n                primarySelectionSyncPending = false;"
+            ),
+            "dispose-time cleanup must cancel the scheduled sync AND reset the pending flag as an adjacent pair — the cancel call alone also occurs inside flushPrimarySelectionSync and pins nothing"
+        );
     }
 
     #[test]
