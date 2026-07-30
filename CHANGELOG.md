@@ -2,6 +2,27 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Fixed: passkeys now reach agent-created browser surfaces.** `web ensure`
+  awaits the app's surface policy before building — a surface constructed
+  while the policy was still in flight permanently lacked its userscripts and
+  the signer bridge, so WebAuthn read as "not supported" on every surface an
+  agent made (a human won that race by sitting still for a second; an agent
+  never did). The wait is bounded: an exhausted policy fetch is re-armed and
+  retried inside the same call, and a policy that never arrives is refused by
+  name (`policy_gate_not_ready` + the gate state) instead of silently building
+  an unprotected page. Every ensure response now reports which policy state
+  the surface settled on. Human click-to-open behavior is unchanged.
+- **Fixed: `YGGTERM_APP_CONTROL_PID` now works as the exported default it was
+  documented to be.** Every `server app` verb used to clear the exported
+  variable whenever the invocation carried no `--pid` flag — so the very
+  setting the multi-client error message told you to use never survived to
+  resolution, and whether a verb appeared to honour it depended on how many
+  GUI clients were registered at that moment. Target resolution now goes
+  through one owner for every verb: an explicit `--pid`/`--client` on the
+  invocation wins, and with no flag the exported environment stands.
+
 ## 2.12.19
 
 - **Fixed: keyboard scrolling works on app-shell sites, and page scrolling is
