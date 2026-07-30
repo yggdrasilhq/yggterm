@@ -105,6 +105,32 @@ symbol rather than trusting a line number:**
 
 ## Standing traps / other open bugs
 
+- **★★★ THE YCHROME VIEWPORT IS NOT BACK-MOST — every chrome reveal recomputes
+  it (user-reported 2026-07-30 night, verbatim: "On every surface hidden
+  un-hidden trigger (sidebars and the titlebar) the UX breaks, recomputes.
+  Unlike the terminal viewport it does not feel like it sits in the back most
+  z-index and undisturbed.").** The architectural direction is the user's own
+  sentence: the web surface should sit at the BACK of the z-order and stay
+  untouched while sidebar/titlebar overlays come and go ABOVE it — the way
+  the terminal canvas already behaves — instead of being stashed, cropped,
+  translated or re-laid-out per reveal (today's overlay machinery treats the
+  reveal as the surface's problem; it should be the chrome's).
+  **⚠ VERIFICATION BAR, set by the user — do NOT call this done without it:
+  compositor-level pixel evidence (`server app screenshot --backend os
+  --region full`, works via spectacle on Wayland) of the FOUR CORNERS of the
+  web viewport plus the ENTIRE yggterm window, across sidebar-hover,
+  titlebar-hover and hide/unhide transitions.** Corner crops must use the
+  WINDOW's bounds, not the screen's (the desktop panel pollutes screen-bound
+  crops). Instrument gaps to close FIRST (extend yggui, per the working
+  rules): (1) a pointer verb that can synthesize edge-hover so the
+  sidebar/titlebar reveal is drivable agentically; (2) a capture path fast
+  enough for sub-second recompute flashes — one spectacle invocation costs
+  ~1 s to spawn, so a 6-frame "burst" around an `app open` transition
+  produced six identical settled frames (measured 2026-07-30; baseline +
+  corner evidence in the round-30 scratchpad). The settled state is already
+  exact-fit and seam-free after the immersion lane; the defect is the
+  TRANSITION.
+
 - **★★★ REMOTE ROWS WEDGE IN `RemoteBootstrap` AFTER A DAEMON VERSION HANDOVER
   (found live on the 2.12.18 → 2.12.19 bump, 2026-07-30 night).** After the
   GUI+daemon swap, every `remote-cc://` / `remote-session://` row the new
