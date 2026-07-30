@@ -1774,6 +1774,19 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 }
 
 fn main() -> Result<()> {
+    // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
+    // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
+    // anything in this process touches GTK without an address to inherit, and
+    // that bus plus its activated portal/secrets/a11y daemons then outlive us
+    // forever. 4,574 MB across 243 such orphans on 43 buses was measured on the
+    // live host (2026-07-30). Every child we spawn inherits this answer, which is
+    // why it belongs here and not at the spawn sites — the sites that leaked were
+    // exactly the ones nobody remembered.
+    //
+    // Must run before any thread exists (`set_var` is unsound afterwards) and
+    // before GLib caches the address on first use.
+    let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
     let entry_args = std::env::args().skip(1).collect::<Vec<_>>();
     // FIRST, ahead of even the supervisor: this process may have been re-exec'd for
     // the sole purpose of dlopening libEGL and reporting what this host rasterizes
@@ -2523,7 +2536,10 @@ fn main() -> Result<()> {
             // A LOCAL /proc walk, not an app-control round trip: the profile is
             // most needed when the GUI is too loaded to answer a socket.
             "memory" | "mem" => {
-                run_app_control_memory_profile(args.iter().any(|arg| arg == "--json"))
+                run_app_control_memory_profile(
+                    args.iter().any(|arg| arg == "--json"),
+                    args.iter().any(|arg| arg == "--sweep"),
+                )
             }
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
