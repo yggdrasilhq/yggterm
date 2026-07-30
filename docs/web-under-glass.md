@@ -1,5 +1,19 @@
 # Phase F — web surfaces under the glass
 
+**Status update 2026-07-30 (round 30): ARMED ON THE LIVE HOST.** Sandbox
+acceptance passed end to end with REAL seat input (headless sway + a
+persistent wlr virtual pointer — `scripts/underglass-sandbox.sh`): hole
+click-through, titlebar-reveal page-pixel BIT-invariance, hide/unhide
+BIT-invariance, 5-cycle soak, corner molding, and both halves of the
+2026-07-26 incident guard (never-revealed surface paints nothing; closing
+the active surface leaves no bleed). Live host armed via relaunch env +
+`~/.config/plasma-workspace/env/yggterm-underglass.sh`; corners + full
+window compositor-captured. Owed: user by-eye across their real triggers +
+a soak before the opt-in default flips. ⚠ Instrument traps that cost time:
+a devices-less seat has NO pointer capability (`swaymsg seat cursor press`
+silently no-ops); one-shot `wlrctl` attach/detach churn never lands a click
+— the pointer must be PERSISTENT for the capability to stick.
+
 **Status: F.1 IMPLEMENTED (2026-07-19, pending live proof). T8–T11 landed:
 the titlebar clamp is DEAD under glass (the geometry eval zeroes `clampTop`
 on the root stamp; legacy keeps it); reveal comes from the host GTK

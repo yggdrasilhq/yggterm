@@ -105,31 +105,38 @@ symbol rather than trusting a line number:**
 
 ## Standing traps / other open bugs
 
-- **★★★ THE YCHROME VIEWPORT IS NOT BACK-MOST — every chrome reveal recomputes
-  it (user-reported 2026-07-30 night, verbatim: "On every surface hidden
-  un-hidden trigger (sidebars and the titlebar) the UX breaks, recomputes.
-  Unlike the terminal viewport it does not feel like it sits in the back most
-  z-index and undisturbed.").** The architectural direction is the user's own
-  sentence: the web surface should sit at the BACK of the z-order and stay
-  untouched while sidebar/titlebar overlays come and go ABOVE it — the way
-  the terminal canvas already behaves — instead of being stashed, cropped,
-  translated or re-laid-out per reveal (today's overlay machinery treats the
-  reveal as the surface's problem; it should be the chrome's).
-  **⚠ VERIFICATION BAR, set by the user — do NOT call this done without it:
-  compositor-level pixel evidence (`server app screenshot --backend os
-  --region full`, works via spectacle on Wayland) of the FOUR CORNERS of the
-  web viewport plus the ENTIRE yggterm window, across sidebar-hover,
-  titlebar-hover and hide/unhide transitions.** Corner crops must use the
-  WINDOW's bounds, not the screen's (the desktop panel pollutes screen-bound
-  crops). Instrument gaps to close FIRST (extend yggui, per the working
-  rules): (1) a pointer verb that can synthesize edge-hover so the
-  sidebar/titlebar reveal is drivable agentically; (2) a capture path fast
-  enough for sub-second recompute flashes — one spectacle invocation costs
-  ~1 s to spawn, so a 6-frame "burst" around an `app open` transition
-  produced six identical settled frames (measured 2026-07-30; baseline +
-  corner evidence in the round-30 scratchpad). The settled state is already
-  exact-fit and seam-free after the immersion lane; the defect is the
-  TRANSITION.
+- **★★ THE YCHROME VIEWPORT Z-ORDER — UNDER-GLASS ARMED ON THE LIVE HOST,
+  USER CONFIRMATION OWED (was: "every hidden un-hidden trigger breaks and
+  recomputes the viewport", 2026-07-30).** Phase F under-glass IS the fix the
+  user described (page at the BACK of the z-order, chrome floating above it,
+  the terminal-canvas property) and it is now ARMED on the live host
+  (relaunch env + `~/.config/plasma-workspace/env/yggterm-underglass.sh` for
+  future logins; `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` reverts).
+  **Acceptance evidence (2026-07-30 night):**
+  - Sandbox (headless sway + persistent wlr virtual pointer +
+    `scripts/underglass-sandbox.sh`, REAL seat input): click-through the
+    glass hole reaches the page (counter incremented); titlebar auto-hide
+    reveal via genuine top-edge pointer motion painted ONLY the titlebar
+    band — page pixels BIT-IDENTICAL during the reveal, and the whole window
+    BIT-IDENTICAL after the cycle; session-switch hide/unhide returned the
+    page BIT-IDENTICAL; 5-cycle reveal soak: zero page-region drift; corner
+    molding (rounded glass hole) pixel-proven; INCIDENT GUARD: a second,
+    never-revealed surface painted ZERO pixels, and closing the active
+    surface left no bleed.
+  - Live host: armed relaunch, rows intact, full-window compositor capture
+    + all four viewport-corner crops show the page compositing under the
+    chrome with molded corners.
+  **STILL OWED before closing:** the user's own by-eye/feel confirmation on
+  real hardware across THEIR triggers (sidebar overlays included — the
+  sandbox exercised the titlebar reveal and session switches; sidebar
+  overlays ride the same floats-over-glass machinery but were not separately
+  driven), and a few days' soak against the 2026-07-26 incident class (a
+  shell that cannot paint shows whatever is behind it — visibility-truth
+  keeps unrevealed pages unmapped, and the sandbox guard held, but the
+  incident fired on the LIVE host's env, so the soak is the honest closer).
+  Instruments now in-repo: `scripts/underglass-sandbox.sh` (isolated armed
+  GUI + real-pointer + fast grim frames; see the script header for the
+  virtual-pointer recipe and its traps).
 
 - **★★★ REMOTE ROWS WEDGE IN `RemoteBootstrap` AFTER A DAEMON VERSION HANDOVER
   (found live on the 2.12.18 → 2.12.19 bump, 2026-07-30 night).** After the
