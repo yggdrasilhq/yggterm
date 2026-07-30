@@ -1438,6 +1438,14 @@ pub struct WebSurfaceHost {
     /// window's top edge zone; the notifier forwards into the shell webview,
     /// which runs its normal reveal logic.
     edge_motion: Rc<RefCell<Option<Rc<dyn Fn(SurfaceRevealEdge)>>>>,
+    /// A clean ALT tap on a PAGE webview — press and release with no other key
+    /// or button between — observed at the GTK level, because when a page holds
+    /// keyboard focus neither the shell webview's window listeners nor tao's
+    /// key handlers ever see the key (§13.1, one level up: the
+    /// focused-web-surface-eats-the-tap defect). The notifier hands keyboard
+    /// focus to the shell and opens the KeyTips layer; the shell gives focus
+    /// back when the layer closes.
+    alt_tap: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     /// THE surface WebKit has taken into element fullscreen, or `None`.
     ///
     /// One owner for "is a page on the whole screen right now", written only by
@@ -2014,6 +2022,89 @@ fn connect_seat_input_observer(webkit: &webkit2gtk::WebView, surface_id: u64) {
     });
 }
 
+/// One step of the clean-ALT-tap state machine. Pure so the contract is
+/// testable without GTK: `armed` survives only an uninterrupted
+/// press-then-release of ALT itself — ANY other key press, or any button,
+/// disarms it (invariant 7: held ALT+key combos belong to the PAGE and must
+/// never be intercepted; only the keyless tap is).
+fn alt_tap_step(armed: bool, event: AltTapEvent) -> (bool, bool) {
+    match event {
+        AltTapEvent::AltPress => (true, false),
+        AltTapEvent::OtherKeyPress | AltTapEvent::ButtonPress => (false, false),
+        AltTapEvent::AltRelease => (false, armed),
+        AltTapEvent::OtherKeyRelease => (armed, false),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltTapEvent {
+    AltPress,
+    AltRelease,
+    OtherKeyPress,
+    OtherKeyRelease,
+    ButtonPress,
+}
+
+fn gdk_keyval_is_alt(keyval: gdk::keys::Key) -> bool {
+    keyval == gdk::keys::constants::Alt_L || keyval == gdk::keys::constants::Alt_R
+}
+
+/// Observe the clean ALT tap on a page webview at the GTK level. Proceed on
+/// every event — observe, never consume — so held ALT+key combos and every
+/// other key reach the page untouched; only the keyless tap NOTIFIES (it does
+/// not even then consume: an ALT release is inert to a page).
+fn connect_alt_tap_observer(
+    webkit: &webkit2gtk::WebView,
+    notify: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+) {
+    webkit.add_events(
+        gdk::EventMask::KEY_PRESS_MASK
+            | gdk::EventMask::KEY_RELEASE_MASK
+            | gdk::EventMask::BUTTON_PRESS_MASK,
+    );
+    let armed = Rc::new(Cell::new(false));
+    {
+        let armed = armed.clone();
+        webkit.connect_key_press_event(move |_, event| {
+            let ev = if gdk_keyval_is_alt(event.keyval()) {
+                AltTapEvent::AltPress
+            } else {
+                AltTapEvent::OtherKeyPress
+            };
+            let (next, _) = alt_tap_step(armed.get(), ev);
+            armed.set(next);
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let armed = armed.clone();
+        let notify = notify.clone();
+        webkit.connect_key_release_event(move |_, event| {
+            let ev = if gdk_keyval_is_alt(event.keyval()) {
+                AltTapEvent::AltRelease
+            } else {
+                AltTapEvent::OtherKeyRelease
+            };
+            let (next, fire) = alt_tap_step(armed.get(), ev);
+            armed.set(next);
+            if fire {
+                if let Some(notify) = notify.borrow().as_ref() {
+                    notify();
+                }
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let armed = armed.clone();
+        webkit.connect_button_press_event(move |_, _| {
+            let (next, _) = alt_tap_step(armed.get(), AltTapEvent::ButtonPress);
+            armed.set(next);
+            gtk::glib::Propagation::Proceed
+        });
+    }
+}
+
 fn rect_logical(w: i32, h: i32) -> Rect {
     Rect {
         position: Position::Logical(LogicalPosition::new(0.0, 0.0)),
@@ -2372,6 +2463,7 @@ struct SurfaceWindowPlumbing {
     surfaces: Rc<RefCell<HashMap<u64, Surface>>>,
     close_requests: Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     edge_motion: Rc<RefCell<Option<Rc<dyn Fn(SurfaceRevealEdge)>>>>,
+    alt_tap: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     backdrop_rgb: Rc<Cell<Option<(u8, u8, u8)>>>,
     fullscreen: Rc<Cell<Option<u64>>>,
     theme_colors: Rc<RefCell<HashMap<u64, String>>>,
@@ -2496,6 +2588,7 @@ fn build_popup_webview(
         surfaces,
         close_requests,
         edge_motion,
+        alt_tap,
         backdrop_rgb,
         fullscreen,
         theme_colors,
@@ -2568,6 +2661,8 @@ fn build_popup_webview(
     // Gate 9: notice when the HUMAN takes this popup, so a queued agent batch
     // stops instead of landing behind them.
     connect_seat_input_observer(&webview.webview(), popup_id);
+    // A popup eats the ALT tap exactly like a page surface would.
+    connect_alt_tap_observer(&webview.webview(), alt_tap);
     // Same dialog guard as a page surface: a popup is just as invisible when the
     // surface it covers is stashed.
     connect_script_dialog_guard(&webview.webview(), popup_id);
@@ -2787,6 +2882,7 @@ impl WebSurfaceHost {
             downloads_in_flight: Rc::new(RefCell::new(Vec::new())),
             next_transfer_id: Rc::new(Cell::new(1)),
             edge_motion: Rc::new(RefCell::new(None)),
+            alt_tap: Rc::new(RefCell::new(None)),
             fullscreen: Rc::new(Cell::new(None)),
             theme_colors: Rc::new(RefCell::new(HashMap::new())),
         }
@@ -2813,6 +2909,13 @@ impl WebSurfaceHost {
         notify: impl Fn(SurfaceRevealEdge) + 'static,
     ) {
         *self.edge_motion.borrow_mut() = Some(Rc::new(notify));
+    }
+
+    /// Install the clean-ALT-tap notifier (see the `alt_tap` field). One
+    /// registration serves every current and future page webview: the
+    /// observers share this cell.
+    pub(crate) fn set_alt_tap_notifier(&self, notify: impl Fn() + 'static) {
+        *self.alt_tap.borrow_mut() = Some(Rc::new(notify));
     }
 
     /// Paint the native backdrop (the overlay's base child) in the app's
@@ -2920,6 +3023,7 @@ impl WebSurfaceHost {
             surfaces: self.surfaces.clone(),
             close_requests: self.close_requests.clone(),
             edge_motion: self.edge_motion.clone(),
+            alt_tap: self.alt_tap.clone(),
             backdrop_rgb: self.backdrop_rgb.clone(),
             fullscreen: self.fullscreen.clone(),
             theme_colors: self.theme_colors.clone(),
@@ -3283,6 +3387,9 @@ impl WebSurfaceHost {
             // layer can tell the agent's own injection from the human (the
             // injected events are deliberately indistinguishable to the page).
             connect_seat_input_observer(&webview.webview(), id);
+            // The ALT KeyTips layer must open from a focused page too — the
+            // shell's own listeners are deaf while WebKit holds the keyboard.
+            connect_alt_tap_observer(&webview.webview(), &self.alt_tap);
             // A page dialog must never be able to wedge this surface (and every
             // sibling on its profile) just because nothing is on screen to
             // answer it.
@@ -5069,6 +5176,91 @@ mod engine_visibility_locks {
             rehide.contains("if surface.wake_token.get() != token {"),
             "the re-hide no longer honours the re-arm token, so a burst gives its \
              wake back part-way through",
+        );
+    }
+}
+
+/// LOCKS for the GTK-level ALT-tap door — the KeyTips layer must open from a
+/// focused PAGE webview, where the shell webview's own listeners are deaf.
+///
+/// The tap decision is a pure function (`alt_tap_step`) driven directly; the
+/// WIRING (both surface doors install the observer; the glue grabs shell
+/// focus BEFORE relaying the tap) is scanned out of product lines.
+#[cfg(test)]
+mod alt_tap_locks {
+    use super::engine_visibility_locks::product_lines;
+    use super::{AltTapEvent, alt_tap_step};
+
+    /// Invariant 7, at the GTK level: only an uninterrupted press-then-release
+    /// of ALT itself is a tap. Everything a page could mean by ALT — combos,
+    /// ALT+click — disarms and passes through untouched.
+    #[test]
+    fn a_clean_tap_fires_and_anything_between_disarms() {
+        assert_eq!(alt_tap_step(false, AltTapEvent::AltPress), (true, false));
+        assert_eq!(
+            alt_tap_step(true, AltTapEvent::AltRelease),
+            (false, true),
+            "press then release with nothing between IS the tap"
+        );
+        assert_eq!(
+            alt_tap_step(true, AltTapEvent::OtherKeyPress),
+            (false, false),
+            "ALT+key is the page's combo — it must never open the layer"
+        );
+        assert_eq!(
+            alt_tap_step(false, AltTapEvent::AltRelease),
+            (false, false),
+            "the release at the end of a combo must not fire"
+        );
+        assert_eq!(
+            alt_tap_step(true, AltTapEvent::ButtonPress),
+            (false, false),
+            "ALT+click disarms"
+        );
+        assert_eq!(
+            alt_tap_step(true, AltTapEvent::OtherKeyRelease),
+            (true, false),
+            "releasing a key held from BEFORE the ALT press does not cancel the \
+             tap — mirrors the shell DOM detector's keyup rule"
+        );
+    }
+
+    /// The wiring: BOTH doors a page webview is built through install the
+    /// observer (a popup that cannot open the layer is the reader window the
+    /// user is inside when they reach for ALT), and the glue hands the shell
+    /// keyboard focus BEFORE relaying the tap — chords that follow must land
+    /// on the shell root, not the page.
+    #[test]
+    fn both_surface_doors_install_the_observer_and_focus_precedes_the_relay() {
+        let product = product_lines();
+        let installs = product
+            .iter()
+            .filter(|line| line.contains("connect_alt_tap_observer(&webview.webview()"))
+            .count();
+        assert!(
+            installs >= 2,
+            "expected the page door AND the popup door to install the ALT-tap \
+             observer; found {installs}"
+        );
+
+        let glue = include_str!("webview.rs");
+        let registration = glue
+            .split("host.set_alt_tap_notifier(move || {")
+            .nth(1)
+            .expect("the webview glue must register the ALT-tap notifier")
+            .split("});")
+            .next()
+            .expect("the registration closes");
+        let focus_at = registration
+            .find("shell_webkit.grab_focus();")
+            .expect("the notifier must hand the shell keyboard focus");
+        let relay_at = registration
+            .find("window.__yggtermAltTapFromHost && window.__yggtermAltTapFromHost();")
+            .expect("the notifier must relay the tap into the shell webview");
+        assert!(
+            focus_at < relay_at,
+            "focus must be granted BEFORE the tap relay — the overlay opens \
+             expecting the keyboard to already be home"
         );
     }
 }
