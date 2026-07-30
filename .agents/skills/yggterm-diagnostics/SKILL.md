@@ -36,7 +36,11 @@ Scenarios (`--scenario`): `alt-screen`, `alt-screen-exit`, `normal-scrollback --
 `clear-storm --count N`, `burst --kb N`, `prompt-box`, `working`, `echo`, `menu`,
 `delayed-prompt`, `composer` (interactive codex-style char-echo + Ctrl+U + Enter),
 `codex-inline` (the codex inline-viewport pattern: committed lines scroll + a fixed
-bottom live region — composer + status — repainted IN PLACE via absolute CUP).
+bottom live region — composer + status — repainted IN PLACE via absolute CUP),
+`web-declare` (a libyggterm app on the OSC 7717 channel: emits the web-surface
+`open`, then one more declare per stdin line — `o…` line = `open`, else
+`heartbeat` — so declare-retention and attach-replay rules are drivable with no
+wall-clock pacing).
 Also `--replay <path>` to emit a recorded real-PTY byte stream verbatim. `--hold-ms`
 keeps the PTY open. See `docs/integration-testing.md`.
 
