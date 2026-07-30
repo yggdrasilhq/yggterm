@@ -8605,6 +8605,17 @@ async fn web_surface_native_reconcile_loop(
                     if entry.visible != want_visible {
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
+                        if want_visible {
+                            // A page that is being SHOWN takes the keyboard. Only
+                            // on the EDGE: re-taking it every tick would fight a
+                            // human who moved focus to the omnibox or the find
+                            // bar while the page stayed up. Without this a
+                            // revealed page had no keyboard at all — build time
+                            // was the only thing that ever focused a surface —
+                            // so PageUp/PageDown/Home/End did nothing until the
+                            // user happened to click the page.
+                            desktop.focus_web_surface(entry.native_id);
+                        }
                     }
                     // THE reveal fact. One owner (`AppliedWebSurface::latch_reveal`):
                     // gate 9 asks it whether a seat-input count can honestly be
@@ -119601,7 +119612,50 @@ mod tests {
     /// exactly what let the fourth path survive three rounds of fixes.
     #[test]
     fn no_web_surface_takes_the_window_keyboard_focus_without_giving_it_back() {
-        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        const HOST_FILE: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        // PRODUCT half only. The vendored file's own tests name `grab_focus` in
+        // their assertion prose — a scan that reads them reports every test as a
+        // thief, which is the mirror of the failure mode this whole family exists
+        // to avoid (a needle satisfied by the words describing it).
+        // Everything outside a `#[cfg(test)] mod` — the file's own rule, because
+        // `#[cfg(test)]` also marks small helpers mid-file and cutting at the
+        // FIRST one loses most of the product.
+        let host_product: String = {
+            let mut kept = String::new();
+            let mut in_test_module = false;
+            let mut pending = false;
+            for line in HOST_FILE.lines() {
+                if in_test_module {
+                    if line == "}" {
+                        in_test_module = false;
+                    }
+                    continue;
+                }
+                if line.starts_with("#[cfg(test)]") {
+                    pending = true;
+                    continue;
+                }
+                if pending {
+                    pending = false;
+                    if line.starts_with("mod ") || line.starts_with("pub(crate) mod ") {
+                        in_test_module = true;
+                        continue;
+                    }
+                }
+                kept.push_str(line);
+                kept.push('\n');
+            }
+            kept
+        };
+        let host: &str = host_product.as_str();
+        assert!(
+            host.len() > 50_000,
+            "the product half of the surface host came out at {} bytes — this \
+             scan went blind",
+            host.len()
+        );
+        #[allow(non_snake_case)]
+        let HOST: &str = host;
         // Clause 1: every webview a surface builds SAYS whether it may focus.
         let builders = HOST.matches("WebViewBuilder::new").count();
         let declared = HOST.matches(".with_focused(").count();
@@ -119641,9 +119695,32 @@ mod tests {
             body.push('\n');
         }
         chunks.push((fn_name, body));
+        // THE ONE EXCEPTION, and it is a different question from the one this
+        // lock exists to answer. Borrow-and-give-back governs focus taken for an
+        // INJECTION: an agent typing into a page must not keep the human's
+        // keyboard (a 63-minute outage taught that). `focus` is the opposite
+        // case — the user REVEALED this page, and a revealed page is supposed to
+        // hold the keyboard, exactly as it does in every browser. Without it
+        // PageUp/PageDown/Home/End did nothing on a page until it was clicked.
+        //
+        // The exemption is not a blank cheque: `focus` must refuse a surface that
+        // is not being shown, and the shell may call it from exactly one place
+        // (the reveal edge — locked by
+        // `the_reveal_edge_is_where_a_page_is_given_the_keyboard`).
+        const REVEAL: &str = "focus";
+        let reveal_body = chunks
+            .iter()
+            .find(|(name, _)| *name == REVEAL)
+            .map(|(_, body)| body.clone())
+            .expect("the reveal-focus mechanism moved — move this exemption with it");
+        assert!(
+            reveal_body.contains("is_visible()"),
+            "the reveal exemption only holds while `focus` refuses a surface that \
+             is not being shown:\n{reveal_body}"
+        );
         let mut thieves: Vec<&str> = Vec::new();
         for (name, chunk) in &chunks {
-            if !chunk.contains("grab_focus(") || *name == BORROW {
+            if !chunk.contains("grab_focus(") || *name == BORROW || *name == REVEAL {
                 continue;
             }
             if !(chunk.contains(BORROW) && chunk.contains(RETURN)) {
@@ -161421,6 +161498,36 @@ mod webtabs_menu_switcher_locks {
             "band: None,",
         ),
     ];
+
+    /// The reconciler hands a page the keyboard exactly when it reveals it —
+    /// inside the visibility EDGE, so nothing re-takes focus on a later tick.
+    #[test]
+    fn the_reveal_edge_is_where_a_page_is_given_the_keyboard() {
+        let product = product_source();
+        let at = product
+            .iter()
+            .position(|line| line.contains("desktop.focus_web_surface(entry.native_id);"))
+            .expect("the reveal focus call moved — move this lock with it");
+        let window = product[at.saturating_sub(12)..at].join("\n");
+        assert!(
+            window.contains("if entry.visible != want_visible {"),
+            "focus must be taken on the visibility EDGE, not every tick — a page \
+             that re-grabs focus each pass fights the omnibox and the find \
+             bar:\n{window}"
+        );
+        assert!(
+            window.contains("if want_visible {"),
+            "…and only when the page is being SHOWN:\n{window}"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("focus_web_surface("))
+                .count(),
+            1,
+            "one place decides a page has the keyboard"
+        );
+    }
 
     /// THE FIRST TAB IS NOT A CLOSE BUTTON FOR THE APP.
     ///
