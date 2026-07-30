@@ -69,6 +69,26 @@ done
 : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
 export XDG_RUNTIME_DIR
 
+# ⭐ Never let GLib autolaunch a private D-Bus session bus. A shadow client is
+# normally started over ssh, with no session bus to inherit, and GTK/WebKit then
+# autolaunches one at /tmp/dbus-XXXXXXXX which activates the portal, the secret
+# service and the accessibility bus — none of which anything ever reaps. 4,574 MB
+# across 243 such orphans on 43 buses was measured on the live host (2026-07-30),
+# and 13 shadow run dirs against 4 live compositors says where they came from.
+#
+# The binary refuses autolaunch itself (yggterm_core::session_bus), but sway is
+# started first and from this script, so the answer has to exist by here.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+  else
+    # Deliberately unusable: an ABSENT address autolaunches, an invalid one fails
+    # loudly and leaks nothing. A shadow client needs no portal.
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent/yggterm-refuses-dbus-autolaunch"
+  fi
+  export DBUS_SESSION_BUS_ADDRESS
+fi
+
 RUN_DIR="$XDG_RUNTIME_DIR/yggterm-shadow/$NAME"
 CONF="$RUN_DIR/sway.conf"
 LOG="$RUN_DIR/sway.log"

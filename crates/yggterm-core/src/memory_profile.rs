@@ -325,6 +325,63 @@ pub fn profile(samples: &[ProcSample]) -> MemoryProfile {
     }
 }
 
+/// A private bus that may be reaped, and the processes on it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReapableBus {
+    pub address: String,
+    pub pids: Vec<i32>,
+    pub committed_kb: u64,
+}
+
+/// Which private buses are safe to reap: those with **nothing of ours still
+/// attached**.
+///
+/// THE SAFETY RULE, and it is the whole function: if any `yggterm` / WebKit /
+/// `ychrome` / compositor process shares a bus, that bus is LIVE and is left
+/// entirely alone. Reaping a live bus takes the portal, the secret service and
+/// the accessibility bus out from under a running agent surface — the sweep would
+/// then be causing the outage it exists to prevent.
+///
+/// Pure, so the rule is testable without a three-week-old desktop.
+pub fn reapable_private_buses(samples: &[ProcSample]) -> Vec<ReapableBus> {
+    let mut owned: BTreeSet<&str> = BTreeSet::new();
+    for sample in samples {
+        let Some(bus) = sample.dbus_session.as_deref() else {
+            continue;
+        };
+        if !is_private_bus(bus) {
+            continue;
+        }
+        if is_plane_role(Role::classify(&sample.comm)) {
+            owned.insert(bus);
+        }
+    }
+
+    let mut buses: BTreeMap<&str, ReapableBus> = BTreeMap::new();
+    for sample in samples {
+        let Some(bus) = sample.dbus_session.as_deref() else {
+            continue;
+        };
+        if !is_private_bus(bus) || owned.contains(bus) {
+            continue;
+        }
+        if !matches!(
+            Role::classify(&sample.comm),
+            Role::SessionHelper | Role::DbusDaemon
+        ) {
+            continue;
+        }
+        let entry = buses.entry(bus).or_insert_with(|| ReapableBus {
+            address: bus.to_string(),
+            pids: Vec::new(),
+            committed_kb: 0,
+        });
+        entry.pids.push(sample.pid);
+        entry.committed_kb = entry.committed_kb.saturating_add(sample.committed_kb());
+    }
+    buses.into_values().collect()
+}
+
 /// Render the profile for a terminal.
 pub fn render(profile: &MemoryProfile) -> String {
     let mut out = String::new();
@@ -499,6 +556,63 @@ mod tests {
             "a majority-swapped web fleet is the audio-glitch mechanism and must be \
              called out: {:?}",
             report.warnings
+        );
+    }
+
+    /// THE SWEEP'S SAFETY RULE. A private bus with anything of OURS still on it
+    /// is live: reaping it would pull the portal and the secret service out from
+    /// under a running agent surface, so the sweep would cause the outage it
+    /// exists to prevent. Only ownerless buses may go.
+    #[test]
+    fn a_private_bus_with_a_live_owner_is_never_reapable() {
+        let live = "unix:path=/tmp/dbus-LIVE,guid=1";
+        let dead = "unix:path=/tmp/dbus-DEAD,guid=2";
+        let samples = vec![
+            // A live shadow surface and its helpers.
+            sample(10, "yggterm", 80_000, 0, Some(live)),
+            sample(11, "xdg-desktop-por", 8_000, 38_000, Some(live)),
+            sample(12, "ksecretd", 6_000, 36_000, Some(live)),
+            // An abandoned launch: helpers only.
+            sample(20, "dbus-daemon", 2_000, 10_000, Some(dead)),
+            sample(21, "xdg-desktop-por", 8_000, 38_000, Some(dead)),
+            sample(22, "at-spi-bus-laun", 1_500, 1_500, Some(dead)),
+        ];
+
+        let reapable = reapable_private_buses(&samples);
+        assert_eq!(reapable.len(), 1, "exactly one bus is ownerless");
+        assert_eq!(reapable[0].address, dead);
+        assert_eq!(reapable[0].pids, vec![20, 21, 22]);
+        assert_eq!(reapable[0].committed_kb, 61_000);
+        assert!(
+            !reapable.iter().any(|bus| bus.address == live),
+            "a bus with a live yggterm process on it must NEVER be reaped"
+        );
+
+        // A WebKit process alone is enough to protect a bus — it is a live web
+        // surface even with no yggterm process sharing the environ.
+        let webkit_only = vec![
+            sample(30, "WebKitWebProces", 100_000, 0, Some(dead)),
+            sample(31, "xdg-desktop-por", 8_000, 0, Some(dead)),
+        ];
+        assert!(
+            reapable_private_buses(&webkit_only).is_empty(),
+            "a live web process must protect its bus"
+        );
+    }
+
+    /// The real session bus is never a sweep candidate, however many helpers sit
+    /// on it. Reaping those would take down the user's own desktop.
+    #[test]
+    fn the_users_real_session_bus_is_never_a_sweep_candidate() {
+        let real = "unix:path=/run/user/1000/bus";
+        let samples = vec![
+            sample(1, "xdg-desktop-por", 8_000, 0, Some(real)),
+            sample(2, "ksecretd", 6_000, 0, Some(real)),
+            sample(3, "dbus-daemon", 2_000, 0, Some(real)),
+        ];
+        assert!(
+            reapable_private_buses(&samples).is_empty(),
+            "the login session's own bus must never be swept — that is the user's desktop"
         );
     }
 

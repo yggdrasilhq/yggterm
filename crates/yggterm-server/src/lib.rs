@@ -17159,7 +17159,7 @@ fn sample_proc_table() -> Vec<yggterm_core::memory_profile::ProcSample> {
 /// at a few hundred MB, because 4.5 GB was sitting in orphaned `xdg-desktop-portal`
 /// and `ksecretd` processes on autolaunched D-Bus buses. See
 /// [`yggterm_core::memory_profile`] for the mechanism.
-pub fn run_app_control_memory_profile(as_json: bool) -> anyhow::Result<()> {
+pub fn run_app_control_memory_profile(as_json: bool, sweep: bool) -> anyhow::Result<()> {
     let samples = sample_proc_table();
     let profile = yggterm_core::memory_profile::profile(&samples);
     if as_json {
@@ -17167,6 +17167,52 @@ pub fn run_app_control_memory_profile(as_json: bool) -> anyhow::Result<()> {
     } else {
         print!("{}", yggterm_core::memory_profile::render(&profile));
     }
+
+    let reapable = yggterm_core::memory_profile::reapable_private_buses(&samples);
+    let total_kb: u64 = reapable.iter().map(|bus| bus.committed_kb).sum();
+    let pids: Vec<i32> = reapable.iter().flat_map(|bus| bus.pids.clone()).collect();
+    if reapable.is_empty() {
+        if sweep {
+            println!("\nnothing to sweep: no ownerless autolaunched buses.");
+        }
+        return Ok(());
+    }
+    if !sweep {
+        println!(
+            "\n  {} MB across {} processes on {} ownerless autolaunched buses can be \
+             reclaimed with `--sweep`.",
+            total_kb / 1024,
+            pids.len(),
+            reapable.len()
+        );
+        return Ok(());
+    }
+
+    // SIGTERM only, and never a follow-up SIGKILL: a portal that exits cleanly
+    // releases its bus name instead of leaving a stale activation record, and on
+    // the live sweep of 2026-07-30 all 243 helpers went on TERM alone. Anything
+    // that ignores TERM is unusual enough to look at by hand rather than to
+    // escalate against blindly.
+    let mut reaped = 0usize;
+    for pid in &pids {
+        #[cfg(unix)]
+        unsafe {
+            if libc::kill(*pid, libc::SIGTERM) == 0 {
+                reaped += 1;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+        }
+    }
+    println!(
+        "\nswept {reaped}/{} helper processes on {} ownerless buses (~{} MB). \
+         Buses with a live yggterm/WebKit/ychrome process were left untouched.",
+        pids.len(),
+        reapable.len(),
+        total_kb / 1024
+    );
     Ok(())
 }
 
