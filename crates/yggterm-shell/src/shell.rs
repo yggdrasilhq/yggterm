@@ -102569,6 +102569,8 @@ fn terminal_eval_script_with_canvas_renderer(
                 targetHost.removeEventListener("pointerup", retainTerminalFocusAfterPointerRelease, true);
                 targetHost.removeEventListener("mouseup", retainTerminalFocusAfterPointerRelease, true);
                 targetHost.removeEventListener("click", retainTerminalFocusAfterPointerRelease, true);
+                targetHost.removeEventListener("mousedown", handlePrimarySelectionSyncPointerDown, true);
+                targetHost.removeEventListener("mouseup", handlePrimarySelectionSyncPointerUp, true);
                 targetHost.removeEventListener("mousedown", handlePrimarySelectionMiddleClick, true);
                 targetHost.removeEventListener("auxclick", handlePrimarySelectionMiddleClick, true);
                 targetHost.removeEventListener("contextmenu", handleTerminalContextMenu, true);
@@ -102593,6 +102595,11 @@ fn terminal_eval_script_with_canvas_renderer(
             targetHost.addEventListener("pointerup", retainTerminalFocusAfterPointerRelease, true);
             targetHost.addEventListener("mouseup", retainTerminalFocusAfterPointerRelease, true);
             targetHost.addEventListener("click", retainTerminalFocusAfterPointerRelease, true);
+            // CC-DRAG-STALL: the sync-flush listeners are registered BEFORE
+            // handlePrimarySelectionMiddleClick so its stopImmediatePropagation
+            // (middle button) can never skip the flush.
+            targetHost.addEventListener("mousedown", handlePrimarySelectionSyncPointerDown, true);
+            targetHost.addEventListener("mouseup", handlePrimarySelectionSyncPointerUp, true);
             targetHost.addEventListener("mousedown", handlePrimarySelectionMiddleClick, true);
             targetHost.addEventListener("auxclick", handlePrimarySelectionMiddleClick, true);
             targetHost.addEventListener("contextmenu", handleTerminalContextMenu, true);
@@ -102823,6 +102830,86 @@ fn terminal_eval_script_with_canvas_renderer(
                 return false;
             }}
         }};
+        // CC-DRAG-STALL: term.onSelectionChange fires per selection delta
+        // during a drag AND per streamed write that shifts the buffer under a
+        // live selection — an agent CLI that streams constantly multiplies the
+        // events. The old handler ran term.getSelection() (an
+        // O(selected-cells) serialization that grows as the drag grows) plus
+        // host-entry sync, a canvas-layer pass, and health telemetry on EVERY
+        // firing, on the same webview thread as the xterm write pump — that
+        // thread contention was the felt UX stall. Per-event work is now O(1):
+        // the scroll pin stays immediate in the handler, and the expensive
+        // half coalesces to a trailing edge (one animation frame). The flush
+        // also runs synchronously on host mousedown/mouseup and before any
+        // primary-selection paste, so window.__yggtermPrimarySelection always
+        // holds the FINAL selection by the time anything can read it —
+        // middle-click paste immediately after drag-end must never see a
+        // stale or partial selection.
+        let primarySelectionSyncPending = false;
+        let primarySelectionSyncScheduleHandle = null;
+        let primarySelectionSyncScheduleKind = '';
+        const runPrimarySelectionSync = (reason) => {{
+            recordPrimarySelectionFromXterm(reason);
+            applySoftwareCanvasLayerOptimization('selection_change');
+            emitHostHealthThrottled();
+        }};
+        const cancelScheduledPrimarySelectionSync = () => {{
+            if (primarySelectionSyncScheduleHandle === null) {{
+                return;
+            }}
+            try {{
+                if (primarySelectionSyncScheduleKind === 'raf'
+                    && typeof window.cancelAnimationFrame === 'function') {{
+                    window.cancelAnimationFrame(primarySelectionSyncScheduleHandle);
+                }} else {{
+                    window.clearTimeout(primarySelectionSyncScheduleHandle);
+                }}
+            }} catch (_error) {{}}
+            primarySelectionSyncScheduleHandle = null;
+            primarySelectionSyncScheduleKind = '';
+        }};
+        const flushPrimarySelectionSync = (reason = 'selection_change') => {{
+            cancelScheduledPrimarySelectionSync();
+            if (!primarySelectionSyncPending) {{
+                return;
+            }}
+            primarySelectionSyncPending = false;
+            runPrimarySelectionSync(reason);
+        }};
+        const schedulePrimarySelectionSync = () => {{
+            primarySelectionSyncPending = true;
+            if (primarySelectionSyncScheduleHandle !== null) {{
+                return;
+            }}
+            const flushScheduledPrimarySelectionSync = () => {{
+                primarySelectionSyncScheduleHandle = null;
+                primarySelectionSyncScheduleKind = '';
+                flushPrimarySelectionSync('selection_change');
+            }};
+            if (typeof window.requestAnimationFrame === 'function') {{
+                primarySelectionSyncScheduleKind = 'raf';
+                primarySelectionSyncScheduleHandle =
+                    window.requestAnimationFrame(flushScheduledPrimarySelectionSync);
+            }} else {{
+                primarySelectionSyncScheduleKind = 'timeout';
+                primarySelectionSyncScheduleHandle =
+                    window.setTimeout(flushScheduledPrimarySelectionSync, 16);
+            }}
+        }};
+        // A left-press starts a NEW selection: xterm clears the current one
+        // before any trailing-edge sync could run. This capture-phase listener
+        // runs BEFORE xterm's element handlers, so the COMPLETED selection is
+        // recorded first — primary-selection semantics keep the last non-empty
+        // selection, exactly as the per-event path did.
+        const handlePrimarySelectionSyncPointerDown = (_event) => {{
+            flushPrimarySelectionSync('selection_flush_pointer_down');
+        }};
+        // Drag end: make the FINAL selection durable NOW, not at the next
+        // animation frame — a middle-click (possibly on another host) must
+        // never read a stale or partial window.__yggtermPrimarySelection.
+        const handlePrimarySelectionSyncPointerUp = (_event) => {{
+            flushPrimarySelectionSync('selection_flush_pointer_up');
+        }};
         // XTERM-BUG: clipboard-double-paste — telemetry to attribute the
         // bug class. Every entry into a paste path emits an
         // xterm_paste_event; if two events arrive within 300 ms with
@@ -102860,6 +102947,23 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const primarySelectionTextForPaste = () => {{
             try {{
+                // CC-DRAG-STALL: a drag released OUTSIDE the owning host's
+                // bounds never delivers that host's mouseup, so its deferred
+                // selection sync can still be pending. Flush every host's
+                // pending sync FIRST so window.__yggtermPrimarySelection is
+                // final, THEN re-record from THIS host's live selection —
+                // the live selection wins, exactly as it did when the
+                // refresh ran last in the per-event model.
+                try {{
+                    const hostsForSelectionFlush = window.__yggtermXtermHosts || {{}};
+                    for (const flushHostKey of Object.keys(hostsForSelectionFlush)) {{
+                        const flushHostEntry = hostsForSelectionFlush[flushHostKey];
+                        if (flushHostEntry
+                            && typeof flushHostEntry.flushPrimarySelectionSync === 'function') {{
+                            flushHostEntry.flushPrimarySelectionSync('middle_click_refresh');
+                        }}
+                    }}
+                }} catch (_selectionFlushError) {{}}
                 recordPrimarySelectionFromXterm('middle_click_refresh');
                 const primary = window.__yggtermPrimarySelection || null;
                 if (primary && typeof primary.text === 'string' && primary.text.length > 0) {{
@@ -103528,6 +103632,10 @@ fn terminal_eval_script_with_canvas_renderer(
             hostId,
                     sessionPath: host.getAttribute("data-terminal-session-path") || "",
                     sessionKind: host.getAttribute("data-terminal-session-kind") || "",
+            // CC-DRAG-STALL: cross-host flush hook — primarySelectionTextForPaste
+            // flushes every host's pending deferred selection sync through this
+            // before reading window.__yggtermPrimarySelection.
+            flushPrimarySelectionSync,
             primarySelectionText: '',
             primarySelectionLength: 0,
             primarySelectionUpdatedAtMs: 0,
@@ -104956,7 +105064,6 @@ fn terminal_eval_script_with_canvas_renderer(
             : null;
         const selectionDisposable = typeof term.onSelectionChange === 'function'
             ? term.onSelectionChange(() => {{
-                recordPrimarySelectionFromXterm('selection_change');
                 // SCROLL MODE = SELECTING/PINNED: the moment the user has a
                 // non-empty selection, pin the viewport (UserScrollback) so
                 // streaming agent output does NOT auto-follow and yank the
@@ -104966,14 +105073,20 @@ fn terminal_eval_script_with_canvas_renderer(
                 // This guards the follow DECISION via the existing intent state,
                 // NOT the low-level viewport mover (guarding the mover broke DOM
                 // sync). See [[audit-viewport-scroll-control-flow]].
+                // The pin MUST stay immediate — it is what keeps streaming
+                // output from yanking the viewport mid-drag.
                 try {{
                     if (term && typeof term.hasSelection === 'function' && term.hasSelection()
                         && scrollbackIntent !== 'UserScrollback') {{
                         setScrollbackIntent('UserScrollback', 'selection_active');
                     }}
                 }} catch (_selectionIntentError) {{}}
-                applySoftwareCanvasLayerOptimization('selection_change');
-                emitHostHealthThrottled();
+                // CC-DRAG-STALL: everything else (the O(selected-cells)
+                // selection serialization, host-entry sync, canvas-layer pass,
+                // health telemetry) is deferred to the coalesced trailing
+                // edge so per-event work stays O(1) during a drag over a
+                // streaming session.
+                schedulePrimarySelectionSync();
             }})
             : null;
         const renderDisposable = term.onRender(() => {{
@@ -105505,6 +105618,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (selectionDisposable) {{
                     selectionDisposable.dispose();
                 }}
+            }} catch (_error) {{}}
+            try {{
+                // CC-DRAG-STALL: never let a deferred selection sync fire
+                // against a disposed terminal.
+                cancelScheduledPrimarySelectionSync();
+                primarySelectionSyncPending = false;
             }} catch (_error) {{}}
             try {{
                 if (suppressedOsc4Disposable) {{
@@ -132695,10 +132814,195 @@ mod tests {
         assert!(script.contains(
             "targetHost.addEventListener(\"auxclick\", handlePrimarySelectionMiddleClick, true);"
         ));
-        assert!(script.contains("recordPrimarySelectionFromXterm('selection_change');"));
+        // Rewritten for the CC drag-stall fix: selection changes no longer
+        // record synchronously (that per-event O(selected-cells) serialization
+        // was the drag stall) — they schedule the coalesced trailing-edge
+        // sync, whose flush performs the recording.
+        assert!(script.contains("schedulePrimarySelectionSync();"));
+        assert!(script.contains("recordPrimarySelectionFromXterm(reason);"));
         assert!(script.contains("primary_selection_paste"));
         assert!(!script.contains("navigator.clipboard.readText()"));
         assert!(!script.contains("navigator.clipboard.writeText("));
+    }
+
+    #[test]
+    fn cc_drag_selection_change_work_is_coalesced_to_a_trailing_edge() {
+        // User-reported 2026-07-30: dragging a mouse selection in a Claude
+        // Code session stalled the UI. term.onSelectionChange fires per
+        // selection delta AND per streamed write shifting the buffer under a
+        // live selection; the handler ran term.getSelection() — an
+        // O(selected-cells) serialization growing with the drag — plus DOM
+        // and telemetry passes on EVERY firing, on the same webview thread as
+        // the xterm write pump. The contract locked here: per-event work is
+        // O(1) (only the scroll pin is immediate), the expensive half is
+        // coalesced to a trailing edge, and every path that can read
+        // window.__yggtermPrimarySelection flushes first so a middle-click
+        // right after drag-end never sees a stale or partial selection.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+
+        // 1. The per-event handler must be O(1): no selection serialization,
+        //    no host-entry sync, no canvas-layer pass, no health emit — only
+        //    the scroll pin (which MUST stay immediate so streaming output
+        //    cannot yank the viewport mid-drag) and the trailing-edge schedule.
+        let handler = script
+            .split("term.onSelectionChange(() => {")
+            .nth(1)
+            .expect("the selection-change handler exists");
+        let handler = &handler[..handler
+            .find("const renderDisposable")
+            .expect("the selection-change handler precedes the render disposable")];
+        assert!(
+            !handler.contains("recordPrimarySelectionFromXterm("),
+            "per-event selection serialization is the CC drag stall — it must be deferred"
+        );
+        assert!(
+            !handler.contains("getSelection("),
+            "the O(selected-cells) serialization must not run per selection event"
+        );
+        assert!(
+            !handler.contains("applySoftwareCanvasLayerOptimization("),
+            "the per-event DOM/layer pass must be deferred to the trailing edge"
+        );
+        assert!(
+            !handler.contains("emitHostHealthThrottled("),
+            "the per-event health emit must be deferred to the trailing edge"
+        );
+        assert!(
+            handler.contains("setScrollbackIntent('UserScrollback', 'selection_active');"),
+            "the scroll pin must stay IMMEDIATE — it keeps streaming output from yanking the viewport mid-drag"
+        );
+        assert!(
+            handler.contains("schedulePrimarySelectionSync();"),
+            "the expensive half must be scheduled on the coalesced trailing edge"
+        );
+
+        // 1b. The schedule itself must actually DEFER. Review demonstrated
+        //     that a schedule body running the sync synchronously (rAF
+        //     deferral deleted, flush called inline) reintroduces the exact
+        //     per-event drag stall while every other assertion here stays
+        //     green. So pin the trailing edge inside the schedule body: it
+        //     must request an animation frame, it must never run the deferred
+        //     work inline, and its ONLY flush invocation must live inside the
+        //     deferred callback — a second (synchronous) flush call is the
+        //     stall coming back through the front door.
+        let schedule_body = script
+            .split("const schedulePrimarySelectionSync = () => {")
+            .nth(1)
+            .expect("the schedule body exists");
+        let schedule_body = &schedule_body[..schedule_body
+            .find("const handlePrimarySelectionSyncPointerDown")
+            .expect("the schedule body precedes the pointer-down flush handler")];
+        assert!(
+            schedule_body.contains("window.requestAnimationFrame("),
+            "the schedule must defer to an animation frame — a synchronous schedule body reintroduces the per-event drag stall"
+        );
+        assert!(
+            !schedule_body.contains("runPrimarySelectionSync("),
+            "the schedule must never run the deferred sync inline"
+        );
+        assert!(
+            !schedule_body.contains("recordPrimarySelectionFromXterm("),
+            "the schedule must never serialize the selection inline"
+        );
+        assert_eq!(
+            schedule_body.matches("flushPrimarySelectionSync(").count(),
+            1,
+            "the schedule body may invoke the flush exactly once — inside the deferred callback"
+        );
+        let deferred_callback_at = schedule_body
+            .find("const flushScheduledPrimarySelectionSync = () => {")
+            .expect("the schedule wraps its flush in a deferred callback");
+        let schedule_flush_at = schedule_body
+            .find("flushPrimarySelectionSync(")
+            .expect("the deferred callback flushes the pending sync");
+        assert!(
+            deferred_callback_at < schedule_flush_at,
+            "the schedule's only flush call must live inside the deferred callback, never inline"
+        );
+
+        // 2. The trailing-edge flush performs the full deferred work.
+        let flush_body = script
+            .split("const runPrimarySelectionSync = (reason) => {")
+            .nth(1)
+            .expect("the deferred selection sync body exists");
+        let flush_body = &flush_body[..flush_body
+            .find("const cancelScheduledPrimarySelectionSync")
+            .expect("the sync body precedes its canceller")];
+        assert!(flush_body.contains("recordPrimarySelectionFromXterm(reason);"));
+        assert!(flush_body.contains("applySoftwareCanvasLayerOptimization('selection_change');"));
+        assert!(flush_body.contains("emitHostHealthThrottled();"));
+
+        // 3. Deterministic flush anchors: drag end (mouseup) and pre-clear
+        //    (mousedown, capture phase — before xterm clears the selection),
+        //    with the mousedown flush registered BEFORE the middle-click
+        //    handler so stopImmediatePropagation can never skip it.
+        assert!(script.contains(
+            "targetHost.addEventListener(\"mousedown\", handlePrimarySelectionSyncPointerDown, true);"
+        ));
+        assert!(script.contains(
+            "targetHost.addEventListener(\"mouseup\", handlePrimarySelectionSyncPointerUp, true);"
+        ));
+        assert!(script.contains(
+            "targetHost.removeEventListener(\"mousedown\", handlePrimarySelectionSyncPointerDown, true);"
+        ));
+        assert!(script.contains(
+            "targetHost.removeEventListener(\"mouseup\", handlePrimarySelectionSyncPointerUp, true);"
+        ));
+        let attach = script
+            .split("attachHostInteractions = (targetHost) => {")
+            .nth(1)
+            .expect("attachHostInteractions exists");
+        let attach = &attach[..attach
+            .find("const pointerEventFallsWithinHost")
+            .expect("attach body precedes the host-bounds helper")];
+        let sync_down_at = attach
+            .find("addEventListener(\"mousedown\", handlePrimarySelectionSyncPointerDown, true);")
+            .expect("attach registers the sync flush on mousedown");
+        let middle_at = attach
+            .find("addEventListener(\"mousedown\", handlePrimarySelectionMiddleClick, true);")
+            .expect("attach registers the middle-click handler");
+        assert!(
+            sync_down_at < middle_at,
+            "the flush listener must be registered before the middle-click handler"
+        );
+
+        // 4. The paste read flushes EVERY host's pending sync (a drag released
+        //    outside the owning host's bounds never delivers that host's
+        //    mouseup) before re-recording from the live selection.
+        let paste = script
+            .split("const primarySelectionTextForPaste = () => {")
+            .nth(1)
+            .expect("primarySelectionTextForPaste exists");
+        let paste = &paste[..paste
+            .find("const handlePrimarySelectionMiddleClick")
+            .expect("paste helper precedes the middle-click handler")];
+        let flush_at = paste
+            .find("flushPrimarySelectionSync('middle_click_refresh')")
+            .expect("paste must flush pending syncs");
+        let record_at = paste
+            .find("recordPrimarySelectionFromXterm('middle_click_refresh')")
+            .expect("paste must re-record from the live selection");
+        assert!(
+            flush_at < record_at,
+            "pending flushes must land before the live re-record so the live selection wins"
+        );
+
+        // 5. The cross-host flush hook rides the host entry, and the
+        //    dispose-time cleanup cancels any scheduled sync AND drops the
+        //    pending flag so a deferred sync can never fire against a
+        //    disposed terminal. A bare contains() on the cancel call alone
+        //    was vacuous — flushPrimarySelectionSync also calls the canceller
+        //    (with an if-return between cancel and reset), so the needle here
+        //    is the ADJACENT cancel + pending-reset pair, which only the
+        //    dispose site has.
+        assert!(script.contains("flushPrimarySelectionSync,"));
+        assert!(
+            script.contains(
+                "cancelScheduledPrimarySelectionSync();\n                primarySelectionSyncPending = false;"
+            ),
+            "dispose-time cleanup must cancel the scheduled sync AND reset the pending flag as an adjacent pair — the cancel call alone also occurs inside flushPrimarySelectionSync and pins nothing"
+        );
     }
 
     #[test]
