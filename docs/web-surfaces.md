@@ -23,7 +23,9 @@ The control channel is an OSC escape sequence emitted on the app's stdout:
 ESC ] 7717 ; web-surface ; <action> ; <base64 json> BEL
 ```
 
-- `<action>`: `open` | `heartbeat` | `close`
+- `<action>`: `open` | `heartbeat` | `close` (app-emitted), plus `seen`
+  (daemon-minted only — see below; an app never writes it, and the daemon
+  ignores one that does)
 - json payload: `{"session": "<YGGTERM_SESSION_ID>", "url": "...", "title": "..."}`
 
 Because the transport is the terminal byte stream itself, it works identically
@@ -57,6 +59,22 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
   (scrollback replay) self-heals the surface.
 - `close` removes the surface immediately. Scrollback replay of an
   open→close pair is order-preserving, so replays converge to the right state.
+- `seen` is the daemon's attach-replay spelling of an `open` it has already
+  consumed. The daemon ingests every declare into its retained record the
+  moment it arrives, but the raw bytes stay in the retained chunk ring as
+  scrollback transcript, and a cursor-0 attach REPLAYS that ring — so a fresh
+  GUI could receive the run's original `open` and re-execute launch intent on
+  what is really a re-attach (re-minting the launch tab over the user's page;
+  with tab restore off, deleting that page's saved row). The daemon is the one
+  owner that knows a cursor-0 serve is a replay, so it rewrites the consumed
+  `open` to the same-length `seen` in the SERVED copy (the ring is untouched;
+  chunk count/seqs/lengths unchanged; a declare straddling chunk boundaries is
+  still caught — the rewrite runs over the joined tail). The GUI classifies
+  `seen` like a heartbeat: liveness and re-attach, never intent. Two
+  deliberate exceptions keep the transcript faithful: a record still on `open`
+  (the app launched within the last heartbeat — the replayed open IS current)
+  and every catch-up read at cursor > 0 (bytes this client never consumed
+  carry the launch intent they would have carried live).
 - The overlay ✕ button removes the surface and writes `\x03` to the PTY —
   the terminal-native way to end the foreground app, which then emits its own
   `close`.
@@ -495,9 +513,11 @@ decides:
   page is opened at all; if it was FILED, it is selected where it sits — adopting
   it onto the always-root app tab would quietly pull it out of its folder.
 - A **re-attach** outranks all of the above for tab 0. A heartbeat rebuilding a
-  surface after a GUI restart, or the daemon-retained declare replayed by the
-  restore tick (`web_surface_open_kind_for_action`: the retained action
-  `heartbeat` means the app has been running; only a real `open` is a launch),
+  surface after a GUI restart, a `seen` declare (the daemon's attach-replay
+  spelling of a consumed `open` — see Lifecycle), or the daemon-retained
+  declare replayed by the restore tick (`web_surface_open_kind_for_action`:
+  `heartbeat`/`seen` mean the app has been running; only a real `open` is a
+  launch),
   continues a run that never ended: tab 0 adopts its marked row regardless of
   the fresh-start setting — the declared URL is the run's old launch page, not a
   request — and the marked row rides through `tabs_to_open`'s fresh-start filter

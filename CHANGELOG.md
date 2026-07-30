@@ -14,7 +14,13 @@ This file tracks user-visible changes in `yggterm`.
   folder or on a different page is untouched). Re-attaching a running browser
   also returns its first tab to the page you were on rather than the page the
   app was launched with, and saved tab lists written by older versions still
-  load unchanged.
+  load unchanged. The daemon closes the replay half of the same bug: attaching
+  to a running app used to replay the app's original "open" announcement from
+  retained scrollback as if it were happening now, which could re-mint the
+  launch page over your tab — and, with tab restore off, delete your page's
+  saved row. A consumed announcement now replays only as an inert "already
+  seen" marker; live announcements, a just-launched app, and catch-up reads
+  are untouched.
 
 ## 2.12.18
 

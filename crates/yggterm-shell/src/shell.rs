@@ -6661,8 +6661,11 @@ struct SavedWebTab {
     /// was standing. Without this, a restored session came back with every tab
     /// present and the app's start page on top of them all.
     ///
-    /// At most one saved tab carries it (the app tab is never saved, so a
-    /// surface that closed with the app tab in front saves none).
+    /// At most one saved tab carries it — including tab 0's own row (the one
+    /// marked [`SavedWebTab::app_tab`]), which carries it when the app tab was
+    /// in front. Only a tab 0 still sitting on the app's own launch page is
+    /// not saved at all ([`web_tab_is_saved`]); a surface that closed in THAT
+    /// state saves no active row.
     #[serde(default)]
     active: bool,
     /// Was this row TAB 0 — the app tab — when it was saved? Every rebuild
@@ -6696,12 +6699,23 @@ enum WebSurfaceOpenKind {
 }
 /// ONE owner for "which kind is this declare action". Both rebuild readers —
 /// the client OSC arm and the daemon-retained-declare path — decide from the
-/// same fact: an app that has been running re-declares via ~4s heartbeats, so
-/// `heartbeat` marks a running app being re-attached, while a real `open` is
-/// the app itself launching (the daemon replays the vt100 screen on re-attach,
-/// never the consumed OSC `open`, so an `open` cannot be stale).
+/// same facts:
+///
+/// - `heartbeat` — an app that has been running re-declares every ~4s, so a
+///   heartbeat is a running app being re-attached.
+/// - `seen` — the daemon's attach-replay spelling of an `open` it has already
+///   consumed. The daemon DOES replay retained declare bytes on a cursor-0
+///   attach (live incident 2026-07-23: a retained-scrollback replay delivered
+///   a stale declare before the fresh one), so a replayed `open` used to
+///   re-execute launch intent against a mere re-attach; a current daemon
+///   serves those neutralized as `seen`, which is liveness, not intent.
+/// - anything else (a real `open`) — the app itself launching. A verbatim
+///   `open` can still be a replay when the OWNING daemon predates the `seen`
+///   rewrite (mixed-version handover); a GUI cannot tell that case from a live
+///   launch and deliberately keeps launch semantics for it, matching what such
+///   a daemon's clients always did.
 fn web_surface_open_kind_for_action(action: &str) -> WebSurfaceOpenKind {
-    if action == "heartbeat" {
+    if action == "heartbeat" || action == "seen" {
         WebSurfaceOpenKind::Reattach
     } else {
         WebSurfaceOpenKind::Launch
@@ -84038,7 +84052,7 @@ fn TerminalCanvas(
                                             });
                                         }
                                     }
-                                    "open" | "heartbeat" => {
+                                    "open" | "heartbeat" | "seen" => {
                                         let (touched, recently_closed) = state.with_mut(|shell| {
                                             // TOUCH BEFORE SWEEP. This heartbeat is proof THIS
                                             // session's app is alive right now, so refresh its
@@ -84072,13 +84086,16 @@ fn TerminalCanvas(
                                         // holds inside the close-ghost grace window: after
                                         // a GUI RESTART the surface is gone with NO recent
                                         // deliberate close on record, so the heartbeat is
-                                        // allowed to REBUILD it (the daemon replays the
-                                        // vt100 screen on re-attach, never the consumed
-                                        // OSC `open`, so a heartbeat is the only signal
-                                        // that comes — without this, ychrome came back as a
-                                        // bare terminal after every restart).
-                                        let heartbeat_for_gone_surface =
-                                            !touched && action == "heartbeat" && recently_closed;
+                                        // allowed to REBUILD it (without this, ychrome came
+                                        // back as a bare terminal after every restart).
+                                        // `seen` — the daemon's attach-replay spelling of a
+                                        // consumed `open` (the daemon replays retained
+                                        // declare bytes on a cursor-0 attach; only the
+                                        // action is rewritten) — is the same liveness, so
+                                        // it obeys the same close-ghost ban.
+                                        let heartbeat_for_gone_surface = !touched
+                                            && (action == "heartbeat" || action == "seen")
+                                            && recently_closed;
                                         let fresh_url = url
                                             .filter(|_| !heartbeat_for_gone_surface)
                                             .filter(|url| web_surface_url_scheme_allowed(url))
@@ -84110,7 +84127,8 @@ fn TerminalCanvas(
                                                 surface_title,
                                                 surface_profile.as_deref(),
                                                 start_page,
-                                                // A heartbeat that builds a
+                                                // A heartbeat (or a replayed
+                                                // `seen` open) that builds a
                                                 // FRESH surface is re-attaching
                                                 // a running app after a GUI
                                                 // restart; only a real `open`
@@ -119304,10 +119322,13 @@ mod tests {
         );
     }
 
-    // Both rebuild readers decide launch-vs-reattach from the SAME fact, in
+    // Both rebuild readers decide launch-vs-reattach from the SAME facts, in
     // one function: a running app re-declares via heartbeats, so `heartbeat`
-    // re-attaches; a real `open` is the app itself launching (the daemon
-    // replays the screen on re-attach, never the consumed OSC `open`).
+    // re-attaches; `seen` is the daemon's attach-replay spelling of an `open`
+    // it already consumed (the daemon DOES replay retained declare bytes on a
+    // cursor-0 attach — a current daemon neutralizes the consumed `open` to
+    // `seen` precisely so this classifier cannot mistake the replay for a
+    // launch); a real `open` is the app itself launching.
     #[test]
     fn a_heartbeat_is_a_reattach_and_an_open_is_a_launch() {
         assert_eq!(
@@ -119315,8 +119336,88 @@ mod tests {
             WebSurfaceOpenKind::Reattach
         );
         assert_eq!(
+            web_surface_open_kind_for_action("seen"),
+            WebSurfaceOpenKind::Reattach,
+            "a replayed open the daemon already consumed is a re-attach, never a launch"
+        );
+        assert_eq!(
             web_surface_open_kind_for_action("open"),
             WebSurfaceOpenKind::Launch
+        );
+    }
+
+    // ⚠ WIRING REMINDER for the client OSC arm — honest about what it is (the
+    // same discipline as `the_ensure_arm_still_asks_before_it_probes`): a
+    // source read of `shell.rs`, so it judges the FILE, not the binary, and a
+    // call spelled differently reddens it while behaving identically. The arm
+    // lives inside a mounted component's event loop, which no test can drive;
+    // this is the deepest lock it can get, and it exists because the
+    // 2026-07-30 review demonstrated that hardcoding
+    // `WebSurfaceOpenKind::Launch` at this call site severed the whole fix
+    // with every behavioural lock green. The daemon-retained reader's
+    // matching needle is asserted here too, but its BEHAVIOUR is locked by
+    // `the_daemon_declare_reader_reattaches_from_the_records_own_action`,
+    // which drives the real reader.
+    #[test]
+    fn both_rebuild_readers_still_wire_the_action_into_the_kind() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police: \
+             {} of {} lines survived",
+            product.len(),
+            source.lines().count(),
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("fn both_rebuild_readers_still_wire_the_action_into_the_kind")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that quotes it",
+        );
+
+        // The OSC arm: it must still ACCEPT the daemon's replay spelling —
+        // dropping `seen` from the match silently ignores every neutralized
+        // replay — and must derive the kind from the action it received.
+        let arm = product
+            .iter()
+            .position(|line| line.trim() == "\"open\" | \"heartbeat\" | \"seen\" => {")
+            .expect("the web-surface OSC arm no longer matches open/heartbeat/seen");
+        let arm_end = product[arm..]
+            .iter()
+            .position(|line| line.trim() == "\"close\" => {")
+            .map(|offset| arm + offset)
+            .expect("the web-surface close arm moved — move this lock with it");
+        let arm_region = product[arm..arm_end].join("\n");
+        assert!(
+            arm_region.contains("web_surface_open_kind_for_action(&action),"),
+            "the OSC arm no longer derives launch-vs-reattach from the declare \
+             action — a hardcoded kind here re-mints the launch tab on every \
+             replayed declare:\n{arm_region}"
+        );
+
+        // The daemon-retained reader: same wiring, same severance risk.
+        let reader = product
+            .iter()
+            .position(|line| line.trim() == "async fn rebuild_web_surface_from_daemon_declare(")
+            .expect("the daemon-retained reader moved — move this lock with it");
+        let reader_end = product[reader..]
+            .iter()
+            .position(|line| line == "}")
+            .map(|offset| reader + offset)
+            .expect("the daemon-retained reader never closes");
+        let reader_region = product[reader..reader_end].join("\n");
+        assert!(
+            reader_region.contains("web_surface_open_kind_for_action(&record.action),"),
+            "the daemon-retained reader no longer derives launch-vs-reattach \
+             from the record's own action:\n{reader_region}"
         );
     }
 
@@ -122847,6 +122948,200 @@ mod tests {
                 .active_tab,
             1,
             "and the user lands where they were standing"
+        );
+    }
+
+    /// A one-shot owner socket answering `TerminalAppDeclares` with ONE
+    /// retained web-surface record — the record-serving twin of
+    /// [`web_ensure_closed_session_locks`]'s empty-records helper. The locks
+    /// below need the reader to FETCH a real record over the real wire and
+    /// classify from it, rather than being handed a classification.
+    #[cfg(unix)]
+    fn spawn_web_surface_declares_socket(
+        path: PathBuf,
+        action: &'static str,
+        url: &'static str,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let listener = std::os::unix::net::UnixListener::bind(&path)
+                .unwrap_or_else(|error| panic!("bind {}: {error}", path.display()));
+            let (mut stream, _) = listener.accept().expect("accept declares request");
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().expect("clone declares stream"))
+                .read_line(&mut line)
+                .expect("read declares request");
+            assert!(
+                line.contains("terminal_app_declares"),
+                "the declare reader asked the owner something other than for its declares: {line}"
+            );
+            let response = yggterm_server::ServerResponse::TerminalAppDeclares {
+                records: vec![yggterm_server::app_declare::AppDeclareRecord {
+                    verb: "web-surface".to_string(),
+                    action: action.to_string(),
+                    payload: json!({
+                        "session": "mock-app",
+                        "url": url,
+                        "profile": "research",
+                        "start_page": false,
+                    }),
+                    at_ms: current_millis(),
+                    seq: 7,
+                }],
+                running: true,
+            };
+            serde_json::to_writer(&mut stream, &response).expect("write declares response");
+            stream.write_all(b"\n").expect("write response terminator");
+            stream.flush().expect("flush declares response");
+        })
+    }
+
+    /// Drive [`rebuild_web_surface_from_daemon_declare`] — the PRODUCTION
+    /// daemon-retained reader, the one the restore tick and `web ensure` call —
+    /// against a real owner socket serving `record_action`, over a real saved
+    /// store. Returns the outcome and the shell state it left behind.
+    #[cfg(unix)]
+    fn drive_daemon_declare_reader(
+        root: &Path,
+        record_action: &'static str,
+        record_url: &'static str,
+    ) -> (DeclareRebuild, Vec<String>, u64) {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-declare-reader-{record_action}-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let socket = home.join("owner.sock");
+        let owner = spawn_web_surface_declares_socket(socket.clone(), record_action, record_url);
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(socket.exists(), "the owner socket never became ready");
+
+        let mut shell = shell_on_scratch_profiles_root(root);
+        // Restore OFF — the shipped default, and the configuration in which a
+        // misread replay DELETES the marked row from disk.
+        shell.settings.web_surface_restore_tabs = false;
+        shell.bootstrap.server_endpoint = ServerEndpoint::UnixSocket(socket);
+
+        let result = super::menu_dismissal_locks::with_live_shell(shell, |state| {
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime")
+                .block_on(rebuild_web_surface_from_daemon_declare(
+                    state,
+                    home.clone(),
+                    "local://ws",
+                ));
+            let (urls, active_tab) = state.with(|shell| {
+                let surface = shell
+                    .web_surfaces
+                    .get("local://ws")
+                    .expect("the reader must have materialized the surface");
+                (
+                    surface.tabs.iter().map(|tab| tab.url.clone()).collect(),
+                    surface.active_tab,
+                )
+            });
+            (outcome, urls, active_tab)
+        });
+        let _ = owner.join();
+        let _ = fs::remove_dir_all(&home);
+        result
+    }
+
+    // ⚠ LOCK — the daemon-retained reader's WIRING, end to end. Mutation D
+    // red-proves the action→kind mapping in isolation and the store locks
+    // red-prove the plan, but none of that stops the reader itself from
+    // hardcoding a kind at its `materialize_declared_web_surface` call — the
+    // severed-wiring bypass the 2026-07-30 review demonstrated (hardcode
+    // `WebSurfaceOpenKind::Launch` at the call site; every other lock stays
+    // green). This test drives the REAL reader over a real socket and a real
+    // saved store: sever the wiring and the marked row is dropped and its
+    // saved copy deleted from disk, and both asserts go red.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_declare_reader_reattaches_from_the_records_own_action() {
+        let root = ScratchProfilesRoot::new("declare-reader-reattach");
+        let profile = "research";
+        let page = "https://x.example/page";
+        let seeded = WebTabStore {
+            folders: vec![WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            }],
+            tabs: vec![
+                saved_app_tab(page, true),
+                saved_tab("https://filed.example/", Some("f1")),
+            ],
+        };
+        save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
+
+        // The record has been HEARTBEATING: the run outlived its launch, so
+        // this rebuild is a re-attach — the page comes back to tab 0 even
+        // under the fresh-start setting, and nothing is deleted.
+        let (outcome, urls, active_tab) =
+            drive_daemon_declare_reader(root.path(), "heartbeat", "https://app.example/start");
+        assert_eq!(outcome, DeclareRebuild::Rebuilt);
+        assert_eq!(
+            urls,
+            vec![page.to_string(), "https://filed.example/".to_string()],
+            "a heartbeat record re-attaches: tab 0 is the marked row's page, \
+             not the run's stale launch URL, and no duplicate row appears"
+        );
+        assert_eq!(active_tab, 0, "the marked row was in front, so tab 0 is");
+        assert_eq!(
+            load_web_tab_store_in(root.path(), profile)
+                .tabs
+                .iter()
+                .map(|tab| (tab.url.as_str(), tab.app_tab))
+                .collect::<Vec<_>>(),
+            vec![(page, true), ("https://filed.example/", false)],
+            "the marked row must survive on disk — a Launch misread here is \
+             the restore-off deletion the review demonstrated"
+        );
+    }
+
+    // The other half of the same wiring: a record still on `open` is an app
+    // that launched within the last heartbeat — a REAL launch, so the shipped
+    // fresh-start default applies (tab 0 shows the declared page; the loose
+    // session row is purged). Hardcode Reattach at the reader and THIS goes
+    // red, so the wiring cannot be "fixed" by pinning either kind.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_declare_reader_launches_when_the_record_is_still_open() {
+        let root = ScratchProfilesRoot::new("declare-reader-launch");
+        let profile = "research";
+        let seeded = WebTabStore {
+            folders: vec![WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            }],
+            tabs: vec![
+                saved_app_tab("https://x.example/page", true),
+                saved_tab("https://filed.example/", Some("f1")),
+            ],
+        };
+        save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
+
+        let (outcome, urls, _active_tab) =
+            drive_daemon_declare_reader(root.path(), "open", "https://app.example/start");
+        assert_eq!(outcome, DeclareRebuild::Rebuilt);
+        assert_eq!(
+            urls,
+            vec![
+                "https://app.example/start".to_string(),
+                "https://filed.example/".to_string()
+            ],
+            "an `open` record is the app launching: fresh start shows the \
+             declared page and only the filed organization"
         );
     }
 
@@ -164198,7 +164493,10 @@ mod menu_dismissal_locks {
     /// giveback through another, so the only honest way to test it is to RUN it
     /// — a lock that reads the string `dismiss_top_menu(state);` out of the key
     /// bridge stays green while the terminus is gutted to `false`.
-    fn with_live_shell<R>(shell: ShellState, body: impl FnOnce(Signal<ShellState>) -> R) -> R {
+    pub(super) fn with_live_shell<R>(
+        shell: ShellState,
+        body: impl FnOnce(Signal<ShellState>) -> R,
+    ) -> R {
         let dom = dioxus_core::VirtualDom::new(|| rsx! {});
         dom.in_runtime(|| {
             // A SCOPE has to be current, not merely a runtime: the terminus ends

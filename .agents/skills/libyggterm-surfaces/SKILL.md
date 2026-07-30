@@ -98,8 +98,18 @@ ESC ] 7717 ; <verb> ; <action> ; <base64-json> BEL
 
 Two verbs ship today:
 
-- `web-surface` — actions `open`, `heartbeat` (~4s, full payload), `close`.
-  Payload `{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`.
+- `web-surface` — app-emitted actions `open`, `heartbeat` (~4s, full payload),
+  `close`. Payload
+  `{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`.
+  One more action exists on the wire that an app must NEVER write: `seen`, the
+  daemon's attach-replay spelling of an `open` it already consumed. The daemon
+  retains every declare, but the raw bytes stay in the scrollback ring and a
+  cursor-0 attach replays them — served verbatim, the run's original `open`
+  would re-execute launch intent on a mere re-attach. The daemon rewrites it to
+  the same-length `seen` in the served copy; the GUI treats `seen` like a
+  heartbeat (liveness, re-attach — never launch intent), and the daemon
+  ignores a `seen` an app emits itself. Authoritative mechanics:
+  `docs/web-surfaces.md` (Lifecycle).
 - `sidebar` — actions `declare` (idempotent, re-emitted on the heartbeat
   cadence), `close`. Payload
   `{"session", "control", "panes":[{id,icon,title}], "policy_version"?}`.

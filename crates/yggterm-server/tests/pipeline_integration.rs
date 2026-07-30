@@ -700,3 +700,97 @@ fn runtime_spawn_id_stable_while_running_and_changes_on_replace() {
         "replacing an exited runtime must change the spawn id (the cold-re-resume signal)"
     );
 }
+
+// ---- OSC 7717 attach replay (the consumed-open hole) ---------------------------
+// ⚠ LOCK — a consumed web-surface `open` must never replay verbatim on a cursor-0
+// attach. The daemon consumes a declare into its retained record the moment it
+// arrives, but the raw bytes stay in the chunk ring as scrollback transcript and
+// a fresh client's first read REPLAYS them (demonstrated live 2026-07-23 as a
+// stale declare beating the fresh one, and again in review 2026-07-30 as the
+// re-minted launch tab / restore-off row deletion). The daemon is the one owner
+// that knows a cursor-0 serve is a replay, so IT must serve the consumed `open`
+// as the same-length `seen` — while the just-launched sliver (record still on
+// `open`) and every catch-up read (cursor > 0, bytes this client never had)
+// keep the faithful transcript. This drives the REAL `read()`, so severing the
+// neutralization from its production wiring reddens here.
+#[test]
+fn a_consumed_web_surface_open_never_replays_verbatim_on_attach() {
+    use yggterm_server::app_declare::{WEB_SURFACE_OPEN_SEQUENCE, WEB_SURFACE_SEEN_SEQUENCE};
+
+    fn web_surface_record_action(mgr: &TerminalManager, key: &str) -> Option<String> {
+        mgr.session_app_declares(key)?
+            .into_iter()
+            .find(|record| record.verb == "web-surface")
+            .map(|record| record.action)
+    }
+    /// Deterministic advance: poll the retained record, never a wall-clock gap.
+    fn wait_for_record_action(mgr: &TerminalManager, key: &str, action: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if web_surface_record_action(mgr, key).as_deref() == Some(action) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "retained web-surface record never reached action {action:?}; got {:?}",
+            web_surface_record_action(mgr, key)
+        );
+    }
+
+    let mut mgr = TerminalManager::new();
+    let key = "test://web-declare-replay";
+    mgr.ensure_session(key, &launch("--scenario web-declare --hold-ms 30000"), None)
+        .expect("ensure_session");
+    let first = wait_for_text(&mgr, key, "MOCK_WEB_DECLARE_0_open", Duration::from_secs(5));
+    // The just-launched sliver: the record's latest action is still `open`, so
+    // the replayed open IS the current declare and serves verbatim — the same
+    // deterministic rule the GUI applies to a retained record on `open`.
+    assert_eq!(web_surface_record_action(&mgr, key).as_deref(), Some("open"));
+    assert!(
+        first.contains(WEB_SURFACE_OPEN_SEQUENCE),
+        "with the record still on `open`, the attach seed must keep the declare verbatim"
+    );
+    let catch_up_cursor = mgr.read(key, 0).expect("read for cursor").cursor;
+
+    // One heartbeat: the run has now outlived its launch.
+    mgr.write(key, "beat\r").expect("trigger heartbeat");
+    wait_for_record_action(&mgr, key, "heartbeat");
+    let attach = read_from_zero(&mgr, key);
+    assert!(
+        !attach.contains(WEB_SURFACE_OPEN_SEQUENCE),
+        "THE HOLE: the daemon replayed a consumed OSC open verbatim at attach"
+    );
+    assert!(
+        attach.contains(WEB_SURFACE_SEEN_SEQUENCE),
+        "the consumed open must serve neutralized as `seen`, not vanish"
+    );
+    assert!(
+        attach.contains("\x1b]7717;web-surface;heartbeat;"),
+        "a heartbeat is liveness already and serves verbatim"
+    );
+
+    // A fresh `open` after the saved cursor, then a heartbeat so the record is
+    // back on `heartbeat` — the state under which cursor-0 neutralizes.
+    mgr.write(key, "open\r").expect("trigger re-open");
+    wait_for_record_action(&mgr, key, "open");
+    mgr.write(key, "beat\r").expect("trigger heartbeat 2");
+    wait_for_record_action(&mgr, key, "heartbeat");
+    let catch_up = mgr
+        .read(key, catch_up_cursor)
+        .expect("catch-up read")
+        .chunks
+        .iter()
+        .map(|chunk| chunk.data.as_str())
+        .collect::<String>();
+    assert!(
+        catch_up.contains(WEB_SURFACE_OPEN_SEQUENCE),
+        "catch-up (cursor > 0) delivers bytes this client never consumed — the \
+         open there carries live launch intent and must stay verbatim"
+    );
+    let attach = read_from_zero(&mgr, key);
+    assert!(
+        !attach.contains(WEB_SURFACE_OPEN_SEQUENCE),
+        "every consumed open in the cursor-0 seed is history and must serve as seen"
+    );
+}
