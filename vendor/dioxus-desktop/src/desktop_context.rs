@@ -359,6 +359,73 @@ impl DesktopService {
     }
 
     /// Show/hide an open web surface without destroying it (tab/session switch).
+    /// The engine's own (can_back, can_forward) for surface `id`.
+    pub fn web_surface_nav_state(&self, id: u64) -> Option<(bool, bool)> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.nav_state(id));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// Step surface `id` back through the ENGINE's history.
+    pub fn web_surface_go_back(&self, id: u64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.go_back(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = id;
+    }
+
+    /// Step surface `id` forward through the ENGINE's history.
+    pub fn web_surface_go_forward(&self, id: u64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.go_forward(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = id;
+    }
+
     /// Hand surface `id` the keyboard (see `WebSurfaceHost::focus`): a revealed
     /// page that never took focus cannot be scrolled from the keyboard at all.
     pub fn focus_web_surface(&self, id: u64) {

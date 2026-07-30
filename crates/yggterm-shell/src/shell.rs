@@ -1263,11 +1263,17 @@ struct WebSurfaceTab {
     /// sweep / replace / navigate paths (never on Drop — a state clone
     /// dropping must not tear down a live forward).
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
-    /// yggterm-driven navigation stack of requested URLs. In-surface
-    /// navigations are invisible to the shell, so back/forward cover only
-    /// address-bar/OSC navigations. `history[history_index]` == `url`.
+    /// yggterm-driven navigation stack of requested URLs. Kept because a restored
+    /// tab is born with a one-entry history and `select_web_surface_tab` pins the
+    /// index — but it is NO LONGER what back/forward read. In-surface navigations
+    /// (every link click) never reach it, so it said "no history" for the normal
+    /// way anyone browses. `history[history_index]` == `url`.
     history: Vec<String>,
     history_index: usize,
+    /// The ENGINE's own back/forward availability, polled in the same reconcile
+    /// tick that polls the page's URL and title. `None` until first observed (a
+    /// tab with no webview yet has no history to offer).
+    engine_nav: Option<(bool, bool)>,
     /// Reload request counter: the ⟳ button bumps it; the native-surface
     /// reconciler observes the change and calls `WebView::reload` on the
     /// surface webview.
@@ -3157,6 +3163,31 @@ fn select_web_surface_tab(mut state: Signal<ShellState>, session_path: String, t
         );
     }
 }
+/// Step a tab through the ENGINE's own history.
+///
+/// THE one owner of back/forward. It deliberately does not touch the shell's URL
+/// stack: WebKit keeps the real list (including every in-page navigation the
+/// shell never saw), stepping it preserves the page state a re-navigation would
+/// throw away, and the reconciler's next tick observes where the page landed and
+/// updates the address bar, the title and the buttons.
+fn web_surface_step_history(
+    state: Signal<ShellState>,
+    session_path: &str,
+    tab_id: u64,
+    forward: bool,
+) {
+    // The ONE owner of (session, tab) -> native id, the same one every other
+    // engine verb resolves through.
+    let Some(native_id) = web_surface_native_id_for(session_path, tab_id) else {
+        return;
+    };
+    let desktop = dioxus_desktop::window();
+    if forward {
+        desktop.web_surface_go_forward(native_id);
+    } else {
+        desktop.web_surface_go_back(native_id);
+    }
+}
 fn navigate_web_surface_tab(
     mut state: Signal<ShellState>,
     session_path: String,
@@ -3318,6 +3349,9 @@ const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
 /// (session, tab). Applied state lives OUTSIDE ShellState — mutating a Signal
 /// from the reconciler would re-render the app every tick.
 struct AppliedWebSurface {
+    /// The ENGINE's last-observed (can_back, can_forward) for this surface —
+    /// the diff baseline, so only an EDGE reaches the shell state.
+    engine_nav: Option<(bool, bool)>,
     native_id: u64,
     url: String,
     bounds: (i32, i32, i32, i32),
@@ -3394,6 +3428,7 @@ impl AppliedWebSurface {
         Self {
             native_id,
             page_url: url.clone(),
+            engine_nav: None,
             url,
             bounds,
             visible: want_visible,
@@ -3430,6 +3465,7 @@ impl AppliedWebSurface {
         Self {
             native_id,
             page_url: url.clone(),
+            engine_nav: None,
             url,
             bounds,
             visible: !background,
@@ -4362,6 +4398,7 @@ mod web_surface_reclaim_locks {
     /// the reclaim pass reads matter; the rest are inert.
     fn applied_surface(native_id: u64, stashed_at_ms: Option<u64>) -> AppliedWebSurface {
         AppliedWebSurface {
+            engine_nav: None,
             native_id,
             url: "https://example.invalid/".to_string(),
             bounds: (0, 0, 800, 600),
@@ -8655,6 +8692,19 @@ async fn web_surface_native_reconcile_loop(
                             let mut writable = state;
                             writable.with_mut(|shell| {
                                 shell.set_web_tab_loading(&key.0, key.1, page_loading);
+                            });
+                        }
+                        // Back/forward, from the ENGINE. Same tick, same reason:
+                        // a link click is a navigation the shell never sees, so
+                        // the only honest source for "can this tab go back" is
+                        // the view that did the navigating. Written through only
+                        // on the EDGE, so a page sitting still costs no render.
+                        let engine_nav = desktop.web_surface_nav_state(entry.native_id);
+                        if entry.engine_nav != engine_nav {
+                            entry.engine_nav = engine_nav;
+                            let mut writable = state;
+                            writable.with_mut(|shell| {
+                                shell.set_web_tab_engine_nav(&key.0, key.1, engine_nav);
                             });
                         }
                         if url_changed || title_changed {
@@ -14239,6 +14289,7 @@ impl ShellState {
             forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
             history: vec![url.clone()],
             history_index: 0,
+            engine_nav: None,
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
@@ -14297,6 +14348,7 @@ impl ShellState {
                 forward_child: None,
                 history: vec![saved.url],
                 history_index: 0,
+            engine_nav: None,
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: saved.folder,
@@ -14409,6 +14461,7 @@ impl ShellState {
             forward_child: None,
             history: Vec::new(),
             history_index: 0,
+            engine_nav: None,
             reload_nonce: 0,
             profile: "default".to_string(),
             folder: None,
@@ -15473,6 +15526,7 @@ impl ShellState {
                 forward_child: None,
                 history: Vec::new(),
                 history_index: 0,
+            engine_nav: None,
                 reload_nonce: 0,
                 profile,
                 folder: None,
@@ -15548,6 +15602,7 @@ impl ShellState {
             forward_child: None,
             history: vec![url.to_string()],
             history_index: 0,
+            engine_nav: None,
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
@@ -16097,14 +16152,14 @@ impl ShellState {
                 loading: tab.loading,
             })
             .collect();
-        let back_target = active
-            .history_index
-            .checked_sub(1)
-            .and_then(|index| active.history.get(index).map(|url| (index, url.clone())));
-        let forward_target = active
-            .history
-            .get(active.history_index + 1)
-            .map(|url| (active.history_index + 1, url.clone()));
+        // ENGINE TRUTH. The shell's own stack only ever recorded navigations the
+        // SHELL drove, so on a site the user browsed by clicking links it stayed
+        // one entry long and both buttons were dead — the reported bug. The
+        // engine's answer needs no URL to act on (`go_back` steps its own list),
+        // so the target is just "is it there".
+        let (can_back, can_forward) = active.engine_nav.unwrap_or((false, false));
+        let back_target = can_back.then(|| (active.history_index, active.url.clone()));
+        let forward_target = can_forward.then(|| (active.history_index, active.url.clone()));
         // The dropdown matches what the USER TYPED, not the inline-completed
         // draft: when a completion is active `address_draft` holds the full
         // completed URL, so slice back to `address_typed_len` for the query.
@@ -16158,6 +16213,19 @@ impl ShellState {
     /// `WebSurfaceTab::loading`: the native-surface reconciler calls it on a
     /// real edge (surface created, load started, load finished) and nowhere
     /// else, so the tab's light can never disagree with the page.
+    /// Record the ENGINE's back/forward availability for a tab.
+    fn set_web_tab_engine_nav(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        engine_nav: Option<(bool, bool)>,
+    ) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.engine_nav = engine_nav;
+        }
+    }
     fn set_web_tab_loading(&mut self, session_path: &str, tab_id: u64, loading: bool) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
             && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
@@ -57337,6 +57405,7 @@ mod web_do_verb_tests {
 
         fn applied(native_id: u64, ever_revealed: bool) -> AppliedWebSurface {
             AppliedWebSurface {
+                engine_nav: None,
                 native_id,
                 url: "https://example.invalid/".to_string(),
                 bounds: (0, 0, 800, 600),
@@ -108135,11 +108204,15 @@ fn WebOmniboxBar(
                 disabled: back_target.is_none(),
                 onclick: {
                     let nav_path = nav_path.clone();
-                    let nav_ssh = nav_ssh.clone();
                     let back_target = back_target.clone();
                     move |_| {
-                        if let Some((index, url)) = back_target.clone() {
-                            navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, url, nav_ssh.clone(), Some(index));
+                        // Step the ENGINE's history, not a URL the shell
+                        // remembered: a re-navigation to the previous address is
+                        // not "back" (it loses the page's scroll and form state,
+                        // and on a site the user browsed by link clicks the
+                        // shell has no previous address at all).
+                        if back_target.is_some() {
+                            web_surface_step_history(state, &nav_path, active_tab_id, false);
                         }
                     }
                 },
@@ -108151,11 +108224,10 @@ fn WebOmniboxBar(
                 disabled: forward_target.is_none(),
                 onclick: {
                     let nav_path = nav_path.clone();
-                    let nav_ssh = nav_ssh.clone();
                     let forward_target = forward_target.clone();
                     move |_| {
-                        if let Some((index, url)) = forward_target.clone() {
-                            navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, url, nav_ssh.clone(), Some(index));
+                        if forward_target.is_some() {
+                            web_surface_step_history(state, &nav_path, active_tab_id, true);
                         }
                     }
                 },
@@ -118877,6 +118949,7 @@ mod tests {
                     forward_child: None,
                     history: Vec::new(),
                     history_index: 0,
+            engine_nav: None,
                     reload_nonce: 0,
                     profile: "default".to_string(),
                     folder: None,
@@ -122216,29 +122289,50 @@ mod tests {
             None,
             None,
         );
+        // ⚠ CONTRACT CHANGED, deliberately. A shell-driven navigation still
+        // RECORDS its stack — that is what pins a restored tab's index — but the
+        // BUTTONS no longer read it: they read the engine, because a link click
+        // is a navigation the shell never sees, and deriving from the stack left
+        // both buttons dead on every site browsed by clicking. See
+        // `back_and_forward_read_the_engine_and_step_the_engine`.
+        let stack: Vec<String> = shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == 1)
+            .map(|tab| tab.history.clone())
+            .expect("the user tab is live");
+        assert_eq!(
+            stack,
+            vec![
+                "https://example.com".to_string(),
+                "https://docs.rs".to_string()
+            ],
+            "a shell-driven navigation still records the stack it owns"
+        );
         let overlay = shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .unwrap();
         assert_eq!(
-            overlay.back_target,
-            Some((0, "https://example.com".to_string()))
+            overlay.back_target, None,
+            "…and the stack alone must NOT enable the button: no engine has said \
+             anything about this tab yet"
         );
-        assert_eq!(overlay.forward_target, None);
-        shell.apply_web_surface_tab_navigation(
-            "local://ws",
-            1,
-            "https://example.com".to_string(),
-            "https://example.com".to_string(),
-            None,
-            None,
-            Some(0),
-        );
+        // The engine speaks: the buttons follow it, both ways.
+        shell.set_web_tab_engine_nav("local://ws", 1, Some((true, true)));
         let overlay = shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .unwrap();
-        assert_eq!(
-            overlay.forward_target,
-            Some((1, "https://docs.rs".to_string()))
+        assert!(
+            overlay.back_target.is_some() && overlay.forward_target.is_some(),
+            "the engine's answer is what lights the buttons"
+        );
+        shell.set_web_tab_engine_nav("local://ws", 1, Some((false, false)));
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .unwrap();
+        assert!(
+            overlay.back_target.is_none() && overlay.forward_target.is_none(),
+            "…and it is what darkens them again"
         );
         // Closing the user tab falls back to the app tab; the app tab itself
         // is not closable through the tab strip.
@@ -161498,6 +161592,81 @@ mod webtabs_menu_switcher_locks {
             "band: None,",
         ),
     ];
+
+    /// BACK AND FORWARD ARE THE ENGINE'S, NOT A URL THE SHELL REMEMBERED.
+    ///
+    /// The buttons were derived from a stack the shell appended to only when IT
+    /// drove a navigation — so on any site browsed by clicking links (i.e. all of
+    /// them) the stack stayed one entry long and both buttons were dead. That is
+    /// the user's report. The engine has always known.
+    #[test]
+    fn back_and_forward_read_the_engine_and_step_the_engine() {
+        // The buttons' enablement comes from the tab's engine reading.
+        let mut shell = shell_with_surface(&[("https://a.example/", None)]);
+        let tab_id = shell.web_surfaces["local://ws"].tabs[1].id;
+        shell.web_surface_select_tab("local://ws", tab_id);
+
+        // Nothing observed yet: a tab with no webview offers no history.
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_000)
+            .expect("an overlay for a live surface");
+        assert!(
+            overlay.back_target.is_none() && overlay.forward_target.is_none(),
+            "an unobserved tab must not claim history"
+        );
+
+        // The engine says back-yes/forward-no: the buttons must follow, and NOT
+        // the shell's stack (which has exactly one entry here, so the old
+        // derivation could only ever answer "no").
+        shell.set_web_tab_engine_nav("local://ws", tab_id, Some((true, false)));
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_000)
+            .expect("an overlay for a live surface");
+        assert!(
+            overlay.back_target.is_some(),
+            "the engine said this tab can go back; the button must be live"
+        );
+        assert!(
+            overlay.forward_target.is_none(),
+            "…and forward must stay dead until the engine says otherwise"
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.history.len().checked_sub(0)),
+            Some(1),
+            "the premise: the shell's own stack has one entry, so this button \
+             could not have come from it"
+        );
+
+        // And the ACTION steps the engine rather than re-navigating to a URL —
+        // a re-navigation loses the page's scroll and form state.
+        let product = product_source();
+        let stepper = function_body(&product, "fn web_surface_step_history(");
+        assert!(
+            stepper.contains("desktop.web_surface_go_back(native_id);")
+                && stepper.contains("desktop.web_surface_go_forward(native_id);"),
+            "the stepper must drive the engine's own history:\n{stepper}"
+        );
+        assert!(
+            !stepper.contains("navigate_web_surface_tab("),
+            "stepping history must never re-navigate — that is what threw away \
+             the page state:\n{stepper}"
+        );
+        // …and the reconciler asks the engine every tick, on the edge.
+        let at = product
+            .iter()
+            .position(|line| line.contains("let engine_nav = desktop.web_surface_nav_state("))
+            .expect("the nav poll moved — move this lock with it");
+        let window = product[at..at + 8].join("\n");
+        assert!(
+            window.contains("if entry.engine_nav != engine_nav {")
+                && window.contains("set_web_tab_engine_nav("),
+            "the poll must write through on the EDGE only:\n{window}"
+        );
+    }
 
     /// The reconciler hands a page the keyboard exactly when it reveals it —
     /// inside the visibility EDGE, so nothing re-takes focus on a later tick.
