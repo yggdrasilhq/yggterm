@@ -8620,8 +8620,17 @@ async fn web_surface_native_reconcile_loop(
                         && let Some((page_url, page_title, page_loading)) =
                             desktop.web_surface_page_state(entry.native_id)
                     {
-                        let url_changed =
-                            !page_url.is_empty() && page_url != entry.page_url;
+                        // `about:blank` is not a page the user navigated to — it
+                        // is what an engine shows when it was handed nothing. It
+                        // must never be written back over a tab that HAS a url:
+                        // a duplicate whose egress had not resolved yet came up
+                        // blank, the observer wrote the blank into the model, and
+                        // `persist_web_tabs` then saved the corpse. Blank stays
+                        // reportable for a tab that genuinely holds nothing.
+                        let page_is_blank = page_url == "about:blank";
+                        let url_changed = !page_url.is_empty()
+                            && page_url != entry.page_url
+                            && !(page_is_blank && !entry.url.trim().is_empty());
                         let title_changed =
                             !page_title.is_empty() && page_title != entry.page_title;
                         // The engine's own `is-loading` is the ONLY honest source
@@ -8843,6 +8852,25 @@ async fn web_surface_native_reconcile_loop(
                     // https→http mixed-content block. None ⇒ no app contribution,
                     // so no bridge (a plain web page needs none).
                     let signer_base = state.peek().sidebar_control_url(&session_path);
+                    // An UNRESOLVED tab (`effective_url` empty — a restored row,
+                    // or a duplicate whose egress has not been resolved yet) has
+                    // no page to show. Opening it anyway hands WebKit "" and it
+                    // lands on about:blank, which then looked like a navigation.
+                    // The tab stays webview-less until something resolves it —
+                    // the same lazy rule a restored tab already follows.
+                    if effective_url.trim().is_empty() {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "web_surface",
+                            "create_skipped_unresolved_tab",
+                            serde_json::json!({
+                                "session_path": session_path,
+                                "tab_id": key.1,
+                            }),
+                        );
+                        continue;
+                    }
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
@@ -15629,7 +15657,16 @@ impl ShellState {
             removed.kill_forward();
             removed_tab = true;
             if surface.active_tab == tab_id {
-                surface.active_tab = surface.tabs[index - 1].id;
+                // The RIGHT neighbour, which is whatever shifted into the closed
+                // tab's slot — every browser's rule, and the one that keeps a
+                // close from throwing the user onto the app tab's page. Falls
+                // back to the left only when the closed tab was the last one.
+                surface.active_tab = surface
+                    .tabs
+                    .get(index)
+                    .or_else(|| surface.tabs.get(index - 1))
+                    .map(|tab| tab.id)
+                    .unwrap_or(WEB_TAB_APP_TAB_ID);
                 surface.address_draft = None;
             }
         }
@@ -17387,7 +17424,19 @@ impl ShellState {
                 }
             }
             WebTabMenuAction::DuplicateTab(tab_id) => {
-                self.web_surface_duplicate_tab(session_path, *tab_id);
+                // The app tab is not copyable, and that refusal lives HERE where
+                // it can be asked without a Signal.
+                if *tab_id == WEB_TAB_APP_TAB_ID {
+                    return true;
+                }
+                // Everything else is finished by the DISPATCH, which owns the
+                // Signal: a duplicate is born with an unresolved egress
+                // (`effective_url` empty, exactly like a restored tab) and only
+                // `select_web_surface_tab` can resolve it. Running it here left
+                // the copy active with no URL, and the reconciler then opened it
+                // on about:blank wearing the source's title. Same reason the
+                // split lives there.
+                return false;
             }
             WebTabMenuAction::MoveToFolder(tab_id, folder) => {
                 self.web_tab_move_to_folder(session_path, *tab_id, folder.clone());
@@ -89408,54 +89457,28 @@ fn TerminalCanvas(
                                             style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
                                             "{tab_label}"
                                         }
-                                        button {
-                                            style: format!(
-                                                "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:2px 4px; border-radius:6px; flex:0 0 auto;",
-                                                theme.foreground,
-                                            ),
-                                            title: if is_app_tab {
-                                                "Close web surface (sends Ctrl+C to the app)"
-                                            } else {
-                                                "Close tab"
-                                            },
-                                            onclick: move |evt| {
-                                                evt.stop_propagation();
-                                                if is_app_tab {
-                                                    // The app tab IS the app: closing it
-                                                    // ends the surface the terminal-native
-                                                    // way, same as the overlay ✕.
-                                                    let close_path = close_tab_path.clone();
-                                                    let endpoint = state
-                                                        .read()
-                                                        .bootstrap
-                                                        .server_endpoint
-                                                        .clone();
-                                                    state.with_mut(|shell| {
-                                                        shell.close_web_surface(&close_path);
-                                                    });
-                                                    spawn(async move {
-                                                        let _ = terminal_write_async(
-                                                            endpoint,
-                                                            close_path,
-                                                            "\u{3}".to_string(),
-                                                        )
-                                                        .await;
-                                                    });
-                                                } else {
+                                        // No ✕ on the app tab: it used to QUIT the
+                                        // app while this tab's own row menu refused
+                                        // to close it. One row, one answer — and
+                                        // quitting is not a tab verb.
+                                        if !is_app_tab {
+                                            button {
+                                                style: format!(
+                                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:2px 4px; border-radius:6px; flex:0 0 auto;",
+                                                    theme.foreground,
+                                                ),
+                                                title: "Close tab",
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
                                                     state.with_mut(|shell| {
                                                         shell.web_surface_close_tab(
                                                             &close_tab_path,
                                                             tab_id,
                                                         );
                                                     });
-                                                }
-                                            },
-                                            // Every tab wears ✕ (Chrome grammar);
-                                            // the app tab's ✕ still quits the app
-                                            // (its tooltip says so) — the STANDARD
-                                            // quit affordance is the ⏻ in the
-                                            // strip's right cluster.
-                                            "✕"
+                                                },
+                                                "✕"
+                                            }
                                         }
                                     }
                                 }
@@ -108721,30 +108744,30 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         );
                     },
                     actions: rsx! {
-                        button {
-                            "data-web-tab-close": "{tab_id}",
-                            style: session_row_action_button_style(palette.text),
-                            title: if is_app_tab { "Close the app (Ctrl+C)" } else { "Close tab" },
-                            onclick: move |evt: MouseEvent| {
-                                evt.stop_propagation();
-                                if is_app_tab {
-                                    // The app tab IS the app: closing it ends the
-                                    // surface the terminal-native way.
-                                    let close_path = close_path.clone();
-                                    let endpoint = state.read().bootstrap.server_endpoint.clone();
-                                    state.with_mut(|shell| shell.close_web_surface(&close_path));
-                                    spawn(async move {
-                                        let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
-                                    });
-                                } else {
+                        // The app tab gets NO ✕. Its ✕ used to QUIT ychrome (a
+                        // Ctrl+C to the app) while this same row's context menu
+                        // refused to close it and said why — two affordances on
+                        // one row disagreeing, and since the app tab wears a real
+                        // page's title it is visually identical to a content row.
+                        // The user's report was exactly this: closing the first
+                        // tab took the whole browser away. Quitting the app lives
+                        // where quitting an app lives — the session row's ✕ and
+                        // the surface's own power control.
+                        if !is_app_tab {
+                            button {
+                                "data-web-tab-close": "{tab_id}",
+                                style: session_row_action_button_style(palette.text),
+                                title: "Close tab",
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
                                     let close_path = close_path.clone();
                                     state.with_mut(|shell| {
                                         shell.web_surface_close_tab(&close_path, tab_id);
                                         shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
                                     });
-                                }
-                            },
-                            "✕"
+                                },
+                                "✕"
+                            }
                         }
                     },
                 }
@@ -112877,6 +112900,17 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
         // The EXISTING intra-tab split, which had no UI entry until now:
         // pane 0 stays the session's surface, pane 1 is pinned to this tab.
         split_web_tab_into_pane(state, &session_path, tab_id, SplitAxis::SideBySide);
+    }
+    if let WebTabMenuAction::DuplicateTab(tab_id) = action {
+        // Duplicate, then SELECT — the selection is what resolves the new tab's
+        // egress and hands the reconciler a real URL to open. Without it the
+        // copy opened on about:blank wearing the source's title, and the page
+        // observer then wrote that blank back into the saved tree.
+        if let Some(new_id) =
+            state.with_mut(|shell| shell.web_surface_duplicate_tab(&session_path, tab_id))
+        {
+            select_web_surface_tab(state, session_path.clone(), new_id);
+        }
     }
 }
 
@@ -161387,6 +161421,184 @@ mod webtabs_menu_switcher_locks {
             "band: None,",
         ),
     ];
+
+    /// THE FIRST TAB IS NOT A CLOSE BUTTON FOR THE APP.
+    ///
+    /// The user's report: "closing the first tab in a multi-tab ychrome whoops me
+    /// out of the session". It did exactly that — the app tab's ✕ sent Ctrl+C to
+    /// the app and tore the surface down, while the SAME row's context menu
+    /// refused to close it and explained why. One row cannot hold two answers,
+    /// and since the app tab wears a real page's title it looks like any other.
+    #[test]
+    fn the_app_tabs_row_offers_no_close_at_all_on_either_surface() {
+        let product = product_source();
+        // BOTH surfaces: the rail row and the classic strip chip. Each ✕ must be
+        // behind an `if !is_app_tab` — a title change alone would leave the
+        // gesture live.
+        for (guard, what) in [
+            ("\"data-web-tab-close\": \"{tab_id}\",", "the rail row's ✕"),
+            ("title: \"Close tab\",", "the strip chip's ✕"),
+        ] {
+            let at = product
+                .iter()
+                .position(|line| line.trim() == guard.trim())
+                .unwrap_or_else(|| panic!("{what} moved — move this lock with it"));
+            let before = product[at.saturating_sub(8)..at].join("\n");
+            assert!(
+                before.contains("if !is_app_tab {"),
+                "{what} must be drawn only for a tab that is not the app:\n{before}"
+            );
+        }
+        // The tab-row spelling is GONE outright.
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("\"Close the app (Ctrl+C)\"")),
+            "a tab ✕ still offers to quit the app"
+        );
+        // Quitting the app still EXISTS — on the surface's own chrome, beside the
+        // suspend control, which is where quitting an app belongs. Exactly one
+        // such control, and it is not on a tab row.
+        let quits: Vec<usize> = product
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("sends Ctrl+C to the app"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            quits.len(),
+            1,
+            "one place quits the app; a second is a tab row growing the gesture back"
+        );
+        let cluster = product[quits[0].saturating_sub(14)..quits[0]].join("\n");
+        assert!(
+            cluster.contains("\"Zzz\""),
+            "the quit control belongs to the surface chrome (beside suspend), not \
+             to a tab:\n{cluster}"
+        );
+    }
+
+    /// Closing a tab selects the RIGHT neighbour, like every browser — and so
+    /// never lands the user on the app tab's page while user tabs remain.
+    #[test]
+    fn closing_a_tab_selects_the_right_neighbour_not_the_app_tab() {
+        let mut shell = shell_with_surface(&[
+            ("https://a.example/", None),
+            ("https://b.example/", None),
+            ("https://c.example/", None),
+        ]);
+        let ids: Vec<u64> = shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect();
+        assert_eq!(ids.len(), 4, "app tab + three user tabs");
+
+        // Close the FIRST user tab (index 1) while it is active: the selection
+        // must move RIGHT, to what is now in its slot — not left onto the app.
+        shell.web_surface_select_tab("local://ws", ids[1]);
+        shell.web_surface_close_tab("local://ws", ids[1]);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].active_tab, ids[2],
+            "closing a tab must not throw the user onto the app tab's page"
+        );
+
+        // Close the LAST tab while active: there is nothing to the right, so the
+        // left neighbour is the honest answer.
+        let last = *ids.last().expect("a last tab");
+        shell.web_surface_select_tab("local://ws", last);
+        shell.web_surface_close_tab("local://ws", last);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].active_tab, ids[2],
+            "the last tab falls back to its LEFT neighbour"
+        );
+    }
+
+    /// A duplicate opens the page it copied, not `about:blank` wearing its name.
+    ///
+    /// The copy is born with an unresolved egress on purpose (a tunnel belongs to
+    /// a run, not a URL) — so the DISPATCH has to select it, which is what
+    /// resolves it. `apply_web_tab_menu_action` returning "handled" for a
+    /// duplicate is what silently skipped that, and the reconciler then opened
+    /// the tab on nothing.
+    #[test]
+    fn a_duplicate_is_finished_by_the_dispatch_that_can_resolve_it() {
+        let mut shell = shell_with_surface(&[("https://a.example/", None)]);
+        let source = shell.web_surfaces["local://ws"].tabs[1].id;
+
+        // The state half: the apply arm must REFUSE to handle it (returning
+        // false hands it to the dispatch), while the duplicate itself works.
+        assert!(
+            !shell.apply_web_tab_menu_action(
+                "local://ws",
+                &WebTabMenuAction::DuplicateTab(source)
+            ),
+            "a duplicate needs the Signal to resolve its URL, so the state-only \
+             path must hand it on rather than half-finish it"
+        );
+        // …while the app tab's refusal stays where it can be asked without one.
+        assert!(
+            shell.apply_web_tab_menu_action(
+                "local://ws",
+                &WebTabMenuAction::DuplicateTab(WEB_TAB_APP_TAB_ID)
+            ),
+            "the app tab is not copyable, and that answer needs no Signal"
+        );
+        let copy = shell
+            .web_surface_duplicate_tab("local://ws", source)
+            .expect("the duplicate is made");
+        let tab = shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == copy)
+            .expect("the copy is in the tree");
+        assert_eq!(
+            tab.url, "https://a.example/",
+            "the copy holds the page it copied"
+        );
+        assert!(
+            tab.effective_url.is_empty(),
+            "…with its egress deliberately unresolved, for the dispatch to finish"
+        );
+
+        // The dispatch half: it must SELECT what it duplicated.
+        let dispatch = function_body(&product_source(), "fn dispatch_web_tab_menu_action(");
+        assert!(
+            dispatch.contains("web_surface_duplicate_tab(&session_path, tab_id)")
+                && dispatch.contains("select_web_surface_tab(state, session_path.clone(), new_id)"),
+            "the dispatch must duplicate AND select — selection is what resolves \
+             the copy's URL:\n{dispatch}"
+        );
+    }
+
+    /// Two guards behind the same promise: an engine that was handed nothing must
+    /// not be able to write `about:blank` into the tree, and a tab with nothing
+    /// to show must not get a webview at all.
+    #[test]
+    fn a_blank_page_cannot_overwrite_a_tab_that_holds_a_url() {
+        let product = product_source();
+        let at = product
+            .iter()
+            .position(|line| line.contains("let page_is_blank = page_url =="))
+            .expect("the blank predicate moved — move this lock with it");
+        let clause = product[at..at + 5].join("\n");
+        assert!(
+            clause.contains("!(page_is_blank && !entry.url.trim().is_empty())"),
+            "a blank report may not count as a navigation for a tab that has a \
+             url of its own:\n{clause}"
+        );
+        // …and the create site refuses an unresolved tab outright.
+        let create = product
+            .iter()
+            .position(|line| line.contains("\"create_skipped_unresolved_tab\","))
+            .expect("the unresolved-create guard moved");
+        let guard = product[create.saturating_sub(10)..create].join("\n");
+        assert!(
+            guard.contains("if effective_url.trim().is_empty() {"),
+            "the reconciler must not hand WebKit an empty url — that IS the \
+             about:blank the user saw:\n{guard}"
+        );
+    }
 
     /// A row menu raised over a NATIVE page must land inside the tree, because
     /// anything outside it is eaten by the page (legacy stacking). The mirror of
