@@ -2701,6 +2701,22 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app session action: {other}"),
                 }
             }
+            "keytips" => {
+                // The twin of main.rs's arm, verb-for-verb: the headless binary
+                // is the one agents actually reach for, and a verb that exists
+                // on only one binary is the split-dispatch trap the app-control
+                // target work just closed (both binaries, one owner).
+                let action = args.get(3).map(String::as_str).unwrap_or("audit");
+                match action {
+                    "audit" => {
+                        let json = args.iter().any(|arg| arg == "--json");
+                        yggterm_server::run_app_control_keytips_audit(json, timeout_ms)
+                    }
+                    "show" => yggterm_server::run_app_control_keytips_overlay(true, timeout_ms),
+                    "hide" => yggterm_server::run_app_control_keytips_overlay(false, timeout_ms),
+                    other => anyhow::bail!("unsupported app keytips action: {other}"),
+                }
+            }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
     }
