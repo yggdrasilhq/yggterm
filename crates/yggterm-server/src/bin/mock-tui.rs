@@ -13,8 +13,10 @@
 //!   mock-tui --scenario clear-storm --count 20
 //!   mock-tui --scenario burst --kb 256
 //!   mock-tui --scenario prompt-box
+//!   mock-tui --scenario web-declare
 //!   mock-tui --replay <path-to-bytes-fixture>
 
+use base64::Engine as _;
 use std::io::{self, Read, Write};
 use std::{env, fs, thread, time::Duration};
 
@@ -124,6 +126,25 @@ fn main() {
                 "• Running the missing PL9 fixture batch.\r\n\r\n• Working (3s \u{00b7} esc to interrupt)"
             );
             let _ = w.flush();
+            hold(&args);
+            return;
+        }
+        // INTERACTIVE: a libyggterm app on the OSC 7717 control channel. Emits
+        // the web-surface `open` declare once, then re-declares ON DEMAND: each
+        // stdin line triggers one more declare — a line starting with `o` emits
+        // another `open`, anything else a `heartbeat` (same full payload, like a
+        // real app's ~4s cadence — but the TEST advances the state, not a
+        // clock). Drives the daemon-side declare retention and the attach-replay
+        // rule: a consumed `open` must serve as `seen` on a cursor-0 attach,
+        // never verbatim, while catch-up reads stay a faithful transcript.
+        "web-declare" => {
+            let payload = base64::engine::general_purpose::STANDARD
+                .encode(br#"{"session":"mock-app","url":"https://app.example/start","profile":"research"}"#);
+            let _ = write!(w, "MOCK_WEB_APP_READY\r\n");
+            let _ = write!(w, "\x1b]7717;web-surface;open;{payload}\x07");
+            let _ = write!(w, "MOCK_WEB_DECLARE_0_open\r\n");
+            let _ = w.flush();
+            run_web_declares(&mut w, &payload);
             hold(&args);
             return;
         }
@@ -251,6 +272,38 @@ fn run_echo(w: &mut impl Write) {
             if byte == b'\r' || byte == b'\n' {
                 let text = String::from_utf8_lossy(&line);
                 let _ = write!(w, "ECHO: {text}\r\n");
+                let _ = w.flush();
+                line.clear();
+            } else {
+                line.push(byte);
+            }
+        }
+    }
+}
+
+/// One more OSC 7717 web-surface declare per stdin line: a line starting with
+/// `o` re-declares `open`, anything else `heartbeat` — always the same full
+/// payload, exactly like a real app. A numbered marker line follows each
+/// declare so a test can wait for the bytes deterministically.
+fn run_web_declares(w: &mut impl Write, payload: &str) {
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut line: Vec<u8> = Vec::new();
+    let mut emitted = 0usize;
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            if byte == b'\r' || byte == b'\n' {
+                emitted += 1;
+                let action = if line.first() == Some(&b'o') {
+                    "open"
+                } else {
+                    "heartbeat"
+                };
+                let _ = write!(w, "\x1b]7717;web-surface;{action};{payload}\x07");
+                let _ = write!(w, "MOCK_WEB_DECLARE_{emitted}_{action}\r\n");
                 let _ = w.flush();
                 line.clear();
             } else {

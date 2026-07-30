@@ -20,6 +20,23 @@ This file tracks user-visible changes in `yggterm`.
   an engine bug that silently ate a press landing over empty space is fixed on
   the way. This half has no live proof yet — it still needs verification on a
   real desktop before it counts as fixed.
+- **Fixed: coming back to a browser session no longer grows a duplicate of the
+  first tab.** The saved tab list now remembers which row IS the browser's first
+  tab, so a rebuilt session hands that page back to the first tab instead of
+  reopening it beside a re-minted start page — the pairing that added one copy
+  of your first tab every time yggterm re-attached a running browser. The
+  copies this bug already left in a saved list are collapsed on the next
+  restore (only exact same-page loose copies of that tab; anything filed in a
+  folder or on a different page is untouched). Re-attaching a running browser
+  also returns its first tab to the page you were on rather than the page the
+  app was launched with, and saved tab lists written by older versions still
+  load unchanged. The daemon closes the replay half of the same bug: attaching
+  to a running app used to replay the app's original "open" announcement from
+  retained scrollback as if it were happening now, which could re-mint the
+  launch page over your tab — and, with tab restore off, delete your page's
+  saved row. A consumed announcement now replays only as an inert "already
+  seen" marker; live announcements, a just-launched app, and catch-up reads
+  are untouched.
 
 ## 2.12.18
 
