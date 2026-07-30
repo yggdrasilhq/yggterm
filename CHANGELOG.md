@@ -2,7 +2,7 @@
 
 This file tracks user-visible changes in `yggterm`.
 
-## Unreleased
+## 2.12.19
 
 - **Fixed: keyboard scrolling works on app-shell sites, and page scrolling is
   smooth.** PageUp/PageDown/Home/End/Space did nothing on pages that pin the
