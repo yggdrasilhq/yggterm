@@ -8,6 +8,9 @@ pub mod click_grid;
 pub mod gl_probe;
 mod icon;
 mod install;
+/// Where yggterm's memory actually goes — including the processes it spawns that
+/// carry no trace of us in their name, parent or cmdline.
+pub mod memory_profile;
 /// THE notification tune — one owner for both the webview script and the
 /// native CLI player, so two players can never drift into two chimes.
 pub mod notification_audio;
