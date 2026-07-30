@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Fixed: coming back to a browser session no longer grows a duplicate of the
+  first tab.** The saved tab list now remembers which row IS the browser's first
+  tab, so a rebuilt session hands that page back to the first tab instead of
+  reopening it beside a re-minted start page — the pairing that added one copy
+  of your first tab every time yggterm re-attached a running browser. The
+  copies this bug already left in a saved list are collapsed on the next
+  restore (only exact same-page loose copies of that tab; anything filed in a
+  folder or on a different page is untouched). Re-attaching a running browser
+  also returns its first tab to the page you were on rather than the page the
+  app was launched with, and saved tab lists written by older versions still
+  load unchanged.
+
 ## 2.12.18
 
 - **Security: a web page can no longer drive ychrome's settings or reach your
