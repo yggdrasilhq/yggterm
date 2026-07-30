@@ -39,25 +39,6 @@ page never taking the keyboard, dead back/forward). **These remain, each already
 root-caused — read the mechanism before opening the file, and grep the named
 symbol rather than trusting a line number:**
 
-- **Accelerating / smooth scroll, and keyboard scroll on app-shell sites.** Two
-  engine facts: WebKit's default key handler scrolls the focused node's
-  scrollable ANCESTORS, and an app-shell page's scroller is a DESCENDANT of body,
-  so with `activeElement === BODY` nothing scrolls; and
-  `webkit_settings_set_enable_smooth_scrolling` is never turned on. Fix: one
-  shell-owned document-start userscript (beside `CLOSE_SHIM_JS`) that scrolls the
-  largest visible `overflow:auto` descendant on PageUp/PageDown/Home/End/Space
-  when the document itself is not scrollable, plus the settings flip. The same
-  script should carry mouse buttons 8/9 and Alt+Left/Right, because wry's
-  `synthetic_mouse_events` swallows those buttons (`Propagation::Stop`).
-- **A duplicate FIRST tab appears on return to a session.** `SavedWebTab` has no
-  notion of which row was the app tab, so every rebuild re-mints tab 0 from the
-  launch declare AND re-opens the saved row as a user tab; with a redirect the
-  two look identical and it accumulates one copy per rebuild
-  (`restore_app_surfaces_tick` runs every 2.5 s). Fix: `app_tab: bool` on
-  `SavedWebTab`, written for tab 0 by `persist_web_tabs`; `plan_web_tab_restore`
-  always adopts that row into tab 0 and never re-opens it; and a
-  heartbeat/retained-declare materialization must be a RE-ATTACH (adopt the saved
-  page) not a relaunch of the stale launch URL.
 - **The vertical tab rail is not the cwdtree, and the user asked for it to be.**
   It hand-rolls its own folder tree and does not use `yggui::drag_tree` — a
   fourth tree in the product. The load-bearing gap is the widget schema:
@@ -123,6 +104,31 @@ symbol rather than trusting a line number:**
   viewport kind (top-center over a terminal, bottom-right over a document).
 
 ## Standing traps / other open bugs
+
+- **★★★ REMOTE ROWS WEDGE IN `RemoteBootstrap` AFTER A DAEMON VERSION HANDOVER
+  (found live on the 2.12.18 → 2.12.19 bump, 2026-07-30 night).** After the
+  GUI+daemon swap, every `remote-cc://` / `remote-session://` row the new
+  daemon adopted sat permanently on the 5-line planning placeholder ("Queue
+  remote Yggterm resume … Daemon PTY: request main viewport terminal stream"):
+  the adopted row's launch request never fired, so no ssh chain was ever
+  spawned for the new owner, while the OLD daemon's viewer chain kept
+  streaming into a grid nobody views. 15 rows wedged; the user-facing symptom
+  is a blank viewport on every remote agent row — the product's core handoff,
+  dead until manual recovery. **Recovery that works, verbatim, per row:**
+  `yggterm-headless server terminal restart '<session>'` (all 15 accepted,
+  all reached `Running` with real content; a freshly re-attached CC repaints
+  fully on its next input/output — nudge an idle row with a bare Enter).
+  Root-cause candidates to investigate BEFORE the next bump: the adopted
+  row's `request_terminal_launch_for_path` queue never draining for
+  preserved-owner rows, and the one-viewer contract holding dev-side slots
+  for the old daemon's chain. ⚠ **Do NOT bump dev/oc daemons until this is
+  fixed** — their next version transition hits the same wedge, and
+  fleet-binary-sync may carry 2.12.19 binaries there on its own.
+  ⚠ Related, observed in the same window: `server snapshot` on the NEW daemon
+  shows the placeholder for preserved-owner rows (the documented
+  snapshot-lies trap), and `update-daemons --force` PRESERVES runtimes on the
+  old socket rather than migrating them — neither is the recovery; the
+  per-row `terminal restart` is.
 
 - **★ THE SUPERVISOR DIES WITH ITS CHILD — confirmed twice in one day (jojo,
   2.12.18, 2026-07-27, ~17:15 and ~23:10).** `kill -TERM <gui-child>` is the
