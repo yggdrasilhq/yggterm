@@ -2020,9 +2020,26 @@ struct WebSurfacePolicy {
     /// ruleset installed). yggterm never second-guesses it.
     #[serde(default)]
     adblock_rules: Option<String>,
-    /// Injected at document-start, in the order the app declared.
+    /// LEGACY wire shape: bare script bodies, injected at document-start in the
+    /// order the app declared. Kept because an app older than the scriptlet
+    /// plane sends nothing else — see [`WebSurfacePolicy::effective_userscripts`]
+    /// for what a body with no placement means.
     #[serde(default)]
     userscripts: Vec<String>,
+    /// The scriptlet plane: the same scripts, each carrying the placement its
+    /// `// ==UserScript==` block declared. `None` = the app is older than this
+    /// field and only `userscripts` is on the wire.
+    ///
+    /// A rich array and a legacy array are never merged. The app derives both
+    /// from ONE list, so merging could only ever double-inject.
+    ///
+    /// The `Option` is what makes the field optional on the wire — serde treats
+    /// an absent `Option` field as `None` on its own, so `#[serde(default)]`
+    /// here is only consistency with its siblings. Give this field a bare
+    /// `Vec` and every app older than the scriptlet plane fails to deserialize,
+    /// taking its adblock ruleset down with its userscripts.
+    #[serde(default)]
+    userscripts_v2: Option<Vec<WireUserscript>>,
     /// The UA string the app's surfaces identify as. Browsing config, so the app
     /// owns it; only the GUI can apply it (WebKit fixes the UA at webview
     /// creation), the same shape as the ruleset. `None` = WebKitGTK's default,
@@ -2032,6 +2049,97 @@ struct WebSurfacePolicy {
     /// the same request from a macOS-Safari UA is served).
     #[serde(default)]
     user_agent: Option<String>,
+}
+
+/// One entry of `userscripts_v2`: a body plus the placement the app's host read
+/// off its `// ==UserScript==` block.
+///
+/// Every field defaults, so a script that declares nothing still deserializes —
+/// and the defaults here are the SAME ones the app's parser applies to a
+/// header-less body, because both are answering the same question ("what does a
+/// script that said nothing mean?") and two different answers would put a script
+/// in a different world depending on which side filled the blank in.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+struct WireUserscript {
+    #[serde(default)]
+    body: String,
+    /// WebKit match patterns, verbatim. Empty = every URL.
+    #[serde(default)]
+    matches: Vec<String>,
+    /// WebKit match patterns the engine must EXCLUDE — the block-list half of
+    /// placement, verbatim like `matches`. Empty = exclude nothing. The
+    /// default matters for the mixed-version fleet: an app older than
+    /// exclusions sends no such field, and "exclude nothing" is exactly what
+    /// its scripts declared.
+    #[serde(default)]
+    exclude_matches: Vec<String>,
+    #[serde(default)]
+    all_frames: bool,
+    /// `"isolated"` (the default) or `"main"`. Any other spelling — a typo, a
+    /// world a future app invents — reads as isolated: the narrower half, where
+    /// a script that meant `main` fails visibly instead of silently gaining the
+    /// run of the page.
+    #[serde(default)]
+    world: Option<String>,
+    /// Carried but NOT honoured: every script is injected at document-start. It
+    /// travels so the wire is already right the day a surface grows document-end
+    /// injection.
+    #[serde(default)]
+    #[allow(dead_code)]
+    run_at: Option<String>,
+}
+
+/// The `world` spelling that means "the page's own world". Everything else,
+/// including an absent field, means isolated.
+const USERSCRIPT_WORLD_MAIN: &str = "main";
+
+impl WireUserscript {
+    fn into_surface(self) -> dioxus_desktop::SurfaceUserscript {
+        dioxus_desktop::SurfaceUserscript {
+            isolated_world: self.world.as_deref() != Some(USERSCRIPT_WORLD_MAIN),
+            body: self.body,
+            matches: self.matches,
+            exclude_matches: self.exclude_matches,
+            all_frames: self.all_frames,
+        }
+    }
+}
+
+impl WebSurfacePolicy {
+    /// The scripts to hand the engine, and the ONE place the two wire shapes
+    /// become one list.
+    ///
+    /// `userscripts_v2` wins outright whenever the app sent it — including when
+    /// it is EMPTY, which is an app saying "no scripts", not an app that forgot.
+    /// Falling back on emptiness would resurrect the legacy array for every app
+    /// that has simply disabled all its userscripts, and inject them.
+    ///
+    /// A legacy body becomes a MAIN-world, every-URL, top-frame script, because
+    /// that is exactly what it did before this field existed. It deliberately
+    /// does NOT get the isolated default: an app too old to say `@world` is also
+    /// too old to have been audited for isolation, and silently moving its
+    /// scripts into a private world would break every one of them that patches a
+    /// page API — with no error, just a page that no longer does the thing.
+    fn effective_userscripts(&self) -> Vec<dioxus_desktop::SurfaceUserscript> {
+        match &self.userscripts_v2 {
+            Some(scripts) => scripts
+                .iter()
+                .cloned()
+                .map(WireUserscript::into_surface)
+                .collect(),
+            None => self
+                .userscripts
+                .iter()
+                .map(|body| dioxus_desktop::SurfaceUserscript {
+                    body: body.clone(),
+                    matches: Vec::new(),
+                    exclude_matches: Vec::new(),
+                    all_frames: false,
+                    isolated_world: false,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// What the surface reconciler knows about a session's app-supplied policy when
@@ -9442,7 +9550,7 @@ async fn web_surface_native_reconcile_loop(
                     // a dashboard app is not browsing.
                     let (userscripts, adblock_ruleset, user_agent) = match &policy_gate {
                         SurfacePolicyGate::Ready(policy) => (
-                            policy.userscripts.clone(),
+                            policy.effective_userscripts(),
                             policy
                                 .adblock_rules
                                 .as_deref()
@@ -54076,7 +54184,11 @@ async fn app_policy_fetch(
                     "session_path": session_path,
                     "policy_version": policy_version,
                     "adblock": policy.adblock_rules.is_some(),
-                    "userscripts": policy.userscripts.len(),
+                    "userscripts": policy.effective_userscripts().len(),
+                    // Which wire shape the app spoke, so a surface running
+                    // page-world scripts on every URL can be told apart from one
+                    // running scoped isolated ones without guessing.
+                    "userscripts_scoped": policy.userscripts_v2.is_some(),
                     "user_agent": policy.user_agent,
                 }),
             );
@@ -120873,6 +120985,49 @@ mod tests {
     /// shell's own webview — window still active, `activeElement` still the
     /// xterm helper textarea, and yet `document.hasFocus()` false and every
     /// keystroke the user types going into the agent's invisible page.
+    /// The PRODUCT source of the vendored web-surface host: everything outside
+    /// a `#[cfg(test)] mod` block.
+    ///
+    /// The focus scan below counts `WebViewBuilder::new` sites, and a lock in
+    /// that file may legitimately construct a builder it never builds — reading
+    /// those as surface builders reports a defect that does not exist, which is
+    /// exactly what happened the first time a test module there staged a
+    /// builder. The rule is duplicated from the one that file uses on itself
+    /// because it lives inside ITS test module, which no other crate can call.
+    fn web_surface_host_product_source() -> String {
+        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        let mut out = String::new();
+        let mut in_test_module = false;
+        let mut pending_test_attribute = false;
+        for line in HOST.lines() {
+            if in_test_module {
+                if line == "}" {
+                    in_test_module = false;
+                }
+                continue;
+            }
+            if line.starts_with("#[cfg(test)]") {
+                pending_test_attribute = true;
+                continue;
+            }
+            if pending_test_attribute {
+                pending_test_attribute = false;
+                if line.starts_with("mod ") || line.starts_with("pub mod ") {
+                    in_test_module = true;
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        assert!(
+            !out.contains("mod scriptlet_locks"),
+            "the strip is not removing test modules, so every scan built on it \
+             is reading its own locks"
+        );
+        out
+    }
+
     /// Live-caught on guihost with a simultaneous two-point read (shell
     /// `hasFocus:false`, never-revealed agent surface `hasFocus:true`).
     ///
@@ -120891,53 +121046,11 @@ mod tests {
     /// exactly what let the fourth path survive three rounds of fixes.
     #[test]
     fn no_web_surface_takes_the_window_keyboard_focus_without_giving_it_back() {
-        const HOST_FILE: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
-        // PRODUCT half only. The vendored file's own tests name `grab_focus` in
-        // their assertion prose — a scan that reads them reports every test as a
-        // thief, which is the mirror of the failure mode this whole family exists
-        // to avoid (a needle satisfied by the words describing it).
-        // Everything outside a `#[cfg(test)] mod` — the file's own rule, because
-        // `#[cfg(test)]` also marks small helpers mid-file and cutting at the
-        // FIRST one loses most of the product.
-        let host_product: String = {
-            let mut kept = String::new();
-            let mut in_test_module = false;
-            let mut pending = false;
-            for line in HOST_FILE.lines() {
-                if in_test_module {
-                    if line == "}" {
-                        in_test_module = false;
-                    }
-                    continue;
-                }
-                if line.starts_with("#[cfg(test)]") {
-                    pending = true;
-                    continue;
-                }
-                if pending {
-                    pending = false;
-                    if line.starts_with("mod ") || line.starts_with("pub(crate) mod ") {
-                        in_test_module = true;
-                        continue;
-                    }
-                }
-                kept.push_str(line);
-                kept.push('\n');
-            }
-            kept
-        };
-        let host: &str = host_product.as_str();
-        assert!(
-            host.len() > 50_000,
-            "the product half of the surface host came out at {} bytes — this \
-             scan went blind",
-            host.len()
-        );
-        #[allow(non_snake_case)]
-        let HOST: &str = host;
+        let host = web_surface_host_product_source();
+        let host = host.as_str();
         // Clause 1: every webview a surface builds SAYS whether it may focus.
-        let builders = HOST.matches("WebViewBuilder::new").count();
-        let declared = HOST.matches(".with_focused(").count();
+        let builders = host.matches("WebViewBuilder::new").count();
+        let declared = host.matches(".with_focused(").count();
         assert!(
             builders > 0,
             "the scan lost its anchor: no WebViewBuilder in the surface host"
@@ -120955,7 +121068,7 @@ mod tests {
         let mut fn_name = "<top level>";
         let mut chunks: Vec<(&str, String)> = Vec::new();
         let mut body = String::new();
-        for line in HOST.lines() {
+        for line in host.lines() {
             let mut trimmed = line.trim_start();
             for prefix in ["pub(crate) ", "pub ", "async ", "unsafe "] {
                 trimmed = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
@@ -131742,14 +131855,153 @@ mod tests {
             WebSurfacePolicy {
                 adblock_rules: Some("[]".to_string()),
                 userscripts: vec!["console.log(1)".to_string()],
+                userscripts_v2: None,
                 user_agent: None,
             },
         );
         let SurfacePolicyGate::Ready(policy) = shell.web_surface_policy_gate("local://p") else {
             panic!("policy did not become ready");
         };
-        assert_eq!(policy.userscripts.len(), 1);
+        assert_eq!(policy.effective_userscripts().len(), 1);
         assert_eq!(policy.adblock_rules.as_deref(), Some("[]"));
+    }
+
+    // ------------------------------------------------------------------
+    // THE SCRIPTLET PLANE — which shape wins, and what each one means.
+    // ------------------------------------------------------------------
+
+    fn policy_json(extra: serde_json::Value) -> WebSurfacePolicy {
+        let mut value = json!({
+            "adblock_rules": null,
+            "userscripts": ["legacy-body"],
+            "user_agent": null,
+        });
+        for (key, item) in extra.as_object().expect("object").clone() {
+            value[key] = item;
+        }
+        serde_json::from_value(value).expect("policy deserializes")
+    }
+
+    // The rich array wins whenever the app sent one, and every placement fact
+    // survives the wire. Mutate the preference in `effective_userscripts` and
+    // this reads back "legacy-body" in the page world on every URL.
+    #[test]
+    fn userscripts_v2_is_preferred_over_the_legacy_bodies() {
+        let policy = policy_json(json!({
+            "userscripts_v2": [{
+                "body": "scoped-body",
+                "matches": ["https://*.youtube.com/*"],
+                "exclude_matches": ["https://*.youtube.com/embed/*"],
+                "all_frames": true,
+                "world": "isolated",
+                "run_at": "document-start",
+            }],
+        }));
+        let scripts = policy.effective_userscripts();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].body, "scoped-body");
+        assert_eq!(
+            scripts[0].matches,
+            vec!["https://*.youtube.com/*".to_string()]
+        );
+        assert_eq!(
+            scripts[0].exclude_matches,
+            vec!["https://*.youtube.com/embed/*".to_string()],
+            "the block-list was dropped off the wire, so the script runs on \
+             the very pages its author excluded"
+        );
+        assert!(scripts[0].all_frames);
+        assert!(scripts[0].isolated_world);
+    }
+
+    // An app too old to send `userscripts_v2` still gets its scripts — and gets
+    // them with EXACTLY the placement they had before the field existed: every
+    // URL, top frame, and the PAGE's world. Moving them to the isolated default
+    // would silently break every legacy script that patches a page API.
+    #[test]
+    fn a_legacy_only_policy_still_injects_in_the_page_world_on_every_url() {
+        let scripts = policy_json(json!({})).effective_userscripts();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].body, "legacy-body");
+        assert!(
+            scripts[0].matches.is_empty(),
+            "legacy scripts ran everywhere"
+        );
+        assert!(
+            scripts[0].exclude_matches.is_empty(),
+            "legacy scripts declared no exclusions"
+        );
+        assert!(!scripts[0].all_frames);
+        assert!(
+            !scripts[0].isolated_world,
+            "a legacy body ran in the page's own world and must keep doing so"
+        );
+    }
+
+    // An EMPTY rich array is an app saying "no scripts", not an app that forgot.
+    // Falling back on emptiness would resurrect the legacy array for every app
+    // that has simply disabled all of its userscripts.
+    #[test]
+    fn an_empty_v2_array_means_no_scripts_not_fall_back_to_legacy() {
+        let policy = policy_json(json!({ "userscripts_v2": [] }));
+        assert!(
+            policy.effective_userscripts().is_empty(),
+            "an app that sent an empty v2 array had its legacy scripts injected"
+        );
+    }
+
+    // Only the exact spelling `main` escapes the isolated world. A typo, a
+    // future world name, or an absent field all land on isolated — the narrow
+    // half, where a mistake makes a patch not take rather than handing a script
+    // the run of the page.
+    #[test]
+    fn only_the_word_main_selects_the_pages_own_world() {
+        for (world, isolated) in [
+            (json!("main"), false),
+            (json!("isolated"), true),
+            (json!("Main"), true),
+            (json!("page"), true),
+            (json!(null), true),
+        ] {
+            let policy = policy_json(json!({
+                "userscripts_v2": [{ "body": "b", "world": world }],
+            }));
+            assert_eq!(
+                policy.effective_userscripts()[0].isolated_world, isolated,
+                "world {world:?} resolved to the wrong side of the boundary"
+            );
+        }
+    }
+
+    // MIXED-VERSION FLEET, our half: a policy from an app OLDER than the
+    // scriptlet plane carries no `userscripts_v2` at all, and the whole policy —
+    // adblock ruleset included — must still deserialize. A required field here
+    // would have taken ad blocking down with it.
+    #[test]
+    fn a_policy_from_a_pre_scriptlet_app_still_deserializes_whole() {
+        let policy: WebSurfacePolicy = serde_json::from_value(json!({
+            "adblock_rules": "[]",
+            "userscripts": ["a", "b"],
+            "user_agent": "UA/1",
+        }))
+        .expect("a pre-scriptlet policy must still deserialize");
+        assert_eq!(policy.adblock_rules.as_deref(), Some("[]"));
+        assert_eq!(policy.effective_userscripts().len(), 2);
+    }
+
+    // ...and a policy from an app NEWER than us: unknown fields must be ignored,
+    // not fatal. This is the same rule that lets an old GUI ignore
+    // `userscripts_v2`, checked from the side we can actually run.
+    #[test]
+    fn a_policy_with_fields_we_have_never_heard_of_still_deserializes() {
+        let policy: WebSurfacePolicy = serde_json::from_value(json!({
+            "adblock_rules": null,
+            "userscripts": ["a"],
+            "userscripts_v3": [{ "body": "a", "sandbox": "worklet" }],
+            "something_invented_next_year": true,
+        }))
+        .expect("an unknown field must not fail the whole policy");
+        assert_eq!(policy.effective_userscripts().len(), 1);
     }
 
     // An app that declares no policy_version ships no policy: it must not gate.
@@ -131840,6 +132092,7 @@ mod tests {
             WebSurfacePolicy {
                 adblock_rules: Some("[retired]".to_string()),
                 userscripts: Vec::new(),
+                userscripts_v2: None,
                 user_agent: None,
             },
         );

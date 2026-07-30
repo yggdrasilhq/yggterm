@@ -1048,9 +1048,44 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub fn with_initialization_script_for_main_only<S: Into<String>>(
+    self,
+    js: S,
+    for_main_frame_only: bool,
+  ) -> Self {
+    self.with_initialization_script_options(js, for_main_frame_only, Vec::new(), Vec::new(), None)
+  }
+
+  /// Same as [`with_initialization_script_for_main_only`](Self::with_initialization_script_for_main_only)
+  /// plus the facts a USERSCRIPT needs and a bootstrap shim does not: which
+  /// URLs it runs on, which it is excluded from, and which JavaScript world it
+  /// runs in.
+  ///
+  /// `allow_list` is a list of match patterns in the engine's own syntax; EMPTY
+  /// means every URL, which is the behaviour of the other constructors.
+  /// `block_list` is the same syntax subtracted: a page matching any of its
+  /// patterns never gets the script, whatever the allow-list says; EMPTY
+  /// excludes nothing. `world_name` names an isolated content world — the
+  /// script shares the page's DOM but gets private globals — while `None`
+  /// injects into the page's own world, where the page can see (and be seen
+  /// by) the script.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux/BSD (WebKitGTK):** all three are honoured natively —
+  ///   `webkit_user_script_new` takes the allow-list and the block-list, and
+  ///   `webkit_user_script_new_for_world` takes the world.
+  /// - **Every other platform:** all three are IGNORED. The script is injected
+  ///   as if it had been added with
+  ///   [`with_initialization_script_for_main_only`](Self::with_initialization_script_for_main_only):
+  ///   every URL, no exclusions, page world. A caller that needs scoping on
+  ///   those platforms must still guard inside the script.
+  pub fn with_initialization_script_options<S: Into<String>>(
     mut self,
     js: S,
     for_main_frame_only: bool,
+    allow_list: Vec<String>,
+    block_list: Vec<String>,
+    world_name: Option<String>,
   ) -> Self {
     let script = js.into();
     if !script.is_empty() {
@@ -1060,9 +1095,23 @@ impl<'a> WebViewBuilder<'a> {
         .push(InitializationScript {
           script,
           for_main_frame_only,
+          allow_list,
+          block_list,
+          world_name,
         });
     }
     self
+  }
+
+  /// The initialization scripts staged on this builder so far, in the order
+  /// they will be injected.
+  ///
+  /// Read-only, and it exists so a CALLER can prove what its own chain built
+  /// without standing up a webview: a userscript's match patterns and world are
+  /// decided here, on a builder, and the alternative test is a live engine on a
+  /// display that a headless CI does not have.
+  pub fn initialization_scripts(&self) -> &[InitializationScript] {
+    &self.attrs.initialization_scripts
   }
 
   /// Register custom loading protocols with pairs of scheme uri string and a handling
@@ -2574,6 +2623,41 @@ pub struct InitializationScript {
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub for_main_frame_only: bool,
+  /// URL match patterns, in the engine's own syntax, that decide which pages
+  /// this script is injected into. EMPTY = every page.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux/BSD (WebKitGTK):** passed to `webkit_user_script_new` as its
+  ///   allow-list; the ENGINE does the matching.
+  /// - **Every other platform:** ignored — the script runs on every page.
+  pub allow_list: Vec<String>,
+  /// URL match patterns, same syntax as [`InitializationScript::allow_list`],
+  /// that decide which pages this script is EXCLUDED from. A page matching any
+  /// of these never gets the script, whatever the allow-list says. EMPTY =
+  /// exclude nothing.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux/BSD (WebKitGTK):** passed to `webkit_user_script_new` as its
+  ///   block-list; the ENGINE does the matching.
+  /// - **Every other platform:** ignored — nothing is excluded.
+  pub block_list: Vec<String>,
+  /// The name of an isolated JavaScript world to inject into. `None` = the
+  /// page's own world, which is where every script ran before this field
+  /// existed.
+  ///
+  /// A script in an isolated world shares the page's DOM but not its globals:
+  /// the page cannot read or overwrite it, and — the other half of the same
+  /// coin — a patch it makes to `window.fetch` is invisible to the page. A
+  /// script whose job is to be CALLED by the page must use `None`.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux/BSD (WebKitGTK):** `webkit_user_script_new_for_world`. Scripts
+  ///   naming the same world share it.
+  /// - **Every other platform:** ignored — the script runs in the page's world.
+  pub world_name: Option<String>,
 }
 
 #[cfg(test)]
