@@ -916,8 +916,8 @@ fn connect_download_plumbing(
     });
 }
 
-/// A window a page opened from inside a surface — `window.open`, a
-/// `target="_blank"` link, a middle/ctrl-click.
+/// A window a page opened from inside a surface — `window.open` or a
+/// `target="_blank"` link.
 ///
 /// The webview ALREADY EXISTS by the time the shell hears about this: WebKit's
 /// `create` signal must be answered synchronously with the view that will run
@@ -933,8 +933,32 @@ pub struct SurfacePopup {
     /// The URL the window was opened on. WebKit is already loading it into the
     /// popup's webview — this is for the tab's model, not a navigation to make.
     pub url: String,
-    /// A middle/ctrl-click means "open it, but do not go there" (Chrome's
-    /// grammar). A `window.open` is a foreground request.
+    /// A middle/ctrl-click on a `target`ed link means "open it, but do not go
+    /// there" (Chrome's grammar). A `window.open` is a foreground request.
+    pub background: bool,
+}
+
+/// A LINK the user asked to open in a background tab — a middle-click, or a
+/// ctrl/cmd-click, on a plain `<a href>` with no `target`.
+///
+/// The twin of [`SurfacePopup`], and deliberately NOT the same thing: here there
+/// is no webview and never was. WebKit raises `create` only for a NEW-WINDOW
+/// action, so an anchor with no `target` is an ordinary navigation of the
+/// current frame; the gesture is visible only on the navigation policy decision,
+/// which the host answers by IGNORING the navigation and queueing this.
+///
+/// So the shell must OPEN a tab for it (mint, then navigate) — adopting it the
+/// way a popup is adopted would record the URL as already-applied and leave a
+/// tab that never loads anything.
+pub struct SurfaceLinkOpen {
+    /// The surface whose page the link was in: the tab the new one belongs
+    /// beside, and whose profile/egress it inherits.
+    pub opener_id: u64,
+    /// The link's URL. Nothing is loading it — this is a navigation to MAKE.
+    pub url: String,
+    /// Always true today (the gesture is background by definition); carried
+    /// rather than assumed so the shell's rule stays the gesture's, not a
+    /// constant buried in a drain.
     pub background: bool,
 }
 
@@ -1018,6 +1042,17 @@ pub struct WebSurfaceHost {
     /// its `window.close()` closed nothing: the sign-in completed, the popup sat
     /// there forever, and the page that started it never learned it had won.
     popups: Rc<RefCell<Vec<SurfacePopup>>>,
+    /// Links the user middle-clicked or ctrl-clicked, drained by the shell each
+    /// reconcile tick and OPENED as background tabs of the opener's session.
+    ///
+    /// Separate from `popups` because the two are opposite obligations, not two
+    /// flavours of one. A popup arrives with a live webview that must be adopted
+    /// and must NOT be navigated; a link arrives with nothing at all — the
+    /// navigation it would have caused was ignored precisely so the opener page
+    /// stays put — and must be opened and navigated. Merging them would need a
+    /// "does this one have a view" flag on every entry, which is the same
+    /// question answered twice.
+    link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
     /// Pages that called `window.close()`. A script-opened window is allowed to
     /// close itself, and a browser that ignores that strands every OAuth popup
     /// ever written.
@@ -1776,6 +1811,114 @@ fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
     let _ = surface.webview.set_bounds(rect_logical(w, h));
 }
 
+/// Everything a surface needs in order to answer "the page here asked for
+/// another window", cloned out of the host once per webview build.
+///
+/// It exists so ONE handler body serves a page surface and an adopted popup
+/// alike. It did not, and the omission was invisible: `build_popup_webview`
+/// installed no `new_window_req_handler` at all, so the SECOND window in a chain
+/// — the `target="_blank"` sign-in inside an already-popped-up consent page —
+/// was answered with a null widget and dropped in silence. A popup is a surface;
+/// the windows it opens are the session's tabs like anyone else's.
+#[derive(Clone)]
+struct SurfaceWindowPlumbing {
+    overlay: gtk::Overlay,
+    glass: Rc<RefCell<Option<gtk::Widget>>>,
+    surfaces: Rc<RefCell<HashMap<u64, Surface>>>,
+    close_requests: Rc<RefCell<Vec<SurfaceCloseRequest>>>,
+    edge_motion: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    backdrop_rgb: Rc<Cell<Option<(u8, u8, u8)>>>,
+    popups: Rc<RefCell<Vec<SurfacePopup>>>,
+    link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
+    next_id: Rc<Cell<u64>>,
+    userscripts: Vec<String>,
+    adblock_ruleset: Option<std::path::PathBuf>,
+}
+
+/// THE new-window handler, for a page surface and for a popup alike.
+///
+/// Boxed rather than `impl Fn` on purpose: it calls `build_popup_webview`, which
+/// installs this same handler on the view it builds, and an opaque return type
+/// cannot name itself.
+fn surface_new_window_handler(
+    plumbing: SurfaceWindowPlumbing,
+    opener_surface_id: u64,
+) -> Box<dyn Fn(String, wry::NewWindowFeatures) -> wry::NewWindowResponse> {
+    Box::new(move |url, features| {
+        let popup_id = {
+            let next = plumbing.next_id.get();
+            plumbing.next_id.set(next + 1);
+            next
+        };
+        let bounds = plumbing
+            .surfaces
+            .borrow()
+            .get(&opener_surface_id)
+            .map(|surface| {
+                let (w, h) = surface.container.size_request();
+                (
+                    surface.container.margin_start(),
+                    surface.container.margin_top(),
+                    w,
+                    h,
+                )
+            })
+            .unwrap_or((0, 0, 1, 1));
+        match build_popup_webview(
+            &plumbing,
+            popup_id,
+            &features.opener.webview,
+            bounds,
+            !features.background,
+        ) {
+            Some(webview) => {
+                plumbing.popups.borrow_mut().push(SurfacePopup {
+                    opener_id: opener_surface_id,
+                    popup_id,
+                    url,
+                    background: features.background,
+                });
+                wry::NewWindowResponse::Create { webview }
+            }
+            // Refusing is the honest failure: a detached GTK window would
+            // escape the viewport entirely, and a tab with no view is a
+            // row that does nothing.
+            None => wry::NewWindowResponse::Deny,
+        }
+    })
+}
+
+/// THE background-open link handler, for a page surface and for a popup alike.
+///
+/// This is the OTHER door, and the one that was missing entirely: WebKit raises
+/// `create` for a NEW-WINDOW action only, so a middle-click on a plain `<a href>`
+/// never reached the handler above — it arrived as a navigation of the current
+/// frame and, with nobody listening, did nothing at all.
+///
+/// Returning `true` tells the engine the open was handled, which CANCELS that
+/// in-place navigation: the page the user is standing on must not move. So the
+/// queue this fills is a promise — the shell owes the URL a tab, and a `false`
+/// here is the only way to decline without losing the click.
+fn surface_link_gesture_handler(
+    link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
+    opener_surface_id: u64,
+) -> Box<dyn Fn(String, bool) -> bool> {
+    Box::new(move |url, background| {
+        // `javascript:` is not a page to open, it is code to run in the frame
+        // that owns it — a tab pointed at one would be blank forever. Declining
+        // hands the click back to the engine, which is where it belongs.
+        if url.trim_start().to_ascii_lowercase().starts_with("javascript:") {
+            return false;
+        }
+        link_opens.borrow_mut().push(SurfaceLinkOpen {
+            opener_id: opener_surface_id,
+            url,
+            background,
+        });
+        true
+    })
+}
+
 /// Build the webview for a popup: RELATED to its opener, parented into its own
 /// overlay child, and registered in `surfaces` under `popup_id`.
 ///
@@ -1789,24 +1932,29 @@ fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
 /// The page policy (userscripts, the passkey shim, the ad filter) is re-attached
 /// here, because a fresh view gets a fresh user-content manager. A popup with no
 /// passkey shim is precisely the window a passkey is needed in.
-#[allow(clippy::too_many_arguments)]
 fn build_popup_webview(
-    overlay: &gtk::Overlay,
-    glass: &Rc<RefCell<Option<gtk::Widget>>>,
-    surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
-    close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
-    edge_motion: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-    backdrop_rgb: &Rc<Cell<Option<(u8, u8, u8)>>>,
+    plumbing: &SurfaceWindowPlumbing,
     popup_id: u64,
     opener: &webkit2gtk::WebView,
     opener_bounds: (i32, i32, i32, i32),
     visible: bool,
-    userscripts: &[String],
-    adblock_ruleset: Option<&std::path::Path>,
 ) -> Option<webkit2gtk::WebView> {
     use webkit2gtk::WebViewExt as _;
     use wry::WebViewBuilderExtUnix as _;
     use wry::WebViewExtUnix as _;
+
+    let SurfaceWindowPlumbing {
+        overlay,
+        glass,
+        surfaces,
+        close_requests,
+        edge_motion,
+        backdrop_rgb,
+        link_opens,
+        userscripts,
+        adblock_ruleset,
+        ..
+    } = plumbing;
 
     let (x, y, w, h) = opener_bounds;
     let container = gtk::Fixed::new();
@@ -1831,7 +1979,14 @@ fn build_popup_webview(
         // NO url: WebKit loads the request that asked for this window into the
         // view we hand back. Loading it ourselves would race that navigation.
         .with_related_view(opener.clone())
-        .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true);
+        .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
+        // A popup is a SURFACE, so both new-window doors are its too. Without
+        // these a `target="_blank"` inside an already-popped-up page (the
+        // "Continue with Google" on a consent screen) was answered with a null
+        // widget, and a middle-click inside one did nothing — the same two bugs
+        // the page surface had, surviving one level down.
+        .with_new_window_req_handler(surface_new_window_handler(plumbing.clone(), popup_id))
+        .with_link_gesture_handler(surface_link_gesture_handler(link_opens.clone(), popup_id));
     for script in userscripts {
         builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
     }
@@ -2056,6 +2211,7 @@ impl WebSurfaceHost {
             contexts: Rc::new(RefCell::new(HashMap::new())),
             next_id: Rc::new(Cell::new(1)),
             popups: Rc::new(RefCell::new(Vec::new())),
+            link_opens: Rc::new(RefCell::new(Vec::new())),
             close_requests: Rc::new(RefCell::new(Vec::new())),
             downloads: Rc::new(RefCell::new(Vec::new())),
             downloads_in_flight: Rc::new(RefCell::new(Vec::new())),
@@ -2161,10 +2317,39 @@ impl WebSurfaceHost {
         id
     }
 
+    /// The plumbing a webview needs to answer "this page asked for another
+    /// window", assembled in ONE place so a page surface and a popup cannot be
+    /// given different answers. See [`SurfaceWindowPlumbing`].
+    fn window_plumbing(
+        &self,
+        userscripts: &[String],
+        adblock_ruleset: Option<&std::path::Path>,
+    ) -> SurfaceWindowPlumbing {
+        SurfaceWindowPlumbing {
+            overlay: self.overlay.clone(),
+            glass: self.glass.clone(),
+            surfaces: self.surfaces.clone(),
+            close_requests: self.close_requests.clone(),
+            edge_motion: self.edge_motion.clone(),
+            backdrop_rgb: self.backdrop_rgb.clone(),
+            popups: self.popups.clone(),
+            link_opens: self.link_opens.clone(),
+            next_id: self.next_id.clone(),
+            userscripts: userscripts.to_vec(),
+            adblock_ruleset: adblock_ruleset.map(|path| path.to_path_buf()),
+        }
+    }
+
     /// Drain the popups pages opened since the last call. Their webviews are
     /// already live — see `WebSurfaceHost::popups`.
     pub fn take_popups(&self) -> Vec<SurfacePopup> {
         std::mem::take(&mut self.popups.borrow_mut())
+    }
+
+    /// Drain the links the user asked to open in a background tab since the last
+    /// call. Nothing is loading them — see `WebSurfaceHost::link_opens`.
+    pub fn take_link_opens(&self) -> Vec<SurfaceLinkOpen> {
+        std::mem::take(&mut self.link_opens.borrow_mut())
     }
 
     /// Drain the pages that called `window.close()`.
@@ -2309,80 +2494,33 @@ impl WebSurfaceHost {
             builder = builder.with_user_agent(user_agent);
         }
 
-        // In-page "new window" requests (a link middle-clicked, ctrl-clicked,
-        // `target="_blank"`, or `window.open`) become TABS of this surface's
-        // session rather than detached GTK windows — but the webview is built
-        // HERE, related to this one, and handed straight back to WebKit.
+        // In-page "another window" requests become TABS of this surface's
+        // session rather than detached GTK windows. There are TWO doors, and
+        // WebKit will only ever open one of them for a given gesture:
         //
-        // This used to deny the window and let the shell reopen the URL in a
-        // fresh webview. That produced a tab, but not a POPUP: with no relation
-        // to the opener, `window.opener` was `null` and `window.close()` had
-        // nothing to close. Every popup-based sign-in (claude.ai -> Google) hung
-        // there: the user authenticated, the callback tried to hand the result
-        // back through `opener.postMessage(...)`, hit `null`, and the page that
-        // started the flow waited forever while the "successful" popup refused
-        // to go away. (The cookie landed, so the NEXT launch was silently signed
-        // in — which is how a broken channel disguised itself as a flaky login.)
+        // - `create`, for a NEW-WINDOW action (`target="_blank"`,
+        //   `window.open`). The webview is built HERE, related to this one, and
+        //   handed straight back. This used to deny the window and let the shell
+        //   reopen the URL in a fresh webview. That produced a tab, but not a
+        //   POPUP: with no relation to the opener, `window.opener` was `null` and
+        //   `window.close()` had nothing to close. Every popup-based sign-in
+        //   (claude.ai -> Google) hung there: the user authenticated, the callback
+        //   tried to hand the result back through `opener.postMessage(...)`, hit
+        //   `null`, and the page that started the flow waited forever while the
+        //   "successful" popup refused to go away. (The cookie landed, so the NEXT
+        //   launch was silently signed in — which is how a broken channel
+        //   disguised itself as a flaky login.)
+        // - the NAVIGATION decision, for a middle/ctrl-click on a plain
+        //   `<a href>`. WebKit does not consider that a new window at all, so it
+        //   never reached the handler above; it was an ordinary navigation with
+        //   nobody listening, and the click did NOTHING. The shell owes each of
+        //   these a real tab, because answering the gesture is what cancels the
+        //   navigation that would otherwise have replaced this page.
         {
-            let popups = self.popups.clone();
-            let surfaces = self.surfaces.clone();
-            let close_requests = self.close_requests.clone();
-            let overlay = self.overlay.clone();
-            let glass = self.glass.clone();
-            let edge_motion = self.edge_motion.clone();
-            let backdrop_rgb = self.backdrop_rgb.clone();
-            let ids = self.next_id.clone();
-            let popup_scripts = userscripts.to_vec();
-            let popup_adblock = adblock_ruleset.map(|path| path.to_path_buf());
-            let surface_id = id;
-            builder = builder.with_new_window_req_handler(move |url, features| {
-                let popup_id = {
-                    let next = ids.get();
-                    ids.set(next + 1);
-                    next
-                };
-                let bounds = surfaces
-                    .borrow()
-                    .get(&surface_id)
-                    .map(|surface| {
-                        let (w, h) = surface.container.size_request();
-                        (
-                            surface.container.margin_start(),
-                            surface.container.margin_top(),
-                            w,
-                            h,
-                        )
-                    })
-                    .unwrap_or((0, 0, 1, 1));
-                match build_popup_webview(
-                    &overlay,
-                    &glass,
-                    &surfaces,
-                    &close_requests,
-                    &edge_motion,
-                    &backdrop_rgb,
-                    popup_id,
-                    &features.opener.webview,
-                    bounds,
-                    !features.background,
-                    &popup_scripts,
-                    popup_adblock.as_deref(),
-                ) {
-                    Some(webview) => {
-                        popups.borrow_mut().push(SurfacePopup {
-                            opener_id: surface_id,
-                            popup_id,
-                            url,
-                            background: features.background,
-                        });
-                        wry::NewWindowResponse::Create { webview }
-                    }
-                    // Refusing is the honest failure: a detached GTK window would
-                    // escape the viewport entirely, and a tab with no view is a
-                    // row that does nothing.
-                    None => wry::NewWindowResponse::Deny,
-                }
-            });
+            let plumbing = self.window_plumbing(userscripts, adblock_ruleset);
+            builder = builder
+                .with_new_window_req_handler(surface_new_window_handler(plumbing.clone(), id))
+                .with_link_gesture_handler(surface_link_gesture_handler(plumbing.link_opens, id));
         }
 
         // App-control bridge from inside a surface. WebKitGTK blocks an https
@@ -4949,6 +5087,256 @@ mod download_locks {
             !entry.contains("webkit2gtk::Download"),
             "the registry holds a `Download` handle again — dropping the last \
              reference to one inside its own signal handler is a use-after-free",
+        );
+    }
+}
+
+/// LOCKS for the two doors a page uses to ask for another window.
+///
+/// One of them was never installed on a popup, and the other was never
+/// installed at all:
+///
+/// - `create` fires for a NEW-WINDOW action only. The page surface answered it;
+///   `build_popup_webview` did not, so a `target="_blank"` inside an
+///   already-popped-up page was answered with a null widget and vanished.
+/// - a middle/ctrl-click on a plain `<a href>` is not a new-window action at
+///   all. It reaches the NAVIGATION decision, which this host never handled, so
+///   the click did nothing whatsoever.
+///
+/// The queue side is driven here with real handlers. The BUILDER side cannot be
+/// (a webview needs a display, an engine and a live opener), so it is scanned
+/// out of the product source, anchored inside the function that must carry it.
+#[cfg(test)]
+mod new_window_door_locks {
+    use super::engine_visibility_locks::{body_of, product_lines};
+    use super::*;
+
+    /// A middle-clicked link becomes a queued OPEN, and the handler tells the
+    /// engine it was handled — which is what cancels the in-place navigation
+    /// that would otherwise have taken the opener page away.
+    #[test]
+    fn a_background_link_gesture_queues_an_open_and_claims_the_navigation() {
+        let link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>> = Rc::new(RefCell::new(Vec::new()));
+        let handler = surface_link_gesture_handler(link_opens.clone(), 7);
+
+        assert!(
+            handler("https://docs.rs/wry".to_string(), true),
+            "the host must CLAIM the gesture: returning false lets WebKit \
+             navigate the opener page to the link the user asked to open \
+             elsewhere",
+        );
+        {
+            let queued = link_opens.borrow();
+            assert_eq!(queued.len(), 1, "the click must survive as a promise of a tab");
+            assert_eq!(
+                queued[0].opener_id, 7,
+                "the open is filed against the surface the link was IN — that is \
+                 the only way the shell can find the session and the profile",
+            );
+            assert_eq!(queued[0].url, "https://docs.rs/wry");
+            assert!(
+                queued[0].background,
+                "a middle/ctrl-click opens WITHOUT going there",
+            );
+        }
+
+        // `javascript:` is code for the frame that owns it, not a page. A tab
+        // pointed at one is blank forever, so the click goes back to the engine.
+        link_opens.borrow_mut().clear();
+        assert!(
+            !handler("javascript:void(0)".to_string(), true),
+            "a `javascript:` link must be declined, not opened in a tab",
+        );
+        assert!(
+            link_opens.borrow().is_empty(),
+            "a declined gesture must not leave a promise the shell will honour \
+             with an empty tab",
+        );
+    }
+
+    /// The two queues stay separate, and the drain empties the new one. A queue
+    /// nobody empties is a leak that also silently swallows every click.
+    #[test]
+    fn the_link_open_queue_is_drained_and_is_not_the_popup_queue() {
+        let product = product_lines().join("\n");
+        assert!(
+            product.contains(
+                "    pub fn take_link_opens(&self) -> Vec<SurfaceLinkOpen> {\n        \
+                 std::mem::take(&mut self.link_opens.borrow_mut())\n    }"
+            ),
+            "the link-open queue is no longer drained",
+        );
+        assert!(
+            product.contains(
+                "    pub fn take_popups(&self) -> Vec<SurfacePopup> {\n        \
+                 std::mem::take(&mut self.popups.borrow_mut())\n    }"
+            ),
+            "the popup queue is no longer drained",
+        );
+        let gesture = body_of(&product_lines(), "fn surface_link_gesture_handler(");
+        assert!(
+            !gesture.contains("SurfacePopup"),
+            "a link gesture must never be queued as a POPUP: a popup carries a \
+             live webview the shell adopts without navigating, and a link \
+             carries none — adopting one leaves a tab that never loads",
+        );
+    }
+
+    /// BOTH doors are installed on BOTH kinds of surface. A popup is a surface;
+    /// the windows and the links inside it belong to the session exactly as the
+    /// opener's do.
+    #[test]
+    fn a_popup_gets_the_same_two_doors_the_page_surface_gets() {
+        let product = product_lines();
+        let popup = body_of(&product, "fn build_popup_webview(");
+        assert!(
+            popup.contains(
+                ".with_new_window_req_handler(surface_new_window_handler(plumbing.clone(), popup_id))"
+            ),
+            "a popup installs no new-window handler again — a `target=\"_blank\"` \
+             inside an adopted popup (the sign-in button on a consent screen) is \
+             answered with a null widget and dropped in silence",
+        );
+        assert!(
+            popup.contains(
+                ".with_link_gesture_handler(surface_link_gesture_handler(link_opens.clone(), popup_id))"
+            ),
+            "a popup installs no link-gesture handler again — middle-click is \
+             dead one level down",
+        );
+        assert!(
+            product.join("\n").contains(
+                "            builder = builder\n                \
+                 .with_new_window_req_handler(surface_new_window_handler(plumbing.clone(), id))\n                \
+                 .with_link_gesture_handler(surface_link_gesture_handler(plumbing.link_opens, id));"
+            ),
+            "the page surface must install the SAME two handler bodies the popup \
+             does — two copies of this policy is two behaviours, and the second \
+             one is always the one nobody tested",
+        );
+    }
+
+    /// The ENGINE's half of the gesture, driven: what wry calls a background
+    /// open. Chrome's grammar is a middle-click or a ctrl/cmd-click, and nothing
+    /// else — a plain left-click has to navigate in place, or every link on the
+    /// page would open a tab and go nowhere.
+    ///
+    /// Driven through wry's own export rather than restated here, because a
+    /// second copy of the rule in a test is a rule that can agree with itself
+    /// while disagreeing with the engine.
+    #[test]
+    fn wry_calls_a_middle_or_ctrl_click_a_background_open_and_nothing_else() {
+        let ctrl = gtk::gdk::ModifierType::CONTROL_MASK.bits();
+        let meta = gtk::gdk::ModifierType::META_MASK.bits();
+        let shift = gtk::gdk::ModifierType::SHIFT_MASK.bits();
+
+        assert!(
+            wry::is_background_open_gesture(2, 0),
+            "a middle-click IS the gesture — this is the whole case",
+        );
+        assert!(
+            wry::is_background_open_gesture(1, ctrl),
+            "ctrl+click is the same gesture on Linux/Windows",
+        );
+        assert!(
+            wry::is_background_open_gesture(1, meta),
+            "cmd+click is the same gesture on macOS",
+        );
+        assert!(
+            wry::is_background_open_gesture(0, ctrl),
+            "ctrl+Enter on a focused link reports NO mouse button and is still \
+             the same request",
+        );
+
+        assert!(
+            !wry::is_background_open_gesture(1, 0),
+            "a plain left-click must navigate in place",
+        );
+        assert!(
+            !wry::is_background_open_gesture(1, shift),
+            "shift+click asks for a WINDOW, not a background tab",
+        );
+        assert!(
+            !wry::is_background_open_gesture(0, 0),
+            "a navigation no mouse started must never be mistaken for a click",
+        );
+    }
+
+    /// The gesture is asked on the NAVIGATION door, and asked whether or not an
+    /// embedder set a navigation handler.
+    ///
+    /// THIS is what kept middle-click dead: `create` fires for a
+    /// NEW_WINDOW_ACTION only, so a plain `<a href>` never reached the new-window
+    /// handler; and the only other door was installed behind a gate on a
+    /// navigation handler this workspace never sets, so nothing was listening at
+    /// all. Scanned out of the wry backend — this file cannot satisfy its own
+    /// needles.
+    #[test]
+    fn the_engine_asks_the_gesture_even_with_no_navigation_handler_set() {
+        const BACKEND: &str = include_str!("../../wry/src/webkitgtk/mod.rs");
+        assert!(
+            BACKEND.contains(
+                "    let link_gesture_handler = attributes.link_gesture_handler.take();\n    \
+                 let navigation_handler = attributes.navigation_handler.take();\n    \
+                 if link_gesture_handler.is_some() || navigation_handler.is_some() {\n      \
+                 webview.connect_decide_policy("
+            ),
+            "the decide-policy handler must be installed when EITHER handler is \
+             set: a link gesture and a navigation policy are unrelated questions, \
+             and requiring the second to get the first is exactly how the gesture \
+             stayed dead",
+        );
+        assert!(
+            !BACKEND
+                .contains("if let Some(navigation_handler) = attributes.navigation_handler.take() {"),
+            "the old gate is back — the gesture handler is unreachable again \
+             unless an embedder also happens to want a navigation policy",
+        );
+    }
+
+    /// A handled background open CANCELS the navigation it replaced. Without the
+    /// ignore, a middle-clicked link would open a tab AND take the opener page
+    /// away — worse than the bug it fixes.
+    #[test]
+    fn a_handled_background_open_ignores_the_navigation_it_replaced() {
+        const BACKEND: &str = include_str!("../../wry/src/webkitgtk/mod.rs");
+        let branch = BACKEND
+            .split("if let Some(gesture) = &link_gesture_handler {")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("if let Some(handler) = &navigation_handler {")
+                    .next()
+            })
+            .expect("the decide-policy handler must consult the link gesture FIRST");
+        assert!(
+            branch.contains(
+                "is_background_open_gesture(nav_action.mouse_button(), nav_action.modifiers())"
+            ),
+            "the navigation door must read the gesture off the navigation \
+             action — the button and the modifiers are the only trace of it that \
+             survives",
+        );
+        assert!(
+            branch.contains("gesture(uri.to_string(), true)"),
+            "the embedder decides whether the open was HANDLED; a gesture it \
+             refused must navigate normally",
+        );
+        assert!(
+            branch.contains("webkit_policy_decision_ignore(policy_decision.as_ptr())"),
+            "a handled gesture must IGNORE the navigation: nothing else stops \
+             the engine from also loading the link over the opener page",
+        );
+        assert!(
+            !branch.contains("webkit_policy_decision_use"),
+            "the gesture branch must never USE the decision — that is the \
+             in-place navigation it exists to cancel",
+        );
+        assert_eq!(
+            BACKEND.matches("ModifierType::CONTROL_MASK").count(),
+            1,
+            "the gesture's modifier mask must appear exactly once, inside \
+             `is_background_open_gesture` — the `create` door and the navigation \
+             door asking the question two different ways is how they drift",
         );
     }
 }

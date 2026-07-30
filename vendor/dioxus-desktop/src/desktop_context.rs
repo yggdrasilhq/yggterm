@@ -532,6 +532,29 @@ impl DesktopService {
             .unwrap_or_default()
     }
 
+    /// Drain the links the user asked to open in a background tab — a
+    /// middle-click, or a ctrl/cmd-click, on a plain `<a href>`.
+    ///
+    /// The OPPOSITE obligation to `take_web_surface_popups`, and the reason the
+    /// two queues are separate: nothing is loading these. WebKit raises `create`
+    /// only for a NEW-WINDOW action, so a `target`-less anchor never becomes a
+    /// popup; the host answered the gesture by IGNORING the navigation (which is
+    /// what keeps the opener page put) and there is no view to adopt. The shell
+    /// must OPEN a tab and navigate it. See `WebSurfaceHost::link_opens`.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_link_opens(&self) -> Vec<crate::web_surface::SurfaceLinkOpen> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_link_opens())
+            .unwrap_or_default()
+    }
+
     /// Drain the pages that called `window.close()`. Each names its own URL and
     /// whether a script opened it, because the channel cannot: a popup shares its
     /// opener's message handler. The shell resolves the tab and decides.

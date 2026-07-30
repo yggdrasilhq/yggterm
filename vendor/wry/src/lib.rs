@@ -378,6 +378,11 @@ pub use raw_window_handle;
 use raw_window_handle::HasWindowHandle;
 #[cfg(gtk)]
 use webkitgtk::*;
+/// yggterm: the rule this backend applies when deciding whether a click was a
+/// background-open gesture — exported so an embedder locks the SAME rule the
+/// engine door uses, instead of writing a second copy of it.
+#[cfg(gtk)]
+pub use webkitgtk::is_background_open_gesture;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc2::rc::Retained;
@@ -709,6 +714,31 @@ struct WebViewAttributes<'a> {
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
   pub new_window_req_handler: Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse>>,
 
+  /// yggterm: a handler for the "open this link in a background tab" GESTURE on
+  /// a link the engine would otherwise navigate IN PLACE — a middle-click, or a
+  /// ctrl/cmd-click, on a plain `<a href>` with no `target`.
+  ///
+  /// This is NOT [`Self::new_window_req_handler`], and the difference is the
+  /// whole reason it exists: WebKit only raises its `create` signal for a
+  /// NEW-WINDOW action (a `target="_blank"`, a `window.open`), so a middle-click
+  /// on an ordinary link never reaches that handler at all. It arrives as a
+  /// perfectly normal navigation of the CURRENT frame, carrying the mouse button
+  /// and modifiers that provoked it — which is the only place the gesture is
+  /// still visible.
+  ///
+  /// The closure takes the URL and whether the gesture asked for a BACKGROUND
+  /// open (Chrome's grammar: a middle/ctrl-click opens without going there), and
+  /// returns whether the embedder HANDLED it. `true` cancels the in-place
+  /// navigation — the page the user is on must not move — and `false` lets the
+  /// engine navigate as it normally would.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Linux**: implemented on the navigation policy decision.
+  /// - **Windows / macOS / Android / iOS**: unimplemented; the gesture keeps
+  ///   whatever behaviour the platform webview gives it.
+  pub link_gesture_handler: Option<Box<dyn Fn(String, bool) -> bool>>,
+
   /// Enables clipboard access for the page rendered on **Linux** and **Windows**.
   ///
   /// macOS doesn't provide such method and is always enabled by default. But your app will still need to add menu
@@ -855,6 +885,7 @@ impl Default for WebViewAttributes<'_> {
       download_started_handler: None,
       download_completed_handler: None,
       new_window_req_handler: None,
+      link_gesture_handler: None,
       clipboard: false,
       #[cfg(debug_assertions)]
       devtools: true,
@@ -1352,6 +1383,23 @@ impl<'a> WebViewBuilder<'a> {
     callback: impl Fn(String, NewWindowFeatures) -> NewWindowResponse + 'static,
   ) -> Self {
     self.attrs.new_window_req_handler = Some(Box::new(callback));
+    self
+  }
+
+  /// yggterm: set the handler for a middle-click / ctrl-click on a plain link —
+  /// the gesture that means "open in a background tab", and the one
+  /// [`Self::with_new_window_req_handler`] never sees, because WebKit's `create`
+  /// signal fires only for a NEW-WINDOW action.
+  ///
+  /// The closure takes the URL and whether the gesture was a background one, and
+  /// returns whether it HANDLED the open. Returning `true` cancels the in-place
+  /// navigation the engine was about to perform; returning `false` lets it
+  /// proceed. See [`WebViewAttributes::link_gesture_handler`].
+  pub fn with_link_gesture_handler(
+    mut self,
+    callback: impl Fn(String, bool) -> bool + 'static,
+  ) -> Self {
+    self.attrs.link_gesture_handler = Some(Box::new(callback));
     self
   }
 
