@@ -2282,6 +2282,70 @@ fn install_container_fill(container: &gtk::Fixed, backdrop_rgb: &Rc<Cell<Option<
     });
 }
 
+/// One userscript and the three facts that decide WHERE it runs.
+///
+/// The engine half of the scriptlet plane. The app's host parses the
+/// Greasemonkey metadata block and ships these decisions already made; this
+/// struct is what arrives, and nothing below it re-derives anything.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SurfaceUserscript {
+    /// The script source, injected at document-start.
+    pub body: String,
+    /// URL match patterns in WebKit's own syntax, passed through VERBATIM —
+    /// the ENGINE does the matching, so nothing here can disagree with it about
+    /// what a pattern means. EMPTY = every URL.
+    pub matches: Vec<String>,
+    /// URL match patterns the engine must EXCLUDE — the same syntax as
+    /// [`SurfaceUserscript::matches`], passed through VERBATIM as WebKit's
+    /// block-list. A page matching any of these never gets the script,
+    /// whatever `matches` says. EMPTY = exclude nothing. Dropping one here is
+    /// running a script on a page its author explicitly ruled out.
+    pub exclude_matches: Vec<String>,
+    /// Inject into sub-frames as well as the top frame.
+    pub all_frames: bool,
+    /// Run in a private JavaScript world (same DOM, private globals) rather than
+    /// the page's own. A script that patches an API the PAGE then calls —
+    /// `window.fetch`, `navigator.credentials` — must NOT set this, because a
+    /// patch made in an isolated world is invisible from the page.
+    pub isolated_world: bool,
+}
+
+/// The one isolated world every isolated userscript on a surface shares.
+///
+/// Shared rather than per-script on purpose. The boundary that matters is
+/// PAGE vs SCRIPTS: the page is untrusted and must not be able to read or
+/// overwrite a userscript, while the scripts themselves all came out of the same
+/// directory on the host the app runs on and are as trusted as each other.
+/// Giving each its own world would also cost a world per script per frame for a
+/// separation nobody asked for.
+const USERSCRIPT_WORLD: &str = "yggterm-userscripts";
+
+/// Stage `scripts` on a webview builder, each with its own patterns, frames and
+/// world.
+///
+/// ONE owner: both the page surface and the popup it opens go through here, so
+/// a popup can never end up with a different placement rule than the page that
+/// spawned it. (The popup path re-attaches policy because a fresh view gets a
+/// fresh user-content manager — a popup with no passkey shim is precisely the
+/// window a passkey is needed in.)
+fn attach_userscripts<'a>(
+    mut builder: WebViewBuilder<'a>,
+    scripts: &[SurfaceUserscript],
+) -> WebViewBuilder<'a> {
+    for script in scripts {
+        builder = builder.with_initialization_script_options(
+            script.body.as_str(),
+            !script.all_frames,
+            script.matches.clone(),
+            script.exclude_matches.clone(),
+            script
+                .isolated_world
+                .then(|| USERSCRIPT_WORLD.to_string()),
+        );
+    }
+    builder
+}
+
 fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
     use wry::WebViewExtUnix as _;
     let (w, h) = (w.max(1), h.max(1));
@@ -2314,7 +2378,7 @@ struct SurfaceWindowPlumbing {
     popups: Rc<RefCell<Vec<SurfacePopup>>>,
     link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
     next_id: Rc<Cell<u64>>,
-    userscripts: Vec<String>,
+    userscripts: Vec<SurfaceUserscript>,
     adblock_ruleset: Option<std::path::PathBuf>,
 }
 
@@ -2483,9 +2547,7 @@ fn build_popup_webview(
         // the page surface had, surviving one level down.
         .with_new_window_req_handler(surface_new_window_handler(plumbing.clone(), popup_id))
         .with_link_gesture_handler(surface_link_gesture_handler(link_opens.clone(), popup_id));
-    for script in userscripts {
-        builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
-    }
+    builder = attach_userscripts(builder, userscripts);
     // The custom `yggterm-appctl://` scheme is registered on the WEB CONTEXT,
     // which a related view shares — so the popup can reach the app's control
     // endpoint (the passkey signer) without re-registering anything.
@@ -2849,7 +2911,7 @@ impl WebSurfaceHost {
     /// given different answers. See [`SurfaceWindowPlumbing`].
     fn window_plumbing(
         &self,
-        userscripts: &[String],
+        userscripts: &[SurfaceUserscript],
         adblock_ruleset: Option<&std::path::Path>,
     ) -> SurfaceWindowPlumbing {
         SurfaceWindowPlumbing {
@@ -2933,7 +2995,7 @@ impl WebSurfaceHost {
         url: &str,
         socks_port: Option<u16>,
         profile_dir: Option<&std::path::Path>,
-        userscripts: &[String],
+        userscripts: &[SurfaceUserscript],
         adblock_ruleset: Option<&std::path::Path>,
         user_agent: Option<&str>,
         signer_base: Option<&str>,
@@ -3030,9 +3092,7 @@ impl WebSurfaceHost {
                 port: port.to_string(),
             }));
         }
-        for script in userscripts {
-            builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
-        }
+        builder = attach_userscripts(builder, userscripts);
         if let Some(user_agent) = user_agent.filter(|value| !value.trim().is_empty()) {
             builder = builder.with_user_agent(user_agent);
         }
@@ -5208,6 +5268,249 @@ mod scroll_nav_shim_locks {
              `elementFromPoint` again — the GTK press was already swallowed \
              (`Propagation::Stop`), so a throwing dispatch eats the only copy \
              and mouse back/forward go dead with no error anywhere",
+        );
+    }
+}
+
+/// LOCKS for the SCRIPTLET PLANE — the placement half of a userscript.
+///
+/// The decision is driven end to end on a real `WebViewBuilder`: patterns, world
+/// and frames are staged on a builder here and read back off it, which is the
+/// last point before the FFI that a test on this host can reach (building the
+/// view itself needs a display and an engine). The FFI call that consumes those
+/// staged facts — `UserScript::new` / `UserScript::for_world` — is scanned out
+/// of wry's own source, because a `webkit_user_script_*` call cannot be made
+/// off the GTK main thread.
+#[cfg(test)]
+mod scriptlet_locks {
+    use super::engine_visibility_locks::product_lines;
+    use super::*;
+
+    fn script(body: &str) -> SurfaceUserscript {
+        SurfaceUserscript {
+            body: body.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Every placement fact reaches the builder, and reaches it INVERTED where
+    /// the two vocabularies disagree: the plane says "all frames", wry says
+    /// "main frame only".
+    #[test]
+    fn a_scripts_patterns_world_and_frames_reach_the_builder() {
+        let scripts = vec![
+            SurfaceUserscript {
+                matches: vec!["https://*.youtube.com/*".to_string()],
+                exclude_matches: vec!["https://*.youtube.com/embed/*".to_string()],
+                all_frames: true,
+                isolated_world: true,
+                ..script("scoped")
+            },
+            SurfaceUserscript {
+                isolated_world: false,
+                ..script("page-world")
+            },
+        ];
+        let builder = attach_userscripts(WebViewBuilder::new(), &scripts);
+        let staged = builder.initialization_scripts();
+        assert_eq!(staged.len(), 2);
+
+        assert_eq!(staged[0].script, "scoped");
+        assert_eq!(
+            staged[0].allow_list,
+            vec!["https://*.youtube.com/*".to_string()],
+            "the @match patterns never reached the engine, so a YouTube script \
+             is running on every tab",
+        );
+        assert_eq!(
+            staged[0].block_list,
+            vec!["https://*.youtube.com/embed/*".to_string()],
+            "the @exclude-match patterns never reached the engine, so the \
+             script is running on the very embeds its author excluded",
+        );
+        assert!(
+            !staged[0].for_main_frame_only,
+            "@all-frames must become NOT main-frame-only",
+        );
+        assert_eq!(staged[0].world_name.as_deref(), Some(USERSCRIPT_WORLD));
+
+        // A main-world script must carry NO world name: `new_for_world` always
+        // resolves a name to an isolated world, so the page's own world is the
+        // absence of a name, never a name that spells it.
+        assert_eq!(staged[1].script, "page-world");
+        assert!(
+            staged[1].world_name.is_none(),
+            "a @world main script was put in an isolated world, where its patch \
+             to a page API is invisible to the page that calls it",
+        );
+        assert!(staged[1].for_main_frame_only);
+        assert!(staged[1].allow_list.is_empty(), "no patterns = every URL");
+        assert!(
+            staged[1].block_list.is_empty(),
+            "no @exclude = exclude nothing"
+        );
+    }
+
+    /// The OLD entry point must keep meaning what it always meant: every URL,
+    /// the page's own world. wry's ipc bridge and this file's `window.close()`
+    /// shim both go through it, and both exist to be reached BY THE PAGE — give
+    /// either one a world or a pattern and it stops being there.
+    ///
+    /// (This is a wry-level invariant, checked from here: wry is a path
+    /// dependency, not a workspace member, so `cargo test -p wry` cannot run and
+    /// a lock left in that crate would never execute.)
+    #[test]
+    fn the_unscoped_entry_point_still_means_every_url_in_the_pages_world() {
+        let builder =
+            WebViewBuilder::new().with_initialization_script_for_main_only(CLOSE_SHIM_JS, true);
+        let staged = builder.initialization_scripts();
+        assert_eq!(staged.len(), 1);
+        assert!(
+            staged[0].allow_list.is_empty(),
+            "the close shim acquired match patterns, so pages outside them can \
+             no longer report window.close()",
+        );
+        assert!(
+            staged[0].world_name.is_none(),
+            "the close shim moved to an isolated world, where the page cannot \
+             see the function it is supposed to call",
+        );
+        assert!(
+            staged[0].block_list.is_empty(),
+            "the close shim acquired exclusion patterns, so pages inside them \
+             can no longer report window.close()",
+        );
+    }
+
+    /// Isolated scripts SHARE one world. Two of them must land in the same one,
+    /// or a script cannot see a helper another script installed and the plane
+    /// silently becomes per-script sandboxes.
+    #[test]
+    fn isolated_scripts_share_one_world() {
+        let builder = attach_userscripts(
+            WebViewBuilder::new(),
+            &[
+                SurfaceUserscript {
+                    isolated_world: true,
+                    ..script("a")
+                },
+                SurfaceUserscript {
+                    isolated_world: true,
+                    ..script("b")
+                },
+            ],
+        );
+        let staged = builder.initialization_scripts();
+        assert_eq!(staged[0].world_name, staged[1].world_name);
+        assert!(staged[0].world_name.is_some());
+    }
+
+    /// Order is injection order, and injection order is what decides which of
+    /// two scripts patching the same thing wins. The passkey shim is first on
+    /// the wire for exactly that reason.
+    #[test]
+    fn scripts_are_staged_in_the_order_they_arrived() {
+        let builder = attach_userscripts(
+            WebViewBuilder::new(),
+            &[script("first"), script("second"), script("third")],
+        );
+        let bodies: Vec<&str> = builder
+            .initialization_scripts()
+            .iter()
+            .map(|staged| staged.script.as_str())
+            .collect();
+        assert_eq!(bodies, vec!["first", "second", "third"]);
+    }
+
+    /// BOTH surfaces go through the one helper. A popup that staged its scripts
+    /// its own way would run them unscoped in the page's world while the page
+    /// that opened it ran them scoped and isolated — and a popup is exactly the
+    /// window a sign-in shim is needed in.
+    ///
+    /// APPEND-PROOF: it is not enough that the helper is called somewhere in the
+    /// file. Neither call site may ALSO still be pushing raw bodies through the
+    /// unscoped entry point, which is what a careless merge of this change onto
+    /// the old loop would leave behind.
+    #[test]
+    fn the_page_and_the_popup_both_stage_scripts_through_the_one_helper() {
+        let product = product_lines();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod scriptlet_locks")),
+            "the scan is reading this test module, so every needle below would \
+             be satisfied by the assertion that names it",
+        );
+        let calls = product
+            .iter()
+            .filter(|line| line.contains("attach_userscripts(builder,"))
+            .count();
+        assert_eq!(
+            calls, 2,
+            "the page surface and the popup must each stage their scripts \
+             through `attach_userscripts`; found {calls} call sites",
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("with_initialization_script_for_main_only(script")),
+            "a call site is still pushing a raw userscript body through the \
+             unscoped entry point, which drops its @match and its @world",
+        );
+    }
+
+    /// The FFI half, scanned out of wry: the staged `allow_list` must reach
+    /// BOTH `UserScript` constructors, and the world must pick between them.
+    /// This is the line that was hardcoded to `&[]` — the whole reason `@match`
+    /// did not exist.
+    #[test]
+    fn wrys_user_script_constructors_take_the_allow_list_and_the_world() {
+        let source = include_str!("../../wry/src/webkitgtk/mod.rs");
+        let body: String = source
+            .lines()
+            .skip_while(|line| !line.contains("fn init_script(&self"))
+            .take_while(|line| line.trim() != "}")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("fn init_script(&self"),
+            "`init_script` is gone from wry's webkitgtk backend",
+        );
+        assert!(
+            body.contains("UserScript::for_world("),
+            "the isolated-world constructor is gone; every script is back in \
+             the page's world",
+        );
+        assert!(
+            body.contains("UserScript::new("),
+            "the page-world constructor is gone; a shim that must be visible to \
+             the page can no longer be injected",
+        );
+        // The allow-list must be threaded into BOTH constructors. `&[]` on
+        // either one silently un-scopes every script that takes that branch —
+        // which is precisely the state this change found the code in.
+        assert_eq!(
+            body.matches("&allow_list,").count(),
+            2,
+            "both `UserScript` constructors must receive the allow-list",
+        );
+        assert!(
+            !body.contains("        &[],\n        &[],"),
+            "a constructor is back to hardcoding an empty allow-list, so \
+             @match is silently ignored again",
+        );
+        // The block-list must be threaded into BOTH constructors too. `&[]` on
+        // either one runs every script that takes that branch on the very
+        // pages its author excluded — the state THIS change found the code in.
+        assert_eq!(
+            body.matches("&block_list,").count(),
+            2,
+            "both `UserScript` constructors must receive the block-list",
+        );
+        assert!(
+            !body.contains("&[],"),
+            "a constructor is hardcoding an empty list, so an allow-list or a \
+             block-list is silently ignored",
         );
     }
 }

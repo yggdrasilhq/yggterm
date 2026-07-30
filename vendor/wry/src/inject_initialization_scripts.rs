@@ -180,6 +180,9 @@ mod tests {
       .map(|script| InitializationScript {
         script,
         for_main_frame_only: true,
+        allow_list: Vec::new(),
+        block_list: Vec::new(),
+        world_name: None,
       })
       .collect();
     let result = inject_scripts_into_html(response, &scripts);
@@ -217,6 +220,9 @@ mod tests {
       .map(|script| InitializationScript {
         script,
         for_main_frame_only: true,
+        allow_list: Vec::new(),
+        block_list: Vec::new(),
+        world_name: None,
       })
       .collect();
     let result = inject_scripts_into_html(response, &scripts);
