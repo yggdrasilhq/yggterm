@@ -16833,6 +16833,79 @@ fn requested_app_control_pid_from_env() -> Option<u32> {
         .filter(|pid| *pid > 0)
 }
 
+/// The `--pid <pid>` flag of a `server app` invocation, if present and sane.
+fn app_control_pid_flag(args: &[String]) -> Option<u32> {
+    args.windows(2)
+        .find_map(|window| {
+            (window[0] == "--pid")
+                .then(|| window[1].parse::<u32>().ok())
+                .flatten()
+        })
+        .filter(|pid| *pid > 0)
+}
+
+/// The `--client <name>` flag of a `server app` invocation, if present.
+fn app_control_client_flag(args: &[String]) -> Option<String> {
+    args.windows(2).find_map(|window| {
+        (window[0] == "--client" && !window[1].starts_with("--")).then(|| window[1].clone())
+    })
+}
+
+/// The precedence rule under [`apply_app_control_target_overrides`], pure so a
+/// lock can drive the whole table:
+///
+/// - an explicit flag on THIS invocation wins, and naming one side clears the
+///   OTHER side's ambient value (the caller just named a target for this verb;
+///   an exported pid must not outrank the `--client` the caller typed);
+/// - NO flags at all leaves the exported environment standing.
+///
+/// That last row is the 2026-07-28 A5 fix: the per-binary dispatch blocks used
+/// to REMOVE `YGGTERM_APP_CONTROL_PID` whenever the flag was absent, so the
+/// exported variable — the very one the multi-client refusal tells the caller
+/// to set — never survived to [`requested_app_control_pid_from_env`], and
+/// whether a verb appeared to "honour" it depended on nothing but how many
+/// Active clients happened to be registered when that verb ran.
+pub fn resolve_app_control_target_overrides(
+    pid_flag: Option<u32>,
+    client_flag: Option<String>,
+    inherited_pid: Option<u32>,
+    inherited_client: Option<String>,
+) -> (Option<u32>, Option<String>) {
+    match (pid_flag, client_flag) {
+        (Some(pid), client) => (Some(pid), client),
+        (None, Some(client)) => (None, Some(client)),
+        (None, None) => (inherited_pid, inherited_client),
+    }
+}
+
+/// THE one owner of how a `server app` invocation names its GUI target. Both
+/// CLI binaries call this before dispatching any `server app` verb; resolution
+/// to a live worker pid stays in [`choose_app_control_pid`], which reads the
+/// result back through [`requested_app_control_pid_from_env`] /
+/// [`requested_app_control_client_from_env`]. Two verbs can therefore no
+/// longer diverge on whether `YGGTERM_APP_CONTROL_PID` counts: there is only
+/// one place that decides.
+pub fn apply_app_control_target_overrides(args: &[String]) {
+    let (pid, client) = resolve_app_control_target_overrides(
+        app_control_pid_flag(args),
+        app_control_client_flag(args),
+        requested_app_control_pid_from_env(),
+        requested_app_control_client_from_env(),
+    );
+    // SAFETY: called from the CLI's single-threaded startup path, before any
+    // worker threads exist (the same footing the dispatch blocks stood on).
+    unsafe {
+        match pid {
+            Some(pid) => std::env::set_var("YGGTERM_APP_CONTROL_PID", pid.to_string()),
+            None => std::env::remove_var("YGGTERM_APP_CONTROL_PID"),
+        }
+        match client {
+            Some(client) => std::env::set_var("YGGTERM_APP_CONTROL_CLIENT", client),
+            None => std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT"),
+        }
+    }
+}
+
 /// The `--client <name>` target (slice 4.3): a daemon-client identity to resolve
 /// to a worker pid, set by the CLI into `YGGTERM_APP_CONTROL_CLIENT`. Blank = no
 /// client filter. Explicit `--pid` still wins over this (see `choose_app_control_pid`).
@@ -36369,6 +36442,195 @@ terminal_window_id: None,
     fn legacy_records_without_role_stay_active_for_routing() {
         assert!(super::client_instance_record_is_active_role(&client_record(1, 1, ":0")));
         assert!(!super::client_instance_record_is_active_role(&shadow_client_record(2, 2, "s")));
+    }
+
+    // ---------------------------------------------------------------------
+    // ONE owner for "which GUI does a `server app` verb target" (field A5,
+    // 2026-07-28): with the variable set and exported, `terminal new` appeared
+    // to honour YGGTERM_APP_CONTROL_PID while `web ensure` refused NAMING that
+    // same variable — because each binary's dispatch block REMOVED the
+    // exported value whenever the invocation carried no `--pid` flag, and
+    // whether a verb then survived depended on nothing but the client roster.
+    // ---------------------------------------------------------------------
+
+    fn cli_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    // The precedence table, whole. The load-bearing row is the last one: NO
+    // flags leaves the ambient environment standing — the exact case the old
+    // dispatch blocks clobbered.
+    #[test]
+    fn target_override_precedence_is_flag_then_ambient() {
+        // A flag on this invocation wins outright.
+        assert_eq!(
+            super::resolve_app_control_target_overrides(
+                Some(99),
+                Some("shadow-1".into()),
+                Some(1234),
+                Some("ambient".into()),
+            ),
+            (Some(99), Some("shadow-1".into())),
+        );
+        // Naming a pid clears the other side's ambient value...
+        assert_eq!(
+            super::resolve_app_control_target_overrides(
+                Some(99),
+                None,
+                Some(1234),
+                Some("ambient".into()),
+            ),
+            (Some(99), None),
+        );
+        // ...and naming a client clears the ambient pid: an exported pid must
+        // not outrank the `--client` the caller just typed.
+        assert_eq!(
+            super::resolve_app_control_target_overrides(
+                None,
+                Some("shadow-1".into()),
+                Some(1234),
+                None,
+            ),
+            (None, Some("shadow-1".into())),
+        );
+        // NO flags: the exported environment stands. This row IS the A5 fix.
+        assert_eq!(
+            super::resolve_app_control_target_overrides(None, None, Some(1234), None),
+            (Some(1234), None),
+            "a flagless verb clobbered the exported YGGTERM_APP_CONTROL_PID again"
+        );
+        assert_eq!(
+            super::resolve_app_control_target_overrides(None, None, None, Some("ambient".into())),
+            (None, Some("ambient".into())),
+        );
+        assert_eq!(
+            super::resolve_app_control_target_overrides(None, None, None, None),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn target_override_flags_parse_exactly() {
+        assert_eq!(
+            super::app_control_pid_flag(&cli_args(&["server", "app", "state", "--pid", "42"])),
+            Some(42)
+        );
+        assert_eq!(
+            super::app_control_pid_flag(&cli_args(&["server", "app", "state", "--pid", "junk"])),
+            None
+        );
+        assert_eq!(
+            super::app_control_pid_flag(&cli_args(&["server", "app", "state", "--pid", "0"])),
+            None,
+            "pid 0 is not a target"
+        );
+        assert_eq!(
+            super::app_control_client_flag(&cli_args(&[
+                "server", "app", "state", "--client", "shadow-1"
+            ]))
+            .as_deref(),
+            Some("shadow-1")
+        );
+        assert_eq!(
+            super::app_control_client_flag(&cli_args(&[
+                "server", "app", "state", "--client", "--timeout-ms"
+            ])),
+            None,
+            "a flag is not a client name"
+        );
+    }
+
+    // The production call site, driven end to end through the environment —
+    // this is what both binaries execute before dispatching a `server app`
+    // verb, so re-introducing the clobber in `apply` (not just the resolver)
+    // goes red here. Env mutation is process-global, so this ONE test owns all
+    // three scenarios serially and restores what it found.
+    #[test]
+    fn an_exported_app_control_target_survives_a_flagless_verb() {
+        let previous_pid = std::env::var_os("YGGTERM_APP_CONTROL_PID");
+        let previous_client = std::env::var_os("YGGTERM_APP_CONTROL_CLIENT");
+
+        // A5 verbatim: the variable exported, the verb flagless.
+        unsafe { std::env::set_var("YGGTERM_APP_CONTROL_PID", "43210") };
+        unsafe { std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT") };
+        super::apply_app_control_target_overrides(&cli_args(&[
+            "server", "app", "web", "ensure", "--session", "local://x",
+        ]));
+        assert_eq!(
+            super::requested_app_control_pid_from_env(),
+            Some(43210),
+            "the flagless verb removed the exported YGGTERM_APP_CONTROL_PID — \
+             the A5 clobber is back"
+        );
+
+        // An explicit flag on the next invocation still wins.
+        super::apply_app_control_target_overrides(&cli_args(&[
+            "server", "app", "terminal", "new", "--pid", "999",
+        ]));
+        assert_eq!(super::requested_app_control_pid_from_env(), Some(999));
+
+        // An explicit --client names the target for THIS invocation: the
+        // ambient pid must not outrank it.
+        super::apply_app_control_target_overrides(&cli_args(&[
+            "server", "app", "state", "--client", "shadow-1",
+        ]));
+        assert_eq!(super::requested_app_control_pid_from_env(), None);
+        assert_eq!(
+            super::requested_app_control_client_from_env().as_deref(),
+            Some("shadow-1")
+        );
+
+        unsafe {
+            match previous_pid {
+                Some(value) => std::env::set_var("YGGTERM_APP_CONTROL_PID", value),
+                None => std::env::remove_var("YGGTERM_APP_CONTROL_PID"),
+            }
+            match previous_client {
+                Some(value) => std::env::set_var("YGGTERM_APP_CONTROL_CLIENT", value),
+                None => std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT"),
+            }
+        }
+    }
+
+    // BOTH binaries go through the one owner — a source read, honestly labeled
+    // as such: it proves the call is present and the per-binary clobber shape
+    // is gone, nothing more; the behaviour claims live in the two tests above.
+    // The needles: `remove_var("YGGTERM_APP_CONTROL_CLIENT")` existed ONLY in
+    // the two dispatch blocks (its reappearance anywhere is the clobber
+    // returning), and `remove_var("YGGTERM_APP_CONTROL_PID")` keeps exactly
+    // one NAMED exemption — `maybe_focus_existing_client` in main.rs, which
+    // sets and clears its own temporary target around a focus call and never
+    // dispatches a verb.
+    #[test]
+    fn both_cli_binaries_resolve_app_targets_through_the_one_owner() {
+        let apps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/yggterm/src");
+        for (file, allowed_pid_removes) in
+            [("main.rs", 1_usize), ("bin/yggterm-headless.rs", 0_usize)]
+        {
+            let source = std::fs::read_to_string(apps.join(file))
+                .unwrap_or_else(|error| panic!("read {file}: {error}"));
+            assert!(
+                source.contains("apply_app_control_target_overrides(&args)"),
+                "{file} no longer routes `server app` targeting through the one owner"
+            );
+            assert_eq!(
+                source
+                    .matches("remove_var(\"YGGTERM_APP_CONTROL_CLIENT\")")
+                    .count(),
+                0,
+                "{file} grew its own YGGTERM_APP_CONTROL_CLIENT clobber back"
+            );
+            assert_eq!(
+                source
+                    .matches("remove_var(\"YGGTERM_APP_CONTROL_PID\")")
+                    .count(),
+                allowed_pid_removes,
+                "{file} touches YGGTERM_APP_CONTROL_PID outside the one owner \
+                 (the only named exemption is maybe_focus_existing_client's \
+                 set-and-clear in main.rs)"
+            );
+        }
     }
 
     #[test]

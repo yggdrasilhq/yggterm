@@ -393,7 +393,20 @@ presence dialog.
   headless-wanted; the reconciler's lazy-create branch then materializes its
   declared surfaces at a canonical offscreen rect (1280×800) and demotes them
   in the SAME tick — created straight into the soft stash, never revealed, no
-  page hole, tab lease set from the same ttl. The materialization request is a
+  page hole, tab lease set from the same ttl. **Ensure AWAITS the surface
+  policy gate before arming a build** (2026-07-28 passkey field report: a
+  surface built while the app's policy was in flight permanently lacked its
+  userscripts and the `yggterm-appctl://` signer bridge, so
+  `window.PublicKeyCredential` was undefined on every agent surface). The wait
+  is bounded (8 s); an exhausted policy fetch is re-armed and re-driven inside
+  the same call; a gate that never reaches `Ready` refuses with
+  `reason: policy_gate_not_ready` plus the gate state (`pending`/`abandoned`)
+  instead of building a silently-unprotected page. A session with no app
+  policy (`absent`) builds immediately as before, and an already-live surface
+  is a lease refresh — the gate is not consulted, so lease renewals never
+  refuse. Every ensure envelope now reports `policy_gate:
+  ready|absent|pending|abandoned` at verb level (the field run's only evidence
+  lived in a trace file). The materialization request is a
   TTL edge (`web_surface_headless_create_due`); the created surface's lifetime
   is the normal hold/lease clock. Paired with `terminal new --no-activate`
   (create a session without switching the user's view — the snapshot apply's

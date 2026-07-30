@@ -123,7 +123,13 @@ yggterm server app terminal new --kind shell --no-activate \
 # (a plain shell, or the app already closed its surface)".
 # Materialize a BACKGROUNDED session's declared web surfaces into the soft
 # stash (created + demoted + leased, never revealed) so web do/read/wait
-# verbs can drive them immediately:
+# verbs can drive them immediately. Ensure AWAITS the app's surface policy
+# (userscripts + the yggterm-appctl:// signer bridge — the passkey plane)
+# before building, bounded at 8s; on timeout it refuses with
+# `reason: policy_gate_not_ready` + the gate state instead of silently
+# building an unprotected surface — just retry once the app's control
+# endpoint serves /policy. Every response reports `policy_gate:
+# ready|absent|pending|abandoned`; "ready" is the one that has WebAuthn.
 yggterm server app web ensure --session <path> [--ttl <secs>]
 # Then automate invisibly:
 yggterm server app web do click --selector "#submit" --session <path>
