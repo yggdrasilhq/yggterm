@@ -9041,6 +9041,63 @@ async fn web_surface_native_reconcile_loop(
                 ),
             );
         }
+        // OPEN the links the user middle-clicked or ctrl-clicked. The twin of the
+        // popup loop above and its exact opposite: a popup arrives WITH a live
+        // webview that must be adopted and must not be navigated, a link arrives
+        // with nothing at all.
+        //
+        // WebKit raises `create` only for a NEW-WINDOW action, so an anchor with
+        // no `target` was never a popup — it was a navigation of the current
+        // frame, and the surface host cancelled it (which is the only thing that
+        // keeps the opener page where the user left it) on the promise that a tab
+        // would appear here. So this takes the SAME pair the `open_tab` command
+        // drain takes — mint the tab in the background, then navigate it — and
+        // never `web_surface_adopt_popup_tab`, whose contract is "a view already
+        // exists and is already loading": it records `effective_url == url`, so
+        // the reconciler would see nothing to navigate and the tab would sit
+        // blank for as long as the user left it open.
+        for link in desktop.take_web_surface_link_opens() {
+            let Some((session_path, opener_tab_id)) = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == link.opener_id)
+                .map(|(key, _)| key.clone())
+            else {
+                // The opener's tab went away between the click and this tick.
+                // There is no orphan view to sweep — nothing was ever built.
+                continue;
+            };
+            let mut writable = state;
+            // `raise = !background`: Chrome's grammar, taken from the GESTURE and
+            // not assumed here. A middle/ctrl-click means "open it, but do not go
+            // there", so the user's current tab keeps the front.
+            let opened =
+                writable.with_mut(|shell| shell.open_command_tab(&session_path, !link.background));
+            let Some((new_tab_id, ssh_target)) = opened else {
+                continue;
+            };
+            navigate_web_surface_tab(
+                state,
+                session_path.clone(),
+                new_tab_id,
+                link.url.clone(),
+                ssh_target,
+                None,
+            );
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "new_tab_from_link",
+                json!({
+                    "session_path": session_path,
+                    "opener_tab_id": opener_tab_id,
+                    "new_tab_id": new_tab_id,
+                    "native_id": link.opener_id,
+                    "url": link.url,
+                    "background": link.background,
+                }),
+            );
+        }
         // `window.close()`. A script-opened window may close itself, and a
         // browser that ignores that strands every OAuth popup ever written: the
         // sign-in completes, the callback closes the window, and the window just
@@ -122143,6 +122200,157 @@ mod tests {
         assert_eq!(
             shell.web_surface_adopt_popup_tab("local://gone", 0, "https://example.com/", false),
             None
+        );
+    }
+
+    // A LINK the user middle-clicked is the opposite obligation to a popup, and
+    // the two must not be confused. A popup arrives with a webview already
+    // loading, so its tab records the URL as ALREADY APPLIED and the reconciler
+    // has nothing to do. A middle-clicked link arrives with nothing — the surface
+    // host cancelled the navigation precisely so the opener page would stay put —
+    // so its tab must be born UN-navigated and the shell must navigate it.
+    //
+    // Routing the link through the popup path is the failure this pins: the tab
+    // appears, `effective_url == url`, the reconciler sees nothing to navigate,
+    // and the user gets a blank tab that never loads.
+    #[test]
+    fn a_middle_clicked_link_opens_a_tab_the_shell_still_has_to_navigate() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/".to_string(),
+            Some("app".to_string()),
+            "http://localhost:8000/".to_string(),
+            None,
+            Some(1080),
+            "work".to_string(),
+            false,
+            1_000,
+        );
+        // What the drain calls: `raise = !background`, i.e. false for the gesture.
+        let (tab_id, ssh_target) = shell
+            .open_command_tab("local://ws", false)
+            .expect("surface is live");
+        let surface = &shell.web_surfaces["local://ws"];
+        assert_eq!(surface.tabs.len(), 2);
+        assert_eq!(
+            surface.active_tab, 0,
+            "a middle/ctrl-click opens WITHOUT going there — the user's tab keeps \
+             the front",
+        );
+        let opened = surface.tabs.iter().find(|tab| tab.id == tab_id).unwrap();
+        assert_eq!(
+            opened.effective_url, "about:blank",
+            "the tab must be born with NOTHING applied, so the navigation the \
+             drain makes is one the reconciler will actually perform",
+        );
+        assert!(
+            opened.url.is_empty(),
+            "nothing is loading this tab — the engine was told to ignore the \
+             navigation, which is the whole reason the opener page stayed put",
+        );
+        assert!(!opened.loading);
+        assert_eq!(
+            ssh_target, None,
+            "a local session egresses directly; the drain hands this to \
+             `navigate_web_surface_tab` as the tab's egress",
+        );
+
+        // The path the drain must NOT take, and why. Same shell, same click.
+        let (adopted_id, _, _) = shell
+            .web_surface_adopt_popup_tab("local://ws", 0, "https://docs.rs/wry", true)
+            .expect("surface is live");
+        let adopted = shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == adopted_id)
+            .unwrap();
+        assert_eq!(
+            adopted.effective_url, "https://docs.rs/wry",
+            "adopting records the URL as already applied — for a link, where no \
+             view exists and nothing is loading, that is a tab which never loads \
+             anything at all",
+        );
+
+        // No surface: a transient drop, not a panic (the opener can die between
+        // the click and the tick that drains it).
+        assert_eq!(shell.open_command_tab("local://gone", false), None);
+    }
+
+    /// The drain that turns a middle-clicked link into a tab: it resolves the
+    /// opener to a session, MINTS a tab and NAVIGATES it, never adopts, and says
+    /// so in the trace.
+    ///
+    /// Scanned rather than driven: the loop lives inside
+    /// `web_surface_native_reconcile_loop`, which needs a `DesktopContext`, a
+    /// GTK display and a live engine. Two things keep the scan honest — it reads
+    /// PRODUCT lines only (`yggterm_core::agent_cli::product_lines`), so the
+    /// assertions below cannot satisfy themselves, and the needles are pinned
+    /// INSIDE the loop body, between the `for` line and the `window.close()`
+    /// drain that follows it, so nothing appended anywhere else in this
+    /// 150k-line file can satisfy them either.
+    #[test]
+    fn the_link_drain_opens_and_navigates_a_tab_and_never_adopts_one() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: String = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            product.len() > 1_000_000,
+            "the product-line scan swallowed the file it is supposed to police",
+        );
+        let body = product
+            .split("for link in desktop.take_web_surface_link_opens() {")
+            .nth(1)
+            .and_then(|rest| rest.split("        // `window.close()`.").next())
+            .expect("the reconcile loop must drain the link-open queue");
+        // Every clause is evaluated, and every one that failed is reported —
+        // not the first. A scan that stops at clause one hides the state of the
+        // other four, which is how "the lock is green again" gets said after a
+        // fix that only moved the failure down the list.
+        let mut violations: Vec<&str> = Vec::new();
+        if !body.contains(".find(|(_, entry)| entry.native_id == link.opener_id)") {
+            violations.push(
+                "the drain must resolve the OPENER surface to its session and tab — that \
+                 lookup is the only thing that knows which session the new tab belongs to, \
+                 and which profile and egress it inherits",
+            );
+        }
+        if !body.contains("shell.open_command_tab(&session_path, !link.background)") {
+            violations.push(
+                "the drain must MINT the tab (raise taken from the gesture, not assumed): \
+                 the `open_tab` command drain's exact call, because this is the same act",
+            );
+        }
+        if !body.contains("navigate_web_surface_tab(") {
+            violations.push(
+                "the drain must NAVIGATE the tab it minted — nothing else is loading it, so \
+                 without this the user gets a blank tab",
+            );
+        }
+        if body.contains("web_surface_adopt_popup_tab") {
+            violations.push(
+                "the link drain must never adopt: adoption records `effective_url == url`, \
+                 so the reconciler would see nothing to navigate and the tab would stay \
+                 blank forever",
+            );
+        }
+        if !body.contains("\"new_tab_from_link\"") {
+            violations.push(
+                "the drain must emit the `new_tab_from_link` trace event — it is the only \
+                 agent-readable proof that a real middle-click reached the shell",
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "the middle-click drain no longer keeps its promises:\n- {}",
+            violations.join("\n- "),
         );
     }
 

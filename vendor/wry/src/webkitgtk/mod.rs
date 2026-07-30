@@ -99,6 +99,29 @@ impl Drop for InnerWebView {
   }
 }
 
+/// yggterm: THE definition of "open in a new tab WITHOUT switching to it" — a
+/// middle-click, or a ctrl/cmd-click — from the mouse button and modifier state
+/// WebKit reports on a navigation action.
+///
+/// One owner, because the same gesture has to be recognised on two different
+/// WebKit doors and they must never drift apart: `create` (a `target="_blank"`
+/// or a `window.open`, where the engine is asking for a window) and
+/// `decide-policy` (a plain `<a href>`, where the engine is about to navigate
+/// the CURRENT frame and nobody would ever be asked). A second copy of this
+/// expression is a second answer to "was that a background open".
+///
+/// `mouse_button` is 0 when no mouse event started the navigation, so a
+/// programmatic navigation can never satisfy this.
+///
+/// Public because the EMBEDDER has to be able to lock this rule: neither door
+/// can be driven from a test (both need a live web process), so the only thing
+/// that can be exercised is the decision, and it has to be reachable to be
+/// exercised.
+pub fn is_background_open_gesture(mouse_button: u32, modifiers: u32) -> bool {
+  mouse_button == 2
+    || (modifiers & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::META_MASK).bits()) != 0
+}
+
 impl InnerWebView {
   pub fn new<W: HasWindowHandle>(
     window: &W,
@@ -495,14 +518,7 @@ impl InnerWebView {
           .request()
           .and_then(|request| request.uri())
           .map(|uri| uri.as_str().to_string())?;
-        // A middle-click, or a ctrl/cmd-click, is the browser gesture for
-        // "open in a new tab WITHOUT switching to it". WebKit reports the
-        // originating mouse button and modifier state on the navigation
-        // action, so the embedder can honour that background semantics.
-        let background = action.mouse_button() == 2
-          || (action.modifiers()
-            & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::META_MASK).bits())
-            != 0;
+        let background = is_background_open_gesture(action.mouse_button(), action.modifiers());
         match new_window_req_handler(
           url.clone(),
           NewWindowFeatures {
@@ -557,29 +573,65 @@ impl InnerWebView {
       });
     }
 
-    // Navigation handler
-    if let Some(navigation_handler) = attributes.navigation_handler.take() {
+    // Navigation handler, and — yggterm — the background-open LINK GESTURE,
+    // which shares this signal because it is the only place the gesture exists.
+    //
+    // A middle-click on a plain `<a href>` is not a new-window request as far as
+    // WebKit is concerned: `create` fires for a NEW_WINDOW_ACTION only, so an
+    // anchor with no `target` never reaches `new_window_req_handler`. It arrives
+    // here, as an ordinary NavigationAction of the current frame, carrying the
+    // button and modifiers that provoked it — and if nobody answers, the engine
+    // navigates the page the user is standing on.
+    //
+    // So the gesture test is HOISTED above the navigation-handler gate: it runs
+    // whether or not an embedder set a navigation handler, because the two are
+    // unrelated questions and requiring one to get the other is how the gesture
+    // stayed dead. When the embedder says it handled the open, the navigation is
+    // IGNORED — that, and nothing else, is what keeps the opener page put.
+    let link_gesture_handler = attributes.link_gesture_handler.take();
+    let navigation_handler = attributes.navigation_handler.take();
+    if link_gesture_handler.is_some() || navigation_handler.is_some() {
       webview.connect_decide_policy(move |_webview, policy_decision, policy_type| {
-        let handler = match policy_type {
-          PolicyDecisionType::NavigationAction => &navigation_handler,
-          _ => return false,
-        };
+        if !matches!(policy_type, PolicyDecisionType::NavigationAction) {
+          return false;
+        }
 
         if let Some(policy) = policy_decision.dynamic_cast_ref::<NavigationPolicyDecision>() {
           if let Some(nav_action) = policy.navigation_action() {
             if let Some(uri_req) = nav_action.request() {
               if let Some(uri) = uri_req.uri() {
-                let allow = handler(uri.to_string());
-                let pointer = policy_decision.as_ptr();
-                unsafe {
-                  if allow {
-                    webkit_policy_decision_use(pointer)
-                  } else {
-                    webkit_policy_decision_ignore(pointer)
+                // The gesture FIRST: a link the user middle-clicked is not a
+                // navigation to allow or deny, it is a navigation that must not
+                // happen here at all.
+                if let Some(gesture) = &link_gesture_handler {
+                  let background =
+                    is_background_open_gesture(nav_action.mouse_button(), nav_action.modifiers());
+                  // Only a LINK the user clicked. A form submitted while ctrl was
+                  // held, or a redirect that inherited the state, is not the
+                  // gesture and must navigate normally.
+                  let link_clicked = matches!(
+                    nav_action.navigation_type(),
+                    webkit2gtk::NavigationType::LinkClicked
+                  );
+                  if background && link_clicked && gesture(uri.to_string(), true) {
+                    unsafe { webkit_policy_decision_ignore(policy_decision.as_ptr()) }
+                    return true;
                   }
                 }
 
-                return true;
+                if let Some(handler) = &navigation_handler {
+                  let allow = handler(uri.to_string());
+                  let pointer = policy_decision.as_ptr();
+                  unsafe {
+                    if allow {
+                      webkit_policy_decision_use(pointer)
+                    } else {
+                      webkit_policy_decision_ignore(pointer)
+                    }
+                  }
+
+                  return true;
+                }
               }
             }
           }
