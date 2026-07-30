@@ -1779,6 +1779,12 @@ pub struct SurfaceUserscript {
     /// the ENGINE does the matching, so nothing here can disagree with it about
     /// what a pattern means. EMPTY = every URL.
     pub matches: Vec<String>,
+    /// URL match patterns the engine must EXCLUDE — the same syntax as
+    /// [`SurfaceUserscript::matches`], passed through VERBATIM as WebKit's
+    /// block-list. A page matching any of these never gets the script,
+    /// whatever `matches` says. EMPTY = exclude nothing. Dropping one here is
+    /// running a script on a page its author explicitly ruled out.
+    pub exclude_matches: Vec<String>,
     /// Inject into sub-frames as well as the top frame.
     pub all_frames: bool,
     /// Run in a private JavaScript world (same DOM, private globals) rather than
@@ -1815,6 +1821,7 @@ fn attach_userscripts<'a>(
             script.body.as_str(),
             !script.all_frames,
             script.matches.clone(),
+            script.exclude_matches.clone(),
             script
                 .isolated_world
                 .then(|| USERSCRIPT_WORLD.to_string()),
@@ -4262,6 +4269,7 @@ mod scriptlet_locks {
         let scripts = vec![
             SurfaceUserscript {
                 matches: vec!["https://*.youtube.com/*".to_string()],
+                exclude_matches: vec!["https://*.youtube.com/embed/*".to_string()],
                 all_frames: true,
                 isolated_world: true,
                 ..script("scoped")
@@ -4282,6 +4290,12 @@ mod scriptlet_locks {
             "the @match patterns never reached the engine, so a YouTube script \
              is running on every tab",
         );
+        assert_eq!(
+            staged[0].block_list,
+            vec!["https://*.youtube.com/embed/*".to_string()],
+            "the @exclude-match patterns never reached the engine, so the \
+             script is running on the very embeds its author excluded",
+        );
         assert!(
             !staged[0].for_main_frame_only,
             "@all-frames must become NOT main-frame-only",
@@ -4299,6 +4313,10 @@ mod scriptlet_locks {
         );
         assert!(staged[1].for_main_frame_only);
         assert!(staged[1].allow_list.is_empty(), "no patterns = every URL");
+        assert!(
+            staged[1].block_list.is_empty(),
+            "no @exclude = exclude nothing"
+        );
     }
 
     /// The OLD entry point must keep meaning what it always meant: every URL,
@@ -4324,6 +4342,11 @@ mod scriptlet_locks {
             staged[0].world_name.is_none(),
             "the close shim moved to an isolated world, where the page cannot \
              see the function it is supposed to call",
+        );
+        assert!(
+            staged[0].block_list.is_empty(),
+            "the close shim acquired exclusion patterns, so pages inside them \
+             can no longer report window.close()",
         );
     }
 
@@ -4443,6 +4466,19 @@ mod scriptlet_locks {
             !body.contains("        &[],\n        &[],"),
             "a constructor is back to hardcoding an empty allow-list, so \
              @match is silently ignored again",
+        );
+        // The block-list must be threaded into BOTH constructors too. `&[]` on
+        // either one runs every script that takes that branch on the very
+        // pages its author excluded — the state THIS change found the code in.
+        assert_eq!(
+            body.matches("&block_list,").count(),
+            2,
+            "both `UserScript` constructors must receive the block-list",
+        );
+        assert!(
+            !body.contains("&[],"),
+            "a constructor is hardcoding an empty list, so an allow-list or a \
+             block-list is silently ignored",
         );
     }
 }
