@@ -464,12 +464,6 @@ impl InnerWebView {
       // Enable App cache
       settings.set_enable_page_cache(true);
 
-      // Smooth scrolling. WebKitGTK ships this OFF, so every wheel tick and
-      // paging key landed as a hard jump — the engine's own animated scroll
-      // was never asked for. Locked by the web-surface scroll shim's tests
-      // (yggterm: dioxus-desktop `web_surface.rs`, `scroll_nav_shim_locks`).
-      settings.set_enable_smooth_scrolling(true);
-
       // Set user agent
       settings.set_user_agent(attributes.user_agent.as_deref());
 
