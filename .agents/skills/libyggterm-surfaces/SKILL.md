@@ -613,6 +613,20 @@ reference doc `docs/alt-keytips.md`.
   the passthrough safe.
 - **Live-session nav = Ctrl+Alt+PgUp/PgDn**; plain Ctrl+PgUp/PgDn is reserved for
   a focused app's tab layer.
+- **§12.2 inversion, at the overlay boundary (2026-07-31).** Opening the ALT
+  overlay derives a hotkey badge for EVERY visible interactable that is neither
+  declared (`data-keytip-node`) nor per-element exempt: one DOM walk
+  (`KEYTIP_INTERACTABLE_WALK_JS` in `shell.rs`, shared with the audit), letters
+  assigned in Rust through the one `assign_scope` ladder (declared letters
+  excluded), painted by the same badge painter, dispatched on registry miss via
+  `data-keytip-derived-id`. Subtree `data-keytip-exempt` stamps are FORBIDDEN
+  (audit-policed); exemption is per-element with a named reason. While a top
+  modal is up the walk confines itself to `[data-yggterm-modal-root=<kind>]` —
+  badges inside modals.
+- **Agent probes:** `server app keytips audit [--json]` reports
+  reachable / excused / orphan + subtree-exempt violations; `server app keytips
+  show|hide` opens/dismisses the overlay through the same terminus as the clean
+  ALT tap (the live-proof instrument for badge work).
 - **NOT built yet (lands with app contribution at 3.0.0):** the app-side
   KeyTip-contribution path (an app claiming Excel's letters over OSC 7717) and
   held-ALT+key DIRECT chords on a focused native web surface. yggterm is the
