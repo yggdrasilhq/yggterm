@@ -28,6 +28,100 @@ fix) once the fix is verified live on guihost.
   **The habit stands regardless: before trusting ANY test in a report, mutate
   the production call site yourself.**
 
+## ⭐ USER-REPORTED, ychrome-as-main-browser (2026-07-30) — OPEN
+
+The user made ychrome their daily driver and reported a list. **Ten of those are
+FIXED and deployed** (see CHANGELOG 2.12.18 and campaign ROUND 28: the app tab's
+✕ quitting the app, left-neighbour close selection, duplicate→about:blank, blank
+overwriting a real tab, the row menu clipping over a page, disabled caching,
+ungranted clipboard, the 320 MB memory cap that distorted video audio, a revealed
+page never taking the keyboard, dead back/forward). **These remain, each already
+root-caused — read the mechanism before opening the file, and grep the named
+symbol rather than trusting a line number:**
+
+- **Accelerating / smooth scroll, and keyboard scroll on app-shell sites.** Two
+  engine facts: WebKit's default key handler scrolls the focused node's
+  scrollable ANCESTORS, and an app-shell page's scroller is a DESCENDANT of body,
+  so with `activeElement === BODY` nothing scrolls; and
+  `webkit_settings_set_enable_smooth_scrolling` is never turned on. Fix: one
+  shell-owned document-start userscript (beside `CLOSE_SHIM_JS`) that scrolls the
+  largest visible `overflow:auto` descendant on PageUp/PageDown/Home/End/Space
+  when the document itself is not scrollable, plus the settings flip. The same
+  script should carry mouse buttons 8/9 and Alt+Left/Right, because wry's
+  `synthetic_mouse_events` swallows those buttons (`Propagation::Stop`).
+- **A duplicate FIRST tab appears on return to a session.** `SavedWebTab` has no
+  notion of which row was the app tab, so every rebuild re-mints tab 0 from the
+  launch declare AND re-opens the saved row as a user tab; with a redirect the
+  two look identical and it accumulates one copy per rebuild
+  (`restore_app_surfaces_tick` runs every 2.5 s). Fix: `app_tab: bool` on
+  `SavedWebTab`, written for tab 0 by `persist_web_tabs`; `plan_web_tab_restore`
+  always adopts that row into tab 0 and never re-opens it; and a
+  heartbeat/retained-declare materialization must be a RE-ATTACH (adopt the saved
+  page) not a relaunch of the stale launch URL.
+- **The vertical tab rail is not the cwdtree, and the user asked for it to be.**
+  It hand-rolls its own folder tree and does not use `yggui::drag_tree` — a
+  fourth tree in the product. The load-bearing gap is the widget schema:
+  `AppPaneWidget::ListRow` has no `depth`/`children`/`expanded`, so contributed
+  panes are FLAT by construction, while `SessionStyleRow` already accepts
+  `depth`. Add those plus an expand action, and let the app drag resolver permit
+  `Into` (it is hard-wired to `reorder_flat_list` today). Then: folders ABOVE
+  tabs, renamable tab rows, working drag, and "New folder" text selected on
+  create. Reuse doctrine applies — no new components.
+- **Downloads have no destination choice, no progress, and lie about history.**
+  `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
+  every terminal in the app (staged destination + async picker is the shape).
+  Progress needs the retained `Download` handle polled (`connect_received_data`,
+  `estimated_progress`) rather than new events. The two toasts never coalesce
+  (`upsert_job_notification("download:<id>")` + `finish_job_notification`).
+  Dismissing a toast DELETES it from the panel — one `Vec<ToastNotification>` is
+  both queue and history; add `dismissed`, split the verbs, and move the
+  visibility predicate into yggui as ONE exported fn (the app-control snapshot
+  re-encodes it today). **And a download that outlives its last tab emits
+  nothing at all** — the drain sits after two early `continue`s in the reconcile
+  loop; move it above them.
+- **No printing at all.** `WebSurfaceHost::print` modelled on `find` + GTK
+  `PrintOperation::run_dialog` (its "Print to File" is the PDF destination users
+  actually want). Do NOT build a Chrome-style preview: nothing in the tree can
+  display a PDF, and every settings change would mean re-rendering the document.
+- ⚠ **Cross-cutting for both of the above:** a browser accelerator claimed in the
+  shell's DOM keydown CANNOT fire while a page holds GTK focus. Promote the seat
+  observer into a chord CLAIMER (Ctrl+F, Ctrl+P) in `connect_key_press_event`.
+- **Fullscreen video takes the WINDOW fullscreen** (KDE then hides its panels
+  until the video is un-fullscreened, even from another session). User-settled
+  design: fullscreen fills the VIEWPORT by default, with an ychrome setting for
+  the "real fullscreen" experience. WebKit's enter/leave-fullscreen signals are
+  not bound at all yet.
+- **Cloudflare managed challenges fail (brilliant.org login).** THREE converging
+  causes, all ours: the passkey shim replaces `navigator.credentials` on EVERY
+  page (a fingerprint mismatch a challenge can see) — install it lazily and
+  per-origin; the adblock filter may be eating `/cdn-cgi/challenge-platform/` or
+  `challenges.cloudflare.com` (zero-build test: disable adblock for that profile;
+  durable: an `ignore-previous-rules` allowlist entry); and **a profile whose
+  write-lock is held elsewhere silently opens EPHEMERAL**, so cookies never
+  persist and the challenge loops forever — make that refusal open the jar
+  READ-ONLY as its own comment claims, and stop degrading silently. Nothing is
+  diagnosable today because no main-frame load status is traced.
+- **False/stale gates.** `runtime_status_handoff_active()` is
+  `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
+  two sessions are parked on an older daemon, so any mount arms the veil. Arm on
+  a genuine daemon-IDENTITY transition instead (`pid:version` differs from last
+  observed) and let the awaiting-key slice only SCOPE which surfaces are veiled.
+  The notice is also raised unconditionally — it never consults
+  `active_view_mode`, which is why it covered a yedit document and claimed "the
+  terminal is paused". ⚠ **The self-check must run IN-PROCESS on the 2.5 s tick:
+  `server app state` REFRESHES the observation, so an external probe cannot
+  measure staleness and can itself arm the gate.**
+- **yedit: the wrap gutter drifts, and chrome draws over text.** The gutter takes
+  one fractional `getComputedStyle(...).lineHeight` and uses it for BOTH the
+  per-entry height and the row count, so error accumulates down the file — emit
+  one gutter block per LOGICAL line at the MIRROR child's measured
+  `offsetHeight`, and make the gutter self-verifying (sum === `scrollHeight -
+  padding`; on mismatch stop drawing numbers and stamp an observable field). The
+  "Document | Terminal" pill floats over an editor with no reserved space —
+  recommended fix is to move it into the titlebar's existing surface-switch slot
+  and delete both floating pills. Toasts need an anchor owned by the active
+  viewport kind (top-center over a terminal, bottom-right over a document).
+
 ## Standing traps / other open bugs
 
 - **★ THE SUPERVISOR DIES WITH ITS CHILD — confirmed twice in one day (guihost,
