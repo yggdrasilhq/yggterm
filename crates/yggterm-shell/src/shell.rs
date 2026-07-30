@@ -44132,6 +44132,27 @@ fn ui_zoom_factor(ui_font_size: f32) -> f64 {
 /// the UI-zoom control's 50% floor the band claims twice the rail there is, which
 /// puts a right-anchored menu straight back over the page. That is the reported
 /// clipping bug, reachable from a shipped control.
+/// The SIDEBAR's band: the strip the LEFT cwd tree occupies, same unit rules as
+/// [`rail_context_menu_band`] (authored width × UI zoom, unzoomed window CSS px).
+///
+/// Handed to the cwd tree's row menu ONLY while a native page owns the active
+/// viewport. A terminal viewport is DOM, so a menu spilling out of the tree
+/// paints fine over it and keeps window clamping — but a native web surface
+/// paints above ALL DOM in legacy stacking, so the spill is invisible AND
+/// unclickable. That is the user's reported clipping, in the mirror image of the
+/// rail case: the rail's menu grows leftward out of the rail, the tree's grows
+/// rightward out of the tree.
+fn sidebar_context_menu_band(sidebar_width: f64, ui_zoom: f64) -> ContextMenuBand {
+    let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
+        ui_zoom
+    } else {
+        1.0
+    };
+    ContextMenuBand {
+        left: 0.0,
+        right: (sidebar_width * zoom).max(0.0),
+    }
+}
 fn rail_context_menu_band(window_width: f64, rail_width: f64, ui_zoom: f64) -> ContextMenuBand {
     let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
         ui_zoom
@@ -71452,6 +71473,17 @@ fn app() -> Element {
         snapshot.rail_width as f64,
         ui_zoom_factor(snapshot.settings.ui_font_size),
     );
+    // The TREE's band, for the same reason and only when it is needed:
+    // `active_web_surface_overlay` is Some exactly while a native page owns the
+    // active viewport ([`ShellState::web_surface_overlay_for_session`] on the
+    // active session), which is the only state in which DOM spilling out of the
+    // tree is eaten.
+    let context_menu_sidebar_band = snapshot.active_web_surface_overlay.as_ref().map(|_| {
+        sidebar_context_menu_band(
+            snapshot.sidebar_width as f64,
+            ui_zoom_factor(snapshot.settings.ui_font_size),
+        )
+    });
     let titlebar_snapshot = snapshot.clone();
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
@@ -72996,12 +73028,13 @@ fn app() -> Element {
                     ContextMenuOverlay {
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
                         window_size: context_menu_window_size,
-                        // The cwd tree is DOM-owned all the way to the left edge
-                        // and the tree sits on the far side of the viewport from
-                        // any rail, so this menu keeps WINDOW clamping. Banding
-                        // it would pin the tree's menu to a strip it has no
-                        // reason to respect.
-                        band: None,
+                        // The cwd tree is DOM-owned, so over a TERMINAL viewport
+                        // this menu keeps WINDOW clamping — banding it would pin
+                        // the tree's menu to a strip it has no reason to respect.
+                        // Over a NATIVE web surface the spill is invisible and
+                        // unclickable (legacy stacking), so there it is banded to
+                        // the tree. `None` when no page owns the viewport.
+                        band: context_menu_sidebar_band,
                         palette: snapshot.palette,
                         items: snapshot.row_menu_items.clone(),
                         menu_title: snapshot.row_menu_title.clone(),
@@ -161133,7 +161166,7 @@ mod webtabs_menu_switcher_locks {
         ),
         (
             "if let Some(row) = context_menu_overlay.clone()",
-            "band: None,",
+            "band: context_menu_sidebar_band,",
         ),
         (
             "if let Some(switcher) = snapshot.web_profile_switcher.clone()",
@@ -161147,6 +161180,57 @@ mod webtabs_menu_switcher_locks {
         ),
     ];
 
+    /// A row menu raised over a NATIVE page must land inside the tree, because
+    /// anything outside it is eaten by the page (legacy stacking). The mirror of
+    /// the rail case, and the user's reported clipping: the menu opened at a row
+    /// mid-tree and its right half vanished.
+    #[test]
+    fn the_tree_menu_lands_inside_the_tree_when_a_page_owns_the_viewport() {
+        // A 270px tree at 100% zoom, a click 143px in — the screenshot's shape.
+        let band = sidebar_context_menu_band(270.0, 1.0);
+        assert_eq!((band.left, band.right), (0.0, 270.0));
+        // The drawn box, whichever edge it anchors from: `right` is a distance
+        // from the WINDOW's right edge, so the box's own left edge is
+        // `window - right - width` (see [`context_menu_placement`]).
+        let box_left = |placement: ContextMenuPlacement, window_w: f64, width: f64| -> f64 {
+            match (placement.left, placement.right) {
+                (Some(left), _) => left,
+                (None, Some(right)) => window_w - right - width,
+                (None, None) => panic!("a menu must anchor from one edge or the other"),
+            }
+        };
+        let placement = context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(band));
+        let width = context_menu_width(Some(band));
+        let left = box_left(placement, 1920.0, width);
+        assert!(
+            left >= 0.0 && left + width <= band.right + 0.01,
+            "the whole menu must sit inside the tree: left {left} + width {width} \
+             must not pass {}",
+            band.right
+        );
+        // …and the UI-zoom control cannot push it out: at 50% the tree is half
+        // as wide on screen, so the band must halve with it.
+        let zoomed = sidebar_context_menu_band(270.0, 0.5);
+        assert_eq!(zoomed.right, 135.0, "the band follows the tree ON SCREEN");
+        let zoomed_placement =
+            context_menu_placement((100.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(zoomed));
+        let zoomed_width = context_menu_width(Some(zoomed));
+        let zoomed_left = box_left(zoomed_placement, 1920.0, zoomed_width);
+        assert!(
+            zoomed_left + zoomed_width <= zoomed.right + 0.01,
+            "at 50% zoom the menu must still fit the tree it is drawn over"
+        );
+        // The negative: over a TERMINAL there is no band and the menu is free to
+        // open at the click, spilling over DOM it can legitimately paint on.
+        let unbanded = context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), None);
+        assert_eq!(
+            unbanded.left,
+            Some(143.0),
+            "an unbanded menu opens AT the click; banding a terminal's menu \
+             would pin it to a strip for no reason"
+        );
+    }
+
     /// Which menus are banded is decided AT THE MOUNT, and there is exactly one
     /// derivation of the rail band. A global "is a web surface open" sniff would
     /// silently re-band the cwd tree's menu the day the user opens ychrome.
@@ -161154,7 +161238,7 @@ mod webtabs_menu_switcher_locks {
     fn each_menu_mount_names_its_own_band() {
         let product = product_source();
 
-        // One definition + ONE derivation at the render site.
+        // One definition + ONE derivation at the render site, per band.
         assert_eq!(
             product
                 .iter()
@@ -161163,6 +161247,26 @@ mod webtabs_menu_switcher_locks {
             2,
             "the rail band has one owner; a second derivation could disagree \
              with the rail the user is actually looking at"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("sidebar_context_menu_band("))
+                .count(),
+            2,
+            "and so does the tree band"
+        );
+        // The tree's band is CONDITIONAL on a native page owning the viewport —
+        // the predicate, not a global sniff, and not unconditional banding.
+        let derivation = product
+            .iter()
+            .position(|line| line.contains("let context_menu_sidebar_band ="))
+            .expect("the tree band is derived at the render site");
+        assert!(
+            product[derivation].contains("snapshot.active_web_surface_overlay"),
+            "the tree band may only apply while a native page owns the active \
+             viewport; over a terminal the menu must keep window clamping:\n{}",
+            product[derivation]
         );
 
         // ENUMERATION, not four hardcoded guards. Dioxus defaults an
@@ -161658,15 +161762,27 @@ mod webtabs_menu_switcher_locks {
             call.contains("ui_zoom_factor(snapshot.settings.ui_font_size),"),
             "the band must be derived at the zoom the rail is drawn at:\n{call}"
         );
+        // One definition + one use PER BAND (the rail's and the tree's), and —
+        // the half with teeth — every use reads the SAME owner. Counting alone
+        // would let a third band derive its zoom from anywhere; this makes a
+        // divergent source fail instead.
+        let uses: Vec<&String> = product
+            .iter()
+            .filter(|line| line.contains("ui_zoom_factor(") && !line.contains("fn ui_zoom_factor"))
+            .collect();
         assert_eq!(
-            product
-                .iter()
-                .filter(|line| line.contains("ui_zoom_factor("))
-                .count(),
+            uses.len(),
             2,
-            "one definition + one use; a second derivation of the UI zoom could \
-             disagree with the `zoom:{{}}%` the rail actually carries"
+            "the rail band and the tree band are the two zoom consumers; a third \
+             wants a decision, not a silent number bump:\n{uses:#?}"
         );
+        for use_line in uses {
+            assert!(
+                use_line.contains("ui_zoom_factor(snapshot.settings.ui_font_size)"),
+                "every band must derive its zoom from the ONE owner the rail is \
+                 drawn at; this one does not:\n{use_line}"
+            );
+        }
     }
 
     /// The placement math is unit-consistent. `desktop.inner_size()` is PHYSICAL
