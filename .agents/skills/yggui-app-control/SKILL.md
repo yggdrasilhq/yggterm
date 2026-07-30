@@ -109,8 +109,18 @@ and watch (agent-presence cursor). The enabling verbs:
 # "Agent <identity> <kind>: <purpose>" instead of inheriting the cwd-shaped
 # default, which renders identically to a human's shell in the same directory
 # and makes your row unfindable by any title probe.
-yggterm --agent <id> server app terminal new --kind shell --no-activate \
-  --purpose "what this session is for"
+#
+# ⚠ --agent is a TRAILING flag on the subcommand, NOT a global prefix.
+# `yggterm --agent <id> server app terminal new ...` produces EMPTY OUTPUT
+# (corrected 2026-07-28 — the global form was documented here and is wrong).
+yggterm server app terminal new --kind shell --no-activate \
+  --purpose "what this session is for" --agent <id>
+
+# ⚠ Sleep ~3s before the first `terminal send`. Sending into a session whose
+# shell has not finished starting is SILENTLY SWALLOWED: the send still answers
+# accepted:true with a byte count, no process appears, and the failure surfaces
+# far away as `web ensure` reporting "the daemon has no web-surface declare
+# (a plain shell, or the app already closed its surface)".
 # Materialize a BACKGROUNDED session's declared web surfaces into the soft
 # stash (created + demoted + leased, never revealed) so web do/read/wait
 # verbs can drive them immediately:
@@ -287,9 +297,15 @@ yggterm server app state | jq .agent_leases
 **Reading a refusal.** `js_result_unsupported` = your script returned a Promise
 or a DOM object; the page is FINE. `webview_unreachable` = nobody answered;
 run `web ensure`. Those two used to share one string and the ambiguity cost a
-field run ten minutes. Likewise `accepted` (the injector ran), `resolved.*`
-(what the DOM said about the node) and `delivered` (what the page's listener
-saw) are three different questions — a `do click` reports all three.
+field run ten minutes.
+
+⚠ **Before reading any refusal, check a webview exists.**
+`server app state | jq .web_surface_tabs` — `views: 0` / `contexts: 0` means
+no content process anywhere, so every verb fails and its error string is noise.
+Note `web ensure` can answer `healed: true` about the declare/tab while no
+view is realized; that pair misleads badly. Probe with `eval '1+1'`: if a
+trivial script is refused, go look at `web_surface_tabs` rather than at your
+script.
 
 **Version mismatch is now honest.** App-control is a filesystem dropbox, so CLI
 and GUI must be swapped together; a verb this GUI does not implement answers
