@@ -2,6 +2,18 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Fixed: dragging a mouse selection over a busy agent session no longer
+  stalls the app.** While an agent CLI streams output, every twitch of a drag —
+  and every streamed write underneath a live selection — re-serialized the
+  entire selected text and re-ran bookkeeping on the same thread that paints
+  the terminal, so the longer the selection grew, the worse the jank got. The
+  per-event work is now constant: the viewport pin that stops streaming output
+  from yanking your selection mid-drag stays immediate, and the selection
+  recording is coalesced to the end of the frame and flushed the moment the
+  drag ends — so a middle-click paste still always gets the final selection.
+
 ## 2.12.18
 
 - **Security: a web page can no longer drive ychrome's settings or reach your
