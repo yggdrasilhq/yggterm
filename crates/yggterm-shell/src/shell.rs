@@ -2018,6 +2018,13 @@ struct WireUserscript {
     /// WebKit match patterns, verbatim. Empty = every URL.
     #[serde(default)]
     matches: Vec<String>,
+    /// WebKit match patterns the engine must EXCLUDE — the block-list half of
+    /// placement, verbatim like `matches`. Empty = exclude nothing. The
+    /// default matters for the mixed-version fleet: an app older than
+    /// exclusions sends no such field, and "exclude nothing" is exactly what
+    /// its scripts declared.
+    #[serde(default)]
+    exclude_matches: Vec<String>,
     #[serde(default)]
     all_frames: bool,
     /// `"isolated"` (the default) or `"main"`. Any other spelling — a typo, a
@@ -2044,6 +2051,7 @@ impl WireUserscript {
             isolated_world: self.world.as_deref() != Some(USERSCRIPT_WORLD_MAIN),
             body: self.body,
             matches: self.matches,
+            exclude_matches: self.exclude_matches,
             all_frames: self.all_frames,
         }
     }
@@ -2077,6 +2085,7 @@ impl WebSurfacePolicy {
                 .map(|body| dioxus_desktop::SurfaceUserscript {
                     body: body.clone(),
                     matches: Vec::new(),
+                    exclude_matches: Vec::new(),
                     all_frames: false,
                     isolated_world: false,
                 })
@@ -129688,6 +129697,7 @@ mod tests {
             "userscripts_v2": [{
                 "body": "scoped-body",
                 "matches": ["https://*.youtube.com/*"],
+                "exclude_matches": ["https://*.youtube.com/embed/*"],
                 "all_frames": true,
                 "world": "isolated",
                 "run_at": "document-start",
@@ -129699,6 +129709,12 @@ mod tests {
         assert_eq!(
             scripts[0].matches,
             vec!["https://*.youtube.com/*".to_string()]
+        );
+        assert_eq!(
+            scripts[0].exclude_matches,
+            vec!["https://*.youtube.com/embed/*".to_string()],
+            "the block-list was dropped off the wire, so the script runs on \
+             the very pages its author excluded"
         );
         assert!(scripts[0].all_frames);
         assert!(scripts[0].isolated_world);
@@ -129716,6 +129732,10 @@ mod tests {
         assert!(
             scripts[0].matches.is_empty(),
             "legacy scripts ran everywhere"
+        );
+        assert!(
+            scripts[0].exclude_matches.is_empty(),
+            "legacy scripts declared no exclusions"
         );
         assert!(!scripts[0].all_frames);
         assert!(

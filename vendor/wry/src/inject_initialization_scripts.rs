@@ -181,6 +181,7 @@ mod tests {
         script,
         for_main_frame_only: true,
         allow_list: Vec::new(),
+        block_list: Vec::new(),
         world_name: None,
       })
       .collect();
@@ -220,6 +221,7 @@ mod tests {
         script,
         for_main_frame_only: true,
         allow_list: Vec::new(),
+        block_list: Vec::new(),
         world_name: None,
       })
       .collect();

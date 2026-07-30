@@ -1021,34 +1021,39 @@ impl<'a> WebViewBuilder<'a> {
     js: S,
     for_main_frame_only: bool,
   ) -> Self {
-    self.with_initialization_script_options(js, for_main_frame_only, Vec::new(), None)
+    self.with_initialization_script_options(js, for_main_frame_only, Vec::new(), Vec::new(), None)
   }
 
   /// Same as [`with_initialization_script_for_main_only`](Self::with_initialization_script_for_main_only)
-  /// plus the two facts a USERSCRIPT needs and a bootstrap shim does not: which
-  /// URLs it runs on, and which JavaScript world it runs in.
+  /// plus the facts a USERSCRIPT needs and a bootstrap shim does not: which
+  /// URLs it runs on, which it is excluded from, and which JavaScript world it
+  /// runs in.
   ///
   /// `allow_list` is a list of match patterns in the engine's own syntax; EMPTY
   /// means every URL, which is the behaviour of the other constructors.
-  /// `world_name` names an isolated content world — the script shares the page's
-  /// DOM but gets private globals — while `None` injects into the page's own
-  /// world, where the page can see (and be seen by) the script.
+  /// `block_list` is the same syntax subtracted: a page matching any of its
+  /// patterns never gets the script, whatever the allow-list says; EMPTY
+  /// excludes nothing. `world_name` names an isolated content world — the
+  /// script shares the page's DOM but gets private globals — while `None`
+  /// injects into the page's own world, where the page can see (and be seen
+  /// by) the script.
   ///
   /// ## Platform-specific
   ///
-  /// - **Linux/BSD (WebKitGTK):** both are honoured natively —
-  ///   `webkit_user_script_new` takes the allow-list, and
+  /// - **Linux/BSD (WebKitGTK):** all three are honoured natively —
+  ///   `webkit_user_script_new` takes the allow-list and the block-list, and
   ///   `webkit_user_script_new_for_world` takes the world.
-  /// - **Every other platform:** both are IGNORED. The script is injected as if
-  ///   it had been added with
+  /// - **Every other platform:** all three are IGNORED. The script is injected
+  ///   as if it had been added with
   ///   [`with_initialization_script_for_main_only`](Self::with_initialization_script_for_main_only):
-  ///   every URL, page world. A caller that needs scoping on those platforms
-  ///   must still guard inside the script.
+  ///   every URL, no exclusions, page world. A caller that needs scoping on
+  ///   those platforms must still guard inside the script.
   pub fn with_initialization_script_options<S: Into<String>>(
     mut self,
     js: S,
     for_main_frame_only: bool,
     allow_list: Vec<String>,
+    block_list: Vec<String>,
     world_name: Option<String>,
   ) -> Self {
     let script = js.into();
@@ -1060,6 +1065,7 @@ impl<'a> WebViewBuilder<'a> {
           script,
           for_main_frame_only,
           allow_list,
+          block_list,
           world_name,
         });
     }
@@ -2578,6 +2584,17 @@ pub struct InitializationScript {
   ///   allow-list; the ENGINE does the matching.
   /// - **Every other platform:** ignored — the script runs on every page.
   pub allow_list: Vec<String>,
+  /// URL match patterns, same syntax as [`InitializationScript::allow_list`],
+  /// that decide which pages this script is EXCLUDED from. A page matching any
+  /// of these never gets the script, whatever the allow-list says. EMPTY =
+  /// exclude nothing.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux/BSD (WebKitGTK):** passed to `webkit_user_script_new` as its
+  ///   block-list; the ENGINE does the matching.
+  /// - **Every other platform:** ignored — nothing is excluded.
+  pub block_list: Vec<String>,
   /// The name of an isolated JavaScript world to inject into. `None` = the
   /// page's own world, which is where every script ran before this field
   /// existed.
