@@ -5102,7 +5102,17 @@ fn configure_linux_webkit_compositing() {}
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_memory_policy() {
     if std::env::var_os(ENV_YGGTERM_WEBKIT_CACHE_MODEL).is_none() {
-        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "document-viewer") };
+        // `document-viewer` is WebKit's own name for "disable the cache
+        // completely" — correct when a web surface was an embedded viewer, wrong
+        // now that ychrome is the user's browser: every navigation and every
+        // reload refetched every byte, and nothing was ever served warm.
+        // `web-browser` is the model WebKit sizes for a browser. The bound on it
+        // is not this knob but the memory policy below (a hard limit plus the
+        // conservative/strict/kill thresholds) and, since 2.12.18, per-tab
+        // reclaim — so caching more does not mean growing without end.
+        // Override with YGGTERM_WEBKIT_CACHE_MODEL=document-viewer to get the
+        // old cacheless behaviour back.
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "web-browser") };
     }
     if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB).is_none() {
         unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB, "320") };
@@ -6156,6 +6166,39 @@ mod web_usage_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A BROWSER CACHES. `document-viewer` is WebKit's own name for "disable the
+    /// cache completely" — the default this process shipped, which meant every
+    /// navigation and every reload in ychrome refetched every byte. The knob
+    /// stays overridable; what is locked is that the DEFAULT is a caching model,
+    /// and that the memory policy which bounds it is still set alongside.
+    #[test]
+    fn the_default_cache_model_is_a_browsers_and_the_memory_bound_still_applies() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs has a product half above its tests");
+        let at = product
+            .find("ENV_YGGTERM_WEBKIT_CACHE_MODEL, ")
+            .expect("the cache-model default moved — move this lock with it");
+        let decision = &product[at..at + 80];
+        assert!(
+            decision.contains("\"web-browser\""),
+            "the default must be a caching model; document-viewer disables the \
+             cache outright:\n{decision}"
+        );
+        // The bound: caching more is only safe because these are still here.
+        for bound in [
+            "ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB",
+            "ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD",
+        ] {
+            assert!(
+                product.contains(&format!("{bound}, ")),
+                "the memory policy that bounds the cache lost {bound}"
+            );
+        }
+    }
     use super::KEYTIPS_AUDIT_JS;
     #[cfg(unix)]
     use super::superseded_client_termination_signal;
