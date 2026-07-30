@@ -219,6 +219,17 @@ pub(crate) enum TerminalJsEvent {
         /// command envelope). Its presence on a ping is also the
         /// routing-capability marker. Absent ⇒ the app is not routing-aware.
         env_id: Option<String>,
+        /// The app's bearer token for its own control endpoint's GUI-only
+        /// routes, presented as `X-Ychrome-Control`. THE ONE SECRET A DECLARE
+        /// CARRIES, and deliberately so: the control endpoint is page-reachable
+        /// through the `yggterm-appctl://` bridge, so the app has to be able to
+        /// tell the GUI apart from a page in one of its own surfaces, and the
+        /// PTY stream is precisely the channel a page cannot read. Absent ⇒ a
+        /// pre-gate app: the GUI sends no header and the app, having no gate,
+        /// answers as it always did.
+        ///
+        /// It must never be logged, traced, or put in a pane schema.
+        control_token: Option<String>,
     },
     /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
     /// user's presence. The app carries only the rpId and a display label — no
@@ -405,6 +416,8 @@ enum TerminalJsEventWire {
         document_version: Option<String>,
         #[serde(default)]
         env_id: Option<String>,
+        #[serde(default)]
+        control_token: Option<String>,
     },
     Fido2Request {
         action: String,
@@ -578,6 +591,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 appearance_version,
                 document_version,
                 env_id,
+                control_token,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
@@ -588,6 +602,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 appearance_version,
                 document_version,
                 env_id,
+                control_token,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
