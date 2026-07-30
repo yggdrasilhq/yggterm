@@ -2768,6 +2768,27 @@ impl WebSurfaceHost {
         }
     }
 
+    /// Give surface `id` the toplevel's keyboard focus.
+    ///
+    /// ⚠ WITHOUT THIS, A REVEALED PAGE HAS NO KEYBOARD. `with_focused(visible)`
+    /// at BUILD time was the only thing that ever focused a surface, so every
+    /// later reveal (`set_visible`, `unstash`) moved bounds, mapping and z-order
+    /// and left the keyboard wherever it was — which is why PageUp, PageDown,
+    /// Home and End did nothing on a page the user had just switched to. A click
+    /// fixed it by accident, because GTK focuses what you click.
+    ///
+    /// Focus is only ever taken for a surface being SHOWN — the caller decides
+    /// that; this is the mechanism, not the policy.
+    pub fn focus(&self, id: u64) {
+        use wry::WebViewExtUnix as _;
+        if let Some(s) = self.surfaces.borrow().get(&id) {
+            let webkit = s.webview.webview();
+            if webkit.is_visible() {
+                webkit.grab_focus();
+            }
+        }
+    }
+
     pub fn navigate(&self, id: u64, url: &str) {
         if let Some(s) = self.surfaces.borrow().get(&id) {
             let _ = s.webview.load_url(url);
@@ -4888,6 +4909,29 @@ mod download_locks {
     /// anchored to the enclosing body, so an APPEND elsewhere in the file
     /// cannot satisfy them.
     #[test]
+    /// A REVEALED PAGE TAKES THE KEYBOARD. Build time was the only thing that
+    /// ever focused a surface, so a page the user switched to had no keyboard at
+    /// all: PageUp, PageDown, Home and End did nothing until they happened to
+    /// click it. Focus is taken on the reveal EDGE only — re-taking it every tick
+    /// would fight a human who moved focus to the omnibox or the find bar.
+    #[test]
+    fn a_revealed_page_is_handed_the_keyboard_and_only_on_the_edge() {
+        let product = product_lines();
+        let focus = product
+            .iter()
+            .position(|line| line.contains("pub fn focus(&self, id: u64) {"))
+            .expect("the focus mechanism moved — move this lock with it");
+        let body = product[focus..focus + 10].join("\n");
+        assert!(
+            body.contains("webkit.grab_focus();"),
+            "focus must actually grab it:\n{body}"
+        );
+        assert!(
+            body.contains("if webkit.is_visible()"),
+            "…and never for a surface that is not being shown:\n{body}"
+        );
+    }
+
     /// EVERY page surface can paste, including a popup — sign-in and upload
     /// popups paste too. wry defaults `clipboard` to false, so the async
     /// clipboard API (and an IMAGE paste in particular) failed silently on every
