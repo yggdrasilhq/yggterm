@@ -359,6 +359,29 @@ impl DesktopService {
     }
 
     /// Show/hide an open web surface without destroying it (tab/session switch).
+    /// Hand surface `id` the keyboard (see `WebSurfaceHost::focus`): a revealed
+    /// page that never took focus cannot be scrolled from the keyboard at all.
+    pub fn focus_web_surface(&self, id: u64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.focus(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = id;
+    }
+
+    /// Show or hide surface `id` — and with it the page's own
+    /// `document.visibilityState` (see `WebSurfaceHost::set_visible`).
     pub fn set_web_surface_visible(&self, id: u64, visible: bool) {
         #[cfg(not(any(
             target_os = "windows",
