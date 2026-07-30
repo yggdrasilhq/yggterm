@@ -752,6 +752,22 @@ impl KeyTipTree {
         None
     }
 
+    /// Every tip claimed by the registry in the scope a typed prefix lands in
+    /// (`""` → root). This is the exclusion set the snapshot-time DERIVATION
+    /// (spec §12.2, achieved at the overlay boundary) feeds back into
+    /// [`assign_scope`] so a derived letter can never shadow a declared one —
+    /// §6 precedence: declared beats derived. `None` when the prefix is not a
+    /// valid path (the caller then derives nothing rather than guessing).
+    pub fn tips_at(&self, sequence: &str) -> Option<Vec<String>> {
+        let scope = self.scope_at(sequence)?;
+        Some(
+            self.scopes
+                .get(&scope)
+                .map(|nodes| nodes.iter().map(|node| node.tip().to_string()).collect())
+                .unwrap_or_default(),
+        )
+    }
+
     /// Which scope id a typed prefix lands in (walking descends). `""` → root.
     /// Returns a synthetic `"<scope>/<letter>"` when the prefix ends on a group
     /// letter. `None` if the prefix is not a valid path.
@@ -1100,6 +1116,24 @@ mod tests {
         assert_eq!(t.tip_for("i", "sidebar.toggle"), None);
         // The group letter paints for its first member's anchor.
         assert_eq!(t.tip_for("i", "insert.n.ychrome").as_deref(), Some("N"));
+    }
+
+    #[test]
+    fn tips_at_reports_the_open_scopes_claimed_letters() {
+        let t = insert_tree();
+        // Root: the sidebar toggle's 'b' and the New… opener's 'i'.
+        let root = t.tips_at("").expect("root is always a valid prefix");
+        assert_eq!(root, vec!["b".to_string(), "i".to_string()]);
+        // One level down: the Insert scope's letters, group letter included.
+        let insert = t.tips_at("i").expect("'i' descends into Insert");
+        assert!(insert.contains(&"s".to_string()));
+        assert!(insert.contains(&"t".to_string()));
+        assert!(
+            insert.contains(&"n".to_string()),
+            "the group letter is claimed too"
+        );
+        // An invalid prefix derives nothing rather than guessing a scope.
+        assert_eq!(t.tips_at("zz"), None);
     }
 
     #[test]
