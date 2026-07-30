@@ -113,9 +113,17 @@ fn create_js_mouse_event(event: &EventButton, pressed: bool, state: &BackForward
   // if modifers_state.contains(ModifierType::BUTTON5_MASK) {
   //   buttons += 16;
   // }
+  // The synthesized event MUST reach the page even when the point maps to no
+  // element (overlay scrollbar, padding, coordinates the page cannot see):
+  // `elementFromPoint` returns null there, and a throwing dispatch would
+  // silently eat the only copy of a button-8/9 press this handler already
+  // swallowed at the GTK level (`Propagation::Stop` above) — back/forward go
+  // dead with no error anywhere. Falling back to the document root keeps the
+  // dispatch, the page's listeners (yggterm's scroll/history shim among them)
+  // and the history fallback below alive.
   format!(
     r#"(() => {{
-        const el = document.elementFromPoint({x},{y});
+        const el = document.elementFromPoint({x},{y}) || document.documentElement;
         const ev = new MouseEvent('{event_name}', {{
           view: window,
           button: {button},

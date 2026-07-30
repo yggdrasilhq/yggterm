@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **Fixed: keyboard scrolling works on app-shell sites, and scrolling is
+  smooth.** PageUp/PageDown/Home/End/Space did nothing on pages that pin the
+  page itself and scroll an inner pane (most modern web apps): the engine only
+  scrolls the focused element's ancestors, and the real scroller is not one of
+  them. The browser surface now pages the pane you are reading — and stands
+  down wherever the page, a text box, or a widget owns the key, so Space in a
+  chat box or on a button behaves exactly as before. The engine's smooth
+  scrolling is also on now, so wheel and key scrolls glide instead of jumping.
+- **Fixed: the mouse back/forward buttons and Alt+Left/Right navigate.** Both
+  traverse the engine's own history — the same history the toolbar back and
+  forward buttons drive.
+
 ## 2.12.18
 
 - **Security: a web page can no longer drive ychrome's settings or reach your

@@ -86,6 +86,229 @@ const CLOSE_SHIM_JS: &str = r#"(function(){
   };
 })();"#;
 
+/// Keyboard scrolling and history navigation, restored to web surfaces. Three
+/// engine gaps, one document-start script:
+///
+/// 1. **Paging keys scroll nothing on app-shell pages.** WebKit's default key
+///    handler scrolls the focused node's scrollable ANCESTORS. An app-shell
+///    page pins the document (`overflow: hidden` on the root) and scrolls a
+///    DESCENDANT of `<body>` instead — so with `document.activeElement` on the
+///    body, PageUp/PageDown/Home/End/Space walk an ancestor chain that ends at
+///    an unscrollable root and do nothing. The shim steps in ONLY there: when
+///    the viewport cannot scroll and no scrollable ancestor of the target can,
+///    it pages the largest visible `overflow: auto|scroll` descendant — the
+///    pane a reader means by "the page". Where the document really scrolls, or
+///    focus sits inside a scrollable pane, the engine's own handler works and
+///    the shim stands down (acting there would DOUBLE scroll).
+/// 2. **Alt+Left/Right are chrome keys, and this browser's chrome is us.** The
+///    engine binds no history keys — real browsers implement them in their
+///    chrome. `history.back()`/`forward()` from page JS traverse the ENGINE's
+///    back/forward list, the same list the shell's toolbar buttons drive: one
+///    history, engine-owned.
+/// 3. **Mouse buttons 8/9 never reach the engine.** The vendored wry swallows
+///    the hardware press at the GTK level (`synthetic_mouse_events.rs`,
+///    `Propagation::Stop`) and re-dispatches a synthetic `mouseup` with
+///    `button` 3/4 into the page; a synthetic event triggers no engine default
+///    action, so the buttons were dead. The shim answers that `mouseup` with
+///    the same engine history calls — and `preventDefault()`s it, so wry's own
+///    inline `history.back()` fallback cannot navigate a second time.
+///
+/// The DECISION is one pure function (`decide`): event facts in, one verdict
+/// out. It is exposed as `window.__yggtermScrollNavDecide` so the agent
+/// control plane can drive the table live with synthetic facts; the
+/// DOM-reading halves only gather facts and execute verdicts, they never
+/// decide. (A Rust mirror of `decide` would be a second encoding of the same
+/// rule and is deliberately absent — the structural locks in
+/// `scroll_nav_shim_locks` pin the decision lines instead.)
+///
+/// Stand-down is sacred: an editable or key-consuming target (input/textarea/
+/// select/contenteditable, media elements, ARIA key widgets) is never
+/// hijacked; Space additionally yields to interactive targets (buttons, links
+/// — stock browser semantics); and a page that `preventDefault()`s keeps its
+/// keys, because the shim listens in the BUBBLE phase, after the page — it is
+/// a stand-in for the default action, and default actions run last.
+///
+/// The engine half of scroll FEEL — WebKitGTK's `enable-smooth-scrolling`,
+/// which ships OFF — is flipped where the other webkit settings live (the
+/// vendored wry's `set_webview_settings`) and locked alongside this shim.
+const SCROLL_NAV_SHIM_JS: &str = r#"(function(){
+  if (window.__yggtermScrollNavShim) { return; }
+  window.__yggtermScrollNavShim = true;
+
+  // The DECISION, pure and total: event facts in, one verdict out.
+  function decide(f) {
+    if (f.defaultPrevented) { return 'stand-down'; }
+    if (f.alt && !f.ctrl && !f.meta && !f.shift
+        && (f.key === 'ArrowLeft' || f.key === 'ArrowRight')) {
+      if (f.editable) { return 'stand-down'; }
+      return f.key === 'ArrowLeft' ? 'history-back' : 'history-forward';
+    }
+    var paging = f.key === 'PageUp' || f.key === 'PageDown'
+      || f.key === 'Home' || f.key === 'End';
+    var space = f.key === ' ';
+    if (!paging && !space) { return 'stand-down'; }
+    if (f.ctrl || f.alt || f.meta) { return 'stand-down'; }
+    if (f.shift && !space) { return 'stand-down'; }
+    if (f.editable || f.keyWidget) { return 'stand-down'; }
+    if (space && f.interactive) { return 'stand-down'; }
+    if (f.viewportScrolls || f.nestedScroller) { return 'stand-down'; }
+    if (f.key === 'PageUp') { return 'page-up'; }
+    if (f.key === 'PageDown') { return 'page-down'; }
+    if (f.key === 'Home') { return 'top'; }
+    if (f.key === 'End') { return 'bottom'; }
+    return f.shift ? 'page-up' : 'page-down';
+  }
+  window.__yggtermScrollNavDecide = decide;
+
+  function isEditable(el) {
+    if (!el || el.nodeType !== 1) { return false; }
+    var t = el.tagName;
+    return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT'
+      || el.isContentEditable === true;
+  }
+
+  // Widgets whose keyboard contract includes the paging/arrow keys themselves:
+  // the engine or the widget consumes them, so the shim may not.
+  var KEY_WIDGET_ROLES = /^(listbox|option|grid|gridcell|treegrid|tree|treeitem|menu|menubar|menuitem|menuitemcheckbox|menuitemradio|tablist|tab|slider|spinbutton|combobox|textbox|searchbox|radiogroup|scrollbar|application)$/;
+  function isKeyWidget(el) {
+    for (var n = el; n && n.nodeType === 1; n = n.parentElement) {
+      var t = n.tagName;
+      if (t === 'VIDEO' || t === 'AUDIO' || t === 'EMBED' || t === 'OBJECT') { return true; }
+      var role = n.getAttribute('role');
+      if (role && KEY_WIDGET_ROLES.test(role)) { return true; }
+    }
+    return false;
+  }
+
+  // Space activates these (stock semantics); scrolling would fire buttons.
+  var SPACE_ROLES = /^(button|link|checkbox|radio|switch|menuitem|menuitemcheckbox|menuitemradio|option|tab)$/;
+  function isSpaceInteractive(el) {
+    for (var n = el; n && n.nodeType === 1; n = n.parentElement) {
+      var t = n.tagName;
+      if (t === 'BUTTON' || t === 'A' || t === 'SUMMARY' || t === 'LABEL') { return true; }
+      var role = n.getAttribute('role');
+      if (role && SPACE_ROLES.test(role)) { return true; }
+    }
+    return false;
+  }
+
+  // Can the VIEWPORT scroll? Overflow on the root decides; body's overflow
+  // propagates to the viewport only while the root's stays 'visible' (the
+  // CSS propagation rule). If yes, the engine's default handler already
+  // works and the shim must stand down.
+  function viewportScrolls() {
+    var se = document.scrollingElement || document.documentElement;
+    if (!se || se.scrollHeight - se.clientHeight <= 1) { return false; }
+    var de = document.documentElement;
+    var deo = getComputedStyle(de).overflowY;
+    if (deo === 'hidden' || deo === 'clip') { return false; }
+    if (deo === 'visible' && document.body) {
+      var bo = getComputedStyle(document.body).overflowY;
+      if (bo === 'hidden' || bo === 'clip') { return false; }
+    }
+    return true;
+  }
+
+  // The engine scrolls the focused node's scrollable ancestors; if the target
+  // has one, the default handler works and the shim must stand down.
+  function hasScrollableAncestor(el) {
+    for (var n = el; n && n.nodeType === 1
+         && n !== document.body && n !== document.documentElement;
+         n = n.parentElement) {
+      if (n.scrollHeight - n.clientHeight > 1) {
+        var oy = getComputedStyle(n).overflowY;
+        if (oy === 'auto' || oy === 'scroll') { return true; }
+      }
+    }
+    return false;
+  }
+
+  // The pane a reader means by "the page": the scrollable descendant with the
+  // largest visible (viewport-intersected) area. Cheap reads first; computed
+  // style only for elements that actually overflow.
+  function largestVisibleScroller() {
+    var body = document.body;
+    if (!body) { return null; }
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var all = body.getElementsByTagName('*');
+    var cap = Math.min(all.length, 30000);
+    var best = null, bestArea = 0;
+    for (var i = 0; i < cap; i++) {
+      var el = all[i];
+      if (el.scrollHeight - el.clientHeight <= 1) { continue; }
+      var style = getComputedStyle(el);
+      var oy = style.overflowY;
+      if (oy !== 'auto' && oy !== 'scroll') { continue; }
+      if (style.visibility === 'hidden') { continue; }
+      var r = el.getBoundingClientRect();
+      var w = Math.min(r.right, vw) - Math.max(r.left, 0);
+      var h = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+      if (w <= 0 || h <= 0) { continue; }
+      var area = w * h;
+      if (area > bestArea) { bestArea = area; best = el; }
+    }
+    return best;
+  }
+
+  function keyFacts(e) {
+    var el = e.target && e.target.nodeType === 1 ? e.target : document.documentElement;
+    return {
+      key: e.key,
+      alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey,
+      defaultPrevented: e.defaultPrevented,
+      editable: isEditable(el),
+      keyWidget: isKeyWidget(el),
+      interactive: isSpaceInteractive(el),
+      viewportScrolls: viewportScrolls(),
+      nestedScroller: hasScrollableAncestor(el),
+    };
+  }
+
+  // Execute a verdict. Returns whether anything was done — a paging verdict
+  // with no scroller anywhere is left entirely alone (no preventDefault).
+  function perform(verdict, repeat) {
+    if (verdict === 'history-back') { history.back(); return true; }
+    if (verdict === 'history-forward') { history.forward(); return true; }
+    var el = largestVisibleScroller();
+    if (!el) { return false; }
+    // Key auto-repeat re-targets from the CURRENT position every event, which
+    // under a smooth animation crawls; repeats jump, single presses glide.
+    var behavior = repeat ? 'auto' : 'smooth';
+    var page = Math.max(el.clientHeight - 40, (el.clientHeight * 0.8) | 0);
+    if (verdict === 'page-up') { el.scrollBy({ top: -page, behavior: behavior }); }
+    else if (verdict === 'page-down') { el.scrollBy({ top: page, behavior: behavior }); }
+    else if (verdict === 'top') { el.scrollTo({ top: 0, behavior: behavior }); }
+    else if (verdict === 'bottom') { el.scrollTo({ top: el.scrollHeight, behavior: behavior }); }
+    else { return false; }
+    return true;
+  }
+
+  // BUBBLE phase on window — after the page's own handlers, like the default
+  // action this stands in for. A page that stopPropagation()s consumed the
+  // key; that is its right.
+  window.addEventListener('keydown', function(e) {
+    var k = e.key;
+    var relevant = k === 'PageUp' || k === 'PageDown' || k === 'Home'
+      || k === 'End' || k === ' '
+      || (e.altKey && (k === 'ArrowLeft' || k === 'ArrowRight'));
+    if (!relevant) { return; }
+    var verdict = decide(keyFacts(e));
+    if (verdict === 'stand-down') { return; }
+    if (perform(verdict, e.repeat === true)) { e.preventDefault(); }
+  }, false);
+
+  // wry re-dispatches swallowed hardware buttons 8/9 as mouseup button 3/4.
+  // Claiming the event (preventDefault) is load-bearing: wry's inline
+  // fallback only navigates when the event is unclaimed, so exactly one of
+  // us drives the history whichever handler the page lets run.
+  window.addEventListener('mouseup', function(e) {
+    if (e.button !== 3 && e.button !== 4) { return; }
+    if (e.defaultPrevented) { return; }
+    e.preventDefault();
+    if (e.button === 3) { history.back(); } else { history.forward(); }
+  }, false);
+})();"#;
+
 /// A page asking to be closed. Which page is `href` + `script_opened`, said by
 /// the page itself — the channel cannot say (see `CLOSE_SHIM_JS`). `surface_id`
 /// is the surface whose channel it arrived on: the sender, or the sender's
@@ -1986,6 +2209,9 @@ fn build_popup_webview(
         // view we hand back. Loading it ourselves would race that navigation.
         .with_related_view(opener.clone())
         .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
+        // Paging keys, Alt-arrows and mouse back/forward work in a popup the
+        // same as in the tab that opened it (see SCROLL_NAV_SHIM_JS).
+        .with_initialization_script_for_main_only(SCROLL_NAV_SHIM_JS, true)
         // A popup is a SURFACE, so both new-window doors are its too. Without
         // these a `target="_blank"` inside an already-popped-up page (the
         // "Continue with Google" on a consent screen) was answered with a null
@@ -2492,6 +2718,11 @@ impl WebSurfaceHost {
             // what it hears — and it must hear it from the page, because the
             // engine never says a word.
             .with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)
+            // Paging keys page the real scroller, Alt-arrows and mouse
+            // buttons 8/9 traverse the ENGINE's history (see
+            // SCROLL_NAV_SHIM_JS). Document-start, main frame only — same
+            // shape as the close shim beside it.
+            .with_initialization_script_for_main_only(SCROLL_NAV_SHIM_JS, true)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -4447,6 +4678,138 @@ mod engine_visibility_locks {
             rehide.contains("if surface.wake_token.get() != token {"),
             "the re-hide no longer honours the re-arm token, so a burst gives its \
              wake back part-way through",
+        );
+    }
+}
+
+/// LOCKS for the scroll/history shim — the fallback that makes paging keys,
+/// Alt-arrows and mouse buttons 8/9 work on web surfaces
+/// (`SCROLL_NAV_SHIM_JS`), plus its two engine-side halves in the vendored
+/// wry (smooth scrolling ON; the swallowed-button re-dispatch that must not
+/// throw).
+///
+/// The shim runs in the ENGINE, which no test on this host can start; the
+/// file's standing split applies (see `download_locks`): the decision lines
+/// are asserted structurally on the shim itself, the WIRING that injects it is
+/// scanned out of the product source, and the decision proper is a pure JS
+/// function (`window.__yggtermScrollNavDecide`) the agent control plane can
+/// drive live. A Rust mirror of that decision would be a second encoding of
+/// the same rule and is deliberately absent.
+#[cfg(test)]
+mod scroll_nav_shim_locks {
+    use super::engine_visibility_locks::{body_of, product_lines};
+    use super::*;
+
+    /// The wiring: BOTH surface builders inject the shim, beside the close
+    /// shim, document-start, main frame only. A popup without it is exactly
+    /// the reader window (docs, sign-in help pages) paging keys die in first.
+    #[test]
+    fn every_surface_builder_injects_the_shim_beside_the_close_shim() {
+        let product = product_lines();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod scroll_nav_shim_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        for builder in ["pub fn open(", "fn build_popup_webview("] {
+            let body = body_of(&product, builder);
+            assert!(
+                body.contains(".with_initialization_script_for_main_only(CLOSE_SHIM_JS, true)"),
+                "`{builder}` no longer injects the close shim this lock anchors \
+                 beside",
+            );
+            assert!(
+                body.contains(
+                    ".with_initialization_script_for_main_only(SCROLL_NAV_SHIM_JS, true)"
+                ),
+                "`{builder}` no longer injects the scroll/history shim — paging \
+                 keys and mouse back/forward die on every page this builder \
+                 creates",
+            );
+        }
+    }
+
+    /// The stand-down clauses — every line where the shim yields to somebody
+    /// with a better claim on the key. Each needle is a decision line; losing
+    /// one turns the fallback into a hijacker.
+    #[test]
+    fn the_decision_stands_down_everywhere_a_page_or_widget_owns_the_key() {
+        for needle in [
+            // Idempotent under re-injection, same latch shape as the close shim.
+            "if (window.__yggtermScrollNavShim) { return; }",
+            // A page that answered first keeps the key: the shim is a stand-in
+            // for the DEFAULT action, and default actions run last.
+            "if (f.defaultPrevented) { return 'stand-down'; }",
+            // Editable targets are never hijacked.
+            "return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT'",
+            "|| el.isContentEditable === true;",
+            "if (f.editable || f.keyWidget) { return 'stand-down'; }",
+            // Space yields to interactive targets — stock browser semantics;
+            // scrolling here would fire buttons.
+            "if (space && f.interactive) { return 'stand-down'; }",
+            // No double scroll where the engine's own handler already works:
+            // a scrollable viewport, or a scrollable ancestor of the target.
+            "if (f.viewportScrolls || f.nestedScroller) { return 'stand-down'; }",
+            // The pure decision stays exposed for live probing.
+            "window.__yggtermScrollNavDecide = decide;",
+            // And the listeners stay in the BUBBLE phase — capture would decide
+            // before the page has spoken, which no default action does.
+            "}, false);",
+        ] {
+            assert!(
+                SCROLL_NAV_SHIM_JS.contains(needle),
+                "the scroll/history shim lost its `{needle}` line",
+            );
+        }
+    }
+
+    /// The act clauses: the pane picked is the largest VISIBLE
+    /// `overflow: auto|scroll` descendant, and history moves are the ENGINE's
+    /// own back/forward list — never a shell-side URL stack.
+    #[test]
+    fn the_fallback_pages_the_largest_visible_scroller_and_history_is_the_engines() {
+        for needle in [
+            "if (oy !== 'auto' && oy !== 'scroll') { continue; }",
+            "if (area > bestArea) { bestArea = area; best = el; }",
+            // A paging verdict with no scroller anywhere leaves the event
+            // entirely alone.
+            "if (!el) { return false; }",
+            "history.back()",
+            "history.forward()",
+            // wry's re-dispatch of swallowed buttons 8/9 arrives as mouseup
+            // button 3/4; claiming it (preventDefault) is what keeps wry's
+            // inline fallback from navigating a SECOND time.
+            "if (e.button !== 3 && e.button !== 4) { return; }",
+            "e.preventDefault();",
+        ] {
+            assert!(
+                SCROLL_NAV_SHIM_JS.contains(needle),
+                "the scroll/history shim lost its `{needle}` line",
+            );
+        }
+    }
+
+    /// The two engine-side halves live in the vendored wry, so they are locked
+    /// the way `download_locks` locks wry's download seam: by scanning the
+    /// source, which survives a re-vendor.
+    #[test]
+    fn the_engine_animates_scrolls_and_a_swallowed_button_still_reaches_the_page() {
+        let wry_gtk = include_str!("../../wry/src/webkitgtk/mod.rs");
+        assert!(
+            wry_gtk.contains("settings.set_enable_smooth_scrolling(true);"),
+            "WebKitGTK smooth scrolling is OFF again — every wheel tick and \
+             paging key lands as a hard jump",
+        );
+        let synthetic = include_str!("../../wry/src/webkitgtk/synthetic_mouse_events.rs");
+        assert!(
+            synthetic
+                .contains("document.elementFromPoint({x},{y}) || document.documentElement"),
+            "the synthesized button-8/9 event can throw on a null \
+             `elementFromPoint` again — the GTK press was already swallowed \
+             (`Propagation::Stop`), so a throwing dispatch eats the only copy \
+             and mouse back/forward go dead with no error anywhere",
         );
     }
 }
