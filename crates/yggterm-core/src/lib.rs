@@ -17,6 +17,9 @@ pub mod notification_audio;
 mod perf;
 pub mod render_probe;
 mod retention;
+/// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of
+/// 2026-07-30.
+pub mod session_bus;
 mod session_kind;
 mod telemetry;
 mod titles;

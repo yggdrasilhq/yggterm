@@ -1161,6 +1161,13 @@ fn maybe_handoff_to_preferred_headless_executable(
 }
 
 fn main() -> Result<()> {
+    // ⭐ FIRST, before the logger and before any thread: see
+    // `yggterm_core::session_bus`. This binary spawns daemons, shadow clients and
+    // web surfaces, and a GLib autolaunch in any of them leaks a session bus plus
+    // its activated helper daemons permanently — 4,574 MB of them were measured on
+    // the live host. Children inherit whatever we resolve here.
+    let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -1661,7 +1668,10 @@ fn main() -> Result<()> {
             // A LOCAL /proc walk, not an app-control round trip: the profile is
             // most needed when the GUI is too loaded to answer a socket.
             "memory" | "mem" => {
-                run_app_control_memory_profile(args.iter().any(|arg| arg == "--json"))
+                run_app_control_memory_profile(
+                    args.iter().any(|arg| arg == "--json"),
+                    args.iter().any(|arg| arg == "--sweep"),
+                )
             }
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
