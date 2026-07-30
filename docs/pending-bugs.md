@@ -205,6 +205,17 @@ symbol rather than trusting a line number:**
   Smallest fix that makes passkeys real for agents: **have `web ensure` await
   `SurfacePolicyGate::Ready`** before returning.
 
+  → **Fix built (`lane/dev/ensure-policy-gate`), awaiting live verification.**
+  `web ensure` now awaits the policy gate before arming a build: bounded 8 s
+  wait, exhausted fetches are re-armed and re-driven in the same call, and a
+  gate that never lands refuses with `reason: policy_gate_not_ready` naming
+  the gate state — never a silent unprotected build. The exhausted state is
+  now named (`SurfacePolicyGate::Abandoned`) instead of folding into `Absent`,
+  and every ensure envelope reports `policy_gate`. Items 1–2 of this entry are
+  covered on the agent path; item 3 (silent `about:blank` reset) and item 4
+  (lease invisibility, `eval` statement-form nulls) are NOT fixed. Remove this
+  entry only after a live passkey ceremony on an agent-created surface.
+
 - **★★ AGENT CO-BROWSE CANNOT COMPLETE AN OTP LOGIN — the logged-in plane stops
   at the door (2026-07-28).** Full field report, seven confirmed defects and
   nine costed feature asks: **[`docs/agent-cobrowse-gaps-2026-07-28.md`](agent-cobrowse-gaps-2026-07-28.md)**.
@@ -224,6 +235,13 @@ symbol rather than trusting a line number:**
      page instead of opening a tab. Destroyed a live page mid-job.
   4. `YGGTERM_APP_CONTROL_PID` is honoured by `terminal new` but NOT by
      `web ensure`, which then refuses while naming that same variable.
+     → **Fixed on `lane/dev/ensure-policy-gate`, awaiting live verification.**
+     Root cause: BOTH binaries' `server app` dispatch blocks REMOVED the
+     exported variable whenever the invocation carried no `--pid` flag, so the
+     ambient default never survived to resolution and whether a verb appeared
+     to honour it depended on the client roster. Targeting now goes through
+     one owner (`yggterm_server::apply_app_control_target_overrides`): an
+     explicit flag wins, no flag leaves the exported environment standing.
   Highest-value asks, in order: trusted input into an unmapped surface (D1),
   `--gesture full` (D2), verb-level `--expect` post-conditions (D3 — this run
   reported five "successful" add-to-cart clicks that had all failed), and
