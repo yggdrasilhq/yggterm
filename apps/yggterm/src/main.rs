@@ -6311,6 +6311,29 @@ mod tests {
                 "the keytips arm must route `{verb}` through the app-control verbs:\n{arm}"
             );
         }
+
+        // BOTH binaries, verb-for-verb: the headless twin is the binary agents
+        // actually call, and it shipped WITHOUT this arm the first time — the
+        // audit answered "unsupported app control command" on a fresh daemon
+        // while every lock here was green, because nothing pinned the twin.
+        // Same split-dispatch class the app-control target work closed.
+        let headless = include_str!("bin/yggterm-headless.rs");
+        let headless_arm_start = headless
+            .find("\"keytips\" => {")
+            .expect("the headless keytips arm exists — agents reach app control through yggterm-headless");
+        let headless_arm = &headless[headless_arm_start..headless_arm_start + 1_400];
+        assert!(!headless_arm.contains("querySelectorAll"));
+        for verb in [
+            "run_app_control_keytips_audit",
+            "run_app_control_keytips_overlay(true",
+            "run_app_control_keytips_overlay(false",
+        ] {
+            assert!(
+                headless_arm.contains(verb),
+                "the HEADLESS keytips arm must route `{verb}` — a verb on one \
+                 binary only is the split-dispatch trap"
+            );
+        }
     }
 
     // ⛔ UNDER-GLASS IS OPT-IN, and this test used to assert the opposite.
