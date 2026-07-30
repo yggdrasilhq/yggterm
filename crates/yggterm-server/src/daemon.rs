@@ -555,6 +555,104 @@ struct MigratableSignals {
     /// recognized agent working indicator. Only ever ADDS safety (an agent
     /// genuinely mid-turn but momentarily silent); shells never depend on it.
     screen_shows_working: bool,
+    /// Has the session's agent TRANSCRIPT grown recently?
+    ///
+    /// ⚠ **This is the only signal that sees a stalled main loop with live
+    /// subagents, and without it the other four all read "idle" on a session
+    /// doing hours of real work.** Measured on jojo 2026-07-30:
+    ///
+    /// - `activity_idle_ms` climbs, because a stalled main loop paints nothing;
+    /// - `screen_shows_working` is false, because there is no `esc to interrupt`
+    ///   footer while the main loop waits;
+    /// - and `foreground_command_running` — the signal whose whole purpose is to
+    ///   catch silent children — **reads `Some(false)` for every agent session**,
+    ///   because the wrapper is `bash -c`, which has no job control and therefore
+    ///   runs `claude` in its OWN process group. Wrapper pgrp, tty tpgid and
+    ///   child pgrp were all measured equal on two live CC sessions. There is no
+    ///   separate foreground group to notice.
+    ///
+    /// So all four cleared while subagents worked, and the session was
+    /// releasable. The user's words for losing one of these: *"very very very
+    /// expensive."* A transcript, by contrast, keeps growing the whole time a
+    /// subagent or workflow runs — this project already treats transcript growth
+    /// as the truth of whether an agent is alive.
+    transcript: TranscriptActivity,
+}
+
+/// Whether an agent session's transcript is still being written.
+///
+/// Three states rather than an `Option<u64>`, because "a shell has no transcript"
+/// and "this agent's transcript could not be read" must not collapse into one
+/// value: the first must never block (shells are the common case and would stop
+/// migrating entirely), and the second must ALWAYS block (the safety bias this
+/// predicate is built on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptActivity {
+    /// Not an agent CLI session — a plain shell. No transcript exists by
+    /// definition, so this never blocks.
+    NotAnAgentSession,
+    /// Milliseconds since the transcript last grew.
+    Idle(u64),
+    /// An agent session whose transcript could not be read. BLOCKS: an
+    /// unreadable liveness signal on a session that might have live subagents is
+    /// exactly the ambiguity that must resolve to "leave it alone".
+    Unknown,
+}
+
+/// Does an agent CLI run anywhere under this pid?
+///
+/// Matches `/proc/<pid>/comm` against every shipped CLI's `binary_name` — the
+/// existing SSOT — rather than a private list, so a fifth CLI is covered by
+/// adding data, which is the whole point of the harness contract.
+///
+/// ⚠ `comm` is TRUNCATED TO 15 BYTES by the kernel, so a long binary name is
+/// compared on its truncated prefix.
+#[cfg(unix)]
+fn process_tree_runs_agent_cli(pid: u32) -> bool {
+    fn comm_is_agent(pid: u32) -> bool {
+        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            return false;
+        };
+        let comm = comm.trim();
+        yggterm_core::AGENT_CLIS.iter().any(|cli| {
+            let name = cli.binary_name;
+            comm == name || (name.len() > 15 && comm == &name[..15])
+        })
+    }
+    // The wrapper itself, then one sweep of everything that claims it as parent.
+    // A single level is enough: `bash -c "… && claude"` puts the agent directly
+    // under the wrapper, which is the shape every agent row has.
+    if comm_is_agent(pid) {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(candidate) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let parent = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok())
+        });
+        if parent == Some(pid) && comm_is_agent(candidate) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn process_tree_runs_agent_cli(_pid: u32) -> bool {
+    // No /proc: cannot prove the session is a plain shell, so never claim it is.
+    true
 }
 
 /// Pure predicate: is this session SAFE to migrate (release + re-resume on the
@@ -580,6 +678,20 @@ fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) ->
     // (d) optional working-footer guard.
     if signals.screen_shows_working {
         return false;
+    }
+    // (e) the transcript is not still being written. THE SUBAGENT CLAUSE: (a),
+    // (c) and (d) all clear on an agent session whose main loop is stalled while
+    // its subagents and workflows keep working, so without this the most
+    // expensive session on the machine is the easiest one to release. A shell
+    // has no transcript and is unaffected.
+    match signals.transcript {
+        TranscriptActivity::NotAnAgentSession => {}
+        TranscriptActivity::Unknown => return false,
+        TranscriptActivity::Idle(idle_ms) => {
+            if idle_ms < idle_threshold_ms {
+                return false;
+            }
+        }
     }
     true
 }
@@ -3367,6 +3479,35 @@ impl DaemonRuntime {
                 .as_deref()
                 .map(yggterm_core::screen_text_shows_agent_working)
                 .unwrap_or(false),
+            transcript: self.session_transcript_activity(runtime_key),
+        }
+    }
+
+    /// Is an agent CLI running under this runtime, and is it safe to call idle?
+    ///
+    /// Classified from the PTY's OWN process tree rather than the session path,
+    /// because `local://` carries shells and every local agent kind alike —
+    /// prefix dispatch is banned for exactly this reason (AGENTS.md).
+    ///
+    /// ⚠ **Agent sessions currently answer [`TranscriptActivity::Unknown`], which
+    /// BLOCKS release.** That is deliberate and it is the safe direction. The four
+    /// other signals were all measured clearing on an agent session whose main
+    /// loop was stalled while its subagents worked — including
+    /// `foreground_command_running`, which cannot help here because `bash -c` has
+    /// no job control and runs the agent in its own process group. Until a
+    /// positive liveness signal is wired (transcript freshness by session id), an
+    /// agent runtime is never released. A lingering old daemon is explicitly
+    /// acceptable under the constitution; losing a working session is not.
+    fn session_transcript_activity(&self, runtime_key: &str) -> TranscriptActivity {
+        let Some(pid) = self.terminals.session_process_id(runtime_key) else {
+            // Not owned / no live runtime: every other signal already answers
+            // `None` here and blocks. Say "unknown" rather than inventing a shell.
+            return TranscriptActivity::Unknown;
+        };
+        if process_tree_runs_agent_cli(pid) {
+            TranscriptActivity::Unknown
+        } else {
+            TranscriptActivity::NotAnAgentSession
         }
     }
 
@@ -15839,6 +15980,7 @@ mod tests {
 
     use super::{
         MigratableSignals, MigrationCandidateRow, RemoteMachineRefreshQueueStatus,
+        TranscriptActivity,
         SERVER_PROTOCOL_VERSION, apply_terminal_runtime_truth_to_snapshot,
         daemon_background_copy_chore_enabled_from_env, mark_remote_machine_refresh_queued,
         parse_daemon_version_triple, persisted_state_content_hash,
@@ -15861,6 +16003,9 @@ mod tests {
             has_pending_draft: Some(false),
             foreground_command_running: Some(false),
             screen_shows_working: false,
+            // The baseline is a SHELL: it has no transcript, so clause (e) must
+            // not block it. Agent sessions get their own cases below.
+            transcript: TranscriptActivity::NotAnAgentSession,
         }
     }
 
@@ -15921,6 +16066,92 @@ mod tests {
                 "an unavailable signal must never be treated as migratable"
             );
         }
+    }
+
+    /// ⭐ THE SUBAGENT CLAUSE. The user's warning, verbatim: *"our working
+    /// tracking is buggy, specially when the main agent stall for hours and the
+    /// sub-agents and workflows keep on working. That is a working session and
+    /// that should not die. A death of such a session is very very very
+    /// expensive."*
+    ///
+    /// This fixture is that session as MEASURED on jojo (2026-07-30), and the
+    /// measurement is the point: **all four original signals clear.**
+    ///
+    /// - output-idle, because a stalled main loop paints nothing;
+    /// - no draft;
+    /// - no working footer, because there is no `esc to interrupt` while the main
+    ///   loop waits;
+    /// - and `foreground_command_running` reads `Some(false)` — the signal whose
+    ///   entire purpose is catching silent children. It cannot help, because the
+    ///   row's wrapper is `bash -c`, which has no job control and therefore runs
+    ///   `claude` in its OWN process group. Wrapper pgrp, tty tpgid and child
+    ///   pgrp were all measured equal on two live sessions.
+    ///
+    /// So before clause (e) this session was migratable, and the most expensive
+    /// thing on the machine was the easiest to release.
+    #[test]
+    fn a_stalled_main_loop_with_live_subagents_is_never_migratable() {
+        let mut sig = migratable_idle_session();
+        sig.transcript = TranscriptActivity::Unknown;
+
+        // Prove the trap first: every ORIGINAL signal says "go".
+        assert_eq!(sig.activity_idle_ms, Some(60_000));
+        assert_eq!(sig.has_pending_draft, Some(false));
+        assert_eq!(
+            sig.foreground_command_running,
+            Some(false),
+            "measured on live CC sessions: bash -c gives the agent no separate \
+             process group, so this signal cannot see a working agent"
+        );
+        assert!(!sig.screen_shows_working);
+
+        assert!(
+            !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "an agent session whose liveness cannot be proven must NEVER be \
+             released — the four OS signals all clear on a stalled main loop \
+             whose subagents are working, and losing that session is the most \
+             expensive failure this daemon has"
+        );
+    }
+
+    /// A transcript still being written blocks release even when it is the ONLY
+    /// thing that objects, and stops blocking once it too has gone quiet past the
+    /// threshold. Without the second half this would be a gate that never opens.
+    #[test]
+    fn transcript_freshness_blocks_release_and_staleness_releases_it() {
+        let mut sig = migratable_idle_session();
+        sig.transcript = TranscriptActivity::Idle(1_000);
+        assert!(
+            !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "a transcript written 1s ago means work is landing right now"
+        );
+
+        sig.transcript = TranscriptActivity::Idle(MIGRATE_IDLE_MS - 1);
+        assert!(
+            !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "just inside the threshold must still block"
+        );
+
+        sig.transcript = TranscriptActivity::Idle(MIGRATE_IDLE_MS);
+        assert!(
+            session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "a genuinely quiet agent session must still be releasable, or the \
+             drain can never converge"
+        );
+    }
+
+    /// A plain shell has no transcript and must be unaffected. If clause (e)
+    /// blocked on absence, migration would stop for the commonest session there
+    /// is and the drain would never converge — the constitution's "the drain must
+    /// not require a quiet window" failure, reintroduced.
+    #[test]
+    fn a_shell_without_a_transcript_still_migrates() {
+        let sig = migratable_idle_session();
+        assert_eq!(sig.transcript, TranscriptActivity::NotAnAgentSession);
+        assert!(
+            session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "the absence of a transcript is not evidence of work"
+        );
     }
 
     fn migration_row(key: &str, re: bool, mig: bool, idle_ms: u64) -> MigrationCandidateRow {
