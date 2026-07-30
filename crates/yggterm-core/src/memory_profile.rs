@@ -88,6 +88,15 @@ pub enum Role {
     SessionHelper,
     /// A crash handler. Accumulates one per crash and never exits on its own.
     CrashHandler,
+    /// An agent CLI running inside one of our sessions — `claude`, `codex`, and
+    /// whatever comes next.
+    ///
+    /// **These are OURS.** Handing off `ssh <machine> && cd && claude -r <uuid>`
+    /// IS the product, so the agent a click starts is yggterm's cost in exactly
+    /// the sense the module header means: what we spawn, we account for. Filing
+    /// them under `Other` was the same "not ours" reflex that hid the D-Bus
+    /// helpers, and it understated the plane by 1,117 MB on the live host.
+    AgentSession,
     /// Anything else.
     Other,
 }
@@ -130,6 +139,12 @@ impl Role {
         if comm.starts_with("drkonqi") {
             return Role::CrashHandler;
         }
+        // Agent CLIs. Matched by name here; whether a given one is OURS is
+        // decided by the env marker in `profile`, because the user may also run
+        // an agent in a terminal we did not launch.
+        if AGENT_CLI_COMMS.iter().any(|name| comm == *name) {
+            return Role::AgentSession;
+        }
         Role::Other
     }
 
@@ -143,10 +158,14 @@ impl Role {
             Role::DbusDaemon => "session bus daemons",
             Role::SessionHelper => "session helpers (portal, secrets, a11y)",
             Role::CrashHandler => "crash handlers",
+            Role::AgentSession => "agent sessions (claude/codex we launched)",
             Role::Other => "other",
         }
     }
 }
+
+/// Agent CLI process names, as `/proc/<pid>/comm` reports them.
+const AGENT_CLI_COMMS: [&str; 3] = ["claude", "codex", "claude.exe"];
 
 /// Is this a PRIVATE, autolaunched session bus rather than the user's real one?
 ///
@@ -264,7 +283,14 @@ pub fn profile(samples: &[ProcSample]) -> MemoryProfile {
             }
         }
 
-        if is_plane_role(role) || (on_private_bus && role == Role::SessionHelper) {
+        // THE MARKER CLAUSE. A process wearing our environment is our cost,
+        // whatever it is called — that is the module's own rule, and this field
+        // was collected and then ignored in the first version, which understated
+        // the plane by the two agent sessions the product exists to launch.
+        if is_plane_role(role)
+            || sample.yggterm_marked
+            || (on_private_bus && role == Role::SessionHelper)
+        {
             plane_committed = plane_committed.saturating_add(committed);
         }
     }
@@ -556,6 +582,50 @@ mod tests {
             "a majority-swapped web fleet is the audio-glitch mechanism and must be \
              called out: {:?}",
             report.warnings
+        );
+    }
+
+    /// ⭐ THE MARKER CLAUSE. A process wearing our environment is OUR cost,
+    /// whatever it is called.
+    ///
+    /// The first version of this module collected `yggterm_marked` and then never
+    /// read it, so the two `claude` sessions the product exists to launch — 1,117 MB
+    /// on the live host, each carrying 36 `YGGTERM_*` variables under our own
+    /// wrapper — were filed under "other" and reported as not ours. That is the
+    /// same "not ours" reflex that hid the D-Bus helpers for three weeks, and the
+    /// user caught it: *"agent sessions not ours sounds sus."*
+    ///
+    /// Handing off `ssh <machine> && cd && claude -r <uuid>` IS the product. What
+    /// we spawn, we account for.
+    #[test]
+    fn a_process_wearing_our_environment_is_counted_as_ours_whatever_it_is_called() {
+        let mut agent = sample(100, "claude", 200_000, 400_000, None);
+        agent.yggterm_marked = true; // 36 YGGTERM_* vars, measured
+        let mut stranger = sample(101, "claude", 90_000, 0, None);
+        stranger.yggterm_marked = false; // an agent the user ran themselves
+
+        let report = profile(&[agent.clone(), stranger.clone()]);
+
+        assert_eq!(
+            Role::classify("claude"),
+            Role::AgentSession,
+            "an agent CLI must be its own visible line, not buried in 'other'"
+        );
+        assert_eq!(
+            report.yggterm_plane_committed_kb,
+            agent.committed_kb(),
+            "the marked agent session must be inside the plane total, and the \
+             unmarked one must not — ownership is the env marker, not the name"
+        );
+
+        // And the marker carries ANY name: the next leak will wear a different one.
+        let mut oddity = sample(102, "some-helper-we-spawned", 10_000, 20_000, None);
+        oddity.yggterm_marked = true;
+        assert_eq!(
+            profile(&[oddity.clone()]).yggterm_plane_committed_kb,
+            oddity.committed_kb(),
+            "attribution must not depend on a name allow-list — that is what \
+             hid 4.5 GB"
         );
     }
 
