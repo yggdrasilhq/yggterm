@@ -105,6 +105,30 @@ symbol rather than trusting a line number:**
 
 ## Standing traps / other open bugs
 
+- **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
+  refuse-exit landmine (user-reported 2026-07-30 night; live-diagnosed and
+  CURED on the live host, the DESIGN fix still owed).** Deploying a new
+  `ychrome` binary makes the RUNNING daemon stale; `ensure()` then "refuses
+  loudly on stale+busy" (round 27) — which means **every fresh `ychrome
+  <url>` invocation exits immediately** until someone runs `ychrome daemon
+  restart` by hand. To the user that is "ychrome suddenly quits to the
+  terminal", hours after an agent deployed binaries. Compounding it: two of
+  the live host's ychrome rows were LOCAL-VARIANT placeholder wedges (the
+  same class as the remote-row wedge below — planning banner, launch never
+  fired), so their relaunches went into dead PTYs. What cured it live:
+  `ychrome daemon restart` (honest handover, surfaces re-registered), then
+  cycling each session's CLI onto the new binary (`routable=yes` returns; a
+  session with no saved page comes back at the profile picker — honest).
+  **The design fix owed:** a new invocation against a stale-but-busy daemon
+  should ROUTE into the running daemon with a one-line stale warning — the
+  old code is still serving perfectly well — and retirement should happen on
+  the user's schedule, never as a precondition for opening a page. A refusal
+  is only honest when routing is genuinely impossible.
+  ⚠ Related trap for agents: after ANY ychrome fleet deploy, the daemon on
+  every GUI host is stale by definition — hand it over as part of the deploy
+  (clients and daemon together per the round-29 mixed-version note), or the
+  user hits the landmine.
+
 - **★★ THE YCHROME VIEWPORT Z-ORDER — UNDER-GLASS ARMED ON THE LIVE HOST,
   USER CONFIRMATION OWED (was: "every hidden un-hidden trigger breaks and
   recomputes the viewport", 2026-07-30).** Phase F under-glass IS the fix the
@@ -222,6 +246,12 @@ symbol rather than trusting a line number:**
   3. **ychrome is single-instance per profile and silently reuses the running
      session** — a second `ychrome --profile X <url>` replaces the existing
      page instead of opening a tab. Destroyed a live page mid-job.
+     **✅ FIXED IN-TREE (ychrome merge d3dae32, 2026-07-31):** a routed url
+     reports "opened as a new tab in the running session" and exits 0; an
+     unrouted url on a stream with another pid's live anchor REFUSES by name
+     (never a silent hijack); every anchor-here fallback names its reason.
+     4 locks red-proven. ⚠ Live verify owed; residuals in the lane report
+     (suspended-sibling anchor, no-arg picker path).
   4. `YGGTERM_APP_CONTROL_PID` is honoured by `terminal new` but NOT by
      `web ensure`, which then refuses while naming that same variable.
   Highest-value asks, in order: trusted input into an unmapped surface (D1),
