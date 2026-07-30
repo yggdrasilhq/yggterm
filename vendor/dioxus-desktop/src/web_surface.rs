@@ -2789,6 +2789,47 @@ impl WebSurfaceHost {
         }
     }
 
+    /// The ENGINE's own back/forward availability for surface `id`.
+    ///
+    /// ⚠ The shell used to answer this from a URL stack it appended to only when
+    /// IT drove a navigation — so clicking links around a site (the normal way
+    /// anyone browses) grew no history at all and both buttons stayed dead. The
+    /// engine has always known; nobody asked it.
+    pub fn nav_state(&self, id: u64) -> Option<(bool, bool)> {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        self.surfaces.borrow().get(&id).map(|s| {
+            let webkit = s.webview.webview();
+            (webkit.can_go_back(), webkit.can_go_forward())
+        })
+    }
+
+    /// Step the ENGINE's history. Returns false when the surface is gone.
+    pub fn go_back(&self, id: u64) -> bool {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        match self.surfaces.borrow().get(&id) {
+            Some(s) => {
+                s.webview.webview().go_back();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Step the ENGINE's history forward. Returns false when the surface is gone.
+    pub fn go_forward(&self, id: u64) -> bool {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        match self.surfaces.borrow().get(&id) {
+            Some(s) => {
+                s.webview.webview().go_forward();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn navigate(&self, id: u64, url: &str) {
         if let Some(s) = self.surfaces.borrow().get(&id) {
             let _ = s.webview.load_url(url);
