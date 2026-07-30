@@ -435,6 +435,21 @@ done becomes **`excused` is small and each entry is individually justified**, no
 `orphan == 0`. An exempt SUBTREE must be forbidden outright — exemption is
 per-element, with a reason string, or it is a hiding place.
 
+**Delivered 2026-07-31 with the §12.2 overlay-boundary inversion.** The audit
+(`server app keytips audit [--json]`) now runs the SAME walk as the derive pass
+— one owner for "visible interactable" — and reports
+`reachable (declared + derived) / excused (each with its reason) / orphan`,
+plus a subtree-exemption police list: a `data-keytip-exempt` on a
+non-interactable container that holds interactables is a violation in its own
+right. The old subtree stamps (`settings-panel`, `notifications-panel`,
+`connect-form`, `daemon-control`, `active-session-menu`, `search`) are
+dissolved; their controls derive letters at overlay open. The per-element
+excused set that remains: the display-none state markers, the modal key-hints
+bar, `list-item` row affordances (§8), and the search input (aliased by the
+declared `search.focus`). `server app keytips show|hide` opens/dismisses the
+overlay through the same terminus as the clean ALT tap, so an agent can see
+the layer it is auditing.
+
 **⛔ The corrected audit was ITSELF miscounting — fixed 2026-07-22.** It tested
 `closest('[data-keytip-exempt]')` BEFORE `querySelector('[data-keytip-node]')`,
 so a control that is genuinely wired but still sits inside a subtree-exempt panel
@@ -499,6 +514,27 @@ is only needed to OVERRIDE the derived one.
   in `shell.rs` rather than through `crates/yggui`, which is why there is no single
   place to make this change. The component layer is the prerequisite, and it is the
   bulk of the work — this is a structural inversion, not a feature.
+- **Achieved TODAY at the OVERLAY boundary (2026-07-31), pending that layer.**
+  On every overlay OPEN the bridge runs ONE walk over the visible DOM
+  (`KEYTIP_INTERACTABLE_WALK_JS` in `shell.rs` — the same function the §12 audit
+  runs): every visible interactable that is neither DECLARED (`data-keytip-node`
+  on itself or a child marker — §6, declared beats derived) nor per-element
+  exempt is stamped `data-keytip-derived-id="d<N>"` (document order) and
+  reported to the one Rust bridge terminus, which assigns letters through the
+  SAME `assign_scope` ladder (letters already claimed by the registry in the
+  open scope are excluded from the pool), stamps `data-keytip-tip` back, and
+  the §9 painter paints them unchanged. A chord letter that misses the registry
+  tree resolves against the derived map; the map and the stamps die with the
+  overlay. While a top modal is up (`[data-yggterm-modal-open]` names the kind,
+  `[data-yggterm-modal-root]` anchors its subtree) the walk confines itself to
+  that modal — which is what puts badges INSIDE modals (§4, §12.3). Derivation
+  is per-open and deterministic (§5: same DOM ⇒ same letters), and PTY safety
+  is untouched (§11.2 — letters are only intercepted while the overlay is up).
+  When the component layer lands, component-emitted declarations replace the
+  DOM walk; the audit keeps the same three numbers either way. Known limit,
+  carried honestly: the ladder still has no two-letter tips (§5 step 7), so
+  once single letters+digits run out the surplus elements go unbadged — the
+  first claimant in document order keeps a contested last-resort letter.
 
 ### 12.3 Modals must take the keyboard (user-reported, 2026-07-22)
 

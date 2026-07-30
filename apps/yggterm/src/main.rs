@@ -82,90 +82,6 @@ use yggterm_shell::{
 };
 use yggui_contract::UiTheme;
 
-/// The no-orphan-affordance audit (spec §12, `docs/alt-keytips.md`). Walks the
-/// visible DOM interactables and reports every one carrying neither a
-/// `data-keytip-node` marker (declared) nor `data-keytip-exempt`. The KeyTip
-/// tree is built in Rust; this only reads the DOM to MEASURE coverage, which is
-/// what makes "wire the whole UI" a number that must be zero. Runs through the
-/// existing dom-eval channel (`return`s its report).
-const KEYTIPS_AUDIT_JS: &str = r#"
-    const SEL = 'button, [role=button], a[href], input, select, [data-sidebar-row-path], [data-app-verb]';
-    function vis(el){
-        if (!el.getClientRects().length) return false;
-        const r = el.getBoundingClientRect();
-        if (r.width < 2 || r.height < 2) return false;      // 1px shortcut proxies are not affordances
-        const cs = window.getComputedStyle(el);
-        if (!cs) return true;
-        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
-        if (parseFloat(cs.opacity || '1') === 0) return false;
-        if (cs.pointerEvents === 'none') return false;      // cannot be clicked -> not an affordance
-        return true;
-    }
-    // §12.1: report REACHABLE / EXCUSED / ORPHAN as three numbers, not one.
-    // The old audit counted `data-keytip-exempt` as satisfied and returned a
-    // single orphan_count, so exempting a SUBTREE silently retired every control
-    // inside it. Measured 2026-07-22: it read 0 while 6 of 71 affordances were
-    // reachable (25 hidden under settings-panel alone). Subtree suppression is
-    // now a VIOLATION class of its own — exemption is per-element or it is a
-    // hiding place.
-    function describe(el){
-        const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('data-app-verb') || el.id || '')
-            .replace(/\s+/g, ' ').trim().slice(0, 60);
-        return { tag: el.tagName.toLowerCase(), id: el.id || '', cls: (el.className && el.className.baseVal !== undefined ? el.className.baseVal : String(el.className || '')).slice(0, 60), label: label };
-    }
-    const all = Array.prototype.slice.call(document.querySelectorAll(SEL));
-    const visible = all.filter(vis);
-    const orphans = [];
-    const subtreeSuppressed = [];
-    const excusedReasons = {};
-    const suppressedBySubtree = {};
-    let reachable = 0, excused = 0;
-    visible.forEach(function(el){
-        if (el.hasAttribute('data-keytip-node')) { reachable++; return; }
-        // A control whose badge marker is a CHILD span -- the shipped pattern for
-        // every wired button, so the badge paints over the control -- is reachable
-        // no matter what encloses it. This MUST precede the exempt-ancestor test:
-        // otherwise wiring a control that still sits inside a subtree-exempt panel
-        // reports it as a violation, and the metric cannot show its own fix.
-        // Measured 2026-07-22: the already-wired settings/theme.light|dark buttons
-        // were both counted as `suppressed_by: settings-panel`.
-        if (el.querySelector('[data-keytip-node]')) { reachable++; return; }
-        if (el.hasAttribute('data-keytip-exempt')) {
-            excused++;
-            const why = el.getAttribute('data-keytip-exempt') || '(no reason)';
-            excusedReasons[why] = (excusedReasons[why] || 0) + 1;
-            return;
-        }
-        const exemptAncestor = el.closest('[data-keytip-exempt]');
-        if (exemptAncestor) {
-            const why = exemptAncestor.getAttribute('data-keytip-exempt') || '(no reason)';
-            suppressedBySubtree[why] = (suppressedBySubtree[why] || 0) + 1;
-            const row = describe(el); row.suppressed_by = why;
-            subtreeSuppressed.push(row);
-            return;
-        }
-        // The declared-descendant case is handled above; what is left here is a
-        // container whose only marked descendant is exempt.
-        if (el.querySelector('[data-keytip-exempt]')) { reachable++; return; }
-        orphans.push(describe(el));
-    });
-    const violations = orphans.length + subtreeSuppressed.length;
-    return {
-        visible_interactables: visible.length,
-        reachable: reachable,
-        excused: excused,
-        excused_reasons: excusedReasons,
-        subtree_suppressed_count: subtreeSuppressed.length,
-        suppressed_by_subtree: suppressedBySubtree,
-        subtree_suppressed: subtreeSuppressed.slice(0, 300),
-        orphan_count: orphans.length,
-        orphans: orphans.slice(0, 300),
-        // The number that must go to zero. Subtree suppression counts against
-        // it, so the old escape hatch can no longer flatter the score.
-        violations: violations,
-        reachable_pct: visible.length ? Math.round((reachable / visible.length) * 100) : 100
-    };
-"#;
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
@@ -1343,7 +1259,7 @@ fn print_server_app_help() {
   yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
-  yggterm server app keytips audit
+  yggterm server app keytips <audit [--json]|show|hide>
   yggterm server app command <list|invoke <id>>
 {web_usage}
 row tenancy (server app terminal new): these flags are parsed by the SAME reader
@@ -3022,11 +2938,20 @@ fn main() -> Result<()> {
             "keytips" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("audit");
                 match action {
-                    // The no-orphan-affordance audit (spec §12): walk the visible
-                    // DOM interactables and report every one carrying neither
-                    // `data-keytip-node` nor `data-keytip-exempt`. The definition of
-                    // done for the ALT+ layer is `orphan_count: 0`.
-                    "audit" => run_app_control_dom_eval(KEYTIPS_AUDIT_JS, timeout_ms),
+                    // The §12 no-orphan-affordance audit. The GUI runs the ONE
+                    // interactable walk (the same JS the ALT overlay's derive
+                    // pass runs — KEYTIP_INTERACTABLE_WALK_JS in yggterm-shell)
+                    // in count-instead-of-skip mode; this CLI only asks and
+                    // formats. §12.1: the definition of done is `excused` SMALL
+                    // and individually justified, with zero violations.
+                    "audit" => {
+                        let json = args.iter().any(|arg| arg == "--json");
+                        yggterm_server::run_app_control_keytips_audit(json, timeout_ms)
+                    }
+                    // Thin verbs on the GUI's one overlay terminus — agents
+                    // open the layer to see/verify it (live-proof instrument).
+                    "show" => yggterm_server::run_app_control_keytips_overlay(true, timeout_ms),
+                    "hide" => yggterm_server::run_app_control_keytips_overlay(false, timeout_ms),
                     other => anyhow::bail!("unsupported app keytips action: {other}"),
                 }
             }
@@ -6335,7 +6260,6 @@ mod tests {
             );
         }
     }
-    use super::KEYTIPS_AUDIT_JS;
     #[cfg(unix)]
     use super::superseded_client_termination_signal;
     use super::{
@@ -6352,26 +6276,41 @@ mod tests {
         superseded_client_retirement_strategy_label, under_glass_default_armed,
     };
 
-    // §12.1: a control whose badge marker is a child span is REACHABLE, whatever
-    // encloses it. If the exempt-ancestor test ran first, wiring a control inside
-    // a panel that still carries a subtree exemption would report it as a
-    // violation — the metric could not show its own fix. Measured 2026-07-22: the
-    // already-wired settings/theme.light|dark buttons were both counted as
-    // `suppressed_by: settings-panel`. The ORDER is the invariant, so assert the
-    // order rather than the mere presence of the checks.
+    // §12 one-owner rule (rewritten for the §12.2 inversion, 2026-07-31): the
+    // audit's walk lives in yggterm-shell (KEYTIP_INTERACTABLE_WALK_JS, the
+    // same function the ALT overlay's derive pass runs) and this CLI only
+    // ASKS. The predecessor test locked the CLI's own walk ordering — that
+    // walk is gone, and this lock refuses its return: a `querySelectorAll` in
+    // the keytips arm would be a second definition of "visible interactable",
+    // which is exactly the drift the inversion killed. The new-model ordering
+    // lock (declared credit before the per-element exempt test, no closest())
+    // lives beside the walk in yggterm-shell.
     #[test]
-    fn audit_counts_a_declared_descendant_before_testing_for_an_exempt_ancestor() {
-        let declared_descendant = KEYTIPS_AUDIT_JS
-            .find("if (el.querySelector('[data-keytip-node]')) { reachable++; return; }")
-            .expect("audit must credit a control that contains a declared marker");
-        let exempt_ancestor = KEYTIPS_AUDIT_JS
-            .find("el.closest('[data-keytip-exempt]')")
-            .expect("audit must still detect subtree suppression");
+    fn the_keytips_cli_carries_no_walk_of_its_own() {
+        let source = include_str!("main.rs");
+        let arm_start = source
+            .find("\"keytips\" => {")
+            .expect("the keytips CLI arm exists");
+        // The arm ends where the next subcommand arm begins.
+        let arm = &source[arm_start
+            ..arm_start
+                + source[arm_start..]
+                    .find("\"command\" | \"commands\" => {")
+                    .expect("the command arm follows the keytips arm")];
         assert!(
-            declared_descendant < exempt_ancestor,
-            "the declared-descendant credit must precede the exempt-ancestor test, \
-             else a wired control inside an exempt subtree reads as a violation"
+            !arm.contains("querySelectorAll"),
+            "the keytips CLI must ask the GUI's one walk, never carry its own:\n{arm}"
         );
+        for verb in [
+            "run_app_control_keytips_audit",
+            "run_app_control_keytips_overlay(true",
+            "run_app_control_keytips_overlay(false",
+        ] {
+            assert!(
+                arm.contains(verb),
+                "the keytips arm must route `{verb}` through the app-control verbs:\n{arm}"
+            );
+        }
     }
 
     // ⛔ UNDER-GLASS IS OPT-IN, and this test used to assert the opposite.

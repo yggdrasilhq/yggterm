@@ -18308,6 +18308,103 @@ pub fn run_app_control_list_commands(timeout_ms: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server app keytips show|hide` — open/dismiss the ALT+ KeyTips overlay
+/// through the GUI's one overlay terminus (docs/alt-keytips.md §12: the
+/// live-proof instrument — agents open the layer to see and verify it).
+pub fn run_app_control_keytips_overlay(open: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetKeytipsOverlay { open },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// `server app keytips audit [--json]` — the §12 no-orphan-affordance audit.
+/// The GUI runs the ONE interactable walk (the same JS the overlay's derive
+/// pass runs) in audit mode; this prints the §12.1-corrected THREE numbers —
+/// reachable / excused / orphan — with every excused entry's reason, or the
+/// raw response with `--json`.
+pub fn run_app_control_keytips_audit(json: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::KeytipsAudit, timeout_ms)?;
+    if json {
+        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+        return Ok(());
+    }
+    let report = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("result"))
+        .cloned();
+    let Some(report) = report else {
+        // No walk report (older GUI, eval error): fall back to the raw
+        // response so the failure is visible rather than formatted away.
+        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+        return Ok(());
+    };
+    let count = |key: &str| report.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let text = |value: &Value, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let mut out = format!(
+        "scope: {}\nvisible interactables: {}\nreachable: {} (declared {}, derived {})\nexcused: {}\norphans: {}\nviolations: {}\n",
+        report.get("scope").and_then(Value::as_str).unwrap_or("?"),
+        count("visible_interactables"),
+        count("reachable"),
+        count("reachable_declared"),
+        count("reachable_derived"),
+        count("excused"),
+        count("orphan_count"),
+        count("violations"),
+    );
+    for entry in report
+        .get("excused_entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&format!(
+            "  excused [{}] {} — {}\n",
+            text(entry, "scope"),
+            text(entry, "label"),
+            text(entry, "reason"),
+        ));
+    }
+    for entry in report
+        .get("orphans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&format!(
+            "  ORPHAN [{}] {}\n",
+            text(entry, "scope"),
+            text(entry, "label"),
+        ));
+    }
+    for entry in report
+        .get("subtree_exempt_stamps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&format!(
+            "  SUBTREE-EXEMPT VIOLATION <{}> — {}\n",
+            text(entry, "tag"),
+            text(entry, "reason"),
+        ));
+    }
+    write_stdout_payload(out.trim_end())?;
+    Ok(())
+}
+
 pub fn run_app_control_set_theme_editor_values(
     brightness: Option<f32>,
     alpha: Option<f32>,

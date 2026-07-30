@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **ALT+ KeyTips now reach every visible control — the §12.2 inversion, at the
+  overlay boundary.** Opening the ALT layer derives a hotkey badge for every
+  visible interactable that has no declared letter and no per-element excuse:
+  one DOM walk collects them, the existing assignment ladder letters them
+  (declared letters always win), the existing badge painter paints them, and
+  pressing a derived letter clicks its control. Settings, the notifications
+  panel, the Connect SSH form, the daemon control, and dialog buttons are all
+  keyboard-reachable — a top modal confines the badges to itself, so
+  chord-opened dialogs no longer dead-end at the mouse. Subtree
+  `data-keytip-exempt` stamps are dissolved and forbidden; the few remaining
+  exemptions are per-element, each with a named reason. New agent probes:
+  `server app keytips audit [--json]` reports the corrected three numbers
+  (reachable / excused / orphan, plus subtree-exemption violations), and
+  `server app keytips show|hide` opens/dismisses the overlay through the same
+  path as the clean ALT tap.
 - **Fixed: passkeys now reach agent-created browser surfaces.** `web ensure`
   awaits the app's surface policy before building — a surface constructed
   while the policy was still in flight permanently lacked its userscripts and
