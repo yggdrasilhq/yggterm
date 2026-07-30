@@ -2151,12 +2151,43 @@ enum SurfacePolicyGate {
     /// non-browser app gets no ad blocking, and that is correct: adblock is
     /// browsing config, and a dashboard is not browsing.
     Absent,
+    /// Declared, and every fetch attempt for the current `policy_version`
+    /// failed. The reconciler opens the gate anyway (show the page, unprotected
+    /// — a broken control endpoint must not mean a permanently blank viewport
+    /// for the user), but this is NOT `Absent`: an app promised a policy and it
+    /// never arrived. The agent door (`web ensure`) refuses on it instead of
+    /// building, because a surface built now permanently lacks its userscripts
+    /// AND its `yggterm-appctl://` signer bridge — the dead-passkeys surface of
+    /// the 2026-07-28 field report — and `ensure` can re-arm the fetch and
+    /// retry where the reconciler can only show something.
+    Abandoned,
     /// Declared, still in flight. Skip this pass; the fetch completing mutates
     /// state, which re-renders, which runs the loop again. Deterministic, not a
     /// race — and the app declares BEFORE it opens, so this normally resolves
     /// before a rect ever exists.
     Pending,
     Ready(WebSurfacePolicy),
+}
+
+impl SurfacePolicyGate {
+    /// Whether the reconciler must SKIP creating a webview this pass. ONE owner
+    /// for the defer rule, so the reconciler and the `web ensure` arm cannot
+    /// drift: only `Pending` defers (a fetch is coming and userscripts inject
+    /// at document-start only). `Abandoned` deliberately does NOT defer — the
+    /// user-facing reconciler shows the page unprotected once the attempts run
+    /// out; the agent path refuses separately in the `web ensure` arm.
+    fn defers_surface_create(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+    /// The state's name in agent-facing envelopes, refusals and traces.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Abandoned => "abandoned",
+            Self::Pending => "pending",
+            Self::Ready(_) => "ready",
+        }
+    }
 }
 
 /// Attempts at `<control>/policy` for one `policy_version` before the reconciler
@@ -9471,8 +9502,10 @@ async fn web_surface_native_reconcile_loop(
                     // inject at document-start, so a surface created now would
                     // run without them for its whole life. Skip the pass: the
                     // fetch completing mutates state, which re-renders, which
-                    // runs this loop again.
-                    if policy_gate == SurfacePolicyGate::Pending {
+                    // runs this loop again. The defer rule itself lives on the
+                    // gate (one owner) so this branch and the `web ensure`
+                    // arm's await cannot disagree about what `Pending` means.
+                    if policy_gate.defers_surface_create() {
                         continue;
                     }
                     // Lazy-create on first visibility: no hidden-create flash,
@@ -10979,6 +11012,130 @@ fn web_ensure_closed_session_detail(session_path: &str) -> String {
     )
 }
 
+/// How long `web ensure` waits for a declared surface policy to land before
+/// refusing. Spans two ~4s declare heartbeats (each re-arms a failed fetch
+/// while attempts remain) plus a fetch round trip, and stays inside the verb's
+/// 15s transport budget.
+const WEB_ENSURE_POLICY_GATE_WAIT_MS: u64 = 8_000;
+/// Poll cadence while `web ensure` waits on the policy gate.
+const WEB_ENSURE_POLICY_GATE_POLL_MS: u64 = 100;
+/// The `reason` string of the policy-gate refusal, shared by the response and
+/// the trace event so an investigation greps ONE name.
+const WEB_ENSURE_POLICY_GATE_NOT_READY: &str = "policy_gate_not_ready";
+
+/// What the `web ensure` arm should do about the policy gate RIGHT NOW.
+///
+/// Pure, so the lock drives the whole table. The rule this encodes (2026-07-28
+/// field report): an agent-created surface must never be BUILT while the app's
+/// policy is `Pending` — a surface constructed then permanently lacks its
+/// userscripts and its `yggterm-appctl://` signer bridge, which is why
+/// `window.PublicKeyCredential` was undefined on every agent surface. A human
+/// wins that race by sitting still; an agent never does, so the agent door
+/// awaits `Ready` and refuses honestly on timeout instead of building a
+/// silently-unprotected page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebEnsurePolicyGateStep {
+    /// Build: the policy is applied (`Ready`), or no app policy is coming
+    /// (`Absent` — a plain page, or an app that ships no policy).
+    Proceed,
+    /// A fetch is in flight or heartbeat-armed; poll again until the deadline.
+    Wait,
+    /// The fetch ran out of attempts before we arrived: re-arm it and drive
+    /// ONE fetch directly — the exhaustion usually means the fetch lost the
+    /// app's boot race, and by now the endpoint is up.
+    RearmFetch,
+    /// Deadline passed and the gate never became `Ready`: refuse, naming the
+    /// gate state — never an unbounded hang, never a silent `Pending` build.
+    Refuse,
+}
+
+fn web_ensure_policy_gate_step(
+    gate: &SurfacePolicyGate,
+    deadline_passed: bool,
+    rearmed_already: bool,
+) -> WebEnsurePolicyGateStep {
+    match gate {
+        SurfacePolicyGate::Ready(_) | SurfacePolicyGate::Absent => {
+            WebEnsurePolicyGateStep::Proceed
+        }
+        _ if deadline_passed => WebEnsurePolicyGateStep::Refuse,
+        SurfacePolicyGate::Abandoned if !rearmed_already => WebEnsurePolicyGateStep::RearmFetch,
+        SurfacePolicyGate::Abandoned | SurfacePolicyGate::Pending => WebEnsurePolicyGateStep::Wait,
+    }
+}
+
+/// The `web ensure` arm's bounded policy-gate await. Returns the label the
+/// gate settled on (to report in the success envelope), or the refusal payload
+/// when the gate never reached `Ready`/`Absent` inside `wait_ms`.
+///
+/// The re-arm drives [`app_policy_fetch`] — THE fetch owner — directly, so an
+/// abandoned fetch heals in this very call instead of demanding the app bump
+/// its `policy_version`. Journals as it refuses: the field run's only evidence
+/// (`policy: false` on the create trace) was unreachable at verb level, and an
+/// agent must not need a trace file to learn why its surface was refused.
+async fn web_ensure_await_policy_gate(
+    mut state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: &str,
+    wait_ms: u64,
+) -> Result<&'static str, Value> {
+    let deadline = current_millis() + wait_ms;
+    let mut rearmed_already = false;
+    loop {
+        let gate = state.peek().web_surface_policy_gate(session_path);
+        let deadline_passed = current_millis() >= deadline;
+        match web_ensure_policy_gate_step(&gate, deadline_passed, rearmed_already) {
+            WebEnsurePolicyGateStep::Proceed => return Ok(gate.label()),
+            WebEnsurePolicyGateStep::RearmFetch => {
+                rearmed_already = true;
+                if let Some(version) = state
+                    .with_mut(|shell| shell.rearm_abandoned_sidebar_policy_fetch(session_path))
+                {
+                    app_policy_fetch(
+                        state,
+                        session_path.to_string(),
+                        version,
+                        trace_home.clone(),
+                    )
+                    .await;
+                }
+            }
+            WebEnsurePolicyGateStep::Wait => {
+                sleep(Duration::from_millis(WEB_ENSURE_POLICY_GATE_POLL_MS)).await;
+            }
+            WebEnsurePolicyGateStep::Refuse => {
+                let label = gate.label();
+                let detail = format!(
+                    "{session_path}'s app declared a web-surface policy that has not arrived \
+                     (gate: {label} after {wait_ms} ms). A surface built now would permanently \
+                     lack the app's userscripts and the yggterm-appctl:// signer bridge — the \
+                     surface on which WebAuthn reads as unsupported — so nothing was built. \
+                     Retry `web ensure` once the app's control endpoint serves /policy."
+                );
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    WEB_ENSURE_POLICY_GATE_NOT_READY,
+                    json!({
+                        "session_path": session_path,
+                        "policy_gate": label,
+                        "policy_gate_wait_ms": wait_ms,
+                    }),
+                );
+                return Err(json!({
+                    "accepted": false,
+                    "session_path": session_path,
+                    "reason": WEB_ENSURE_POLICY_GATE_NOT_READY,
+                    "policy_gate": label,
+                    "policy_gate_wait_ms": wait_ms,
+                    "detail": detail,
+                }));
+            }
+        }
+    }
+}
+
 /// LOCKS for `web ensure`'s closed-session refusal — BEHAVIOURAL, over the
 /// arm's own preamble.
 ///
@@ -11250,6 +11407,118 @@ mod web_ensure_closed_session_locks {
                 .contains("web_ensure_closed_session_check(ensure_endpoint, &home, &session_path)"),
             "the ensure arm no longer asks its closed-session check ahead of the liveness \
              probe — a closed session can be revived again:\n{preamble}"
+        );
+    }
+}
+
+/// LOCKS for `web ensure`'s policy-gate await (2026-07-28 field report: every
+/// agent-created surface was built with `policy: false, signer: null`, so
+/// `window.PublicKeyCredential` was undefined and the passkey plane was dead).
+///
+/// The decision itself is pure ([`web_ensure_policy_gate_step`]) and locked as
+/// a whole table; the arm's wiring is locked by the same one-needle source
+/// read the closed-session module uses, with the same honesty note: the scan
+/// proves the CALL sits between the arm's start and the line that arms a
+/// build, nothing more — every claim about what the await DOES is made by the
+/// table and by the gate/re-arm tests beside the other policy tests.
+#[cfg(test)]
+mod web_ensure_policy_gate_locks {
+    use super::*;
+
+    /// The whole table, one row per (gate, deadline, rearmed) cell that can
+    /// occur. The two load-bearing rows are named in their messages: a Pending
+    /// gate must NEVER proceed (that is the silent unprotected build), and a
+    /// deadline must ALWAYS refuse (that is the unbounded hang).
+    #[test]
+    fn the_policy_gate_step_table_is_exactly_this() {
+        use WebEnsurePolicyGateStep::*;
+        let ready = SurfacePolicyGate::Ready(WebSurfacePolicy::default());
+        for rearmed in [false, true] {
+            assert_eq!(
+                web_ensure_policy_gate_step(&ready, false, rearmed),
+                Proceed,
+                "a Ready gate is the build path"
+            );
+            assert_eq!(
+                web_ensure_policy_gate_step(&SurfacePolicyGate::Absent, false, rearmed),
+                Proceed,
+                "no app policy is coming — a plain page must not wait"
+            );
+            // Ready/Absent proceed even past the deadline: the answer exists.
+            assert_eq!(web_ensure_policy_gate_step(&ready, true, rearmed), Proceed);
+            assert_eq!(
+                web_ensure_policy_gate_step(&SurfacePolicyGate::Absent, true, rearmed),
+                Proceed
+            );
+            assert_eq!(
+                web_ensure_policy_gate_step(&SurfacePolicyGate::Pending, true, rearmed),
+                Refuse,
+                "the deadline passed and the arm kept waiting — the unbounded hang"
+            );
+            assert_eq!(
+                web_ensure_policy_gate_step(&SurfacePolicyGate::Abandoned, true, rearmed),
+                Refuse
+            );
+        }
+        assert_eq!(
+            web_ensure_policy_gate_step(&SurfacePolicyGate::Pending, false, false),
+            Wait,
+            "a Pending gate proceeded — the silent unprotected build the field \
+             report exists to end"
+        );
+        assert_eq!(
+            web_ensure_policy_gate_step(&SurfacePolicyGate::Pending, false, true),
+            Wait
+        );
+        assert_eq!(
+            web_ensure_policy_gate_step(&SurfacePolicyGate::Abandoned, false, false),
+            RearmFetch,
+            "an abandoned fetch was not retried — ensure cannot heal the boot race"
+        );
+        assert_eq!(
+            web_ensure_policy_gate_step(&SurfacePolicyGate::Abandoned, false, true),
+            Wait,
+            "a second re-arm in one call would loop the fetch forever"
+        );
+    }
+
+    /// THE ARM STILL AWAITS IT, between its start and the line that arms a
+    /// build (`web_surface_headless_wanted`). Same honest caveat as the
+    /// closed-session sibling: this reads the FILE, not the binary, and one
+    /// needle is all it is.
+    #[test]
+    fn the_ensure_arm_awaits_the_gate_before_arming_a_build() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_ensure_policy_gate_locks")),
+            "the scan is reading this test module, so the needle below would be \
+             satisfied by the assertion that names it",
+        );
+
+        let start = product
+            .iter()
+            .position(|line| line.trim() == "AppControlCommand::EnsureWebSurface {")
+            .expect("the ensure arm moved — move this lock with it");
+        let armed = product[start..]
+            .iter()
+            .position(|line| line.contains("web_surface_headless_wanted"))
+            .map(|offset| start + offset)
+            .expect("the ensure arm no longer arms a headless build");
+        let preamble = product[start..armed].join("\n");
+        assert!(
+            preamble.contains("web_ensure_await_policy_gate("),
+            "the ensure arm no longer awaits the policy gate before arming a \
+             build — an agent surface can again be born without its userscripts \
+             and signer bridge:\n{preamble}"
         );
     }
 }
@@ -15703,6 +15972,25 @@ impl ShellState {
             contribution.policy_attempts = 0;
         }
     }
+    /// Re-arm an ABANDONED policy fetch — attempts exhausted for the current
+    /// stamp — so `web ensure` can deliberately retry it (the field mechanism:
+    /// the fetch lost the app's boot race; by ensure time the endpoint is up).
+    /// Returns the stamp to fetch under, or `None` when there is nothing to
+    /// re-arm: no contribution, no declared policy, a policy already held, or
+    /// attempts still running (the heartbeat retry loop owns those). One narrow
+    /// owner so the agent path cannot reset bookkeeping mid-flight fetches
+    /// still depend on.
+    fn rearm_abandoned_sidebar_policy_fetch(&mut self, session_path: &str) -> Option<String> {
+        let contribution = self.sidebar_contributions.get_mut(session_path)?;
+        if contribution.policy.is_some()
+            || contribution.policy_version.is_empty()
+            || contribution.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS
+        {
+            return None;
+        }
+        contribution.policy_attempts = 0;
+        Some(contribution.policy_version.clone())
+    }
     /// The stamp a policy fetch for this session should be filed under. `None`
     /// when the app ships no policy, so there is nothing to fetch.
     fn sidebar_policy_version(&self, session_path: &str) -> Option<String> {
@@ -15862,9 +16150,11 @@ impl ShellState {
         };
         match &contribution.policy {
             Some(policy) => SurfacePolicyGate::Ready(policy.clone()),
-            // Gave up after MAX_POLICY_FETCH_ATTEMPTS: show the page.
+            // Gave up after MAX_POLICY_FETCH_ATTEMPTS: the reconciler shows the
+            // page. Named `Abandoned`, not folded into `Absent`, because the
+            // agent door refuses on it — see the variant's own comment.
             None if contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS => {
-                SurfacePolicyGate::Absent
+                SurfacePolicyGate::Abandoned
             }
             None if contribution.policy_version.is_empty() => SurfacePolicyGate::Absent,
             None => SurfacePolicyGate::Pending,
@@ -67839,6 +68129,39 @@ async fn process_pending_app_control_requests(
                     reloaded = true;
                 }
             }
+            // AWAIT THE POLICY GATE BEFORE ARMING A BUILD (2026-07-28 field
+            // report). Everything above only queues tabs; nothing materializes
+            // for a backgrounded session until the headless-wanted flag is set
+            // below — so this is the last moment before the reconciler can
+            // create a webview for this ask. It runs AFTER the rebuild on
+            // purpose: the rebuild ingests the daemon's retained declare, which
+            // is what creates the contribution the gate reads. A surface that
+            // is ALREADY alive is a lease refresh, not a build — its policy
+            // fate was sealed at its own create, and refusing here would break
+            // every lease renewal on a live page. The human click-to-open path
+            // is untouched: it never enters this arm.
+            if !alive_before {
+                if let Err(refusal) = web_ensure_await_policy_gate(
+                    state,
+                    home.clone(),
+                    &session_path,
+                    WEB_ENSURE_POLICY_GATE_WAIT_MS,
+                )
+                .await
+                {
+                    break 'ensure AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        error: refusal
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        data: Some(refusal),
+                    };
+                }
+            }
             let tabs = state.with_mut(|shell| {
                 let tabs = shell
                     .web_surfaces
@@ -67912,6 +68235,15 @@ async fn process_pending_app_control_requests(
                     "rebuilt_from_daemon_declare": rebuild
                         .as_ref()
                         .is_some_and(DeclareRebuild::rebuilt),
+                    // The policy state this ensure settled on, at verb level —
+                    // the field run's only evidence lived in a trace file. On
+                    // the build path this is "ready"/"absent" (the await above
+                    // refused anything else); on a lease refresh it reports
+                    // whatever the live surface's session currently holds.
+                    "policy_gate": state
+                        .peek()
+                        .web_surface_policy_gate(&session_path)
+                        .label(),
                 })),
             }
         }
@@ -132141,7 +132473,9 @@ mod tests {
     // A broken control endpoint must not mean a permanently blank viewport: the
     // gate opens after MAX_POLICY_FETCH_ATTEMPTS, unprotected but visible. And
     // the retry signal stops, so a dead endpoint is not polled every heartbeat
-    // for the life of the session.
+    // for the life of the session. Exhaustion is NAMED (`Abandoned`, not
+    // `Absent`) so the agent door can refuse what the reconciler shows — but
+    // it still opens the reconciler's gate, which is what this test locks.
     #[test]
     fn an_unreachable_policy_endpoint_eventually_opens_the_gate() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
@@ -132159,9 +132493,15 @@ mod tests {
             );
         }
         assert!(shell.fail_sidebar_policy("local://p", "v1"), "never gave up");
+        let gate = shell.web_surface_policy_gate("local://p");
         assert_eq!(
-            shell.web_surface_policy_gate("local://p"),
-            SurfacePolicyGate::Absent,
+            gate,
+            SurfacePolicyGate::Abandoned,
+            "exhaustion folded back into Absent — the agent door can no longer \
+             tell a promised-but-failed policy from no policy at all"
+        );
+        assert!(
+            !gate.defers_surface_create(),
             "the surface stayed gated behind a dead endpoint"
         );
         assert!(
@@ -132174,6 +132514,69 @@ mod tests {
         assert_eq!(
             shell.web_surface_policy_gate("local://p"),
             SurfacePolicyGate::Pending
+        );
+    }
+
+    // THE DEFER TABLE, whole. One owner decides which gate state makes the
+    // reconciler skip a create pass; the `web ensure` await consumes the same
+    // states through its own step table below. Only `Pending` defers: `Absent`
+    // and `Abandoned` build (unprotected — the human-path behavior), `Ready`
+    // builds protected.
+    #[test]
+    fn only_a_pending_gate_defers_the_surface_create() {
+        assert!(SurfacePolicyGate::Pending.defers_surface_create());
+        assert!(!SurfacePolicyGate::Absent.defers_surface_create());
+        assert!(!SurfacePolicyGate::Abandoned.defers_surface_create());
+        assert!(
+            !SurfacePolicyGate::Ready(WebSurfacePolicy::default()).defers_surface_create()
+        );
+    }
+
+    // The re-arm is exactly as narrow as its name: ONLY an abandoned fetch
+    // (attempts exhausted, nothing left to retry it) is re-armed, and re-arming
+    // hands back the stamp to fetch under while the gate returns to `Pending`.
+    // Everything else — attempts still running, a policy already held, no
+    // declared policy, no contribution — is refused, because those all have a
+    // live owner (the heartbeat retry loop, or nothing to fetch at all).
+    #[test]
+    fn only_an_abandoned_policy_fetch_can_be_rearmed() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        assert_eq!(
+            shell.rearm_abandoned_sidebar_policy_fetch("local://p"),
+            None,
+            "re-armed a session with no contribution"
+        );
+
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+        assert_eq!(
+            shell.rearm_abandoned_sidebar_policy_fetch("local://p"),
+            None,
+            "re-armed while the heartbeat loop still owned the retries"
+        );
+
+        for _ in 0..MAX_POLICY_FETCH_ATTEMPTS {
+            shell.fail_sidebar_policy("local://p", "v1");
+        }
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Abandoned
+        );
+        assert_eq!(
+            shell.rearm_abandoned_sidebar_policy_fetch("local://p").as_deref(),
+            Some("v1"),
+            "an abandoned fetch was not re-armed"
+        );
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending,
+            "the re-arm did not re-open the pending window"
+        );
+
+        shell.apply_sidebar_policy("local://p", "v1", WebSurfacePolicy::default());
+        assert_eq!(
+            shell.rearm_abandoned_sidebar_policy_fetch("local://p"),
+            None,
+            "re-armed a fetch whose policy already landed"
         );
     }
 

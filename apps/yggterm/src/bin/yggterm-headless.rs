@@ -1568,40 +1568,14 @@ fn main() -> Result<()> {
         }
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
-        let preferred_pid = args.windows(2).find_map(|window| {
-            if window[0] == "--pid" {
-                window[1].parse::<u32>().ok()
-            } else {
-                None
-            }
-        });
-        if let Some(preferred_pid) = preferred_pid {
-            unsafe {
-                std::env::set_var("YGGTERM_APP_CONTROL_PID", preferred_pid.to_string());
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("YGGTERM_APP_CONTROL_PID");
-            }
-        }
-        // `--client <name>` (slice 4.3): route this verb to the GUI worker whose
-        // `--client-id` matches (naming a shadow view client). `--pid` still wins.
-        let preferred_client = args.windows(2).find_map(|window| {
-            if window[0] == "--client" && !window[1].starts_with("--") {
-                Some(window[1].clone())
-            } else {
-                None
-            }
-        });
-        if let Some(preferred_client) = preferred_client {
-            unsafe {
-                std::env::set_var("YGGTERM_APP_CONTROL_CLIENT", preferred_client);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("YGGTERM_APP_CONTROL_CLIENT");
-            }
-        }
+        // ONE owner for how a verb names its GUI target: an explicit
+        // `--pid`/`--client` on this invocation wins (`--pid` beats `--client`
+        // downstream in `choose_app_control_pid`), and with no flag the
+        // exported YGGTERM_APP_CONTROL_PID/_CLIENT stands. The inline block
+        // this replaces REMOVED the exported variable whenever the flag was
+        // absent, which is why it worked for one verb and not another
+        // (field report A5, 2026-07-28).
+        yggterm_server::apply_app_control_target_overrides(&args);
         let timeout_ms = args
             .windows(2)
             .find_map(|window| {
