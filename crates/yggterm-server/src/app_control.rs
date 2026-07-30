@@ -1240,6 +1240,19 @@ pub enum AppControlCommand {
     /// Enumerate the command registry: every command's id, title, and in-force
     /// KeyTip chord. Read-only; the discovery half of `InvokeCommand`.
     ListCommands,
+    /// The §12 no-orphan-affordance audit (`docs/alt-keytips.md`): run the ONE
+    /// interactable walk (the same JS the ALT overlay's derive pass runs) in
+    /// count-instead-of-skip mode and report the §12.1-corrected THREE numbers
+    /// — reachable / excused / orphan — plus the subtree-exemption police.
+    /// Pure observation: audit mode stamps nothing.
+    KeytipsAudit,
+    /// Open (`show`) or dismiss (`hide`) the ALT+ KeyTips overlay — thin verbs
+    /// on the EXISTING activate/clear overlay terminus, so what an agent opens
+    /// is exactly the layer the user's clean ALT tap opens. The live-proof
+    /// instrument for badge/derivation work: open the layer, screenshot, close.
+    SetKeytipsOverlay {
+        open: bool,
+    },
     /// A well-formed request whose `kind` this build DOES know, but whose
     /// FIELDS it cannot read.
     ///
@@ -1313,6 +1326,9 @@ impl AppControlCommand {
                 | Self::WebSurfaceFrames { .. }
                 | Self::WebSurfaceWait { .. }
                 | Self::ListCommands
+                // The audit WALKS and counts; derive-mode stamping belongs to
+                // the overlay path, never to this verb.
+                | Self::KeytipsAudit
                 // An unknown kind, and a kind whose payload could not be read,
                 // are never executed — they can only be refused, so they mutate
                 // nothing.
@@ -1407,6 +1423,8 @@ impl AppControlCommand {
             Self::DescribeState => "describe_state",
             Self::InvokeCommand { .. } => "invoke_command",
             Self::ListCommands => "list_commands",
+            Self::KeytipsAudit => "keytips_audit",
+            Self::SetKeytipsOverlay { .. } => "set_keytips_overlay",
             Self::Unsupported => "unsupported",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -2198,6 +2216,31 @@ mod tests {
         assert_eq!(request.command.name(), "unsupported");
         // It can only ever be refused, so it mutates nothing.
         assert!(request.command.is_read_only());
+    }
+
+    /// The ALT+ KeyTips app-control verbs, on the wire exactly as the CLI
+    /// writes them (`server app keytips audit|show|hide`,
+    /// `docs/alt-keytips.md` §12). The audit is pure observation (audit mode
+    /// stamps nothing); show/hide mutate the overlay and therefore are not.
+    #[test]
+    fn keytips_verbs_ride_the_wire() {
+        let audit: AppControlCommand =
+            serde_json::from_str(r#"{ "kind": "keytips_audit" }"#).unwrap();
+        assert_eq!(audit, AppControlCommand::KeytipsAudit);
+        assert_eq!(audit.name(), "keytips_audit");
+        assert!(audit.is_read_only(), "the audit walks and counts, only");
+
+        let show: AppControlCommand =
+            serde_json::from_str(r#"{ "kind": "set_keytips_overlay", "open": true }"#).unwrap();
+        assert_eq!(show, AppControlCommand::SetKeytipsOverlay { open: true });
+        assert_eq!(show.name(), "set_keytips_overlay");
+        assert!(
+            !show.is_read_only(),
+            "opening the overlay mutates UI state and must re-render"
+        );
+        let hide: AppControlCommand =
+            serde_json::from_str(r#"{ "kind": "set_keytips_overlay", "open": false }"#).unwrap();
+        assert_eq!(hide, AppControlCommand::SetKeytipsOverlay { open: false });
     }
 
     /// The other half of the contract: genuinely malformed JSON must still be
