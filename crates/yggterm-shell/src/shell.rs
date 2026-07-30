@@ -6665,6 +6665,47 @@ struct SavedWebTab {
     /// surface that closed with the app tab in front saves none).
     #[serde(default)]
     active: bool,
+    /// Was this row TAB 0 — the app tab — when it was saved? Every rebuild
+    /// re-mints tab 0 from the app's declare, so without this mark a restore
+    /// can only GUESS which saved row the re-minted tab already is. Guessing
+    /// wrong was the duplicate-first-tab bug: the app tab's own saved page
+    /// reopened as a user tab NEXT TO a re-minted tab 0 showing the same page
+    /// (identical once the launch URL redirected), one more copy per rebuild.
+    /// [`plan_web_tab_restore`] routes the marked row back INTO tab 0 whenever
+    /// tab 0 has no request of its own to show, and never opens it as a user
+    /// tab alongside. Stores written before the mark existed lack the field
+    /// (serde default `false`); their rows restore under the pre-mark rule.
+    #[serde(default)]
+    app_tab: bool,
+}
+/// What a web-surface materialization IS, and every caller of
+/// [`ShellState::upsert_web_surface`] has to say which — because the two mean
+/// opposite things for the URL in the declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceOpenKind {
+    /// The app itself just declared `open`: the URL is what the app wants to
+    /// show RIGHT NOW (its start page, or the page a `ychrome <url>` launch
+    /// named).
+    Launch,
+    /// A rebuild of a surface for an app that is ALREADY RUNNING — a heartbeat
+    /// after a GUI restart, or the daemon's retained declare replayed by the
+    /// restore tick. The declared URL is the run's old LAUNCH page, not where
+    /// the user is: treating it as a launch re-minted tab 0 onto that stale
+    /// page, which is half of the duplicate-first-tab bug.
+    Reattach,
+}
+/// ONE owner for "which kind is this declare action". Both rebuild readers —
+/// the client OSC arm and the daemon-retained-declare path — decide from the
+/// same fact: an app that has been running re-declares via ~4s heartbeats, so
+/// `heartbeat` marks a running app being re-attached, while a real `open` is
+/// the app itself launching (the daemon replays the vt100 screen on re-attach,
+/// never the consumed OSC `open`, so an `open` cannot be stale).
+fn web_surface_open_kind_for_action(action: &str) -> WebSurfaceOpenKind {
+    if action == "heartbeat" {
+        WebSurfaceOpenKind::Reattach
+    } else {
+        WebSurfaceOpenKind::Launch
+    }
 }
 /// The persisted tab tree for one profile.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -6679,10 +6720,19 @@ impl WebTabStore {
     /// you left off": OFF (the default) keeps only the filed tabs, so the folders
     /// and everything organized into them come back and the loose session does
     /// not. Order is preserved either way — the tree must not shuffle.
-    fn tabs_to_open(&self, restore: bool) -> Vec<SavedWebTab> {
+    ///
+    /// The one exception is the saved APP-TAB row on a [`WebSurfaceOpenKind::
+    /// Reattach`]: "start fresh" governs a fresh start of the app, and a
+    /// re-attach is not one — the run never ended, so the page tab 0 was on
+    /// comes back to tab 0 regardless of the fresh-start setting.
+    fn tabs_to_open(&self, restore: bool, open: WebSurfaceOpenKind) -> Vec<SavedWebTab> {
         self.tabs
             .iter()
-            .filter(|tab| restore || tab.folder.is_some())
+            .filter(|tab| {
+                restore
+                    || tab.folder.is_some()
+                    || (open == WebSurfaceOpenKind::Reattach && tab.app_tab)
+            })
             .filter(|tab| !tab.url.trim().is_empty())
             .cloned()
             .collect()
@@ -6722,15 +6772,33 @@ struct WebTabRestorePlan {
     /// Index into `tabs` of the tab to land on, or `None` for the app tab.
     land_on: Option<usize>,
 }
+/// The rows the duplicate-first-tab bug minted: the adopted app-tab page
+/// reopened as a loose ROOT tab, once per rebuild. Only an EXACT url match at
+/// the root collapses — a FILED copy is the user's own organization and a
+/// different url is a different page, so any row that differs in any way
+/// stays.
+fn collapse_adopted_app_tab_duplicates(saved: &mut Vec<SavedWebTab>, adopted: &SavedWebTab) {
+    saved.retain(|tab| tab.folder.is_some() || tab.url != adopted.url);
+}
 /// The restore rule, in one place.
 ///
-/// - "Continue where you left off" OFF: the tabs are the FILED ones (saved
-///   organization); the browsing session is gone and there is nowhere to return
-///   to, so the app tab is what you land on.
+/// - The saved row MARKED as the app tab ([`SavedWebTab::app_tab`]) is tab 0's
+///   own page, never a user tab. Whenever tab 0 has no request of its own to
+///   show — every [`WebSurfaceOpenKind::Reattach`], and a fresh `start_page`
+///   launch under "continue where you left off" — tab 0 ADOPTS it. Reopening
+///   it as a user tab next to a re-minted tab 0 was the duplicate-first-tab
+///   bug, so the adopt also collapses the copies that bug already minted
+///   (identical by URL at the root, nothing else).
+/// - "Continue where you left off" OFF on a launch: the tabs are the FILED
+///   ones (saved organization); the browsing session is gone and there is
+///   nowhere to return to, so the app tab is what you land on.
 /// - ON, and the app had a URL of its own (`ychrome <url>`): the launch is a
-///   REQUEST. Every saved tab comes back, but the app tab shows what was asked
+///   REQUEST. Every saved tab comes back — the app-tab row too, as the one
+///   place it can survive while tab 0 shows the request (dropping it would be
+///   the lost-session incident again) — but the app tab shows what was asked
 ///   for and stays in front.
-/// - ON, and the app had no URL (`ychrome`, `start_page`): land where the user
+/// - ON, and the app had no URL (`ychrome`, `start_page`), and no saved row
+///   carries the mark (a store written before it existed): land where the user
 ///   was standing. If that tab was a ROOT tab the app tab adopts it (a start
 ///   page nobody asked for is not worth a tab); if it was FILED, it is selected
 ///   where it sits, because moving it onto the always-root app tab would quietly
@@ -6739,7 +6807,25 @@ fn plan_web_tab_restore(
     mut saved: Vec<SavedWebTab>,
     restore: bool,
     start_page: bool,
+    open: WebSurfaceOpenKind,
 ) -> WebTabRestorePlan {
+    let tab_zero_is_free = open == WebSurfaceOpenKind::Reattach || (restore && start_page);
+    if tab_zero_is_free && let Some(index) = saved.iter().position(|tab| tab.app_tab) {
+        let adopted = saved.remove(index);
+        collapse_adopted_app_tab_duplicates(&mut saved, &adopted);
+        // Land where the user was standing: on the app tab itself if its row
+        // was in front, else on whichever surviving row was.
+        let land_on = if adopted.active {
+            None
+        } else {
+            saved.iter().position(|tab| tab.active)
+        };
+        return WebTabRestorePlan {
+            adopt: Some(adopted),
+            tabs: saved,
+            land_on,
+        };
+    }
     if !(restore && start_page) {
         return WebTabRestorePlan {
             adopt: None,
@@ -6749,11 +6835,18 @@ fn plan_web_tab_restore(
     }
     let active = saved.iter().position(|tab| tab.active);
     match active {
-        Some(index) if saved[index].folder.is_none() => WebTabRestorePlan {
-            adopt: Some(saved.remove(index)),
-            tabs: saved,
-            land_on: None,
-        },
+        Some(index) if saved[index].folder.is_none() => {
+            let adopted = saved.remove(index);
+            // A pre-mark store holds the accumulated copies too; the adopted
+            // active root row is the page the user was on, so the same
+            // collapse applies.
+            collapse_adopted_app_tab_duplicates(&mut saved, &adopted);
+            WebTabRestorePlan {
+                adopt: Some(adopted),
+                tabs: saved,
+                land_on: None,
+            }
+        }
         Some(index) => WebTabRestorePlan {
             adopt: None,
             tabs: saved,
@@ -10712,6 +10805,10 @@ async fn rebuild_web_surface_from_daemon_declare(
         title,
         profile.as_deref(),
         start_page,
+        // The retained record's own action tells a running app being
+        // re-attached (it has been heartbeating) from one that only just
+        // launched — see `web_surface_open_kind_for_action`.
+        web_surface_open_kind_for_action(&record.action),
         ssh_target,
         "daemon_declare_rebuild",
         claimed_session.as_deref(),
@@ -10744,6 +10841,7 @@ async fn materialize_declared_web_surface(
     title: Option<String>,
     profile: Option<&str>,
     start_page: bool,
+    open: WebSurfaceOpenKind,
     ssh_target: Option<String>,
     action: &str,
     claimed_session: Option<&str>,
@@ -10792,6 +10890,7 @@ async fn materialize_declared_web_surface(
             socks_port,
             profile,
             start_page,
+            open,
             now_ms,
         );
     });
@@ -14247,6 +14346,8 @@ impl ShellState {
     /// URL). `effective_url`/`forward` are precomputed by the caller (forward
     /// setup blocks, so it must not run under the state lock). An existing
     /// surface keeps its user tabs; only the app tab (tabs[0]) retargets.
+    /// `open` says whether this is the app launching or a re-attach to a run
+    /// already in flight — the tab-restore plan turns on it.
     #[allow(clippy::too_many_arguments)]
     fn upsert_web_surface(
         &mut self,
@@ -14258,6 +14359,7 @@ impl ShellState {
         socks_port: Option<u16>,
         profile: String,
         start_page: bool,
+        open: WebSurfaceOpenKind,
         now_ms: u64,
     ) {
         // A surface still in its PICKER placeholder has no chosen profile and so
@@ -14357,7 +14459,7 @@ impl ShellState {
             None => WebTabStore::default(),
         };
         let restore = self.settings.web_surface_restore_tabs;
-        let plan = plan_web_tab_restore(store.tabs_to_open(restore), restore, start_page);
+        let plan = plan_web_tab_restore(store.tabs_to_open(restore, open), restore, start_page, open);
         if let Some(saved) = &plan.adopt {
             app_tab.url = saved.url.clone();
             // The egress the caller resolved was for the START PAGE, and this is
@@ -16493,6 +16595,9 @@ impl ShellState {
                     folder: tab.folder.clone(),
                     // Where the user was standing, not just what was open.
                     active: tab.id == active_tab,
+                    // Which row IS tab 0, so a rebuild can hand the page back
+                    // to the re-minted app tab instead of duplicating it.
+                    app_tab: tab.id == WEB_TAB_APP_TAB_ID,
                 })
                 .collect(),
         };
@@ -17504,8 +17609,9 @@ impl ShellState {
     /// ([`ShellState::web_surface_close_tab`]) and not filable
     /// ([`ShellState::web_tab_move_to_folder`]): it is the app process's own
     /// page, and a copy of it would be a PERSISTED user tab
-    /// ([`ShellState::persist_web_tabs`] deliberately never saves tabs[0]) that
-    /// resurrects a stale start page on the next visit.
+    /// ([`ShellState::persist_web_tabs`] saves tabs[0] only as the MARKED
+    /// app-tab row, never as a user tab) that resurrects a stale start page
+    /// on the next visit.
     fn web_surface_duplicate_tab(&mut self, session_path: &str, tab_id: u64) -> Option<u64> {
         if tab_id == WEB_TAB_APP_TAB_ID {
             return None;
@@ -84004,6 +84110,12 @@ fn TerminalCanvas(
                                                 surface_title,
                                                 surface_profile.as_deref(),
                                                 start_page,
+                                                // A heartbeat that builds a
+                                                // FRESH surface is re-attaching
+                                                // a running app after a GUI
+                                                // restart; only a real `open`
+                                                // is the app launching.
+                                                web_surface_open_kind_for_action(&action),
                                                 web_surface_ssh_target.clone(),
                                                 &action,
                                                 Some(claimed_session.as_str()),
@@ -118541,6 +118653,7 @@ mod tests {
             None,
             "default".to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             0,
         );
         shell.window_focused = false;
@@ -118598,6 +118711,7 @@ mod tests {
             None,
             "default".to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         let (tab_id, _, _) = shell
@@ -118660,6 +118774,7 @@ mod tests {
             None,
             "default".to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         let (tab_id, _, _) = shell
@@ -118829,12 +118944,22 @@ mod tests {
             title: String::new(),
             folder: folder.map(str::to_string),
             active: false,
+            app_tab: false,
         }
     }
     fn saved_active_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
         SavedWebTab {
             active: true,
             ..saved_tab(url, folder)
+        }
+    }
+    /// The row [`ShellState::persist_web_tabs`] writes for tab 0 once the user
+    /// has taken it off the app's own page.
+    fn saved_app_tab(url: &str, active: bool) -> SavedWebTab {
+        SavedWebTab {
+            app_tab: true,
+            active,
+            ..saved_tab(url, None)
         }
     }
 
@@ -118858,7 +118983,7 @@ mod tests {
         };
 
         let fresh: Vec<String> = store
-            .tabs_to_open(false)
+            .tabs_to_open(false, WebSurfaceOpenKind::Launch)
             .into_iter()
             .map(|tab| tab.url)
             .collect();
@@ -118872,7 +118997,7 @@ mod tests {
         );
 
         let continued: Vec<String> = store
-            .tabs_to_open(true)
+            .tabs_to_open(true, WebSurfaceOpenKind::Launch)
             .into_iter()
             .map(|tab| tab.url)
             .collect();
@@ -118901,6 +119026,7 @@ mod tests {
             ],
             true,
             true,
+            WebSurfaceOpenKind::Launch,
         );
         assert_eq!(
             plan.adopt.as_ref().map(|tab| tab.url.as_str()),
@@ -118927,6 +119053,7 @@ mod tests {
             ],
             true,
             true,
+            WebSurfaceOpenKind::Launch,
         );
         assert_eq!(plan.adopt, None, "a filed tab is never adopted");
         assert_eq!(
@@ -118950,6 +119077,7 @@ mod tests {
             vec![saved_active_tab("https://b.example/", None)],
             true,
             false,
+            WebSurfaceOpenKind::Launch,
         );
         assert_eq!(plan.adopt, None);
         assert_eq!(plan.land_on, None, "the requested URL stays in front");
@@ -118969,9 +119097,227 @@ mod tests {
             vec![saved_active_tab("https://b.example/", Some("f1"))],
             false,
             true,
+            WebSurfaceOpenKind::Launch,
         );
         assert_eq!(plan.adopt, None);
         assert_eq!(plan.land_on, None, "a fresh start lands on the app tab");
+    }
+
+    // ⚠ LOCK — work-left item B, the duplicate FIRST tab. The saved row marked
+    // as the app tab is tab 0's OWN page: it is adopted back into tab 0 even
+    // when it was not the front tab, and it NEVER opens as a user tab next to
+    // the re-minted tab 0 — that pairing (identical once the launch URL
+    // redirected) was the duplicate.
+    #[test]
+    fn the_marked_app_tab_row_returns_to_tab_zero_and_never_becomes_a_user_tab() {
+        // The user was standing on a user tab, not the app tab. The pre-mark
+        // rule adopted whichever ROOT row was active — re-opening the app
+        // tab's own row as a user tab. The mark settles ownership.
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_app_tab("https://x.example/page", false),
+                saved_active_tab("https://y.example/", None),
+                saved_tab("https://z.example/", Some("f1")),
+            ],
+            true,
+            true,
+            WebSurfaceOpenKind::Launch,
+        );
+        assert_eq!(
+            plan.adopt.as_ref().map(|tab| tab.url.as_str()),
+            Some("https://x.example/page"),
+            "the marked row is what tab 0 already IS"
+        );
+        assert_eq!(
+            plan.tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://y.example/", "https://z.example/"],
+            "the marked row must not ALSO open as a user tab"
+        );
+        assert_eq!(
+            plan.land_on,
+            Some(0),
+            "the user still lands where they were standing (y, tab id 1)"
+        );
+
+        // App-tab row in front: land on tab 0 itself.
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_app_tab("https://x.example/page", true),
+                saved_tab("https://y.example/", None),
+            ],
+            true,
+            true,
+            WebSurfaceOpenKind::Launch,
+        );
+        assert_eq!(
+            plan.adopt.as_ref().map(|tab| tab.url.as_str()),
+            Some("https://x.example/page")
+        );
+        assert_eq!(plan.land_on, None, "the app tab was the front tab");
+    }
+
+    // ⚠ LOCK — the other half of item B. A heartbeat/retained-declare rebuild
+    // RE-ATTACHES a running app: tab 0 returns to the page it was on, never to
+    // the run's stale launch URL — and it does so regardless of the
+    // fresh-start setting, because the run never ended. Only the app-tab row
+    // rides through a fresh-start filter that way (`tabs_to_open`); the loose
+    // session stays governed by `restore`.
+    #[test]
+    fn a_reattach_adopts_the_app_tab_page_even_under_a_fresh_start_setting() {
+        // start_page=false models the stale record of a `ychrome <url>` run
+        // (and pre-round-27 ychrome): on a re-attach that URL is history, not
+        // a request.
+        for start_page in [true, false] {
+            let plan = plan_web_tab_restore(
+                vec![saved_app_tab("https://x.example/page", true)],
+                false,
+                start_page,
+                WebSurfaceOpenKind::Reattach,
+            );
+            assert_eq!(
+                plan.adopt.as_ref().map(|tab| tab.url.as_str()),
+                Some("https://x.example/page"),
+                "a re-attach (start_page={start_page}) must return to the page, \
+                 not relaunch the stale launch URL"
+            );
+            assert!(plan.tabs.is_empty());
+        }
+
+        let store = WebTabStore {
+            folders: vec![WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            }],
+            tabs: vec![
+                saved_app_tab("https://x.example/page", true),
+                saved_tab("https://loose.example/", None),
+                saved_tab("https://filed.example/", Some("f1")),
+            ],
+        };
+        assert_eq!(
+            store
+                .tabs_to_open(false, WebSurfaceOpenKind::Reattach)
+                .into_iter()
+                .map(|tab| tab.url)
+                .collect::<Vec<_>>(),
+            vec![
+                "https://x.example/page".to_string(),
+                "https://filed.example/".to_string()
+            ],
+            "the app-tab row survives the fresh-start filter on a re-attach; \
+             the loose session still does not"
+        );
+        assert_eq!(
+            store
+                .tabs_to_open(false, WebSurfaceOpenKind::Launch)
+                .into_iter()
+                .map(|tab| tab.url)
+                .collect::<Vec<_>>(),
+            vec!["https://filed.example/".to_string()],
+            "a fresh LAUNCH purge is unchanged: filed tabs only"
+        );
+    }
+
+    // ⚠ LOCK — the accumulated copies. Real saved files already hold the rows
+    // this bug minted: the app tab's page reopened as a loose root tab, one
+    // per rebuild. Adopting collapses exactly those — identical by URL at the
+    // root — and touches nothing that differs in any way (a filed copy, a
+    // different page).
+    #[test]
+    fn adopting_collapses_the_duplicates_the_bug_minted_and_nothing_else() {
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_app_tab("https://x.example/page", true),
+                saved_tab("https://x.example/page", None),
+                saved_tab("https://x.example/page", None),
+                saved_tab("https://other.example/", None),
+                saved_tab("https://x.example/page", Some("f1")),
+            ],
+            true,
+            true,
+            WebSurfaceOpenKind::Launch,
+        );
+        assert_eq!(
+            plan.adopt.as_ref().map(|tab| tab.url.as_str()),
+            Some("https://x.example/page")
+        );
+        assert_eq!(
+            plan.tabs
+                .iter()
+                .map(|tab| (tab.url.as_str(), tab.folder.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("https://other.example/", None),
+                ("https://x.example/page", Some("f1")),
+            ],
+            "the loose copies collapse; a different page and a FILED copy stay"
+        );
+
+        // A store written before the mark existed holds the same accumulation;
+        // the pre-mark adopt (the active root row) collapses it the same way.
+        let plan = plan_web_tab_restore(
+            vec![
+                saved_active_tab("https://x.example/page", None),
+                saved_tab("https://x.example/page", None),
+                saved_tab("https://x.example/page", None),
+                saved_tab("https://other.example/", None),
+            ],
+            true,
+            true,
+            WebSurfaceOpenKind::Launch,
+        );
+        assert_eq!(
+            plan.tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://other.example/"],
+            "a pre-mark store's accumulated copies collapse under the old adopt rule too"
+        );
+    }
+
+    // A `ychrome <url>` launch is still a REQUEST: tab 0 shows it, so the
+    // marked row cannot ride there — and dropping it would be the lost-session
+    // incident again. The ONE place it survives is as a user tab. This is the
+    // deliberate exception to "never a user tab": tab 0 is occupied by an
+    // explicit ask, and the two show different pages, so no duplicate exists.
+    #[test]
+    fn a_url_launch_keeps_the_marked_row_alive_as_a_user_tab() {
+        let plan = plan_web_tab_restore(
+            vec![saved_app_tab("https://x.example/page", true)],
+            true,
+            false,
+            WebSurfaceOpenKind::Launch,
+        );
+        assert_eq!(plan.adopt, None, "the requested URL owns tab 0");
+        assert_eq!(
+            plan.tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://x.example/page"],
+            "the page the user was on must not be dropped"
+        );
+    }
+
+    // Both rebuild readers decide launch-vs-reattach from the SAME fact, in
+    // one function: a running app re-declares via heartbeats, so `heartbeat`
+    // re-attaches; a real `open` is the app itself launching (the daemon
+    // replays the screen on re-attach, never the consumed OSC `open`).
+    #[test]
+    fn a_heartbeat_is_a_reattach_and_an_open_is_a_launch() {
+        assert_eq!(
+            web_surface_open_kind_for_action("heartbeat"),
+            WebSurfaceOpenKind::Reattach
+        );
+        assert_eq!(
+            web_surface_open_kind_for_action("open"),
+            WebSurfaceOpenKind::Launch
+        );
     }
 
     // A re-declare is idempotent for an UNCHANGED control url only. When the
@@ -121718,6 +122064,7 @@ mod tests {
             // real tab store.
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
 
@@ -121745,6 +122092,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -121782,6 +122130,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -121825,6 +122174,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -121878,6 +122228,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -121923,6 +122274,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -122053,6 +122405,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
@@ -122095,7 +122448,7 @@ mod tests {
         store.reconcile();
         assert_eq!(store.tabs[0].folder, None);
         assert_eq!(
-            store.tabs_to_open(false).len(),
+            store.tabs_to_open(false, WebSurfaceOpenKind::Launch).len(),
             0,
             "and being at the root, a fresh start purges it"
         );
@@ -122138,6 +122491,7 @@ mod tests {
             None,
             profile.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             now_ms,
         );
     }
@@ -122341,6 +122695,161 @@ mod tests {
         );
     }
 
+    // ⚠ LOCK — SERDE COMPAT for the app-tab mark. Saved-tabs files already on
+    // disk were written without `app_tab`, and they must still load with the
+    // mark defaulting OFF — otherwise the fix for the duplicate would eat
+    // every saved tree it touches. The fixture is the OLD shape verbatim (raw
+    // bytes), not a struct round-trip, so a lost `#[serde(default)]` cannot
+    // hide behind the serializer.
+    #[test]
+    fn an_old_shape_tabs_json_still_loads_and_defaults_the_mark_off() {
+        let root = ScratchProfilesRoot::new("old-shape-tabs");
+        let profile = "research";
+        let jar = root.path().join(profile);
+        fs::create_dir_all(&jar).expect("create scratch jar");
+        fs::write(
+            jar.join("tabs.json"),
+            r#"{
+  "folders": [
+    { "id": "f1", "name": "Work", "collapsed": false }
+  ],
+  "tabs": [
+    { "url": "https://a.example/", "title": "A", "folder": null, "active": true },
+    { "url": "https://b.example/", "title": "", "folder": "f1", "active": false }
+  ]
+}"#,
+        )
+        .expect("write old-shape fixture");
+
+        let store = load_web_tab_store_in(root.path(), profile);
+        assert_eq!(
+            store
+                .tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://a.example/", "https://b.example/"],
+            "a store written before the mark existed must still load whole"
+        );
+        assert!(
+            store.tabs.iter().all(|tab| !tab.app_tab),
+            "an absent field means NO row claims to be the app tab"
+        );
+        assert_eq!(store.folders.len(), 1);
+    }
+
+    // ⚠ LOCK — work-left item B, END TO END: "duplicate FIRST tab on return
+    // to a session". Coming back after a while is the restore tick rebuilding
+    // the surface from the daemon's retained declare — a RE-ATTACH, and (in
+    // the shape that accumulated live) one whose stale record predates the
+    // app declaring `start_page`. Every such rebuild used to re-mint tab 0
+    // from the launch declare AND reopen the saved row as a user tab: one
+    // more copy of the first tab per rebuild. The mark hands the page back to
+    // tab 0 instead, every round, and the tab count holds.
+    #[test]
+    fn a_reattach_returns_the_page_to_tab_zero_and_never_stacks_a_duplicate() {
+        let root = ScratchProfilesRoot::new("reattach-no-duplicate");
+        let profile = "research";
+        let launch_url = "https://search.brave.com/";
+        let page = "https://www.khanacademy.org/badges/copernicus";
+
+        // The run: a plain launch, then the user browses the app tab away.
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        open_ychrome_surface(&mut shell, profile, 1_000);
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            WEB_TAB_APP_TAB_ID,
+            page.to_string(),
+            page.to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            load_web_tab_store_in(root.path(), profile)
+                .tabs
+                .iter()
+                .map(|tab| (tab.url.as_str(), tab.app_tab))
+                .collect::<Vec<_>>(),
+            vec![(page, true)],
+            "the page tab 0 is on is saved MARKED as the app tab"
+        );
+
+        // The GUI dies; the tick rebuilds — repeatedly (it runs every 2.5s,
+        // and each round persists what it built, which is exactly how the
+        // copies used to accumulate one per rebuild).
+        for round in 0u64..3 {
+            let mut shell = shell_on_scratch_profiles_root(root.path());
+            shell.upsert_web_surface(
+                "local://ws",
+                launch_url.to_string(),
+                Some("Brave".to_string()),
+                launch_url.to_string(),
+                None,
+                None,
+                profile.to_string(),
+                false,
+                WebSurfaceOpenKind::Reattach,
+                2_000 + round,
+            );
+            assert_eq!(
+                surface_tab_urls(&shell),
+                vec![page.to_string()],
+                "rebuild {round}: tab 0 returns to the page — no stale start \
+                 page in front of it, no duplicate row beside it"
+            );
+        }
+    }
+
+    // The modern rebuild (the app declares `start_page`): the marked row still
+    // owns tab 0 even when the user was standing on a USER tab — the pre-mark
+    // rule would have pulled that user tab into tab 0 and reopened the app
+    // tab's page as a new user tab, scrambling both identities.
+    #[test]
+    fn a_start_page_reattach_keeps_both_identities_and_lands_where_the_user_stood() {
+        let root = ScratchProfilesRoot::new("reattach-start-page");
+        let profile = "research";
+        let seeded = WebTabStore {
+            folders: Vec::new(),
+            tabs: vec![
+                saved_app_tab("https://x.example/page", false),
+                saved_active_tab("https://y.example/", None),
+            ],
+        };
+        save_web_tab_store_in(root.path(), profile, &seeded, WebTabSave::TreeEdit);
+
+        let mut shell = shell_on_scratch_profiles_root(root.path());
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://search.brave.com/".to_string(),
+            Some("Brave".to_string()),
+            "https://search.brave.com/".to_string(),
+            None,
+            None,
+            profile.to_string(),
+            true,
+            WebSurfaceOpenKind::Reattach,
+            2_000,
+        );
+        assert_eq!(
+            surface_tab_urls(&shell),
+            vec![
+                "https://x.example/page".to_string(),
+                "https://y.example/".to_string()
+            ],
+            "tab 0 is the app tab's own page; the user tab stays a user tab"
+        );
+        assert_eq!(
+            shell
+                .web_surfaces
+                .get("local://ws")
+                .expect("the surface is open")
+                .active_tab,
+            1,
+            "and the user lands where they were standing"
+        );
+    }
+
     // The omnibox must relabel the internal page, never show the base64 blob.
     #[test]
     fn internal_page_label_hides_the_data_url() {
@@ -122364,6 +122873,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -122386,6 +122896,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             2_000,
         );
         let overlay = shell
@@ -122488,6 +122999,7 @@ mod tests {
             Some(1080),
             "work".to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         // Background (middle-click): tab added, focus stays on the app tab.
@@ -122549,6 +123061,7 @@ mod tests {
             Some(1080),
             "work".to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         // What the drain calls: `raise = !background`, i.e. false for the gesture.
@@ -122952,6 +123465,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         // User navigates the app tab via the address bar.
@@ -122974,6 +123488,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             2_000,
         );
         let overlay = shell
@@ -122990,6 +123505,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             3_000,
         );
         let overlay = shell
@@ -123013,6 +123529,7 @@ mod tests {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         shell.web_surface_set_address_draft("local://ws", Some("oi".to_string()));
@@ -144931,6 +145448,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             current_millis(),
         );
         assert!(
@@ -147080,6 +147598,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             current_millis(),
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -160152,6 +160671,7 @@ mod webtabs_menu_switcher_locks {
             None,
             WEB_SURFACE_TEMP_PROFILE.to_string(),
             false,
+            WebSurfaceOpenKind::Launch,
             1_000,
         );
         for (url, folder_id) in tabs {
