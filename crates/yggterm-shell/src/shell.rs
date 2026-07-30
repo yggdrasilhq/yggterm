@@ -163471,23 +163471,39 @@ mod web_surface_immersion_locks {
     // stopped skipping this module, the needles below would be satisfied by
     // their own text and the scans would be worthless.
     //
-    // TWO canaries, both ends of the module. The top one catches the skip rule
-    // being lost outright; the bottom one (the LAST test's name) catches the
-    // subtler leak this module has already produced once: a bare column-0 `}`
-    // inside an embedded string reads as the module's end, so the scan resumes
-    // MID-module and self-satisfies every needle after that line while the
-    // top canary stays green.
+    // TWO canaries. The name check catches the skip rule being lost outright.
+    // The index check catches the subtler leak this module has already
+    // produced once — a bare column-0 `}` inside an embedded string reads as
+    // the module's end, so the scan resumes MID-module and self-satisfies
+    // every needle after that line. It is POSITION-IRRELEVANT on purpose: a
+    // leak ANYWHERE in the module reds it, whatever order the tests sit in,
+    // so appending a test at the tail (the natural place) can never reopen
+    // it. (The first cut of this canary greped for "the last test's name" —
+    // which stopped being last one commit later.) It does require this
+    // module to remain the LAST item in shell.rs; if that ever changes,
+    // bound the check by the module's true end instead of end-of-file.
     #[test]
     fn the_scan_is_not_reading_this_test_module() {
-        let scanned = product(&shell_source());
+        let source = shell_source();
+        let scanned = product(&source);
         assert!(
             !scanned.contains("the_scan_is_not_reading_this_test_module"),
             "product_lines stopped skipping this module — every scan below now self-satisfies"
         );
+        let module_header = source
+            .lines()
+            .position(|line| line == "mod web_surface_immersion_locks {")
+            .expect("this module's own column-0 header is findable");
+        let leaked: Vec<usize> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .filter(|(index, _)| *index >= module_header)
+            .map(|(index, _)| index + 1)
+            .collect();
         assert!(
-            !scanned.contains("the_edge_motion_loop_performs_the_dispatch_and_is_spawned"),
-            "product_lines resumed scanning MID-module (a column-0 `}}` leaked out of an \
-             embedded string?) — every needle after the leak now self-satisfies"
+            leaked.is_empty(),
+            "product_lines resumed scanning MID-module at source line(s) {:?} (a column-0 `}}` \
+             leaked out of an embedded string?) — every needle after the leak self-satisfies",
+            leaked.iter().take(5).collect::<Vec<_>>()
         );
     }
 
@@ -163781,8 +163797,8 @@ mod web_surface_immersion_locks {
         // column-0 `}` inside this raw string reads, to `product_lines`'s
         // block-end rule, as the END of this `#[cfg(test)]` module — the scan
         // would resume mid-module and every needle below it would self-satisfy
-        // (the end-of-module canary in `the_scan_is_not_reading_this_test_module`
-        // catches exactly that).
+        // (the position-irrelevant leak canary in
+        // `the_scan_is_not_reading_this_test_module` catches exactly that).
         const HARNESS_JS: &str = r#"
     const fs = require('fs');
     const evalSource = fs.readFileSync(process.argv[2], 'utf8');
@@ -164009,6 +164025,17 @@ mod web_surface_immersion_locks {
             // The pin stamps the claim sampler reads.
             "\"data-titlebar-autohide-pin\": if titlebar_reveal_pinned",
             "\"data-sidebar-autohide-pin\": if auto_hide && autohide_pinned",
+            // The RAIL's pin takes two hops this scan cannot see end-to-end —
+            // the shell computes it, crate yggui stamps it (rails.rs, locked
+            // by `the_rail_pin_stamp_survives_the_crate_boundary`) — so BOTH
+            // shell hops are needles: the feed into `RightRail` and the value
+            // it hands `SideRailShell`. The review proved `pinned: false,`
+            // here stayed green against every lock: a standing gesture's rail
+            // reveal (KeyTips, theme editor, settings focus) would then read
+            // pinned=0 and the placement rule would TRANSLATE the page 320px
+            // off-window instead of RESIZING it.
+            "autohide_pinned: right_rail_pinned,",
+            "pinned: autohide_pinned && !visible,",
         ] {
             assert!(
                 scanned.contains(needle),
@@ -164034,9 +164061,14 @@ mod web_surface_immersion_locks {
         for needle in [
             // The loop is armed at app start...
             "spawn_forever(web_surface_edge_motion_reveal_loop(",
-            // ...decides through the lock-driven dispatch, with the titlebar
-            // setting read at message time...
-            "match web_surface_edge_motion_reveal_target(",
+            // ...decides through the lock-driven dispatch, anchored on the
+            // call's OWN argument lines: `&edge` ties the call to the
+            // received message, and the inline `state.peek()` IS the
+            // titlebar setting read at message time. Hoisting the peek above
+            // the loop (freezing the toggle at spawn, until app restart)
+            // necessarily rewrites the argument to a binding — and reddens
+            // here.
+            "match web_surface_edge_motion_reveal_target(\n                &edge,\n                state.peek().settings.auto_hide_titlebar,\n            ) {",
             // ...and performs every arm of its answer.
             "Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),",
             "Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),",
@@ -164057,11 +164089,16 @@ mod web_surface_immersion_locks {
     // against each other here, on the file that owns the sending half.
     #[test]
     fn the_engine_and_the_shell_agree_on_the_edge_name_vocabulary() {
-        let vendor = std::fs::read_to_string(concat!(
+        let vendor_source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../vendor/dioxus-desktop/src/webview.rs"
         ))
         .expect("the vendored webview.rs is readable");
+        // PRODUCT lines only, exactly as the shell scans below: webview.rs has
+        // no test module today, but a future vendor test quoting a mapping
+        // must not satisfy this lock with the production mapping deleted —
+        // the self-satisfaction failure `product_lines` exists to prevent.
+        let vendor = product(&vendor_source);
         for mapping in [
             "crate::web_surface::SurfaceRevealEdge::Top => \"top\",",
             "crate::web_surface::SurfaceRevealEdge::Left => \"left\",",
@@ -164082,5 +164119,38 @@ mod web_surface_immersion_locks {
                 .contains("window.__yggtermGlassEdgeMotion = (edge) => dioxus.send(edge);"),
             "the shell stopped binding the edge-motion hook the engine forward calls"
         );
+    }
+
+    // The rail's pin stamp is the OTHER cross-crate contract: the shell
+    // computes the pin and feeds `SideRailShell` (both hops are needles in
+    // the wiring lock above), crate yggui stamps it into the DOM here in
+    // rails.rs, and the geometry eval samples the stamp by these exact
+    // attribute spellings (LOCK 8 drives that sampling behaviourally, fake
+    // DOM stamped with these same names). No single crate's scan can see the
+    // chain whole — the review proved the yggui half was unwatched. Losing a
+    // stamp, or renaming an attribute on either side of the boundary,
+    // silently demotes a pinned rail reveal from RESIZE to TRANSLATE (a
+    // standing gesture over a page slides the page off-window, left edge
+    // cropped) while both crates' own suites stay green.
+    #[test]
+    fn the_rail_pin_stamp_survives_the_crate_boundary() {
+        let rails_source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../yggui/src/rails.rs"
+        ))
+        .expect("the yggui rails.rs is readable");
+        // PRODUCT lines only, same as the vendor read above: a future
+        // rails.rs test module quoting a stamp must not satisfy this lock.
+        let rails = product(&rails_source);
+        for stamp in [
+            "\"data-yggui-side-rail-auto-hide\": if auto_hide { \"1\" } else { \"0\" },",
+            "\"data-yggui-side-rail-autohide-revealed\": if revealed { \"1\" } else { \"0\" },",
+            "\"data-yggui-side-rail-autohide-pin\": if pinned { \"1\" } else { \"0\" },",
+        ] {
+            assert!(
+                rails.contains(stamp),
+                "the rail stopped stamping what the geometry eval samples: {stamp}"
+            );
+        }
     }
 }
