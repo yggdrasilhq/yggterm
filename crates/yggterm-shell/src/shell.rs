@@ -8151,6 +8151,42 @@ fn web_surface_reveal_edge_from_name(name: &str) -> Option<SidebarEdge> {
     }
 }
 
+/// The panel ONE engine edge-motion report reveals.
+///
+/// Split from the loop below so the whole dispatch decision — name to panel,
+/// setting gate included — is a pure function the immersion locks DRIVE. The
+/// loop holds a live eval channel no test can enter; anything decided inline
+/// there could be made to swallow edges without a test noticing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebSurfaceEdgeReveal {
+    Titlebar,
+    LeftSidebar,
+    RightRail,
+}
+
+/// Which panel an engine edge-motion named `edge_name` reveals, if any.
+///
+/// The tree and the rail are auto-hidden exactly when they are closed — there
+/// is no separate setting to consult, so their reveal is unconditional and the
+/// panel's own mode decides whether anything visible happens. The titlebar
+/// auto-hides only when the user asked it to (`auto_hide_titlebar`).
+///
+/// An UNKNOWN name reveals NOTHING. It is not folded into the titlebar case:
+/// flashing the titlebar for an edge the shell cannot place is chrome the user
+/// never went near (the same rule `web_surface_reveal_edge_from_name` states
+/// for the sides).
+fn web_surface_edge_motion_reveal_target(
+    edge_name: &str,
+    auto_hide_titlebar: bool,
+) -> Option<WebSurfaceEdgeReveal> {
+    match web_surface_reveal_edge_from_name(edge_name) {
+        Some(SidebarEdge::Left) => Some(WebSurfaceEdgeReveal::LeftSidebar),
+        Some(SidebarEdge::Right) => Some(WebSurfaceEdgeReveal::RightRail),
+        None if edge_name == "top" => auto_hide_titlebar.then_some(WebSurfaceEdgeReveal::Titlebar),
+        None => None,
+    }
+}
+
 /// Reveal trigger, shell half. The vendored host observes pointer motion on
 /// page webviews and calls `window.__yggtermGlassEdgeMotion('<edge>')` when the
 /// pointer enters a window edge zone — the zones the shell's own 6px hover
@@ -8173,19 +8209,19 @@ async fn web_surface_edge_motion_reveal_loop(
         let mut eval =
             document::eval("window.__yggtermGlassEdgeMotion = (edge) => dioxus.send(edge);");
         while let Ok(edge) = eval.recv::<String>().await {
-            match web_surface_reveal_edge_from_name(&edge) {
-                // The tree and the rail are auto-hidden exactly when they are
-                // closed — there is no separate setting to consult, so the
-                // reveal is unconditional and the panel's own mode decides
-                // whether anything visible happens.
-                Some(SidebarEdge::Left) => left_sidebar.reveal(),
-                Some(SidebarEdge::Right) => right_rail.reveal(),
-                // The titlebar auto-hides only when the user asked it to.
-                None => {
-                    if state.peek().settings.auto_hide_titlebar {
-                        titlebar.reveal();
-                    }
-                }
+            // The DECISION lives in `web_surface_edge_motion_reveal_target`
+            // (pure, lock-driven); this match only performs it. Every arm's
+            // reveal call is a lock needle — an arm that stops revealing its
+            // panel is a swallowed edge, which is exactly the regression the
+            // immersion locks exist to catch.
+            match web_surface_edge_motion_reveal_target(
+                &edge,
+                state.peek().settings.auto_hide_titlebar,
+            ) {
+                Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),
+                Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),
+                Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),
+                None => {}
             }
         }
         // Channel died (webview reload): rebind the hook.
@@ -163393,7 +163429,11 @@ mod menu_dismissal_locks {
 ///
 /// The three symptoms these hold shut, in the user's words: a dark page framed
 /// by white strips; the whole page re-flowing every time a hover reveals a
-/// panel; and player fullscreen keeping the borders.
+/// panel; and player fullscreen keeping the borders. Plus the cost exact fit
+/// must never charge back: with the reserved strip gone, every auto-hidden
+/// panel is reachable over a page ONLY through the engine's edge-motion
+/// forward, so the name→panel dispatch and the sampler's revealed-gate are
+/// locked here too.
 ///
 /// The placement rule is a pure function BECAUSE the loop that calls it holds a
 /// live `DesktopContext` and cannot be entered by a test (field guide §7.1). So
@@ -163430,12 +163470,24 @@ mod web_surface_immersion_locks {
     // The trap every scanning lock in this repo must disarm: if `product_lines`
     // stopped skipping this module, the needles below would be satisfied by
     // their own text and the scans would be worthless.
+    //
+    // TWO canaries, both ends of the module. The top one catches the skip rule
+    // being lost outright; the bottom one (the LAST test's name) catches the
+    // subtler leak this module has already produced once: a bare column-0 `}`
+    // inside an embedded string reads as the module's end, so the scan resumes
+    // MID-module and self-satisfies every needle after that line while the
+    // top canary stays green.
     #[test]
     fn the_scan_is_not_reading_this_test_module() {
         let scanned = product(&shell_source());
         assert!(
             !scanned.contains("the_scan_is_not_reading_this_test_module"),
             "product_lines stopped skipping this module — every scan below now self-satisfies"
+        );
+        assert!(
+            !scanned.contains("the_edge_motion_loop_performs_the_dispatch_and_is_spawned"),
+            "product_lines resumed scanning MID-module (a column-0 `}}` leaked out of an \
+             embedded string?) — every needle after the leak now self-satisfies"
         );
     }
 
@@ -163632,6 +163684,296 @@ mod web_surface_immersion_locks {
         }
     }
 
+    // -- LOCK 6 -- ENGINE EDGE NAMES resolve to their own edge and nothing
+    // else. The name half of the reveal contract: the vendored host sends
+    // 'left'/'right'/'top' (`SurfaceRevealEdge`, engine layer), and a name this
+    // shell cannot place must resolve to NO edge — defaulting it anywhere
+    // would flash chrome the user never went near.
+    #[test]
+    fn engine_edge_names_resolve_to_their_own_edge_and_nothing_else() {
+        assert_eq!(
+            web_surface_reveal_edge_from_name("left"),
+            Some(SidebarEdge::Left),
+            "the engine's 'left' is the hidden tree's edge"
+        );
+        assert_eq!(
+            web_surface_reveal_edge_from_name("right"),
+            Some(SidebarEdge::Right),
+            "the engine's 'right' is the hidden rail's edge"
+        );
+        for not_a_side in ["top", "bottom", "", "Left", "RIGHT", " left", "right "] {
+            assert_eq!(
+                web_surface_reveal_edge_from_name(not_a_side),
+                None,
+                "{not_a_side:?} is not a side edge and must not resolve to one"
+            );
+        }
+    }
+
+    // -- LOCK 7 -- THE DISPATCH: each engine edge reveals its own panel, the
+    // titlebar only when the user asked for auto-hide, and an unknown name
+    // reveals NOTHING. This is the decision the reveal loop performs verbatim
+    // (its arms are needles in the wiring lock below), so "the loop swallows
+    // an edge" reddens either here (the decision changed) or there (the
+    // performance of it stopped).
+    #[test]
+    fn each_engine_edge_reveals_its_own_panel_and_unknown_edges_reveal_nothing() {
+        for auto_hide_titlebar in [false, true] {
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar),
+                Some(WebSurfaceEdgeReveal::LeftSidebar),
+                "the hidden tree must be revealable over a page whatever the titlebar setting"
+            );
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar),
+                Some(WebSurfaceEdgeReveal::RightRail),
+                "the hidden rail must be revealable over a page whatever the titlebar setting"
+            );
+        }
+        assert_eq!(
+            web_surface_edge_motion_reveal_target("top", true),
+            Some(WebSurfaceEdgeReveal::Titlebar),
+            "top-edge motion must reveal the auto-hidden titlebar"
+        );
+        assert_eq!(
+            web_surface_edge_motion_reveal_target("top", false),
+            None,
+            "a titlebar the user did NOT auto-hide must not be revealed by edge motion"
+        );
+        for junk in ["bottom", "", "TOP", "player"] {
+            for auto_hide_titlebar in [false, true] {
+                assert_eq!(
+                    web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar),
+                    None,
+                    "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
+                     flashing the titlebar for it is chrome the user never went near"
+                );
+            }
+        }
+    }
+
+    // -- LOCK 8 -- THE SAMPLER'S REVEALED-GATE, run in a real JS engine. The
+    // Rust placement rule is only as honest as the claims the eval hands it:
+    // if the eval measured COLLAPSED chrome again, every 6px hover sensor
+    // would come back as a permanent claim — the reserved strip — while every
+    // Rust-side lock above stayed green. So the eval is DRIVEN, exactly as the
+    // webview runs it, against a fake DOM: collapsed chrome claims nothing,
+    // revealed chrome claims its px (pin flag included), under glass nothing
+    // claims, and the page rect is reported RAW (the eval samples; it does not
+    // decide).
+    //
+    // Node-skipping follows the existing precedent
+    // (`terminal_eval_script_is_parseable_as_dioxus_async_function_body`); the
+    // structural needles in `the_geometry_eval_keeps_its_revealed_gate` hold
+    // the gate line shut where node is unavailable.
+    #[test]
+    fn the_geometry_eval_driven_in_a_js_engine_claims_only_revealed_chrome() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("skipping geometry-eval behavioural lock because node is unavailable");
+            return;
+        }
+        // A fake DOM shaped like the shell's: three chrome elements looked up
+        // by the EXACT selectors the eval uses, attribute maps, laid-out
+        // rects, and a dioxus channel that records what the eval sends.
+        //
+        // ⚠ Every line of this embedded JS is INDENTED on purpose: a bare
+        // column-0 `}` inside this raw string reads, to `product_lines`'s
+        // block-end rule, as the END of this `#[cfg(test)]` module — the scan
+        // would resume mid-module and every needle below it would self-satisfy
+        // (the end-of-module canary in `the_scan_is_not_reading_this_test_module`
+        // catches exactly that).
+        const HARNESS_JS: &str = r#"
+    const fs = require('fs');
+    const evalSource = fs.readFileSync(process.argv[2], 'utf8');
+    const scenarios = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+    const results = {};
+    for (const [name, scenario] of Object.entries(scenarios)) {
+        const makeEl = (spec) => spec ? {
+            getAttribute: (attr) =>
+                (spec.attrs && Object.prototype.hasOwnProperty.call(spec.attrs, attr))
+                    ? spec.attrs[attr] : null,
+            getBoundingClientRect: () => {
+                const [left, top, right, bottom] = spec.rect;
+                return { left, top, right, bottom, width: right - left, height: bottom - top };
+            },
+        } : null;
+        const pages = (scenario.pages || []).map((page) => makeEl({
+            attrs: { 'data-ws-page': page.name },
+            rect: page.rect,
+        }));
+        const fakeDocument = {
+            documentElement: {
+                getAttribute: (attr) =>
+                    attr === 'data-under-glass' ? (scenario.underGlass ? '1' : '0') : null,
+            },
+            querySelector: (selector) => makeEl((scenario.chrome || {})[selector]),
+            querySelectorAll: (selector) => selector === '[data-ws-page]' ? pages : [],
+        };
+        const fakeWindow = {
+            innerWidth: scenario.viewport[0],
+            innerHeight: scenario.viewport[1],
+        };
+        const sent = [];
+        const fakeDioxus = { send: (value) => sent.push(value) };
+        new Function('document', 'window', 'dioxus', evalSource)(fakeDocument, fakeWindow, fakeDioxus);
+        if (sent.length !== 1) {
+            throw new Error(name + ': the eval must send exactly once, sent ' + sent.length);
+        }
+        results[name] = sent[0];
+    }
+    process.stdout.write(JSON.stringify(results));
+"#;
+        // One chrome set, four postures. Rects are realistic: a 40px titlebar,
+        // a 320px tree, a 320px rail on a 1920x1080 window — and in the
+        // collapsed posture the side elements are their 6px hover sensors,
+        // which is exactly what the old clamp measured into a permanent strip.
+        let chrome = |revealed: bool, pinned: bool| {
+            let pin = if pinned { "1" } else { "0" };
+            json!({
+                "[data-yggterm-titlebar=\"1\"]": {
+                    "attrs": {
+                        "data-titlebar-revealed": if revealed { "true" } else { "false" },
+                        "data-titlebar-autohide-pin": pin,
+                    },
+                    "rect": [0, 0, 1920, 40],
+                },
+                "[data-sidebar-auto-hide=\"true\"]": {
+                    "attrs": {
+                        "data-sidebar-autohide-revealed": if revealed { "true" } else { "false" },
+                        "data-sidebar-autohide-pin": pin,
+                    },
+                    "rect": if revealed { json!([0, 0, 320, 1080]) } else { json!([0, 0, 6, 1080]) },
+                },
+                "[data-yggui-side-rail-auto-hide=\"1\"]": {
+                    "attrs": {
+                        "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
+                        "data-yggui-side-rail-autohide-pin": pin,
+                    },
+                    "rect": if revealed { json!([1600, 0, 1920, 1080]) } else { json!([1914, 0, 1920, 1080]) },
+                },
+            })
+        };
+        let page = json!([{ "name": "ws", "rect": [0, 0, 1920, 1080] }]);
+        let scenarios = json!({
+            "collapsed": {
+                "underGlass": false, "viewport": [1920, 1080],
+                "chrome": chrome(false, false), "pages": page,
+            },
+            "revealed_hover": {
+                "underGlass": false, "viewport": [1920, 1080],
+                "chrome": chrome(true, false), "pages": page,
+            },
+            "revealed_pinned": {
+                "underGlass": false, "viewport": [1920, 1080],
+                "chrome": chrome(true, true), "pages": page,
+            },
+            "under_glass": {
+                "underGlass": true, "viewport": [1920, 1080],
+                "chrome": chrome(true, true), "pages": page,
+            },
+        });
+        let tmp_dir = std::env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join("tmp")
+            .join("web-surface-geometry-eval-lock");
+        std::fs::create_dir_all(&tmp_dir).expect("create geometry eval tmp dir");
+        let eval_path = tmp_dir.join("geometry-eval.js");
+        let harness_path = tmp_dir.join("harness.js");
+        let scenarios_path = tmp_dir.join("scenarios.json");
+        std::fs::write(&eval_path, WEB_SURFACE_GEOMETRY_EVAL_JS).expect("write eval js");
+        std::fs::write(&harness_path, HARNESS_JS).expect("write harness js");
+        std::fs::write(&scenarios_path, scenarios.to_string()).expect("write scenarios");
+        let output = Command::new("node")
+            .arg(&harness_path)
+            .arg(&eval_path)
+            .arg(&scenarios_path)
+            .output()
+            .expect("run node geometry eval harness");
+        assert!(
+            output.status.success(),
+            "the geometry eval failed to RUN against the fake DOM: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let results: Value =
+            serde_json::from_slice(&output.stdout).expect("harness output is JSON");
+        let claim = |scenario: &str, edge: &str| -> Vec<i64> {
+            results[scenario]["chrome"][edge]
+                .as_array()
+                .unwrap_or_else(|| panic!("{scenario}.chrome.{edge} missing from the eval's send"))
+                .iter()
+                .map(|value| value.as_i64().expect("claim entries are integers"))
+                .collect()
+        };
+        // THE regression this lock exists for: collapsed chrome — including
+        // the 6px sensors, which HAVE nonzero rects — claims nothing.
+        for edge in ["top", "left", "right"] {
+            assert_eq!(
+                claim("collapsed", edge),
+                vec![0, 0],
+                "collapsed {edge} chrome claimed a strip — the reserved strip is back"
+            );
+        }
+        // Revealed chrome claims exactly its reach, and the pin stamp rides.
+        for (edge, px) in [("top", 40), ("left", 320), ("right", 320)] {
+            assert_eq!(
+                claim("revealed_hover", edge),
+                vec![px, 0],
+                "a revealed unpinned {edge} must claim [{px}, 0]"
+            );
+            assert_eq!(
+                claim("revealed_pinned", edge),
+                vec![px, 1],
+                "a revealed pinned {edge} must claim [{px}, 1]"
+            );
+            // Under glass the chrome draws OVER the page: no claim, ever.
+            assert_eq!(
+                claim("under_glass", edge),
+                vec![0, 0],
+                "under glass the {edge} chrome must claim nothing"
+            );
+        }
+        // The eval SAMPLES, it does not decide: the page rect is reported raw
+        // in every posture — a revealed titlebar must NOT clamp it here.
+        for scenario in ["collapsed", "revealed_hover", "revealed_pinned", "under_glass"] {
+            assert_eq!(
+                results[scenario]["pages"]["ws"],
+                json!([0, 0, 1920, 1080]),
+                "{scenario}: the eval clamped the page rect — placement is \
+                 `web_surface_place_page_rect`'s job"
+            );
+            assert_eq!(
+                results[scenario]["viewport"],
+                json!([1920, 1080]),
+                "{scenario}: the viewport must ride the same send"
+            );
+        }
+    }
+
+    // The no-node fallback for LOCK 8, and the exact-line tripwire for the
+    // gate: a claim exists ONLY while the chrome says it is revealed.
+    #[test]
+    fn the_geometry_eval_keeps_its_revealed_gate() {
+        let js = WEB_SURFACE_GEOMETRY_EVAL_JS;
+        assert!(
+            js.contains(
+                "if (el.getAttribute(revealedAttr) !== revealedValue) { return [0, 0]; }"
+            ),
+            "the sampler's revealed-gate is gone — collapsed chrome (the 6px hover sensors) \
+             would claim a permanent strip between every page and the window"
+        );
+        // The clamp must never come back in any spelling: the eval reports raw
+        // rects and Rust decides.
+        for forbidden in ["clampBox", "clampTop", "clampLeft", "clampRight", "Math.min("] {
+            assert!(
+                !js.contains(forbidden),
+                "the geometry eval grew a clamp again ({forbidden}) — placement is \
+                 `web_surface_place_page_rect`'s job, and an eval-side clamp is a second decider"
+            );
+        }
+    }
+
     // -- WIRING -- the residual seams a pure function cannot reach.
     //
     // Each needle is a PRODUCTION call site, so reverting the wiring reddens
@@ -163641,8 +163983,12 @@ mod web_surface_immersion_locks {
     fn the_placement_rule_is_wired_to_the_reconciler_and_the_render() {
         let scanned = product(&shell_source());
         for needle in [
-            // The reconciler places every tab through the rule...
-            "web_surface_place_page_rect(",
+            // The reconciler places every tab through the rule. Anchored on
+            // the call's OWN argument lines, deliberately: the bare name
+            // `web_surface_place_page_rect(` is satisfied by the function's
+            // DEFINITION line, so with that needle the call could be deleted
+            // and this lock would stay green.
+            ".map(|raw| {\n                    web_surface_place_page_rect(\n                        raw,\n                        viewport_size,\n                        chrome_claims,\n                        tab_fullscreen,\n                    )\n                });",
             // ...with the engine's own fullscreen answer, not a shell guess.
             "let fullscreen_native_id = desktop.web_surface_fullscreen();",
             // ...and the claims the eval sampled, not a re-derivation.
@@ -163653,6 +163999,13 @@ mod web_surface_immersion_locks {
             // The seam has ONE owner, and the native backdrop shares it.
             "let web_surface_seam = web_surface_seam_css(",
             "let backdrop = web_surface_seam_rgb(",
+            // ...and its FEED: the reconciler polls the engine's answer and
+            // writes it through on a change edge. Losing either line leaves
+            // every page on the dark fallback — right for a dark site, a
+            // window-edge-coloured frame around a light one — while all the
+            // seam locks above stay green.
+            "desktop.web_surface_page_theme_color(entry.native_id);",
+            "shell.set_web_tab_theme_color(&key.0, key.1, page_theme_color);",
             // The pin stamps the claim sampler reads.
             "\"data-titlebar-autohide-pin\": if titlebar_reveal_pinned",
             "\"data-sidebar-autohide-pin\": if auto_hide && autohide_pinned",
@@ -163667,6 +164020,67 @@ mod web_surface_immersion_locks {
         assert!(
             !scanned.contains("margin:4px; border-radius:10px; background:#ffffff;"),
             "the page placeholder's inset + white fill came back"
+        );
+    }
+
+    // The loop that PERFORMS the dispatch cannot be entered by a test (it owns
+    // a live eval channel), so its arms are needles over product lines: an arm
+    // that stops calling its panel's reveal — or a loop nobody spawns — is a
+    // swallowed edge even while `web_surface_edge_motion_reveal_target` itself
+    // stays green in LOCK 7.
+    #[test]
+    fn the_edge_motion_loop_performs_the_dispatch_and_is_spawned() {
+        let scanned = product(&shell_source());
+        for needle in [
+            // The loop is armed at app start...
+            "spawn_forever(web_surface_edge_motion_reveal_loop(",
+            // ...decides through the lock-driven dispatch, with the titlebar
+            // setting read at message time...
+            "match web_surface_edge_motion_reveal_target(",
+            // ...and performs every arm of its answer.
+            "Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),",
+            "Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),",
+            "Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),",
+        ] {
+            assert!(
+                scanned.contains(needle),
+                "the edge-motion reveal wiring lost its call site: {needle}"
+            );
+        }
+    }
+
+    // The edge NAMES are a cross-crate contract: the vendored host's forward
+    // spells them, the shell's dispatch consumes them, and neither crate can
+    // see the other's tests. Renaming one side ('left' → 'l' in the forward,
+    // say) silently kills that panel's reveal over every page while both
+    // crates' own locks stay green — so the two vocabularies are pinned
+    // against each other here, on the file that owns the sending half.
+    #[test]
+    fn the_engine_and_the_shell_agree_on_the_edge_name_vocabulary() {
+        let vendor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/dioxus-desktop/src/webview.rs"
+        ))
+        .expect("the vendored webview.rs is readable");
+        for mapping in [
+            "crate::web_surface::SurfaceRevealEdge::Top => \"top\",",
+            "crate::web_surface::SurfaceRevealEdge::Left => \"left\",",
+            "crate::web_surface::SurfaceRevealEdge::Right => \"right\",",
+            // ...delivered to the exact hook the shell binds.
+            "window.__yggtermGlassEdgeMotion && window.__yggtermGlassEdgeMotion('{edge}');",
+        ] {
+            assert!(
+                vendor.contains(mapping),
+                "the engine's edge-name forward lost its spelling: {mapping}"
+            );
+        }
+        // The shell's half of the same contract: the hook the forward calls,
+        // bound to the channel the dispatch consumes. LOCK 7 already proves
+        // what 'top'/'left'/'right' DO once received.
+        assert!(
+            product(&shell_source())
+                .contains("window.__yggtermGlassEdgeMotion = (edge) => dioxus.send(edge);"),
+            "the shell stopped binding the edge-motion hook the engine forward calls"
         );
     }
 }
