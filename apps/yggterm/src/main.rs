@@ -5099,6 +5099,58 @@ fn configure_linux_webkit_compositing() {
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_webkit_compositing() {}
 
+/// What ONE web process may hold before WebKit starts taking memory back.
+///
+/// ⚠ THIS IS AN AUDIO/VIDEO FIX as much as a memory one. The old numbers were a
+/// 320 MB limit with conservative reclaim at 33% and strict at 50% — i.e. every
+/// page over ~160 MB lived permanently in WebKit's most aggressive reclaim, and
+/// the first things that reclaim drops are decoded media buffers. Measured on
+/// the live host: YouTube tabs at 325 and 416 MB, so the user's video was ALWAYS
+/// in strict pressure, and it came out as distorted audio (worse on Bluetooth,
+/// where an underrun is audible immediately). 320 MB was sized when a web
+/// surface was a small embedded viewer; ychrome is the user's browser now.
+///
+/// So: size the limit to the MACHINE, and leave real headroom below the
+/// thresholds. The limit still bounds a runaway page — round 24 watched one
+/// balloon to 3.9 GB — and it is no longer the only defence: per-tab reclaim
+/// (2.12.18) bounds how many live pages exist at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WebkitMemoryPolicy {
+    limit_mb: u32,
+    conservative: f64,
+    strict: f64,
+}
+/// A browser's share of one machine: an eighth of RAM per web process, never
+/// below 768 MB (a media page needs room to decode) and never above 3 GB (past
+/// that the limit stops being a bound at all). `None` (unreadable meminfo) takes
+/// a conservative middle rather than the old cliff.
+fn webkit_memory_policy(mem_total_kb: Option<u64>) -> WebkitMemoryPolicy {
+    const MIN_MB: u64 = 768;
+    const MAX_MB: u64 = 3072;
+    let limit_mb = match mem_total_kb {
+        Some(kb) if kb > 0 => ((kb / 1024) / 8).clamp(MIN_MB, MAX_MB),
+        _ => 1024,
+    } as u32;
+    WebkitMemoryPolicy {
+        limit_mb,
+        // Three quarters, not a third. The thresholds are FRACTIONS OF THE
+        // LIMIT, so on a modest host a low fraction re-creates the very bug this
+        // policy exists to kill: at 0.5 an 8 GB machine starts reclaiming at
+        // 512 MB, and a 416 MB video page is already crowding it. Reclaim should
+        // begin when a page is genuinely outsized for its share, not when it is
+        // merely playing a video.
+        conservative: 0.75,
+        strict: 0.90,
+    }
+}
+fn read_mem_total_kb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_memory_policy() {
     if std::env::var_os(ENV_YGGTERM_WEBKIT_CACHE_MODEL).is_none() {
@@ -5114,14 +5166,30 @@ fn configure_linux_webkit_memory_policy() {
         // old cacheless behaviour back.
         unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "web-browser") };
     }
+    let policy = webkit_memory_policy(read_mem_total_kb());
     if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB).is_none() {
-        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB, "320") };
+        unsafe {
+            std::env::set_var(
+                ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB,
+                policy.limit_mb.to_string(),
+            )
+        };
     }
     if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD).is_none() {
-        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD, "0.33") };
+        unsafe {
+            std::env::set_var(
+                ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD,
+                format!("{:.2}", policy.conservative),
+            )
+        };
     }
     if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD).is_none() {
-        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD, "0.50") };
+        unsafe {
+            std::env::set_var(
+                ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD,
+                format!("{:.2}", policy.strict),
+            )
+        };
     }
     if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC).is_none() {
         unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC, "30.0") };
@@ -6167,6 +6235,61 @@ mod web_usage_tests {
 #[cfg(test)]
 mod tests {
 
+    /// ⚠ THE AUDIO FIX. A media page must not live in permanent memory pressure:
+    /// WebKit's reclaim drops decoded buffers first, which on the live host came
+    /// out as distorted YouTube audio (325-416 MB tabs against a 320 MB limit
+    /// whose strict threshold sat at 160 MB — every video always in the most
+    /// aggressive reclaim). What is locked is the PROPERTY, not the numbers: a
+    /// real media page has headroom, and a runaway page is still bounded.
+    #[test]
+    fn a_media_page_is_not_born_in_memory_pressure_and_a_runaway_is_still_bounded() {
+        // A YouTube tab as measured on the live host, and the balloon round 24
+        // watched.
+        const MEDIA_PAGE_MB: f64 = 416.0;
+        const RUNAWAY_MB: f64 = 3_900.0;
+        // 8 GB and up. Below that a host genuinely cannot give one page 1.5x a
+        // video's working set, and pretending otherwise would be the dishonest
+        // half of this lock — what it asserts for a small machine is the floor.
+        for total_gb in [8u64, 16, 32, 64] {
+            let policy = super::webkit_memory_policy(Some(total_gb * 1024 * 1024));
+            let limit = f64::from(policy.limit_mb);
+            let conservative = limit * policy.conservative;
+            assert!(
+                conservative > MEDIA_PAGE_MB * 1.5,
+                "on a {total_gb} GB host a {MEDIA_PAGE_MB} MB video page must sit \
+                 well below the first reclaim threshold ({conservative} MB), or \
+                 its audio is what pays"
+            );
+            assert!(
+                limit < RUNAWAY_MB,
+                "the limit must still bound a runaway page on a {total_gb} GB host"
+            );
+            assert!(
+                policy.strict > policy.conservative && policy.strict < 1.0,
+                "strict pressure comes after conservative, and before the limit"
+            );
+        }
+        // The clamps: a small machine still gets room to decode, a huge one does
+        // not get a limit so large it stops being a bound.
+        assert_eq!(
+            super::webkit_memory_policy(Some(2 * 1024 * 1024)).limit_mb,
+            768,
+            "even a 2 GB host gives a page room to decode media"
+        );
+        assert_eq!(
+            super::webkit_memory_policy(Some(512 * 1024 * 1024)).limit_mb,
+            3072,
+            "a 512 GB host does not get an unbounded page"
+        );
+        // Unreadable meminfo takes a middle, never the old 320 MB cliff.
+        let unknown = super::webkit_memory_policy(None);
+        assert!(
+            unknown.limit_mb >= 768,
+            "an unknown machine still must not put a media page in permanent \
+             pressure: {unknown:?}"
+        );
+    }
+
     /// A BROWSER CACHES. `document-viewer` is WebKit's own name for "disable the
     /// cache completely" — the default this process shipped, which meant every
     /// navigation and every reload in ychrome refetched every byte. The knob
@@ -6188,14 +6311,33 @@ mod tests {
             "the default must be a caching model; document-viewer disables the \
              cache outright:\n{decision}"
         );
-        // The bound: caching more is only safe because these are still here.
-        for bound in [
-            "ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB",
-            "ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD",
+        // The bound: caching more is only safe because the memory policy is
+        // still applied — and applied FROM THE DERIVATION, not hardcoded, so the
+        // audio-headroom lock above actually governs what ships.
+        let configure = product
+            .split("fn configure_linux_webkit_memory_policy() {")
+            .nth(1)
+            .expect("the memory policy function moved — move this lock with it");
+        let body = configure
+            .split("\n}")
+            .next()
+            .expect("the function has a body");
+        assert!(
+            body.contains("let policy = webkit_memory_policy(read_mem_total_kb());"),
+            "the policy must be DERIVED from the machine:\n{body}"
+        );
+        for (env_name, from) in [
+            ("ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB", "policy.limit_mb"),
+            (
+                "ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD",
+                "policy.conservative",
+            ),
+            ("ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD", "policy.strict"),
         ] {
             assert!(
-                product.contains(&format!("{bound}, ")),
-                "the memory policy that bounds the cache lost {bound}"
+                body.contains(env_name) && body.contains(from),
+                "{env_name} must be set from {from}; a hardcoded number here \
+                 escapes the headroom lock entirely"
             );
         }
     }
