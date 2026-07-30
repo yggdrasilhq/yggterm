@@ -39,6 +39,7 @@ use yggterm_server::{
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_ensure_web_surface, run_app_control_focus_window,
     run_app_control_grid, run_app_control_key, run_app_control_list_clients,
+    run_app_control_memory_profile,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_pointer, run_app_control_probe_terminal_context_menu,
@@ -2519,6 +2520,11 @@ fn main() -> Result<()> {
             }
             "clients" => run_app_control_list_clients(),
             "desktop-identity" => run_app_control_desktop_identity(),
+            // A LOCAL /proc walk, not an app-control round trip: the profile is
+            // most needed when the GUI is too loaded to answer a socket.
+            "memory" | "mem" => {
+                run_app_control_memory_profile(args.iter().any(|arg| arg == "--json"))
+            }
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
                 let output_path = cli_positional_args(&args, 3)

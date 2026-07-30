@@ -17077,6 +17077,99 @@ fn active_client_instance_records_from_dir(
     Ok(())
 }
 
+/// Sample every readable process out of `/proc` for the memory profile.
+///
+/// Deliberately a LOCAL walk with no app-control round trip: the profile is most
+/// needed exactly when the GUI is too busy to answer a socket, and a probe that
+/// times out under memory pressure is a probe that cannot see the thing it is
+/// for.
+///
+/// Unreadable fields are recorded as absent, never guessed. A helper whose
+/// environ we cannot read must not be counted into the leak (that would blame the
+/// user's own desktop) nor cleared of it (that would hide ours).
+fn sample_proc_table() -> Vec<yggterm_core::memory_profile::ProcSample> {
+    use yggterm_core::memory_profile::ProcSample;
+
+    let mut samples = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return samples;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<i32>() else { continue };
+        let base = entry.path();
+
+        let Ok(status) = fs::read_to_string(base.join("status")) else {
+            continue;
+        };
+        let mut rss_kb = None;
+        let mut swap_kb = 0u64;
+        let mut ppid = 0i32;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("VmSwap:") {
+                swap_kb = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("PPid:") {
+                ppid = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+        // No VmRSS means a kernel thread: no address space, nothing to attribute.
+        let Some(rss_kb) = rss_kb else { continue };
+
+        let comm = fs::read_to_string(base.join("comm"))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+
+        let environ = fs::read(base.join("environ")).unwrap_or_default();
+        let mut dbus_session = None;
+        let mut yggterm_marked = false;
+        for var in environ.split(|byte| *byte == 0) {
+            let Ok(var) = std::str::from_utf8(var) else { continue };
+            if let Some(value) = var.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
+                dbus_session = Some(value.to_string());
+            }
+            if var.starts_with("YGGTERM_") || var.contains("yggterm") {
+                yggterm_marked = true;
+            }
+        }
+
+        samples.push(ProcSample {
+            pid,
+            ppid,
+            comm,
+            rss_kb,
+            swap_kb,
+            dbus_session,
+            yggterm_marked,
+        });
+    }
+    samples
+}
+
+/// `server app memory` — where yggterm's memory actually goes.
+///
+/// Answers the question that every other instrument got wrong on 2026-07-30: the
+/// user saw a 16 GB machine consumed by yggterm while `ps` showed our processes
+/// at a few hundred MB, because 4.5 GB was sitting in orphaned `xdg-desktop-portal`
+/// and `ksecretd` processes on autolaunched D-Bus buses. See
+/// [`yggterm_core::memory_profile`] for the mechanism.
+pub fn run_app_control_memory_profile(as_json: bool) -> anyhow::Result<()> {
+    let samples = sample_proc_table();
+    let profile = yggterm_core::memory_profile::profile(&samples);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&profile)?);
+    } else {
+        print!("{}", yggterm_core::memory_profile::render(&profile));
+    }
+    Ok(())
+}
+
 pub fn run_app_control_list_clients() -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let endpoint = default_endpoint(&home);
