@@ -419,6 +419,42 @@ If a project has a conversation Web View surface:
 - overview/graph mode should feel structural, not like the same chat list in a second skin
 - overview mode should highlight summary, counts, and message progression before full transcript detail
 
+### Native page surfaces (the browser viewport)
+
+A native page surface — a real web page rendered by the engine and layered over
+the viewport (ychrome) — is **not** a widget inside the main canvas. It **is**
+the canvas for as long as it is up. The rules above about a floating sheet with
+a mild radius describe the TERMINAL viewport; a page is the other kind of main
+artifact, and applying the terminal's frame to it is what produced the border
+users kept reporting.
+
+- **The molded frame is opt-out for web surfaces, and web surfaces take the
+  opt-out.** No inset, no corner radius, no drop shadow around a page. The
+  terminal's 4px frame padding and 10px radius exist to make a canvas of TEXT
+  read as a sheet; around a page they are a visible strip of shell (near-white
+  on the light chrome — the white border around a dark site) and the radius was
+  never real anyway, because a native child webview paints its full container
+  box and cannot be clipped by CSS `border-radius`.
+- **The seam is the page's colour.** Every surface that can be seen behind or
+  beside a page — the frame wrapper, the page placeholder, the native fill
+  under a webview that has not painted its first frame — takes ONE colour,
+  derived from the page's own declared `theme-color` (else its painted body
+  background). They must never disagree; a disagreement between two of them is
+  exactly what the eye reads as a border.
+- **The seam fallback is dark, never white.** When a page has not said what
+  colour it is yet, the seam is a dark neutral. A dark seam against a light page
+  reads as a window edge; a white seam against a dark page reads as damage.
+- **The page chrome keeps the app appearance.** Tab strip and omnibox carry text
+  and stay on the light/dark chrome palette. Only the surfaces that BACK the
+  page take the seam.
+- **A transient reveal must not reflow the page.** Hover-revealed chrome
+  translates the page (its far edge crops for the duration of the hover);
+  only chrome held open by a standing gesture may resize it.
+- **Element fullscreen owns the whole window.** Every chrome claim — including
+  the auto-hide reveal sensors — stands down, and the page fills the window
+  edge to edge until it leaves fullscreen, which restores the exact prior
+  layout.
+
 ### Reusable shell guidance
 
 If a project has:
