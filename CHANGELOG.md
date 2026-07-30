@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.12.18
 
+- **Security: a web page can no longer drive ychrome's settings or reach your
+  vault.** ychrome's settings pane is served over a small local endpoint, and
+  that endpoint was reachable from any page you visited — so a hostile site could
+  have switched off ad blocking, deleted a userscript, changed the browser
+  identity, or asked for a saved credential and been handed it, because a
+  credential fill is delivered as a script into the page that asked. The
+  endpoint now requires a per-session key that yggterm receives over the
+  terminal stream, which is the one channel a page cannot read. Reads that
+  contain no secret (the ad-blocking ruleset a page can already see, the zoom
+  table, and a liveness check) stay open, so an older yggterm keeps its ad
+  blocking while you upgrade.
+
 - **Fixed: right-click menus now close the way you expect.** Clicking anywhere
   outside a menu closes it, Escape closes it, and a menu whose row disappeared
   closes itself — previously the only reliable way out was picking an item, and
