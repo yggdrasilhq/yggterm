@@ -23,7 +23,9 @@ The control channel is an OSC escape sequence emitted on the app's stdout:
 ESC ] 7717 ; web-surface ; <action> ; <base64 json> BEL
 ```
 
-- `<action>`: `open` | `heartbeat` | `close`
+- `<action>`: `open` | `heartbeat` | `close` (app-emitted), plus `seen`
+  (daemon-minted only — see below; an app never writes it, and the daemon
+  ignores one that does)
 - json payload: `{"session": "<YGGTERM_SESSION_ID>", "url": "...", "title": "..."}`
 
 Because the transport is the terminal byte stream itself, it works identically
@@ -57,6 +59,22 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
   (scrollback replay) self-heals the surface.
 - `close` removes the surface immediately. Scrollback replay of an
   open→close pair is order-preserving, so replays converge to the right state.
+- `seen` is the daemon's attach-replay spelling of an `open` it has already
+  consumed. The daemon ingests every declare into its retained record the
+  moment it arrives, but the raw bytes stay in the retained chunk ring as
+  scrollback transcript, and a cursor-0 attach REPLAYS that ring — so a fresh
+  GUI could receive the run's original `open` and re-execute launch intent on
+  what is really a re-attach (re-minting the launch tab over the user's page;
+  with tab restore off, deleting that page's saved row). The daemon is the one
+  owner that knows a cursor-0 serve is a replay, so it rewrites the consumed
+  `open` to the same-length `seen` in the SERVED copy (the ring is untouched;
+  chunk count/seqs/lengths unchanged; a declare straddling chunk boundaries is
+  still caught — the rewrite runs over the joined tail). The GUI classifies
+  `seen` like a heartbeat: liveness and re-attach, never intent. Two
+  deliberate exceptions keep the transcript faithful: a record still on `open`
+  (the app launched within the last heartbeat — the replayed open IS current)
+  and every catch-up read at cursor > 0 (bytes this client never consumed
+  carry the launch intent they would have carried live).
 - The overlay ✕ button removes the surface and writes `\x03` to the PTY —
   the terminal-native way to end the foreground app, which then emits its own
   `close`.
@@ -450,15 +468,24 @@ unless the reconciler stashes the surface.
 ### Tab persistence — "continue tabs from last time"
 
 `~/.yggterm/web-profiles/<profile>/tabs.json` (GUI-side, beside `history.jsonl`
-and the cookie jar) holds `{folders, tabs:[{url,title,folder}]}`. `folder: null`
-is a ROOT tab.
+and the cookie jar) holds `{folders, tabs:[{url,title,folder,active,app_tab}]}`.
+`folder: null` is a ROOT tab. Older files lack `active`/`app_tab`; both are
+serde-defaulted, so they load unchanged.
 
 **The rule:** a tab filed in a folder is *organization* and survives; a root tab
 is the *browsing session* and does not. `AppSettings::web_surface_restore_tabs`
 (default OFF = start fresh) decides which set a new surface reopens
 (`WebTabStore::tabs_to_open`, unit-tested). A fresh start writes the purge through
-immediately, so a GUI kill cannot resurrect it. The app tab is never saved — it
-belongs to the app, which supplies it on the next `open`. A restored tab carries
+immediately, so a GUI kill cannot resurrect it. The app tab's LAUNCH page is
+never saved — it belongs to the app, which supplies it on the next `open` — but
+the page the user *navigated* tab 0 to is the browsing session (for a plain
+launch, all of it), and it is saved carrying `app_tab: true`. That mark is how a
+rebuild knows which saved row the re-minted tab 0 already IS: the marked row is
+handed back to tab 0 (`plan_web_tab_restore` adopts it) and never reopened as a
+user tab beside it — reopening it was the duplicate-first-tab bug, one copy per
+rebuild once the launch URL's redirect made the two look distinct. Adopting also
+collapses the loose root copies that bug already minted (exact URL match at the
+root only; a filed copy or a different page is untouched). A restored tab carries
 no live handle: it is a URL in the tree until it is activated, so restoring thirty
 tabs costs thirty rows, not thirty webviews.
 
@@ -480,10 +507,22 @@ decides:
   but the app tab keeps what was asked for and stays in front. A request outranks
   a restore.
 - restore ON, launch carried NO URL (the app says so with `start_page` on the OSC
-  open — only the app knows the difference): land where the user was standing. If
-  that was a ROOT tab the app tab ADOPTS it, so no start page is opened at all. If
-  it was FILED, it is selected where it sits — adopting it onto the always-root
-  app tab would quietly pull it out of its folder.
+  open — only the app knows the difference): tab 0 adopts its own marked row and
+  the user lands where they were standing. In a store written before the mark
+  existed: if the active row was a ROOT tab the app tab ADOPTS it, so no start
+  page is opened at all; if it was FILED, it is selected where it sits — adopting
+  it onto the always-root app tab would quietly pull it out of its folder.
+- A **re-attach** outranks all of the above for tab 0. A heartbeat rebuilding a
+  surface after a GUI restart, a `seen` declare (the daemon's attach-replay
+  spelling of a consumed `open` — see Lifecycle), or the daemon-retained
+  declare replayed by the restore tick (`web_surface_open_kind_for_action`:
+  `heartbeat`/`seen` mean the app has been running; only a real `open` is a
+  launch),
+  continues a run that never ended: tab 0 adopts its marked row regardless of
+  the fresh-start setting — the declared URL is the run's old launch page, not a
+  request — and the marked row rides through `tabs_to_open`'s fresh-start filter
+  for exactly that reason. The rest of the loose session stays governed by
+  `restore`.
 
 **A restored tab has no `effective_url`.** Egress (a SOCKS tunnel, an `ssh -L`
 forward) belongs to a run, not to a saved tree, so it cannot be persisted.

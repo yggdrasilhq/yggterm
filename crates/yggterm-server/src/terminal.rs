@@ -1,4 +1,7 @@
-use crate::app_declare::{AppDeclareLog, AppDeclareRecord, AppDeclareScanner};
+use crate::app_declare::{
+    AppDeclareLog, AppDeclareRecord, AppDeclareScanner, attach_replay_neutralizes_web_surface_open,
+    rewrite_consumed_web_surface_opens,
+};
 use crate::codex_cli::{
     TerminalIdentityColorProfile, normalize_terminal_identity_color,
     terminal_identity_appearance_from_environment,
@@ -2309,6 +2312,41 @@ impl PtySessionRuntime {
             );
             chunks.push(reconcile_chunk);
         }
+        // A consumed web-surface `open` must never replay AS AN OPEN. The
+        // declare was consumed into the retained record when it arrived
+        // (`ingest_app_declares`); the raw bytes stay in the ring only as
+        // scrollback transcript, and this cursor-0 attach seed is a REPLAY of
+        // them. Served verbatim they re-execute launch intent on a client that
+        // is merely re-attaching — which re-minted the launch tab over the
+        // user's page (and, with tab restore off, deleted that page's saved
+        // row). Serve them as `seen` instead — same length, so the chunk
+        // skeleton (count, seqs, byte lengths) is untouched. The record's own
+        // action gates the sliver where the `open` IS current; catch-up reads
+        // (cursor > 0) are deliberately left verbatim — both rules live in
+        // `attach_replay_neutralizes_web_surface_open`.
+        if effective_cursor == 0 {
+            let record_action = self
+                .app_declares
+                .lock()
+                .expect("app declare log poisoned")
+                .records()
+                .into_iter()
+                .find(|record| record.verb == "web-surface")
+                .map(|record| record.action);
+            if attach_replay_neutralizes_web_surface_open(record_action.as_deref()) {
+                let rewritten = neutralize_replayed_web_surface_opens(&mut chunks);
+                if rewritten > 0 {
+                    trace_terminal_event(
+                        "web_surface_open_replay_neutralized",
+                        serde_json::json!({
+                            "path": self.key,
+                            "sequences": rewritten,
+                            "record_action": record_action,
+                        }),
+                    );
+                }
+            }
+        }
         TerminalReadResult {
             cursor: next_cursor,
             chunks,
@@ -3172,6 +3210,38 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
     }
     trim_initial_attach_low_signal_suffix(&mut selected);
     selected
+}
+
+/// Rewrite every consumed web-surface `open` in a SERVED attach seed to `seen`.
+///
+/// Operates on the joined tail because a declare can straddle chunk boundaries
+/// (the PTY reader hands the ring arbitrary splits — the same reason
+/// `AppDeclareScanner` reassembles at ingest); a per-chunk replace would miss
+/// exactly those. The swap is same-length by construction, so the joined
+/// result re-slices at the ORIGINAL chunk byte lengths: chunk count, seqs and
+/// sizes are all unchanged, and only the served COPY is touched — the ring
+/// itself keeps its faithful transcript. An `open` whose terminator has not
+/// reached the ring yet is not in this tail at all; its remainder arrives on a
+/// later read as live bytes, which is the just-launched case and correct.
+///
+/// Returns how many sequences were rewritten (0 = bytes untouched).
+fn neutralize_replayed_web_surface_opens(chunks: &mut [TerminalChunk]) -> usize {
+    let joined: String = chunks
+        .iter()
+        .map(|chunk| chunk.data.as_str())
+        .collect();
+    let Some((rewritten, count)) = rewrite_consumed_web_surface_opens(&joined) else {
+        return 0;
+    };
+    let mut offset = 0;
+    for chunk in chunks.iter_mut() {
+        let len = chunk.data.len();
+        // Same-length swap of ASCII for ASCII: every original boundary is
+        // still a char boundary in the rewritten stream.
+        chunk.data = rewritten[offset..offset + len].to_string();
+        offset += len;
+    }
+    count
 }
 
 fn select_initial_attach_chunks_for_launch(
@@ -4646,6 +4716,71 @@ line-two on the real screen\r\n\
             joined.contains("Summarize recent commits"),
             "composer placeholder must survive the attach trim"
         );
+    }
+
+    // The served attach seed never carries a consumed web-surface `open` — even
+    // when the PTY reader split the declare across chunk boundaries. EVERY
+    // split point is exercised (the scanner's own split test discipline): a
+    // per-chunk replace would miss the straddles, and a straddled replay is
+    // exactly the shape a reviewer can construct on demand. The chunk skeleton
+    // (count, seqs, per-chunk byte lengths) must come through untouched, since
+    // downstream consumers filter whole chunks by seq.
+    #[test]
+    fn a_replayed_open_is_neutralized_across_every_chunk_split() {
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(br#"{"session":"s","url":"https://app.example/start"}"#);
+        let stream = format!(
+            "MOCK_READY\r\n\x1b]7717;web-surface;open;{payload}\x07after the declare\r\n"
+        );
+        for cut in 1..stream.len() {
+            if !stream.is_char_boundary(cut) {
+                continue;
+            }
+            let mut chunks = vec![
+                TerminalChunk {
+                    seq: 7,
+                    data: stream[..cut].to_string(),
+                },
+                TerminalChunk {
+                    seq: 8,
+                    data: stream[cut..].to_string(),
+                },
+            ];
+            let lens: Vec<usize> = chunks.iter().map(|chunk| chunk.data.len()).collect();
+            let rewritten = neutralize_replayed_web_surface_opens(&mut chunks);
+            assert_eq!(rewritten, 1, "cut {cut} missed the straddled open");
+            let joined: String = chunks.iter().map(|chunk| chunk.data.as_str()).collect();
+            assert!(
+                !joined.contains("\x1b]7717;web-surface;open;"),
+                "cut {cut} served the consumed open verbatim"
+            );
+            assert!(
+                joined.contains("\x1b]7717;web-surface;seen;"),
+                "cut {cut} lost the declare instead of neutralizing it"
+            );
+            assert!(
+                joined.contains(&payload) && joined.contains("after the declare"),
+                "cut {cut} disturbed bytes outside the action token"
+            );
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.data.len()).collect::<Vec<_>>(),
+                lens,
+                "cut {cut} moved a chunk boundary"
+            );
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.seq).collect::<Vec<_>>(),
+                vec![7, 8],
+                "cut {cut} renumbered the chunks"
+            );
+        }
+
+        // And a seed with nothing to neutralize is left byte-identical.
+        let mut chunks = vec![TerminalChunk {
+            seq: 1,
+            data: "plain output\r\n".to_string(),
+        }];
+        assert_eq!(neutralize_replayed_web_surface_opens(&mut chunks), 0);
+        assert_eq!(chunks[0].data, "plain output\r\n");
     }
 
     #[test]
