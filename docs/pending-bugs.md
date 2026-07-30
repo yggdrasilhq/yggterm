@@ -30,6 +30,59 @@ fix) once the fix is verified live on jojo.
 
 ## Standing traps / other open bugs
 
+- **★★ WEBAUTHN / PASSKEYS ARE UNREACHABLE ON AN AGENT-CREATED SURFACE
+  (2026-07-28).** Full field report:
+  **[`docs/agent-passkey-gap-2026-07-28.md`](agent-passkey-gap-2026-07-28.md)**.
+  Written from a real deadline job (minting a Cloudflare DNS-01 token to renew
+  the expiring `*.gour.top` wildcard). The passkey machinery is built and
+  correct; it is simply **never wired to a surface an agent makes**:
+  1. **Surface policy is bound ONCE, at `open_web_surface` time**
+     (`crates/yggterm-shell/src/shell.rs:8715`). A surface built while
+     `web_surface_policy_gate()` is still `Pending` gets `userscripts: []` AND
+     `signer_base: None`, permanently — nothing re-fits it when the policy
+     lands. Our surface's own trace says `{"policy":false,"signer":null}` on
+     every tab. Result: `window.PublicKeyCredential` is **undefined**, and the
+     relying party (Cloudflare) renders "your browser does not support security
+     key". A human wins that race by sitting still for a second; an agent never
+     does. This is why "⚠ still owed: full crypto E2E against a real relying
+     party" is still owed.
+  2. **A hand-injected shim cannot rescue it** — `yggterm-appctl://signer` is
+     not a registered scheme on such a webview (`TypeError: Load failed`), so
+     the fix must be in the construction path, not in a userscript.
+  3. **`web ensure` silently reset a live, logged-in page to `about:blank`**
+     after the 600 s lease lapsed, reporting `healed: false, leased: true`. It
+     discarded a half-finished 2FA. Survived only because the cookie jar is
+     per-profile.
+  4. The 600 s lease is **unreadable and un-renewable**; `web eval` returns
+     `null` for statement-form scripts (`if (…) {…}` has no completion value),
+     which makes a click that DID fire look like a failure.
+  Smallest fix that makes passkeys real for agents: **have `web ensure` await
+  `SurfacePolicyGate::Ready`** before returning.
+
+- **★★ AGENT CO-BROWSE CANNOT COMPLETE AN OTP LOGIN — the logged-in plane stops
+  at the door (2026-07-28).** Full field report, seven confirmed defects and
+  nine costed feature asks: **[`docs/agent-cobrowse-gaps-2026-07-28.md`](agent-cobrowse-gaps-2026-07-28.md)**.
+  Written from a real job (building two diagnostic-lab orders end to end), not a
+  synthetic test. The headline four:
+  1. `web do fill --selector-set` refuses `surface_not_mapped` on a shadow
+     surface, and the eval fallback fills segmented OTP boxes **visibly but
+     without updating React state**, so the form posts an empty code and the
+     site shows no error. Reads like a wrong OTP; is not. Same wall already
+     recorded at a services portal. **An agent can read the SMS code off the phone in
+     five seconds and then cannot type it.**
+  2. `el.click()` silently no-ops on many React handlers; a full
+     `pointerover→…→pointerdown→mousedown→pointerup→mouseup→click` sequence at
+     real coordinates works. Should be `web do click --gesture full`.
+  3. **ychrome is single-instance per profile and silently reuses the running
+     session** — a second `ychrome --profile X <url>` replaces the existing
+     page instead of opening a tab. Destroyed a live page mid-job.
+  4. `YGGTERM_APP_CONTROL_PID` is honoured by `terminal new` but NOT by
+     `web ensure`, which then refuses while naming that same variable.
+  Highest-value asks, in order: trusted input into an unmapped surface (D1),
+  `--gesture full` (D2), verb-level `--expect` post-conditions (D3 — this run
+  reported five "successful" add-to-cart clicks that had all failed), and
+  multiple tabs per profile (D4).
+
 - **★★ THE DAEMON'S ENVIRONMENT IS FROZEN AT LAUNCH AND POISONS EVERY SESSION IT
   EVER SPAWNS — including across hot-restarts (oc, 2.12.18, 2026-07-28).**
   Observed: on oc, `claude` in every yggterm-launched session died with
