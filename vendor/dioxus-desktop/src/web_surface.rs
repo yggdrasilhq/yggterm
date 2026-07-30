@@ -1975,6 +1975,12 @@ fn build_popup_webview(
         // looking at. A popup on a stashed surface is exactly as invisible as
         // its opener.
         .with_focused(visible)
+        // A page in a browser can paste. WebKitGTK has no permission UI for
+        // this, so it is granted for the surface as a whole — the same trust
+        // boundary the profile jar already draws. Without it an IMAGE paste
+        // (and the async clipboard API generally) fails silently, which is
+        // exactly what the user hit.
+        .with_clipboard(true)
         .with_devtools(true)
         // NO url: WebKit loads the request that asked for this window into the
         // view we hand back. Loading it ourselves would race that navigation.
@@ -2474,6 +2480,12 @@ impl WebSurfaceHost {
             // 2026-07-26. A surface only gets the focus when it is being shown
             // TO SOMEONE.
             .with_focused(visible)
+        // A page in a browser can paste. WebKitGTK has no permission UI for
+        // this, so it is granted for the surface as a whole — the same trust
+        // boundary the profile jar already draws. Without it an IMAGE paste
+        // (and the async clipboard API generally) fails silently, which is
+        // exactly what the user hit.
+        .with_clipboard(true)
             .with_devtools(true)
             // Every surface reports `window.close()`. A normal tab's request is
             // REFUSED by the shell (Chrome's rule), but the shell can only refuse
@@ -4876,6 +4888,48 @@ mod download_locks {
     /// anchored to the enclosing body, so an APPEND elsewhere in the file
     /// cannot satisfy them.
     #[test]
+    /// EVERY page surface can paste, including a popup — sign-in and upload
+    /// popups paste too. wry defaults `clipboard` to false, so the async
+    /// clipboard API (and an IMAGE paste in particular) failed silently on every
+    /// page in the product; the user reported exactly that.
+    #[test]
+    fn every_page_surface_is_built_able_to_paste() {
+        let product = product_lines();
+        let focused = product
+            .iter()
+            .filter(|line| line.contains(".with_focused(visible)"))
+            .count();
+        assert!(
+            focused >= 2,
+            "the surface builders moved — there are two (the surface and its \
+             popup) and this lock counts them: {focused}"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains(".with_clipboard(true)"))
+                .count(),
+            focused,
+            "every builder that opens a page must grant the clipboard; a popup \
+             that cannot paste is the same bug in a smaller window"
+        );
+        // …and the grant sits ON the builders, not somewhere a refactor could
+        // strand it: each one immediately follows a `.with_focused(visible)`.
+        for (index, line) in product.iter().enumerate() {
+            if line.contains(".with_focused(visible)") {
+                assert!(
+                    product
+                        .get(index + 1..index + 9)
+                        .is_some_and(|window| window
+                            .iter()
+                            .any(|next| next.contains(".with_clipboard(true)"))),
+                    "the clipboard grant must be part of this builder chain, at \
+                     line {index}"
+                );
+            }
+        }
+    }
+
     fn the_engine_is_wired_to_this_download_policy_and_to_no_other() {
         let product = product_lines();
         assert!(
