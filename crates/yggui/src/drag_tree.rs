@@ -280,37 +280,191 @@ pub fn drag_threshold_reached(origin: (f64, f64), pointer: (f64, f64)) -> bool {
     dx.hypot(dy) >= DRAG_BEGIN_THRESHOLD_PX
 }
 
-/// Reorder a FLAT list: move `moved` to sit before/after `target`, returning the
-/// new order, or `None` when the drop is a no-op or names an id the list does
-/// not hold.
+/// One row of a rendered ROW LIST, as the reorder engine sees it.
 ///
-/// The tree engine above is path-and-parent shaped because the cwd tree nests.
-/// A contributed app rail does not: it is one flat sequence of row ids the app
-/// owns, and the whole reorder is "take this out, put it back there". Keeping
-/// that here rather than in the GUI means the meaning of a drop is unit-tested
-/// without a webview, and both the tree and the rail speak one
-/// [`DragDropPlacement`] vocabulary.
+/// The list is given in DRAW ORDER — the tree already flattened, parents before
+/// their children — and a row names its parent rather than owning a nested
+/// `children` array. That is deliberate and it is the SINGLE tree model every
+/// row surface in the product now shares: the sidebar's contributed panes
+/// declare a flat `Vec` of widgets in draw order, and the WebTabs rail draws a
+/// flat `Vec` of rows; a nested schema would have to be flattened by every
+/// renderer before it could be drawn, which is a second encoding of the same
+/// shape and exactly what this codebase forbids.
 ///
-/// `Into` has no meaning in a flat list — nothing can be dropped *inside* a row
-/// — so it is treated as `After`, which is what the pointer bands either side of
-/// a row's midpoint already produce.
-pub fn reorder_flat_list(
-    order: &[String],
+/// Rows hidden inside a COLLAPSED group still belong here. Only visible rows
+/// can be dropped ON, but every row has to be in the model or a reorder would
+/// silently drop the ones the user cannot currently see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTreeRow {
+    pub id: String,
+    /// The group this row is filed in; `None` = the list's own root band.
+    pub parent: Option<String>,
+    /// This row is a GROUP: something dropped INTO it becomes its child.
+    /// A row that is not a group has no inside, and `Into` degrades to `After`
+    /// — the rule a flat list has always followed.
+    pub group: bool,
+}
+
+impl RowTreeRow {
+    /// A leaf at the root — the whole of what a FLAT list's row is.
+    pub fn leaf(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            parent: None,
+            group: false,
+        }
+    }
+}
+
+/// What a drop MEANT: the moved row's new parent, and the list's whole new
+/// draw order. Both, because a drop can re-parent, re-order, or do both at
+/// once, and a caller that only learned one of the two would have to
+/// reconstruct the other — a second answer to the same question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTreeDrop {
+    pub parent: Option<String>,
+    pub order: Vec<String>,
+}
+
+/// Move `moved` before/into/after `target` in a hierarchical row list,
+/// returning the new parent and the whole new draw order — or `None` when the
+/// drop is a no-op, names an id the list does not hold, or would file a group
+/// inside its own subtree.
+///
+/// THE one ordering algorithm for id-keyed row lists. A FLAT list is its
+/// degenerate case — every row a root leaf — and has no entry point of its own,
+/// so a flat rail and a nested one cannot disagree about what dropping a row on
+/// another row means.
+///
+/// The rules, in the same vocabulary [`resolve_tree_drop_placement`] uses for
+/// the path-keyed cwd tree:
+///
+/// - `Into` a GROUP files the row at the TOP of that group (`TopOfGroup`).
+/// - `Into` a non-group has no inside, so it is `After`.
+/// - `After` puts the row immediately after the target AND everything nested
+///   under it, so dropping below a folder lands beside the folder, not in it.
+/// - `Before` puts the row immediately above the target, among its siblings.
+pub fn reorder_row_tree(
+    rows: &[RowTreeRow],
     moved: &str,
     target: &str,
     placement: DragDropPlacement,
-) -> Option<Vec<String>> {
-    if moved == target || !order.iter().any(|id| id == moved) {
+) -> Option<RowTreeDrop> {
+    if moved == target {
         return None;
     }
-    let mut remaining: Vec<String> = order.iter().filter(|id| *id != moved).cloned().collect();
-    let target_index = remaining.iter().position(|id| id == target)?;
-    let insert_at = match placement {
-        DragDropPlacement::Before => target_index,
-        DragDropPlacement::Into | DragDropPlacement::After => target_index + 1,
+    let moved_row = rows.iter().find(|row| row.id == moved)?;
+    let target_row = rows.iter().find(|row| row.id == target)?;
+    // A group cannot be filed inside itself. Without this a folder dragged onto
+    // one of its own tabs would become its own descendant and vanish from the
+    // flatten, taking every row under it with it.
+    if row_tree_descends_from(rows, target, moved) {
+        return None;
+    }
+
+    // Children per parent, in draw order. `None` (the root band) is keyed by
+    // the empty string: an id is never empty, so the two can never collide.
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        children
+            .entry(row.parent.clone().unwrap_or_default())
+            .or_default()
+            .push(row.id.clone());
+    }
+
+    let (new_parent, anchor) = match placement {
+        DragDropPlacement::Into if target_row.group => (Some(target_row.id.clone()), None),
+        DragDropPlacement::Into | DragDropPlacement::After => (
+            target_row.parent.clone(),
+            Some((target_row.id.clone(), true)),
+        ),
+        DragDropPlacement::Before => (
+            target_row.parent.clone(),
+            Some((target_row.id.clone(), false)),
+        ),
     };
-    remaining.insert(insert_at.min(remaining.len()), moved.to_string());
-    (remaining != order).then_some(remaining)
+
+    let old_parent_key = moved_row.parent.clone().unwrap_or_default();
+    if let Some(siblings) = children.get_mut(&old_parent_key) {
+        siblings.retain(|id| id != moved);
+    }
+    let new_parent_key = new_parent.clone().unwrap_or_default();
+    let siblings = children.entry(new_parent_key).or_default();
+    let insert_at = match &anchor {
+        // Top of the group: the same landing `TreeDropPlacement::TopOfGroup`
+        // gives the path-keyed tree.
+        None => 0,
+        Some((anchor_id, after)) => match siblings.iter().position(|id| id == anchor_id) {
+            Some(index) => index + usize::from(*after),
+            // The anchor is the moved row's own former slot — it was just
+            // lifted out — so the row lands where it already was.
+            None => return None,
+        },
+    };
+    siblings.insert(insert_at.min(siblings.len()), moved.to_string());
+
+    let order = flatten_row_tree(&children);
+    // A drop that changes nothing must be `None`, never `Some(unchanged)`: the
+    // caller decides from that whether to write anything at all, and a write
+    // per settled drag would rewrite the store on every mouse-up.
+    let unchanged_order = order.len() == rows.len()
+        && order
+            .iter()
+            .zip(rows.iter())
+            .all(|(id, row)| id == &row.id);
+    if unchanged_order && new_parent == moved_row.parent {
+        return None;
+    }
+    Some(RowTreeDrop {
+        parent: new_parent,
+        order,
+    })
+}
+
+/// Does `id` sit anywhere under `ancestor`? Bounded by the row count so a
+/// malformed parent cycle terminates instead of hanging the render thread.
+fn row_tree_descends_from(rows: &[RowTreeRow], id: &str, ancestor: &str) -> bool {
+    let mut cursor = Some(id.to_string());
+    for _ in 0..=rows.len() {
+        let Some(current) = cursor else {
+            return false;
+        };
+        if current == ancestor {
+            return true;
+        }
+        cursor = rows
+            .iter()
+            .find(|row| row.id == current)
+            .and_then(|row| row.parent.clone());
+    }
+    false
+}
+
+/// Depth-first flatten of a `parent -> children` map back into draw order.
+fn flatten_row_tree(children: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut stack: Vec<String> = children
+        .get("")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut guard = 0usize;
+    let bound = children.values().map(Vec::len).sum::<usize>();
+    while let Some(id) = stack.pop() {
+        guard += 1;
+        if guard > bound {
+            break;
+        }
+        order.push(id.clone());
+        if let Some(kids) = children.get(&id) {
+            for kid in kids.iter().rev() {
+                stack.push(kid.clone());
+            }
+        }
+    }
+    order
 }
 
 #[cfg(test)]
@@ -319,6 +473,20 @@ mod tests {
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// A FLAT list, through the ONE engine: every row a root leaf. There is no
+    /// separate flat entry point — a flat list IS a tree with no groups, and a
+    /// second function for it is how two orderings come to disagree. These
+    /// tests are therefore tree tests as much as list tests.
+    fn reorder_flat(
+        order: &[&str],
+        moved: &str,
+        target: &str,
+        placement: DragDropPlacement,
+    ) -> Option<Vec<String>> {
+        let rows: Vec<RowTreeRow> = order.iter().map(|id| RowTreeRow::leaf(*id)).collect();
+        reorder_row_tree(&rows, moved, target, placement).map(|drop| drop.order)
     }
 
     // A press is not a drag. The rail used to begin one on contact while the
@@ -355,13 +523,13 @@ mod tests {
 
     #[test]
     fn flat_reorder_moves_a_row_before_and_after_its_target() {
-        let order = ids(&["a", "b", "c", "d"]);
+        let order = &["a", "b", "c", "d"];
         assert_eq!(
-            reorder_flat_list(&order, "d", "b", DragDropPlacement::Before),
+            reorder_flat(&order[..], "d", "b", DragDropPlacement::Before),
             Some(ids(&["a", "d", "b", "c"]))
         );
         assert_eq!(
-            reorder_flat_list(&order, "a", "c", DragDropPlacement::After),
+            reorder_flat(&order[..], "a", "c", DragDropPlacement::After),
             Some(ids(&["b", "c", "a", "d"]))
         );
     }
@@ -371,10 +539,10 @@ mod tests {
     // row on the floor.
     #[test]
     fn flat_reorder_treats_into_as_after() {
-        let order = ids(&["a", "b", "c"]);
+        let order = &["a", "b", "c"];
         assert_eq!(
-            reorder_flat_list(&order, "a", "b", DragDropPlacement::Into),
-            reorder_flat_list(&order, "a", "b", DragDropPlacement::After)
+            reorder_flat(&order[..], "a", "b", DragDropPlacement::Into),
+            reorder_flat(&order[..], "a", "b", DragDropPlacement::After)
         );
     }
 
@@ -383,19 +551,19 @@ mod tests {
     // app rewrite its store on every mouse-up.
     #[test]
     fn flat_reorder_reports_no_op_drops_as_none() {
-        let order = ids(&["a", "b", "c"]);
+        let order = &["a", "b", "c"];
         assert_eq!(
-            reorder_flat_list(&order, "b", "b", DragDropPlacement::Before),
+            reorder_flat(&order[..], "b", "b", DragDropPlacement::Before),
             None,
             "a row dropped on itself changes nothing"
         );
         assert_eq!(
-            reorder_flat_list(&order, "a", "b", DragDropPlacement::Before),
+            reorder_flat(&order[..], "a", "b", DragDropPlacement::Before),
             None,
             "dropping before the row that already follows it changes nothing"
         );
         assert_eq!(
-            reorder_flat_list(&order, "c", "b", DragDropPlacement::After),
+            reorder_flat(&order[..], "c", "b", DragDropPlacement::After),
             None,
             "dropping after the row that already precedes it changes nothing"
         );
@@ -403,27 +571,177 @@ mod tests {
 
     #[test]
     fn flat_reorder_rejects_ids_the_list_does_not_hold() {
-        let order = ids(&["a", "b"]);
+        let order = &["a", "b"];
         assert_eq!(
-            reorder_flat_list(&order, "zz", "a", DragDropPlacement::Before),
+            reorder_flat(&order[..], "zz", "a", DragDropPlacement::Before),
             None
         );
         assert_eq!(
-            reorder_flat_list(&order, "a", "zz", DragDropPlacement::Before),
+            reorder_flat(&order[..], "a", "zz", DragDropPlacement::Before),
             None
         );
     }
 
     #[test]
     fn flat_reorder_can_move_a_row_to_either_end() {
-        let order = ids(&["a", "b", "c"]);
+        let order = &["a", "b", "c"];
         assert_eq!(
-            reorder_flat_list(&order, "c", "a", DragDropPlacement::Before),
+            reorder_flat(&order[..], "c", "a", DragDropPlacement::Before),
             Some(ids(&["c", "a", "b"]))
         );
         assert_eq!(
-            reorder_flat_list(&order, "a", "c", DragDropPlacement::After),
+            reorder_flat(&order[..], "a", "c", DragDropPlacement::After),
             Some(ids(&["b", "c", "a"]))
+        );
+    }
+
+    // ===================================================================
+    // The ONE row-list ordering engine. Everything above this line already
+    // exercises it through `reorder_flat`, so the flat locks are tree locks.
+    // ===================================================================
+
+    fn group(id: &str, parent: Option<&str>) -> RowTreeRow {
+        RowTreeRow {
+            id: id.to_string(),
+            parent: parent.map(str::to_string),
+            group: true,
+        }
+    }
+
+    fn leaf(id: &str, parent: Option<&str>) -> RowTreeRow {
+        RowTreeRow {
+            id: id.to_string(),
+            parent: parent.map(str::to_string),
+            group: false,
+        }
+    }
+
+    /// Folders above tabs, one folder holding two tabs, two loose tabs after.
+    /// The WebTabs rail's exact shape.
+    fn rail() -> Vec<RowTreeRow> {
+        vec![
+            group("f1", None),
+            leaf("t1", Some("f1")),
+            leaf("t2", Some("f1")),
+            group("f2", None),
+            leaf("t3", None),
+            leaf("t4", None),
+        ]
+    }
+
+    #[test]
+    fn a_row_dropped_into_a_group_is_filed_at_its_top() {
+        let drop = reorder_row_tree(&rail(), "t4", "f1", DragDropPlacement::Into).expect("drop");
+        assert_eq!(drop.parent.as_deref(), Some("f1"));
+        assert_eq!(drop.order, ids(&["f1", "t4", "t1", "t2", "f2", "t3"]));
+    }
+
+    // The defect this whole engine exists to fix: the rail's hand-rolled drag
+    // could only ever RE-PARENT. A drop must be able to change the row's slot
+    // among its siblings without changing its parent at all.
+    #[test]
+    fn a_drop_reorders_siblings_without_re_parenting() {
+        let drop = reorder_row_tree(&rail(), "t1", "t2", DragDropPlacement::After).expect("drop");
+        assert_eq!(
+            drop.parent.as_deref(),
+            Some("f1"),
+            "reordering inside a folder must not unfile the row"
+        );
+        assert_eq!(drop.order, ids(&["f1", "t2", "t1", "f2", "t3", "t4"]));
+    }
+
+    // …and the other half: a filed row dropped beside a loose one comes OUT of
+    // its folder. Re-parent and re-order are one gesture, not two features.
+    #[test]
+    fn a_filed_row_dropped_beside_a_root_row_returns_to_the_root() {
+        let drop = reorder_row_tree(&rail(), "t1", "t3", DragDropPlacement::Before).expect("drop");
+        assert_eq!(drop.parent, None);
+        assert_eq!(drop.order, ids(&["f1", "t2", "f2", "t1", "t3", "t4"]));
+    }
+
+    // `After` a GROUP means beside the group, never inside it — otherwise the
+    // band under a folder header would file rows the user meant to place next
+    // to the folder.
+    #[test]
+    fn after_a_group_lands_beside_it_not_inside_it() {
+        let drop = reorder_row_tree(&rail(), "t4", "f1", DragDropPlacement::After).expect("drop");
+        assert_eq!(drop.parent, None);
+        assert_eq!(
+            drop.order,
+            ids(&["f1", "t1", "t2", "t4", "f2", "t3"]),
+            "the row sits after the folder's whole subtree"
+        );
+    }
+
+    // A non-group has no inside. This is the rule a flat list has always
+    // followed, now stated once for lists and trees alike.
+    #[test]
+    fn into_a_non_group_is_after_it() {
+        assert_eq!(
+            reorder_row_tree(&rail(), "t4", "t3", DragDropPlacement::Into),
+            reorder_row_tree(&rail(), "t4", "t3", DragDropPlacement::After),
+        );
+    }
+
+    // Groups reorder among themselves, carrying their contents with them.
+    #[test]
+    fn a_group_drags_its_whole_subtree() {
+        let drop = reorder_row_tree(&rail(), "f1", "f2", DragDropPlacement::After).expect("drop");
+        assert_eq!(drop.parent, None);
+        assert_eq!(drop.order, ids(&["f2", "f1", "t1", "t2", "t3", "t4"]));
+    }
+
+    // A folder filed inside itself would disappear from the flatten, taking
+    // every tab in it along.
+    #[test]
+    fn a_group_cannot_be_filed_inside_its_own_subtree() {
+        assert_eq!(
+            reorder_row_tree(&rail(), "f1", "t1", DragDropPlacement::Into),
+            None
+        );
+        assert_eq!(
+            reorder_row_tree(&rail(), "f1", "t2", DragDropPlacement::Before),
+            None
+        );
+        assert_eq!(
+            reorder_row_tree(&rail(), "f1", "f1", DragDropPlacement::After),
+            None
+        );
+    }
+
+    #[test]
+    fn tree_reorder_reports_no_op_drops_as_none() {
+        assert_eq!(
+            reorder_row_tree(&rail(), "t1", "t2", DragDropPlacement::Before),
+            None,
+            "before the row that already follows it changes nothing"
+        );
+        assert_eq!(
+            reorder_row_tree(&rail(), "t3", "t4", DragDropPlacement::Before),
+            None
+        );
+        assert_eq!(
+            reorder_row_tree(&rail(), "t1", "f1", DragDropPlacement::Into),
+            None,
+            "already the first child of that folder"
+        );
+        assert_eq!(
+            reorder_row_tree(&rail(), "t9", "t1", DragDropPlacement::After),
+            None,
+            "an id the list does not hold"
+        );
+    }
+
+    // The rail's collapsed folders hide rows that still have to survive the
+    // reorder — feeding only the VISIBLE rows would silently delete them.
+    #[test]
+    fn rows_hidden_in_a_collapsed_group_survive_a_drop_elsewhere() {
+        let drop = reorder_row_tree(&rail(), "t4", "t3", DragDropPlacement::Before).expect("drop");
+        assert_eq!(drop.order, ids(&["f1", "t1", "t2", "f2", "t4", "t3"]));
+        assert_eq!(
+            drop.order.len(),
+            rail().len(),
+            "every row comes back, visible or not"
         );
     }
 

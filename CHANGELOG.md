@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Fixed: the vertical tab rail IS the cwd tree now.** It hand-rolled its own
+  folder tree — a fourth tree in the product — and its drag could only ever
+  re-parent a tab; dropping one beside another did nothing. Every rail row,
+  folder and tab alike, is now the shared session-style row: one component, one
+  disclosure chevron, one indent, and one reorder engine
+  (`yggui::reorder_row_tree`, of which a flat list is the degenerate case — the
+  separate flat helper is gone). What you get: **folders above tabs**, a folder's
+  tabs indented under it, **drag that reorders as well as re-files** (in and out
+  of a folder, and among siblings), **tab rows you can rename** in place by
+  double-click or the row menu, and **"New folder" opening with its name already
+  selected** so the first keystroke replaces it. Contributed sidebar panes
+  inherit all of it: `list-row` gained `depth` / `expanded` / `expand_action`, so
+  any app can declare a tree and a drop now reports the group it landed in.
+
 - **Fixed: pasting an image into a web app now works.** Ctrl+V of a screenshot
   into a chat composer (open-webui was the report) did nothing, while pasting
   text was fine. WebKitGTK hands the page an EMPTY `clipboardData` for an
