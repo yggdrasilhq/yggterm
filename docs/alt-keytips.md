@@ -130,6 +130,22 @@ For each scope, over its declarations **in render order** (which is stable):
 Ties break by declaration order. The same input list always produces the same
 letters — this is a hard invariant, tested, not an aspiration.
 
+**Step 7, and why the reservation happens FIRST (built 2026-07-31).** A pair
+`ZA` is only typeable if `Z` is not itself a tip — press `Z` and the walker has
+to be able to answer "keep going" instead of firing something. So a scope that
+declares more entries than there are letters holds letters BACK as prefixes
+*before* it hands any out (`overflow_prefixes`, taken from the tail of the
+alphabet, skipping any letter a declaration explicitly asked for). A prefix
+chosen after the fact would already belong to somebody, and the pair could never
+be reached. The walk (`match_tip`) therefore reads one char, and a second only
+when that char is a prefix at this level; a lone prefix resolves to `Pending` —
+the same "waiting for a key" the leader itself produces. The derived map (§12.2)
+walks by the identical rule (`resolve_derived`).
+
+Until this landed, a crowded surface silently dropped its surplus: the ladder
+repeated a letter, a repeated letter cannot dispatch, and those elements went
+unbadged. That was the honest gap recorded when §12.2 shipped.
+
 ## 6. Collisions, numbering, and pinning
 
 **The shell never numbers.** Shell chrome letters are documented, fixed muscle
@@ -531,10 +547,20 @@ is only needed to OVERRIDE the derived one.
   is per-open and deterministic (§5: same DOM ⇒ same letters), and PTY safety
   is untouched (§11.2 — letters are only intercepted while the overlay is up).
   When the component layer lands, component-emitted declarations replace the
-  DOM walk; the audit keeps the same three numbers either way. Known limit,
-  carried honestly: the ladder still has no two-letter tips (§5 step 7), so
-  once single letters+digits run out the surplus elements go unbadged — the
-  first claimant in document order keeps a contested last-resort letter.
+  DOM walk; the audit keeps the same three numbers either way.
+- **Derivation follows the SURFACE, not the open edge (2026-07-31).** The first
+  cut derived once, on the overlay's open edge, so a chord that DESCENDED — into
+  the Settings panel, a menu, a dialog — revealed controls that stayed unbadged
+  until the layer was closed and re-opened. The bridge now recomputes a cheap
+  surface signature every tick (`__yggtermKeytipSignature`: chord level, modal
+  kind, menu, interactable count — the count read through the same `KT_SEL` the
+  walk owns) and re-derives when it changes. Deterministic in the sense that
+  matters: the letters are a pure function of the DOM being shown, so *when* the
+  re-derive runs cannot change *what* it assigns.
+- **A container confines derivation to itself (§4).** While a top modal is up
+  the walk confines to its `data-yggterm-modal-root`; failing that, while a
+  floating menu is up it confines to the top menu surface. Otherwise letters
+  would be handed to chrome BEHIND the container the chord just opened.
 
 ### 12.3 Modals must take the keyboard (user-reported, 2026-07-22)
 
@@ -553,6 +579,35 @@ modal:
 These are dialog conventions, not KeyTips, so they must work whether or not the
 ALT overlay is open, and must not reach a PTY (§11.2 applies).
 
+**The other half, and the one the user reported twice: a modal is a SCOPE
+(built 2026-07-31).** The dialog keys alone still ended the chord at the mouse —
+`ALT,E,X` opened *Close Terminal?* with **no letters on its buttons**, because
+dispatch is act-and-*dismiss* and the layer went down with it. Now:
+
+- a chord whose action puts a dialog on screen **descends into it**
+  (`follow_chord_into_modal`, synchronous at the one chord terminus — every
+  dialog a chord can raise is raised inside its own dispatch, so nothing has to
+  watch the DOM for one to appear). An **accelerator** deliberately does not:
+  §11 is flat, and badges after `Ctrl+Shift+X` would be a surprise;
+- a clean ALT tap while a dialog is already up opens **inside** it
+  (`activate_alt_overlay` reads `top_modal`);
+- the modal scope is **isolating**: the registry tree is not consulted at all,
+  so a letter can never reach the chrome behind the dialog, and every letter in
+  it comes from §12.2's derivation confined to its subtree;
+- `Enter` / `Escape` / `Backspace` keep going to the ONE `modal_key_dispatch`
+  while the badges are up, and the layer closes with the dialog — only with it,
+  since a deliberately swallowed Enter (Fido2) must not take the badges down;
+- the breadcrumb names the scope (`⌨ ALT › Confirm`), because a leader with no
+  trail reads as "nothing is listening".
+
+**Every over-viewport dialog is in that list, including our own.** The ALT+
+KeyTips editor (`ALT,K`) and the theme editor were full-window dialogs that were
+not in `top_modal` — so the layer's own editor could not be operated by the
+layer, and Escape did not close it. Both are `top_modal` members now (paint
+order decides precedence: the editors sit above the dialogs), which also puts
+them in `chrome_transient_over_viewport` and the web-surface stash, the two
+lists that answer the same question for the two stacking modes.
+
 ## 13. Invariants (each one testable)
 
 1. Assignment is a pure function of `(ordered declarations, keymap, pins)`.
@@ -567,7 +622,10 @@ ALT overlay is open, and must not reach a PTY (§11.2 applies).
    small per-element exempt set each carrying a reason.* Subtree exemption is
    forbidden.
 12. A modal accepts `Enter` / `Escape` / `Backspace` whether or not the ALT
-    overlay is open (§12.3).
+    overlay is open (§12.3), and while it is up it IS the layer's scope: its
+    buttons carry letters and no letter reaches the chrome behind it.
+13. A tip is reachable: a two-letter tip's prefix is never also a tip in the
+    same scope (§5 step 7), so no element on a crowded surface is unbadgeable.
 7. Held ALT+key in a focused terminal always reaches the PTY.
 8. No shell accelerator is a bare `Ctrl+<letter>` — the PTY keeps them (§11.2).
 9. No chord is hardcoded at a callsite; the registry owns every binding in both layers.
