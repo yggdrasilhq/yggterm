@@ -841,28 +841,75 @@ fn status_dot_blink_opacity_css(working: bool) -> String {
         " opacity: 1;".to_string()
     }
 }
-/// Session-style rows reveal their trailing actions (✕ …) on ROW HOVER only —
-/// the cwdtree's rule, now shared: a column of always-visible close buttons
-/// reads as clutter next to the tree (user-caught 2026-07-17). Injected once
-/// per rail body that renders `SessionStyleRow`s.
-const SESSION_ROW_HOVER_CSS: &str =
-    "[data-session-row] [data-session-row-actions]{opacity:0; transition:opacity 120ms ease;} \
-     [data-session-row]:hover [data-session-row-actions]{opacity:1;} \
-     [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions]{opacity:1;} \
-     [data-session-row] [data-session-row-actions]:focus-within{opacity:1;}";
+/// Session-style rows reveal their trailing actions (✕ …) on HOVER, on the
+/// ACTIVE/selected row, or when the keyboard is somewhere inside the row —
+/// never at rest. DESIGN.md "Session-style rows" has declared this since the
+/// slot was named: *"The `expander` slot is ALWAYS visible, unlike `actions`,
+/// which are hover-revealed verbs."*
+///
+/// THREE triggers, deliberately. `:hover` alone would strand the ALT/KeyTip
+/// keyboard layer — a row reached by keyboard would offer verbs nobody can see.
+/// `:focus-within` is on the ROW, not on the actions box, so tabbing to
+/// ANYTHING in the row (its rename field, its expander) reveals them too.
+///
+/// The actions are OUT OF FLOW ([`session_row_actions_style`]) so the label
+/// track keeps the whole row width at all times and the verbs fade in OVER its
+/// trailing edge — the Chrome/VS Code shape. Reflowing the label on reveal
+/// would make every title jump sideways under the pointer as it walks the list,
+/// which trades one irritation for a worse one.
+///
+/// `pointer-events` moves with the opacity, and it is on the CHILDREN: the
+/// container spans the fade too, and a fade that ate clicks would swallow the
+/// last characters of every row's label.
+///
+/// Injected ONCE, at the shell root — every surface that draws a session-style
+/// row inherits it, the cwdtree included. It used to be injected per rail body,
+/// which is exactly why the ychrome tab rail (whose body never injected it) wore
+/// a ✕ on every row at rest (user report + screenshot, 2026-08-01).
+///
+/// …and the FROSTED CHIP is painted HERE, in the revealed state only, rather
+/// than in the row's inline style. `backdrop-filter` forces a compositing layer
+/// wherever it is declared, and a sidebar of 22 live rows plus a rail of tabs
+/// would each carry one at rest, forever, for a chip nobody is looking at. At
+/// rest the rule says `none`; the reveal turns it on.
+///
+/// It is a FUNCTION of the palette because the wash is the surface's own
+/// colour, and one window has one palette — so this is the single owner of that
+/// answer rather than a prop each row family passes and could pass differently.
+fn session_row_hover_css(palette: Palette) -> String {
+    let fade = SESSION_ROW_ACTIONS_FADE_PX;
+    let wash = format!("color-mix(in srgb, {} 62%, transparent)", palette.panel);
+    format!(
+        "[data-session-row] [data-session-row-actions]{{opacity:0; pointer-events:none; \
+         background-image:none; backdrop-filter:none; -webkit-backdrop-filter:none; \
+         transition:opacity 120ms ease;}} \
+         [data-session-row] [data-session-row-actions] *{{pointer-events:none;}} \
+         [data-session-row]:hover [data-session-row-actions],\
+         [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions],\
+         [data-session-row]:focus-within [data-session-row-actions]\
+         {{opacity:1; \
+         background-image:linear-gradient(to right, transparent 0px, {wash} {fade}px); \
+         backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);}} \
+         [data-session-row]:hover [data-session-row-actions] *,\
+         [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions] *,\
+         [data-session-row]:focus-within [data-session-row-actions] *{{pointer-events:auto;}}"
+    )
+}
 /// The vertical-tabs left pane slides in from the edge as the top chrome
 /// collapses (max-height transition on the tab bar + nav bar).
 const WEB_SURFACE_VTAB_CSS: &str = "@keyframes ygg-vtab-slide-in { from { transform: translateX(-14px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }";
-// Live-session close [x] visibility + hover (user decision 2026-06-26): the X is
-// HIDDEN at rest and only appears when its row is hovered or selected (not always
-// on). On hover it "burns" in — a soft danger tint + a faint backing — to read as
-// the destructive close it is, while still respecting the theme via the inherited
-// icon color. focus-visible keeps it keyboard-reachable.
-const SIDEBAR_LIVE_CLOSE_CSS: &str = "[data-sidebar-live-session-close]{opacity:0;}\
-[data-sidebar-row-depth]:hover [data-sidebar-live-session-close],\
-[data-sidebar-row-depth][data-selected=\"true\"] [data-sidebar-live-session-close],\
-[data-sidebar-live-session-close]:focus-visible{opacity:1;}\
-[data-sidebar-live-session-close]:hover{opacity:1;color:#ef4444;background:rgba(239,68,68,0.14);}";
+// The live-session close [x]'s "BURN" (user decision 2026-06-26): on hover it
+// takes a soft danger tint + a faint backing, so it reads as the destructive
+// close it is while still respecting the theme via the inherited icon color.
+//
+// ⚠ WHEN it is visible at all is NOT here any more. That rule — hidden at rest,
+// revealed by hover / selection / keyboard — belongs to every session-style row
+// alike and now has ONE owner, session_row_hover_css, reached because the
+// cwdtree's rows wear the same `data-session-row*` marks as the rails'. Two
+// encodings of one rule is how the cwdtree came to hide its ✕ while the ychrome
+// rail three pixels away showed one on every row.
+const SIDEBAR_LIVE_CLOSE_CSS: &str =
+    "[data-sidebar-live-session-close]:hover{color:#ef4444;background:rgba(239,68,68,0.14);}";
 const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
@@ -3700,17 +3747,273 @@ mod app_pane_reorder_tests {
 
     #[test]
     fn the_drop_line_sits_on_the_edge_the_drop_would_land_on() {
-        let before = app_pane_row_drop_line_style(DragDropPlacement::Before, "#0af");
-        let after = app_pane_row_drop_line_style(DragDropPlacement::After, "#0af");
+        let before = app_pane_row_drop_line_style(Some(DragDropPlacement::Before), "#0af");
+        let after = app_pane_row_drop_line_style(Some(DragDropPlacement::After), "#0af");
         assert!(before.contains("inset 0 2px 0 0 #0af"), "{before}");
         assert!(after.contains("inset 0 -2px 0 0 #0af"), "{after}");
         // INSIDE is a real placement now that a row list can nest, and it is a
         // RING, never an edge line: a line under a folder header would promise
         // "beside the folder" while the drop lands in it.
-        let into = app_pane_row_drop_line_style(DragDropPlacement::Into, "#0af");
+        let into = app_pane_row_drop_line_style(Some(DragDropPlacement::Into), "#0af");
         assert!(into.contains("inset 0 0 0 2px #0af"), "{into}");
         assert_ne!(into, after);
         assert_ne!(into, before);
+        // …and NO drop is a state of the same function, drawing nothing.
+        let none = app_pane_row_drop_line_style(None, "#0af");
+        assert!(!none.contains("#0af"), "{none}");
+        assert!(none.contains("box-shadow:none"), "{none}");
+    }
+
+    /// ★ THE GENERIC STYLE-KEY LOCK — the trap, not the instance.
+    ///
+    /// Dioxus applies the inline `style` attribute PROPERTY-BY-PROPERTY and
+    /// never clears a property a later render omits. So EVERY style function
+    /// that varies with state must emit the SAME set of property keys in every
+    /// one of its states, values only differing. This is the third time the
+    /// project has paid for the rule (the docked-rail ghost, the never-clearing
+    /// blink `opacity`, and now the drag TRAIL: one drag left an accent line
+    /// above ~10 rows at once, because the no-drop state emitted nothing at
+    /// all — user screenshot, 2026-08-01).
+    ///
+    /// It sweeps a REGISTRY of state-varying row/rail style functions rather
+    /// than one of them, so a fourth offender written tomorrow is caught by the
+    /// same lock the day it joins the list.
+    #[test]
+    fn every_state_varying_row_style_emits_one_property_key_set() {
+        fn keys(style: &str) -> Vec<String> {
+            let mut ks: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            ks.sort();
+            ks
+        }
+        // (what it draws, the styles it can ever produce)
+        let families: Vec<(&str, Vec<String>)> = vec![
+            (
+                "app_pane_row_drop_line_style",
+                vec![
+                    app_pane_row_drop_line_style(None, "#0af"),
+                    app_pane_row_drop_line_style(Some(DragDropPlacement::Before), "#0af"),
+                    app_pane_row_drop_line_style(Some(DragDropPlacement::After), "#0af"),
+                    app_pane_row_drop_line_style(Some(DragDropPlacement::Into), "#0af"),
+                ],
+            ),
+            (
+                "session_row_status_badge_style",
+                vec![
+                    session_row_status_badge_style(false),
+                    session_row_status_badge_style(true),
+                ],
+            ),
+            (
+                "status_dot_blink_opacity_css",
+                vec![
+                    status_dot_blink_opacity_css(false),
+                    status_dot_blink_opacity_css(true),
+                ],
+            ),
+            (
+                "session_row_container_style",
+                [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                    (true, true, true),
+                ]
+                .into_iter()
+                .flat_map(|(selected, dimmed, clickable)| {
+                    [SessionRowDensity::Sidebar, SessionRowDensity::Rail]
+                        .into_iter()
+                        .map(move |density| {
+                            session_row_container_style(
+                                density, 0, selected, dimmed, clickable, "#eef", "#123",
+                            )
+                        })
+                })
+                .collect(),
+            ),
+            (
+                "live_session_close_button_style",
+                vec![
+                    live_session_close_button_style(palette(UiTheme::ZedLight), false),
+                    live_session_close_button_style(palette(UiTheme::ZedLight), true),
+                    live_session_close_button_style(palette(UiTheme::ZedDark), false),
+                    live_session_close_button_style(palette(UiTheme::ZedDark), true),
+                ],
+            ),
+            (
+                "live_session_status_dot_style",
+                vec![
+                    live_session_status_dot_style(palette(UiTheme::ZedLight), false, false),
+                    live_session_status_dot_style(palette(UiTheme::ZedLight), true, false),
+                    live_session_status_dot_style(palette(UiTheme::ZedLight), false, true),
+                    live_session_status_dot_style(palette(UiTheme::ZedLight), true, true),
+                ],
+            ),
+        ];
+        for (what, styles) in families {
+            let expected = keys(&styles[0]);
+            for style in &styles[1..] {
+                assert_eq!(
+                    keys(style),
+                    expected,
+                    "{what} emits a DIFFERENT property key set for one of its \
+                     states. Dioxus never clears a key the next render drops, so \
+                     the missing key stays painted from whatever the last state \
+                     was — write every key in every arm, values only differing.\n\
+                     first: {}\nthis:  {style}",
+                    styles[0],
+                );
+            }
+        }
+    }
+
+    /// ★ THE TRAILING VERBS COST THE TITLE NOTHING.
+    ///
+    /// The user's report, with a screenshot of the ychrome rail: *"the x should
+    /// be visible on hover or on active tab only. This allows rows to use the
+    /// horizontal real estate to display the heading occupied by the 'X' to the
+    /// entire width. In fact, this should be updated on yggterm's cwdtree too."*
+    ///
+    /// An `opacity:0` button is still a LAYOUT BOX — measured on the live
+    /// cwdtree 2026-08-01, the hidden ✕ claimed 18px plus its 6px gap on every
+    /// live-session row, so a truncated title stopped 24px short of the row it
+    /// was in. Hiding it was never enough; it has to leave the flex line.
+    #[test]
+    fn the_trailing_verbs_are_out_of_flow_so_the_title_keeps_the_whole_row() {
+        let anchor = session_row_actions_anchor_style();
+        assert!(anchor.contains("width:0px;"), "{anchor}");
+        assert!(anchor.contains("flex:0 0 0px;"), "{anchor}");
+        assert!(
+            anchor.contains("position:relative;"),
+            "the verbs are positioned against the anchor, so it must be the \
+             containing block: {anchor}"
+        );
+        let actions = session_row_actions_style();
+        assert!(
+            actions.contains("position:absolute;"),
+            "the verbs must not be a flex item: {actions}"
+        );
+        assert!(actions.contains("right:0px;"), "{actions}");
+        assert!(actions.contains("mask-image:linear-gradient(to right"), "{actions}");
+        // …and the fade that lets them sit OVER a long title, which lives in the
+        // REVEALED rule so a row at rest pays for no compositing layer. Both
+        // halves: the blur takes its colour from whatever is really behind (the
+        // window is transparent and the backdrop is a gradient, so a flat fade
+        // would read as a bright rectangle) and the wash is the fallback if a
+        // platform has no backdrop-filter.
+        let light = session_row_hover_css(palette(UiTheme::ZedLight));
+        assert!(light.contains("backdrop-filter:none;"), "{light}");
+        assert!(light.contains("backdrop-filter:blur("), "{light}");
+        assert!(
+            light.contains("color-mix(in srgb, #ffffff 62%, transparent)"),
+            "the wash is the WINDOW's own surface colour: {light}"
+        );
+        let dark = session_row_hover_css(palette(UiTheme::ZedDark));
+        assert!(
+            dark.contains("color-mix(in srgb, #161c22 62%, transparent)"),
+            "…and it follows the theme: {dark}"
+        );
+        // The row itself is the positioning context for consumers that hand the
+        // whole thing to the shared component.
+        let container = session_row_container_style(
+            SessionRowDensity::Rail,
+            0,
+            false,
+            false,
+            true,
+            "#eef",
+            "#123",
+        );
+        assert!(container.contains("position:relative;"), "{container}");
+    }
+
+    /// ★ ONE REVEAL RULE, THREE TRIGGERS, ONE INJECTION SITE.
+    ///
+    /// DESIGN.md "Session-style rows" declared this when the slot was named:
+    /// *"The `expander` slot is ALWAYS visible, unlike `actions`, which are
+    /// hover-revealed verbs."* The rail never implemented it because the rule
+    /// was injected PER RAIL BODY and the tab rail's body never injected it —
+    /// which is exactly the screenshot the user sent.
+    #[test]
+    fn the_row_reveal_rule_has_one_owner_and_reaches_every_surface() {
+        let css = session_row_hover_css(palette(UiTheme::ZedLight));
+        // Hidden at rest.
+        assert!(
+            css.contains("[data-session-row] [data-session-row-actions]{opacity:0;"),
+            "{css}"
+        );
+        // THREE triggers. Mouse-only would strand the ALT/KeyTip layer.
+        for trigger in [
+            "[data-session-row]:hover [data-session-row-actions]",
+            "[data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions]",
+            "[data-session-row]:focus-within [data-session-row-actions]",
+        ] {
+            assert!(
+                css.contains(trigger),
+                "the reveal must fire on {trigger}:\n{css}"
+            );
+        }
+        // A fade that ate clicks would swallow the end of every title.
+        assert!(css.contains("pointer-events:none;"), "{css}");
+        assert!(css.contains("pointer-events:auto;"), "{css}");
+        // The EXPANDER is never in it: expand/collapse is not a verb you should
+        // have to hover to discover.
+        assert!(
+            !css.contains("data-session-row-expander"),
+            "the disclosure control must stay visible at rest:\n{css}"
+        );
+        let product = product_source();
+        // ONE injection, and it is at the shell root — not once per rail.
+        assert_eq!(
+            product.matches("style { \"{session_row_hover_css}\" }").count(),
+            1,
+            "the reveal rule is declared once for the whole window; a second \
+             injection site is how the tab rail came to have none"
+        );
+        // The cwdtree wears the shared marks, so it inherits that one rule
+        // instead of keeping a private copy of it.
+        assert!(
+            product.contains("\"data-session-row-selected\": if selected { \"true\" } else { \"false\" },"),
+            "SidebarRow must publish its selection in the shared vocabulary"
+        );
+        // …and its own stylesheet keeps ONLY the burn tint.
+        assert!(
+            SIDEBAR_LIVE_CLOSE_CSS.contains("#ef4444"),
+            "{SIDEBAR_LIVE_CLOSE_CSS}"
+        );
+        assert!(
+            !SIDEBAR_LIVE_CLOSE_CSS.contains("opacity"),
+            "visibility has ONE owner now; a second encoding is what let the \
+             tree and the rail disagree:\n{SIDEBAR_LIVE_CLOSE_CSS}"
+        );
+    }
+
+    /// The verbs float to the LEFT of the disclosure chevron, never over it: an
+    /// expander is permanent chrome, and a hover that covered it would make the
+    /// one control on a group row disappear exactly when you reach for it.
+    #[test]
+    fn the_floating_verbs_land_before_the_always_visible_expander() {
+        // Anchored on the two MARKS, not on the component's signature: a source
+        // scan that spells `fn <TheComponent>(` in a test module ahead of the
+        // component itself shifts every OTHER scan that splits on the same
+        // needle (it did, and it broke the dot-rail lock).
+        let product = product_source();
+        let anchor = product
+            .find("\"data-session-row-actions-anchor\": \"1\",")
+            .expect("the shared row hangs its verbs off the anchor");
+        let expander = product
+            .find("\"data-session-row-expander\": \"1\",")
+            .expect("the shared row still draws the expander slot");
+        assert!(
+            anchor < expander,
+            "the actions anchor must come first in the row's DOM, so `right:0` \
+             lands beside the chevron rather than on top of it"
+        );
     }
 
     /// The pointer band → placement rule, once for every row list.
@@ -4150,14 +4453,29 @@ fn app_pane_row_tree(widgets: &[AppPaneWidget]) -> Vec<RowTreeRow> {
 /// the edge for before/after, and for INSIDE the whole group ringed — DESIGN.md
 /// "Drag and drop": the final placement must match the visible snap indicator
 /// exactly, and a line under a folder header would promise the wrong landing.
-fn app_pane_row_drop_line_style(placement: DragDropPlacement, accent: &str) -> String {
-    match placement {
-        DragDropPlacement::Before => format!("box-shadow: inset 0 2px 0 0 {accent};"),
-        DragDropPlacement::After => format!("box-shadow: inset 0 -2px 0 0 {accent};"),
-        DragDropPlacement::Into => {
-            format!("border-radius:8px; box-shadow: inset 0 0 0 2px {accent};")
-        }
-    }
+///
+/// ⚠⚠ IT TAKES THE `Option`, AND EVERY STATE EMITS THE SAME KEYS. Dioxus applies
+/// the inline `style` attribute PROPERTY-BY-PROPERTY and never clears a property
+/// the next render omits, so the old shape — `drop_edge.map(…).unwrap_or_default()`
+/// — left the LAST drop's `box-shadow` painted on every row the pointer had
+/// crossed. The user's screenshot after ONE drag showed an accent line above ~10
+/// rows at once (2026-08-01): not a drop indicator, a TRAIL. `border-radius` had
+/// the same hole one level down — only the `Into` arm ever wrote it, so an
+/// Into → Before move left `border-radius:8px` stuck on the row.
+///
+/// The neutral radius is `0px` because the box this lands on is a bare WRAPPER
+/// around the row: the row's own 8/12px radius lives on
+/// [`session_row_container_style`], one level in (live DOM, 2026-08-01: the
+/// wrapper computes `border-radius: 0px` at rest). Only the INTO ring rounds the
+/// wrapper, so the ring hugs the row it draws around.
+fn app_pane_row_drop_line_style(placement: Option<DragDropPlacement>, accent: &str) -> String {
+    let (radius, shadow) = match placement {
+        None => ("0px", "none".to_string()),
+        Some(DragDropPlacement::Before) => ("0px", format!("inset 0 2px 0 0 {accent}")),
+        Some(DragDropPlacement::After) => ("0px", format!("inset 0 -2px 0 0 {accent}")),
+        Some(DragDropPlacement::Into) => ("8px", format!("inset 0 0 0 2px {accent}")),
+    };
+    format!("border-radius:{radius}; box-shadow:{shadow};")
 }
 
 fn app_pane_action_url(control_url: &str) -> String {
@@ -40231,10 +40549,11 @@ fn palette_is_dark(palette: Palette) -> bool {
 fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
     // Themed, minimal close affordance (user decision 2026-06-26): a transparent
     // icon button holding the SVG X, NOT a filled pill. The X inherits this
-    // `color` (theme-aware muted text). Resting visibility (hidden unless the row
-    // is hovered or selected) and the hover "burn" tint live in
-    // SIDEBAR_LIVE_CLOSE_CSS so they can use :hover / [data-selected]. The
-    // `selected` arg only nudges the resting color a touch stronger.
+    // `color` (theme-aware muted text). Resting visibility — hidden unless the
+    // row is hovered, selected or holding the keyboard — is
+    // session_row_hover_css's, shared with every session-style row; only the
+    // hover "burn" tint is still SIDEBAR_LIVE_CLOSE_CSS's. The `selected` arg
+    // only nudges the resting color a touch stronger.
     let dark = palette_is_dark(palette);
     let color = if dark {
         if selected { "rgba(221,232,243,0.92)" } else { "rgba(221,232,243,0.74)" }
@@ -76222,6 +76541,9 @@ fn app() -> Element {
          [data-yggterm-window-focused=\"false\"] .yggterm-loading-dot, \
          [data-yggterm-window-focused=\"false\"] .yggterm-tree-spinner { animation:none !important; }"
             .to_string();
+    // The session-style row's reveal rule, resolved against THIS window's
+    // palette (the frosted chip's wash is the surface's own colour).
+    let session_row_hover_css = session_row_hover_css(snapshot.palette);
     let context_menu_overlay = snapshot.context_menu_row.clone();
     rsx! {
         div {
@@ -76549,6 +76871,12 @@ fn app() -> Element {
                 let _ = document::eval(&context_menu_policy_script());
             },
             style { "{TOAST_CSS}" }
+            // The session-style row's reveal rule, declared ONCE for the whole
+            // window: the cwdtree sidebar, the ychrome tab rail and every
+            // contributed app pane all draw `data-session-row`s, and a rule
+            // injected per rail body only reached the bodies that remembered to
+            // inject it (the tab rail never did).
+            style { "{session_row_hover_css}" }
             style { "{DOCUMENT_SURFACE_STANDDOWN_CSS}" }
             style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
@@ -80696,7 +81024,7 @@ fn session_row_container_style(
     let m = session_row_metrics(density);
     let indent = m.indent_base_px + depth * m.indent_step_px;
     format!(
-        "display:flex; align-items:center; gap:{gap}px; box-sizing:border-box; min-width:0; overflow:hidden; \
+        "position:relative; display:flex; align-items:center; gap:{gap}px; box-sizing:border-box; min-width:0; overflow:hidden; \
          padding:{pv}px {ph}px {pv}px {indent}px; border-radius:{radius}px; font-size:{font}px; color:{text_color}; \
          background:{bg}; opacity:{opacity}; cursor:{cursor}; user-select:none; -webkit-user-select:none;",
         gap = m.gap_px,
@@ -80777,6 +81105,56 @@ fn session_row_label_style(density: SessionRowDensity, color: &str, bold: bool) 
          white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
         font = m.font_px,
         weight = if bold { 600 } else { 500 },
+    )
+}
+
+/// How far the revealed verbs' frosted chip FEATHERS in from its left edge, and
+/// therefore how much clear room its first glyph has above the title running
+/// under it. One number for every row family.
+const SESSION_ROW_ACTIONS_FADE_PX: u32 = 22;
+
+/// The zero-width, full-height IN-FLOW anchor the trailing verbs hang off.
+///
+/// This is the whole of "the label gets the width back". The verbs themselves
+/// are absolutely positioned against this anchor, so they cost the flex row
+/// NOTHING: the title track measures the full row at rest AND while the verbs
+/// are showing, and no title ever jumps sideways as the pointer walks the list.
+/// Measured on the live cwdtree 2026-08-01: an `opacity:0` ✕ still claimed 18px
+/// of layout plus its 6px gap on every live-session row, so a truncated title
+/// stopped 24px short of the row it was in.
+///
+/// It is an anchor rather than the row itself so the verbs land to the LEFT of
+/// the always-visible `expander` — a hover must never cover the disclosure
+/// chevron, which is permanent chrome, not a hover-revealed verb.
+fn session_row_actions_anchor_style() -> String {
+    "position:relative; align-self:stretch; width:0px; min-width:0px; flex:0 0 0px;".to_string()
+}
+
+/// The revealed verbs themselves: out of flow, pinned to the anchor's trailing
+/// edge, feathered in from the left by a mask.
+///
+/// LAYOUT only. What the chip is MADE of — the `backdrop-filter` blur and the
+/// wash of the surface's colour — lives in [`session_row_hover_css`], so it is
+/// only paid for while the verbs are showing. The pair is deliberate:
+/// yggterm's window is TRANSPARENT and the backdrop under a row is
+/// `[data-yggterm-app-bg]`'s 135° gradient — measured live 2026-08-01, it runs
+/// rgb(174,223,220) at the top of the sidebar to rgb(207,227,233) at the bottom
+/// — so an opaque fade of any single palette colour would read as a bright
+/// rectangle sliding down the list. The blur takes its colour from whatever is
+/// actually behind (gradient, selection tint, a dark theme) and only smears the
+/// glyphs under it; the wash finishes the job and is the graceful degradation
+/// if a platform ever lacks `backdrop-filter`.
+///
+/// The mask is here rather than in the CSS because it is the SHAPE of the chip,
+/// and it must match the `padding-left` that keeps the first glyph clear of the
+/// feather — one number, one place.
+fn session_row_actions_style() -> String {
+    let fade = SESSION_ROW_ACTIONS_FADE_PX;
+    format!(
+        "position:absolute; right:0px; top:0px; bottom:0px; display:inline-flex; align-items:center; \
+         gap:2px; padding-left:{fade}px; \
+         -webkit-mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px); \
+         mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px);"
     )
 }
 
@@ -80952,20 +81330,31 @@ fn SessionStyleRow(
                     "{badge_text}"
                 }
             }
+            if let Some(actions) = actions {
+                // Revealed by hover / selection / keyboard focus
+                // (session_row_hover_css) and OUT OF FLOW: a zero-width anchor
+                // holds the place, the verbs float over the title's trailing
+                // edge on a frosted chip. So the title track is the full row
+                // WHENEVER, and the verbs cost it nothing.
+                //
+                // Ahead of the `expander` on purpose: an expander is permanent
+                // chrome (DESIGN.md — "always visible, unlike `actions`"), so
+                // the floating verbs must land to its LEFT and never cover it.
+                span {
+                    "data-session-row-actions-anchor": "1",
+                    style: session_row_actions_anchor_style(),
+                    span {
+                        "data-session-row-actions": "1",
+                        style: session_row_actions_style(),
+                        {actions}
+                    }
+                }
+            }
             if let Some(expander) = expander {
                 span {
                     "data-session-row-expander": "1",
                     style: "display:inline-flex; align-items:center; gap:2px; flex:0 0 auto;",
                     {expander}
-                }
-            }
-            if let Some(actions) = actions {
-                // Hover-revealed (SESSION_ROW_HOVER_CSS): trailing verbs show
-                // on row hover only, the cwdtree's rule.
-                span {
-                    "data-session-row-actions": "1",
-                    style: "display:inline-flex; align-items:center; gap:2px; flex:0 0 auto;",
-                    {actions}
                 }
             }
         }
@@ -81355,6 +81744,13 @@ fn SidebarRow(
             "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
             "data-sidebar-row-depth": "{row.depth}",
+            // The SHARED row marks. SidebarRow keeps its bespoke DOM (drag,
+            // rename, keytips, click zones) but it is a session-style row like
+            // any other, and wearing these is how it inherits the one reveal
+            // rule (session_row_hover_css) instead of keeping a private copy —
+            // the copy is how the tree and the rail disagreed about the ✕.
+            "data-session-row": "1",
+            "data-session-row-selected": if selected { "true" } else { "false" },
             "data-sidebar-row-draggable": if draggable { "true" } else { "false" },
             "data-sidebar-live-session-member": if show_live_close { "true" } else { "false" },
             tabindex: if selected { "0" } else { "-1" },
@@ -81503,8 +81899,12 @@ fn SidebarRow(
                 }
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
+                    // `flex:1 1 auto` is the tree's half of "the title gets the
+                    // width": with the ✕ out of flow there is nothing left to
+                    // share the line with, so the label cluster takes all of it
+                    // and truncates at the row's own edge instead of 24px short.
                     div {
-                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                    style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
@@ -81697,6 +82097,16 @@ fn SidebarRow(
                     }
                 }
                 if show_live_close {
+                    // OUT OF FLOW, on the shared anchor + frosted chip: the ✕
+                    // floats over the title's trailing edge when the row is
+                    // hovered, selected or holding the keyboard, and costs the
+                    // title nothing the rest of the time.
+                    span {
+                    "data-session-row-actions-anchor": "1",
+                    style: session_row_actions_anchor_style(),
+                    span {
+                    "data-session-row-actions": "1",
+                    style: session_row_actions_style(),
                     button {
                         "data-sidebar-live-session-close": "1",
                         // Per-element (§12.1), reason "list-item": a per-row
@@ -81716,9 +82126,10 @@ fn SidebarRow(
                         },
                         // Themed X close-icon (user decision 2026-06-26): an SVG
                         // stroke that inherits `currentColor` (the button color,
-                        // theme-aware), not a filled "×" glyph pill. Visibility
-                        // (hover/selected only) + the hover "burn" tint are driven
-                        // by SIDEBAR_LIVE_CLOSE_CSS.
+                        // theme-aware), not a filled "×" glyph pill. WHEN it is
+                        // visible is session_row_hover_css's (shared with every
+                        // session-style row); the hover "burn" tint is
+                        // SIDEBAR_LIVE_CLOSE_CSS's.
                         svg {
                             width: "11",
                             height: "11",
@@ -81738,6 +82149,8 @@ fn SidebarRow(
                                 stroke_linecap: "round",
                             }
                         }
+                    }
+                    }
                     }
                 } else if row.kind == BrowserRowKind::Group {
                     button {
@@ -114481,9 +114894,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         Some(DragDropPlacement::After) => "after",
                         None => "",
                     },
-                    style: drop_edge
-                        .map(|placement| app_pane_row_drop_line_style(placement, palette.accent))
-                        .unwrap_or_default(),
+                    // The WHOLE `Option` goes in: a `.map(…).unwrap_or_default()`
+                    // here emitted NOTHING when the drag left the row, and Dioxus
+                    // never clears a property a later render omits — so the
+                    // accent line stayed on every row the pointer had crossed.
+                    style: app_pane_row_drop_line_style(drop_edge, palette.accent),
                     onmousedown: move |evt: MouseEvent| {
                         if evt.trigger_button() != Some(MouseButton::Primary) {
                             return;
@@ -115766,7 +116181,6 @@ fn AppPaneRailBody(
 
     rsx! {
         RailHeader { title: title, color: palette.text.to_string() }
-        style { "{SESSION_ROW_HOVER_CSS}" }
         RailScrollBody {
             content: rsx!{
             div {
@@ -116248,15 +116662,17 @@ fn AppPaneRailBody(
                                             None => "",
                                         },
                                         "data-app-pane-row-dragging": if row_is_dragging { "1" } else { "0" },
+                                        // THREE properties, and all three are
+                                        // written in EVERY state — `margin-top`
+                                        // included. An `else { "" }` here left
+                                        // the -8px collapse stuck on a row that
+                                        // stopped following one, for the same
+                                        // property-by-property reason the drop
+                                        // line leaked.
                                         style: format!(
-                                            "{}{}",
-                                            if follows_row { "margin-top:-8px;" } else { "" },
-                                            drop_edge
-                                                .map(|placement| app_pane_row_drop_line_style(
-                                                    placement,
-                                                    palette.accent,
-                                                ))
-                                                .unwrap_or_default(),
+                                            "margin-top:{}; {}",
+                                            if follows_row { "-8px" } else { "0px" },
+                                            app_pane_row_drop_line_style(drop_edge, palette.accent),
                                         ),
                                         // A reorder drag is a MOUSE gesture, like
                                         // the cwd tree's: HTML5 dnd never fires
@@ -140535,7 +140951,8 @@ mod tests {
 
         // Redesigned close affordance (2026-06-26): a transparent icon button
         // (no filled pill) whose X inherits a theme-aware color. Hidden at rest;
-        // visibility/burn-hover live in SIDEBAR_LIVE_CLOSE_CSS, not the style.
+        // visibility lives in session_row_hover_css and the burn-hover in
+        // SIDEBAR_LIVE_CLOSE_CSS — neither is in this style.
         let close_style = live_session_close_button_style(dark, false);
         assert!(close_style.contains("background:transparent"));
         assert!(close_style.contains("rgba(221,232,243,0.74)"));
