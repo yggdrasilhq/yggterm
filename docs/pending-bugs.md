@@ -2406,32 +2406,47 @@ symbol rather than trusting a line number:**
     unit tests again** — the locks prove the wiring, not that WebKit delivers a
     middle-click as a `LinkClicked` NavigationAction on this engine build.
 
-## ⭐ 3.0.0 RELEASE BLOCKER — the product does not build for Windows or macOS
+## 3.0.0 — the product does not build for Windows or macOS (NOT NOW; ~2 months out)
 
-**Verified 2026-07-31, live against GitHub Actions.** Every `release.yml` run has
-ended in `failure` since ≥2.8.14. The Linux jobs pass, so the red went unread and
-the failure has now outlived twenty releases. Two separable facts:
+**Verified 2026-07-31 against GitHub Actions. User-scheduled: cross-platform is
+IN SCOPE for 3.0.0, but 3.0.0 is at least two months away and there is a lot of
+work ahead of it — do NOT start this lane unprompted.** Recorded here so it is
+not rediscovered a third time. Recovered from the archived memory
+`ci-release-cross-platform-failing`.
+
+Two separable facts:
 
 1. **Windows x86_64/aarch64 and macOS aarch64 fail to COMPILE** — not to package.
-   Run 29164529909 (v2.11.0) ends with `could not compile yggterm-server (lib) due
-   to 7 previous errors`. The errors are one shape: the versioned-unix-socket
-   daemon layer is `#[cfg(unix)]` on its DEFINITIONS while its CALLERS are
-   unguarded. Confirmed still true on `main` today —
-   `ServerEndpoint::UnixSocket` carries `#[cfg(unix)]` (daemon.rs:934) but is
-   matched unconditionally at daemon.rs:432, 811, 816, 962; likewise
-   `parse_versioned_server_socket_name` (daemon.rs:349),
-   `versioned_server_socket_alias_candidates` (daemon.rs:363),
-   `retire_stale_daemons`, `run_duplicate_legacy_owned_runtime_prune`, and
-   `env_flag_truthy`. **Fix = give the socket/daemon-topology layer a windows arm
-   or gate the call sites, not more `#[cfg]` on definitions.** A CI job that
-   `cargo check`s the windows target on every PR is the lock — without it this
-   regresses the moment it is fixed.
-2. **No GitHub release has published since v2.11.0 (2026-07-11).** jojo runs
-   2.12.19. Eight versions exist only as local binaries and fleet `scp`s.
+   Every `release.yml` run has ended in `failure` since ≥2.8.14; the Linux jobs
+   pass, so the red went unread for twenty releases. Run 29164529909 (v2.11.0)
+   ends with `could not compile yggterm-server (lib) due to 7 previous errors`:
+   `env_flag_truthy`, `retire_stale_daemons`, `run_duplicate_legacy_owned_runtime_prune`,
+   `versioned_server_socket_alias_candidates`, `parse_versioned_server_socket_name`
+   (×3), and `no variant UnixSocket for ServerEndpoint`.
+2. **No GitHub release has published since v2.11.0 (2026-07-11)** while jojo runs
+   2.12.19 — eight versions exist only as local binaries and fleet `scp`s. This
+   half is independent of the compile failure and cheaper to fix.
 
-Cross-platform is IN SCOPE for 3.0.0 (user-confirmed 2026-07-31), which makes
-this the release's critical path, not a background annoyance. Recovered from the
-archived memory `ci-release-cross-platform-failing`.
+**The shape, as far as it is actually verified:** the versioned-unix-socket
+daemon layer is `#[cfg(unix)]` on its DEFINITIONS — `ServerEndpoint::UnixSocket`
+(daemon.rs:934), `parse_versioned_server_socket_name` (daemon.rs:348),
+`versioned_server_socket_alias_candidates` (daemon.rs:362),
+`refresh_legacy_server_socket_aliases` (daemon.rs:412), `retire_stale_daemons`
+(daemon.rs:11791) — and at least one caller is unconditional:
+**`lib.rs:81` imports `retire_stale_daemons` with no `cfg`.**
+
+⚠ **The full unguarded-caller list is NOT enumerated yet, and do not guess it
+from grep.** An earlier pass in this file cited daemon.rs:432/811/816/962 as
+unguarded; every one of those is in fact inside a `#[cfg(unix)]` function or
+match arm, and the claim was wrong. Get the real list from the compiler:
+`rustup target add x86_64-pc-windows-msvc` works on the fleet (no MSVC linker
+needed for `cargo check`), then
+`cargo check --target x86_64-pc-windows-msvc -p yggterm-server`.
+
+**When the lane opens:** fix by giving the socket/daemon-topology layer a windows
+arm or gating the call sites — not by adding more `#[cfg]` to definitions, which
+is what produced this. Add a CI job that `cargo check`s the windows target on
+every PR; without that lock it regresses the moment it is fixed.
 
 ## Residual threads recovered from archived memory (2026-07-31)
 
