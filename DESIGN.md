@@ -541,6 +541,46 @@ functions and the `SessionStyleRow` component in shell.rs.
   per-consumer mix.
 - Trailing actions use `session_row_action_button_style`; a trailing pill uses
   `session_row_badge_style` (ychrome profile badges live here).
+- **THE TITLE TRACK IS THE WHOLE ROW, AT REST AND ON HOVER ALIKE.** The trailing
+  `actions` are OUT OF FLOW — a zero-width in-flow anchor
+  (`session_row_actions_anchor_style`) holds their place and the verbs float
+  against it (`session_row_actions_style`), so they cost the flex line nothing
+  and the title measures the full row whether they are showing or not. Hiding
+  them with `opacity:0` is NOT enough and never was: an invisible button is
+  still a layout box, and on the cwdtree the hidden ✕ was taking 18px plus its
+  6px gap off every live-session row's title (user report + measurement,
+  2026-08-01: *"rows [should] use the horizontal real estate to display the
+  heading occupied by the 'X' to the entire width"*).
+  - **They must not REFLOW the title on reveal either.** Letting the verbs push
+    the label in and out makes every title jump sideways under the pointer as
+    it walks the list, which trades one irritation for a worse one. They
+    overlay; Chrome's tab strip and VS Code's explorer do the same.
+  - **The fade behind them is a FROSTED CHIP**, not an opaque swatch:
+    `backdrop-filter: blur(…)` plus a light wash of the surface's own colour,
+    feathered in by a mask. yggterm's window is transparent and the backdrop
+    under a row is `[data-yggterm-app-bg]`'s gradient, so a flat fade of any one
+    palette colour reads as a bright rectangle sliding down the list. The blur
+    takes its colour from whatever is actually behind — gradient, selection
+    tint, dark theme — and the wash is the graceful degradation where
+    `backdrop-filter` is unavailable. Both are declared in the REVEALED rule
+    only: `backdrop-filter` forces a compositing layer wherever it appears, and
+    a sidebar of twenty rows should not each carry one for a chip nobody is
+    looking at.
+  - **The chip BLEEDS over the row's own padding, so it wears the row's rounded
+    edge** — a chip that stopped at the content box read as a white sticker
+    floating inside the row, with a strip of the selection tint past it. The
+    row's `overflow:hidden` clips it back to the radius, so the feathered left
+    edge is the only edge meant to be seen. **It does not bleed when an expander
+    follows it**: the chevron sits one gap to the right and the bleed put the
+    chip 2px on top of it, which inverts the rule above.
+  - **THREE reveal triggers, and all three are required**: row `:hover`, the row
+    being active/selected, and `:focus-within` on the ROW. Mouse-only would
+    strand the ALT/KeyTip keyboard layer — a row reached by keyboard would offer
+    verbs nobody can see. One owner, `SESSION_ROW_HOVER_CSS`, injected ONCE at
+    the shell root; the cwdtree inherits it by wearing the same
+    `data-session-row*` marks as the rails. A per-surface copy of this rule is
+    what let the ychrome tab rail show a ✕ on every row at rest while the tree
+    three pixels away hid its own.
 - New list surfaces MUST consume the engine (component, or the style functions
   when the interactivity is bespoke, as the cwdtree row does). Do not write a
   fourth row style.
@@ -595,6 +635,16 @@ If a project has drag-and-drop tree or list reordering:
 - **before/after draw as a 2px accent LINE on the edge that will receive the
   row; inside draws as a 2px accent RING around the whole group.** A line under
   a folder header would promise "beside the folder" while the drop lands in it.
+- **EXACTLY ONE ROW WEARS THE INDICATOR, AND THE FUNCTION THAT DRAWS IT TAKES
+  THE `Option`.** The no-drop state is a state of the same style function, not
+  the absence of a call: `drop_edge.map(…).unwrap_or_default()` emits an empty
+  string, Dioxus applies `style` property-by-property and never clears a
+  property the next render omits, so the last drop's `box-shadow` stayed painted
+  on every row the pointer had crossed. One drag left an accent line above ~10
+  rows at once (user screenshot, 2026-08-01). Same hole cost `border-radius`,
+  which only the `inside` ring ever wrote. **Every state emits every key, values
+  only differing** — see "the fixed-property-key invariant" wherever a style
+  varies with state.
 - **One drag grammar per window, and it is ONE OBJECT.** Every row list drives
   `yggui::RowDragGesture` — the WebTabs rail, every contributed app pane, and
   anything added later. There is one gesture in the shell because there is one
