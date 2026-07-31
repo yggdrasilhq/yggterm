@@ -287,6 +287,105 @@ Avoid:
 - labels that invent confusing product language
 - hard-coded light styling in dark mode
 
+##### Structure: grouped by intent, destructive last
+
+A menu is a sentence about a thing, and it reads in one order:
+
+1. **create** — the verbs that make something new
+2. **act on this thing** — reload, copy, duplicate, split
+3. **arrange** — file it, rename it, move it
+4. **destroy** — close, delete
+
+Separators mark the group boundaries and nothing else. A divider that is not a
+change of intent is decoration.
+
+The destructive group is **last, always**. Opening a menu with its irreversible
+verb puts that verb under the pointer the instant the menu appears, and the
+pointer is already moving.
+
+##### Icons: an opt-in column, greyscale, never emoji
+
+Modern Microsoft menus have an icon column, and so may ours — but it is a
+property of the **menu**, not of the item. A menu draws the column when at least
+one of its entries carries a mark, and then every entry reserves the slot,
+including the ones with no mark: a half-indented list reads worse than none. A
+menu that opts out is drawn exactly as it would be if the column did not exist.
+
+Marks are stroked SVG paths in `currentColor` on a shared box, from a **named
+set** — never path data invented at the call site, which is how a menu ends up
+with three different close marks. `currentColor` is what makes a mark inherit
+its row's tone, so the destructive red and the dimmed grey reach the icon
+without anyone maintaining a second palette. Emoji fail both halves of this:
+full colour, and a different metric on every platform.
+
+##### Depth: a submenu is a page of the same menu
+
+There is ONE menu component. A nested list is that component, at the same
+anchor, showing a different list — a page turn, with a `Back` row and a heading
+that says where you are. The entry into a page ends in `▸`.
+
+This is not merely an implementation convenience. A submenu that scales with
+something the user controls (their folders, their profiles) must not be
+flattened into the parent list, where it pushes the item's own verbs off the
+bottom; and it must not become a second popover, which is a second thing to
+place, dismiss, theme and badge.
+
+##### An unavailable verb is shown, dimmed, and says why — in the tooltip
+
+Never omit an item because it would not work right now. A menu whose shape
+depends on state teaches the user that a verb exists only by accident, and an
+item that just goes dim is indistinguishable from a bug. Dim it and give it a
+reason. A dimmed item also loses its accelerator — the keyboard must never reach
+a verb the mouse cannot.
+
+**The reason belongs in the tooltip, never in the label.** A label is the
+command's NAME; our justification for dimming it is not part of that name, and
+the user must never read one as the other. Appending it produced entries like
+`Close tab — this is the app's own tab; quitting the app closes it` in a menu
+~216px wide, which rendered as `Close tab — this is the app's own ta…` — not one
+dimmed verb in the menu could be read.
+
+Follow through on the same rule for anything else that is *about* a command
+rather than its name: a consequence worth stating ("its tabs return to the
+root") is a note on the tooltip, not a parenthetical in the label.
+
+##### A label must fit the narrowest menu we draw
+
+Menus are narrow — a rail-banded menu is about 216px, and the icon column and
+padding take ~60 of that. Any label the shell authors has to fit what is left.
+Ellipsis and a tooltip are the safety net for labels carrying *user* text (a
+folder's name, a page title), whose length is not ours to choose; they are not a
+licence to write long ones.
+
+Every entry carries a `title` regardless, so a name the box did have to
+ellipsize is still readable somewhere.
+
+##### A heading only when it says what the row cannot
+
+A context menu opens at the pointer, directly under the row it was raised on —
+a row that is highlighted and already showing its own name. Repeating that name
+as the menu's header stacks the same words twice and spends a line of a narrow
+box on nothing.
+
+So a heading has to earn its place by saying something no row on screen does:
+
+- **which page** you have walked into (`Move to folder`)
+- **how many** rows the menu will act on (`3 selected items`)
+- **which surface** raised it, when the surface has no labelled row at all
+  (`Terminal`, `Editor`, `Profile`)
+
+A menu with nothing of that kind to say draws no header at all, and takes the
+whole row with it — not a blank band of padding where the header used to be.
+
+##### Undo, not "are you sure?"
+
+A bulk destructive verb names its count in the label ("Close 12 other tabs") and
+is **reversible**, rather than guarded by a confirmation dialog. A modal in
+front of every destructive action taxes the correct ones to catch the rare wrong
+one. The toast that reports the action names the undo, at the moment it happens
+— telling the user afterwards where the escape hatch is beats making them find
+it.
+
 #### KeyTip badges
 
 A KeyTip badge is a context menu containing nothing but one letter. It inherits
@@ -900,6 +999,42 @@ The header should not contain:
 - literal markdown markers like `#`
 - noisy fake status cards
 - gratuitous terminal framing
+
+### Browser tab behavior (native page surfaces)
+
+Tabs are a vocabulary users already own from every other browser. Match it
+exactly; do not invent.
+
+**Where a new tab goes** is one rule with one owner, not a decision each opening
+path makes for itself:
+
+- a tab opened BY a tab — a menu's "new tab below", a middle- or ctrl-clicked
+  link, a duplicate, a `window.open` — lands **immediately below its opener**
+- successive tabs from the same opener **cascade**: the second goes after the
+  first, not between the opener and it. The group is the whole subtree, so a
+  grandchild is stepped over too
+- a child is born in its **opener's folder**. Opening a link from a filed tab
+  must not scatter the folder
+- a tab nothing opened — a header "+" — appends. A folder row's "+" appends to
+  that folder
+- the relationship **expires** when the user picks a row by hand: they have
+  re-declared where they are, and the next link belongs beside that tab. The
+  front moving because a verb the user ran finished its work is not that
+
+**Where the keyboard goes** on a new tab is the other half, and it is decided by
+the tab's DESTINATION:
+
+- a **blank** tab opens typing-ready: the address bar is in edit mode and holds
+  the keyboard, from every path that opens one — a "+", a row menu, a folder
+  row, a keyboard route. "Only some of the buttons do it" is the bug
+- a tab that already has a **URL on its way** never takes the keyboard. The page
+  is loading and the user is reading the tab they are on; moving their caret out
+  of it is theft, and it is what makes middle-click unusable
+- neither does a **background** open, for the same reason
+
+**Both tab homes are one feature.** The vertical rail and the classic strip show
+the same tabs; a verb that exists in one and not the other is a bug in the one
+that lacks it, not a difference in kind.
 
 ### Web View surfaces
 
