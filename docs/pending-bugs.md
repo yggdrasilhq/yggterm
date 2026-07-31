@@ -274,6 +274,22 @@ as its live-verified fix.
   unit-tested but never run against a deployed daemon, the gate has not been
   re-run on jojo, and phases C/D/E remain. **Phase F stays out of scope.**
 
+- **⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` BREAKS THE WEB SURFACE OUTRIGHT** (found
+  2026-07-31 by the tearing lane, reproduced twice: the page never appeared).
+  This is the **top-precedence GL escape hatch** per `docs/optimization-pass.md:222`
+  (`WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
+  `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the EGL child probe), so the documented
+  way to force software presentation currently costs the user every web surface.
+  Either fix it or stop documenting it as the escape hatch — a hatch that
+  destroys the thing it is meant to rescue is worse than none.
+
+- **⚠ THE GL PROBE NEVER RUNS ON THE LIVE HOST.** jojo reports
+  `webkit_gl_policy: hardware_gl_forced`, not `probed`, because
+  `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` sits in the launcher env and outranks
+  the probe. Any reasoning that assumes the live host measured its own GL is
+  wrong. Noted while investigating tearing; not itself known to be a defect,
+  but it silently invalidates a premise agents keep reusing.
+
 ## Standing traps / other open bugs
 
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
