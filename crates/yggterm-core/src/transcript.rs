@@ -29,6 +29,130 @@ pub struct TranscriptMessage {
     pub lines: Vec<String>,
 }
 
+// ===== the TIMELINE model =====
+//
+// A transcript is not a list of things people said. Roughly 57% of a Codex
+// rollout and 96% of a Claude Code JSONL is the agent WORKING — commands it
+// ran, files it changed, what it was thinking — and the flat
+// `TranscriptMessage` model dropped all of it silently. A session view built on
+// that model can only ever show half a conversation, which is why the web
+// surface reads as stale next to the terminal beside it.
+//
+// So the reader's primary output is a TIMELINE of typed entries, and
+// `TranscriptMessage` becomes a PROJECTION of it (`transcript_messages_from_entries`).
+// One decode per CLI, two views over it — never two parsers.
+
+/// What a timeline entry IS. The axis the flat message model never had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptEntryKind {
+    /// Prose a person or the agent addressed to the other. `lines` is markdown.
+    Message,
+    /// The agent's own thinking. Both CLIs render this collapsed and so do we.
+    Reasoning,
+    /// A tool the agent ran: a command, a file edit, a search, an MCP call.
+    ToolCall,
+}
+
+/// The tool half of a `ToolCall` entry.
+///
+/// `headline` is the ONE line a folded block shows and is the whole reason this
+/// type exists: a tool call the reader cannot summarise in a line is a tool call
+/// the user has to expand to identify, which defeats folding.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TranscriptToolCall {
+    /// The tool's own name, as the CLI wrote it (`Bash`, `Edit`, `exec_command`,
+    /// `apply_patch`). Never translated — a name the user cannot find in their
+    /// CLI's own output is a name we invented.
+    pub tool: String,
+    /// One line, folded state. The command, the path, the query.
+    pub headline: String,
+    /// The body, shown when expanded. Output, arguments, the patch.
+    pub detail: Vec<String>,
+    /// Files this call changed, if it changed any.
+    pub changed_files: Vec<String>,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    /// The CLI reported this call as failed.
+    pub failed: bool,
+}
+
+/// One entry on the timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub kind: TranscriptEntryKind,
+    pub role: TranscriptRole,
+    pub timestamp: Option<String>,
+    /// Message/reasoning text. Empty for a tool call — its text lives on `tool`.
+    pub lines: Vec<String>,
+    pub tool: Option<TranscriptToolCall>,
+    /// The CLI's own call id, used ONLY to pair a call with its output record.
+    /// Never displayed.
+    pub call_id: Option<String>,
+}
+
+impl TranscriptEntry {
+    fn message(role: TranscriptRole, lines: Vec<String>, timestamp: Option<String>) -> Self {
+        Self {
+            kind: TranscriptEntryKind::Message,
+            role,
+            timestamp,
+            lines,
+            tool: None,
+            call_id: None,
+        }
+    }
+
+    fn reasoning(lines: Vec<String>, timestamp: Option<String>) -> Self {
+        Self {
+            kind: TranscriptEntryKind::Reasoning,
+            role: TranscriptRole::Assistant,
+            timestamp,
+            lines,
+            tool: None,
+            call_id: None,
+        }
+    }
+
+    fn tool_call(
+        tool: TranscriptToolCall,
+        timestamp: Option<String>,
+        call_id: Option<String>,
+    ) -> Self {
+        Self {
+            kind: TranscriptEntryKind::ToolCall,
+            role: TranscriptRole::Assistant,
+            timestamp,
+            lines: Vec::new(),
+            tool: Some(tool),
+            call_id,
+        }
+    }
+}
+
+/// Project a timeline back onto the flat message model.
+///
+/// This is what keeps `TranscriptMessage` honest now that it is no longer parsed
+/// directly: title/précis/summary generation, search fragments and the sidebar's
+/// shallow preview all consume THIS, so they see exactly the messages the
+/// timeline shows and cannot drift from it. Reasoning and tool calls are
+/// deliberately absent — they are not what the session SAID, and feeding a
+/// command log to a summariser produced titles about `rg`.
+pub fn transcript_messages_from_entries(entries: &[TranscriptEntry]) -> Vec<TranscriptMessage> {
+    let mut messages = Vec::new();
+    for entry in entries {
+        if entry.kind != TranscriptEntryKind::Message {
+            continue;
+        }
+        push_message_lines(
+            &mut messages,
+            entry.role,
+            entry.lines.clone(),
+            entry.timestamp.clone(),
+        );
+    }
+    messages
+}
+
 pub fn generation_context_from_messages(messages: &[TranscriptMessage]) -> String {
     let mut goals = Vec::<String>::new();
     let mut recent = Vec::<(TranscriptRole, String)>::new();
@@ -168,69 +292,23 @@ fn read_codex_transcript_messages_with_limit(
         .with_context(|| format!("failed to read session transcript {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut entries = Vec::new();
 
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-
-        match value.get("type").and_then(Value::as_str) {
-            Some("response_item") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("message") {
-                    continue;
-                }
-                push_message(
-                    &mut messages,
-                    payload,
-                    extract_timestamp_raw(payload).or_else(|| extract_timestamp_raw(&value)),
-                );
+        entries.clear();
+        codex_entries_from_record(&value, &mut entries);
+        for entry in entries.drain(..) {
+            if entry.kind != TranscriptEntryKind::Message {
+                continue;
             }
-            Some("compacted") => {
-                let Some(history) = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("replacement_history"))
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                let fallback_timestamp = extract_timestamp_raw(&value);
-                for item in history {
-                    if item.get("type").and_then(Value::as_str) != Some("message") {
-                        continue;
-                    }
-                    push_message(
-                        &mut messages,
-                        item,
-                        extract_timestamp_raw(item).or_else(|| fallback_timestamp.clone()),
-                    );
-                    if max_messages.is_some_and(|limit| messages.len() >= limit) {
-                        break;
-                    }
-                }
+            push_message_lines(&mut messages, entry.role, entry.lines, entry.timestamp);
+            if max_messages.is_some_and(|limit| messages.len() >= limit) {
+                return Ok(messages);
             }
-            Some("event_msg") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                let Some((role, text)) = event_message_role_and_text(payload) else {
-                    continue;
-                };
-                push_message_lines(
-                    &mut messages,
-                    role,
-                    normalize_preview_text(text),
-                    extract_timestamp_raw(&value),
-                );
-            }
-            _ => {}
-        }
-
-        if max_messages.is_some_and(|limit| messages.len() >= limit) {
-            break;
         }
     }
 
@@ -252,28 +330,364 @@ pub fn message_lines_from_payload(payload: &Value) -> Vec<String> {
     lines
 }
 
-fn push_message(messages: &mut Vec<TranscriptMessage>, payload: &Value, timestamp: Option<String>) {
-    push_message_lines(
-        messages,
-        normalized_message_role(payload),
-        message_lines_from_payload(payload),
-        timestamp,
-    );
+// ===== the CODEX decoder — ONE owner of "what is in a rollout record" =====
+//
+// Every Codex reader in this file drives this function: the whole-file message
+// reader, the head-limited reader, the tail window, and the timeline reader.
+// The match arms used to be transcribed twice, verbatim, in two functions that
+// then drifted in their `max_messages` handling; a third copy for the timeline
+// would have been the point where they stopped agreeing about what a transcript
+// contains.
+
+/// Decode ONE rollout record into the timeline entries it carries.
+///
+/// A record can yield several entries (`compacted` replays a whole history), or
+/// none, or it can MUTATE an entry already in `out` — a `function_call_output`
+/// is not an entry of its own, it is the result half of the call above it.
+fn codex_entries_from_record(value: &Value, out: &mut Vec<TranscriptEntry>) {
+    let record_timestamp = extract_timestamp_raw(value);
+    match value.get("type").and_then(Value::as_str) {
+        Some("response_item") => {
+            let Some(payload) = value.get("payload") else {
+                return;
+            };
+            let timestamp = extract_timestamp_raw(payload).or_else(|| record_timestamp.clone());
+            match payload.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    let lines = message_lines_from_payload(payload);
+                    if !lines.is_empty() {
+                        out.push(TranscriptEntry::message(
+                            normalized_message_role(payload),
+                            lines,
+                            timestamp,
+                        ));
+                    }
+                }
+                Some("reasoning") => {
+                    // `summary` is the only readable half; `encrypted_content` is
+                    // opaque by design and must never be surfaced as text.
+                    let lines = payload
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(extract_text_fragment)
+                                .flat_map(normalize_preview_text)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if !lines.is_empty() {
+                        out.push(TranscriptEntry::reasoning(lines, timestamp));
+                    }
+                }
+                Some("function_call") => {
+                    let name = payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let arguments = payload.get("arguments").and_then(Value::as_str).unwrap_or("");
+                    out.push(TranscriptEntry::tool_call(
+                        codex_tool_call(&name, arguments),
+                        timestamp,
+                        payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    ));
+                }
+                Some("custom_tool_call") => {
+                    let name = payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
+                    out.push(TranscriptEntry::tool_call(
+                        codex_tool_call(&name, input),
+                        timestamp,
+                        payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    ));
+                }
+                Some("web_search_call") => {
+                    let query = payload
+                        .get("action")
+                        .and_then(|action| action.get("query"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    out.push(TranscriptEntry::tool_call(
+                        TranscriptToolCall {
+                            tool: "web_search".to_string(),
+                            headline: query.to_string(),
+                            ..TranscriptToolCall::default()
+                        },
+                        timestamp,
+                        payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    ));
+                }
+                Some("function_call_output") | Some("custom_tool_call_output") => {
+                    let call_id = payload.get("call_id").and_then(Value::as_str);
+                    attach_tool_output(out, call_id, tool_output_lines(payload.get("output")));
+                }
+                _ => {}
+            }
+        }
+        Some("compacted") => {
+            let Some(history) = value
+                .get("payload")
+                .and_then(|payload| payload.get("replacement_history"))
+                .and_then(Value::as_array)
+            else {
+                return;
+            };
+            for item in history {
+                if item.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                let lines = message_lines_from_payload(item);
+                if lines.is_empty() {
+                    continue;
+                }
+                out.push(TranscriptEntry::message(
+                    normalized_message_role(item),
+                    lines,
+                    extract_timestamp_raw(item).or_else(|| record_timestamp.clone()),
+                ));
+            }
+        }
+        Some("event_msg") => {
+            let Some(payload) = value.get("payload") else {
+                return;
+            };
+            match payload.get("type").and_then(Value::as_str) {
+                // The DIFF record. It arrives after the `apply_patch` call it
+                // belongs to, so the stat lands on that call rather than
+                // becoming a second block saying the same thing.
+                Some("patch_apply_end") => {
+                    let call_id = payload.get("call_id").and_then(Value::as_str);
+                    let changed = payload
+                        .get("changes")
+                        .and_then(Value::as_object)
+                        .map(|changes| {
+                            let mut added = 0usize;
+                            let mut removed = 0usize;
+                            let files = changes
+                                .iter()
+                                .map(|(path, change)| {
+                                    if let Some(diff) =
+                                        change.get("unified_diff").and_then(Value::as_str)
+                                    {
+                                        let (plus, minus) = unified_diff_stat(diff);
+                                        added += plus;
+                                        removed += minus;
+                                    } else if let Some(content) =
+                                        change.get("content").and_then(Value::as_str)
+                                    {
+                                        added += content.lines().count();
+                                    }
+                                    path.clone()
+                                })
+                                .collect::<Vec<_>>();
+                            (files, added, removed)
+                        });
+                    let Some((files, added, removed)) = changed else {
+                        return;
+                    };
+                    let failed = payload.get("success").and_then(Value::as_bool) == Some(false);
+                    attach_tool_change_stat(out, call_id, files, added, removed, failed);
+                }
+                _ => {
+                    let Some((role, text)) = event_message_role_and_text(payload) else {
+                        return;
+                    };
+                    let lines = normalize_preview_text(text);
+                    if !lines.is_empty() {
+                        out.push(TranscriptEntry::message(role, lines, record_timestamp));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
-fn push_message_deque(
-    messages: &mut VecDeque<TranscriptMessage>,
-    payload: &Value,
-    timestamp: Option<String>,
-    max_messages: usize,
+/// A tool call's folded line, from the CLI's own argument blob.
+///
+/// The argument blob is JSON for `function_call` and free text for
+/// `custom_tool_call` (`apply_patch` sends a patch), so this tries JSON first
+/// and treats the raw text as the headline when that fails. The keys tried are
+/// the ones Codex actually writes — `cmd`, `command`, `path`, `query` — and the
+/// fallback is the tool's own name, never an invented phrase.
+fn codex_tool_call(name: &str, arguments: &str) -> TranscriptToolCall {
+    let mut call = TranscriptToolCall {
+        tool: name.to_string(),
+        ..TranscriptToolCall::default()
+    };
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(parsed) => {
+            call.headline = first_argument_headline(&parsed).unwrap_or_default();
+            call.detail = normalize_preview_text(
+                &serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| arguments.to_string()),
+            );
+        }
+        Err(_) => {
+            let mut lines = arguments.lines();
+            call.headline = lines.next().unwrap_or_default().trim().to_string();
+            call.detail = normalize_preview_text(arguments);
+            // A patch body names its own files; reading them here means the
+            // folded line can say WHICH file before the diff record arrives.
+            call.changed_files = apply_patch_files(arguments);
+        }
+    }
+    call
+}
+
+fn first_argument_headline(parsed: &Value) -> Option<String> {
+    for key in ["cmd", "command", "file_path", "path", "query", "description"] {
+        match parsed.get(key) {
+            Some(Value::String(text)) => return Some(text.trim().to_string()),
+            Some(Value::Array(items)) => {
+                let joined = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !joined.trim().is_empty() {
+                    return Some(joined);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The files an `apply_patch` body touches, from its own `*** … File:` markers.
+fn apply_patch_files(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let rest = trimmed.strip_prefix("*** ")?;
+            for marker in ["Add File: ", "Update File: ", "Delete File: ", "Move to: "] {
+                if let Some(path) = rest.strip_prefix(marker) {
+                    return Some(path.trim().to_string());
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// `+`/`-` counts from a unified diff, ignoring the `+++`/`---` headers.
+fn unified_diff_stat(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// A tool output payload is either a string or a block array; both CLIs use both.
+fn tool_output_lines(output: Option<&Value>) -> Vec<String> {
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    if let Some(text) = output.as_str() {
+        return normalize_preview_text(text);
+    }
+    if let Some(items) = output.as_array() {
+        return items
+            .iter()
+            .filter_map(extract_text_fragment)
+            .flat_map(normalize_preview_text)
+            .collect();
+    }
+    extract_text_fragment(output)
+        .map(normalize_preview_text)
+        .unwrap_or_default()
+}
+
+/// How many output lines a folded/expanded tool block keeps.
+///
+/// A single `cargo build` output is tens of thousands of lines; carrying it into
+/// a snapshot that crosses an IPC boundary once per refresh is how a transcript
+/// view becomes a performance bug. The head is kept rather than the tail because
+/// a command's first lines say what it did; a truncation note replaces the rest.
+const TOOL_OUTPUT_LINE_BUDGET: usize = 40;
+
+fn clamp_tool_output(mut lines: Vec<String>) -> Vec<String> {
+    if lines.len() > TOOL_OUTPUT_LINE_BUDGET {
+        let dropped = lines.len() - TOOL_OUTPUT_LINE_BUDGET;
+        lines.truncate(TOOL_OUTPUT_LINE_BUDGET);
+        lines.push(format!("… {dropped} more lines"));
+    }
+    lines
+}
+
+/// Attach an output record to the call it answers.
+///
+/// Matched by `call_id` when there is one, else to the most recent tool call
+/// still without output — the CLIs interleave calls and results strictly, so
+/// "most recent" is right, and a mismatched id attaches to nothing rather than
+/// to the wrong call.
+fn attach_tool_output(out: &mut [TranscriptEntry], call_id: Option<&str>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    let Some(entry) = find_tool_call_mut(out, call_id) else {
+        return;
+    };
+    if let Some(tool) = entry.tool.as_mut() {
+        tool.detail = clamp_tool_output(lines);
+    }
+}
+
+fn attach_tool_change_stat(
+    out: &mut [TranscriptEntry],
+    call_id: Option<&str>,
+    files: Vec<String>,
+    added: usize,
+    removed: usize,
+    failed: bool,
 ) {
-    push_message_lines_deque(
-        messages,
-        normalized_message_role(payload),
-        message_lines_from_payload(payload),
-        timestamp,
-        max_messages,
-    );
+    let Some(entry) = find_tool_call_mut(out, call_id) else {
+        return;
+    };
+    if let Some(tool) = entry.tool.as_mut() {
+        tool.changed_files = files;
+        tool.added_lines = added;
+        tool.removed_lines = removed;
+        tool.failed = failed;
+    }
+}
+
+fn find_tool_call_mut<'a>(
+    out: &'a mut [TranscriptEntry],
+    call_id: Option<&str>,
+) -> Option<&'a mut TranscriptEntry> {
+    out.iter_mut().rev().find(|entry| {
+        entry.kind == TranscriptEntryKind::ToolCall
+            && match call_id {
+                Some(id) => entry.call_id.as_deref() == Some(id),
+                None => true,
+            }
+    })
 }
 
 fn parse_transcript_message_lines<'a, I>(lines: I, max_messages: usize) -> Vec<TranscriptMessage>
@@ -281,63 +695,24 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let mut messages = VecDeque::new();
+    let mut entries = Vec::new();
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-
-        match value.get("type").and_then(Value::as_str) {
-            Some("response_item") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("message") {
-                    continue;
-                }
-                push_message_deque(
-                    &mut messages,
-                    payload,
-                    extract_timestamp_raw(payload).or_else(|| extract_timestamp_raw(&value)),
-                    max_messages,
-                );
+        entries.clear();
+        codex_entries_from_record(&value, &mut entries);
+        for entry in entries.drain(..) {
+            if entry.kind != TranscriptEntryKind::Message {
+                continue;
             }
-            Some("compacted") => {
-                let Some(history) = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("replacement_history"))
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                let fallback_timestamp = extract_timestamp_raw(&value);
-                for item in history {
-                    if item.get("type").and_then(Value::as_str) != Some("message") {
-                        continue;
-                    }
-                    push_message_deque(
-                        &mut messages,
-                        item,
-                        extract_timestamp_raw(item).or_else(|| fallback_timestamp.clone()),
-                        max_messages,
-                    );
-                }
-            }
-            Some("event_msg") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                let Some((role, text)) = event_message_role_and_text(payload) else {
-                    continue;
-                };
-                push_message_lines_deque(
-                    &mut messages,
-                    role,
-                    normalize_preview_text(text),
-                    extract_timestamp_raw(&value),
-                    max_messages,
-                );
-            }
-            _ => {}
+            push_message_lines_deque(
+                &mut messages,
+                entry.role,
+                entry.lines,
+                entry.timestamp,
+                max_messages,
+            );
         }
     }
     messages.into_iter().collect()
@@ -807,64 +1182,356 @@ mod tests {
 ///   **`isSidechain` records** (sub-agent chatter): neither is the conversation
 ///   the user had.
 pub fn read_claude_code_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessage>> {
+    Ok(transcript_messages_from_entries(
+        &read_claude_code_transcript_entries(path)?,
+    ))
+}
+
+/// Read a Claude Code transcript as a TIMELINE — prose, thinking and tool calls.
+///
+/// The doc comment above lists what the message projection drops and why. Those
+/// reasons were about the flat model: `thinking` and `tool_use` are not prose,
+/// and emitting them AS prose produced a wall of JSON. They are not dropped
+/// here, because the timeline has a place to put them — a reasoning entry the
+/// reader keeps folded, and a tool entry that shows one line until asked.
+pub fn read_claude_code_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read claude code transcript {}", path.display()))?;
-    let mut messages = Vec::new();
+    let mut entries = Vec::new();
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let role = match value.get("type").and_then(Value::as_str) {
-            Some("user") => TranscriptRole::User,
-            Some("assistant") => TranscriptRole::Assistant,
-            _ => continue,
-        };
-        if value.get("isMeta").and_then(Value::as_bool) == Some(true)
-            || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
-        {
-            continue;
-        }
-        let Some(message) = value.get("message") else {
-            continue;
-        };
-        let lines = claude_code_message_lines(message);
-        if lines.is_empty() || lines_are_only_command_plumbing(&lines) {
-            continue;
-        }
-        push_message_lines(
-            &mut messages,
-            role,
-            lines,
-            value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        );
+        claude_code_entries_from_record(&value, &mut entries);
     }
-    Ok(messages)
+    Ok(entries)
 }
 
-/// A CC message's `content` is either a bare string (user turns) or a block
-/// array (assistant turns). Only `text` blocks carry displayable prose.
-fn claude_code_message_lines(message: &Value) -> Vec<String> {
-    let content = message.get("content");
-    if let Some(text) = content.and_then(Value::as_str) {
-        return normalize_preview_text(strip_local_command_caveat(text));
-    }
-    let Some(blocks) = content.and_then(Value::as_array) else {
-        return Vec::new();
+/// Decode ONE Claude Code record into the timeline entries it carries.
+///
+/// A CC record is one message whose `content` is a list of blocks, and the
+/// blocks are the interesting part: a single assistant record routinely carries
+/// thinking, prose and a tool call at once. A user record carries the RESULTS of
+/// the tool calls above it, which is why this can mutate `out` rather than only
+/// append to it.
+fn claude_code_entries_from_record(value: &Value, out: &mut Vec<TranscriptEntry>) {
+    let role = match value.get("type").and_then(Value::as_str) {
+        Some("user") => TranscriptRole::User,
+        Some("assistant") => TranscriptRole::Assistant,
+        _ => return,
     };
-    let mut lines = Vec::new();
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("text") {
-            continue;
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(message) = value.get("message") else {
+        return;
+    };
+
+    // A bare-string `content` is the user typing. No blocks to walk.
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        let lines = normalize_preview_text(strip_local_command_caveat(text));
+        if !lines.is_empty() && !lines_are_only_command_plumbing(&lines) {
+            out.push(TranscriptEntry::message(role, lines, timestamp));
         }
-        if let Some(text) = block.get("text").and_then(Value::as_str) {
-            lines.extend(normalize_preview_text(strip_local_command_caveat(text)));
+        return;
+    }
+
+    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    // The rich result record: `toolUseResult` carries the structured patch a
+    // `tool_result` block only describes in prose.
+    let tool_use_result = value.get("toolUseResult");
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let Some(text) = block.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let lines = normalize_preview_text(strip_local_command_caveat(text));
+                if lines.is_empty() || lines_are_only_command_plumbing(&lines) {
+                    continue;
+                }
+                out.push(TranscriptEntry::message(role, lines, timestamp.clone()));
+            }
+            Some("thinking") => {
+                let Some(text) = block.get("thinking").and_then(Value::as_str) else {
+                    continue;
+                };
+                let lines = normalize_preview_text(text);
+                if lines.is_empty() {
+                    continue;
+                }
+                out.push(TranscriptEntry::reasoning(lines, timestamp.clone()));
+            }
+            Some("tool_use") => {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                out.push(TranscriptEntry::tool_call(
+                    claude_code_tool_call(&name, &input),
+                    timestamp.clone(),
+                    block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                ));
+            }
+            Some("tool_result") => {
+                let call_id = block.get("tool_use_id").and_then(Value::as_str);
+                attach_tool_output(out, call_id, tool_output_lines(block.get("content")));
+                if block.get("is_error").and_then(Value::as_bool) == Some(true)
+                    && let Some(entry) = find_tool_call_mut(out, call_id)
+                    && let Some(tool) = entry.tool.as_mut()
+                {
+                    tool.failed = true;
+                }
+                if let Some(result) = tool_use_result
+                    && let Some((files, added, removed)) = claude_code_change_stat(result)
+                {
+                    attach_tool_change_stat(out, call_id, files, added, removed, false);
+                }
+            }
+            _ => {}
         }
     }
-    lines
+}
+
+/// A CC tool call's folded line, from the tool's own input object.
+fn claude_code_tool_call(name: &str, input: &Value) -> TranscriptToolCall {
+    let headline = first_argument_headline(input)
+        .or_else(|| {
+            input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| input.get("url").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    // `changed_files` is deliberately NOT filled from `file_path` here. A `Read`
+    // names a file too, and a chip row that says "changed" under a call that only
+    // looked is a lie the headline already told the truth about. The changed set
+    // arrives from the RESULT record's `structuredPatch`, which only a call that
+    // actually wrote something has.
+    TranscriptToolCall {
+        tool: name.to_string(),
+        headline: headline.lines().next().unwrap_or_default().trim().to_string(),
+        detail: normalize_preview_text(
+            &serde_json::to_string_pretty(input).unwrap_or_else(|_| String::new()),
+        ),
+        ..TranscriptToolCall::default()
+    }
+}
+
+/// `+`/`-` counts from CC's `structuredPatch` hunks.
+fn claude_code_change_stat(result: &Value) -> Option<(Vec<String>, usize, usize)> {
+    let hunks = result.get("structuredPatch").and_then(Value::as_array)?;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for hunk in hunks {
+        let Some(lines) = hunk.get("lines").and_then(Value::as_array) else {
+            continue;
+        };
+        for line in lines.iter().filter_map(Value::as_str) {
+            if line.starts_with('+') {
+                added += 1;
+            } else if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+    }
+    let files = result
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(|path| vec![path.to_string()])
+        .unwrap_or_default();
+    Some((files, added, removed))
+}
+
+/// Read a Codex transcript as a TIMELINE.
+pub fn read_codex_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read session transcript {}", path.display()))?;
+    let mut entries = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        codex_entries_from_record(&value, &mut entries);
+    }
+    Ok(entries)
+}
+
+/// Read whichever agent CLI owns `path`, as MESSAGES.
+///
+/// The message-shaped door onto the one dispatch. It exists so a caller that
+/// only wants prose does not have to re-answer "which CLI wrote this file" with
+/// a `match` of its own — which is how the loopback transcript server came to
+/// carry the second copy of that decision.
+pub fn read_agent_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessage>> {
+    Ok(transcript_messages_from_entries(
+        &read_agent_transcript_entries(path)?,
+    ))
+}
+
+/// Read whichever agent CLI owns `path`, as a timeline.
+///
+/// The dispatch is the agent-CLI registry's job, never a per-caller `match` —
+/// this is the exact bug the session web view was built on: every consumer but
+/// one called the CODEX reader unconditionally, and a Claude Code JSONL shares
+/// no record type with a Codex rollout, so those calls returned `Ok(vec![])`
+/// SILENTLY. A CC session's web view then fell through to a hardcoded
+/// "Resume Codex session <uuid>." placeholder, which is what the surface has
+/// been showing.
+pub fn read_agent_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
+    match transcript_reader_kind(path) {
+        TranscriptReaderKind::Codex => read_codex_transcript_entries(path),
+        TranscriptReaderKind::ClaudeCode => read_claude_code_transcript_entries(path),
+    }
+}
+
+/// The TAIL of a transcript, at most `max_entries` entries.
+///
+/// The reason a transcript view needs this: a long session's JSONL is tens of
+/// megabytes and the reader runs on every snapshot refresh. Reading the whole
+/// file to show the last screen is the difference between a surface that opens
+/// and one that hitches. Windowing at the BYTE level and re-widening (the shape
+/// `read_codex_transcript_messages_tail_limited` already uses) keeps that cost
+/// proportional to what is shown rather than to what exists.
+pub fn read_agent_transcript_entries_tail_limited(
+    path: &Path,
+    max_entries: usize,
+) -> Result<Vec<TranscriptEntry>> {
+    const INITIAL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+    const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
+    let kind = transcript_reader_kind(path);
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to read session transcript {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat session transcript {}", path.display()))?
+        .len();
+    let mut window = INITIAL_WINDOW_BYTES.min(file_len.max(1));
+
+    loop {
+        let start = file_len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))
+            .with_context(|| format!("failed to seek session transcript {}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).with_context(|| {
+            format!("failed to read session transcript tail {}", path.display())
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        // A window that did not start at byte 0 begins mid-record; that partial
+        // line is dropped rather than parsed into a half-entry.
+        let lines: Vec<&str> = if start > 0 {
+            text.lines().skip(1).collect()
+        } else {
+            text.lines().collect()
+        };
+
+        let mut entries = Vec::new();
+        for line in lines {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match kind {
+                TranscriptReaderKind::Codex => codex_entries_from_record(&value, &mut entries),
+                TranscriptReaderKind::ClaudeCode => {
+                    claude_code_entries_from_record(&value, &mut entries)
+                }
+            }
+        }
+        if entries.len() >= max_entries || start == 0 || window >= MAX_WINDOW_BYTES {
+            // Keep the TAIL: the newest entries are the ones a reader opens on.
+            if entries.len() > max_entries {
+                entries.drain(..entries.len() - max_entries);
+            }
+            return Ok(entries);
+        }
+        window = (window.saturating_mul(2))
+            .min(MAX_WINDOW_BYTES)
+            .min(file_len.max(1));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptReaderKind {
+    Codex,
+    ClaudeCode,
+}
+
+/// Which CLI's reader owns this file.
+///
+/// The agent-CLI registry answers first and is authoritative: it is the one
+/// place that knows where each CLI keeps its sessions.
+///
+/// A path the registry cannot name — a transcript copied out of its store, a
+/// fixture, a `local://<uuid>` row resolved by hand — is NOT guessed. Picking a
+/// reader by hope is the exact failure this lane exists to fix: the wrong reader
+/// returns `Ok(vec![])` and the caller cannot tell "empty session" from "wrong
+/// parser". So the file is SNIFFED, which answers a different question (what
+/// FORMAT is this?) from a different source (the bytes), and cannot silently
+/// disagree with the registry because it is only consulted when the registry
+/// declined.
+fn transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
+    match crate::agent_cli_for_store_session_file(&path.display().to_string())
+        .map(|descriptor| descriptor.kind)
+    {
+        Some(crate::SessionKind::Codex) | Some(crate::SessionKind::CodexLiteLlm) => {
+            return TranscriptReaderKind::Codex;
+        }
+        Some(crate::SessionKind::ClaudeCode) => return TranscriptReaderKind::ClaudeCode,
+        _ => {}
+    }
+    sniff_transcript_reader_kind(path)
+}
+
+/// How many leading records the format sniff reads. Both formats declare
+/// themselves on their FIRST record (`session_meta` / a `user` turn); the margin
+/// covers a file whose head is a record type neither branch names.
+const TRANSCRIPT_SNIFF_RECORD_BUDGET: usize = 24;
+
+/// The format of a transcript whose path the registry could not name.
+///
+/// Codex tags its records `session_meta` / `response_item` / `event_msg` /
+/// `compacted`; Claude Code tags them `user` / `assistant` and nests the turn
+/// under `message`. The two vocabularies do not overlap, so the first record
+/// that matches either decides. A file that matches NEITHER falls to Claude
+/// Code, which is the same answer as before this function existed — an honest
+/// default, not a claim.
+fn sniff_transcript_reader_kind(path: &Path) -> TranscriptReaderKind {
+    let Ok(file) = fs::File::open(path) else {
+        return TranscriptReaderKind::ClaudeCode;
+    };
+    for line in BufReader::new(file).lines().take(TRANSCRIPT_SNIFF_RECORD_BUDGET) {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("session_meta" | "response_item" | "event_msg" | "compacted" | "turn_context") => {
+                return TranscriptReaderKind::Codex;
+            }
+            Some("user" | "assistant") if value.get("message").is_some() => {
+                return TranscriptReaderKind::ClaudeCode;
+            }
+            _ => {}
+        }
+    }
+    TranscriptReaderKind::ClaudeCode
 }
 
 /// Slash-command bookkeeping the CLI records as user turns: the command it
@@ -961,6 +1628,231 @@ pub fn transcript_view_messages(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    fn write_at(dir: &std::path::Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "yggterm-timeline-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// A Codex rollout is 57% tool activity, and the reader used to drop all of
+    /// it: `payload.type != "message" => continue`. THE lock on that: a call
+    /// must arrive as its own entry, wearing its command as a headline, its
+    /// output attached from the SEPARATE record that carries it, and — when a
+    /// patch landed — the diff stat from the `event_msg` that reports it.
+    #[test]
+    fn a_codex_tool_call_carries_its_command_its_output_and_its_diff_stat() {
+        let root = scratch_root("codex").join(".codex/sessions/2026/08/01");
+        let path = write_at(
+            &root,
+            "rollout-2026-08-01T00-00-00-abc.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-01T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"rename the flag"}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"rg -n needle src\",\"workdir\":\"/repo\"}"}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":[{"type":"text","text":"src/lib.rs:12: needle"}]}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_2","input":"*** Begin Patch\n*** Update File: /repo/src/lib.rs\n*** End Patch"}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:04.000Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_2","success":true,"changes":{"/repo/src/lib.rs":{"type":"update","unified_diff":"--- a\n+++ b\n+added one\n+added two\n-removed one"}}}}"#,
+                r#"{"timestamp":"2026-08-01T00:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Renamed it."}}"#,
+            ],
+        );
+
+        let entries = read_agent_transcript_entries(&path).unwrap();
+        let tools = entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptEntryKind::ToolCall)
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2, "both calls must survive: {entries:?}");
+
+        let exec = tools[0].tool.as_ref().unwrap();
+        assert_eq!(exec.tool, "exec_command");
+        assert_eq!(exec.headline, "rg -n needle src");
+        assert!(
+            exec.detail.iter().any(|line| line.contains("src/lib.rs:12")),
+            "the output record must attach to its call: {exec:?}"
+        );
+
+        let patch = tools[1].tool.as_ref().unwrap();
+        assert_eq!(patch.tool, "apply_patch");
+        assert_eq!(patch.changed_files, vec!["/repo/src/lib.rs".to_string()]);
+        assert_eq!(
+            (patch.added_lines, patch.removed_lines),
+            (2, 1),
+            "the `+++`/`---` headers are not changes: {patch:?}"
+        );
+        assert!(!patch.failed);
+
+        // …and the prose is still exactly the two turns, in order.
+        let messages = transcript_messages_from_entries(&entries);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, TranscriptRole::User);
+        assert_eq!(messages[1].lines, vec!["Renamed it.".to_string()]);
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The same lock for Claude Code, whose tool activity lives in CONTENT
+    /// BLOCKS rather than in records of its own — one assistant record routinely
+    /// carries thinking, prose and a call at once — and whose diff stat lives on
+    /// the RESULT record's `structuredPatch`.
+    #[test]
+    fn a_claude_code_record_yields_thinking_prose_and_the_call_it_made() {
+        let root = scratch_root("cc").join(".claude/projects/-repo");
+        let path = write_at(
+            &root,
+            "session.jsonl",
+            &[
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:00.000Z","message":{"role":"user","content":"rename the flag"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"the flag is in lib.rs"},{"type":"text","text":"Editing it now."},{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/repo/src/lib.rs","old_string":"a","new_string":"b"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"applied"}]},"toolUseResult":{"filePath":"/repo/src/lib.rs","structuredPatch":[{"lines":["-a","+b","+c"," ctx"]}]}}"#,
+            ],
+        );
+
+        let entries = read_agent_transcript_entries(&path).unwrap();
+        let kinds = entries.iter().map(|entry| entry.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TranscriptEntryKind::Message,
+                TranscriptEntryKind::Reasoning,
+                TranscriptEntryKind::Message,
+                TranscriptEntryKind::ToolCall,
+            ],
+            "one record carries three blocks, in the order it wrote them: {entries:?}"
+        );
+
+        let tool = entries[3].tool.as_ref().unwrap();
+        assert_eq!(tool.tool, "Edit");
+        assert_eq!(tool.headline, "/repo/src/lib.rs");
+        assert!(
+            tool.detail.iter().any(|line| line.contains("applied")),
+            "the tool_result block must attach to its call: {tool:?}"
+        );
+        assert_eq!(
+            (tool.added_lines, tool.removed_lines),
+            (2, 1),
+            "a context line is not a change: {tool:?}"
+        );
+
+        // The prose projection is the two message entries and nothing else —
+        // feeding a command log to the summariser produced titles about `rg`.
+        let messages = transcript_messages_from_entries(&entries);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0].lines, vec!["rename the flag".to_string()]);
+        assert_eq!(messages[1].lines, vec!["Editing it now.".to_string()]);
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// THE bug this lane exists to close: every transcript consumer but one
+    /// called the CODEX reader unconditionally, and the two formats share no
+    /// record type, so a Claude Code file parsed to `Ok(vec![])` SILENTLY.
+    ///
+    /// The lock is deliberately stated as "each file is read by its own CLI's
+    /// reader, keyed by the registry", not "CC files work" — pointing either
+    /// reader at the other's file must yield nothing, which is what made the
+    /// failure invisible.
+    #[test]
+    fn a_transcript_is_read_by_the_reader_its_own_cli_registered() {
+        let cc_root = scratch_root("dispatch-cc").join(".claude/projects/-repo");
+        let cc = write_at(
+            &cc_root,
+            "session.jsonl",
+            &[
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:00.000Z","message":{"role":"user","content":"hello from claude code"}}"#,
+            ],
+        );
+        let codex_root = scratch_root("dispatch-codex").join(".codex/sessions/2026/08/01");
+        let codex = write_at(
+            &codex_root,
+            "rollout-2026-08-01T00-00-00-abc.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-01T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello from codex"}}"#,
+            ],
+        );
+
+        assert_eq!(read_agent_transcript_entries(&cc).unwrap().len(), 1);
+        assert_eq!(read_agent_transcript_entries(&codex).unwrap().len(), 1);
+        // The cross pairing is the silent hole: both are Ok, both are empty.
+        assert!(read_codex_transcript_entries(&cc).unwrap().is_empty());
+        assert!(
+            read_claude_code_transcript_entries(&codex)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(cc_root.parent().unwrap());
+        let _ = fs::remove_dir_all(codex_root.parent().unwrap());
+    }
+
+    /// A live session's transcript grows without limit and the reader runs on
+    /// every refresh, so the tail reader must cost what is SHOWN. The lock: it
+    /// returns the LAST `max` entries — a head-limited read would open the
+    /// user's Web View on the start of a conversation they are in the middle of.
+    #[test]
+    fn the_tail_reader_returns_the_newest_entries() {
+        let root = scratch_root("tail").join(".codex/sessions/2026/08/01");
+        let lines = (0..50)
+            .map(|index| {
+                format!(
+                    r#"{{"timestamp":"2026-08-01T00:00:00.000Z","type":"event_msg","payload":{{"type":"user_message","message":"turn {index}"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>();
+        let path = write_at(
+            &root,
+            "rollout-2026-08-01T00-00-00-abc.jsonl",
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let tail = read_agent_transcript_entries_tail_limited(&path, 5).unwrap();
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail[4].lines, vec!["turn 49".to_string()]);
+        assert_eq!(tail[0].lines, vec!["turn 45".to_string()]);
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Tool output is unbounded (`cargo build` is tens of thousands of lines)
+    /// and it crosses the snapshot IPC boundary once per refresh. The clamp is a
+    /// correctness constraint on the surface, not a cosmetic choice, so it is
+    /// locked: the HEAD is kept (a command's first lines say what it did) and
+    /// the drop is NAMED rather than silent.
+    #[test]
+    fn tool_output_is_clamped_and_says_how_much_it_dropped() {
+        let root = scratch_root("clamp").join(".codex/sessions/2026/08/01");
+        let output = (0..500)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let path = write_at(
+            &root,
+            "rollout-2026-08-01T00-00-00-abc.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-01T00:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo build\"}"}}"#,
+                &format!(
+                    r#"{{"timestamp":"2026-08-01T00:00:02.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1","output":"{output}"}}}}"#
+                ),
+            ],
+        );
+        let entries = read_agent_transcript_entries(&path).unwrap();
+        let tool = entries[0].tool.as_ref().unwrap();
+        assert_eq!(tool.detail.len(), 41, "40 lines plus the note: {tool:?}");
+        assert_eq!(tool.detail[0], "line 0", "the HEAD is kept");
+        assert_eq!(tool.detail[40], "… 460 more lines");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
 }
 
 #[cfg(test)]

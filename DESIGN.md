@@ -693,6 +693,57 @@ If a project has a conversation Web View surface:
 - overview/graph mode should feel structural, not like the same chat list in a second skin
 - overview mode should highlight summary, counts, and message progression before full transcript detail
 
+#### A conversation is a TIMELINE, not a list of messages
+
+**Most of an agent session is not prose.** Roughly 57% of a Codex rollout and
+96% of a Claude Code transcript is the agent working — commands it ran, files it
+changed, what it was thinking. A Web View that draws only the prose is not a
+tidier conversation, it is *half* of one, and it reads as stale next to the
+terminal beside it. So the surface draws three kinds of entry, and they are
+deliberately unequal:
+
+- **Prose** — the conversation. Reading typography, full width, the visual
+  weight. This is what the user came for.
+- **A tool call** — one row, FOLDED by default: `[mark] Tool — headline`, in the
+  monospace face, at a size and tone BELOW prose. It is context, not content.
+- **Reasoning** — the same row treatment, labelled `Thinking`. Both CLIs render
+  their own thinking collapsed; a transcript view that splays it open is
+  showing the user something they did not ask to see.
+
+**The folded row must identify the call on its own.** A tool call whose folded
+line cannot say WHICH command or WHICH file is a row the user has to expand to
+recognise, which defeats folding — so the reader extracts a headline (the
+command, the path, the query) and the row shows it. The headline is *user* text
+of unbounded length: it ellipsizes on one line and keeps a `title` tooltip, per
+the label rule above. It never wraps the row into a paragraph.
+
+**The whole row is the control.** Expand/collapse is not something a reader
+should have to hover to discover — the same reason the row engine's `expander`
+slot is always visible while `actions` are hover-revealed.
+
+**A change shows its stat, and its files.** A call that edited something carries
+`+N −M` on the folded row and its changed files as chips when expanded — trailing
+path segments, not whole absolute paths, which are identical for every file in a
+repo and push the identifying part off the end. Chips cap at four and then count
+(`+7`), exactly as an overflowing list does everywhere else.
+
+**Marks come from a named set keyed by what the tool DOES** — command, file
+change, file read, search, thinking — never by its name, so a CLI calling its
+shell tool `exec_command` and one calling it `Bash` wear the same mark. Stroked
+paths in `currentColor` on a shared box, as the context-menu rule already
+requires; the row's own tone reaches the glyph without a second palette.
+
+**A failed call is dimmed toward warning, not painted `RED`.** `RED` is reserved
+by the status-indicator vocabulary for a dead runtime; a command that exited
+non-zero is a normal event in a working session and must not borrow the signal
+that means the session is gone. The diff stat's *removed* side reuses that same
+warning tone rather than introducing a third red — both mean "this went away",
+and two reds in one row would read as two meanings.
+
+**Every message can be copied.** A transcript exists to be taken somewhere else.
+Without a per-message copy the user is re-selecting prose by hand out of a
+virtualised list, where the rows they are dragging across may not be mounted.
+
 ### Native page surfaces (the browser viewport)
 
 A native page surface — a real web page rendered by the engine and layered over

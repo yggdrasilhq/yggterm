@@ -272,6 +272,45 @@ pub enum PreviewTone {
     Assistant,
 }
 
+/// What a Web View block IS, when it is not prose.
+///
+/// `SessionPreviewBlock` carried only `role` + `lines`, which forced every
+/// non-prose part of a session — the commands it ran, the files it changed,
+/// what it was thinking — to be either flattened into prose or dropped. It was
+/// dropped, which is why the surface reads as a stale half-transcript.
+///
+/// Deliberately NOT a new `PreviewTone` variant: `tone` answers "which side of
+/// the conversation is this", which for a tool call is still the assistant, and
+/// the run-grouping/layout code is right to keep treating it that way. `kind`
+/// answers "what is it", which is a different question with a different answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreviewBlockKind {
+    /// Prose. `lines` is markdown.
+    Message,
+    /// The agent's own thinking. Folded by default.
+    Reasoning,
+    /// A tool the agent ran. Folded by default; `activity` carries the rest.
+    ToolCall,
+}
+
+/// The tool half of a `ToolCall` block, as the Web View draws it.
+///
+/// Mirrors `yggterm_core::TranscriptToolCall` across the snapshot boundary. It
+/// is a mirror rather than a re-export because the wire type is
+/// serde-serialised into the daemon snapshot and yggterm-core carries no serde
+/// derive on the reader's types; the ONE parse still happens in core, and this
+/// is filled only by projecting from it (`push_preview_block`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PreviewActivity {
+    pub tool: String,
+    /// The one line a folded block shows.
+    pub headline: String,
+    pub changed_files: Vec<String>,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub failed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPreviewBlock {
     pub role: &'static str,
@@ -279,6 +318,29 @@ pub struct SessionPreviewBlock {
     pub tone: PreviewTone,
     pub folded: bool,
     pub lines: Vec<String>,
+    pub kind: PreviewBlockKind,
+    /// `Some` exactly when `kind == PreviewBlockKind::ToolCall`.
+    pub activity: Option<PreviewActivity>,
+}
+
+impl SessionPreviewBlock {
+    /// A prose block — what every block was before the timeline model existed.
+    pub fn message(
+        role: &'static str,
+        timestamp: String,
+        tone: PreviewTone,
+        lines: Vec<String>,
+    ) -> Self {
+        Self {
+            role,
+            timestamp,
+            tone,
+            folded: false,
+            lines,
+            kind: PreviewBlockKind::Message,
+            activity: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2234,7 +2296,25 @@ pub struct SnapshotPreviewBlock {
     pub tone: PreviewTone,
     pub folded: bool,
     pub lines: Vec<String>,
+    // Older daemons do not send these. A mixed-version snapshot must degrade to
+    // "every block is prose" rather than fail to deserialise and lose the whole
+    // session view (version-coexisting daemons, CLAUDE.md ⚖).
+    #[serde(default = "default_preview_block_kind")]
+    pub kind: PreviewBlockKind,
+    #[serde(default)]
+    pub activity: Option<PreviewActivity>,
 }
+
+fn default_preview_block_kind() -> PreviewBlockKind {
+    PreviewBlockKind::Message
+}
+
+/// How many timeline entries a LIVE local session's Web View hydrates.
+///
+/// The tail, not the head: a live session is one the user is in right now, and
+/// the thing they open the Web View to read is what just happened. 400 entries
+/// is roughly the last dozen turns of an agent session including its tool calls.
+const LIVE_LOCAL_PREVIEW_ENTRY_BUDGET: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotPreview {
@@ -2765,7 +2845,7 @@ impl YggtermServer {
         };
         match session.source {
             SessionSource::Stored => self.refresh_stored_session_preview(path, &session)?,
-            SessionSource::LiveLocal => {}
+            SessionSource::LiveLocal => self.refresh_live_local_session_preview(path, &session)?,
             SessionSource::LiveSsh => {
                 if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
                 {
@@ -8364,6 +8444,79 @@ impl YggtermServer {
         Ok(())
     }
 
+    /// Hydrate a LIVE LOCAL agent session's Web View from the CLI's own JSONL.
+    ///
+    /// This arm was a literal no-op. A live local Codex/Claude Code session
+    /// therefore carried only the two launch-scaffold blocks `build_live_session`
+    /// pushes — and the renderer filters those out BY TEXT as scaffold — so the
+    /// Web View toggle was visible, clickable, and opened onto nothing. Every
+    /// other kind of session had a hydration path; this one had a comment-free
+    /// empty block.
+    ///
+    /// There is nothing to fetch: the agent CLI writes its transcript to disk as
+    /// it goes, and this daemon runs on the machine that owns the file. The
+    /// read is TAIL-BOUNDED because a live session's transcript grows without
+    /// limit and this runs on refresh — the reader must cost what is shown, not
+    /// what exists.
+    fn refresh_live_local_session_preview(
+        &mut self,
+        path: &str,
+        existing: &ManagedSessionView,
+    ) -> anyhow::Result<()> {
+        if !existing.kind.is_agent() {
+            return Ok(());
+        }
+        let Some(file) = crate::transcript_view::local_transcript_path_for_session(path)? else {
+            return Ok(());
+        };
+        let started_at = session_metadata_value(existing, "Started")
+            .unwrap_or_else(|| format_display_datetime(OffsetDateTime::now_utc()));
+        let entries = yggterm_core::read_agent_transcript_entries_tail_limited(
+            &file,
+            LIVE_LOCAL_PREVIEW_ENTRY_BUDGET,
+        )?;
+        let mut blocks = Vec::new();
+        let mut metadata_entries = Vec::new();
+        let mut user_messages = 0usize;
+        let mut assistant_messages = 0usize;
+        for entry in &entries {
+            let timestamp = entry
+                .timestamp
+                .as_deref()
+                .map(parse_and_format_timestamp)
+                .unwrap_or_else(|| started_at.clone());
+            push_preview_block(
+                &mut blocks,
+                &mut metadata_entries,
+                &mut user_messages,
+                &mut assistant_messages,
+                entry,
+                timestamp,
+            );
+        }
+        if blocks.is_empty() {
+            // Nothing read is NOT a reason to clear what is there: a transcript
+            // the CLI has not flushed yet would otherwise blank a surface that
+            // was correct a second ago.
+            return Ok(());
+        }
+        if let Some(session) = self.sessions.get_mut(path) {
+            session.preview.blocks = blocks;
+            upsert_session_metadata(
+                &mut session.preview.summary,
+                "Messages",
+                format!("{user_messages} user · {assistant_messages} assistant"),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Preview Hydration",
+                "tail".to_string(),
+            );
+            session.stored_preview_hydrated = true;
+        }
+        Ok(())
+    }
+
     fn refresh_remote_scanned_session_preview_from_cache(
         &mut self,
         machine_key: &str,
@@ -10975,13 +11128,12 @@ fn parse_recent_context_sections(
         if compact.is_empty() {
             return;
         }
-        blocks.push(SessionPreviewBlock {
+        blocks.push(SessionPreviewBlock::message(
             role,
-            timestamp: "remote:scan".to_string(),
+            "remote:scan".to_string(),
             tone,
-            folded: false,
-            lines: vec![compact],
-        });
+            vec![compact],
+        ));
     }
 
     let mut section = RecentContextSection::None;
@@ -11496,6 +11648,10 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
                 tone: block.tone,
                 folded: block.folded,
                 lines: block.lines,
+                // Carried, never re-derived: a remote row's timeline is decided
+                // by the reader on the host that owns the file.
+                kind: block.kind,
+                activity: block.activity,
             })
             .collect(),
     };
@@ -11519,18 +11675,18 @@ fn build_remote_preview_payload_from_messages(
     path: &std::path::Path,
     title_store: &SessionTitleStore,
     title_hint: Option<String>,
-    messages: Vec<yggterm_core::TranscriptMessage>,
+    entries: Vec<yggterm_core::TranscriptEntry>,
 ) -> anyhow::Result<RemotePreviewPayload> {
-    let started_at = messages
+    let started_at = entries
         .iter()
-        .find_map(|message| message.timestamp.as_deref().map(parse_and_format_timestamp))
+        .find_map(|entry| entry.timestamp.as_deref().map(parse_and_format_timestamp))
         .unwrap_or_else(|| format_display_datetime(OffsetDateTime::now_utc()));
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
     let mut metadata_entries = Vec::new();
     let mut blocks = Vec::new();
-    for message in messages {
-        let timestamp = message
+    for entry in &entries {
+        let timestamp = entry
             .timestamp
             .as_deref()
             .map(parse_and_format_timestamp)
@@ -11540,8 +11696,7 @@ fn build_remote_preview_payload_from_messages(
             &mut metadata_entries,
             &mut user_messages,
             &mut assistant_messages,
-            message.role,
-            message.lines,
+            entry,
             timestamp,
         );
     }
@@ -11837,26 +11992,42 @@ fn remote_preview_payload_for_path(
     }))
 }
 
+/// Identity for a transcript on THIS host, whichever agent CLI wrote it.
+///
+/// Codex records it in a `session_meta` line, Claude Code on every record. Both
+/// are tried because a remote row's CLI is not knowable from the path alone on
+/// the host that answers — and answering `None` for a CC file is how a remote CC
+/// session ended up with no previewable payload at all.
+fn remote_agent_session_identity_fields(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<(String, String)>> {
+    if let Some(fields) = read_codex_session_identity_fields(path)? {
+        return Ok(Some(fields));
+    }
+    yggterm_core::read_cc_session_identity_fields(path)
+}
+
 fn remote_preview_head_payload_for_path(
     path: &std::path::Path,
     title_store: &SessionTitleStore,
     max_blocks: usize,
 ) -> anyhow::Result<Option<RemotePreviewPayload>> {
-    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+    let Some((session_id, cwd)) = remote_agent_session_identity_fields(path)? else {
         return Ok(None);
     };
     let title_hint = title_store
         .get_title(&session_id)?
         .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
-    let messages = read_codex_transcript_messages_limited(path, max_blocks)
+    let mut entries = yggterm_core::read_agent_transcript_entries(path)
         .with_context(|| format!("reading remote transcript head {}", path.display()))?;
+    entries.truncate(max_blocks);
     Ok(Some(build_remote_preview_payload_from_messages(
         &session_id,
         &cwd,
         path,
         title_store,
         title_hint,
-        messages,
+        entries,
     )?))
 }
 
@@ -11865,13 +12036,13 @@ fn remote_preview_tail_payload_for_path(
     title_store: &SessionTitleStore,
     max_blocks: usize,
 ) -> anyhow::Result<Option<RemotePreviewPayload>> {
-    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+    let Some((session_id, cwd)) = remote_agent_session_identity_fields(path)? else {
         return Ok(None);
     };
     let title_hint = title_store
         .get_title(&session_id)?
         .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
-    let messages = read_codex_transcript_messages_tail_limited(path, max_blocks)
+    let entries = yggterm_core::read_agent_transcript_entries_tail_limited(path, max_blocks)
         .with_context(|| format!("reading remote transcript tail {}", path.display()))?;
     Ok(Some(build_remote_preview_payload_from_messages(
         &session_id,
@@ -11879,7 +12050,7 @@ fn remote_preview_tail_payload_for_path(
         path,
         title_store,
         title_hint,
-        messages,
+        entries,
     )?))
 }
 
@@ -22012,6 +22183,8 @@ fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
         tone: block.tone,
         folded: block.folded,
         lines: block.lines,
+        kind: block.kind,
+        activity: block.activity,
     }
 }
 
@@ -22283,6 +22456,8 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                     tone: block.tone,
                     folded: block.folded,
                     lines: block.lines,
+                    kind: block.kind,
+                    activity: block.activity,
                 })
                 .collect(),
         },
@@ -22449,12 +22624,11 @@ fn build_session(
             .filter(|blocks| !blocks.is_empty())
             .unwrap_or_else(|| {
                 vec![
-                    SessionPreviewBlock {
-                        role: "USER",
-                        timestamp: started_at.clone(),
-                        tone: PreviewTone::User,
-                        folded: false,
-                        lines: vec![
+                    SessionPreviewBlock::message(
+                        "USER",
+                        started_at.clone(),
+                        PreviewTone::User,
+                        vec![
                             if kind == SessionKind::Document {
                                 format!("Open document {title}.")
                             } else {
@@ -22466,13 +22640,12 @@ fn build_session(
                                 format!("Open the workspace rooted at {cwd}.")
                             },
                         ],
-                    },
-                    SessionPreviewBlock {
-                        role: "ASSISTANT",
-                        timestamp: "server:restore".to_string(),
-                        tone: PreviewTone::Assistant,
-                        folded: false,
-                        lines: vec![
+                    ),
+                    SessionPreviewBlock::message(
+                        "ASSISTANT",
+                        "server:restore".to_string(),
+                        PreviewTone::Assistant,
+                        vec![
                             if kind == SessionKind::Document {
                                 "Web View renders document content immediately from the local workspace store.".to_string()
                             } else {
@@ -22489,7 +22662,7 @@ fn build_session(
                 format!("Terminal launch command: {launch_command}")
                             },
                         ],
-                    },
+                    ),
                 ]
             }),
     };
@@ -22859,26 +23032,24 @@ fn build_live_session(
                 },
             ],
             blocks: vec![
-                SessionPreviewBlock {
-                    role: "USER",
-                    timestamp: started_at.clone(),
-                    tone: PreviewTone::User,
-                    folded: false,
-                    lines: vec![
+                SessionPreviewBlock::message(
+                    "USER",
+                    started_at.clone(),
+                    PreviewTone::User,
+                    vec![
                         format!("Open live terminal {uuid} through the Yggterm server."),
                         preview_intro,
                     ],
-                },
-                SessionPreviewBlock {
-                    role: "ASSISTANT",
-                    timestamp: "server:launch".to_string(),
-                    tone: PreviewTone::Assistant,
-                    folded: false,
-                    lines: vec![
+                ),
+                SessionPreviewBlock::message(
+                    "ASSISTANT",
+                    "server:launch".to_string(),
+                    PreviewTone::Assistant,
+                    vec![
                         format!("Launch command prepared: {launch_command}"),
                         preview_runtime,
                     ],
-                },
+                ),
             ],
         },
         metadata: vec![
@@ -23093,21 +23264,19 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
         WorkspaceDocumentKind::Note => "note",
         WorkspaceDocumentKind::TerminalRecipe => "terminal recipe",
     };
-    let mut preview_blocks = vec![SessionPreviewBlock {
-        role: "NOTE",
-        timestamp: document.updated_at.clone(),
-        tone: PreviewTone::Assistant,
-        folded: false,
-        lines: document.body.lines().map(ToOwned::to_owned).collect(),
-    }];
+    let mut preview_blocks = vec![SessionPreviewBlock::message(
+        "NOTE",
+        document.updated_at.clone(),
+        PreviewTone::Assistant,
+        document.body.lines().map(ToOwned::to_owned).collect(),
+    )];
     if !document.replay_commands.is_empty() {
-        preview_blocks.push(SessionPreviewBlock {
-            role: "REPLAY",
-            timestamp: "document:replay".to_string(),
-            tone: PreviewTone::User,
-            folded: false,
-            lines: document.replay_commands.clone(),
-        });
+        preview_blocks.push(SessionPreviewBlock::message(
+            "REPLAY",
+            "document:replay".to_string(),
+            PreviewTone::User,
+            document.replay_commands.clone(),
+        ));
     }
     session.preview = SessionPreview {
         summary: vec![
@@ -23839,8 +24008,15 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
         }
     }
 
-    for message in read_codex_transcript_messages(std::path::Path::new(path)).ok()? {
-        let timestamp = message
+    // ONE reader, dispatched by the agent-CLI registry. This used to call the
+    // CODEX reader unconditionally, so a Claude Code JSONL — which shares no
+    // record type with a Codex rollout — parsed to zero messages SILENTLY, and
+    // the caller fell through to a hardcoded "Resume Codex session <uuid>."
+    // placeholder. That placeholder is what the Web View has been showing for
+    // every CC session, local and remote.
+    let entries = yggterm_core::read_agent_transcript_entries(std::path::Path::new(path)).ok()?;
+    for entry in &entries {
+        let timestamp = entry
             .timestamp
             .as_deref()
             .map(parse_and_format_timestamp)
@@ -23854,8 +24030,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
             &mut metadata_entries,
             &mut user_messages,
             &mut assistant_messages,
-            message.role,
-            message.lines,
+            entry,
             timestamp,
         );
     }
@@ -23874,38 +24049,86 @@ fn push_preview_block(
     metadata_entries: &mut Vec<SessionMetadataEntry>,
     user_messages: &mut usize,
     assistant_messages: &mut usize,
-    role: TranscriptRole,
-    lines: Vec<String>,
+    entry: &yggterm_core::TranscriptEntry,
     timestamp: String,
 ) {
-    let lines = match role {
-        TranscriptRole::System => Vec::new(),
-        TranscriptRole::User | TranscriptRole::Assistant => sanitize_preview_lines(lines),
-    };
-    if lines.is_empty() {
-        return;
-    }
-    if role == TranscriptRole::Assistant
-        && blocks.is_empty()
-        && looks_like_session_metadata_block(&lines)
-    {
-        *metadata_entries = parse_session_metadata_lines(&lines);
-        return;
-    }
+    let role = entry.role;
+    match entry.kind {
+        // A tool call is a first-class block: it starts FOLDED, showing one
+        // headline line, and carries its own activity. Folding it by default is
+        // the whole point — an agent turn is mostly tool calls, and a view that
+        // expands all of them is the wall of JSON the old reader avoided by
+        // dropping them entirely.
+        yggterm_core::TranscriptEntryKind::ToolCall => {
+            let Some(tool) = entry.tool.as_ref() else {
+                return;
+            };
+            blocks.push(SessionPreviewBlock {
+                role: "TOOL",
+                timestamp,
+                // Still the assistant's side of the conversation: layout and
+                // run-grouping are right to treat it that way.
+                tone: PreviewTone::Assistant,
+                folded: true,
+                lines: sanitize_preview_lines(tool.detail.clone()),
+                kind: PreviewBlockKind::ToolCall,
+                activity: Some(PreviewActivity {
+                    tool: tool.tool.clone(),
+                    headline: tool.headline.clone(),
+                    changed_files: tool.changed_files.clone(),
+                    added_lines: tool.added_lines,
+                    removed_lines: tool.removed_lines,
+                    failed: tool.failed,
+                }),
+            });
+        }
+        yggterm_core::TranscriptEntryKind::Reasoning => {
+            let lines = sanitize_preview_lines(entry.lines.clone());
+            if lines.is_empty() {
+                return;
+            }
+            blocks.push(SessionPreviewBlock {
+                role: "THINKING",
+                timestamp,
+                tone: PreviewTone::Assistant,
+                folded: true,
+                lines,
+                kind: PreviewBlockKind::Reasoning,
+                activity: None,
+            });
+        }
+        yggterm_core::TranscriptEntryKind::Message => {
+            let lines = match role {
+                TranscriptRole::System => Vec::new(),
+                TranscriptRole::User | TranscriptRole::Assistant => {
+                    sanitize_preview_lines(entry.lines.clone())
+                }
+            };
+            if lines.is_empty() {
+                return;
+            }
+            if role == TranscriptRole::Assistant
+                && blocks.is_empty()
+                && looks_like_session_metadata_block(&lines)
+            {
+                *metadata_entries = parse_session_metadata_lines(&lines);
+                return;
+            }
 
-    match role {
-        TranscriptRole::User => *user_messages += 1,
-        TranscriptRole::Assistant => *assistant_messages += 1,
-        TranscriptRole::System => {}
-    }
+            match role {
+                TranscriptRole::User => *user_messages += 1,
+                TranscriptRole::Assistant => *assistant_messages += 1,
+                TranscriptRole::System => {}
+            }
 
-    blocks.push(SessionPreviewBlock {
-        role: session_role_label(role),
-        timestamp,
-        tone: session_preview_tone(role),
-        folded: false,
-        lines,
-    });
+            blocks.push(SessionPreviewBlock::message(
+                session_role_label(role),
+                timestamp,
+                session_preview_tone(role),
+                lines,
+            ));
+        }
+    }
 }
 
 fn looks_like_session_metadata_block(lines: &[String]) -> bool {
@@ -24099,6 +24322,7 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::PreviewBlockKind;
     use super::app_control_open_path_ready;
     use super::{
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
@@ -27542,6 +27766,8 @@ mod tests {
                         tone: PreviewTone::User,
                         folded: false,
                         lines: vec!["preview line".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     }],
                 },
                 metadata: vec![SessionMetadataEntry {
@@ -27642,6 +27868,8 @@ mod tests {
                     tone: PreviewTone::Assistant,
                     folded: false,
                     lines: heavy_preview_lines.clone(),
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -27691,6 +27919,8 @@ mod tests {
                     tone: PreviewTone::Assistant,
                     folded: false,
                     lines: heavy_preview_lines,
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -28106,6 +28336,8 @@ mod tests {
                         tone: PreviewTone::User,
                         folded: false,
                         lines: vec!["Investigate the remote terminal.".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     SnapshotPreviewBlock {
                         role: "assistant".to_string(),
@@ -28115,6 +28347,8 @@ mod tests {
                         lines: (1..=45)
                             .map(|line| format!("Recovered transcript line {line:03}"))
                             .collect(),
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -28484,6 +28718,8 @@ mod tests {
                         "I tried http://192.0.2.13:5055 on the phone as the tracking URL.".to_string(),
                         "I’ll expose port 5055 through the nginx proxy and verify Traccar can connect.".to_string(),
                     ],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -29356,6 +29592,8 @@ terminal_window_id: None,
                 },
                 folded: false,
                 lines: vec![format!("preview block {index}")],
+                kind: PreviewBlockKind::Message,
+                activity: None,
             })
             .collect();
         upsert_session_metadata(
@@ -30153,6 +30391,117 @@ terminal_window_id: None,
         assert!(!text.contains("</image>"));
     }
 
+    fn message_entry(
+        role: TranscriptRole,
+        lines: Vec<String>,
+    ) -> yggterm_core::TranscriptEntry {
+        yggterm_core::TranscriptEntry {
+            kind: yggterm_core::TranscriptEntryKind::Message,
+            role,
+            timestamp: None,
+            lines,
+            tool: None,
+            call_id: None,
+        }
+    }
+
+    fn scratch_transcript(relative_dir: &str, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join(relative_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    /// THE bug the session Web View was built on, at the layer that shows it.
+    ///
+    /// `parse_stored_transcript` called the CODEX reader on whatever path it was
+    /// handed. A Claude Code JSONL shares no record type with a Codex rollout, so
+    /// it parsed to zero messages — silently, `Ok(vec![])` — the `blocks` filter
+    /// saw an empty list, and `build_session` fell through to its hardcoded
+    /// "Resume Codex session <uuid>." pair. That placeholder is what every CC
+    /// session's Web View has been showing, on jojo, live.
+    #[test]
+    fn a_claude_code_transcript_yields_its_real_turns_not_the_resume_placeholder() {
+        let path = scratch_transcript(
+            ".claude/projects/-repo",
+            "session.jsonl",
+            &[
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:00.000Z","message":{"role":"user","content":"rename the flag"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}"#,
+            ],
+        );
+        let transcript = parse_stored_transcript(&path.display().to_string(), "fallback")
+            .expect("a CC transcript must parse");
+        assert_eq!(
+            (transcript.user_messages, transcript.assistant_messages),
+            (1, 1),
+            "{transcript:?}"
+        );
+        assert_eq!(transcript.blocks.len(), 2, "{:?}", transcript.blocks);
+        assert_eq!(
+            transcript.blocks[0].lines,
+            vec!["rename the flag".to_string()]
+        );
+        assert!(
+            transcript
+                .blocks
+                .iter()
+                .all(|block| block.kind == PreviewBlockKind::Message),
+            "prose turns are prose blocks: {:?}",
+            transcript.blocks
+        );
+    }
+
+    /// A tool call reaches the Web View as its OWN block: folded, carrying the
+    /// activity the folded row draws. Folded is the load-bearing half — an agent
+    /// turn is mostly tool calls, and a view that expands them all is the wall of
+    /// JSON the old reader avoided by dropping them entirely.
+    #[test]
+    fn a_tool_call_reaches_the_preview_as_a_folded_block_carrying_its_activity() {
+        let path = scratch_transcript(
+            ".claude/projects/-repo",
+            "session.jsonl",
+            &[
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:00.000Z","message":{"role":"user","content":"rename the flag"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/repo/src/lib.rs"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-08-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},"toolUseResult":{"filePath":"/repo/src/lib.rs","structuredPatch":[{"lines":["+a","+b","-c"]}]}}"#,
+            ],
+        );
+        let transcript = parse_stored_transcript(&path.display().to_string(), "fallback")
+            .expect("a CC transcript must parse");
+        let tool = transcript
+            .blocks
+            .iter()
+            .find(|block| block.kind == PreviewBlockKind::ToolCall)
+            .expect("the tool call must be its own block");
+        assert!(tool.folded, "a tool block opens folded: {tool:?}");
+        assert_eq!(tool.role, "TOOL");
+        assert_eq!(
+            tool.tone,
+            PreviewTone::Assistant,
+            "still the assistant's side of the conversation, so run-grouping is right"
+        );
+        let activity = tool.activity.as_ref().expect("activity");
+        assert_eq!(activity.tool, "Edit");
+        assert_eq!(activity.headline, "/repo/src/lib.rs");
+        assert_eq!((activity.added_lines, activity.removed_lines), (2, 1));
+        // A tool call is not a message: the counts the summary shows are turns.
+        assert_eq!(
+            (transcript.user_messages, transcript.assistant_messages),
+            (1, 0),
+            "{transcript:?}"
+        );
+    }
+
     #[test]
     fn stored_transcript_preview_blocks_filter_scaffold_and_system_messages() {
         let mut blocks = Vec::new();
@@ -30165,15 +30514,14 @@ terminal_window_id: None,
             &mut metadata_entries,
             &mut user_messages,
             &mut assistant_messages,
-            TranscriptRole::User,
-            vec![
+            &message_entry(TranscriptRole::User, vec![
                 "<cwd>/home/user</cwd>".to_string(),
                 "<shell>bash</shell>".to_string(),
                 "# AGENTS.md instructions for /home/user <INSTRUCTIONS> ## Skills ...".to_string(),
                 "Approvals are your mechanism to get user consent to run shell commands without the sandbox.".to_string(),
                 "<turn_aborted> The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. </turn_aborted>".to_string(),
                 "I launched excel but it is a blank window.".to_string(),
-            ],
+            ]),
             "Feb 07, 2026 08:41 PM UTC+0530".to_string(),
         );
         push_preview_block(
@@ -30181,8 +30529,10 @@ terminal_window_id: None,
             &mut metadata_entries,
             &mut user_messages,
             &mut assistant_messages,
-            TranscriptRole::System,
-            vec!["You are now in Default mode.".to_string()],
+            &message_entry(
+                TranscriptRole::System,
+                vec!["You are now in Default mode.".to_string()],
+            ),
             "Feb 07, 2026 08:43 PM UTC+0530".to_string(),
         );
 
@@ -30241,6 +30591,8 @@ terminal_window_id: None,
                             "<shell>bash</shell>".to_string(),
                             "I launched excel but it is a blank window.".to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     SnapshotPreviewBlock {
                         role: "USER".to_string(),
@@ -30251,6 +30603,8 @@ terminal_window_id: None,
                             "You are now in Default mode.".to_string(),
                             "</collaboration_mode>".to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -30469,6 +30823,8 @@ terminal_window_id: None,
                             "<current_date>2026-03-20</current_date>".to_string(),
                             "<timezone>Asia/Kolkata</timezone>".to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     SnapshotPreviewBlock {
                         role: "USER".to_string(),
@@ -30476,6 +30832,8 @@ terminal_window_id: None,
                         tone: PreviewTone::User,
                         folded: false,
                         lines: vec!["Investigate the boot delay on manin.".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -30541,6 +30899,8 @@ terminal_window_id: None,
                     tone: PreviewTone::User,
                     folded: false,
                     lines: vec!["Check the rendered preview.".to_string()],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             rendered_sections: vec![
@@ -30599,6 +30959,8 @@ terminal_window_id: None,
             tone: PreviewTone::Assistant,
             folded: false,
             lines: vec!["Hydrated preview block".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         }];
         upsert_session_metadata(
             &mut session.metadata,
@@ -30651,6 +31013,8 @@ terminal_window_id: None,
             tone: PreviewTone::Assistant,
             folded: false,
             lines: vec!["Recent tail transcript block".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         }];
         upsert_session_metadata(
             &mut session.metadata,
@@ -30878,6 +31242,8 @@ terminal_window_id: None,
             tone: PreviewTone::User,
             folded: false,
             lines: vec!["Stale cached preview text".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         }];
         session.rendered_sections = vec![SessionRenderedSection {
             title: "Primary User Goals",
@@ -30925,6 +31291,8 @@ terminal_window_id: None,
                             "Just 30 mins ago, no client can connect with my GL-iNet router."
                                 .to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     SnapshotPreviewBlock {
                         role: "USER".to_string(),
@@ -30936,6 +31304,8 @@ terminal_window_id: None,
                             "If a decision is necessary and cannot be discovered from local context, ask the user directly.".to_string(),
                             "</collaboration_mode>".to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
