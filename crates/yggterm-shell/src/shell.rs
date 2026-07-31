@@ -125848,14 +125848,19 @@ mod tests {
 
     /// Every step name the CLI can put on the wire is one `web_find` can parse.
     ///
-    /// The seam is three crates wide — `apps/yggterm` writes a string, the
-    /// app-control command carries it, `web_find::FindStep::from_verb` reads it
-    /// — and a mismatch fails as "unknown find step" for a flag the usage text
-    /// advertises. Read out of the CLI's own mapping table so renaming a flag
-    /// there cannot quietly outrun the parser here.
+    /// The seam is three crates wide — the `server app web` CLI writes a
+    /// string, the app-control command carries it, `web_find::FindStep::from_verb`
+    /// reads it — and a mismatch fails as "unknown find step" for a flag the
+    /// usage text advertises. Read out of the CLI's own mapping table so
+    /// renaming a flag there cannot quietly outrun the parser here.
+    ///
+    /// ⚠ The CLI moved on 2026-07-31: the `web` verb plane was extracted from
+    /// `apps/yggterm/src/main.rs` into ONE owner both binaries call, because it
+    /// existed on the GUI binary only. This scanner follows it — it must point
+    /// at wherever `web find` is dispatched, never at a copy.
     #[test]
     fn every_find_step_the_cli_can_emit_parses() {
-        const CLI: &str = include_str!("../../../apps/yggterm/src/main.rs");
+        const CLI: &str = include_str!("../../yggterm-server/src/app_control_web_cli.rs");
         let table = CLI
             .split("let steps: Vec<&str> = [")
             .nth(1)

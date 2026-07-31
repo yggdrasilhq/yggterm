@@ -19,6 +19,16 @@ This file tracks user-visible changes in `yggterm`.
   any app can declare a tree and a drop now reports the group it landed in.
 
 - **Fixed: pasting an image into a web app now works.** Ctrl+V of a screenshot
+- **Fixed: `server app web` now works on `yggterm-headless`, not just the GUI
+  binary.** The entire web-surface verb plane — `eval`, `read`, `await`, `do`,
+  `fill`, `wait`, `ensure`, `frames`, `batch`, `lease`, `totp`, `fill-vault`,
+  `fill-card`, `screenshot`, `cookies`, `find`, `devtools`, `capture-element`,
+  `reload`, `close` — was implemented inside the GUI binary only, so the
+  headless CLI answered `unsupported app control command: web` for every one of
+  them, and its `--help` did not list the plane either: the whole surface read
+  as "not built" to anyone driving the headless binary. The plane now has one
+  owner that both binaries call, so the verbs, their behaviour and their help
+  text are the same on either, and a new verb lands on both at once. Ctrl+V of a screenshot
   into a chat composer (open-webui was the report) did nothing, while pasting
   text was fine. WebKitGTK hands the page an EMPTY `clipboardData` for an
   image-only clipboard — measured, and reproduced in a bare webkit2gtk window
