@@ -4560,12 +4560,19 @@ fn configure_linux_accessibility_bridge() {
 }
 
 /// Whether under-glass web-surface stacking should be armed, from the two
-/// environment knobs. DEFAULT ON (F.1 tail, 2026-07-19): unset ⇒ armed.
-/// Explicit opt-outs: `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` or the legacy
-/// force `YGGTERM_WEB_SURFACE_LEGACY_STACK=1`. Structural safety stays
-/// runtime-side — the vendored host's self-probe demotes to legacy
+/// environment knobs. **DEFAULT ON (user directive 2026-07-31): unset ⇒ armed
+/// on a hardware-GL host.** Explicit opt-outs: `YGGTERM_WEB_SURFACE_UNDER_GLASS=0`
+/// or the legacy force `YGGTERM_WEB_SURFACE_LEGACY_STACK=1`. Structural safety
+/// stays runtime-side — the vendored host's self-probe demotes to legacy
 /// stacking on engines/paths that cannot composite (SHM, webkit < 2.40),
 /// so the default costs nothing where under-glass is impossible.
+///
+/// The user settled this after quitting the GUI and finding that a web surface
+/// launched WITHOUT the flag does not sit flush in the viewport: *"I could not
+/// understand why our software needs an extra flag to be correct."* That is the
+/// right reading. Under-glass is not an experiment any more — it IS the
+/// correct presentation path, and a product whose correct path is opt-in is a
+/// product that is wrong by default.
 fn under_glass_default_armed(
     under_glass_var: Option<&str>,
     legacy_stack_var: Option<&str>,
@@ -4590,28 +4597,37 @@ fn under_glass_default_armed(
     if software_gl && under_glass_var != Some("1") {
         return false;
     }
-    // ⛔ HARDWARE GL DOES NOT IMPLY ARMING PHASE F. It used to: the default was
-    // `true` for any host that was not on software GL, so probing a working GPU
-    // silently turned under-glass on for the first time in production — and the
-    // user's whole window became an agent's background page.
+    // ⭐ UNDER-GLASS IS THE STANDARD PRESENTATION PATH (user directive
+    // 2026-07-31). It is what makes a web surface sit FLUSH in the viewport:
+    // the page composites at the back of the z-order with the chrome floating
+    // above it, instead of a native child painting over the top of everything.
+    // Without it the user sees the surface not fitting its frame — which is
+    // exactly the report that settled this.
     //
-    // Under glass the shell webview is TRANSPARENT by construction and the
-    // surfaces composite behind it, so anything that stops the shell painting
-    // stops being "a blank window" and starts being "whatever page happens to
-    // be back there, full screen". On the live host that happened while memory
-    // was exhausted (swap 100% full, the GUI too starved to answer a state
-    // probe for 25 s) — exactly when the shell is least likely to paint. Under
-    // the legacy stack the same starvation is invisible, because the shell is
-    // opaque.
+    // ⚠ THE RISK THIS ACCEPTS, STATED HONESTLY. Under glass the shell webview
+    // is TRANSPARENT by construction and the surfaces composite behind it, so
+    // anything that stops the shell painting stops being "a blank window" and
+    // starts being "whatever page happens to be back there, full screen". That
+    // fired once in production (2026-07-26) while memory was exhausted — swap
+    // 100% full, the GUI too starved to answer a state probe for 25 s, exactly
+    // when the shell is least likely to paint. Under the legacy stack the same
+    // starvation is invisible, because the shell is opaque.
     //
-    // The two decisions were bundled for a reason that no longer holds. Under
-    // glass genuinely REQUIRES DMABuf (the refusal above), but the reverse was
-    // never true, and `shm_force_for_arming` now refuses SHM on a probed
-    // hardware host whatever arming decides. So hardware GL keeps DMABuf and
-    // keeps the measured GL benefit with under-glass OFF; Phase F is a separate
-    // feature and now needs its own explicit opt-in, which is what the user
-    // asked for when they said hardware GL should come back without this.
-    under_glass_var == Some("1")
+    // What changed since, and why the default flips anyway: the incident guard
+    // is now pixel-proven (a second, never-revealed surface paints ZERO pixels;
+    // visibility-truth keeps unrevealed pages unmapped), the arrangement has
+    // been the user's daily driver on the live host since 2026-07-30 and they
+    // have asked for it as the standard, and the swap exhaustion that supplied
+    // the starvation has eased. The failure mode is a DEGRADED-PAINT problem,
+    // not a stacking problem — the honest fix is to keep the shell painting,
+    // not to keep the correct presentation path switched off.
+    //
+    // Both escape hatches survive and are the supported answer if it regresses:
+    // `YGGTERM_WEB_SURFACE_UNDER_GLASS=0`, or `YGGTERM_WEB_SURFACE_LEGACY_STACK=1`
+    // which beats everything. The software-GL demotion above still refuses to
+    // arm where DMABuf would SIGSEGV, so this default cannot resurrect the
+    // crash-loop.
+    under_glass_var != Some("0")
 }
 
 /// What the arming decision implies for the WebKit presentation path. The
@@ -6336,35 +6352,49 @@ mod tests {
         }
     }
 
-    // ⛔ UNDER-GLASS IS OPT-IN, and this test used to assert the opposite.
+    // ⭐ UNDER-GLASS IS THE STANDARD PRESENTATION PATH (user directive
+    // 2026-07-31). This test asserted the opposite twice before, in both
+    // directions, so read the whole history before flipping it a third time.
     //
-    // It was default-on for any host not on software GL, so the moment the GL
-    // probe found a working GPU, Phase F armed in production for the first time
-    // — and the user's entire window became an agent's background page. Under
-    // glass the shell is transparent by construction, so a shell that fails to
-    // paint (memory was exhausted: swap 100% full, the GUI too starved to
-    // answer a state probe for 25 s) stops showing a blank window and starts
-    // showing whatever surface is behind it, full screen.
+    // Round 1 it was default-on for any host not on software GL — so the moment
+    // the GL probe found a working GPU, Phase F armed in production for the
+    // first time and the user's entire window became an agent's background
+    // page. Round 2 it became strictly opt-in, which stopped that incident and
+    // introduced a quieter one: a web surface launched without the flag does
+    // not sit FLUSH in the viewport, and the user hit that after a restart —
+    // *"I could not understand why our software needs an extra flag to be
+    // correct."*
     //
-    // Arming now requires saying so. The GL benefit does not depend on it:
-    // `shm_force_for_arming` refuses SHM on a probed hardware host whatever
-    // arming decides, so hardware GL keeps DMABuf either way.
+    // Round 3 (here) restores the default, because the two rounds were arguing
+    // about different things. Stacking was never the defect; DEGRADED PAINT
+    // was. The incident needed a shell too starved to paint, and it is now
+    // guarded structurally (unrevealed surfaces stay unmapped — pixel-proven:
+    // a never-revealed second surface paints ZERO pixels) rather than by
+    // keeping the correct path switched off. The software-GL demotion below is
+    // the load-bearing safety and is UNCHANGED, so this default cannot
+    // resurrect the DMABuf crash-loop.
+    //
+    // If you are here because under-glass regressed: the fix is an escape hatch
+    // (`=0`, or `YGGTERM_WEB_SURFACE_LEGACY_STACK=1`) plus a root-cause on why
+    // the shell stopped painting. Do NOT weaken this lock back to opt-in
+    // without the user saying so — they asked for the flag to stop existing.
     #[test]
-    fn under_glass_arms_only_when_asked() {
-        // Hardware GL is NOT consent: an unset var must not arm Phase F.
+    fn under_glass_arms_by_default_on_hardware_gl() {
+        // The correct presentation path does not wait to be asked for.
         assert!(
-            !under_glass_default_armed(None, None, false),
-            "hardware GL must not silently arm under-glass — that is how a \
-             background page took over the whole window"
+            under_glass_default_armed(None, None, false),
+            "under-glass is the standard path on a hardware-GL host — a web \
+             surface that needs an extra flag to sit flush is wrong by default"
         );
         assert!(under_glass_default_armed(Some("1"), None, false));
+        // The explicit opt-out is the supported answer if it regresses.
         assert!(!under_glass_default_armed(Some("0"), None, false));
-        // The legacy force is the escape hatch of last resort and beats an
-        // explicit opt-in.
+        // The legacy force is the escape hatch of last resort and beats both
+        // the default and an explicit opt-in.
         assert!(!under_glass_default_armed(None, Some("1"), false));
         assert!(!under_glass_default_armed(Some("1"), Some("1"), false));
-        // Legacy explicitly off is still not an opt-IN.
-        assert!(!under_glass_default_armed(None, Some("0"), false));
+        // Legacy explicitly OFF is not an opt-out of the default.
+        assert!(under_glass_default_armed(None, Some("0"), false));
     }
 
     // A software-GL host must NOT arm by default: under glass requires the
