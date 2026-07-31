@@ -180,7 +180,27 @@ as its live-verified fix.
   `navigator.clipboard.read()`, and a drop — since the failure may be specific
   to one.
 
-- **Screen tearing during scroll or animation.** `lane/dev/web-tearing`.
+- ✅ **CLOSED 2026-07-31 — "screen tearing" was an XWAYLAND artifact, and there
+  is no issue on Wayland.** User's own words, after being asked to distinguish a
+  true tear from judder: *"few frames of stickiness or artifacting … but that was
+  recorded in xWayland as we find out"* and, on the current Wayland-native GUI,
+  *"NO on wayland no issue."* They also confirmed it happened **only in yggterm**,
+  never in another app — consistent with our own launch path having been the
+  thing that landed in XWayland, not with a compositor or panel fault.
+  **This is why [[finding-yggterm-must-run-wayland-native]] is load-bearing and
+  not a preference: XWayland produced user-visible artifacts.** The measurement
+  that could not find the bug was right to report nothing — the lane ran 21 arms
+  and 1,190 frames on Wayland with a 4 px detector and found zero torn frames,
+  because on Wayland there is nothing to find. Instrument and doc are kept
+  (`tools/tear-probe/`, `scripts/web-tear-probe.sh`,
+  `docs/web-surface-tearing-2026-07-31.md`); they are the right tool if a real
+  tear is ever reported.
+  ⚠ Do NOT reopen this from a report that does not first establish which backend
+  the GUI actually resolved — measure with `xwininfo -root -children`, never
+  `/proc/<pid>/environ` (`set_var` never appears there).
+
+- **~~Screen tearing during scroll or animation.~~** (superseded by the entry
+  above; kept for the mechanism notes) `lane/dev/web-tearing`.
   Investigation-first, no speculative fix. Established: guihost is a **KDE Wayland**
   session (`kwin_wayland`), AMD `amdgpu`, `kwinrc` carries no tearing/VRR/latency
   keys, and the GUI is **Wayland-native** (proven: `xwininfo -root -children` on
