@@ -14,8 +14,16 @@ fix) once the fix is verified live on jojo.
   `docs/optimization-pass.md` and field guide §7.3 before quoting any number.
 - **Two supernumerary daemons persist** holding unmigratable `local://` shells.
   That is the durable half of the chaining bug, still open.
-- **The vault agents on dev and jojo still need ONE `ychrome-vault unlock` each**
-  — the 401-on-write fix is installed but the running agents predate it.
+- ✅ **The vault agents on dev and jojo are current and unlocked (2026-07-31).**
+  Neither needed an unlock in the end. jojo was already satisfied; dev's binary
+  predated the `socket` field that the card-fill path's socket lookup reads, so
+  it was rebuilt, installed, and moved across with `ychrome-vault handover` —
+  the unlocked session hands to the new binary instead of re-locking, so the
+  refresh cost ZERO unlocks. Both now report `agent_stale:false`,
+  `state:unlocked`, `undecryptable:0`, `socket:…/vault/agent.sock`, and both
+  agree at 1116 items (dev resynced from 1115 on the handover).
+  ⚠ The handover verb is the way to refresh a vault binary. Do NOT
+  `stop-agent` for a version bump — that re-locks and costs the user an unlock.
 - ✅ **The five could-only-pass locks are all closed.** The last one — the
   web-surface reclaim family, where reverting all four production call sites
   left the suite green — is replaced by `shell::web_surface_reclaim_locks`,
@@ -2539,10 +2547,23 @@ some are certainly fixed already. Full narrative for each is in
   is pure redundancy. It is now skipped, and drag-end does the single serialization.
   Cost during a drag is O(1) per event AND O(1) per frame.
   Lock: `a_live_drag_schedules_no_per_frame_selection_work`, red-proven by deleting
-  the guard. ⚠ **NOT YET LIVE-VERIFIED** — needs a real drag on the deployed build.
+  the guard.
 
-  ⚠ It remains possible that a second mechanism also contributes; the instrument
-  below exists to answer that rather than guess.
+  ✅ **USER-CONFIRMED BY HAND 2026-07-31 on the deployed build ("I just drag
+  tested. It works.").** That closes it — the user's hands outrank the
+  instruments here.
+
+  ⚠ **One loose end in the INSTRUMENT, not the fix.** The two gestures the trace
+  caught at 12:04:35 / 12:04:37 both logged `selection_events=0` and
+  `selected_chars=0`, so they read as clicks rather than the selecting drag —
+  meaning the confirmed drag either was not captured, or `selected_chars` is not
+  populating. Mechanism to check: at pointerup the flush only does work when
+  `primarySelectionSyncPending` is true, so a drag that fires no
+  `onSelectionChange` leaves `entry.primarySelectionLength` untouched and the
+  report reads 0. That is arguably correct (no selection change ⇒ nothing to
+  record) but it makes the field useless for sizing a real drag, which was its
+  whole point. Worth one pass before trusting `selected_chars` in any future
+  measurement.
 
 - ✅ **THESE THREE BUG CLASSES ARE NOW PROVABLE FROM TELEMETRY (2026-07-31).** Each
   of them survived because the instrument could not see it. What was added:
@@ -2629,8 +2650,14 @@ some are certainly fixed already. Full narrative for each is in
 - **Rows lost across a daemon swap** (`project-resume-after-2100-daemon-swap`) — 3
   live rows lost, 2 of them keep-alive, with a rescue file. Same family as
   `finding-daemon-handoff-drops-live-rows` (still in memory/, code-cited).
-- **ychrome queued slices** (`campaign-zoom-system-rework`) — per-site zoom,
-  settings pane, session buddy, vertical tabs.
+- **ychrome queued slices** (`campaign-zoom-system-rework`) — **per-site zoom and
+  the settings pane BOTH SHIPPED** (verified on ychrome main 2026-07-31:
+  `src/webzoom.rs` is 238 lines of per-site overrides behind a `/zoom` endpoint
+  with a change-hash so the GUI refetches only when an override moved;
+  `src/sidebar.rs` serves "Tabs", "Browser identity" and "Userscripts"
+  sections). What is left of this slice is **session buddy**; **vertical tabs**
+  is NOT a separate item, it is the rail-as-cwdtree entry in the
+  ychrome-as-main-browser list above, and should be tracked there only.
 - **Non-code todos** (`project-blackboard-clearing-2026-07-16`) —
   awesome_steer_prompts repo, app-infra forecast.
 
