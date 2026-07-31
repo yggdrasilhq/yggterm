@@ -2539,10 +2539,23 @@ some are certainly fixed already. Full narrative for each is in
   is pure redundancy. It is now skipped, and drag-end does the single serialization.
   Cost during a drag is O(1) per event AND O(1) per frame.
   Lock: `a_live_drag_schedules_no_per_frame_selection_work`, red-proven by deleting
-  the guard. ⚠ **NOT YET LIVE-VERIFIED** — needs a real drag on the deployed build.
+  the guard.
 
-  ⚠ It remains possible that a second mechanism also contributes; the instrument
-  below exists to answer that rather than guess.
+  ✅ **USER-CONFIRMED BY HAND 2026-07-31 on the deployed build ("I just drag
+  tested. It works.").** That closes it — the user's hands outrank the
+  instruments here.
+
+  ⚠ **One loose end in the INSTRUMENT, not the fix.** The two gestures the trace
+  caught at 12:04:35 / 12:04:37 both logged `selection_events=0` and
+  `selected_chars=0`, so they read as clicks rather than the selecting drag —
+  meaning the confirmed drag either was not captured, or `selected_chars` is not
+  populating. Mechanism to check: at pointerup the flush only does work when
+  `primarySelectionSyncPending` is true, so a drag that fires no
+  `onSelectionChange` leaves `entry.primarySelectionLength` untouched and the
+  report reads 0. That is arguably correct (no selection change ⇒ nothing to
+  record) but it makes the field useless for sizing a real drag, which was its
+  whole point. Worth one pass before trusting `selected_chars` in any future
+  measurement.
 
 - ✅ **THESE THREE BUG CLASSES ARE NOW PROVABLE FROM TELEMETRY (2026-07-31).** Each
   of them survived because the instrument could not see it. What was added:
