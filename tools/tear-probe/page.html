@@ -1,0 +1,150 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>yggterm tear probe</title>
+<!--
+  A page whose EVERY PIXEL ROW carries its own content-space index, so a
+  screenshot can be decoded instead of squinted at.
+
+  Encoding (see tools/tear-probe/analyze.py, which is the other half):
+    band i (BAND px tall, content y = i*BAND .. i*BAND+BAND-1) is painted
+      r = (i >> 8) & 0xFF
+      g =  i       & 0xFF
+      b = 0xA5 ^ ((i * 7) & 0xFF)        <- a checksum over i, not free data
+
+  Given one captured pixel, i = (r << 8) | g, and b MUST equal the checksum.
+  A blended pixel (subpixel scroll edge, scaling, compositor fade) fails the
+  checksum and is DISCARDED rather than mis-decoded. That is the whole point:
+  the analyzer can refuse.
+
+  A frame that contains content from ONE scroll position has a single value of
+  D(y) = BAND*i(y) - y (modulo the within-band ramp of BAND). A frame that
+  contains content from TWO scroll positions -- a tear -- has two plateaus of
+  D(y), and the step between them is the tear magnitude in pixels.
+
+  Modes (?mode=):
+    scroll    document scrolling; drive it with real input (keyboard)
+    jsscroll  document scrolling driven from rAF (no input tool needed)
+    anim3d  a fixed layer animated with translate3d  (forces a compositing layer)
+    anim2d  a fixed layer animated with top:         (repaint path, no layer)
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow-x: hidden; }
+  #bands { position: relative; width: 100%; }
+  .b { width: 100%; }
+  body.anim #wrap {
+    position: fixed; left: 0; top: 0; width: 100%; height: 100%;
+    overflow: hidden;
+  }
+  body.anim #bands { position: absolute; left: 0; top: 0; }
+  body.scroll #wrap { position: static; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="bands"></div></div>
+<script>
+(function () {
+  const q = new URLSearchParams(location.search);
+  const BAND = parseInt(q.get('band') || '4', 10);
+  const N = parseInt(q.get('n') || '6000', 10);
+  const MODE = q.get('mode') || 'scroll';
+  const SPEED = parseFloat(q.get('speed') || '900');   // px/second for anim modes
+  const SPAN = parseInt(q.get('span') || '4000', 10);  // anim travel in px
+
+  function color(i) {
+    const r = (i >> 8) & 0xff;
+    const g = i & 0xff;
+    const b = 0xa5 ^ ((i * 7) & 0xff);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  const bands = document.getElementById('bands');
+  // One string build, one innerHTML write: N inserts through the DOM API is
+  // itself a multi-second stall and would confound the first frames.
+  const parts = new Array(N);
+  for (let i = 0; i < N; i++) {
+    parts[i] = '<div class="b" style="height:' + BAND + 'px;background:' + color(i) + '"></div>';
+  }
+  bands.innerHTML = parts.join('');
+  bands.style.height = (N * BAND) + 'px';
+
+  document.body.classList.add(MODE.indexOf('scroll') >= 0 ? 'scroll' : 'anim');
+
+  // ?heavy=1 makes each frame EXPENSIVE to paint. Solid bands rasterize almost
+  // instantly, and a tear needs the paint to be slow enough that a buffer can be
+  // read while it is still being written -- so a cheap page can produce a false
+  // negative. The heavy content is confined to a left-hand strip so the decoder
+  // still has a wide clean region: its per-row mode is taken over the columns
+  // that pass the checksum, and the strip's text/gradients/shadows do not.
+  if (q.get('heavy') === '1') {
+    const strip = document.createElement('div');
+    strip.style.cssText =
+      'position:absolute;left:0;top:0;width:300px;pointer-events:none;';
+    const rows = [];
+    for (let i = 0; i < N; i++) {
+      rows.push(
+        '<div style="height:' + BAND + 'px;overflow:hidden;font:9px monospace;' +
+        'color:#fff;text-shadow:0 0 3px #000,0 0 6px #f0f;' +
+        'background:linear-gradient(90deg,hsl(' + (i % 360) + ',90%,45%),#000);' +
+        'border-radius:4px;box-shadow:inset 0 0 6px rgba(255,255,255,.6)">' +
+        'row ' + i + ' █░▓▒ heavy paint</div>'
+      );
+    }
+    strip.innerHTML = rows.join('');
+    bands.appendChild(strip);
+  }
+
+  if (MODE === 'jsscroll') {
+    // A REAL document scroll -- same scrolling tree, same compositing, same
+    // tiling as a wheel -- requested from rAF instead of from an input device.
+    // It exists because the wheel driver needs `wtype`, which is not installed
+    // everywhere the instrument has to run (guihost has sway+grim and neither
+    // wtype nor wlrctl), and an arm that cannot run on the GPU under suspicion
+    // is worthless.
+    let dir = 1;
+    (function step() {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      let y = window.scrollY + dir * Math.round(SPEED / 60);
+      if (y >= max) { y = max; dir = -1; }
+      if (y <= 0) { y = 0; dir = 1; }
+      window.scrollTo(0, y);
+      window.__tearOffset = y;
+      requestAnimationFrame(step);
+    })();
+  }
+
+  if (MODE === 'anim3d' || MODE === 'anim2d') {
+    const use3d = MODE === 'anim3d';
+    if (use3d) bands.style.willChange = 'transform';
+    let t0 = null;
+    function step(t) {
+      if (t0 === null) t0 = t;
+      const dt = (t - t0) / 1000;
+      // ping-pong so the layer never runs off the end
+      const period = (2 * SPAN) / SPEED;
+      let phase = (dt % period) / period;              // 0..1
+      let off = phase < 0.5 ? phase * 2 * SPAN : (1 - phase) * 2 * SPAN;
+      off = Math.round(off);                            // integer px: no subpixel blend
+      if (use3d) {
+        bands.style.transform = 'translate3d(0,' + (-off) + 'px,0)';
+      } else {
+        bands.style.top = (-off) + 'px';
+      }
+      window.__tearOffset = off;
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  // Liveness + readiness beacons the driver polls over `web eval`.
+  window.__tearReady = true;
+  window.__tearMode = MODE;
+  window.__tearBand = BAND;
+  let frames = 0;
+  (function tick() { frames++; window.__tearFrames = frames; requestAnimationFrame(tick); })();
+  document.title = 'tear-probe ' + MODE + ' band=' + BAND;
+})();
+</script>
+</body>
+</html>
