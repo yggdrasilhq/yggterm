@@ -395,16 +395,12 @@ fn display_key(key: &str) -> String {
 /// folded into a numbered Group.
 pub fn assign_scope(scope: &ScopeId, decls: &[KeyTipDecl], keymap: &KeymapConfig) -> Vec<AssignedNode> {
     let reserved_ns = scope.is_reserved_namespace();
-    // taken: single letters already claimed at this level (bare leaves + groups).
-    let mut taken: Vec<char> = Vec::new();
+    // The tip pool for this scope: single letters claimed so far, the letters
+    // reserved as two-letter PREFIXES (§5 step 7), and the pairs spent.
+    let mut pool = TipPool::new(overflow_prefixes(decls, keymap));
     // Output preserves render order; we fill leaves in a first pass over shell
     // decls, then apps, then stitch back to the original order at the end.
     let mut assignment: BTreeMap<usize, AssignedNode> = BTreeMap::new();
-
-    let take = |taken: &mut Vec<char>, letter: char| {
-        taken.push(letter.to_ascii_lowercase());
-    };
-    let is_taken = |taken: &[char], letter: char| taken.contains(&letter.to_ascii_lowercase());
 
     // Resolve the letter a declaration wants: user override first, then its hint.
     let desired = |decl: &KeyTipDecl| -> Option<char> {
@@ -419,14 +415,14 @@ pub fn assign_scope(scope: &ScopeId, decls: &[KeyTipDecl], keymap: &KeymapConfig
         if decl.origin != Origin::Shell {
             continue;
         }
-        let letter = pick_letter(decl, desired(decl), &taken, reserved_ns, true);
-        take(&mut taken, letter);
+        let tip = pick_tip(decl, desired(decl), &pool, reserved_ns, true);
+        pool.claim(&tip);
         assignment.insert(
             idx,
             AssignedNode::Leaf {
                 key: decl.key.clone(),
                 title: decl.title.clone(),
-                tip: letter.to_string(),
+                tip,
                 target: decl.target.clone(),
             },
         );
@@ -442,7 +438,7 @@ pub fn assign_scope(scope: &ScopeId, decls: &[KeyTipDecl], keymap: &KeymapConfig
             continue;
         }
         match desired(decl) {
-            Some(letter) if !is_taken(&taken, letter) => {
+            Some(letter) if pool.single_free(letter) => {
                 app_by_letter.entry(letter).or_default().push(idx);
             }
             // No hint, or the hint is already taken by shell/another group: this
@@ -453,7 +449,7 @@ pub fn assign_scope(scope: &ScopeId, decls: &[KeyTipDecl], keymap: &KeymapConfig
 
     // Group letters are claimed in ascending letter order for determinism.
     for (&letter, claimants) in &app_by_letter {
-        take(&mut taken, letter);
+        pool.claim(&letter.to_string());
         if claimants.len() == 1 {
             let idx = claimants[0];
             let decl = &decls[idx];
@@ -487,14 +483,14 @@ pub fn assign_scope(scope: &ScopeId, decls: &[KeyTipDecl], keymap: &KeymapConfig
     // Pass 3 — app declarations with no free hint fall through the ladder.
     for idx in app_ladder {
         let decl = &decls[idx];
-        let letter = pick_letter(decl, None, &taken, reserved_ns, false);
-        take(&mut taken, letter);
+        let tip = pick_tip(decl, None, &pool, reserved_ns, false);
+        pool.claim(&tip);
         assignment.insert(
             idx,
             AssignedNode::Leaf {
                 key: decl.key.clone(),
                 title: decl.title.clone(),
-                tip: letter.to_string(),
+                tip,
                 target: decl.target.clone(),
             },
         );
@@ -556,21 +552,105 @@ fn number_group(
     members
 }
 
-/// The letter ladder for one declaration (§5), given the letters already taken.
+/// The single tips one scope can hand out: `a-z` then `0-9` (§5 steps 4-6).
+const SINGLE_TIP_CAPACITY: usize = 36;
+/// The tips one reserved prefix carries: `<p>a`..`<p>z` then `<p>0`..`<p>9`.
+const TIPS_PER_PREFIX: usize = 36;
+/// The letters a scope may hand out before it needs a two-letter tip at all.
+/// Reservation starts here rather than at [`SINGLE_TIP_CAPACITY`] so the digits
+/// stay available as ordinary tips instead of being the last thing between a
+/// crowded scope and an unbadgeable element.
+const LETTERS_BEFORE_OVERFLOW: usize = 26;
+/// Which letters this scope holds back as two-letter PREFIXES (§5 step 7).
+///
+/// The reservation is made BEFORE any letter is handed out, and that ordering is
+/// the whole trick: a two-letter tip `ZA` is only reachable if `Z` is not itself
+/// a tip — press `Z` and the walker must be able to say "keep going" instead of
+/// firing something. A prefix chosen after the fact would already be somebody's
+/// letter, so the pair could never be typed. Prefixes are taken from the END of
+/// the alphabet (`z`, `y`, `x`, …), skipping any letter a declaration explicitly
+/// asked for, because the tail is where the title/`a-z` ladder arrives last.
+fn overflow_prefixes(decls: &[KeyTipDecl], keymap: &KeymapConfig) -> Vec<char> {
+    let needed = decls.len();
+    if needed <= LETTERS_BEFORE_OVERFLOW {
+        return Vec::new();
+    }
+    let wanted: Vec<char> = decls
+        .iter()
+        .filter_map(|decl| keymap.keytip_override(&decl.key).or(decl.hint))
+        .map(|letter| letter.to_ascii_lowercase())
+        .collect();
+    let mut prefixes: Vec<char> = Vec::new();
+    let mut capacity = SINGLE_TIP_CAPACITY;
+    for letter in ('a'..='z').rev() {
+        if capacity >= needed {
+            break;
+        }
+        if wanted.contains(&letter) {
+            continue;
+        }
+        prefixes.push(letter);
+        // One single letter spent, a whole two-letter namespace gained.
+        capacity = capacity - 1 + TIPS_PER_PREFIX;
+    }
+    prefixes
+}
+
+/// One scope's tip pool: the singles already claimed, the letters reserved as
+/// two-letter prefixes, and the pairs spent. It is the only thing that knows a
+/// letter can be unavailable for two different reasons (claimed vs reserved),
+/// which is what keeps a prefix from ever also being a tip.
+struct TipPool {
+    taken: Vec<char>,
+    prefixes: Vec<char>,
+    pairs: Vec<String>,
+}
+
+impl TipPool {
+    fn new(prefixes: Vec<char>) -> Self {
+        Self {
+            taken: Vec::new(),
+            prefixes,
+            pairs: Vec::new(),
+        }
+    }
+
+    /// Free as a SINGLE tip: neither claimed nor held back as a prefix.
+    fn single_free(&self, letter: char) -> bool {
+        let letter = letter.to_ascii_lowercase();
+        !self.taken.contains(&letter) && !self.prefixes.contains(&letter)
+    }
+
+    fn pair_free(&self, pair: &str) -> bool {
+        !self.pairs.iter().any(|claimed| claimed == pair)
+    }
+
+    /// Record an assigned tip, single or pair.
+    fn claim(&mut self, tip: &str) {
+        let mut chars = tip.chars();
+        match (chars.next(), chars.next()) {
+            (Some(letter), None) => self.taken.push(letter.to_ascii_lowercase()),
+            (Some(_), Some(_)) => self.pairs.push(tip.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+}
+
+/// The tip ladder for one declaration (§5), given the pool of what is left.
 /// `desired` is the override-or-hint (already resolved); `honor_hint` lets pass 3
 /// skip the hint (it was already tried and lost). Steps: desired hint (if free
 /// and namespace-legal) → first free letter of the title → first free `a-z` →
-/// digits `0-9` → a two-letter tip.
-fn pick_letter(
+/// digits `0-9` → a two-letter tip under a reserved prefix (step 7).
+fn pick_tip(
     decl: &KeyTipDecl,
     desired: Option<char>,
-    taken: &[char],
+    pool: &TipPool,
     reserved_ns: bool,
     honor_hint: bool,
-) -> char {
+) -> String {
     let free = |letter: char| -> bool {
         let letter = letter.to_ascii_lowercase();
-        if taken.contains(&letter) {
+        if !pool.single_free(letter) {
             return false;
         }
         // A shell command may not sit on an Excel-reserved letter at the root
@@ -584,35 +664,54 @@ fn pick_letter(
     if honor_hint {
         if let Some(letter) = desired {
             if free(letter) {
-                return letter;
+                return letter.to_string();
             }
         }
     }
     // First free alphanumeric of the title.
     for ch in decl.title.chars() {
         if ch.is_ascii_alphanumeric() && free(ch.to_ascii_lowercase()) {
-            return ch.to_ascii_lowercase();
+            return ch.to_ascii_lowercase().to_string();
         }
     }
     // First free a-z.
     for ch in 'a'..='z' {
         if free(ch) {
-            return ch;
+            return ch.to_string();
         }
     }
-    // Digits 0-9 (these are never reserved).
+    // Digits 0-9 (these are never Excel-reserved).
     for ch in '0'..='9' {
-        if !taken.contains(&ch) {
-            return ch;
+        if free(ch) {
+            return ch.to_string();
         }
     }
-    // Two-letter tips are handled by the caller when singles are exhausted; as a
-    // last resort return the title's first alnum lowercased (deterministic).
+    // Step 7 — a two-letter tip under the first prefix with a free suffix. The
+    // suffix walks the SAME ladder (title letters first, then a-z, then digits)
+    // so `Format Painter` under prefix `z` reads `ZF`, not `ZA`.
+    for &prefix in &pool.prefixes {
+        let suffixes = decl
+            .title
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .chain('a'..='z')
+            .chain('0'..='9');
+        for suffix in suffixes {
+            let pair = format!("{prefix}{suffix}");
+            if pool.pair_free(&pair) {
+                return pair;
+            }
+        }
+    }
+    // Nothing left at all (a scope with >1000 elements, or none reserved because
+    // the count fit): deterministic last resort, as before.
     decl.title
         .chars()
         .find(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .unwrap_or('z')
+        .to_string()
 }
 
 /// The shipping direct accelerators (spec §11.4): `command-id → chord`. Sparse on
@@ -662,6 +761,77 @@ pub fn accel_command_for(chord: &Chord, cfg: &KeymapConfig) -> Option<String> {
         .into_iter()
         .find(|(_, c)| c == chord)
         .map(|(id, _)| id)
+}
+
+/// What a typed chord makes of the DERIVED tip map (§12.2 — the letters the
+/// overlay-open walk assigned to elements that carry no declaration).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DerivedResolution {
+    /// A valid prefix of a two-letter derived tip; wait for the second key.
+    Pending,
+    /// The sequence names this element (the walk's `data-keytip-derived-id`).
+    Hit(String),
+    /// Neither a tip nor a prefix — dismiss.
+    Miss,
+}
+
+/// Walk a typed sequence against the derived map. The same prefix rule the
+/// registry walk uses ([`match_tip`]), on the flat map the derivation produces:
+/// exact tip wins, else a tip that STARTS with the sequence keeps the layer up.
+pub fn resolve_derived(map: &BTreeMap<String, String>, sequence: &str) -> DerivedResolution {
+    if sequence.is_empty() {
+        return DerivedResolution::Miss;
+    }
+    let sequence = sequence.to_ascii_lowercase();
+    if let Some(id) = map.get(&sequence) {
+        return DerivedResolution::Hit(id.clone());
+    }
+    if map.keys().any(|tip| tip.starts_with(&sequence)) {
+        return DerivedResolution::Pending;
+    }
+    DerivedResolution::Miss
+}
+
+/// What one level of the walk makes of the sequence in front of it.
+enum TipMatch<'a> {
+    /// A tip matched, eating `consumed` chars (1, or 2 for a §5 step-7 pair).
+    Node {
+        node: &'a AssignedNode,
+        consumed: usize,
+    },
+    /// The next char is the first half of a two-letter tip and the sequence ends
+    /// there — a valid path, waiting for one more key.
+    Pending,
+    /// No tip and no prefix claims that char.
+    Invalid,
+}
+
+/// Match the next TIP at one level. A tip is one char (`"b"`) or two (`"za"`,
+/// §5 step 7); the walker cannot know which without asking the level, and it is
+/// unambiguous because [`overflow_prefixes`] holds a prefix letter back from the
+/// singles — a letter is a tip or a prefix, never both.
+fn match_tip<'a>(nodes: &'a [AssignedNode], rest: &[char]) -> TipMatch<'a> {
+    let Some(&first) = rest.first() else {
+        return TipMatch::Invalid;
+    };
+    let one = first.to_string();
+    if let Some(node) = nodes.iter().find(|node| node.tip() == one) {
+        return TipMatch::Node { node, consumed: 1 };
+    }
+    let claims_prefix = nodes
+        .iter()
+        .any(|node| node.tip().chars().count() == 2 && node.tip().starts_with(first));
+    if !claims_prefix {
+        return TipMatch::Invalid;
+    }
+    let Some(&second) = rest.get(1) else {
+        return TipMatch::Pending;
+    };
+    let pair: String = [first, second].iter().collect();
+    match nodes.iter().find(|node| node.tip() == pair) {
+        Some(node) => TipMatch::Node { node, consumed: 2 },
+        None => TipMatch::Invalid,
+    }
 }
 
 /// The resolved KeyTip tree for a whole frame (spec §1): every open scope's
@@ -772,11 +942,17 @@ impl KeyTipTree {
     /// Returns a synthetic `"<scope>/<letter>"` when the prefix ends on a group
     /// letter. `None` if the prefix is not a valid path.
     fn scope_at(&self, sequence: &str) -> Option<String> {
+        let chars: Vec<char> = sequence.to_ascii_lowercase().chars().collect();
         let mut scope = ScopeId::Root.as_str();
-        let mut chars = sequence.chars().peekable();
-        while let Some(c) = chars.next() {
+        let mut index = 0;
+        while index < chars.len() {
             let nodes = self.scopes.get(&scope)?;
-            let node = nodes.iter().find(|n| n.tip() == c.to_string())?;
+            let (node, consumed) = match match_tip(nodes, &chars[index..]) {
+                TipMatch::Node { node, consumed } => (node, consumed),
+                // A bare prefix names no scope yet, and neither does a miss.
+                TipMatch::Pending | TipMatch::Invalid => return None,
+            };
+            index += consumed;
             match node {
                 AssignedNode::Leaf {
                     target: Target::Descend(child),
@@ -797,20 +973,27 @@ impl KeyTipTree {
     /// `Descend` node's open-action fires once (on the keystroke that lands on it)
     /// and never re-fires as the chord grows.
     pub fn resolve(&self, sequence: &str) -> ChordResolution {
-        let sequence = sequence.to_ascii_lowercase();
-        if sequence.is_empty() {
+        let chars: Vec<char> = sequence.to_ascii_lowercase().chars().collect();
+        if chars.is_empty() {
             return ChordResolution::Pending;
         }
         let mut scope = ScopeId::Root.as_str();
-        let mut chars = sequence.chars().peekable();
-        while let Some(c) = chars.next() {
-            let last = chars.peek().is_none();
+        let mut index = 0;
+        while index < chars.len() {
             let Some(nodes) = self.scopes.get(&scope) else {
                 return ChordResolution::Invalid;
             };
-            let Some(node) = nodes.iter().find(|n| n.tip() == c.to_string()) else {
-                return ChordResolution::Invalid;
+            // A tip is one char, or two once the scope overflowed (§5 step 7):
+            // the walk asks the level how much of the sequence its tip eats.
+            let (node, consumed) = match match_tip(nodes, &chars[index..]) {
+                TipMatch::Node { node, consumed } => (node, consumed),
+                // Half of a two-letter tip: a valid path, waiting for its second
+                // key — exactly the Pending an empty sequence gets.
+                TipMatch::Pending => return ChordResolution::Pending,
+                TipMatch::Invalid => return ChordResolution::Invalid,
             };
+            index += consumed;
+            let last = index >= chars.len();
             match node {
                 AssignedNode::Leaf { key, target, .. } => match target {
                     Target::Run => {
@@ -838,10 +1021,11 @@ impl KeyTipTree {
                         };
                     }
                     // Next char selects a numbered member.
-                    let Some(d) = chars.next() else {
+                    let Some(&d) = chars.get(index) else {
                         return ChordResolution::Invalid;
                     };
-                    let after_last = chars.peek().is_none();
+                    index += 1;
+                    let after_last = index >= chars.len();
                     let number = d.to_digit(10);
                     let member = number.and_then(|n| members.iter().find(|m| m.number == n));
                     return match (member, after_last) {
@@ -969,6 +1153,145 @@ mod tests {
             }
             other => panic!("expected a Group, got {other:?}"),
         }
+    }
+
+    // --- §5 step 7: two-letter tips ---
+
+    /// A scope big enough to overflow the single letters, the way a derived
+    /// surface (§12.2) does: every element wants a tip, none declares a hint.
+    fn crowded(count: usize) -> Vec<KeyTipDecl> {
+        (0..count)
+            .map(|index| app(&format!("el{index}"), &format!("Element {index}"), None))
+            .collect()
+    }
+
+    #[test]
+    fn a_scope_that_fits_in_single_letters_gets_no_two_letter_tips() {
+        // The reservation must not cost a letter until the scope needs it —
+        // 26 elements still read as 26 single keys.
+        let assigned = assign_scope(
+            &ScopeId::App("derived".into()),
+            &crowded(26),
+            &KeymapConfig::default(),
+        );
+        assert_eq!(assigned.len(), 26);
+        for node in &assigned {
+            assert_eq!(node.tip().chars().count(), 1, "no pair before overflow");
+        }
+    }
+
+    #[test]
+    fn an_overflowing_scope_gives_every_element_its_own_reachable_tip() {
+        // 40 elements > 36 singles: the surplus MUST get two-letter tips, every
+        // tip must be unique, and no pair's prefix may also be a single tip —
+        // otherwise pressing the prefix fires that single and the pair is dead.
+        let decls = crowded(40);
+        let assigned = assign_scope(
+            &ScopeId::App("derived".into()),
+            &decls,
+            &KeymapConfig::default(),
+        );
+        assert_eq!(assigned.len(), 40, "every element is assigned");
+        let tips: Vec<String> = assigned.iter().map(|node| node.tip().to_string()).collect();
+        let unique: std::collections::BTreeSet<&String> = tips.iter().collect();
+        assert_eq!(unique.len(), tips.len(), "no element shares another's tip");
+        let singles: std::collections::BTreeSet<char> = tips
+            .iter()
+            .filter(|tip| tip.chars().count() == 1)
+            .filter_map(|tip| tip.chars().next())
+            .collect();
+        let pairs: Vec<&String> = tips.iter().filter(|tip| tip.chars().count() == 2).collect();
+        assert!(!pairs.is_empty(), "the surplus is carried by two-letter tips");
+        for pair in pairs {
+            let prefix = pair.chars().next().unwrap();
+            assert!(
+                !singles.contains(&prefix),
+                "pair `{pair}`'s prefix `{prefix}` is also a single tip — unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn two_letter_assignment_is_deterministic() {
+        let decls = crowded(45);
+        let km = KeymapConfig::default();
+        let a = assign_scope(&ScopeId::App("derived".into()), &decls, &km);
+        let b = assign_scope(&ScopeId::App("derived".into()), &decls, &km);
+        assert_eq!(a, b, "invariant 1 holds through the overflow ladder");
+    }
+
+    #[test]
+    fn an_overflow_prefix_never_steals_a_declared_letter() {
+        // A crowded scope where one element insists on 'z': the reservation must
+        // step over it (and take 'y' instead), or an explicit hint would silently
+        // become unreachable.
+        let mut decls = crowded(40);
+        decls.push(app("pinned.z", "Zoom", Some('z')));
+        let assigned = assign_scope(
+            &ScopeId::App("derived".into()),
+            &decls,
+            &KeymapConfig::default(),
+        );
+        let zoom = assigned
+            .iter()
+            .find(|node| matches!(node, AssignedNode::Leaf { key, .. } if key == "pinned.z"))
+            .expect("the hinted element is assigned");
+        assert_eq!(zoom.tip(), "z", "an explicit hint outranks the prefix reserve");
+    }
+
+    #[test]
+    fn a_two_letter_tip_resolves_only_after_its_second_key() {
+        // Build a tree whose root scope overflowed, then walk a pair: the prefix
+        // alone is Pending (the layer stays up), the pair runs its node, and a
+        // prefix followed by a letter nobody claimed is Invalid.
+        let tree = KeyTipTree::build(
+            &[(ScopeId::App("derived".into()), crowded(40))],
+            &KeymapConfig::default(),
+        );
+        let nodes = tree
+            .scope_nodes("app.derived")
+            .expect("the scope is in the tree");
+        let pair = nodes
+            .iter()
+            .find(|node| node.tip().chars().count() == 2)
+            .expect("the crowded scope produced a pair");
+        let tip = pair.tip().to_string();
+        let key = match pair {
+            AssignedNode::Leaf { key, .. } => key.clone(),
+            other => panic!("expected a leaf, got {other:?}"),
+        };
+        let prefix = tip.chars().next().unwrap().to_string();
+        // Resolve against this scope directly by making it the root of its own tree.
+        let flat = KeyTipTree {
+            scopes: [("root".to_string(), nodes.to_vec())].into_iter().collect(),
+        };
+        assert_eq!(
+            flat.resolve(&prefix),
+            ChordResolution::Pending,
+            "the prefix alone must not fire anything"
+        );
+        assert_eq!(flat.resolve(&tip), ChordResolution::Run(key));
+        assert_eq!(
+            flat.resolve(&format!("{prefix}!")),
+            ChordResolution::Invalid,
+            "a prefix plus an unclaimed suffix dismisses"
+        );
+    }
+
+    #[test]
+    fn derived_map_walks_pairs_the_same_way() {
+        let map: BTreeMap<String, String> = [
+            ("b".to_string(), "d0".to_string()),
+            ("za".to_string(), "d1".to_string()),
+            ("zb".to_string(), "d2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(resolve_derived(&map, "b"), DerivedResolution::Hit("d0".into()));
+        assert_eq!(resolve_derived(&map, "z"), DerivedResolution::Pending);
+        assert_eq!(resolve_derived(&map, "za"), DerivedResolution::Hit("d1".into()));
+        assert_eq!(resolve_derived(&map, "zq"), DerivedResolution::Miss);
+        assert_eq!(resolve_derived(&map, "q"), DerivedResolution::Miss);
     }
 
     #[test]

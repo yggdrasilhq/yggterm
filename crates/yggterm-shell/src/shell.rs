@@ -12096,6 +12096,19 @@ struct ShellState {
     /// consulted only when a chord letter misses the registry tree, so a
     /// declared letter can never be shadowed (§6: declared beats derived).
     alt_derived_tips: std::collections::BTreeMap<String, String>,
+    /// The derived chord typed so far (§5 step 7): a two-letter derived tip's
+    /// first key parks here while the layer waits for its second. Non-empty means
+    /// the registry is OUT of the walk — a prefix must never be re-read as a
+    /// registry letter — and it dies with the overlay like the map above.
+    alt_derived_sequence: String,
+    /// The MODAL the ALT layer has descended into (§4 — "a command that opens a
+    /// container descends into that container"), by the kind rendered on
+    /// `data-yggterm-modal-open`. While this is `Some` the layer is ISOLATED to
+    /// that dialog: the registry tree is not consulted at all (a letter must
+    /// never reach chrome behind a modal), every letter comes from the §12.2
+    /// derivation confined to the modal's subtree, and Enter/Escape/Backspace go
+    /// to the one modal dispatcher.
+    alt_overlay_modal_scope: Option<String>,
     /// The ALT+ KeyTips keymap in force (Excel-familiar defaults ∪ the user's
     /// `~/.yggterm/keymap.json` overrides). SSOT for the letters; the registry
     /// (`command_registry`) is SSOT for the command structure. See
@@ -12756,6 +12769,12 @@ struct RenderSnapshot {
     titlebar_overflow_menu_open: bool,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// The modal scope the layer has descended into (§4), by kind — it rides the
+    /// breadcrumb's signature attribute so the bridge re-derives when the layer
+    /// enters or leaves a dialog.
+    alt_overlay_modal_scope: Option<String>,
+    /// …and its human name for the visible trail (`⌨ ALT › Confirm`).
+    alt_overlay_modal_label: Option<String>,
     /// Jump mode (`ALT,J`): `(1-based index, count, label)` of the highlighted live
     /// session, `None` when jump mode is not up. Drives the breadcrumb — the only
     /// feedback there is when the sidebar is closed.
@@ -14029,6 +14048,8 @@ impl ShellState {
             alt_overlay_sequence: String::new(),
             alt_jump_path: None,
             alt_derived_tips: std::collections::BTreeMap::new(),
+            alt_derived_sequence: String::new(),
+            alt_overlay_modal_scope: None,
             keymap,
             keytip_config,
             keymap_editor_open: false,
@@ -15027,6 +15048,15 @@ impl ShellState {
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
+            alt_overlay_modal_scope: self.alt_overlay_modal_scope.clone(),
+            // The label comes from the SAME `top_modal` precedence the marker and
+            // the dispatcher use, never from the stored kind string, so the trail
+            // cannot name a dialog that is no longer on top.
+            alt_overlay_modal_label: self
+                .alt_overlay_modal_scope
+                .as_ref()
+                .and(self.top_modal())
+                .map(|modal| modal.scope_label().to_string()),
             session_jump_status: self.session_jump_status(),
             keytip_tree,
             keytip_config: self.keytip_config.clone(),
@@ -16487,6 +16517,12 @@ impl ShellState {
     /// ordering could disagree about which dialog an Enter belongs to.
     fn top_modal(&self) -> Option<TopModal> {
         top_modal_of(
+            // The ALT layer's own editor and the theme editor are full-window
+            // dialogs like any other: they own the screen, so they own the keys
+            // and the KeyTip scope (§4). Before they joined this list, `ALT,K`
+            // opened a dialog the ALT layer could not operate.
+            self.keymap_editor_open,
+            self.theme_editor_open,
             self.pending_fido2.is_some(),
             self.pending_delete.is_some(),
             self.copy_edit_dialog.is_some(),
@@ -25221,9 +25257,27 @@ impl ShellState {
         // walk on the open edge, and until its answer lands no letter from a
         // PREVIOUS open may dispatch (§12.2 — derivation is per-open).
         self.alt_derived_tips.clear();
+        self.alt_derived_sequence.clear();
+        // §4: a modal already on screen IS the scope this open lands in — the
+        // dialog owns the screen, so the layer must not be able to reach the
+        // chrome behind it. Set here rather than left to the walk's answer so
+        // there is no window in which a root letter could fire under a dialog.
+        self.alt_overlay_modal_scope = self.top_modal().map(|modal| modal.kind().to_string());
         self.titlebar_new_menu_open = false;
         self.titlebar_session_menu_open = false;
         self.titlebar_overflow_menu_open = false;
+    }
+    /// Re-open the layer INSIDE a modal a chord just opened (§4/§12.3). Same
+    /// activation, minus the menu-closing: the dialog is the container the chord
+    /// asked for, so the layer follows the keyboard into it instead of ending at
+    /// the mouse.
+    fn descend_alt_overlay_into_modal(&mut self, kind: &str) {
+        self.alt_overlay_active = true;
+        self.alt_overlay_sequence.clear();
+        self.alt_derived_tips.clear();
+        self.alt_derived_sequence.clear();
+        self.alt_jump_path = None;
+        self.alt_overlay_modal_scope = Some(kind.to_string());
     }
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
@@ -25232,6 +25286,8 @@ impl ShellState {
         // (§12.2). The DOM stamps are the bridge's half, removed on the same
         // close edge by __yggtermKeytipClearDerived.
         self.alt_derived_tips.clear();
+        self.alt_derived_sequence.clear();
+        self.alt_overlay_modal_scope = None;
         // Jump mode lives inside the overlay: dismissing the overlay ends it. The
         // selection it moved STAYS where the cursor left it — the same contract as
         // arrow-navigating the sidebar, so "here" is never surprising.
@@ -35441,6 +35497,11 @@ fn queue_copy_edit_for_active_session(mut state: Signal<ShellState>, field: Copy
 /// species of lie the ALT layer exists to end (spec §12.3).
 fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
     match top {
+        // Both editors are FORMS: Enter belongs to the field being edited (a
+        // rebind, a colour), never to a primary button, so only Escape is
+        // advertised — and only Escape is acted on below.
+        TopModal::KeymapEditor => &[("Esc", "close")],
+        TopModal::ThemeEditor => &[("Esc", "close")],
         TopModal::Fido2 => &[("Esc", "dismiss")],
         TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
         TopModal::CopyEdit => &[("Enter", "save"), ("Esc", "cancel")],
@@ -35462,6 +35523,21 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
         return false;
     }
     match top {
+        TopModal::KeymapEditor => {
+            // Escape closes the editor; Enter is SWALLOWED — a rebind is
+            // committed in its own field, and "Enter = the primary button" would
+            // have to invent a primary button this dialog does not have.
+            if dismiss {
+                state.with_mut(|shell| shell.close_keymap_editor());
+            }
+            true
+        }
+        TopModal::ThemeEditor => {
+            if dismiss {
+                state.with_mut(|shell| shell.set_theme_editor_open(false));
+            }
+            true
+        }
         TopModal::Fido2 => {
             let Some(dialog) = state.with(|shell| shell.pending_fido2.clone()) else {
                 return false;
@@ -37122,6 +37198,11 @@ fn titlebar_autohide_pinned_flags(
 /// deliberately written topmost-first and must stay in sync with that tree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TopModal {
+    /// The ALT+ KeyTips editor (`ALT,K`). Painted above everything (z-index 500),
+    /// so it takes the keys above everything too.
+    KeymapEditor,
+    /// The theme editor, raised over the whole window from Settings.
+    ThemeEditor,
     Fido2,
     Delete,
     CopyEdit,
@@ -37130,6 +37211,40 @@ enum TopModal {
     /// the folder-overflow menu. Bottom of the precedence: any real dialog
     /// raised while one is open owns the screen over it.
     StripDropdown,
+}
+
+impl TopModal {
+    /// The modal's KIND string — ONE table read by three places that must never
+    /// disagree: the `data-yggterm-modal-open` marker, the `data-yggterm-modal-root`
+    /// subtree the §12.2 walk confines itself to, and the ALT layer's modal scope
+    /// (`alt_overlay_modal_scope`). A kind spelled twice would let the walk badge
+    /// one dialog while the chord dispatched into another.
+    fn kind(self) -> &'static str {
+        match self {
+            TopModal::KeymapEditor => "keymap-editor",
+            TopModal::ThemeEditor => "theme-editor",
+            TopModal::Fido2 => "fido2",
+            TopModal::Delete => "delete",
+            TopModal::CopyEdit => "copy-edit",
+            TopModal::ClassicTabsSwitch => "classic-tabs-switch",
+            TopModal::StripDropdown => "strip-dropdown",
+        }
+    }
+
+    /// The name the KeyTips breadcrumb shows for this scope, so the trail reads
+    /// `⌨ ALT › Confirm` instead of stopping at the leader while a dialog owns
+    /// the keys.
+    fn scope_label(self) -> &'static str {
+        match self {
+            TopModal::KeymapEditor => "KeyTips",
+            TopModal::ThemeEditor => "Theme",
+            TopModal::Fido2 => "Passkey",
+            TopModal::Delete => "Confirm",
+            TopModal::CopyEdit => "Edit",
+            TopModal::ClassicTabsSwitch => "Tabs",
+            TopModal::StripDropdown => "Menu",
+        }
+    }
 }
 
 /// Is a dropdown anchored on the CLASSIC STRIP open?
@@ -37152,12 +37267,23 @@ fn strip_dropdown_over_viewport(
 /// Pure precedence: which modal is on top given what is open. Split out so the
 /// live `ShellState` and the `RenderSnapshot` cannot disagree about the answer.
 fn top_modal_of(
+    keymap_editor: bool,
+    theme_editor: bool,
     fido2: bool,
     delete: bool,
     copy_edit: bool,
     classic_tabs_switch: bool,
     strip_dropdown: bool,
 ) -> Option<TopModal> {
+    // The two editors are raised ABOVE the dialogs (z-index 500 / 98 against
+    // 96 / 95), so they take the keyboard above them too — precedence follows
+    // paint order, or Enter would land in a dialog the user cannot see.
+    if keymap_editor {
+        return Some(TopModal::KeymapEditor);
+    }
+    if theme_editor {
+        return Some(TopModal::ThemeEditor);
+    }
     if fido2 {
         return Some(TopModal::Fido2);
     }
@@ -37179,6 +37305,8 @@ fn top_modal_of(
 /// Snapshot-side view of the same precedence, for the render pass.
 fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
     top_modal_of(
+        snapshot.keymap_editor_open,
+        snapshot.theme_editor_open,
         snapshot.pending_fido2.is_some(),
         snapshot.pending_delete.is_some(),
         snapshot.copy_edit_dialog.is_some(),
@@ -37276,6 +37404,10 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         || snapshot.copy_edit_dialog.is_some()
         || snapshot.pending_fido2.is_some()
         || snapshot.theme_editor_open
+        // The ALT+ KeyTips editor is a full-window dialog like the theme editor
+        // beside it; it joined `top_modal` (§4 — it owns the keys while it is up)
+        // and the two lists answer the same question, so it joins here too.
+        || snapshot.keymap_editor_open
 }
 fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
     // KeyTips need the affordances they annotate on screen: when the overlay is
@@ -39128,6 +39260,29 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
       if (!el.hasAttribute('data-keytip-node')) { el.removeAttribute('data-keytip-tip'); }
     });
   };
+  // The SURFACE SIGNATURE: what the walk would answer differently about. Kept
+  // here, beside KT_SEL, because "the set of interactables changed" is the same
+  // question the walk answers — a second definition next to the painter could
+  // drift from this one. Cheap by construction: attribute reads plus one
+  // selector count, no layout (getBoundingClientRect belongs to the walk).
+  //
+  // Derivation was per-overlay-OPEN until 2026-07-31, so a chord that DESCENDED
+  // (the Settings panel, the row menu, a modal) revealed controls that stayed
+  // unbadged until the next open — the user's report: a dialog reached by
+  // ALT,E,X with no letters on its buttons. The signature makes derivation
+  // follow the surface instead of the open edge.
+  window.__yggtermKeytipSignature = function(){
+    var crumb = document.querySelector('[data-yggterm-keytip-breadcrumb]');
+    var seq = crumb ? (crumb.getAttribute('data-yggterm-keytip-sequence') || '') : '';
+    var modal = document.querySelector('[data-yggterm-modal-open]');
+    var kind = modal ? (modal.getAttribute('data-yggterm-modal-open') || '') : '';
+    var menu = document.querySelector('[data-yggterm-menu-open]') ? '1' : '';
+    return seq + '|' + kind + '|' + menu + '|' + document.querySelectorAll(KT_SEL).length;
+  };
+  window.__yggtermKeytipModalKind = function(){
+    var modal = document.querySelector('[data-yggterm-modal-open]');
+    return modal ? (modal.getAttribute('data-yggterm-modal-open') || '') : '';
+  };
   window.__yggtermKeytipWalk = function(mode){
     function visibleInteractable(el){
       if (el.disabled) { return false; }
@@ -39151,6 +39306,15 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
       var kind = marker.getAttribute('data-yggterm-modal-open') || '';
       var modalRoot = document.querySelector('[data-yggterm-modal-root="' + kind + '"]');
       if (modalRoot) { root = modalRoot; scope = 'modal:' + kind; }
+    } else {
+      // A floating MENU is a container too (§4): while one is up the layer is
+      // showing that menu's level, so deriving letters for the chrome BEHIND it
+      // would badge things the open scope does not contain. Its own items are
+      // DECLARED, so confining derivation here costs the menu nothing. Last
+      // mounted wins, the same rule `ShellMenu` documents for what paints on
+      // top.
+      var menus = document.querySelectorAll('[data-yggterm-menu-surface]');
+      if (menus.length) { root = menus[menus.length - 1]; scope = 'menu'; }
     }
     var all = Array.prototype.slice.call(root.querySelectorAll(KT_SEL)).filter(visibleInteractable);
     if (mode === 'derive') {
@@ -39167,8 +39331,8 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
       return { scope: scope, derive: derive };
     }
     // Audit mode: the SAME classification, counted instead of skipped.
-    var reachableDeclared = 0, reachableDerived = 0;
-    var excusedEntries = [], derivedEntries = [], orphans = [];
+    var reachableDeclared = 0, reachableDerived = 0, derivedStamped = 0;
+    var excusedEntries = [], derivedEntries = [], orphans = [], unbadged = [];
     all.forEach(function(el){
       if (el.hasAttribute('data-keytip-node')) { reachableDeclared++; return; }
       if (el.querySelector('[data-keytip-node]')) { reachableDeclared++; return; }
@@ -39179,6 +39343,19 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
       }
       reachableDerived++;
       derivedEntries.push({ scope: scope, label: labelOf(el) });
+      // …and "would be derived" is not "has a letter". While the layer is UP the
+      // stamps are on the DOM, so the audit can check the ladder's actual
+      // output: an element the walk collected that carries no tip is NOT
+      // reachable, whatever the derived count says. Before two-letter tips
+      // existed this was the silent failure mode — a 283-row start page
+      // reported 1,135 "reachable derived" while the ladder could only address
+      // 443 of them. Zero stamps at all (layer closed) means nothing to judge.
+      if (el.hasAttribute('data-keytip-derived-id')) {
+        derivedStamped++;
+        if (!(el.getAttribute('data-keytip-tip') || '').trim()) {
+          unbadged.push({ scope: scope, label: labelOf(el) });
+        }
+      }
     });
     // The subtree-exemption police (§12.1: forbidden outright). A stamp on a
     // NON-interactable container that holds interactables is a hiding place;
@@ -39202,7 +39379,12 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
       orphan_count: orphans.length,
       orphans: orphans.slice(0, 300),
       subtree_exempt_stamps: subtreeExemptStamps.slice(0, 300),
-      violations: orphans.length + subtreeExemptStamps.length,
+      // `derived_stamped` says how much of this report the layer was actually
+      // asked about (0 = the layer is closed, so `unbadged` judges nothing).
+      derived_stamped: derivedStamped,
+      unbadged_count: unbadged.length,
+      unbadged: unbadged.slice(0, 300),
+      violations: orphans.length + subtreeExemptStamps.length + unbadged.length,
       derived: derivedEntries.slice(0, 300)
     };
   };
@@ -39413,29 +39595,40 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     var cont = document.getElementById(KT_CONT);
     if (cont){ Array.prototype.slice.call(cont.children).forEach(function(ch){ if (!live[ch.id]){ ch.remove(); } }); }
   }
-  // §12.2 at the overlay boundary: on the overlay's OPEN edge run the ONE
-  // interactable walk (window.__yggtermKeytipWalk) in derive mode and post the
-  // collected {id,label} list to the one Rust terminus — Rust assigns letters
-  // through the one ladder and stamps data-keytip-tip back, which the painter
-  // above then paints with zero new render code. Re-runs on EVERY open
-  // (dynamic UIs; the walk removes stale stamps before restamping). On the
-  // CLOSE edge the derived stamps go with the overlay — the Rust map's half of
-  // that clear lives in clear_alt_overlay, same edge, each owner its own half.
+  // §12.2 at the overlay boundary: whenever the visible surface CHANGES while
+  // the layer is up, run the ONE interactable walk (window.__yggtermKeytipWalk)
+  // in derive mode and post the collected {scope, derive:[{id,label}]} to the
+  // one Rust terminus — Rust assigns letters through the one ladder and stamps
+  // data-keytip-tip back, which the painter above then paints with zero new
+  // render code. The change signal is __yggtermKeytipSignature (chord level,
+  // modal kind, menu, interactable count): an open edge changes it, and so does
+  // a chord that DESCENDS into a panel, a menu, or a dialog — which is what
+  // makes a chord-opened modal's buttons carry letters. On the CLOSE edge the
+  // derived stamps go with the overlay; the Rust map's half of that clear lives
+  // in clear_alt_overlay, same edge, each owner its own half.
   var ktLastOverlayOpen = false;
-  function ktDeriveEdge(){
+  var ktLastSignature = '';
+  function ktSurfaceTick(){
     var open = overlayOpen();
-    if (open && !ktLastOverlayOpen && window.__yggtermKeytipWalk) {
-      try {
-        var report = window.__yggtermKeytipWalk('derive');
-        if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ derive: report.derive }); }
-      } catch (_e) {}
+    if (open && window.__yggtermKeytipWalk) {
+      var signature = window.__yggtermKeytipSignature ? window.__yggtermKeytipSignature() : '';
+      if (signature !== ktLastSignature) {
+        ktLastSignature = signature;
+        try {
+          var report = window.__yggtermKeytipWalk('derive');
+          if (window.__yggtermAltTapSend) {
+            window.__yggtermAltTapSend({ derive: report.derive, scope: report.scope });
+          }
+        } catch (_e) {}
+      }
     }
     if (!open && ktLastOverlayOpen && window.__yggtermKeytipClearDerived) {
       try { window.__yggtermKeytipClearDerived(); } catch (_e) {}
     }
+    if (!open) { ktLastSignature = ''; }
     ktLastOverlayOpen = open;
   }
-  window.setInterval(function(){ ktDeriveEdge(); ktPaint(); }, 90);
+  window.setInterval(function(){ ktSurfaceTick(); ktPaint(); }, 90);
 })();"#;
 /// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
 /// generated from the EFFECTIVE accelerators (shipping defaults + the user's
@@ -39548,6 +39741,14 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
     // carry no declaration and no per-element exemption. Assign them letters
     // through the ONE ladder and stamp the letters back for the §9 painter.
     if let Some(derive) = msg.get("derive").and_then(|value| value.as_array()) {
+        // The scope the walk actually confined itself to (`"root"` or
+        // `"modal:<kind>"`). It is the SAME walk that produced these elements,
+        // so letters and scope can never describe two different surfaces.
+        let scope = msg
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .unwrap_or("root")
+            .to_string();
         let elements: Vec<(String, String)> = derive
             .iter()
             .filter_map(|entry| {
@@ -39567,12 +39768,29 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                 Some((id.to_string(), label.to_string()))
             })
             .collect();
-        apply_derived_keytips(state, &elements);
+        apply_derived_keytips(state, &scope, &elements);
         return;
     }
     let Some(key) = msg.get("key").and_then(|value| value.as_str()) else {
         return;
     };
+    // §12.3 with the layer UP: inside a modal scope the dialog keys belong to
+    // the dialog, not to the chord walker — the same three keys, the same one
+    // dispatcher as the overlay-closed path, so a modal answers Enter/Escape
+    // identically whether the badges are showing or not. The layer closes with
+    // the dialog and only with it (Fido2 deliberately swallows Enter, and a
+    // swallowed key must not take the badges down with it).
+    if state.read().alt_overlay_modal_scope.is_some()
+        && matches!(key, "Escape" | "Enter" | "Backspace")
+    {
+        modal_key_dispatch(state, key);
+        state.with_mut(|shell| {
+            if shell.top_modal().is_none() {
+                shell.clear_alt_overlay();
+            }
+        });
+        return;
+    }
     match key {
         // Esc backs all the way out: the overlay AND whatever container it opened.
         // Leaving a keyboard-opened row menu on screen after Esc would strand a
@@ -39631,7 +39849,37 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
 /// ladder — and the stamps are `data-keytip-tip`, which the EXISTING §9 painter
 /// paints with zero new render code. The map is stored on [`ShellState`] and
 /// dies with the overlay.
-fn apply_derived_keytips(mut state: Signal<ShellState>, elements: &[(String, String)]) {
+fn apply_derived_keytips(
+    mut state: Signal<ShellState>,
+    scope: &str,
+    elements: &[(String, String)],
+) {
+    // The walk is the observer of which surface is on top, so its scope is what
+    // reconciles the layer: a dialog that appeared while the overlay was up puts
+    // the layer INSIDE it, and a dialog that has gone takes the layer with it
+    // (the container the scope named is no longer there to act on).
+    let modal_kind = scope.strip_prefix("modal:").map(|kind| kind.to_string());
+    let closed = state.with_mut(|shell| {
+        if !shell.alt_overlay_active {
+            return false;
+        }
+        if shell.alt_overlay_modal_scope.is_some() && modal_kind.is_none() {
+            shell.clear_alt_overlay();
+            return true;
+        }
+        if modal_kind.is_some() && shell.alt_overlay_modal_scope != modal_kind {
+            // Entering (or switching) a modal resets the chord: the letters
+            // about to be assigned are the dialog's, not the old surface's.
+            shell.alt_overlay_sequence.clear();
+            shell.alt_derived_sequence.clear();
+            shell.alt_jump_path = None;
+            shell.alt_overlay_modal_scope = modal_kind.clone();
+        }
+        false
+    });
+    if closed {
+        return;
+    }
     let assignments = {
         let shell = state.read();
         // The overlay closed before the walk answered — a stale report must not
@@ -39639,13 +39887,26 @@ fn apply_derived_keytips(mut state: Signal<ShellState>, elements: &[(String, Str
         if !shell.alt_overlay_active {
             return;
         }
-        let tree = shell.snapshot().keytip_tree;
-        derive_keytips_for_elements(&tree, &shell.alt_overlay_sequence, elements)
+        // Which letters the REGISTRY already owns on this surface, so derivation
+        // can never shadow a declared one (§6). Inside a modal the registry owns
+        // nothing at all: the dialog is isolated, so its whole alphabet is free.
+        let claimed = if shell.alt_overlay_modal_scope.is_some() {
+            Vec::new()
+        } else {
+            match shell.snapshot().keytip_tree.tips_at(&shell.alt_overlay_sequence) {
+                Some(tips) => tips,
+                // Not a resolvable scope: derive nothing rather than guess an
+                // exclusion set.
+                None => return,
+            }
+        };
+        derive_keytips_for_elements(&claimed, elements)
     };
     state.with_mut(|shell| {
         // Replace wholesale: the report is the complete derivation for THIS
-        // open; merging with a previous open's map could dispatch a dead stamp.
+        // surface; merging with a previous one could dispatch a dead stamp.
         shell.alt_derived_tips.clear();
+        shell.alt_derived_sequence.clear();
         for (id, tip) in &assignments {
             shell.alt_derived_tips.insert(tip.clone(), id.clone());
         }
@@ -39667,25 +39928,20 @@ fn apply_derived_keytips(mut state: Signal<ShellState>, elements: &[(String, Str
 }
 /// Derived (snapshot-time) letter assignment — §12.2 achieved at the overlay
 /// boundary. ONE assigner: a phantom head re-claims every letter the registry
-/// already owns in the scope the overlay is showing (declared beats derived,
+/// already owns on the surface being shown (`claimed`; declared beats derived,
 /// §6), then the walk's elements ladder through the same [`keytip::assign_scope`]
-/// as every declaration — title letter, then a–z, then digits (§5). Pure and
-/// deterministic: elements arrive in document order and the ladder is pure, so
-/// the same DOM always yields the same letters.
+/// as every declaration — title letter, then a–z, then digits, then a two-letter
+/// tip when the surface is crowded (§5). Pure and deterministic: elements arrive
+/// in document order and the ladder is pure, so the same DOM always yields the
+/// same letters.
 fn derive_keytips_for_elements(
-    tree: &KeyTipTree,
-    sequence: &str,
+    claimed: &[String],
     elements: &[(String, String)],
 ) -> Vec<(String, String)> {
-    // An invalid prefix means the overlay is not showing a resolvable scope;
-    // derive nothing rather than guess an exclusion set.
-    let Some(scope_tips) = tree.tips_at(sequence) else {
-        return Vec::new();
-    };
     // Exclude the FIRST char of every claimed tip: a bare letter, a group
-    // letter, and a future two-letter tip's prefix all make that char
-    // unavailable to derivation.
-    let mut taken: Vec<char> = scope_tips
+    // letter, and a two-letter tip's prefix all make that char unavailable to
+    // derivation.
+    let mut taken: Vec<char> = claimed
         .iter()
         .filter_map(|tip| tip.chars().next())
         .collect();
@@ -39727,10 +39983,11 @@ fn derive_keytips_for_elements(
             let Some(id) = key.strip_prefix("derived:") else {
                 continue;
             };
-            // Once singles are exhausted the ladder's last resort can repeat a
-            // letter, and a repeated letter cannot dispatch unambiguously: the
-            // first claimant (document order) keeps it, the rest go unbadged.
-            // (§5 step 7 — two-letter tips — is not implemented anywhere yet.)
+            // A crowded surface now overflows into two-letter tips (§5 step 7),
+            // so the ladder no longer repeats itself — but a tip that somehow
+            // arrived twice still cannot dispatch unambiguously, so the first
+            // claimant (document order) keeps it and the duplicate is dropped
+            // rather than badged with a letter that would fire the other one.
             if !used.insert(tip.clone()) {
                 continue;
             }
@@ -39738,18 +39995,6 @@ fn derive_keytips_for_elements(
         }
     }
     out
-}
-/// The dispatch seam for a chord letter the REGISTRY tree does not know
-/// (§12.2): the letter is answered by the derived map — the overlay-open
-/// snapshot assignment — or by nobody. Registry resolution always ran first
-/// (this is only consulted on [`ChordResolution::Invalid`]), so a declared
-/// letter can never be shadowed by a derived one. Pure, so the lock drives it
-/// with a fake map.
-fn resolve_registry_miss(
-    derived: &std::collections::BTreeMap<String, String>,
-    ch: char,
-) -> Option<String> {
-    derived.get(ch.to_ascii_lowercase().to_string().as_str()).cloned()
 }
 /// `~/.yggterm/keymap.json` — the directly-editable ALT+ keymap override file.
 fn keymap_config_path() -> Option<std::path::PathBuf> {
@@ -40013,10 +40258,20 @@ fn keytip_node_id(node_key: &str) -> String {
 fn keytip_tip_attr(snapshot: &RenderSnapshot, node_key: &str) -> String {
     keytip_tip_for(
         &snapshot.keytip_tree,
-        snapshot.alt_overlay_active,
+        keytip_declared_badges_active(snapshot),
         &snapshot.alt_overlay_sequence,
         node_key,
     )
+}
+/// Whether DECLARED (registry) badges may paint at all this frame.
+///
+/// The layer being up is not enough: inside a modal scope (§4) the registry is
+/// out of the walk entirely, so a badge on the chrome behind the dialog would
+/// advertise a key that does nothing — the exact species of lie this layer
+/// exists to end. Caught on the first live pixel of the modal scope: the
+/// KeyTips editor was fully badged and the titlebar was ALSO wearing B/V/T/I.
+fn keytip_declared_badges_active(snapshot: &RenderSnapshot) -> bool {
+    snapshot.alt_overlay_active && snapshot.alt_overlay_modal_scope.is_none()
 }
 /// The tip lookup itself, over the raw tree — so a component that holds the tree
 /// without the whole snapshot (the row menu) badges from the same SSOT.
@@ -40186,6 +40441,21 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     if !state.read().alt_overlay_active {
         return;
     }
+    // Two cases where the REGISTRY is out of the walk entirely:
+    //
+    // - a modal scope (§4): the dialog owns the screen, so a letter must never
+    //   reach the chrome behind it — its letters are its own derivation;
+    // - a derived two-letter tip in flight (§5 step 7): the second key belongs
+    //   to the prefix that is waiting, never to a registry letter that happens
+    //   to share it.
+    let derived_only = {
+        let shell = state.read();
+        shell.alt_overlay_modal_scope.is_some() || !shell.alt_derived_sequence.is_empty()
+    };
+    if derived_only {
+        feed_alt_derived_char(state, ch);
+        return;
+    }
     let (next_sequence, resolution) = {
         let shell = state.read();
         let next = format!("{}{}", shell.alt_overlay_sequence, ch.to_ascii_lowercase());
@@ -40210,24 +40480,71 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
                 shell.alt_overlay_sequence = next_sequence;
             });
         }
-        ChordResolution::Run(key) => dispatch_keytip_node(state, &key),
-        ChordResolution::Invalid => {
-            // §12.2: a letter the registry tree does not know may still be a
-            // DERIVED tip — the snapshot assignment made when this overlay
-            // opened. Registry resolution ran first (it produced the Invalid),
-            // so a declared letter is never shadowed. A letter matching neither
-            // dismisses exactly as before.
-            let derived_target = resolve_registry_miss(&state.read().alt_derived_tips, ch);
+        ChordResolution::Run(key) => {
+            dispatch_keytip_node(state, &key);
+            follow_chord_into_modal(state);
+        }
+        // §12.2: a letter the registry tree does not know may still be a DERIVED
+        // tip — the assignment the walk made for the surface on screen. Registry
+        // resolution ran first (it produced the Invalid), so a declared letter is
+        // never shadowed.
+        ChordResolution::Invalid => feed_alt_derived_char(state, ch),
+    }
+}
+/// §4/§12.3 — a chord that opened a DIALOG opened a container, so the layer
+/// follows the keyboard into it instead of ending at the mouse. This is the
+/// user's `ALT,E,X` report: the dialog appeared with no letters on its buttons
+/// because dispatch is act-and-DISMISS and the layer went down with it.
+///
+/// Synchronous, at the one chord terminus, deliberately: every dialog a chord
+/// can raise is raised inside its dispatch (`open_context_menu_delete_for_row`,
+/// `copy_edit_dialog`, …), so the shell KNOWS on the same tick and nothing has
+/// to watch the DOM for a dialog to appear. `!alt_overlay_active` is the guard
+/// that keeps this to act-and-dismiss nodes — a node that DESCENDS parks the
+/// layer itself and must not be re-parked here. Accelerators (§11) deliberately
+/// do not call this: a flat chord is not a chord walk, and raising badges after
+/// `Ctrl+Shift+X` would be a surprise.
+fn follow_chord_into_modal(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        if shell.alt_overlay_active {
+            return;
+        }
+        if let Some(kind) = shell.top_modal().map(|modal| modal.kind()) {
+            shell.descend_alt_overlay_into_modal(kind);
+        }
+    });
+}
+/// One key against the DERIVED map (§12.2), which is where a modal's letters and
+/// a crowded surface's overflow live. Mirrors the registry walk one level down:
+/// a tip fires, a two-letter tip's first key waits (§5 step 7), anything else
+/// dismisses the layer exactly as an unknown letter always has.
+fn feed_alt_derived_char(mut state: Signal<ShellState>, ch: char) {
+    let (next, resolution) = {
+        let shell = state.read();
+        let next = format!(
+            "{}{}",
+            shell.alt_derived_sequence,
+            ch.to_ascii_lowercase()
+        );
+        let resolution = keytip::resolve_derived(&shell.alt_derived_tips, &next);
+        (next, resolution)
+    };
+    match resolution {
+        keytip::DerivedResolution::Pending => {
+            state.with_mut(|shell| shell.alt_derived_sequence = next);
+        }
+        keytip::DerivedResolution::Hit(id) => {
             state.with_mut(|shell| shell.clear_alt_overlay());
-            if let Some(id) = derived_target {
-                // The id shape was enforced at the bridge terminus (`d<N>`), so
-                // the selector is literal. Focus-then-click: click activates a
-                // button, focus is the useful half for an input/select.
-                let _ = document::eval(&format!(
-                    "var el = document.querySelector('[data-keytip-derived-id=\"{id}\"]'); \
-                     if (el) {{ if (el.focus) {{ el.focus(); }} el.click(); }}"
-                ));
-            }
+            // The id shape was enforced at the bridge terminus (`d<N>`), so the
+            // selector is literal. Focus-then-click: click activates a button,
+            // focus is the useful half for an input/select.
+            let _ = document::eval(&format!(
+                "var el = document.querySelector('[data-keytip-derived-id=\"{id}\"]'); \
+                 if (el) {{ if (el.focus) {{ el.focus(); }} el.click(); }}"
+            ));
+        }
+        keytip::DerivedResolution::Miss => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
         }
     }
 }
@@ -47180,6 +47497,12 @@ fn describe_app_state_snapshot(
             "search_focused": shell.search_focused,
             "alt_overlay_active": shell.alt_overlay_active,
             "alt_overlay_sequence": shell.alt_overlay_sequence,
+            // §4/§12.2, for the agent probe: which dialog owns the layer, the
+            // derived chord half-typed (a two-letter tip's first key), and how
+            // many derived letters the surface currently carries.
+            "alt_overlay_modal_scope": shell.alt_overlay_modal_scope,
+            "alt_derived_sequence": shell.alt_derived_sequence,
+            "alt_derived_tips": shell.alt_derived_tips,
             "selected_tree_paths": selected_tree_paths,
             "selection_anchor": shell.selection_anchor,
             "pending_delete": pending_delete_debug,
@@ -66927,6 +67250,10 @@ async fn process_pending_app_control_requests(
                     "command": "set_keytips_overlay",
                     "open": open,
                     "alt_overlay_active": state.read().alt_overlay_active,
+                    // Which scope the layer landed in: a dialog on screen IS the
+                    // scope (§4), so an agent can see that its badges belong to
+                    // the modal and not to the chrome behind it.
+                    "modal_scope": state.read().alt_overlay_modal_scope.clone(),
                 })),
                 error: None,
             }
@@ -73645,6 +73972,20 @@ fn app() -> Element {
             if snapshot.alt_overlay_active {
                 div {
                     "data-yggterm-keytip-breadcrumb": "1",
+                    // The chord LEVEL, for the bridge's surface signature: when
+                    // this changes the walk re-derives, which is what gives a
+                    // panel/menu/dialog the chord descended into its letters.
+                    // An attribute rather than the visible text because the text
+                    // also carries jump mode's moving label.
+                    "data-yggterm-keytip-sequence": format!(
+                        "{}{}",
+                        snapshot
+                            .alt_overlay_modal_scope
+                            .clone()
+                            .map(|kind| format!("modal:{kind}/"))
+                            .unwrap_or_default(),
+                        snapshot.alt_overlay_sequence,
+                    ),
                     // Sits INSIDE the titlebar's search field, vertically centred in
                     // it — at top:8px the pill hung off the titlebar's bottom border.
                     // The field's box is 3..29 and the pill is 22 tall, so 5 centres it.
@@ -73657,6 +73998,13 @@ fn app() -> Element {
                         snapshot.palette.accent,
                     ),
                     span { "⌨ ALT" }
+                    // A modal scope has no chord letters of its own — the trail
+                    // names the dialog instead, so the breadcrumb never reads as
+                    // a bare leader while a dialog owns the keys (§4).
+                    if let Some(label) = snapshot.alt_overlay_modal_label.clone() {
+                        span { style: "opacity:0.55;", "›" }
+                        span { "{label}" }
+                    }
                     if !snapshot.alt_overlay_sequence.is_empty() {
                         span { style: "opacity:0.55;", "›" }
                         span { "{snapshot.alt_overlay_sequence.to_uppercase()}" }
@@ -73704,6 +74052,8 @@ fn app() -> Element {
                     rsx! {
                         div {
                             "data-keytips-editor-modal": "1",
+                            // §4 walk root — see the delete overlay's stamp.
+                            "data-yggterm-modal-root": "keymap-editor",
                             style: "position:absolute; inset:0; z-index:500; display:flex; align-items:center; \
                                     justify-content:center; background:rgba(6,10,14,0.5); backdrop-filter:blur(2px);",
                             onclick: move |_| state.with_mut(|shell| shell.close_keymap_editor()),
@@ -74782,7 +75132,10 @@ fn app() -> Element {
                         items: snapshot.row_menu_items.clone(),
                         menu_title: snapshot.row_menu_title.clone(),
                         keytip_tree: snapshot.keytip_tree.clone(),
-                        alt_overlay_active: snapshot.alt_overlay_active,
+                        // The row menu's DECLARED badges obey the same rule as
+                        // every other declared badge: silent while a dialog owns
+                        // the layer (`keytip_declared_badges_active`).
+                        alt_overlay_active: keytip_declared_badges_active(&snapshot),
                         alt_overlay_sequence: snapshot.alt_overlay_sequence.clone(),
                         modal_root: None,
                         on_close: move |_| {
@@ -74897,13 +75250,10 @@ fn app() -> Element {
                 // never disagree about which dialog is on top.
                 if let Some(top_modal) = render_top_modal(&snapshot) {
                     div {
-                        "data-yggterm-modal-open": match top_modal {
-                            TopModal::Fido2 => "fido2",
-                            TopModal::Delete => "delete",
-                            TopModal::CopyEdit => "copy-edit",
-                            TopModal::ClassicTabsSwitch => "classic-tabs-switch",
-                            TopModal::StripDropdown => "strip-dropdown",
-                        },
+                        // ONE kind table ([`TopModal::kind`]), shared with the
+                        // `data-yggterm-modal-root` subtree stamps and the ALT
+                        // layer's modal scope.
+                        "data-yggterm-modal-open": top_modal.kind(),
                         "data-keytip-exempt": "modal-marker",
                         style: "display:none;",
                     }
@@ -109568,6 +109918,16 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             rsx! {
                                 div {
                                     "data-yggterm-start-page-recent-session": "1",
+                                    // §8 — lists are navigated, not badged. Each
+                                    // card carries four affordances, and this list
+                                    // is as long as the user's history: measured on
+                                    // a 283-row start page the ALT layer derived
+                                    // 1,135 badges in ONE scope, more than the
+                                    // alphabet can even address. So the four are
+                                    // per-element exempt with the `list-item`
+                                    // reason (the row menu and the cwd tree reach
+                                    // the same actions), and the layer badges the
+                                    // NAMED chrome above them.
                                     "data-session-path": "{row.full_path}",
                                     style: format!(
                                         "display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:center; width:100%; text-align:left; \
@@ -109598,6 +109958,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                             button {
                                                 r#type: "button",
                                                 "data-yggterm-start-action": "rename-recent",
+                                                "data-keytip-exempt": "list-item",
                                                 title: "Rename title",
                                                 style: "{card_icon_button_style}",
                                                 onmousedown: |evt| {
@@ -109642,6 +110003,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         button {
                                             r#type: "button",
                                             "data-yggterm-start-action": "open-recent",
+                                            "data-keytip-exempt": "list-item",
                                             style: "{open_button_style}",
                                             onclick: move |_| spawn_open_session_row(state, row_for_click.clone()),
                                             "{open_button_label}"
@@ -109649,6 +110011,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         button {
                                             r#type: "button",
                                             "data-yggterm-start-action": "summary-recent",
+                                            "data-keytip-exempt": "list-item",
                                             title: "Edit summary",
                                             style: "{card_icon_button_style}",
                                             onmousedown: |evt| {
@@ -109665,6 +110028,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         button {
                                             r#type: "button",
                                             "data-yggterm-start-action": "delete-recent",
+                                            "data-keytip-exempt": "list-item",
                                             title: "Delete session",
                                             style: "{card_delete_button_style}",
                                             onmousedown: |evt| {
@@ -116042,6 +116406,8 @@ fn ThemeEditorOverlay(
     rsx! {
         div {
             "data-theme-editor-overlay": "1",
+            // §4 walk root — see the delete overlay's stamp.
+            "data-yggterm-modal-root": "theme-editor",
             style: format!(
                 "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:{};",
                 overlay_wash
@@ -127769,40 +128135,54 @@ mod tests {
     // ONE precedence list decides both "is a modal up" and "who gets the Enter".
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
-        assert_eq!(top_modal_of(false, false, false, false, false), None);
+        assert_eq!(top_modal_of(false, false, false, false, false, false, false), None);
+        // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false),
+            Some(TopModal::KeymapEditor)
+        );
+        assert_eq!(
+            top_modal_of(false, true, false, false, false, false, false),
+            Some(TopModal::ThemeEditor)
+        );
+        assert_eq!(
+            top_modal_of(false, false, true, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false),
+            top_modal_of(false, false, false, true, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, true, false, false),
+            top_modal_of(false, false, false, false, true, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, true, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
-        // Stacked: the topmost-rendered dialog wins the keyboard.
+        // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
+        // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, true, true),
+            top_modal_of(true, true, true, true, true, true, true),
+            Some(TopModal::KeymapEditor)
+        );
+        assert_eq!(
+            top_modal_of(false, false, true, true, true, true, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, true, true, true, true),
+            top_modal_of(false, false, false, true, true, true, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, true, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -127883,6 +128263,22 @@ mod tests {
                         anchor: WebProfileSwitcherAnchor::Strip,
                         position: (820.0, 90.0),
                     });
+                }),
+            ),
+            // The two full-window EDITORS. They joined `top_modal` so the ALT
+            // layer could operate them (§4 — a dialog is a scope), and the two
+            // lists answer the same question, so they have to be here as well:
+            // over a legacy web surface an unstashed editor is invisible.
+            (
+                "keymap_editor_open",
+                Box::new(|shell: &mut ShellState| {
+                    shell.open_keymap_editor();
+                }),
+            ),
+            (
+                "theme_editor_open",
+                Box::new(|shell: &mut ShellState| {
+                    shell.set_theme_editor_open(true);
                 }),
             ),
         ];
@@ -154122,6 +154518,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -154776,6 +155174,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -154965,6 +155365,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -155154,6 +155556,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -155346,6 +155750,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -155542,6 +155948,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -155730,6 +156138,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -155918,6 +156328,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -156140,6 +156552,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -156331,6 +156745,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -156554,6 +156970,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -156954,6 +157372,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_overlay_modal_scope: None,
+            alt_overlay_modal_label: None,
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
@@ -166803,11 +167223,15 @@ mod menu_dismissal_locks {
         let product = product_source();
         let marker = product
             .iter()
-            .position(|line| line.contains("\"data-yggterm-modal-open\": match top_modal {"))
+            .position(|line| line.contains("\"data-yggterm-modal-open\": top_modal.kind(),"))
             .expect("the modal marker moved — move this lock with it");
-        assert_eq!(
-            product[marker - 2].trim(),
-            "if let Some(top_modal) = render_top_modal(&snapshot) {",
+        // The gate sits just above the marker; the exact offset moves with the
+        // comment block between them, so look in the handful of lines above it
+        // rather than pinning a number that a doc edit would break.
+        assert!(
+            product[marker.saturating_sub(8)..marker]
+                .iter()
+                .any(|line| line.trim() == "if let Some(top_modal) = render_top_modal(&snapshot) {"),
             "the modal marker must be gated on the render-side precedence too"
         );
     }
@@ -167058,6 +167482,10 @@ mod keytips_inversion_locks {
             "excused:",
             "orphan_count:",
             "subtree_exempt_stamps:",
+            // "would be derived" is not "has a letter": an element the walk
+            // collected but the ladder never lettered is a violation, and
+            // counting it is what made the old over-report visible.
+            "unbadged_count:",
             "violations:",
         ] {
             assert!(
@@ -167098,8 +167526,9 @@ mod keytips_inversion_locks {
             ("d1".to_string(), "Clear All".to_string()),
             ("d2".to_string(), "Clear session".to_string()),
         ];
-        let first = derive_keytips_for_elements(&tree, "", &elements);
-        let second = derive_keytips_for_elements(&tree, "", &elements);
+        let root_claimed = tree.tips_at("").expect("root resolves");
+        let first = derive_keytips_for_elements(&root_claimed, &elements);
+        let second = derive_keytips_for_elements(&root_claimed, &elements);
         assert_eq!(first, second, "invariant 1: same input, same letters");
         assert_eq!(first.len(), 3, "every element gets a letter while the pool lasts");
         let mut seen = std::collections::BTreeSet::new();
@@ -167117,14 +167546,13 @@ mod keytips_inversion_locks {
         assert_eq!(first[0].0, "d0");
         assert_eq!(first[0].1, "r", "Brightness: b taken -> next title letter r");
         // Same-title collision inside the derivation, isolated from the live
-        // registry: an empty root scope, two identical labels — the second
+        // registry: no claimed letters, two identical labels — the second
         // claimant ladders past the first's letter instead of colliding.
-        let empty = KeyTipTree::build(&[(KtScope::Root, vec![])], &KeymapConfig::default());
         let twins = vec![
             ("d0".to_string(), "Alpha".to_string()),
             ("d1".to_string(), "Alpha".to_string()),
         ];
-        let assigned = derive_keytips_for_elements(&empty, "", &twins);
+        let assigned = derive_keytips_for_elements(&[], &twins);
         assert_eq!(
             assigned,
             vec![
@@ -167133,8 +167561,49 @@ mod keytips_inversion_locks {
             ],
             "two Alphas: first takes 'a', second falls to the next title letter"
         );
-        // An invalid prefix derives nothing rather than guessing a scope.
-        assert!(derive_keytips_for_elements(&tree, "zz", &elements).is_empty());
+        // An unresolvable chord prefix derives nothing rather than guessing a
+        // scope — the claimed set has ONE owner (`apply_derived_keytips`) and it
+        // refuses when the tree cannot answer.
+        assert!(tree.tips_at("zz").is_none(), "fixture sanity: 'zz' is not a path");
+        let apply = function_body(&product_source(), "fn apply_derived_keytips(");
+        assert!(
+            apply.contains("tips_at(&shell.alt_overlay_sequence)") && apply.contains("None => return"),
+            "an unresolvable scope must derive nothing rather than guess:\n{apply}"
+        );
+    }
+
+    /// LOCK 2b — a CROWDED surface stays fully reachable (§5 step 7). More
+    /// elements than there are letters used to leave the surplus unbadged: the
+    /// ladder repeated a letter and the duplicate was dropped. Now the overflow
+    /// rides two-letter tips, and every element still gets its own.
+    #[test]
+    fn a_crowded_surface_overflows_into_two_letter_tips_and_badges_everything() {
+        let elements: Vec<(String, String)> = (0..40)
+            .map(|index| (format!("d{index}"), format!("Element {index}")))
+            .collect();
+        let assigned = derive_keytips_for_elements(&[], &elements);
+        assert_eq!(
+            assigned.len(),
+            elements.len(),
+            "every element on a crowded surface is badged"
+        );
+        let tips: std::collections::BTreeSet<String> =
+            assigned.iter().map(|(_, tip)| tip.clone()).collect();
+        assert_eq!(tips.len(), assigned.len(), "no two elements share a tip");
+        assert!(
+            tips.iter().any(|tip| tip.chars().count() == 2),
+            "the surplus is carried by two-letter tips, not dropped"
+        );
+        // And the walk can still reach them: a pair's prefix is not itself a tip.
+        let singles: std::collections::BTreeSet<&String> =
+            tips.iter().filter(|tip| tip.chars().count() == 1).collect();
+        for pair in tips.iter().filter(|tip| tip.chars().count() == 2) {
+            let prefix = pair.chars().next().unwrap().to_string();
+            assert!(
+                !singles.contains(&prefix),
+                "pair `{pair}` is unreachable — `{prefix}` is also a single tip"
+            );
+        }
     }
 
     /// LOCK 3 — chord dispatch: a letter the registry tree does not know is
@@ -167146,26 +167615,45 @@ mod keytips_inversion_locks {
     fn a_registry_miss_resolves_against_the_derived_map() {
         let mut derived = std::collections::BTreeMap::new();
         derived.insert("r".to_string(), "d0".to_string());
-        assert_eq!(resolve_registry_miss(&derived, 'r').as_deref(), Some("d0"));
+        derived.insert("za".to_string(), "d1".to_string());
         assert_eq!(
-            resolve_registry_miss(&derived, 'R').as_deref(),
-            Some("d0"),
+            keytip::resolve_derived(&derived, "r"),
+            keytip::DerivedResolution::Hit("d0".into())
+        );
+        assert_eq!(
+            keytip::resolve_derived(&derived, "R"),
+            keytip::DerivedResolution::Hit("d0".into()),
             "chord letters are case-folded"
         );
         assert_eq!(
-            resolve_registry_miss(&derived, 'z'),
-            None,
+            keytip::resolve_derived(&derived, "q"),
+            keytip::DerivedResolution::Miss,
             "a letter matching neither registry nor derived stays a plain miss"
+        );
+        assert_eq!(
+            keytip::resolve_derived(&derived, "z"),
+            keytip::DerivedResolution::Pending,
+            "a two-letter tip's prefix keeps the layer up (§5 step 7)"
         );
         let product = product_source();
         let body = function_body(&product, "fn feed_alt_overlay_char(");
         assert!(
-            body.contains("resolve_registry_miss("),
+            body.contains("feed_alt_derived_char(state, ch)"),
             "the Invalid arm must consult the derived map:\n{body}"
         );
+        let derived_arm = function_body(&product, "fn feed_alt_derived_char(");
         assert!(
-            body.contains("data-keytip-derived-id") && body.contains("el.click();"),
-            "a derived hit must dispatch by the walk's own stamp:\n{body}"
+            derived_arm.contains("keytip::resolve_derived("),
+            "the derived walk is the ONE derived resolver:\n{derived_arm}"
+        );
+        assert!(
+            derived_arm.contains("data-keytip-derived-id") && derived_arm.contains("el.click();"),
+            "a derived hit must dispatch by the walk's own stamp:\n{derived_arm}"
+        );
+        assert!(
+            derived_arm.contains("DerivedResolution::Pending")
+                && derived_arm.contains("alt_derived_sequence = next"),
+            "a pending prefix must PARK, not dismiss:\n{derived_arm}"
         );
     }
 
@@ -167207,19 +167695,20 @@ mod keytips_inversion_locks {
     }
 
     /// LOCK 5 — the derive pass is wired end to end through ONE terminus: the
-    /// bridge walks on the OPEN edge and posts `{derive}`; the one bridge
-    /// dispatcher hands it to `apply_derived_keytips`; that derives through the
-    /// one assigner and stamps `data-keytip-tip`; the EXISTING §9 painter
-    /// paints derived stamps by anchoring to the element itself.
+    /// bridge walks whenever the SURFACE changes and posts `{derive, scope}`;
+    /// the one bridge dispatcher hands it to `apply_derived_keytips`; that
+    /// derives through the one assigner and stamps `data-keytip-tip`; the
+    /// EXISTING §9 painter paints derived stamps by anchoring to the element
+    /// itself.
     #[test]
     fn the_open_edge_derives_through_the_one_terminus_and_the_one_painter() {
         assert!(
             ALT_TAP_LISTENER_JS_TEMPLATE.contains("window.__yggtermKeytipWalk('derive')"),
-            "the open edge runs the one walk in derive mode"
+            "the surface tick runs the one walk in derive mode"
         );
         assert!(
             ALT_TAP_LISTENER_JS_TEMPLATE
-                .contains("window.__yggtermAltTapSend({ derive: report.derive });"),
+                .contains("window.__yggtermAltTapSend({ derive: report.derive, scope: report.scope });"),
             "the report rides the SAME sender as every other bridge message"
         );
         let product = product_source();
@@ -167229,8 +167718,8 @@ mod keytips_inversion_locks {
             "the one bridge terminus must handle the derive message:\n{bridge}"
         );
         assert!(
-            bridge.contains("apply_derived_keytips(state, &elements);"),
-            "…and hand it to the derivation applier:\n{bridge}"
+            bridge.contains("apply_derived_keytips(state, &scope, &elements);"),
+            "…and hand it to the derivation applier, scope included:\n{bridge}"
         );
         let apply = function_body(&product, "fn apply_derived_keytips(");
         assert!(
@@ -167240,9 +167729,8 @@ mod keytips_inversion_locks {
         );
         let seam = function_body(&product, "fn derive_keytips_for_elements(");
         assert!(
-            seam.contains("keytip::assign_scope(")
-                && seam.contains("tree.tips_at(sequence)"),
-            "the seam is the ONE assigner with the registry letters excluded:\n{seam}"
+            seam.contains("keytip::assign_scope(") && seam.contains("claimed"),
+            "the seam is the ONE assigner with the claimed letters excluded:\n{seam}"
         );
         // The painter's minimal extension: a derived stamp anchors to itself.
         assert!(
@@ -167265,12 +167753,16 @@ mod keytips_inversion_locks {
     #[test]
     fn every_modal_marker_kind_names_a_walk_root() {
         let product = product_source();
-        let marker_at = product
-            .iter()
-            .position(|line| line.contains("\"data-yggterm-modal-open\": match top_modal {"))
-            .expect("the modal marker renders from render_top_modal");
-        let marker_block = product[marker_at..marker_at + 8].join("\n");
+        let kind_table = function_body(&product, "fn kind(self) -> &'static str {");
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("\"data-yggterm-modal-open\": top_modal.kind(),")),
+            "the modal marker must read the ONE kind table, not spell kinds again"
+        );
         for kind in [
+            "keymap-editor",
+            "theme-editor",
             "fido2",
             "delete",
             "copy-edit",
@@ -167278,8 +167770,8 @@ mod keytips_inversion_locks {
             "strip-dropdown",
         ] {
             assert!(
-                marker_block.contains(&format!("\"{kind}\"")),
-                "the marker match must still name `{kind}` — if the vocabulary \
+                kind_table.contains(&format!("\"{kind}\"")),
+                "the kind table must still name `{kind}` — if the vocabulary \
                  changed, move the walk roots with it"
             );
             let attr = format!("\"data-yggterm-modal-root\": \"{kind}\"");
@@ -167292,6 +167784,167 @@ mod keytips_inversion_locks {
                  badged while it is the top modal (§4)"
             );
         }
+    }
+
+    /// LOCK 6b — §4/§12.3: the layer FOLLOWS the keyboard into a dialog a chord
+    /// opened, and the dialog's scope is ISOLATING. This is the user's reported
+    /// break: `ALT,E,X` opened the close-terminal dialog with no letters on its
+    /// buttons, because dispatch dismissed the layer and derivation only ever
+    /// ran on the overlay's open edge.
+    #[test]
+    fn a_chord_opened_modal_becomes_the_layers_scope() {
+        let product = product_source();
+        // The follow is SYNCHRONOUS at the chord terminus — no watcher, no tick
+        // edge, so it cannot depend on when a poll happened to run.
+        let feed_run = function_body(&product, "fn feed_alt_overlay_char(");
+        assert!(
+            feed_run.contains("dispatch_keytip_node(state, &key);")
+                && feed_run.contains("follow_chord_into_modal(state);"),
+            "a chord's Run arm must follow the dialog it opened:\n{feed_run}"
+        );
+        let follow = function_body(&product, "fn follow_chord_into_modal(");
+        assert!(
+            follow.contains("if shell.alt_overlay_active {")
+                && follow.contains("shell.top_modal()")
+                && follow.contains("descend_alt_overlay_into_modal(kind)"),
+            "the follow is: layer dismissed + a dialog now on top => descend into it:\n{follow}"
+        );
+        // An ACCELERATOR must not raise the layer — §11 is flat by design.
+        let bridge = function_body(&product, "fn keytip_apply_bridge_message(");
+        let accel_arm = bridge
+            .split("if let Some(accel) = msg.get(\"accel\")")
+            .nth(1)
+            .expect("the accelerator arm is in the one terminus");
+        assert!(
+            !accel_arm
+                .split("// §12.3")
+                .next()
+                .unwrap_or_default()
+                .contains("follow_chord_into_modal"),
+            "an accelerator must not raise KeyTips over the dialog it opens"
+        );
+        // Isolation: inside a modal the registry is out of the walk entirely, so
+        // a letter can never reach the chrome behind the dialog.
+        let feed = function_body(&product, "fn feed_alt_overlay_char(");
+        assert!(
+            feed.contains("alt_overlay_modal_scope.is_some()")
+                && feed.contains("feed_alt_derived_char(state, ch)"),
+            "a modal scope must resolve letters ONLY against its own derivation:\n{feed}"
+        );
+        // …and the derivation inside a modal excludes nothing, because the
+        // registry owns nothing there.
+        let apply = function_body(&product, "fn apply_derived_keytips(");
+        assert!(
+            apply.contains("if shell.alt_overlay_modal_scope.is_some() {"),
+            "inside a dialog the whole alphabet is free:\n{apply}"
+        );
+        // The dialog keys keep working while the badges are up (§12.3), through
+        // the SAME dispatcher the overlay-closed path uses.
+        assert!(
+            bridge.contains("modal_key_dispatch(state, key);"),
+            "Enter/Escape/Backspace in a modal scope go to the one dispatcher:\n{bridge}"
+        );
+        // State: entering a modal isolates, leaving it takes the layer down.
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://active");
+        let mut shell = ShellState::new(bootstrap);
+        shell.activate_alt_overlay();
+        assert_eq!(shell.alt_overlay_modal_scope, None, "no dialog, no modal scope");
+        shell.descend_alt_overlay_into_modal("delete");
+        assert!(shell.alt_overlay_active);
+        assert_eq!(shell.alt_overlay_modal_scope.as_deref(), Some("delete"));
+        assert!(
+            shell.alt_overlay_sequence.is_empty() && shell.alt_derived_tips.is_empty(),
+            "the dialog's letters are its own — the old surface's chord is gone"
+        );
+        shell.clear_alt_overlay();
+        assert_eq!(shell.alt_overlay_modal_scope, None);
+    }
+
+    /// LOCK 6e — §8 holds on the START PAGE too: an unbounded list's per-row
+    /// affordances are not badged. Measured before this stamp: a 283-row start
+    /// page derived 1,135 letters in one scope — more elements than the whole
+    /// tip space can address, so hundreds went unbadged anyway and the rest were
+    /// unreadable. The four card buttons are exempt per element, by name.
+    #[test]
+    fn the_start_pages_recent_list_is_navigated_not_badged() {
+        let product = product_source();
+        for action in [
+            "rename-recent",
+            "open-recent",
+            "summary-recent",
+            "delete-recent",
+        ] {
+            let at = product
+                .iter()
+                .position(|line| line.contains(&format!("\"data-yggterm-start-action\": \"{action}\"")))
+                .unwrap_or_else(|| panic!("the `{action}` card button moved — move this lock with it"));
+            assert!(
+                product[at + 1].contains("\"data-keytip-exempt\": \"list-item\""),
+                "`{action}` is a per-row affordance of an unbounded list (§8) and must \
+                 carry the list-item exemption, or the layer badges the whole history"
+            );
+        }
+    }
+
+    /// LOCK 6d — a badge never advertises a key that does nothing. Inside a
+    /// modal scope the registry is out of the walk, so DECLARED badges on the
+    /// chrome behind the dialog must not paint. Caught on the first live pixel:
+    /// the KeyTips editor was fully badged and the titlebar wore B/V/T/I too.
+    #[test]
+    fn declared_badges_go_silent_while_a_dialog_owns_the_layer() {
+        let product = product_source();
+        let owner = function_body(&product, "fn keytip_declared_badges_active(");
+        assert!(
+            owner.contains("snapshot.alt_overlay_active && snapshot.alt_overlay_modal_scope.is_none()"),
+            "declared badges paint only when the layer is up AND no dialog owns it:\n{owner}"
+        );
+        // Every declared-badge reader goes through that owner — the attr helper
+        // and the row menu's mount both, or one surface keeps lying.
+        let attr = function_body(&product, "fn keytip_tip_attr(");
+        assert!(
+            attr.contains("keytip_declared_badges_active(snapshot)"),
+            "the badge attribute must read the one owner:\n{attr}"
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("alt_overlay_active: snapshot.alt_overlay_active,")),
+            "a mount passing the raw flag would keep painting dead letters over a dialog"
+        );
+    }
+
+    /// LOCK 6c — derivation follows the SURFACE, not the open edge. A chord that
+    /// descends (a panel, a menu, a dialog) reveals controls that must be badged
+    /// without closing and re-opening the layer.
+    #[test]
+    fn derivation_reruns_when_the_visible_surface_changes() {
+        assert!(
+            KEYTIP_INTERACTABLE_WALK_JS.contains("window.__yggtermKeytipSignature = function()"),
+            "the signature lives beside KT_SEL — one definition of 'what changed'"
+        );
+        for part in [
+            "data-yggterm-keytip-sequence",
+            "data-yggterm-modal-open",
+            "data-yggterm-menu-open",
+            "document.querySelectorAll(KT_SEL).length",
+        ] {
+            assert!(
+                KEYTIP_INTERACTABLE_WALK_JS.contains(part),
+                "the surface signature must include `{part}` or a descend goes unbadged"
+            );
+        }
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("if (signature !== ktLastSignature) {"),
+            "the derive pass must be driven by the signature, not by the open edge"
+        );
+        // The chord LEVEL reaches the signature: the breadcrumb carries it.
+        let product = product_source();
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("\"data-yggterm-keytip-sequence\":")),
+            "the breadcrumb must publish the chord level for the signature"
+        );
     }
 
     /// LOCK 7 — the dissolved subtree exemptions stay dissolved (§12.1), and
