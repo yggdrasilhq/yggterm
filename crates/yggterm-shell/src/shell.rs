@@ -3907,6 +3907,18 @@ mod app_pane_reorder_tests {
         assert!(actions.contains("right:-9px;"), "{actions}");
         assert!(actions.contains("top:-5px;"), "{actions}");
         assert!(actions.contains("bottom:-5px;"), "{actions}");
+        // …and a row that ALSO has an expander does not bleed sideways: the
+        // chevron sits 6px to the right and the bleed put the chip 2px on it
+        // (measured live on a rail folder row). The expander is permanent
+        // chrome; a hover may never cover it.
+        let beside_expander = session_row_actions_style(5, 0);
+        assert!(beside_expander.contains("right:-0px;"), "{beside_expander}");
+        assert!(beside_expander.contains("top:-5px;"), "{beside_expander}");
+        let product_src = product_source();
+        assert!(
+            product_src.contains("if expander_present { 0 } else { metrics.pad_h_px },"),
+            "the shared row must choose the bleed by whether an expander follows"
+        );
         assert!(actions.contains("mask-image:linear-gradient(to right"), "{actions}");
         // …and the fade that lets them sit OVER a long title, which lives in the
         // REVEALED rule so a row at rest pays for no compositing layer. Both
@@ -81264,6 +81276,9 @@ fn SessionStyleRow(
     // a bolded selected row read as a different font next to it.
     let title_style = session_row_label_style(density, &text_color, false);
     let icon_slot_color = icon_color.unwrap_or_else(|| text_color.clone());
+    // Read BEFORE the rsx moves it: the chip's horizontal bleed depends on
+    // whether the always-visible expander is behind it.
+    let expander_present = expander.is_some();
     rsx! {
         div {
             "data-session-row": "1",
@@ -81376,8 +81391,16 @@ fn SessionStyleRow(
                     span {
                         "data-session-row-actions": "1",
                         // Bled over the row's OWN padding, so the chip wears the
-                        // row's rounded edges instead of floating inside it.
-                        style: session_row_actions_style(metrics.pad_v_px, metrics.pad_h_px),
+                        // row's rounded edges instead of floating inside it —
+                        // but ONLY when nothing follows it. A row that also has
+                        // an expander has the chevron 6px to the right, and the
+                        // bleed put the chip 2px ON it (measured live on a rail
+                        // folder row, 2026-08-01). The expander is permanent
+                        // chrome; a hover may never cover it.
+                        style: session_row_actions_style(
+                            metrics.pad_v_px,
+                            if expander_present { 0 } else { metrics.pad_h_px },
+                        ),
                         {actions}
                     }
                 }
