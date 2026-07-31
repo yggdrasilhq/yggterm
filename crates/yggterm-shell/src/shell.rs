@@ -1319,6 +1319,34 @@ struct WebSurfaceUiState {
     /// and — the part that matters most — who held the keyboard when it opened,
     /// so closing can hand it straight back. See `web_find`.
     find: Option<web_find::WebFindState>,
+    /// The tabs the user has closed here, oldest first — ONE entry per GESTURE,
+    /// so "Close 12 tabs" is undone by one "Reopen 12 closed tabs" rather than
+    /// by twelve separate reopens.
+    ///
+    /// This is why the bulk closes need no confirmation dialog. A modal in front
+    /// of a close is a tax every correct close pays for the rare wrong one;
+    /// every browser answers this with an undo instead, and so does this.
+    ///
+    /// Bounded ([`MAX_CLOSED_WEB_TAB_BATCHES`]) and NOT persisted: a closed tab
+    /// is a fact about this browsing session, and the saved tree is what the
+    /// user chose to keep.
+    closed_tabs: Vec<Vec<ClosedWebTab>>,
+}
+
+/// How many close GESTURES a surface can undo. Ten is Chrome's own depth, and
+/// the bound matters: an unbounded stack on a long-lived surface holds every URL
+/// the user has ever closed, which is a memory leak wearing a feature's clothes.
+const MAX_CLOSED_WEB_TAB_BATCHES: usize = 10;
+
+/// One closed tab, and enough about it to put it back where it was.
+#[derive(Debug, Clone, PartialEq)]
+struct ClosedWebTab {
+    url: String,
+    title: Option<String>,
+    folder: Option<String>,
+    /// The index it sat at. A reopen that appended would answer "undo" with
+    /// "open this URL again somewhere", which is not the same promise.
+    index: usize,
 }
 #[derive(Debug, Clone)]
 struct WebSurfacePickerState {
@@ -1387,6 +1415,20 @@ struct WebSurfaceTab {
     /// the USER opened is theirs, and a page asking to close it is ignored.
     /// Not persisted: a restored tab is one the user chose to keep.
     script_opened: bool,
+    /// The tab this one was SPAWNED FROM — its opener. The whole input to
+    /// [`web_tab_placement`], and the reason a second link opened from one page
+    /// lands after the first instead of between the page and it.
+    ///
+    /// Never dangles: [`ShellState::web_surface_close_tab`] re-points a closed
+    /// tab's children at ITS opener, so an id here is always a tab that exists.
+    /// Cleared wholesale when the user picks a row by hand
+    /// ([`ShellState::web_surface_select_tab`] under [`WebTabSelect::User`]) —
+    /// the group orders tabs the user has not visited yet, and choosing one
+    /// re-declares where they are.
+    ///
+    /// Not persisted: a restored tab is a URL in a tree, and the browsing
+    /// session that opened it is over.
+    opener: Option<u64>,
     /// Is this tab's page loading right now? Written from the ENGINE's
     /// `is-loading` by the native-surface reconciler (the only source that knows
     /// when a load actually ends), and rendered as the tab's blinking dot in
@@ -1467,6 +1509,280 @@ impl WebSurfaceTab {
         // cannot tell, so we do not claim it is dead.
         matches!(child.try_wait(), Ok(Some(_)))
     }
+}
+
+// ===== WHERE A NEW TAB GOES =====
+//
+// One owner, and it exists because there were three: `web_surface_new_tab`,
+// `web_surface_adopt_popup_tab` and the restore all pushed onto the end of
+// `WebSurfaceUiState::tabs` independently, so a link opened from the tab at the
+// top of the rail appeared at the BOTTOM, a duplicate landed nowhere near its
+// original, and nothing could ever cascade. The three call sites did not
+// disagree — they had no opinion at all, which is worse: there was nothing to
+// change when the answer needed to be "below the tab it came from".
+
+/// WHERE a new tab comes FROM. Every path that opens a tab names one of these,
+/// and the name is the ONLY input to placement — so "a duplicate sits below its
+/// original" and "a middle-clicked link sits below the page that linked it" are
+/// one rule with one implementation, not two call sites that happen to agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebTabOrigin {
+    /// Nothing opened it: the rail header's "+", the classic strip's "+", an
+    /// agent's `open_tab` command. It joins the end of the list, which is where
+    /// a browser has always put a tab nobody asked to sit anywhere.
+    Append,
+    /// Born filed, with no opener: a folder row's "+". It joins the end of THAT
+    /// FOLDER's run, so it appears under the header that minted it rather than
+    /// at the bottom of the window.
+    Folder(String),
+    /// A TAB opened it: the row menu's "New tab below this one", a middle- or
+    /// ctrl-clicked link, a duplicate, a `window.open` / `target="_blank"`.
+    /// It lands immediately below its opener and CASCADES after the children
+    /// that opener already has — Chrome's and Firefox's opener-group model.
+    Opener(u64),
+    /// Back where it was: the "Reopen closed tab" verb. The index is the one the
+    /// CLOSE recorded, clamped on the way in — the list has moved on since, and
+    /// a reopen that lands somewhere plausible beats one that refuses.
+    Restore {
+        index: usize,
+        folder: Option<String>,
+    },
+}
+
+/// Does the new tab already know where it is going?
+///
+/// The distinction the whole focus rule hangs on, so it is a value rather than a
+/// bool at each call site: a bool named `blank` reads the same whether it is
+/// right or inverted, and inverting it makes middle-click unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebTabDestination {
+    /// No URL. The address bar opens in edit mode and TAKES THE KEYBOARD — a
+    /// blank tab whose omnibox is not focused makes the user click before they
+    /// can type, which is the reported complaint.
+    Blank,
+    /// A URL is already on its way (a link, a duplicate, an adopted popup, an
+    /// agent's `open_tab`). The omnibox must NOT take the keyboard: the page is
+    /// loading and the user is reading it, and yanking the caret into the
+    /// address bar is exactly what would make middle-click unusable.
+    Bound,
+}
+
+/// One opened tab, fully specified: where it came from, where it is going, and
+/// whether the user goes with it.
+///
+/// ONE request type, so no path can mint a tab while leaving one of the three
+/// questions to a local guess — which is how the rail's "+" came to focus the
+/// omnibox while every other way of opening a tab did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebTabOpenRequest {
+    origin: WebTabOrigin,
+    destination: WebTabDestination,
+    /// Does the new tab take the front? Chrome's grammar: a middle/ctrl-click
+    /// opens WITHOUT going there, and everything the user asked for by name
+    /// takes the front.
+    foreground: bool,
+}
+
+impl WebTabOpenRequest {
+    /// A header "+": a blank tab at the end, typing-ready.
+    fn blank() -> Self {
+        Self {
+            origin: WebTabOrigin::Append,
+            destination: WebTabDestination::Blank,
+            foreground: true,
+        }
+    }
+    /// A folder row's "+": a blank tab filed in that folder, typing-ready.
+    fn blank_in_folder(folder_id: impl Into<String>) -> Self {
+        Self {
+            origin: WebTabOrigin::Folder(folder_id.into()),
+            destination: WebTabDestination::Blank,
+            foreground: true,
+        }
+    }
+    /// The row menu's "New tab below this one": a blank tab in the clicked
+    /// tab's group, typing-ready.
+    fn blank_below(opener: u64) -> Self {
+        Self {
+            origin: WebTabOrigin::Opener(opener),
+            destination: WebTabDestination::Blank,
+            foreground: true,
+        }
+    }
+    /// A page opened it and named a URL — a middle/ctrl-clicked link, a
+    /// `target="_blank"`, a `window.open`, a duplicate. `background` is the
+    /// GESTURE's answer, never an assumption.
+    fn opened_by(opener: u64, background: bool) -> Self {
+        Self {
+            origin: WebTabOrigin::Opener(opener),
+            destination: WebTabDestination::Bound,
+            foreground: !background,
+        }
+    }
+    /// A duplicate: the same page, below the original, and the user goes with
+    /// it — which is what "duplicate" means to someone who wants two of
+    /// something to compare.
+    fn duplicate_of(source: u64) -> Self {
+        Self::opened_by(source, false)
+    }
+    /// An agent's `open_tab` command. No opener — the command names a session,
+    /// not a page — so it appends, and it carries a URL, so it never steals the
+    /// keyboard even when it raises.
+    fn command(raise: bool) -> Self {
+        Self {
+            origin: WebTabOrigin::Append,
+            destination: WebTabDestination::Bound,
+            foreground: raise,
+        }
+    }
+    /// One tab of a reopened batch. Background, deliberately: reopening twelve
+    /// tabs must not flash the user through twelve fronts, so the dispatch
+    /// selects ONE of them when the batch is back.
+    fn restore(index: usize, folder: Option<String>) -> Self {
+        Self {
+            origin: WebTabOrigin::Restore { index, folder },
+            destination: WebTabDestination::Bound,
+            foreground: false,
+        }
+    }
+}
+
+/// Does this open put the keyboard in the omnibox?
+///
+/// THE one answer, for every path that opens a tab. Two clauses, both
+/// load-bearing: a tab with a destination must not (the page is loading), and a
+/// BACKGROUND open must not either (the user is still reading the tab they were
+/// on, and moving their caret out of it would be theft).
+fn web_tab_opens_typing_ready(request: &WebTabOpenRequest) -> bool {
+    request.foreground && matches!(request.destination, WebTabDestination::Blank)
+}
+
+/// One tab as the PLACEMENT arithmetic sees it. The projection exists so the
+/// rule is a pure function over three fields and can be tested without a
+/// surface, a webview or a Dioxus runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebTabPlacementRow {
+    id: u64,
+    opener: Option<u64>,
+    folder: Option<String>,
+}
+
+/// Where a new tab goes: its index in `WebSurfaceUiState::tabs`, the folder it
+/// is born into, and the opener it will remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebTabPlacement {
+    index: usize,
+    folder: Option<String>,
+    opener: Option<u64>,
+}
+
+fn web_tab_placement_rows(tabs: &[WebSurfaceTab]) -> Vec<WebTabPlacementRow> {
+    tabs.iter()
+        .map(|tab| WebTabPlacementRow {
+            id: tab.id,
+            opener: tab.opener,
+            folder: tab.folder.clone(),
+        })
+        .collect()
+}
+
+/// Is the tab at `index` inside `ancestor`'s opener group — a child, a
+/// grandchild, or deeper?
+///
+/// Walks the opener chain, bounded by the row count. The bound is not defensive
+/// noise: it makes the walk TERMINATE for any input at all, so a malformed
+/// chain can never hang the render thread, and the answer stays a pure function
+/// of the rows rather than of how they were built.
+fn web_tab_descends_from(rows: &[WebTabPlacementRow], index: usize, ancestor: u64) -> bool {
+    let mut opener = rows.get(index).and_then(|row| row.opener);
+    for _ in 0..rows.len() {
+        match opener {
+            Some(id) if id == ancestor => return true,
+            Some(id) => opener = rows.iter().find(|row| row.id == id).and_then(|row| row.opener),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// THE single owner of "where does a new tab go".
+///
+/// Pure, total, and a function of the rows alone — never of timing, of which
+/// call site asked, or of how many webviews happen to exist. The three rules:
+///
+/// - `Append` joins the end.
+/// - `Folder` joins the end of that folder's run, so a folder's "+" fills the
+///   folder instead of the window.
+/// - `Opener` lands immediately below its opener, AFTER the descendants that
+///   opener already has. That last clause is the cascade: the second link
+///   opened from a page goes after the first, not between the page and it.
+///
+/// The app tab is `tabs[0]` and stays there — no branch can return 0, because
+/// `Append`/`Folder` return a length (≥ 1, the app tab is always present) and
+/// `Opener` returns at least `at + 1`.
+fn web_tab_placement(rows: &[WebTabPlacementRow], origin: &WebTabOrigin) -> WebTabPlacement {
+    match origin {
+        WebTabOrigin::Append => WebTabPlacement {
+            index: rows.len(),
+            folder: None,
+            opener: None,
+        },
+        WebTabOrigin::Folder(folder_id) => WebTabPlacement {
+            index: rows
+                .iter()
+                .rposition(|row| row.folder.as_deref() == Some(folder_id.as_str()))
+                .map(|last| last + 1)
+                .unwrap_or(rows.len()),
+            folder: Some(folder_id.clone()),
+            opener: None,
+        },
+        WebTabOrigin::Restore { index, folder } => WebTabPlacement {
+            // Never onto the app tab's slot, never past the end.
+            index: (*index).clamp(1, rows.len()),
+            folder: folder.clone(),
+            opener: None,
+        },
+        WebTabOrigin::Opener(opener) => {
+            let Some(at) = rows.iter().position(|row| row.id == *opener) else {
+                // The opener went away between the gesture and the mint. There
+                // is nothing to sit below, so this is an ordinary append — and
+                // it carries NO opener id, because a dangling one would quietly
+                // turn every later open in this group into an append too.
+                return WebTabPlacement {
+                    index: rows.len(),
+                    folder: None,
+                    opener: None,
+                };
+            };
+            let mut index = at + 1;
+            while index < rows.len() && web_tab_descends_from(rows, index, *opener) {
+                index += 1;
+            }
+            WebTabPlacement {
+                index,
+                // A child is born where its parent lives, so opening a link from
+                // a filed tab does not scatter the folder it was filed in.
+                folder: rows[at].folder.clone(),
+                opener: Some(*opener),
+            }
+        }
+    }
+}
+
+/// How a tab came to be selected — the input to opener-group expiry.
+///
+/// Chrome's `user_gesture` flag, and it has to be one: the duplicate verb
+/// SELECTS the copy it just made, and if that counted as the user re-declaring
+/// where they are, the cascade would collapse on its very first hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebTabSelect {
+    /// The user picked this row by hand (a rail row, a strip tab). Forgets every
+    /// opener group on the surface: the groups order tabs the user has not
+    /// visited yet, and choosing one says where they are now.
+    User,
+    /// The shell moved the front as part of an open the user asked for. Leaves
+    /// the groups standing.
+    Opened,
 }
 
 /// One tab, as the egress-reuse rule sees it.
@@ -2739,6 +3055,13 @@ impl AppPaneContextMenu {
                 emphasized: false,
                 separator: false,
                 disabled: false,
+                // A CONTRIBUTED row's actions are the app's words, and the
+                // shell has no idea what any of them mean — so it draws no
+                // icon column here rather than guessing a mark per verb.
+                icon: None,
+                // …and for the same reason it invents no reason: the tooltip
+                // falls back to the label, which the app authored.
+                reason: None,
             })
             .collect()
     }
@@ -2752,29 +3075,76 @@ enum WebTabMenuTarget {
     Folder(String),
 }
 
-/// An open right-click menu over a WebTabs rail row.
+/// Which PAGE of the tab menu is showing.
 ///
-/// Carries only WHERE the click landed. The ITEMS are rebuilt from live surface
-/// state every frame by [`web_tab_menu_items`], so a count baked into a label
-/// ("Close 12 other tabs") can never be stale by the time it is clicked — and
-/// the count in the label and the tabs the action closes come from the one
-/// planner ([`web_tab_close_others_targets`]).
+/// "Move to folder ▸" used to be FLATTENED into one sibling row per folder,
+/// which stops scaling the moment a user has more than a handful — the tab's own
+/// verbs get pushed off the bottom by a filing list. A page turn fixes that
+/// without a second menu component: [`ContextMenuOverlay`] is the one menu in
+/// the app and it draws a flat list, so the submenu is the SAME overlay at the
+/// SAME anchor showing a different list. Everything downstream follows for free
+/// — the KeyTip `rowmenu` scope is rebuilt from whatever is on screen, the
+/// dismissal is unchanged, and the styling cannot drift because there is still
+/// only one thing drawing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WebTabMenuPage {
+    #[default]
+    Root,
+    MoveToFolder,
+}
+
+/// An open right-click menu over a tab row — the WebTabs rail's, or the classic
+/// strip's, which raise the same menu on the same state.
+///
+/// Carries only WHERE the click landed and which page it is on. The ITEMS are
+/// rebuilt from live surface state every frame by [`web_tab_menu_items`], so a
+/// count baked into a label ("Close 12 other tabs") can never be stale by the
+/// time it is clicked — and the count in the label and the tabs the action
+/// closes come from the one planner ([`web_tab_close_others_targets`]).
 #[derive(Debug, Clone, PartialEq)]
 struct WebTabContextMenu {
     session_path: String,
     target: WebTabMenuTarget,
-    /// Client coordinates of the right-click, where the menu anchors.
+    /// Client coordinates of the right-click, where the menu anchors. A page
+    /// turn keeps it: a submenu that jumps somewhere else is a new menu.
     position: (f64, f64),
+    page: WebTabMenuPage,
+    /// Which tab home raised it. Decides banding vs stashing — see
+    /// [`WebSurfaceChromeAnchor`].
+    anchor: WebSurfaceChromeAnchor,
 }
 
-/// Which badge the profile dropdown was raised from. The two anchor sites are
-/// the vertical rail's header badge and the classic strip's badge; they differ
-/// ONLY in where the menu anchors — same state, same items, same component.
+/// Which piece of surface chrome raised a floating menu: the vertical tab rail,
+/// or the classic tab strip.
+///
+/// ONE enum for every floating thing either of them raises — the profile
+/// dropdown and now the tab context menu — because the question they are both
+/// asking is the same one, and the answer decides the same two things:
+///
+/// - a RAIL-anchored menu is BANDED to the rail (in legacy stacking, DOM that
+///   spills out of the rail is eaten by the native page beside it)
+/// - a STRIP-anchored menu hangs over PURE PAGE, where no band can save it, so
+///   it is a member of the strip-dropdown STASH instead
+///   ([`strip_dropdown_over_viewport`]) and the reconciler unmaps the page while
+///   it is up.
+///
+/// Getting this wrong is silent: a strip-raised menu banded to the rail is
+/// squeezed into a strip of window at the far right — or, when no rail is
+/// showing at all, into nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum WebProfileSwitcherAnchor {
+enum WebSurfaceChromeAnchor {
     Rail,
     Strip,
+}
+
+/// Is this floating thing hanging over pure page?
+///
+/// The one reader of the anchor's MEANING, so the stash predicate and the
+/// strip-scoped closer cannot come to different conclusions about the same
+/// menu.
+fn anchored_on_strip(anchor: Option<WebSurfaceChromeAnchor>) -> bool {
+    anchor == Some(WebSurfaceChromeAnchor::Strip)
 }
 
 /// The open ychrome-profile dropdown for a web surface.
@@ -2791,7 +3161,7 @@ struct WebProfileSwitcher {
     /// directory), never per frame: a dropdown must not put a `read_dir` in the
     /// render path.
     profiles: Vec<String>,
-    anchor: WebProfileSwitcherAnchor,
+    anchor: WebSurfaceChromeAnchor,
     position: (f64, f64),
 }
 
@@ -3419,9 +3789,18 @@ struct WebSurfaceOverlayTabView {
 /// This is the ONE way a tab is selected. Both tab homes (the rail rows, the
 /// classic strip), the folder overflow menu and the surface-open path go through
 /// it, so no caller can select a tab and forget to make it load.
-fn select_web_surface_tab(mut state: Signal<ShellState>, session_path: String, tab_id: u64) {
+///
+/// `gesture` is carried, not guessed: a row the USER clicked expires the opener
+/// groups ([`WebTabSelect`]), and the front moving because a verb the user ran
+/// finished its work does not.
+fn select_web_surface_tab(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    tab_id: u64,
+    gesture: WebTabSelect,
+) {
     let pending = state.with_mut(|shell| {
-        shell.web_surface_select_tab(&session_path, tab_id);
+        shell.web_surface_select_tab(&session_path, tab_id, gesture);
         let surface = shell.web_surfaces.get(&session_path)?;
         let tab = surface.tabs.iter().find(|tab| tab.id == tab_id)?;
         if !tab.effective_url.trim().is_empty() || tab.url.trim().is_empty() {
@@ -9939,11 +10318,17 @@ async fn web_surface_native_reconcile_loop(
                 continue;
             };
             let mut writable = state;
-            // `raise = !background`: Chrome's grammar, taken from the GESTURE and
-            // not assumed here. A middle/ctrl-click means "open it, but do not go
-            // there", so the user's current tab keeps the front.
-            let opened =
-                writable.with_mut(|shell| shell.open_command_tab(&session_path, !link.background));
+            // Chrome's grammar, taken from the GESTURE and not assumed here. A
+            // middle/ctrl-click means "open it, but do not go there", so the
+            // user's current tab keeps the front — and `opened_by` is what puts
+            // the new tab BELOW the page that linked it, cascading after the
+            // links already opened from that same page.
+            let opened = writable.with_mut(|shell| {
+                shell.open_command_tab(
+                    &session_path,
+                    &WebTabOpenRequest::opened_by(opener_tab_id, link.background),
+                )
+            });
             let Some((new_tab_id, ssh_target)) = opened else {
                 continue;
             };
@@ -11816,7 +12201,7 @@ async fn materialize_declared_web_surface(
             .map(|surface| surface.active_tab)
     });
     if let Some(tab_id) = landed {
-        select_web_surface_tab(state, session_path.clone(), tab_id);
+        select_web_surface_tab(state, session_path.clone(), tab_id, WebTabSelect::Opened);
     }
     landed.is_some()
 }
@@ -14921,12 +15306,16 @@ impl ShellState {
                     saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
                 );
                 let selected_count = drag_paths.len().max(1);
+                // A heading only when it says something the row does not. A
+                // MULTI-selection does: the menu acts on three things and no
+                // single row shows that. One row's own label does not — the row
+                // is directly above the menu, highlighted, saying it already.
                 let title = if selected_count > 1
                     && drag_paths.iter().any(|path| path == &row.full_path)
                 {
                     format!("{selected_count} selected items")
                 } else {
-                    row.label.clone()
+                    String::new()
                 };
                 (items, title)
             }
@@ -15392,6 +15781,8 @@ impl ShellState {
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
+            // The app tab is nobody's child.
+            opener: None,
         };
         // Rehydrate the profile's tab tree. The folders and everything filed in
         // them always come back — that is saved organization, like a cwd-tree
@@ -15454,6 +15845,9 @@ impl ShellState {
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
+                // A restored tab is a URL in a tree; the browsing session that
+                // opened it is over, so it belongs to no group.
+                opener: None,
             });
             next_tab_id += 1;
         }
@@ -15480,6 +15874,8 @@ impl ShellState {
                 osc_url: url,
                 picker: None,
                 find: None,
+                // A fresh surface has closed nothing yet.
+                closed_tabs: Vec::new(),
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -15566,6 +15962,8 @@ impl ShellState {
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
+            // The app tab is nobody's child.
+            opener: None,
         };
         self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
@@ -15588,6 +15986,7 @@ impl ShellState {
                     forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
                 }),
                 find: None,
+                closed_tabs: Vec::new(),
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -15863,29 +16262,27 @@ impl ShellState {
             self.drained_command_ids.pop_front();
         }
     }
-    /// Create the tab an `open_tab` command wants, into a LIVE web surface only
-    /// (no surface ⇒ `None`, a transient drop the caller leaves un-acked). Under
-    /// `raise` the tab is foregrounded within the surface; otherwise focus stays
-    /// on the previously active tab (a background open). Returns the new tab id
-    /// and the session's egress target so the caller can navigate it.
-    fn open_command_tab(&mut self, session_path: &str, raise: bool) -> Option<(u64, Option<String>)> {
+    /// Create the tab an `open_tab` command or a middle-clicked link wants, into
+    /// a LIVE web surface only (no surface ⇒ `None`, a transient drop the caller
+    /// leaves un-acked). Returns the new tab id and the session's egress target
+    /// so the caller can navigate it.
+    ///
+    /// `request` carries the whole answer — where the tab goes, that it is
+    /// BOUND (a URL is coming, so the omnibox must not take the keyboard), and
+    /// whether the user goes with it. The background case no longer saves and
+    /// restores `active_tab` around the mint: the mint simply does not move the
+    /// front, which is also why an address the user was half-way through typing
+    /// now survives a background open instead of being cleared under them.
+    fn open_command_tab(
+        &mut self,
+        session_path: &str,
+        request: &WebTabOpenRequest,
+    ) -> Option<(u64, Option<String>)> {
         if !self.web_surfaces.contains_key(session_path) {
             return None;
         }
         let ssh_target = self.web_surface_session_ssh_target(session_path);
-        let previous_active = self
-            .web_surfaces
-            .get(session_path)
-            .map(|surface| surface.active_tab);
-        self.web_surface_new_tab(session_path);
-        let surface = self.web_surfaces.get_mut(session_path)?;
-        let tab_id = surface.active_tab;
-        if !raise && let Some(previous) = previous_active {
-            // web_surface_new_tab foregrounded the tab; put focus back for a
-            // background open so the user's current tab is not yanked away.
-            surface.active_tab = previous;
-            surface.address_draft = None;
-        }
+        let tab_id = self.web_surface_open_tab(session_path, request)?;
         Some((tab_id, ssh_target))
     }
     /// Drain one ping reply's command batch ([[campaign-libyggterm]] Phase 5,
@@ -15957,7 +16354,9 @@ impl ShellState {
                             self.remember_drained_command_id(id);
                             outcome.dropped += 1;
                         }
-                        Some(session_path) => match self.open_command_tab(&session_path, raise) {
+                        Some(session_path) => match self
+                            .open_command_tab(&session_path, &WebTabOpenRequest::command(raise))
+                        {
                             Some((tab_id, ssh_target)) => {
                                 self.remember_drained_command_id(id);
                                 outcome.open_tabs.push(CommandOpenTab {
@@ -16632,6 +17031,9 @@ impl ShellState {
                 self.web_profile_switcher
                     .as_ref()
                     .map(|switcher| switcher.anchor),
+                self.web_tab_context_menu
+                    .as_ref()
+                    .map(|menu| menu.anchor),
             ),
         )
     }
@@ -16648,27 +17050,51 @@ impl ShellState {
             self.app_pane_context_menu.is_some(),
         )
     }
-    fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64) {
+    /// Put a tab in front.
+    ///
+    /// `gesture` is the opener-group expiry input, and it is a parameter rather
+    /// than an assumption because the two callers genuinely differ: a rail row's
+    /// click is the user saying where they are, and the duplicate verb selecting
+    /// the copy it just minted is not.
+    fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64, gesture: WebTabSelect) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
             && surface.tabs.iter().any(|tab| tab.id == tab_id)
         {
             surface.active_tab = tab_id;
             surface.address_draft = None;
+            if gesture == WebTabSelect::User {
+                // The user re-declared where they are, so the groups that were
+                // ordering tabs they had not visited yet are spent. A link
+                // opened after this belongs beside THIS tab.
+                for tab in &mut surface.tabs {
+                    tab.opener = None;
+                }
+            }
         }
     }
-    /// Open a fresh user tab (blank page, address bar in edit mode).
-    fn web_surface_new_tab(&mut self, session_path: &str) {
-        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            // A user tab inherits the surface's (app-tab) profile so every tab
-            // of one ychrome invocation shares the same identity/storage.
-            let profile = surface
-                .tabs
-                .first()
-                .map(|tab| tab.profile.clone())
-                .unwrap_or_else(|| "default".to_string());
-            let id = surface.next_tab_id;
-            surface.next_tab_id += 1;
-            surface.tabs.push(WebSurfaceTab {
+    /// Open a tab. THE one minting path for every user- or page-opened tab, and
+    /// the only caller of the placement owner ([`web_tab_placement`]).
+    ///
+    /// Returns the new tab's id, or `None` when the surface is not live.
+    fn web_surface_open_tab(
+        &mut self,
+        session_path: &str,
+        request: &WebTabOpenRequest,
+    ) -> Option<u64> {
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        // A user tab inherits the surface's (app-tab) profile so every tab
+        // of one ychrome invocation shares the same identity/storage.
+        let profile = surface
+            .tabs
+            .first()
+            .map(|tab| tab.profile.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let placement = web_tab_placement(&web_tab_placement_rows(&surface.tabs), &request.origin);
+        let id = surface.next_tab_id;
+        surface.next_tab_id += 1;
+        surface.tabs.insert(
+            placement.index,
+            WebSurfaceTab {
                 id,
                 url: String::new(),
                 effective_url: "about:blank".to_string(),
@@ -16677,30 +17103,35 @@ impl ShellState {
                 forward_child: None,
                 history: Vec::new(),
                 history_index: 0,
-            engine_nav: None,
+                engine_nav: None,
                 reload_nonce: 0,
                 profile,
-                folder: None,
+                folder: placement.folder.clone(),
                 loading: false,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
-            });
+                opener: placement.opener,
+            },
+        );
+        if request.foreground {
             surface.active_tab = id;
-            surface.address_draft = Some(String::new());
+            surface.address_draft = match request.destination {
+                // Typing-ready: the edit-mode draft is what
+                // `web_tab_opens_typing_ready` promises the keyboard is going to.
+                WebTabDestination::Blank => Some(String::new()),
+                // A URL is on its way, so the bar shows that URL rather than an
+                // empty edit box the user did not ask for.
+                WebTabDestination::Bound => None,
+            };
         }
-    }
-    /// Open a fresh tab already filed in `folder` — the tree's "+" on a folder
-    /// row. Same tab as any other; it is born organized instead of at the root.
-    fn web_surface_new_tab_in_folder(&mut self, session_path: &str, folder_id: &str) {
-        self.web_surface_new_tab(session_path);
-        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            let active = surface.active_tab;
-            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active) {
-                tab.folder = Some(folder_id.to_string());
-            }
+        // A tab born FILED changes the saved tree, so it is written through. A
+        // root tab with an empty URL has nothing to save (`web_tab_is_saved`),
+        // so the write would be a no-op — this is the one case that is not.
+        if placement.folder.is_some() {
+            self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
         }
-        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
+        Some(id)
     }
     /// Adopt a POPUP a page opened (`window.open`, `target="_blank"`, a
     /// middle/ctrl-click) as a tab of the same session.
@@ -16739,32 +17170,48 @@ impl ShellState {
             .iter()
             .find(|tab| tab.id == opener_tab_id)
             .or_else(|| surface.tabs.first())?;
+        // The opener the PLACEMENT uses is the one actually resolved above, not
+        // the id the engine reported: when a popup's opener has already gone the
+        // fallback is `tabs[0]`, and placing the popup below a tab that is not
+        // there would be an append wearing a group's clothes.
+        let opener_id = opener.id;
         let profile = opener.profile.clone();
         let socks_port = opener.socks_port;
+        // The SAME owner every other open goes through. A popup is a tab a page
+        // spawned, so it sits below the page that spawned it and cascades with
+        // that page's other children.
+        let placement = web_tab_placement(
+            &web_tab_placement_rows(&surface.tabs),
+            &WebTabOrigin::Opener(opener_id),
+        );
         let id = surface.next_tab_id;
         surface.next_tab_id += 1;
-        surface.tabs.push(WebSurfaceTab {
-            id,
-            url: url.to_string(),
-            effective_url: url.to_string(),
-            socks_port,
-            title: None,
-            // The popup rides the opener's tunnel — it has no forward of its own
-            // to own or to reap.
-            forward_child: None,
-            history: vec![url.to_string()],
-            history_index: 0,
-            engine_nav: None,
-            reload_nonce: 0,
-            profile: profile.clone(),
-            folder: None,
-            // WebKit began the load the moment it made the view.
-            loading: true,
-            theme_color: None,
-            lease_until_ms: None,
-            // A script opened it, so a script may close it.
-            script_opened: true,
-        });
+        surface.tabs.insert(
+            placement.index,
+            WebSurfaceTab {
+                id,
+                url: url.to_string(),
+                effective_url: url.to_string(),
+                socks_port,
+                title: None,
+                // The popup rides the opener's tunnel — it has no forward of its
+                // own to own or to reap.
+                forward_child: None,
+                history: vec![url.to_string()],
+                history_index: 0,
+                engine_nav: None,
+                reload_nonce: 0,
+                profile: profile.clone(),
+                folder: placement.folder.clone(),
+                // WebKit began the load the moment it made the view.
+                loading: true,
+                theme_color: None,
+                lease_until_ms: None,
+                // A script opened it, so a script may close it.
+                script_opened: true,
+                opener: placement.opener,
+            },
+        );
         // Chrome's grammar: a middle/ctrl-click opens WITHOUT going there; a
         // `window.open` is a foreground request and takes the front.
         if !background {
@@ -16875,6 +17322,31 @@ impl ShellState {
             let removed = surface.tabs.remove(index);
             removed.kill_forward();
             removed_tab = true;
+            // UNDO. Recorded here, in the one removal path, so every close verb
+            // in the product is undoable by construction rather than by each of
+            // them remembering to record. A tab that never went anywhere has
+            // nothing to reopen, so only a tab with a URL is kept.
+            if !removed.url.trim().is_empty() {
+                surface.closed_tabs.push(vec![ClosedWebTab {
+                    url: removed.url.clone(),
+                    title: removed.title.clone(),
+                    folder: removed.folder.clone(),
+                    index,
+                }]);
+                while surface.closed_tabs.len() > MAX_CLOSED_WEB_TAB_BATCHES {
+                    surface.closed_tabs.remove(0);
+                }
+            }
+            // The closed tab's children inherit ITS opener, so a group survives
+            // losing a tab in the middle of it and no tab is ever left pointing
+            // at an id that is gone. A dangling opener would not error — it
+            // would quietly turn the next open in that group into an append,
+            // which is precisely the non-determinism this model exists to kill.
+            for tab in &mut surface.tabs {
+                if tab.opener == Some(tab_id) {
+                    tab.opener = removed.opener;
+                }
+            }
             if surface.active_tab == tab_id {
                 // The RIGHT neighbour, which is whatever shifted into the closed
                 // tab's slot — every browser's rule, and the one that keeps a
@@ -16898,14 +17370,51 @@ impl ShellState {
         // resurrect a tab the user closed on the next visit.
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
+    /// Which omnibox input is on screen for the active surface, by DOM id.
+    ///
+    /// Reads the two things that decide it from their own owners — the tab-mode
+    /// setting, and `active_terminal_host_id` for which surface host is mounted
+    /// — and hands them to [`web_omnibox_input_id`]. Nothing else in the app is
+    /// allowed to guess an omnibox id.
+    fn active_web_omnibox_input_id(&self) -> Option<String> {
+        if self.settings.web_surface_vertical_tabs {
+            return Some(web_omnibox_input_id(true, ""));
+        }
+        let host_id = self.active_terminal_host_id.clone()?;
+        Some(web_omnibox_input_id(false, &host_id))
+    }
+    /// Request a reload of ONE tab's page. THE reload owner: the nav bar's ⟳
+    /// aims it at the active tab and the row menu aims it at the row that was
+    /// right-clicked, which is a difference in the AIM, not in the verb.
+    fn web_surface_reload_tab(&mut self, session_path: &str, tab_id: u64) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.reload_nonce = tab.reload_nonce.wrapping_add(1);
+        }
+    }
     /// Request a reload of the active tab's page (native surface ⟳).
     fn web_surface_reload_active_tab(&mut self, session_path: &str) {
-        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
-            let active_tab = surface.active_tab;
-            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active_tab) {
-                tab.reload_nonce = tab.reload_nonce.wrapping_add(1);
-            }
-        }
+        let Some(active_tab) = self
+            .web_surfaces
+            .get(session_path)
+            .map(|surface| surface.active_tab)
+        else {
+            return;
+        };
+        self.web_surface_reload_tab(session_path, active_tab);
+    }
+    /// A tab's URL, for the menu's "Copy URL". `None` when the tab has never
+    /// gone anywhere — there is no address to copy, and copying an empty string
+    /// would silently wipe whatever the user had on the clipboard.
+    fn web_surface_tab_url(&self, session_path: &str, tab_id: u64) -> Option<String> {
+        self.web_surfaces
+            .get(session_path)?
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.url.trim().to_string())
+            .filter(|url| !url.is_empty())
     }
     // -- find-in-page (Ctrl+F) ------------------------------------------------
     //
@@ -17492,15 +18001,24 @@ impl ShellState {
     /// over the viewport, and has its own closer. The overflow menu has only the
     /// strip anchor, so it always closes.
     fn close_strip_anchored_dropdowns(&mut self) {
-        let switcher_is_strip_anchored = strip_dropdown_over_viewport(
-            false,
+        let switcher_is_strip_anchored = anchored_on_strip(
             self.web_profile_switcher
                 .as_ref()
                 .map(|switcher| switcher.anchor),
         );
+        // The tab context menu has both anchors too, now that the classic strip
+        // raises it. A strip-anchored one is a stash member, so it must be
+        // reachable by the strip-scoped closer — otherwise Escape would report
+        // the strip dropdown as the top modal and then close nothing.
+        let tab_menu_is_strip_anchored = anchored_on_strip(
+            self.web_tab_context_menu.as_ref().map(|menu| menu.anchor),
+        );
         self.close_web_tab_overflow();
         if switcher_is_strip_anchored {
             self.close_web_profile_switcher();
+        }
+        if tab_menu_is_strip_anchored {
+            self.close_web_tab_context_menu();
         }
     }
     fn confirm_classic_tabs_switch(&mut self) {
@@ -18538,16 +19056,30 @@ impl ShellState {
         session_path: &str,
         target: WebTabMenuTarget,
         position: (f64, f64),
+        anchor: WebSurfaceChromeAnchor,
     ) {
         self.web_profile_switcher = None;
         self.web_tab_context_menu = Some(WebTabContextMenu {
             session_path: session_path.to_string(),
             target,
             position,
+            anchor,
+            // A right-click always opens on the root page. A menu that
+            // remembered the page it was on last time would answer one
+            // right-click with somebody else's submenu.
+            page: WebTabMenuPage::Root,
         });
     }
     fn close_web_tab_context_menu(&mut self) {
         self.web_tab_context_menu = None;
+    }
+    /// Turn the open menu to another PAGE, in place. The anchor and the target
+    /// are untouched — this is the same menu showing a different list, which is
+    /// exactly what a submenu is.
+    fn turn_web_tab_menu_page(&mut self, page: WebTabMenuPage) {
+        if let Some(menu) = self.web_tab_context_menu.as_mut() {
+            menu.page = page;
+        }
     }
     /// The open rail menu's ITEMS + TITLE against the live tab tree. A menu left
     /// open over a surface that has since gone offers NOTHING — an item that
@@ -18567,9 +19099,22 @@ impl ShellState {
                 &overlay.folders,
                 overlay.active_tab_id,
                 &menu.target,
+                menu.page,
+                self.web_surface_reopen_plan(&menu.session_path).len(),
             ),
-            web_tab_menu_title(&overlay.tabs, &overlay.folders, &menu.target),
+            web_tab_menu_title(&overlay.tabs, &overlay.folders, &menu.target, menu.page),
         )
+    }
+    /// The batch a "Reopen closed tabs" would put back — the WHOLE answer, and
+    /// the only derivation of it. The menu label counts this and the verb
+    /// restores exactly this, so the label can never promise a number the verb
+    /// does not deliver.
+    fn web_surface_reopen_plan(&self, session_path: &str) -> Vec<ClosedWebTab> {
+        self.web_surfaces
+            .get(session_path)
+            .and_then(|surface| surface.closed_tabs.last())
+            .cloned()
+            .unwrap_or_default()
     }
     /// The `(id, folder)` rows of a surface's tabs, for the scope planners.
     /// Same shape the render path derives from the overlay view, so the count in
@@ -18591,6 +19136,13 @@ impl ShellState {
     /// pinned-pane prune and the persist are its rules, and a bulk close must
     /// not get its own softer copy of them.
     fn web_surface_close_tabs(&mut self, session_path: &str, tabs: &[u64]) -> usize {
+        // Where the undo stack stood before this GESTURE. Everything the loop
+        // pushes above this mark is folded back into one entry afterwards.
+        let stack_before = self
+            .web_surfaces
+            .get(session_path)
+            .map(|surface| surface.closed_tabs.len())
+            .unwrap_or(0);
         let mut closed = 0;
         for tab_id in tabs {
             let existed = self
@@ -18609,7 +19161,81 @@ impl ShellState {
                 closed += 1;
             }
         }
+        // ONE undo entry for ONE gesture: "Close 12 tabs" is answered by one
+        // "Reopen 12 closed tabs", not by twelve. Folded here rather than
+        // recorded here, so `web_surface_close_tab` stays the single removal
+        // path with the app-tab guard, the pane prune and the persist on it.
+        self.coalesce_closed_web_tabs(session_path, stack_before);
         closed
+    }
+    /// Fold every undo entry pushed at or after `from` into one, keeping the
+    /// order the tabs were closed in. A no-op below two entries.
+    fn coalesce_closed_web_tabs(&mut self, session_path: &str, from: usize) {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return;
+        };
+        if from >= surface.closed_tabs.len() || surface.closed_tabs.len() - from < 2 {
+            return;
+        }
+        let folded: Vec<ClosedWebTab> = surface.closed_tabs.split_off(from).concat();
+        surface.closed_tabs.push(folded);
+    }
+    /// Put the most recently closed batch back, and say which tabs those are.
+    ///
+    /// Chrome's Ctrl+Shift+T, and the reason none of this menu's bulk closes
+    /// asks for confirmation: a modal in front of every close taxes the correct
+    /// ones to catch the rare wrong one, and an undo does not.
+    ///
+    /// Every tab goes back through the ONE minting path
+    /// ([`ShellState::web_surface_open_tab`]) with a `Restore` origin, so the
+    /// placement owner still decides where each lands — a reopen does not get a
+    /// private idea about tab order. Egress is left unresolved exactly as a
+    /// restored tab's is; selecting one resolves it.
+    fn web_surface_reopen_closed_tabs(&mut self, session_path: &str) -> Vec<u64> {
+        let plan = self.web_surface_reopen_plan(session_path);
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.closed_tabs.pop();
+        }
+        // REVERSE ORDER, and this is the whole correctness of the restore.
+        //
+        // Each index was recorded against the list AS IT STOOD when that tab was
+        // removed — so the second removal's index already accounts for the
+        // first. Undoing a sequence of removals therefore means re-inserting
+        // last-removed-first, each at its own recorded index. Replaying them
+        // forwards instead reassembles the batch shuffled: closing tabs 1 and 3
+        // of [app,a,b,c] records (a,1) and (c,2), and inserting a then c yields
+        // [app,a,c,b].
+        let mut reopened = Vec::new();
+        for closed in plan.iter().rev() {
+            let Some(new_id) = self.web_surface_open_tab(
+                session_path,
+                &WebTabOpenRequest::restore(closed.index, closed.folder.clone()),
+            ) else {
+                continue;
+            };
+            let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+                continue;
+            };
+            let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == new_id) else {
+                continue;
+            };
+            tab.url = closed.url.clone();
+            tab.effective_url = String::new();
+            tab.socks_port = None;
+            tab.title = closed.title.clone();
+            tab.history = vec![closed.url.clone()];
+            tab.history_index = 0;
+            reopened.push(new_id);
+        }
+        // Handed back in CLOSE order, so `reopened.first()` is the tab that was
+        // closed first — the topmost of the batch, and the sensible one to land
+        // the user on.
+        reopened.reverse();
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
+        reopened
     }
     /// Chrome's "Duplicate": a NEW tab beside this one, on the same URL, in the
     /// same folder. It gets its own history — a duplicate is a fresh visit, not
@@ -18633,14 +19259,18 @@ impl ShellState {
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
-            .map(|tab| (tab.url.clone(), tab.title.clone(), tab.folder.clone()))?;
-        let (url, title, folder) = source;
+            .map(|tab| (tab.url.clone(), tab.title.clone()))?;
+        let (url, title) = source;
         if url.trim().is_empty() {
             return None;
         }
-        self.web_surface_new_tab(session_path);
+        // Placement is the OWNER's, not this verb's: `duplicate_of` says "a tab
+        // this tab opened", so the copy lands directly below the original and
+        // cascades with its siblings. It used to append, which put a duplicate
+        // at the bottom of the rail, arbitrarily far from what it copied.
+        let new_id =
+            self.web_surface_open_tab(session_path, &WebTabOpenRequest::duplicate_of(tab_id))?;
         let surface = self.web_surfaces.get_mut(session_path)?;
-        let new_id = surface.active_tab;
         let tab = surface.tabs.iter_mut().find(|tab| tab.id == new_id)?;
         tab.url = url.clone();
         // Unresolved egress, exactly like a restored tab: the tunnel belongs to
@@ -18649,7 +19279,10 @@ impl ShellState {
         tab.effective_url = String::new();
         tab.socks_port = None;
         tab.title = title;
-        tab.folder = folder;
+        // The FOLDER is not re-assigned here. The placement owner already put
+        // the copy in its opener's folder, and re-deriving it from the source
+        // would be a second encoding of one fact — the two could not disagree
+        // today, and that is exactly when a second encoding gets written.
         tab.history = vec![url];
         tab.history_index = 0;
         surface.address_draft = None;
@@ -18679,18 +19312,53 @@ impl ShellState {
                 let scope = self.web_tab_scope_rows_for_session(session_path);
                 self.web_surface_close_tabs(session_path, &web_tab_menu_close_plan(&scope, action));
             }
-            WebTabMenuAction::CloseOtherTabs(_) | WebTabMenuAction::CloseFolderTabs(_) => {
+            WebTabMenuAction::CloseOtherTabs(_)
+            | WebTabMenuAction::CloseTabsBelow(_)
+            | WebTabMenuAction::CloseFolderTabs(_) => {
                 let scope = self.web_tab_scope_rows_for_session(session_path);
                 let closed = self
                     .web_surface_close_tabs(session_path, &web_tab_menu_close_plan(&scope, action));
                 if closed > 0 {
+                    // The toast names the UNDO, because that is the answer this
+                    // menu gives instead of a confirmation dialog: a bulk close
+                    // is reversible, and a user who has just closed twelve tabs
+                    // needs to be told so at the moment it happens, not to go
+                    // hunting for the verb in a menu.
                     self.push_notification(
                         NotificationTone::Info,
                         "Tabs Closed",
-                        format!("Closed {}.", web_tab_count_phrase(closed, "tab")),
+                        format!(
+                            "Closed {}. Right-click any tab ▸ Reopen to undo.",
+                            web_tab_count_phrase(closed, "tab")
+                        ),
                     );
                 }
             }
+            WebTabMenuAction::ReloadTab(tab_id) => {
+                self.web_surface_reload_tab(session_path, *tab_id);
+            }
+            WebTabMenuAction::NewTabInFolder(folder_id) => {
+                self.web_surface_open_tab(
+                    session_path,
+                    &WebTabOpenRequest::blank_in_folder(folder_id.clone()),
+                );
+            }
+            WebTabMenuAction::DeleteFolder(folder_id) => {
+                // Deleting ORGANIZATION, never content: the folder goes and its
+                // tabs come back to the root — the same verb the row's 🗑 runs,
+                // which until now had no menu or keyboard route at all.
+                self.web_tab_delete_folder(session_path, folder_id);
+            }
+            // Finished by the DISPATCH, which owns the Signal: opening a tab
+            // must be able to put the keyboard in the omnibox
+            // (`open_web_surface_tab`), reopening must SELECT what it restored
+            // so the egress resolves, and copying a URL needs the native
+            // clipboard owner. Same reason the split and the duplicate live
+            // there.
+            WebTabMenuAction::NewTab
+            | WebTabMenuAction::NewTabBelow(_)
+            | WebTabMenuAction::ReopenClosedTabs
+            | WebTabMenuAction::CopyTabUrl(_) => return false,
             WebTabMenuAction::DuplicateTab(tab_id) => {
                 // The app tab is not copyable, and that refusal lives HERE where
                 // it can be asked without a Signal.
@@ -18751,7 +19419,7 @@ impl ShellState {
     fn open_web_profile_switcher(
         &mut self,
         session_path: &str,
-        anchor: WebProfileSwitcherAnchor,
+        anchor: WebSurfaceChromeAnchor,
         position: (f64, f64),
     ) {
         let Some(current) = self.web_surface_session_profile(session_path) else {
@@ -37424,9 +38092,10 @@ impl TopModal {
 /// retires the stash, so this membership needs no second stacking gate.
 fn strip_dropdown_over_viewport(
     tab_overflow_open: bool,
-    switcher_anchor: Option<WebProfileSwitcherAnchor>,
+    switcher_anchor: Option<WebSurfaceChromeAnchor>,
+    tab_menu_anchor: Option<WebSurfaceChromeAnchor>,
 ) -> bool {
-    tab_overflow_open || switcher_anchor == Some(WebProfileSwitcherAnchor::Strip)
+    tab_overflow_open || anchored_on_strip(switcher_anchor) || anchored_on_strip(tab_menu_anchor)
 }
 
 /// Pure precedence: which modal is on top given what is open. Split out so the
@@ -37482,6 +38151,10 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
                 .web_profile_switcher
                 .as_ref()
                 .map(|switcher| switcher.anchor),
+            snapshot
+                .web_tab_context_menu
+                .as_ref()
+                .map(|menu| menu.anchor),
         ),
     )
 }
@@ -46528,6 +47201,19 @@ const CONTEXT_MENU_MIN_BAND_WIDTH_PX: f64 = 96.0;
 /// The natural minimum box, so a two-item menu is not a sliver. Border-box, like
 /// the max — see [`context_menu_surface_style`].
 const CONTEXT_MENU_MIN_BOX_PX: f64 = 200.0;
+/// How much of a menu entry's width is NOT label: the surface's own padding, the
+/// entry's horizontal padding, and the icon slot with its gap.
+///
+/// Named because a lock reads it. "Does this label fit the narrowest menu the app
+/// draws" is a question about geometry, and a lock that answered it with a magic
+/// number would go quietly wrong the day the padding changes.
+const CONTEXT_MENU_ITEM_TEXT_INSET_PX: f64 = 12.0 + 24.0 + 25.0;
+/// A rough average advance for the menu's 12px, 600-weight interface font.
+///
+/// Deliberately approximate — this is the budget for a length lock, not a
+/// layout. It only has to be close enough to catch a label that is four times
+/// too long, which is the failure the user photographed.
+const CONTEXT_MENU_LABEL_CHAR_PX: f64 = 6.6;
 /// THE width owner for a context menu.
 ///
 /// Both halves of the decision read this one number: [`context_menu_placement`]
@@ -75686,7 +76372,9 @@ fn app() -> Element {
                         band: Some(context_menu_rail_band),
                         palette: snapshot.palette,
                         items: menu.menu_items(),
-                        menu_title: menu.title.clone(),
+                        // The contributed ROW's own label, which the row is
+                        // saying right above this menu. No heading.
+                        menu_title: String::new(),
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: false,
                         alt_overlay_sequence: String::new(),
@@ -75749,11 +76437,20 @@ fn app() -> Element {
                     ContextMenuOverlay {
                         position: menu.position,
                         window_size: context_menu_window_size,
-                        // THE reported bug: a rail row sits at the window's right
-                        // edge, so the menu anchors right and grew LEFTWARD over
-                        // the page — where a legacy web surface composites above
-                        // it and clipped everything past the rail's inner edge.
-                        band: Some(context_menu_rail_band),
+                        // ONE menu, TWO anchors, and they neighbour different
+                        // things. THE reported bug for the RAIL: a rail row sits
+                        // at the window's right edge, so the menu anchors right
+                        // and grew LEFTWARD over the page — where a legacy web
+                        // surface composites above it and clipped everything past
+                        // the rail's inner edge. The classic STRIP has no band to
+                        // be saved by: it hangs over pure page, so it takes the
+                        // STASH instead (`strip_dropdown_over_viewport`) and
+                        // banding it to a rail that may not even be mounted would
+                        // squeeze it into nothing.
+                        band: match menu.anchor {
+                            WebSurfaceChromeAnchor::Rail => Some(context_menu_rail_band),
+                            WebSurfaceChromeAnchor::Strip => None,
+                        },
                         palette: snapshot.palette,
                         items: snapshot.web_tab_menu_items.clone(),
                         menu_title: snapshot.web_tab_menu_title.clone(),
@@ -75788,8 +76485,8 @@ fn app() -> Element {
                         // geometry cannot save it and the STASH does
                         // (`strip_dropdown_over_viewport`).
                         band: match switcher.anchor {
-                            WebProfileSwitcherAnchor::Rail => Some(context_menu_rail_band),
-                            WebProfileSwitcherAnchor::Strip => None,
+                            WebSurfaceChromeAnchor::Rail => Some(context_menu_rail_band),
+                            WebSurfaceChromeAnchor::Strip => None,
                         },
                         palette: snapshot.palette,
                         items: switcher.menu_items(),
@@ -75802,8 +76499,8 @@ fn app() -> Element {
                         // names itself as the §4 walk root; rail-anchored it is
                         // an ordinary menu and stamps nothing.
                         modal_root: match switcher.anchor {
-                            WebProfileSwitcherAnchor::Strip => Some("strip-dropdown".to_string()),
-                            WebProfileSwitcherAnchor::Rail => None,
+                            WebSurfaceChromeAnchor::Strip => Some("strip-dropdown".to_string()),
+                            WebSurfaceChromeAnchor::Rail => None,
                         },
                         on_close: move |_| {
                             dismiss_menu(state, ShellMenu::WebProfile);
@@ -92183,6 +92880,7 @@ fn TerminalCanvas(
                                 let tab_loading_dot = web_tab_loading_dot_style(tab_loading);
                                 let select_path = web_surface_session_path.clone();
                                 let close_tab_path = web_surface_session_path.clone();
+                                let menu_path = web_surface_session_path.clone();
                                 let (tab_background, tab_opacity) = if tab_active {
                                     (web_chrome_bg.clone(), "1")
                                 } else {
@@ -92197,7 +92895,23 @@ fn TerminalCanvas(
                                             tab_background, web_chrome_fg, tab_opacity,
                                         ),
                                         onclick: move |_| {
-                                            select_web_surface_tab(state, select_path.clone(), tab_id);
+                                            select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
+                                        },
+                                        // THE SAME MENU the vertical rail's rows
+                                        // raise, through the same shared handler
+                                        // and onto the same state slot. A tab is
+                                        // a tab: it had every one of these verbs
+                                        // in one tab home and none of them in the
+                                        // other, which is the check-all-surfaces
+                                        // law broken in the plainest way there is.
+                                        oncontextmenu: move |evt: MouseEvent| {
+                                            open_web_tab_menu_from_event(
+                                                state,
+                                                &menu_path,
+                                                WebTabMenuTarget::Tab(tab_id),
+                                                WebSurfaceChromeAnchor::Strip,
+                                                evt,
+                                            );
                                         },
                                         span {
                                             "data-web-tab-loading": if tab_loading { "true" } else { "false" },
@@ -92241,17 +92955,19 @@ fn TerminalCanvas(
                                 title: "New tab",
                                 onclick: {
                                     let new_tab_path = web_surface_session_path.clone();
-                                    let address_input_id =
-                                        format!("{web_surface_host_id}-ws-address");
+                                    // The ONE opener. It places the tab
+                                    // (`WebTabOrigin::Append` — nothing opened
+                                    // it) and focuses the omnibox, because the
+                                    // request says the tab is Blank. The
+                                    // hand-copied `setTimeout` snippet that used
+                                    // to live here also hand-spelled the input's
+                                    // id, one of the two places it was written.
                                     move |_| {
-                                        state.with_mut(|shell| {
-                                            shell.web_surface_new_tab(&new_tab_path);
-                                        });
-                                        // Chrome opens new tabs typing-ready: focus
-                                        // the omnibox once the re-render commits.
-                                        let _ = document::eval(&format!(
-                                            "setTimeout(() => {{ const el = document.getElementById({address_input_id:?}); if (el) {{ el.focus(); if (el.select) {{ el.select(); }} }} }}, 60);"
-                                        ));
+                                        open_web_surface_tab(
+                                            state,
+                                            &new_tab_path,
+                                            WebTabOpenRequest::blank(),
+                                        );
                                     }
                                 },
                                 "+"
@@ -92349,7 +93065,7 @@ fn TerminalCanvas(
                                                                             if tab_active { "rgba(127,127,127,0.22)" } else { "transparent" },
                                                                         ),
                                                                         onclick: move |_| {
-                                                                            select_web_surface_tab(state, select_path.clone(), tab_id);
+                                                                            select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
                                                                             state.with_mut(|shell| shell.close_web_tab_overflow());
                                                                         },
                                                                         "{tab_label}"
@@ -92385,7 +93101,7 @@ fn TerminalCanvas(
                                                 open_web_profile_switcher_from_event(
                                                     state,
                                                     &badge_path,
-                                                    WebProfileSwitcherAnchor::Strip,
+                                                    WebSurfaceChromeAnchor::Strip,
                                                     evt,
                                                 );
                                             },
@@ -92467,7 +93183,8 @@ fn TerminalCanvas(
                             WebOmniboxBar {
                                 state,
                                 session_path: web_surface_session_path.clone(),
-                                input_id: format!("{web_surface_host_id}-ws-address"),
+                                // The id OWNER, not a second spelling of it.
+                                input_id: web_omnibox_input_id(false, &web_surface_host_id),
                                 ssh_target: web_surface_nav_ssh_target.clone(),
                                 overlay: web_overlay.clone(),
                                 foreground: web_chrome_fg.clone(),
@@ -97229,6 +97946,113 @@ fn focus_search_input_script(select_all: bool) -> String {
 fn focus_search_input(select_all: bool) {
     clear_sidebar_keyboard_owner();
     let _ = document::eval(&focus_search_input_script(select_all));
+}
+
+// ===== THE OMNIBOX'S DOM IDENTITY, AND THE ONE WAY TO PUT THE KEYBOARD IN IT ===
+
+/// The rail omnibox's DOM id. There is one vertical rail, so there is one of
+/// these.
+const WEB_RAIL_OMNIBOX_INPUT_ID: &str = "ws-rail-address";
+
+/// The DOM id of the omnibox input for one web surface.
+///
+/// ONE owner for BOTH tab modes. The rail mounts a single shared bar (one rail,
+/// one id); the classic strip mounts one bar per surface HOST, so its id carries
+/// the host and several can be on screen at once.
+///
+/// Spelled here because the mount and the focus call naming different elements
+/// fails SILENTLY — focus goes nowhere, and the user simply finds their typing
+/// landing in whatever had the keyboard before. Both ids used to be written by
+/// hand at the mount and again inside a hand-copied focus snippet, twice each.
+fn web_omnibox_input_id(vertical_tabs: bool, host_id: &str) -> String {
+    if vertical_tabs {
+        WEB_RAIL_OMNIBOX_INPUT_ID.to_string()
+    } else {
+        format!("{host_id}-ws-address")
+    }
+}
+
+/// Put the keyboard in an omnibox and select what is in it.
+///
+/// The same retry ladder the settings/search focus paths use, and for the same
+/// reason: `document::eval` is asynchronous, so a single shot can land before
+/// Dioxus has committed the render that creates the input. The ladder is what
+/// makes the promise "a new tab opens typing-ready" true rather than usually
+/// true — the three hand-copied `setTimeout(…, 60)` snippets this replaces were
+/// one guess each.
+fn focus_web_omnibox_script(input_id: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+          const claimFocus = () => {{
+            try {{
+              window.__yggtermUiFocusClaimUntilMs = Math.max(
+                Number(window.__yggtermUiFocusClaimUntilMs || 0),
+                Date.now() + 2200
+              );
+            }} catch (_error) {{}}
+          }};
+          claimFocus();
+          const runFocus = () => {{
+            const input = document.getElementById({input_id:?});
+            if (!input || typeof input.focus !== 'function') {{
+              return false;
+            }}
+            claimFocus();
+            try {{
+              input.focus({{ preventScroll: true }});
+            }} catch (_error) {{
+              try {{ input.focus(); }} catch (_error2) {{}}
+            }}
+            if (typeof input.select === 'function') {{
+              try {{ input.select(); }} catch (_error) {{}}
+            }}
+            return document.activeElement === input;
+          }};
+          if (runFocus()) {{
+            return;
+          }}
+          window.requestAnimationFrame(runFocus);
+          window.setTimeout(runFocus, 0);
+          window.setTimeout(runFocus, 32);
+          window.setTimeout(runFocus, 96);
+          window.setTimeout(runFocus, 220);
+        }})();
+        "#,
+    )
+}
+
+/// Put the keyboard in the omnibox of whichever tab mode is on screen.
+///
+/// THE one focus path for a new tab, reachable from anywhere in the tree. It was
+/// three hand-copied snippets, one per "+" button, so every OTHER way of opening
+/// a tab — a folder row's "+", the row menu, a keyboard route — left the user
+/// clicking into the address bar before they could type.
+///
+/// Silent when no surface is mounted: there is no omnibox to focus, and
+/// inventing one to shout about would be worse than doing nothing.
+fn focus_web_omnibox(state: Signal<ShellState>) {
+    let Some(input_id) = state.peek().active_web_omnibox_input_id() else {
+        return;
+    };
+    let _ = document::eval(&focus_web_omnibox_script(&input_id));
+}
+
+/// Open a tab from the UI, and put the keyboard where the request says it goes.
+///
+/// The ONE UI entry point for opening a tab. "A blank tab is typing-ready and a
+/// link-opened tab is not" is decided once here, by
+/// [`web_tab_opens_typing_ready`], instead of being re-remembered at each "+".
+fn open_web_surface_tab(
+    mut state: Signal<ShellState>,
+    session_path: &str,
+    request: WebTabOpenRequest,
+) -> Option<u64> {
+    let opened = state.with_mut(|shell| shell.web_surface_open_tab(session_path, &request));
+    if opened.is_some() && web_tab_opens_typing_ready(&request) {
+        focus_web_omnibox(state);
+    }
+    opened
 }
 fn terminal_should_accept_input(
     active_view_mode: WorkspaceViewMode,
@@ -111823,7 +112647,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         }
                     },
                     onclick: move |_| {
-                        select_web_surface_tab(state, select_path.clone(), tab_id);
+                        select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
                     },
                     // The rail's rows join every other row surface in the app:
                     // right-click raises the SHARED `ContextMenuOverlay`. The
@@ -111834,6 +112658,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             state,
                             &menu_path,
                             WebTabMenuTarget::Tab(tab_id),
+                            WebSurfaceChromeAnchor::Rail,
                             evt,
                         );
                     },
@@ -111891,7 +112716,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             WebOmniboxBar {
                 state,
                 session_path: omni_session_path.clone(),
-                input_id: "ws-rail-address".to_string(),
+                // The id OWNER, not a second spelling of it.
+                input_id: web_omnibox_input_id(true, ""),
                 ssh_target: omni_ssh.clone(),
                 overlay: omni_overlay.clone(),
                 foreground: omni_text.clone(),
@@ -111933,7 +112759,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                         open_web_profile_switcher_from_event(
                                             state,
                                             &badge_path,
-                                            WebProfileSwitcherAnchor::Rail,
+                                            WebSurfaceChromeAnchor::Rail,
                                             evt,
                                         );
                                     },
@@ -111951,12 +112777,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         ),
                         title: "New tab",
                         onclick: move |_| {
-                            state.with_mut(|shell| shell.web_surface_new_tab(&new_tab_path));
-                            // Chrome opens new tabs typing-ready: focus the rail omnibox
-                            // once the re-render commits.
-                            let _ = document::eval(
-                                "setTimeout(() => { const el = document.getElementById('ws-rail-address'); if (el) { el.focus(); if (el.select) { el.select(); } } }, 60);",
-                            );
+                            open_web_surface_tab(state, &new_tab_path, WebTabOpenRequest::blank());
                         },
                         svg {
                             width: "12",
@@ -112104,6 +112925,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                                 state,
                                                 &menu_path,
                                                 WebTabMenuTarget::Folder(menu_id.clone()),
+                                                WebSurfaceChromeAnchor::Rail,
                                                 evt,
                                             );
                                         }
@@ -112168,10 +112990,19 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                         onclick: {
                                             let add_path = add_path.clone();
                                             let add_id = add_id.clone();
+                                            // Same opener as every other "+", so
+                                            // a tab born in a folder is
+                                            // typing-ready too. It never was:
+                                            // this button had no focus snippet
+                                            // of its own to copy.
                                             move |evt: MouseEvent| {
                                                 evt.stop_propagation();
                                                 let (add_path, add_id) = (add_path.clone(), add_id.clone());
-                                                state.with_mut(|shell| shell.web_surface_new_tab_in_folder(&add_path, &add_id));
+                                                open_web_surface_tab(
+                                                    state,
+                                                    &add_path,
+                                                    WebTabOpenRequest::blank_in_folder(add_id),
+                                                );
                                             }
                                         },
                                         "+"
@@ -114800,6 +115631,62 @@ fn ConnectRailBody(
 /// [`build_keytip_scopes`] declares it. So a chord can never name an item the menu
 /// does not show, an item can never appear without an accelerator (the §12 audit),
 /// and adding an item wires the mouse and the keyboard in one edit.
+/// A menu entry's leading mark.
+///
+/// DESIGN.md ▸ Context menus asks for "modern Microsoft app menus", and those
+/// have an icon column; DESIGN.md ▸ Tree behavior and ▸ Brand and mascot ask for
+/// the marks themselves to stay "restrained and mostly grayscale" and to be
+/// "crisp simple line icons". So these are stroked SVG paths in `currentColor`
+/// on a 14-unit box — they inherit the row's tone, including the destructive red
+/// and the dimmed grey, rather than carrying colour of their own. An emoji glyph
+/// would fail both rules at once (full colour, and a different metric per
+/// platform).
+///
+/// A NAMED SET, not free-form path data at the call site: an icon vocabulary
+/// that anyone can extend inline is how a menu ends up with three different
+/// close marks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuIcon {
+    Plus,
+    Reopen,
+    Reload,
+    Copy,
+    Duplicate,
+    Split,
+    Folder,
+    Rename,
+    Collapse,
+    Expand,
+    Back,
+    Close,
+    Trash,
+}
+
+impl MenuIcon {
+    /// The stroked paths that draw this mark, on a `0 0 14 14` box.
+    fn paths(self) -> &'static [&'static str] {
+        match self {
+            MenuIcon::Plus => &["M7 3.2v7.6", "M3.2 7h7.6"],
+            MenuIcon::Reopen => &["M3.6 7.4a3.9 3.9 0 1 1 1.4 3.3", "M2.6 4.6v3h3"],
+            MenuIcon::Reload => &["M10.4 6.6a3.9 3.9 0 1 0 .3 2.2", "M11.4 3.6v3h-3"],
+            MenuIcon::Copy => &["M5.4 5.4h5.2v5.2H5.4z", "M3.4 8.6V3.4h5.2"],
+            MenuIcon::Duplicate => &["M3.2 3.2h5v5h-5z", "M5.8 10.8h5v-5"],
+            MenuIcon::Split => &["M2.6 3.4h8.8v7.2H2.6z", "M7 3.4v7.2"],
+            MenuIcon::Folder => &["M2.4 4.3a1 1 0 0 1 1-1h2l1.2 1.4h4.1a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H3.4a1 1 0 0 1-1-1V4.3Z"],
+            MenuIcon::Rename => &["M3 11l1.4-.35 6-6-1.05-1.05-6 6L3 11z"],
+            MenuIcon::Collapse => &["M3.8 5.4L7 8.6l3.2-3.2"],
+            MenuIcon::Expand => &["M5.4 3.8L8.6 7l-3.2 3.2"],
+            MenuIcon::Back => &["M8.6 3.8L5.4 7l3.2 3.2"],
+            MenuIcon::Close => &["M4.2 4.2l5.6 5.6", "M9.8 4.2l-5.6 5.6"],
+            MenuIcon::Trash => &[
+                "M3.2 4.4h7.6",
+                "M5.6 4.4V2.9h2.8v1.5",
+                "M4.4 4.4l.45 6.3h4.3l.45-6.3",
+            ],
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 struct RowMenuItem {
     /// Stable within the menu. Doubles as the `data-context-menu-action` value and
@@ -114820,6 +115707,24 @@ struct RowMenuItem {
     /// state teaches a verb exists only by accident; greying it out with the
     /// reason teaches what would make it available.
     disabled: bool,
+    /// WHY the item is inert, or a note a live item carries — for the TOOLTIP,
+    /// never for the label.
+    ///
+    /// It used to be appended to the label (`"Close tab — this is the app's own
+    /// tab; quitting the app closes it"`), which made every dimmed row four
+    /// times too long for the menu box and clipped it mid-word — the user's
+    /// screenshot, and a menu in which not one dimmed verb could be READ. The
+    /// reason is a hint about a command; it is not the command's name, and the
+    /// user must never read our justification as if it were the verb.
+    reason: Option<String>,
+    /// The leading mark, when this menu draws an icon column.
+    ///
+    /// `None` is the default and stays the default for four of the five menus:
+    /// [`ContextMenuOverlay`] draws the column only when at least ONE item in
+    /// the list it was handed carries an icon, so a menu that opts out is drawn
+    /// exactly as it was before the column existed. Within a menu that opts in,
+    /// every row reserves the slot — a half-indented list reads worse than none.
+    icon: Option<MenuIcon>,
 }
 impl RowMenuItem {
     fn new(id: impl Into<String>, label: impl Into<String>, hint: char) -> Self {
@@ -114831,6 +115736,8 @@ impl RowMenuItem {
             emphasized: false,
             separator: false,
             disabled: false,
+            icon: None,
+            reason: None,
         }
     }
     fn hinted(id: impl Into<String>, label: impl Into<String>, hint: Option<char>) -> Self {
@@ -114842,7 +115749,13 @@ impl RowMenuItem {
             emphasized: false,
             separator: false,
             disabled: false,
+            icon: None,
+            reason: None,
         }
+    }
+    fn icon(mut self, icon: MenuIcon) -> Self {
+        self.icon = Some(icon);
+        self
     }
     fn destructive(mut self) -> Self {
         self.destructive = true;
@@ -114852,15 +115765,39 @@ impl RowMenuItem {
         self.emphasized = true;
         self
     }
-    /// Grey the item out and SAY WHY, in the label itself. The reason is not
+    /// Grey the item out and SAY WHY — in the TOOLTIP. The reason is not
     /// decoration: an item that just goes dim is indistinguishable from a bug.
+    /// But it is not the item's NAME either; appending it to the label is what
+    /// made a 216px menu render `Close tab — this is the app's own ta…` and
+    /// left the user with no readable verb at all.
+    ///
     /// A disabled item also loses its accelerator — a chord must never reach a
     /// verb the mouse cannot.
-    fn disabled(mut self, reason: impl AsRef<str>) -> Self {
+    fn disabled(mut self, reason: impl Into<String>) -> Self {
         self.disabled = true;
         self.hint = None;
-        self.label = format!("{} — {}", self.label, reason.as_ref());
+        self.reason = Some(reason.into());
         self
+    }
+    /// A note a LIVE item carries, for the same tooltip slot. Used where the
+    /// consequence matters more than the verb reads — "Delete folder" needs to
+    /// say that the tabs survive, and it needs to say it somewhere other than
+    /// in its own name.
+    fn note(mut self, note: impl Into<String>) -> Self {
+        self.reason = Some(note.into());
+        self
+    }
+    /// The hover text for this entry.
+    ///
+    /// The reason when there is one; otherwise the LABEL, so an entry the box
+    /// had to ellipsize is still readable somewhere. A menu must never show a
+    /// name it cannot show in full and offer no way to read the rest.
+    fn tooltip(&self) -> String {
+        match (&self.reason, self.disabled) {
+            (Some(reason), true) => format!("{} — {reason}", self.label),
+            (Some(note), false) => format!("{} — {note}", self.label),
+            (None, _) => self.label.clone(),
+        }
     }
     fn divider() -> Self {
         Self {
@@ -114871,8 +115808,20 @@ impl RowMenuItem {
             emphasized: false,
             separator: true,
             disabled: false,
+            icon: None,
+            reason: None,
         }
     }
+}
+
+/// Does this menu draw an icon column?
+///
+/// A property of the LIST, asked once per menu, so the answer is the same for
+/// every row in it: a column that appears on some rows and not others is a
+/// ragged left edge, and reserving the slot unconditionally would re-indent the
+/// four menus that carry no icons at all.
+fn context_menu_has_icons(items: &[RowMenuItem]) -> bool {
+    items.iter().any(|item| item.icon.is_some())
 }
 /// What a click on a menu item DISPATCHES — `None` when the item is inert.
 ///
@@ -115009,6 +115958,24 @@ fn web_tab_folder_close_targets(tabs: &[WebTabScopeRow], folder_id: &str) -> Vec
         .collect()
 }
 
+/// The tabs a "Close tabs below" on `from` closes: the ones AFTER it in its own
+/// scope. Folder-scoped for the same reason
+/// [`web_tab_close_others_targets`] is — a tab filed in "Work" does not speak
+/// for the root, and "below" in a tree means below within your own group.
+fn web_tab_close_below_targets(tabs: &[WebTabScopeRow], from: u64) -> Vec<u64> {
+    let Some(at) = tabs.iter().position(|(id, _)| *id == from) else {
+        return Vec::new();
+    };
+    let scope = tabs[at].1.clone();
+    tabs.iter()
+        .skip(at + 1)
+        .filter(|(id, folder)| {
+            *id != WEB_TAB_APP_TAB_ID && folder.as_deref() == scope.as_deref()
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// English for a count of tabs, so every destructive item in this menu NAMES
 /// what it will take. One owner, because "Close 12 other tabs" and "Close 1
 /// other tab" must not be two independently-maintained sentences.
@@ -115020,18 +115987,33 @@ fn web_tab_count_phrase(count: usize, noun: &str) -> String {
     }
 }
 
-/// The rail row menu. Pure: same surface, same target, same menu, in a stable
-/// order.
+/// The tab menu. Pure: same surface, same target, same page, same menu, in a
+/// stable order.
 ///
-/// "Move to folder" is FLATTENED into one row per folder rather than a nested
-/// submenu: [`ContextMenuOverlay`] is the app's one menu component and it draws
-/// a flat list, and inventing a second menu component to hold a submenu is
-/// exactly the duplication the reuse doctrine forbids.
+/// GROUPED BY INTENT, dividers between the groups, destructive LAST. The order
+/// used to open with "Close tab", which put the one irreversible verb under the
+/// pointer the instant the menu appeared — and buried the create verbs, of which
+/// there were none at all. DESIGN.md ▸ Context menus asks for "modern Microsoft
+/// app menus", and those read create → act on this thing → arrange → destroy:
+///
+///   create      New tab · New tab below this one · Reopen closed tabs
+///   page        Reload · Copy URL · Duplicate tab · Split with active tab
+///   arrange     Move to folder ▸
+///   destroy     Close tab · Close N other tabs · Close N tabs below
+///
+/// "Move to folder ▸" turns the menu to its own PAGE rather than flattening one
+/// sibling row per folder into this list. The flat form pushed the tab's own
+/// verbs off the bottom as soon as a user had more than a few folders, and it
+/// scaled linearly with something the user controls. The page is the same
+/// [`ContextMenuOverlay`] at the same anchor — one menu component, per the reuse
+/// doctrine — showing a different list.
 fn web_tab_menu_items(
     tabs: &[WebSurfaceOverlayTabView],
     folders: &[WebTabFolder],
     active_tab_id: u64,
     target: &WebTabMenuTarget,
+    page: WebTabMenuPage,
+    reopen_count: usize,
 ) -> Vec<RowMenuItem> {
     let scope = web_tab_scope_rows(tabs);
     let mut items: Vec<RowMenuItem> = Vec::new();
@@ -115041,19 +116023,92 @@ fn web_tab_menu_items(
             let Some(tab) = tabs.iter().find(|tab| tab.id == tab_id) else {
                 return items;
             };
-            let close = RowMenuItem::new("webtab-close", "Close tab", 'c').destructive();
+            if page == WebTabMenuPage::MoveToFolder {
+                return web_tab_move_page_items(tab, folders);
+            }
+            // ---- create -----------------------------------------------------
+            items.push(
+                RowMenuItem::new("webtab-new", "New tab", 't').icon(MenuIcon::Plus),
+            );
+            // Meaningful only because placement has an owner: "below this one"
+            // is a real destination now, and the tab it opens joins this tab's
+            // opener group so the next one cascades after it.
+            items.push(
+                RowMenuItem::new("webtab-new-below", "New tab below this one", 'b')
+                    .icon(MenuIcon::Plus),
+            );
+            let reopen = RowMenuItem::new(
+                "webtab-reopen",
+                format!("Reopen {}", web_tab_count_phrase(reopen_count.max(1), "closed tab")),
+                'e',
+            )
+            .icon(MenuIcon::Reopen);
+            items.push(if reopen_count == 0 {
+                reopen.disabled("nothing has been closed here yet")
+            } else {
+                reopen
+            });
+            items.push(RowMenuItem::divider());
+            // ---- this page --------------------------------------------------
+            let reload = RowMenuItem::new("webtab-reload", "Reload", 'r').icon(MenuIcon::Reload);
+            items.push(if tab.effective_url.trim().is_empty() {
+                reload.disabled("this tab has not gone anywhere yet")
+            } else {
+                reload
+            });
+            let copy_url =
+                RowMenuItem::new("webtab-copy-url", "Copy URL", 'u').icon(MenuIcon::Copy);
+            items.push(if tab.effective_url.trim().is_empty() {
+                copy_url.disabled("this tab has no address to copy")
+            } else {
+                copy_url
+            });
+            // The app tab is the APP, not a page to copy: a duplicate of it
+            // would be an ordinary user tab, and user tabs are persisted — the
+            // menu would mint the stale start-page row `persist_web_tabs`
+            // deliberately refuses to save. Greyed and saying so, like the
+            // other two app-tab verbs.
+            let duplicate = RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd')
+                .icon(MenuIcon::Duplicate);
+            items.push(if tab.is_app_tab {
+                duplicate.disabled("the app's own tab is the app, not a page to copy")
+            } else {
+                duplicate
+            });
+            let split = RowMenuItem::new("webtab-split", "Split with active tab", 's')
+                .icon(MenuIcon::Split);
+            items.push(if tab_id == active_tab_id {
+                split.disabled("this IS the active tab")
+            } else {
+                split
+            });
+            items.push(RowMenuItem::divider());
+            // ---- arrange ----------------------------------------------------
+            let move_to = RowMenuItem::new("webtab-move", "Move to folder ▸", 'm')
+                .icon(MenuIcon::Folder);
+            items.push(if tab.is_app_tab {
+                move_to.disabled("the app's tab belongs to the app, not to the tree")
+            } else {
+                move_to
+            });
+            items.push(RowMenuItem::divider());
+            // ---- destroy, last ----------------------------------------------
+            let close = RowMenuItem::new("webtab-close", "Close tab", 'c')
+                .icon(MenuIcon::Close)
+                .destructive();
             items.push(if tab.is_app_tab {
                 close.disabled("this is the app's own tab; quitting the app closes it")
             } else {
                 close
             });
             let others = web_tab_close_others_targets(&scope, tab_id);
-            let others_label = format!(
-                "Close {}",
-                web_tab_count_phrase(others.len(), "other tab")
-            );
-            let close_others =
-                RowMenuItem::new("webtab-close-others", others_label, 'o').destructive();
+            let close_others = RowMenuItem::new(
+                "webtab-close-others",
+                format!("Close {}", web_tab_count_phrase(others.len(), "other tab")),
+                'o',
+            )
+            .icon(MenuIcon::Close)
+            .destructive();
             items.push(if others.is_empty() {
                 close_others.disabled(if tab.folder.is_some() {
                     "nothing else is filed here"
@@ -115063,69 +116118,49 @@ fn web_tab_menu_items(
             } else {
                 close_others
             });
-            // The app tab is the APP, not a page to copy: a duplicate of it
-            // would be an ordinary user tab, and user tabs are persisted — the
-            // menu would mint the stale start-page row `persist_web_tabs`
-            // deliberately refuses to save. Greyed and saying so, like the
-            // other two app-tab verbs.
-            let duplicate = RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd');
-            items.push(if tab.is_app_tab {
-                duplicate.disabled("the app's own tab is the app, not a page to copy")
+            let below = web_tab_close_below_targets(&scope, tab_id);
+            let close_below = RowMenuItem::new(
+                "webtab-close-below",
+                format!("Close {} below", web_tab_count_phrase(below.len(), "tab")),
+                'w',
+            )
+            .icon(MenuIcon::Close)
+            .destructive();
+            items.push(if below.is_empty() {
+                close_below.disabled("nothing is below this one here")
             } else {
-                duplicate
+                close_below
             });
-            let split = RowMenuItem::new("webtab-split", "Split with active tab", 's');
-            items.push(if tab_id == active_tab_id {
-                split.disabled("this IS the active tab")
-            } else {
-                split
-            });
-            items.push(RowMenuItem::divider());
-            // FILE IT. One row per destination, the flat form of "Move to
-            // folder ▸". A tab already in a folder still lists that folder, so
-            // the current home is visible rather than mysteriously absent.
-            if tab.is_app_tab {
-                items.push(
-                    RowMenuItem::hinted("webtab-move-root", "Move to folder", None)
-                        .disabled("the app's tab belongs to the app, not to the tree"),
-                );
-            } else {
-                if tab.folder.is_some() {
-                    items.push(RowMenuItem::new("webtab-move-root", "Move to Root", 'r'));
-                }
-                for folder in folders {
-                    let item = RowMenuItem::hinted(
-                        format!("webtab-move:{}", folder.id),
-                        format!("Move to {}", folder.name),
-                        folder.name.chars().next(),
-                    );
-                    items.push(if tab.folder.as_deref() == Some(folder.id.as_str()) {
-                        item.disabled("already here")
-                    } else {
-                        item
-                    });
-                }
-                items.push(RowMenuItem::new(
-                    "webtab-move-new-folder",
-                    "Move to New Folder…",
-                    'n',
-                ));
-            }
         }
         WebTabMenuTarget::Folder(folder_id) => {
             let Some(folder) = folders.iter().find(|folder| &folder.id == folder_id) else {
                 return items;
             };
-            items.push(RowMenuItem::new("webfolder-rename", "Rename", 'r'));
-            items.push(RowMenuItem::new(
-                "webfolder-toggle",
-                if folder.collapsed {
-                    "Expand"
+            // Same intent grouping as a tab's menu: create, arrange, destroy.
+            items.push(
+                RowMenuItem::new("webfolder-new-tab", "New tab in this folder", 't')
+                    .icon(MenuIcon::Plus),
+            );
+            items.push(RowMenuItem::divider());
+            items.push(
+                RowMenuItem::new("webfolder-rename", "Rename", 'r').icon(MenuIcon::Rename),
+            );
+            items.push(
+                RowMenuItem::new(
+                    "webfolder-toggle",
+                    if folder.collapsed {
+                        "Expand"
+                    } else {
+                        "Collapse"
+                    },
+                    'e',
+                )
+                .icon(if folder.collapsed {
+                    MenuIcon::Expand
                 } else {
-                    "Collapse"
-                },
-                'e',
-            ));
+                    MenuIcon::Collapse
+                }),
+            );
             items.push(RowMenuItem::divider());
             let filed = web_tab_folder_close_targets(&scope, folder_id);
             let close = RowMenuItem::new(
@@ -115133,34 +116168,98 @@ fn web_tab_menu_items(
                 format!("Close {}", web_tab_count_phrase(filed.len(), "tab")),
                 'c',
             )
+            .icon(MenuIcon::Close)
             .destructive();
             items.push(if filed.is_empty() {
                 close.disabled("this folder is empty")
             } else {
                 close
             });
+            // The row's hover 🗑 had no keyboard or menu route at all. The
+            // consequence rides the TOOLTIP, where the reasons live: deleting
+            // organization must never read as deleting content, and it must not
+            // say so in a name four times too wide for the box.
+            items.push(
+                RowMenuItem::new("webfolder-delete", "Delete folder", 'd')
+                    .icon(MenuIcon::Trash)
+                    .destructive()
+                    .note("its tabs return to the root"),
+            );
         }
     }
     items
 }
 
-/// The menu heading: the row the user right-clicked, named.
-fn web_tab_menu_title(
-    tabs: &[WebSurfaceOverlayTabView],
+/// The "Move to folder ▸" PAGE: back out, then one row per destination.
+///
+/// The same one-row-per-folder list the root menu used to carry inline — but on
+/// its own page, so the tab's verbs are never pushed off the bottom by how many
+/// folders the user happens to have. A tab already in a folder still sees that
+/// folder, inert and saying so, because the current home being mysteriously
+/// absent is worse than it being unclickable.
+fn web_tab_move_page_items(
+    tab: &WebSurfaceOverlayTabView,
     folders: &[WebTabFolder],
-    target: &WebTabMenuTarget,
+) -> Vec<RowMenuItem> {
+    let mut items = vec![
+        RowMenuItem::new("webtab-move-back", "Back", 'b').icon(MenuIcon::Back),
+        RowMenuItem::divider(),
+    ];
+    let root = RowMenuItem::new("webtab-move-root", "Root", 'r').icon(MenuIcon::Folder);
+    items.push(if tab.folder.is_none() {
+        root.disabled("already here")
+    } else {
+        root
+    });
+    for folder in folders {
+        let item = RowMenuItem::hinted(
+            format!("webtab-move:{}", folder.id),
+            folder.name.clone(),
+            folder.name.chars().next(),
+        )
+        .icon(MenuIcon::Folder);
+        items.push(if tab.folder.as_deref() == Some(folder.id.as_str()) {
+            item.disabled("already here")
+        } else {
+            item
+        });
+    }
+    items.push(RowMenuItem::divider());
+    items.push(
+        RowMenuItem::new("webtab-move-new-folder", "New folder…", 'n').icon(MenuIcon::Plus),
+    );
+    items
+}
+
+/// The menu heading: the row the user right-clicked, named — and on a submenu
+/// page, what that page is for.
+fn web_tab_menu_title(
+    _tabs: &[WebSurfaceOverlayTabView],
+    _folders: &[WebTabFolder],
+    _target: &WebTabMenuTarget,
+    page: WebTabMenuPage,
 ) -> String {
-    match target {
-        WebTabMenuTarget::Tab(tab_id) => tabs
-            .iter()
-            .find(|tab| tab.id == *tab_id)
-            .map(|tab| tab.label.clone())
-            .unwrap_or_else(|| "Tab".to_string()),
-        WebTabMenuTarget::Folder(folder_id) => folders
-            .iter()
-            .find(|folder| &folder.id == folder_id)
-            .map(|folder| folder.name.clone())
-            .unwrap_or_else(|| "Folder".to_string()),
+    match page {
+        // Which PAGE you are on — something no row on screen says.
+        WebTabMenuPage::MoveToFolder => "Move to folder".to_string(),
+        // The row's own name, which the row is saying directly above the menu,
+        // highlighted. Repeating it stacked the same words twice and spent a
+        // line of a 216px box on nothing (the user's screenshot).
+        WebTabMenuPage::Root => String::new(),
+    }
+}
+
+/// Menu ids that TURN THE PAGE rather than run a verb.
+///
+/// Resolved BEFORE the action router, because these two are the only ids that
+/// must leave the menu open — everything else in this menu closes it. A pure
+/// function so "which ids are navigation" is one list rather than a shape
+/// inside the dispatch closure.
+fn web_tab_menu_page_turn(id: &str) -> Option<WebTabMenuPage> {
+    match id {
+        "webtab-move" => Some(WebTabMenuPage::MoveToFolder),
+        "webtab-move-back" => Some(WebTabMenuPage::Root),
+        _ => None,
     }
 }
 
@@ -115172,15 +116271,23 @@ fn web_tab_menu_title(
 /// cannot reach a tab verb by spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebTabMenuAction {
+    NewTab,
+    NewTabBelow(u64),
+    ReopenClosedTabs,
+    ReloadTab(u64),
+    CopyTabUrl(u64),
     CloseTab(u64),
     CloseOtherTabs(u64),
+    CloseTabsBelow(u64),
     DuplicateTab(u64),
     MoveToFolder(u64, Option<String>),
     MoveToNewFolder(u64),
     SplitWithActiveTab(u64),
+    NewTabInFolder(String),
     RenameFolder(String),
     ToggleFolder(String),
     CloseFolderTabs(String),
+    DeleteFolder(String),
 }
 
 fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenuAction> {
@@ -115188,8 +116295,14 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
         WebTabMenuTarget::Tab(tab) => {
             let tab = *tab;
             match id {
+                "webtab-new" => Some(WebTabMenuAction::NewTab),
+                "webtab-new-below" => Some(WebTabMenuAction::NewTabBelow(tab)),
+                "webtab-reopen" => Some(WebTabMenuAction::ReopenClosedTabs),
+                "webtab-reload" => Some(WebTabMenuAction::ReloadTab(tab)),
+                "webtab-copy-url" => Some(WebTabMenuAction::CopyTabUrl(tab)),
                 "webtab-close" => Some(WebTabMenuAction::CloseTab(tab)),
                 "webtab-close-others" => Some(WebTabMenuAction::CloseOtherTabs(tab)),
+                "webtab-close-below" => Some(WebTabMenuAction::CloseTabsBelow(tab)),
                 "webtab-duplicate" => Some(WebTabMenuAction::DuplicateTab(tab)),
                 "webtab-split" => Some(WebTabMenuAction::SplitWithActiveTab(tab)),
                 "webtab-move-root" => Some(WebTabMenuAction::MoveToFolder(tab, None)),
@@ -115203,9 +116316,11 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
             }
         }
         WebTabMenuTarget::Folder(folder) => match id {
+            "webfolder-new-tab" => Some(WebTabMenuAction::NewTabInFolder(folder.clone())),
             "webfolder-rename" => Some(WebTabMenuAction::RenameFolder(folder.clone())),
             "webfolder-toggle" => Some(WebTabMenuAction::ToggleFolder(folder.clone())),
             "webfolder-close-tabs" => Some(WebTabMenuAction::CloseFolderTabs(folder.clone())),
+            "webfolder-delete" => Some(WebTabMenuAction::DeleteFolder(folder.clone())),
             _ => None,
         },
     }
@@ -115230,17 +116345,28 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
             .map(|(id, _)| *id)
             .collect(),
         WebTabMenuAction::CloseOtherTabs(tab_id) => web_tab_close_others_targets(tabs, *tab_id),
+        WebTabMenuAction::CloseTabsBelow(tab_id) => web_tab_close_below_targets(tabs, *tab_id),
         WebTabMenuAction::CloseFolderTabs(folder_id) => {
             web_tab_folder_close_targets(tabs, folder_id)
         }
         // Not a close verb. An empty plan is the honest answer, and the arm
-        // that runs it never asks.
-        WebTabMenuAction::DuplicateTab(_)
+        // that runs it never asks. `DeleteFolder` is listed HERE deliberately:
+        // deleting a folder returns its tabs to the root, it does not close
+        // them, and a close plan is the one place that could quietly turn
+        // "delete the organization" into "delete the content".
+        WebTabMenuAction::NewTab
+        | WebTabMenuAction::NewTabBelow(_)
+        | WebTabMenuAction::ReopenClosedTabs
+        | WebTabMenuAction::ReloadTab(_)
+        | WebTabMenuAction::CopyTabUrl(_)
+        | WebTabMenuAction::DuplicateTab(_)
         | WebTabMenuAction::MoveToFolder(_, _)
         | WebTabMenuAction::MoveToNewFolder(_)
         | WebTabMenuAction::SplitWithActiveTab(_)
+        | WebTabMenuAction::NewTabInFolder(_)
         | WebTabMenuAction::RenameFolder(_)
-        | WebTabMenuAction::ToggleFolder(_) => Vec::new(),
+        | WebTabMenuAction::ToggleFolder(_)
+        | WebTabMenuAction::DeleteFolder(_) => Vec::new(),
     }
 }
 
@@ -115937,6 +117063,7 @@ fn open_web_tab_menu_from_event(
     mut state: Signal<ShellState>,
     session_path: &str,
     target: WebTabMenuTarget,
+    anchor: WebSurfaceChromeAnchor,
     evt: MouseEvent,
 ) {
     // The native WebKit menu must not also open, and the row's own click must
@@ -115946,7 +117073,7 @@ fn open_web_tab_menu_from_event(
     let coords = evt.client_coordinates();
     let session_path = session_path.to_string();
     state.with_mut(|shell| {
-        shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y));
+        shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y), anchor);
     });
 }
 
@@ -115958,7 +117085,7 @@ fn open_web_tab_menu_from_event(
 fn open_web_profile_switcher_from_event(
     mut state: Signal<ShellState>,
     session_path: &str,
-    anchor: WebProfileSwitcherAnchor,
+    anchor: WebSurfaceChromeAnchor,
     evt: MouseEvent,
 ) {
     evt.stop_propagation();
@@ -115978,6 +117105,15 @@ fn open_web_profile_switcher_from_event(
 /// what a label counted against what actually closed; the one thing that cannot
 /// live there is the split, which needs this `Signal` to open a pane.
 fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabContextMenu, id: String) {
+    // PAGE TURNS FIRST, and they are the only ids that leave the menu standing.
+    // "Move to folder ▸" is a submenu: the overlay stays where it is and shows
+    // the other list. Resolved through the pure owner
+    // ([`web_tab_menu_page_turn`]) so which ids navigate is a list, not a shape
+    // buried in this closure.
+    if let Some(page) = web_tab_menu_page_turn(&id) {
+        state.with_mut(|shell| shell.turn_web_tab_menu_page(page));
+        return;
+    }
     let Some(action) = web_tab_menu_action(&menu.target, &id) else {
         state.with_mut(|shell| shell.close_web_tab_context_menu());
         return;
@@ -115986,6 +117122,66 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
     state.with_mut(|shell| shell.close_web_tab_context_menu());
     if state.with_mut(|shell| shell.apply_web_tab_menu_action(&session_path, &action)) {
         return;
+    }
+    // The verbs that need the Signal.
+    match &action {
+        // Both open through the ONE UI opener, so a tab opened from the menu is
+        // typing-ready exactly like one opened from a "+" — which is the whole
+        // "on new tab ANYWHERE in the tree the focus should be on the URL input
+        // box" half of the report.
+        WebTabMenuAction::NewTab => {
+            open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank());
+            return;
+        }
+        WebTabMenuAction::NewTabBelow(tab_id) => {
+            open_web_surface_tab(state, &session_path, WebTabOpenRequest::blank_below(*tab_id));
+            return;
+        }
+        WebTabMenuAction::ReopenClosedTabs => {
+            let reopened =
+                state.with_mut(|shell| shell.web_surface_reopen_closed_tabs(&session_path));
+            // ONE selection for the batch: reopening twelve tabs must not walk
+            // the user through twelve fronts, and the selection is what
+            // resolves that tab's egress (the same reason the duplicate
+            // selects). `Opened`, because the user picked a verb, not a row.
+            if let Some(first) = reopened.first() {
+                select_web_surface_tab(
+                    state,
+                    session_path.clone(),
+                    *first,
+                    WebTabSelect::Opened,
+                );
+            }
+            return;
+        }
+        WebTabMenuAction::CopyTabUrl(tab_id) => {
+            let url = state.peek().web_surface_tab_url(&session_path, *tab_id);
+            let Some(url) = url else {
+                return;
+            };
+            // The app's ONE clipboard owner. A second writer here would fight
+            // the terminal's copy path for the selection.
+            let copied = set_native_clipboard_contents(
+                state,
+                &YgguiClipboardContents::Text { text: url.clone() },
+            );
+            state.with_mut(|shell| match copied {
+                Ok(_) => shell.push_notification(
+                    NotificationTone::Success,
+                    "URL Copied",
+                    url.clone(),
+                ),
+                // Named, not swallowed: a copy that silently did nothing is
+                // discovered at the paste, somewhere else entirely.
+                Err(error) => shell.push_notification(
+                    NotificationTone::Warning,
+                    "Could Not Copy URL",
+                    error.to_string(),
+                ),
+            });
+            return;
+        }
+        _ => {}
     }
     if let WebTabMenuAction::SplitWithActiveTab(tab_id) = action {
         // The EXISTING intra-tab split, which had no UI entry until now:
@@ -116000,7 +117196,7 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
         if let Some(new_id) =
             state.with_mut(|shell| shell.web_surface_duplicate_tab(&session_path, tab_id))
         {
-            select_web_surface_tab(state, session_path.clone(), new_id);
+            select_web_surface_tab(state, session_path.clone(), new_id, WebTabSelect::Opened);
         }
     }
 }
@@ -116502,6 +117698,8 @@ fn ContextMenuOverlay(
 ) -> Element {
     // ONE width, read by the placement and by the box that is drawn.
     let menu_width = context_menu_width(band);
+    // Asked once for the whole list, so every row of one menu agrees.
+    let menu_has_icons = context_menu_has_icons(&items);
     let placement = context_menu_placement(
         position,
         window_size,
@@ -116572,9 +117770,19 @@ fn ContextMenuOverlay(
                     evt.prevent_default();
                     evt.stop_propagation();
                 },
-                div {
-                    style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                    "{menu_title}"
+                // A HEADING ONLY WHEN IT EARNS ITS PLACE. A menu raised ON a row
+                // is drawn directly under that row, which is highlighted and
+                // already says its own name — repeating it stacks the same words
+                // twice (the user's screenshot) and costs a line of a box that
+                // is only ~216px wide. An empty title is a mount saying "the
+                // thing this acts on is right there"; the mounts that DO pass
+                // one are saying something the row cannot — which page you are
+                // on, how many rows are selected, or which surface this is.
+                if !menu_title.trim().is_empty() {
+                    div {
+                        style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                        "{menu_title}"
+                    }
                 }
                 for item in items.iter().cloned() {
                     if item.separator {
@@ -116584,9 +117792,20 @@ fn ContextMenuOverlay(
                         }
                     } else {
                         button {
+                            // The ICON COLUMN, drawn only for a menu that opted
+                            // in (`context_menu_has_icons`). Every row of such a
+                            // menu reserves the slot, including the rows with no
+                            // mark, so the labels keep one left edge. The mark
+                            // is stroked in `currentColor`, so it inherits the
+                            // row's tone — destructive red, dimmed grey — rather
+                            // than carrying colour of its own (DESIGN.md ▸ Tree
+                            // behavior: restrained and mostly grayscale).
                             key: "item-{item.id}",
                             "data-context-menu-action": "{item.id}",
                             "data-context-menu-disabled": "{item.disabled}",
+                            // WHY it is inert, or the whole label when the box
+                            // had to ellipsize it. Never in the label itself.
+                            title: item.tooltip(),
                             class: "yggterm-menu-item",
                             // ONE style owner (`context_menu_item_style`) routes
                             // every branch through the shared style engine, so
@@ -116626,7 +117845,34 @@ fn ContextMenuOverlay(
                                 ),
                                 style: "display:none;",
                             }
-                            "{item.label}"
+                            if menu_has_icons {
+                                span {
+                                    "data-context-menu-icon": item.icon.is_some(),
+                                    style: "flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px; margin-right:9px;",
+                                    if let Some(icon) = item.icon {
+                                        svg {
+                                            width: "14",
+                                            height: "14",
+                                            view_box: "0 0 14 14",
+                                            fill: "none",
+                                            for d in icon.paths() {
+                                                path {
+                                                    key: "{d}",
+                                                    d: "{d}",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "1.25",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            span {
+                                style: "flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;",
+                                "{item.label}"
+                            }
                         }
                     }
                 }
@@ -122334,6 +123580,7 @@ mod tests {
                     theme_color: None,
                     lease_until_ms: None,
                     script_opened: false,
+                    opener: None,
                 }],
                 folders: Vec::new(),
                 active_tab: 0,
@@ -122346,6 +123593,8 @@ mod tests {
                 osc_url: "https://app".to_string(),
                 picker: None,
                 find: None,
+                // A fresh surface has closed nothing yet.
+                closed_tabs: Vec::new(),
             },
         );
     }
@@ -126292,7 +127541,7 @@ mod tests {
             WebSurfaceOpenKind::Launch,
             1_000,
         );
-        shell.web_surface_new_tab("local://ws");
+        shell.web_surface_open_tab("local://ws", &WebTabOpenRequest::blank());
         shell.apply_web_surface_tab_navigation(
             "local://ws",
             1,
@@ -126482,7 +127731,10 @@ mod tests {
         );
         // What the drain calls: `raise = !background`, i.e. false for the gesture.
         let (tab_id, ssh_target) = shell
-            .open_command_tab("local://ws", false)
+            .open_command_tab(
+                "local://ws",
+                &WebTabOpenRequest::opened_by(0, true),
+            )
             .expect("surface is live");
         let surface = &shell.web_surfaces["local://ws"];
         assert_eq!(surface.tabs.len(), 2);
@@ -126527,7 +127779,10 @@ mod tests {
 
         // No surface: a transient drop, not a panic (the opener can die between
         // the click and the tick that drains it).
-        assert_eq!(shell.open_command_tab("local://gone", false), None);
+        assert_eq!(
+            shell.open_command_tab("local://gone", &WebTabOpenRequest::opened_by(0, true)),
+            None
+        );
     }
 
     /// The drain that turns a middle-clicked link into a tab: it resolves the
@@ -126574,10 +127829,21 @@ mod tests {
                  and which profile and egress it inherits",
             );
         }
-        if !body.contains("shell.open_command_tab(&session_path, !link.background)") {
+        if !body.contains("WebTabOpenRequest::opened_by(opener_tab_id, link.background)") {
             violations.push(
-                "the drain must MINT the tab (raise taken from the gesture, not assumed): \
-                 the `open_tab` command drain's exact call, because this is the same act",
+                "the drain must MINT the tab through the ONE open request, naming the \
+                 OPENER and taking `background` from the gesture rather than assuming it. \
+                 `opened_by` is what carries both halves the user asked for: the new tab \
+                 lands below the page that linked it (and cascades after that page's \
+                 earlier links), and it is BOUND — a URL is on its way — so it never \
+                 steals the keyboard into the address bar. An `Append` here loses the \
+                 placement silently; a `Blank` destination makes middle-click unusable",
+            );
+        }
+        if !body.contains("shell.open_command_tab(") {
+            violations.push(
+                "…and it must still be `open_command_tab`, the `open_tab` command drain's \
+                 own minting path, because this is the same act",
             );
         }
         if !body.contains("navigate_web_surface_tab(") {
@@ -129436,7 +130702,7 @@ mod tests {
                         session_path: "local://ws".to_string(),
                         current_profile: "default".to_string(),
                         profiles: vec!["default".to_string()],
-                        anchor: WebProfileSwitcherAnchor::Strip,
+                        anchor: WebSurfaceChromeAnchor::Strip,
                         position: (820.0, 90.0),
                     });
                 }),
@@ -164759,6 +166025,41 @@ mod webtabs_menu_switcher_locks {
         }
     }
 
+    /// The ROOT page of a tab/folder menu, with nothing on the undo stack —
+    /// what a right-click shows. The two extra arguments are spelled here once
+    /// so a test that cares about neither does not restate them.
+    fn menu_items(
+        tabs: &[WebSurfaceOverlayTabView],
+        folders: &[WebTabFolder],
+        active_tab_id: u64,
+        target: &WebTabMenuTarget,
+    ) -> Vec<RowMenuItem> {
+        web_tab_menu_items(
+            tabs,
+            folders,
+            active_tab_id,
+            target,
+            WebTabMenuPage::Root,
+            0,
+        )
+    }
+
+    /// The "Move to folder ▸" PAGE of a tab's menu.
+    fn move_page_items(
+        tabs: &[WebSurfaceOverlayTabView],
+        folders: &[WebTabFolder],
+        target: &WebTabMenuTarget,
+    ) -> Vec<RowMenuItem> {
+        web_tab_menu_items(
+            tabs,
+            folders,
+            1,
+            target,
+            WebTabMenuPage::MoveToFolder,
+            0,
+        )
+    }
+
     fn folder(id: &str, name: &str, collapsed: bool) -> WebTabFolder {
         WebTabFolder {
             id: id.to_string(),
@@ -164793,7 +166094,7 @@ mod webtabs_menu_switcher_locks {
             1_000,
         );
         for (url, folder_id) in tabs {
-            shell.web_surface_new_tab("local://ws");
+            shell.web_surface_open_tab("local://ws", &WebTabOpenRequest::blank());
             let surface = shell
                 .web_surfaces
                 .get_mut("local://ws")
@@ -164850,7 +166151,12 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", None)]);
         assert!(shell.snapshot().web_tab_context_menu.is_none());
 
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (120.0, 240.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (120.0, 240.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         let snapshot = shell.snapshot();
         let menu = snapshot
             .web_tab_context_menu
@@ -164868,7 +166174,12 @@ mod webtabs_menu_switcher_locks {
         // snapshot (`an_empty_web_tab_menu_renders_nothing_at_all`), so a target
         // this surface does not have would resolve to no menu at all rather than
         // to an empty box the user has to fight off.
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(2), (10.0, 20.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(2),
+            (10.0, 20.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         let replaced = shell.snapshot();
         assert_eq!(
             replaced.web_tab_context_menu.map(|menu| menu.target),
@@ -164882,7 +166193,12 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn a_menu_over_a_dead_surface_resolves_to_nothing() {
         let mut shell = shell_with_surface(&[("https://a/", None)]);
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         assert!(!shell.snapshot().web_tab_menu_items.is_empty());
         shell.close_web_surface("local://ws");
         assert!(
@@ -164935,7 +166251,7 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             handler_body(&product, "\"data-web-tab-row\"", "oncontextmenu:"),
             "oncontextmenu:move|evt:MouseEvent|{open_web_tab_menu_from_event(state,\
-             &menu_path,WebTabMenuTarget::Tab(tab_id),evt,);},",
+             &menu_path,WebTabMenuTarget::Tab(tab_id),WebSurfaceChromeAnchor::Rail,evt,);},",
             "a rail TAB row's right-click must BE the opener call — nothing around \
              it, nothing instead of it"
         );
@@ -164943,7 +166259,7 @@ mod webtabs_menu_switcher_locks {
             handler_body(&product, "\"data-web-tab-folder-collapsed\"", "oncontextmenu:"),
             "oncontextmenu:{let(menu_path,menu_id)=(menu_path.clone(),menu_id.clone());\
              move|evt:MouseEvent|{open_web_tab_menu_from_event(state,&menu_path,\
-             WebTabMenuTarget::Folder(menu_id.clone()),evt,);}},",
+             WebTabMenuTarget::Folder(menu_id.clone()),WebSurfaceChromeAnchor::Rail,evt,);}},",
             "a rail FOLDER row's right-click must BE the opener call"
         );
         // …and there is exactly ONE place the two of them go through, so the
@@ -164954,8 +166270,9 @@ mod webtabs_menu_switcher_locks {
                 .filter(|line| line.contains("shell.open_web_tab_context_menu("))
                 .count(),
             1,
-            "one handler owns the rail's right-click; a row that opened the menu \
-             itself would be a second wiring nothing pins"
+            "one handler owns EVERY tab row's right-click — the rail's two row \
+             kinds and the classic strip's tabs alike; a row that opened the \
+             menu itself would be a second wiring nothing pins"
         );
         let shared = function_body(&product, "fn open_web_tab_menu_from_event(");
         assert!(
@@ -164964,7 +166281,7 @@ mod webtabs_menu_switcher_locks {
         );
         assert!(
             shared.contains(
-                "shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y))"
+                "shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y), anchor)"
             ),
             "the shared handler must raise the menu at the pointer:\n{shared}"
         );
@@ -165011,14 +166328,14 @@ mod webtabs_menu_switcher_locks {
         // number, no room for a lie.
         let folders = vec![folder("f1", "Work", false)];
         assert_eq!(
-            web_tab_menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1))
+            menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1))
                 .iter()
                 .find(|item| item.id == "webtab-close-others")
                 .map(|item| item.label.clone()),
             Some("Close 2 other tabs".to_string()),
         );
         assert_eq!(
-            web_tab_menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(4))
+            menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(4))
                 .iter()
                 .find(|item| item.id == "webtab-close-others")
                 .map(|item| item.label.clone()),
@@ -165091,6 +166408,7 @@ mod webtabs_menu_switcher_locks {
             "local://ws",
             WebTabMenuTarget::Folder("f1".to_string()),
             (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
         );
         assert_eq!(
             shell
@@ -165148,7 +166466,12 @@ mod webtabs_menu_switcher_locks {
         );
 
         // The LABEL's number, from the menu the user is looking at.
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         assert_eq!(
             shell
                 .snapshot()
@@ -165182,6 +166505,7 @@ mod webtabs_menu_switcher_locks {
             "local://ws",
             WebTabMenuTarget::Folder("f1".to_string()),
             (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
         );
         shell
             .web_surfaces
@@ -165305,7 +166629,7 @@ mod webtabs_menu_switcher_locks {
             tab(1, "here", None, true),
             tab(2, "other", None, false),
         ];
-        let split = web_tab_menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))
+        let split = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))
             .into_iter()
             .find(|item| item.id == "webtab-split")
             .expect("the split item is offered");
@@ -165314,7 +166638,8 @@ mod webtabs_menu_switcher_locks {
             "splitting the ACTIVE tab against itself is not a split"
         );
         assert!(
-            split.label.contains("this IS the active tab"),
+            split.label == "Split with active tab"
+                && split.reason.as_deref() == Some("this IS the active tab"),
             "a disabled item must say WHY: {}",
             split.label
         );
@@ -165323,7 +166648,7 @@ mod webtabs_menu_switcher_locks {
             "a chord must never reach a verb the mouse cannot"
         );
 
-        let split = web_tab_menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(2))
+        let split = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(2))
             .into_iter()
             .find(|item| item.id == "webtab-split")
             .expect("the split item is offered");
@@ -165621,7 +166946,7 @@ mod webtabs_menu_switcher_locks {
 
         shell.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Rail,
+            WebSurfaceChromeAnchor::Rail,
             (300.0, 40.0),
         );
         let rail = shell
@@ -165631,7 +166956,7 @@ mod webtabs_menu_switcher_locks {
 
         shell.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Strip,
+            WebSurfaceChromeAnchor::Strip,
             (820.0, 90.0),
         );
         let strip = shell
@@ -165674,9 +166999,14 @@ mod webtabs_menu_switcher_locks {
 
         // Raising one floating menu closes the other — two open menus is two
         // surfaces, not one.
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         assert!(shell.snapshot().web_profile_switcher.is_none());
-        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Rail, (0.0, 0.0));
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (0.0, 0.0));
         assert!(shell.snapshot().web_tab_context_menu.is_none());
     }
 
@@ -165707,13 +167037,13 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             handler_body(&product, "\"data-ws-rail-profile-badge\"", "onclick:"),
             "onclick:move|evt:MouseEvent|{open_web_profile_switcher_from_event(state,\
-             &badge_path,WebProfileSwitcherAnchor::Rail,evt,);},",
+             &badge_path,WebSurfaceChromeAnchor::Rail,evt,);},",
             "the rail badge's click must BE the opener call"
         );
         assert_eq!(
             handler_body(&product, "\"data-ws-profile-badge\"", "onclick:"),
             "onclick:move|evt:MouseEvent|{open_web_profile_switcher_from_event(state,\
-             &badge_path,WebProfileSwitcherAnchor::Strip,evt,);},",
+             &badge_path,WebSurfaceChromeAnchor::Strip,evt,);},",
             "the classic strip badge's click must BE the opener call"
         );
         assert_eq!(
@@ -165879,8 +167209,15 @@ mod webtabs_menu_switcher_locks {
     // honesty of a disabled item.
     // ======================================================================
 
+    /// "Move to folder ▸" is a PAGE of the same menu, not N sibling rows in it.
+    ///
+    /// The flattened form was replaced because it scaled with something the user
+    /// controls: a dozen folders pushed the tab's own verbs off the bottom of
+    /// its own context menu. Nothing about the destinations themselves changed —
+    /// same ids, same routing, same "already here" honesty — so this test tracks
+    /// them onto the page they now live on.
     #[test]
-    fn move_to_folder_is_flattened_into_one_row_per_destination() {
+    fn move_to_folder_is_a_page_of_the_same_menu_not_n_rows_in_it() {
         let tabs = vec![
             tab(0, "app", None, false),
             tab(1, "loose", None, true),
@@ -165888,32 +167225,82 @@ mod webtabs_menu_switcher_locks {
         ];
         let folders = vec![folder("f1", "Work", false), folder("f2", "Play", false)];
 
-        // A ROOT tab: both folders, plus New Folder…, and no "Move to Root" (it is
-        // already there).
-        let root = web_tab_menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1));
+        // The ROOT page carries ONE filing row, whatever the folder count.
+        let root = menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(1));
         let ids: Vec<&str> = root.iter().map(|item| item.id.as_str()).collect();
+        assert!(ids.contains(&"webtab-move"), "the entry into the page");
+        assert!(
+            !ids.iter().any(|id| id.starts_with("webtab-move:")),
+            "no destination rows on the root page — that is the whole point:\n{ids:?}"
+        );
+        // …and it is a page TURN, not a verb, so it must leave the menu open.
+        assert_eq!(
+            web_tab_menu_page_turn("webtab-move"),
+            Some(WebTabMenuPage::MoveToFolder),
+        );
+        assert_eq!(
+            web_tab_menu_page_turn("webtab-move-back"),
+            Some(WebTabMenuPage::Root),
+        );
+        assert_eq!(
+            web_tab_menu_page_turn("webtab-close"),
+            None,
+            "every other id runs a verb and closes the menu"
+        );
+
+        // The PAGE: a way back, every destination, and New folder….
+        let page = move_page_items(&tabs, &folders, &WebTabMenuTarget::Tab(1));
+        let ids: Vec<&str> = page.iter().map(|item| item.id.as_str()).collect();
+        assert!(ids.contains(&"webtab-move-back"), "{ids:?}");
         assert!(ids.contains(&"webtab-move:f1"));
         assert!(ids.contains(&"webtab-move:f2"));
         assert!(ids.contains(&"webtab-move-new-folder"));
-        assert!(!ids.contains(&"webtab-move-root"));
+        // A ROOT tab sees Root, inert: the current home must be visible rather
+        // than mysteriously absent.
+        let home = page
+            .iter()
+            .find(|item| item.id == "webtab-move-root")
+            .expect("Root is a destination on the page");
+        assert!(
+            home.disabled
+                && home.label == "Root"
+                && home.reason.as_deref() == Some("already here"),
+            "the LABEL is the destination's name; the reason is the tooltip's: {home:?}"
+        );
+        // The page never carries a tab verb — a submenu that still offered
+        // "Close tab" would be the flattening back again, upside down.
+        assert!(
+            !ids.iter()
+                .any(|id| id.starts_with("webtab-close") || *id == "webtab-duplicate"),
+            "{ids:?}"
+        );
+        assert_eq!(
+            web_tab_menu_title(&tabs, &folders, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToFolder),
+            "Move to folder",
+            "the heading says which page you are on"
+        );
 
-        // A FILED tab: "Move to Root" appears, and its own folder is listed but
-        // inert, so the current home is visible rather than mysteriously absent.
-        let filed = web_tab_menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(2));
-        assert!(filed.iter().any(|item| item.id == "webtab-move-root"));
+        // A FILED tab: Root is live, and its OWN folder is the inert one.
+        let filed = move_page_items(&tabs, &folders, &WebTabMenuTarget::Tab(2));
+        assert!(
+            filed
+                .iter()
+                .any(|item| item.id == "webtab-move-root" && !item.disabled),
+        );
         let home = filed
             .iter()
             .find(|item| item.id == "webtab-move:f1")
             .expect("its own folder is listed");
         assert!(
-            home.disabled && home.label.contains("already here"),
-            "{}",
-            home.label
+            home.disabled
+                && home.label == "Work"
+                && home.reason.as_deref() == Some("already here"),
+            "{home:?}"
         );
 
         // The APP tab is the app's: it cannot be closed or filed, and the menu
         // SAYS so rather than silently omitting the verbs.
-        let app = web_tab_menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(0));
+        let app = menu_items(&tabs, &folders, 1, &WebTabMenuTarget::Tab(0));
         assert!(
             app.iter()
                 .find(|item| item.id == "webtab-close")
@@ -165923,16 +167310,12 @@ mod webtabs_menu_switcher_locks {
         );
         assert!(
             app.iter()
-                .find(|item| item.id == "webtab-move-root")
+                .find(|item| item.id == "webtab-move")
                 .expect("the filing item is drawn, inert")
                 .disabled,
         );
-        assert!(
-            !app.iter().any(|item| item.id.starts_with("webtab-move:")),
-            "the app tab has no destinations at all"
-        );
 
-        // Routing for the flattened rows.
+        // Routing for the destination rows is unchanged.
         assert_eq!(
             web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move:f2"),
             Some(WebTabMenuAction::MoveToFolder(2, Some("f2".to_string()))),
@@ -165945,6 +167328,675 @@ mod webtabs_menu_switcher_locks {
             web_tab_menu_action(&WebTabMenuTarget::Tab(2), "webtab-move:"),
             None,
             "an empty folder id is not a destination"
+        );
+    }
+
+
+    // ======================================================================
+    // THE MENU'S UX. The user's report was "the right click context menu in
+    // the ychrome vertical cwdtree can use some lot of UX polish."
+    // ======================================================================
+
+    /// The ids of a menu's real entries, dividers marked, so ORDER and GROUPING
+    /// are assertable as one value rather than as a pile of `position()` calls.
+    fn menu_shape(items: &[RowMenuItem]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|item| if item.separator { "--" } else { item.id.as_str() })
+            .collect()
+    }
+
+    /// GROUPED BY INTENT, destructive LAST.
+    ///
+    /// The old order opened with "Close tab", which put the one irreversible
+    /// verb under the pointer the instant the menu appeared, and carried no
+    /// create verb at all.
+    #[test]
+    fn the_tab_menu_reads_create_then_page_then_arrange_then_destroy() {
+        let tabs = vec![
+            tab(0, "app", None, false),
+            tab(1, "one", None, true),
+            tab(2, "two", None, false),
+        ];
+        assert_eq!(
+            menu_shape(&menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))),
+            vec![
+                "webtab-new",
+                "webtab-new-below",
+                "webtab-reopen",
+                "--",
+                "webtab-reload",
+                "webtab-copy-url",
+                "webtab-duplicate",
+                "webtab-split",
+                "--",
+                "webtab-move",
+                "--",
+                "webtab-close",
+                "webtab-close-others",
+                "webtab-close-below",
+            ],
+        );
+
+        let items = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        // Everything destructive is in the LAST group and nothing before it is.
+        let first_destructive = items
+            .iter()
+            .position(|item| item.destructive)
+            .expect("the menu has destructive verbs");
+        assert!(
+            items[first_destructive..].iter().all(|item| item.destructive),
+            "a non-destructive verb must not sit below a destructive one — that \
+             is the whole reason the group is last"
+        );
+        // Every live entry keeps an accelerator, so the ALT layer can reach
+        // every verb the mouse can (`build_keytip_scopes` declares exactly the
+        // non-disabled ones).
+        for item in items.iter().filter(|item| !item.separator && !item.disabled) {
+            assert!(item.hint.is_some(), "{} has no accelerator", item.id);
+        }
+        // …and no two live entries want the same letter, or the §5 ladder has to
+        // deny one of them a badge on a menu small enough to avoid that.
+        let mut hints: Vec<char> = items
+            .iter()
+            .filter(|item| !item.separator && !item.disabled)
+            .filter_map(|item| item.hint)
+            .collect();
+        let before = hints.len();
+        hints.sort_unstable();
+        hints.dedup();
+        assert_eq!(before, hints.len(), "two entries want one letter");
+    }
+
+    /// The CREATE verbs the menu never had — including the one the placement
+    /// model is what makes meaningful.
+    #[test]
+    fn the_menu_can_open_a_tab_and_open_one_below_this_one() {
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-new"),
+            Some(WebTabMenuAction::NewTab),
+        );
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(3), "webtab-new-below"),
+            Some(WebTabMenuAction::NewTabBelow(3)),
+        );
+        // "Below this one" IS the opener group: the tab it opens is this tab's
+        // child, so the next one cascades after it.
+        assert_eq!(
+            WebTabOpenRequest::blank_below(3).origin,
+            WebTabOrigin::Opener(3),
+        );
+
+        // Both are the dispatch's, because opening a tab has to be able to put
+        // the keyboard in the omnibox and only the Signal path can.
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        for action in [
+            WebTabMenuAction::NewTab,
+            WebTabMenuAction::NewTabBelow(1),
+            WebTabMenuAction::ReopenClosedTabs,
+            WebTabMenuAction::CopyTabUrl(1),
+        ] {
+            assert!(
+                !shell.apply_web_tab_menu_action("local://ws", &action),
+                "{action:?} must be finished by the dispatch"
+            );
+        }
+    }
+
+    /// Reload and Copy URL are INERT until the tab has been somewhere, and the
+    /// label says why rather than the row just going dim.
+    #[test]
+    fn reload_and_copy_url_wait_until_the_tab_has_an_address() {
+        let mut blank = tab(1, "new tab", None, true);
+        blank.effective_url = String::new();
+        let tabs = vec![tab(0, "app", None, false), blank];
+        let items = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        for id in ["webtab-reload", "webtab-copy-url"] {
+            let item = items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("{id} is drawn"));
+            assert!(item.disabled, "{id} must be inert on a blank tab");
+            assert!(
+                item.reason.as_deref() == Some("this tab has not gone anywhere yet")
+                    || item.reason.as_deref() == Some("this tab has no address to copy"),
+                "{id} must SAY why — in the tooltip, never in the name: {item:?}"
+            );
+            assert!(
+                context_menu_click_action(item).is_none(),
+                "{id} must not dispatch"
+            );
+        }
+
+        // …and live once it has one.
+        let visited = vec![tab(0, "app", None, false), tab(1, "a", None, true)];
+        let items = menu_items(&visited, &[], 1, &WebTabMenuTarget::Tab(1));
+        assert!(
+            items
+                .iter()
+                .filter(|item| item.id == "webtab-reload" || item.id == "webtab-copy-url")
+                .all(|item| !item.disabled),
+        );
+
+        // The reload verb aims at the row that was clicked, not at whatever is
+        // active — the aim is the difference, the verb is one.
+        let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", None)]);
+        let before = shell.web_surfaces["local://ws"].tabs[1].reload_nonce;
+        assert!(shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::ReloadTab(1)));
+        assert_eq!(
+            shell.web_surfaces["local://ws"].tabs[1].reload_nonce,
+            before + 1,
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"].tabs[2].reload_nonce,
+            0,
+            "…and only at that row"
+        );
+    }
+
+    /// "Close N tabs below" is FOLDER-SCOPED, exactly like "Close N other tabs":
+    /// a tab filed in Work does not speak for the root, and "below" in a tree
+    /// means below within your own group.
+    #[test]
+    fn close_tabs_below_is_scoped_to_the_row_it_was_raised_on() {
+        let scope: Vec<WebTabScopeRow> = vec![
+            (0, None),
+            (1, None),
+            (2, Some("f1".to_string())),
+            (3, None),
+            (4, Some("f1".to_string())),
+        ];
+        assert_eq!(
+            web_tab_close_below_targets(&scope, 1),
+            vec![3],
+            "a root tab reaches the root tabs after it, and no further"
+        );
+        assert_eq!(
+            web_tab_close_below_targets(&scope, 2),
+            vec![4],
+            "a filed tab reaches its own folder"
+        );
+        assert_eq!(web_tab_close_below_targets(&scope, 4), Vec::<u64>::new());
+        assert_eq!(web_tab_close_below_targets(&scope, 99), Vec::<u64>::new());
+
+        // The label counts exactly what the plan takes — one derivation, so the
+        // number in the label and the tabs that go cannot disagree.
+        let tabs = vec![
+            tab(0, "app", None, false),
+            tab(1, "one", None, true),
+            tab(2, "two", None, false),
+            tab(3, "three", None, false),
+        ];
+        let label = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1))
+            .into_iter()
+            .find(|item| item.id == "webtab-close-below")
+            .map(|item| item.label)
+            .expect("the verb is drawn");
+        assert_eq!(label, "Close 2 tabs below");
+        assert_eq!(
+            web_tab_menu_close_plan(
+                &web_tab_scope_rows(&tabs),
+                &WebTabMenuAction::CloseTabsBelow(1)
+            ),
+            vec![2, 3],
+        );
+        // Nothing below ⇒ drawn, inert, and saying so.
+        let last = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(3))
+            .into_iter()
+            .find(|item| item.id == "webtab-close-below")
+            .expect("the verb is still drawn");
+        assert!(
+            last.disabled
+                && last.label == "Close 0 tabs below"
+                && last.reason.as_deref() == Some("nothing is below this one here"),
+            "{last:?}"
+        );
+    }
+
+    /// UNDO, which is the answer this menu gives instead of a confirmation
+    /// dialog: a bulk close is ONE entry, and the tabs come back where they
+    /// were rather than piled at the end.
+    #[test]
+    fn a_bulk_close_is_undone_by_one_reopen_that_restores_the_order() {
+        let mut shell = shell_with_surface(&[
+            ("https://a/", None),
+            ("https://b/", None),
+            ("https://c/", None),
+        ]);
+        assert_eq!(tab_ids(&shell), vec![0, 1, 2, 3]);
+        assert!(
+            shell.web_surface_reopen_plan("local://ws").is_empty(),
+            "nothing closed yet"
+        );
+
+        // "Close 2 other tabs" on tab 2.
+        let action = WebTabMenuAction::CloseOtherTabs(2);
+        assert!(shell.apply_web_tab_menu_action("local://ws", &action));
+        assert_eq!(tab_ids(&shell), vec![0, 2]);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].closed_tabs.len(),
+            1,
+            "ONE gesture, ONE undo entry — not one per tab"
+        );
+        assert_eq!(
+            shell.web_surface_reopen_plan("local://ws").len(),
+            2,
+            "…and the label counts both"
+        );
+        // The menu says so, in the same words.
+        let tabs = vec![tab(0, "app", None, false), tab(1, "kept", None, true)];
+        let label = web_tab_menu_items(
+            &tabs,
+            &[],
+            1,
+            &WebTabMenuTarget::Tab(1),
+            WebTabMenuPage::Root,
+            2,
+        )
+        .into_iter()
+        .find(|item| item.id == "webtab-reopen")
+        .map(|item| item.label)
+        .expect("the verb is drawn");
+        assert_eq!(label, "Reopen 2 closed tabs");
+
+        let reopened = shell.web_surface_reopen_closed_tabs("local://ws");
+        assert_eq!(reopened.len(), 2);
+        let surface = &shell.web_surfaces["local://ws"];
+        let urls: Vec<&str> = surface.tabs.iter().map(|tab| tab.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://app.example/", "https://a/", "https://b/", "https://c/"],
+            "back in the slots they were closed from, not appended"
+        );
+        assert!(
+            surface
+                .tabs
+                .iter()
+                .filter(|tab| reopened.contains(&tab.id))
+                .all(|tab| tab.effective_url.is_empty()),
+            "a reopened tab's egress is unresolved, exactly like a restored \
+             tab's — selecting it resolves it"
+        );
+        assert!(
+            shell.web_surfaces["local://ws"].closed_tabs.is_empty(),
+            "the entry is spent"
+        );
+        assert!(shell
+            .web_surface_reopen_closed_tabs("local://ws")
+            .is_empty());
+    }
+
+    /// A blank tab has nothing to reopen, and the stack is BOUNDED — an
+    /// unbounded one on a long-lived surface is a memory leak wearing a
+    /// feature's clothes.
+    #[test]
+    fn the_undo_stack_ignores_blank_tabs_and_is_bounded() {
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        let blank = shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+            .expect("surface is live");
+        shell.web_surface_close_tab("local://ws", blank);
+        assert!(
+            shell.web_surfaces["local://ws"].closed_tabs.is_empty(),
+            "a tab that never went anywhere has nothing to reopen"
+        );
+
+        for _ in 0..(MAX_CLOSED_WEB_TAB_BATCHES + 5) {
+            let id = shell
+                .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+                .expect("surface is live");
+            if let Some(surface) = shell.web_surfaces.get_mut("local://ws")
+                && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == id)
+            {
+                tab.url = "https://x/".to_string();
+            }
+            shell.web_surface_close_tab("local://ws", id);
+        }
+        assert_eq!(
+            shell.web_surfaces["local://ws"].closed_tabs.len(),
+            MAX_CLOSED_WEB_TAB_BATCHES,
+        );
+    }
+
+    /// The FOLDER menu gained the two verbs its row already had as hover
+    /// buttons and its menu did not — the mouse could reach them and the
+    /// keyboard could not.
+    #[test]
+    fn the_folder_menu_offers_the_verbs_its_hover_buttons_had() {
+        let tabs = vec![tab(0, "app", None, true), tab(1, "filed", Some("f1"), false)];
+        let folders = vec![folder("f1", "Work", false)];
+        assert_eq!(
+            menu_shape(&menu_items(&tabs, &folders, 0, &WebTabMenuTarget::Folder("f1".to_string()))),
+            vec![
+                "webfolder-new-tab",
+                "--",
+                "webfolder-rename",
+                "webfolder-toggle",
+                "--",
+                "webfolder-close-tabs",
+                "webfolder-delete",
+            ],
+        );
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Folder("f1".to_string()), "webfolder-new-tab"),
+            Some(WebTabMenuAction::NewTabInFolder("f1".to_string())),
+        );
+
+        // DELETING ORGANIZATION IS NOT DELETING CONTENT. The folder goes; its
+        // tabs come back to the root, and the close plan for the verb is empty
+        // so no path can quietly turn one into the other.
+        assert_eq!(
+            web_tab_menu_close_plan(
+                &web_tab_scope_rows(&tabs),
+                &WebTabMenuAction::DeleteFolder("f1".to_string())
+            ),
+            Vec::<u64>::new(),
+        );
+        let mut shell = shell_with_surface(&[("https://a/", Some("f1"))]);
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(folder("f1", "Work", false));
+        assert!(shell.apply_web_tab_menu_action(
+            "local://ws",
+            &WebTabMenuAction::DeleteFolder("f1".to_string())
+        ));
+        let surface = &shell.web_surfaces["local://ws"];
+        assert!(surface.folders.is_empty(), "the folder went");
+        assert_eq!(surface.tabs.len(), 2, "…and its tab did NOT");
+        assert_eq!(surface.tabs[1].folder, None, "it came back to the root");
+
+        // A folder's "+" verb files its tab in that folder, through the same
+        // placement owner as every other open.
+        assert!(shell.apply_web_tab_menu_action(
+            "local://ws",
+            &WebTabMenuAction::NewTabInFolder("f2".to_string())
+        ));
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .last()
+                .and_then(|tab| tab.folder.clone()),
+            Some("f2".to_string()),
+        );
+    }
+
+    /// The ICON COLUMN is opt-in PER MENU, and only the tab menus opted in. The
+    /// other four `RowMenuItem` builders must stay iconless, or the column
+    /// re-indents menus that never asked for it.
+    #[test]
+    fn the_icon_column_is_opt_in_and_only_the_tab_menus_opted_in() {
+        let tabs = vec![tab(0, "app", None, false), tab(1, "one", None, true)];
+        let tab_menu = menu_items(&tabs, &[], 1, &WebTabMenuTarget::Tab(1));
+        assert!(context_menu_has_icons(&tab_menu));
+        assert!(
+            tab_menu
+                .iter()
+                .all(|item| item.separator || item.icon.is_some()),
+            "within an opted-in menu EVERY row carries a mark, or the labels \
+             lose their common left edge"
+        );
+        assert!(context_menu_has_icons(&move_page_items(
+            &tabs,
+            &[folder("f1", "Work", false)],
+            &WebTabMenuTarget::Tab(1)
+        )));
+
+        // The four that did not.
+        assert!(!context_menu_has_icons(&viewport_menu_items(
+            ViewportMenuKind::Terminal
+        )));
+        assert!(!context_menu_has_icons(&viewport_menu_items(
+            ViewportMenuKind::Document
+        )));
+        assert!(!context_menu_has_icons(&web_profile_switcher_menu_items(
+            &["default".to_string()],
+            "default"
+        )));
+        assert!(
+            !context_menu_has_icons(&[]),
+            "an empty menu draws no column"
+        );
+
+        // Every mark is a stroked path on the shared 14-unit box — greyscale by
+        // construction, because the paths carry no colour at all (DESIGN.md ▸
+        // Tree behavior: restrained and mostly grayscale).
+        for icon in [
+            MenuIcon::Plus,
+            MenuIcon::Reopen,
+            MenuIcon::Reload,
+            MenuIcon::Copy,
+            MenuIcon::Duplicate,
+            MenuIcon::Split,
+            MenuIcon::Folder,
+            MenuIcon::Rename,
+            MenuIcon::Collapse,
+            MenuIcon::Expand,
+            MenuIcon::Back,
+            MenuIcon::Close,
+            MenuIcon::Trash,
+        ] {
+            assert!(!icon.paths().is_empty(), "{icon:?} draws nothing");
+            for d in icon.paths() {
+                assert!(
+                    !d.contains('#') && !d.contains("rgb"),
+                    "{icon:?} carries colour of its own"
+                );
+            }
+        }
+        // The overlay draws the column from the LIST's own answer, never from a
+        // per-item test that would leave a ragged edge.
+        let overlay = function_body(&product_source(), "fn ContextMenuOverlay(");
+        assert!(
+            overlay.contains("context_menu_has_icons(&items)")
+                && overlay.contains("if menu_has_icons {"),
+            "the column is a property of the menu, asked once:\n{overlay}"
+        );
+    }
+
+
+    /// A LABEL IS THE COMMAND'S NAME. Never our justification for dimming it.
+    ///
+    /// The reason used to be appended to the label, and the user's screenshot is
+    /// what that costs: a 216px menu rendering `Close tab — this is the app's
+    /// own ta…`, `Duplicate tab — the app's own tab i…`, `Split with active tab
+    /// — this IS the ac…`, `Move to folder — the app's tab belo…`. Not one
+    /// dimmed verb in that menu could be READ. The placement was never at fault
+    /// — the box was measured inside its band, and it clipped correctly. The
+    /// labels were four times too long for any box.
+    #[test]
+    fn a_menu_label_never_carries_its_own_reason_and_never_outgrows_the_box() {
+        // Every shape of every tab menu, including the app tab, whose four
+        // dimmed verbs are the ones in the screenshot.
+        let tabs = vec![
+            tab(0, "app", None, false),
+            tab(1, "one", None, true),
+            tab(2, "filed", Some("f1"), false),
+        ];
+        let folders = vec![folder("f1", "Work", false), folder("f2", "Play", true)];
+        let mut every: Vec<RowMenuItem> = Vec::new();
+        for target in [
+            WebTabMenuTarget::Tab(0),
+            WebTabMenuTarget::Tab(1),
+            WebTabMenuTarget::Tab(2),
+            WebTabMenuTarget::Folder("f1".to_string()),
+            WebTabMenuTarget::Folder("f2".to_string()),
+        ] {
+            every.extend(menu_items(&tabs, &folders, 1, &target));
+            every.extend(web_tab_menu_items(
+                &tabs,
+                &folders,
+                1,
+                &target,
+                WebTabMenuPage::MoveToFolder,
+                3,
+            ));
+        }
+        every.extend(viewport_menu_items(ViewportMenuKind::Terminal));
+        every.extend(viewport_menu_items(ViewportMenuKind::Document));
+        assert!(every.len() > 40, "the sweep must actually cover the menus");
+
+        for item in every.iter().filter(|item| !item.separator) {
+            // The em-dash join IS the old bug, spelled.
+            assert!(
+                !item.label.contains(" — "),
+                "`{}` reads our justification as if it were the command",
+                item.label,
+            );
+            // …and nothing goes dim in silence: an item that just greys out is
+            // indistinguishable from a bug, so the reason has to exist —
+            // somewhere the user can reach it, which is now the tooltip.
+            if item.disabled {
+                assert!(
+                    item.reason.is_some(),
+                    "`{}` is dimmed and says nothing about why",
+                    item.label,
+                );
+                assert!(
+                    item.tooltip().contains(" — "),
+                    "…and the hover text is where the whole sentence lives: {item:?}",
+                );
+                assert!(
+                    item.hint.is_none(),
+                    "a dimmed item keeps no accelerator: {item:?}",
+                );
+            }
+            // A tooltip always says at least the name, so a label the box had to
+            // ellipsize is still readable somewhere.
+            assert!(item.tooltip().starts_with(&item.label), "{item:?}");
+        }
+
+        // AND IT FITS. The narrowest menu the app draws is the one banded to the
+        // rail; everything the SHELL authors must fit inside it, or we are back
+        // to a name the user cannot read. Labels carrying USER text — a folder's
+        // name on the move page — are exempt: their length is not ours to
+        // choose, which is exactly what the ellipsis and the tooltip are for.
+        let drawable = context_menu_width(Some(rail_context_menu_band(
+            1920.0,
+            RAIL_MIN_WIDTH as f64,
+            1.0,
+        ))) - CONTEXT_MENU_ITEM_TEXT_INSET_PX;
+        let budget = (drawable / CONTEXT_MENU_LABEL_CHAR_PX) as usize;
+        assert!(budget >= 20, "the budget itself went implausible: {budget}");
+        for item in every
+            .iter()
+            .filter(|item| !item.separator && !item.id.starts_with("webtab-move:"))
+        {
+            assert!(
+                item.label.chars().count() <= budget,
+                "`{}` is {} chars and the narrowest menu draws about {budget} — \
+                 put the rest in `note`/`disabled`, which is the tooltip",
+                item.label,
+                item.label.chars().count(),
+            );
+        }
+    }
+
+    /// A HEADING ONLY WHEN IT EARNS ITS PLACE.
+    ///
+    /// The screenshot shows `Statistical Power / Open WebUI` twice, stacked: the
+    /// rail row, highlighted, and the menu's own header immediately below it.
+    /// A menu drawn ON a row must not repeat that row's name.
+    #[test]
+    fn a_menu_heading_says_only_what_the_row_underneath_it_cannot() {
+        let tabs = vec![tab(0, "app", None, false), tab(1, "one", None, true)];
+        let folders = vec![folder("f1", "Work", false)];
+        for target in [
+            WebTabMenuTarget::Tab(0),
+            WebTabMenuTarget::Tab(1),
+            WebTabMenuTarget::Folder("f1".to_string()),
+        ] {
+            assert_eq!(
+                web_tab_menu_title(&tabs, &folders, &target, WebTabMenuPage::Root),
+                "",
+                "the row is directly above the menu, selected, saying this already"
+            );
+        }
+        // A PAGE label is not a repeat — no row on screen says which page you
+        // walked into.
+        assert_eq!(
+            web_tab_menu_title(
+                &tabs,
+                &folders,
+                &WebTabMenuTarget::Tab(1),
+                WebTabMenuPage::MoveToFolder
+            ),
+            "Move to folder",
+        );
+        // Nor is a SURFACE's name: the terminal canvas has no labelled row.
+        assert_eq!(viewport_menu_title(ViewportMenuKind::Terminal), "Terminal");
+
+        let product = product_source();
+        // The cwd tree's heading follows the same rule: a multi-selection says
+        // something ("3 selected items"), one row's own label does not.
+        let snapshot = function_body(&product, "fn snapshot(");
+        assert!(
+            snapshot.contains("format!(\"{selected_count} selected items\")")
+                && snapshot.contains("} else {\n                    String::new()\n                };"),
+            "the tree's single-row menu must carry no heading",
+        );
+        // A contributed pane's rows are rows too.
+        assert!(
+            handler_body(&product, "if let Some(menu) = snapshot.app_pane_context_menu", "menu_title:")
+                .contains("String::new()"),
+        );
+        // …and the overlay actually SKIPS an empty one rather than drawing a
+        // blank band of padding where the heading used to be.
+        let overlay = function_body(&product, "fn ContextMenuOverlay(");
+        assert!(
+            overlay.contains("if !menu_title.trim().is_empty() {"),
+            "an absent heading must take its whole row with it:\n{overlay}"
+        );
+    }
+
+    /// BOTH TAB HOMES raise the same menu. The verbs existed in the vertical
+    /// rail and in neither the classic strip nor anywhere else — one surface
+    /// with a feature and one without is the check-all-surfaces law broken in
+    /// the plainest way there is.
+    #[test]
+    fn the_classic_strip_raises_the_same_tab_menu_the_rail_does() {
+        let product = product_source();
+        let strip = handler_body(&product, r#"key: "ws-tab-{tab_id}","#, "oncontextmenu:");
+        assert_eq!(
+            strip,
+            "oncontextmenu:move|evt:MouseEvent|{open_web_tab_menu_from_event(state,&menu_path,\
+             WebTabMenuTarget::Tab(tab_id),WebSurfaceChromeAnchor::Strip,evt,);},",
+            "a classic strip tab's right-click must be ONE call to the shared \
+             opener and nothing else — the same body the rail's rows carry, \
+             differing ONLY in the anchor, which is the one thing that really \
+             does differ",
+        );
+        // …onto the same state slot, so the two homes cannot become two menus.
+        let opener = function_body(&product, "fn open_web_tab_menu_from_event(");
+        assert!(opener.contains("shell.open_web_tab_context_menu("));
+
+        // And the anchor is load-bearing, not decoration: a STRIP-raised menu
+        // hangs over pure page. Banding it to the rail would squeeze it into a
+        // sliver at the far right — or, with no rail mounted, into nothing.
+        let mut shell = shell_with_surface(&[("https://a/", None)]);
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (400.0, 40.0),
+            WebSurfaceChromeAnchor::Strip,
+        );
+        assert!(
+            shell.has_modal_over_viewport(),
+            "the strip's menu takes the STASH, which is what makes it visible \
+             over a native page"
+        );
+        shell.close_web_tab_context_menu();
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (1500.0, 300.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
+        assert!(
+            !shell.has_modal_over_viewport(),
+            "…and the rail's does not, because geometry already saves it"
         );
     }
 
@@ -165982,7 +168034,7 @@ mod webtabs_menu_switcher_locks {
 
         // A blank tab (opened, never navigated) has nothing to duplicate, and
         // duplicating it must not mint an empty row.
-        shell.web_surface_new_tab("local://ws");
+        shell.web_surface_open_tab("local://ws", &WebTabOpenRequest::blank());
         let blank = shell.web_surfaces["local://ws"].active_tab;
         let before = shell.web_surfaces["local://ws"].tabs.len();
         assert_eq!(shell.web_surface_duplicate_tab("local://ws", blank), None);
@@ -165994,10 +168046,418 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
+    // ======================================================================
+    // WHERE A NEW TAB GOES — the placement owner, and the opener group it
+    // runs on.
+    //
+    // The reported behaviour: "new tab spawns from right click context menu,
+    // middle clicking link, or duplicating, should be just below the current
+    // tab and cascading as more links are clicked." Before this, all three
+    // paths pushed onto the END of the list independently — so a link opened
+    // from the top of the rail appeared at the bottom of it.
+    // ======================================================================
+
+    fn placement_row(id: u64, opener: Option<u64>, folder: Option<&str>) -> WebTabPlacementRow {
+        WebTabPlacementRow {
+            id,
+            opener,
+            folder: folder.map(str::to_string),
+        }
+    }
+
+    /// The ids in `tabs` order — the order the rail and the classic strip both
+    /// draw, so this IS what the user sees.
+    fn tab_ids(shell: &ShellState) -> Vec<u64> {
+        shell.web_surfaces["local://ws"]
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    /// The CASCADE, as arithmetic. Two links opened from one page go below that
+    /// page in the order they were opened — not both immediately under it,
+    /// which would show them reversed.
+    #[test]
+    fn a_spawned_tab_lands_below_its_opener_and_siblings_cascade_after_it() {
+        // app(0), page(1).
+        let rows = vec![placement_row(0, None, None), placement_row(1, None, None)];
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(1)),
+            WebTabPlacement {
+                index: 2,
+                folder: None,
+                opener: Some(1)
+            },
+            "the first link opened from page 1 sits directly below it"
+        );
+
+        // …with that first child (2) now present, the SECOND link from page 1
+        // must go after it, not between 1 and 2.
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, None),
+            placement_row(2, Some(1), None),
+        ];
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index,
+            3,
+            "the second link cascades AFTER the first"
+        );
+
+        // A link opened from child 2 sits directly under 2 — the rule is the
+        // same one level down.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(2)).index,
+            3,
+            "a link from child 2, which has no children yet, goes right below it"
+        );
+
+        // A GRANDCHILD counts as part of the group it descends from: the next
+        // link from page 1 must clear the whole subtree, not just the child.
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, None),
+            placement_row(2, Some(1), None),
+            placement_row(3, Some(2), None),
+        ];
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index,
+            4,
+            "the group is the whole subtree, so page 1's next link clears the \
+             grandchild too"
+        );
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(2)).index,
+            4,
+            "…and child 2's next link cascades after the child IT already has"
+        );
+
+        // A tab from ANOTHER group is where the scan stops — page 1's group
+        // does not swallow the tab that follows it.
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, None),
+            placement_row(2, Some(1), None),
+            placement_row(3, None, None),
+        ];
+        assert_eq!(web_tab_placement(&rows, &WebTabOrigin::Opener(1)).index, 3);
+    }
+
+    /// `Append` appends, a folder's "+" fills its folder, and NO branch can
+    /// displace the app tab — `tabs[0]` is the app's, and every close verb in
+    /// the product is written on that premise.
+    #[test]
+    fn placement_appends_fills_folders_and_never_displaces_the_app_tab() {
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, Some("f1")),
+            placement_row(2, None, None),
+            placement_row(3, None, Some("f1")),
+        ];
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Append),
+            WebTabPlacement {
+                index: 4,
+                folder: None,
+                opener: None
+            },
+        );
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Folder("f1".to_string())),
+            WebTabPlacement {
+                index: 4,
+                folder: Some("f1".to_string()),
+                opener: None
+            },
+            "after the LAST tab already filed in f1, so a folder's + fills the \
+             folder rather than the window"
+        );
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Folder("empty".to_string())).index,
+            4,
+            "a folder with nothing in it yet takes the end"
+        );
+
+        // An opener that has already gone is an append, and — the part that
+        // matters — it carries NO opener id. A dangling id would make the next
+        // open in that group append too, silently.
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(99)),
+            WebTabPlacement {
+                index: 4,
+                folder: None,
+                opener: None
+            },
+        );
+
+        // Nothing returns 0. Every origin, against every shape of list.
+        for origin in [
+            WebTabOrigin::Append,
+            WebTabOrigin::Folder("f1".to_string()),
+            WebTabOrigin::Folder("nope".to_string()),
+            WebTabOrigin::Opener(0),
+            WebTabOrigin::Opener(3),
+            WebTabOrigin::Opener(404),
+        ] {
+            assert!(
+                web_tab_placement(&rows, &origin).index >= 1,
+                "{origin:?} would have displaced the app tab"
+            );
+        }
+    }
+
+    /// A child is born where its parent lives — opening a link from a filed tab
+    /// must not scatter the folder it was filed in.
+    #[test]
+    fn a_child_inherits_its_openers_folder() {
+        let rows = vec![
+            placement_row(0, None, None),
+            placement_row(1, None, Some("work")),
+        ];
+        let placement = web_tab_placement(&rows, &WebTabOrigin::Opener(1));
+        assert_eq!(placement.folder.as_deref(), Some("work"));
+        assert_eq!(placement.index, 2);
+    }
+
+    /// The whole model, run through the real shell: a middle-click, then a
+    /// second one, then a duplicate — each landing where the user expects.
+    #[test]
+    fn the_open_paths_place_their_tabs_where_the_placement_owner_says() {
+        let mut shell = shell_with_surface(&[("https://page/", None), ("https://other/", None)]);
+        // app=0, page=1, other=2.
+        assert_eq!(tab_ids(&shell), vec![0, 1, 2]);
+
+        // A middle-click on page 1 (background: the user stays put).
+        let (first, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        assert_eq!(
+            tab_ids(&shell),
+            vec![0, 1, first, 2],
+            "the link lands directly below the page that linked it, not at the end"
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"].active_tab, 2,
+            "a background open does not move the front"
+        );
+
+        // A second middle-click on the SAME page cascades after the first.
+        let (second, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2]);
+
+        // A duplicate of `other` sits below `other`, not at the bottom.
+        let copy = shell
+            .web_surface_duplicate_tab("local://ws", 2)
+            .expect("other has a URL to copy");
+        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2, copy]);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].active_tab, copy,
+            "a duplicate takes the front"
+        );
+
+        // The header "+" still appends, with no opener: nothing spawned it.
+        let appended = shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+            .expect("surface is live");
+        assert_eq!(tab_ids(&shell), vec![0, 1, first, second, 2, copy, appended]);
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .find(|tab| tab.id == appended)
+                .and_then(|tab| tab.opener),
+            None,
+        );
+    }
+
+    /// EXPIRY, both halves. A row the user clicks ends the groups; the front
+    /// moving because a verb the user ran finished its work does not.
+    #[test]
+    fn a_user_selection_expires_the_opener_groups_and_an_opened_selection_does_not() {
+        let mut shell = shell_with_surface(&[("https://page/", None)]);
+        let (child, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .find(|tab| tab.id == child)
+                .and_then(|tab| tab.opener),
+            Some(1),
+        );
+
+        // The shell moving the front leaves the group standing…
+        shell.web_surface_select_tab("local://ws", child, WebTabSelect::Opened);
+        assert!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .any(|tab| tab.opener.is_some()),
+            "an opened selection must not expire the groups — the duplicate verb \
+             selects what it just made, and the cascade would die on its first hop"
+        );
+
+        // …and the USER picking a row ends them all.
+        shell.web_surface_select_tab("local://ws", 1, WebTabSelect::User);
+        assert!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .all(|tab| tab.opener.is_none()),
+            "the user re-declared where they are; the groups that ordered tabs \
+             they had not visited are spent"
+        );
+
+        // So the next link from page 1 goes directly below page 1 again, ahead
+        // of the child it opened before.
+        let (later, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        assert_eq!(tab_ids(&shell), vec![0, 1, later, child]);
+    }
+
+    /// An opener id may NEVER dangle. Closing a tab in the middle of a group
+    /// re-points its children at its own opener, so the group survives and the
+    /// placement stays a pure function of the rows.
+    #[test]
+    fn closing_a_tab_repoints_its_children_and_never_dangles_an_opener() {
+        let mut shell = shell_with_surface(&[("https://page/", None)]);
+        let (child, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        let (grandchild, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(child, true))
+            .expect("surface is live");
+        assert_eq!(tab_ids(&shell), vec![0, 1, child, grandchild]);
+
+        shell.web_surface_close_tab("local://ws", child);
+        let surface = &shell.web_surfaces["local://ws"];
+        assert_eq!(
+            surface
+                .tabs
+                .iter()
+                .find(|tab| tab.id == grandchild)
+                .and_then(|tab| tab.opener),
+            Some(1),
+            "the grandchild inherits the closed tab's opener"
+        );
+        let live: Vec<u64> = surface.tabs.iter().map(|tab| tab.id).collect();
+        assert!(
+            surface
+                .tabs
+                .iter()
+                .all(|tab| tab.opener.is_none_or(|id| live.contains(&id))),
+            "no tab may point at an id that is gone"
+        );
+
+        // And the group still works: a new link from page 1 clears the survivor.
+        let (next, _) = shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(1, true))
+            .expect("surface is live");
+        assert_eq!(tab_ids(&shell), vec![0, 1, grandchild, next]);
+    }
+
+    /// THE FOCUS RULE, as one predicate. Both clauses are load-bearing and both
+    /// are checked here: a tab with a destination must not take the keyboard
+    /// (the page is loading), and a BACKGROUND open must not either (the user
+    /// is still reading the tab they are on).
+    #[test]
+    fn only_a_blank_foreground_open_is_typing_ready() {
+        assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank()));
+        assert!(web_tab_opens_typing_ready(
+            &WebTabOpenRequest::blank_in_folder("f1")
+        ));
+        assert!(web_tab_opens_typing_ready(&WebTabOpenRequest::blank_below(
+            1
+        )));
+
+        // A middle-click, either gesture. Getting this wrong makes middle-click
+        // unusable — the caret leaves the page the user is reading.
+        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::opened_by(
+            1, true
+        )));
+        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::opened_by(
+            1, false
+        )));
+        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::duplicate_of(
+            1
+        )));
+        // An agent's `open_tab` carries a URL, so it never steals the keyboard
+        // even when it raises.
+        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::command(
+            true
+        )));
+        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::command(
+            false
+        )));
+    }
+
+    /// A blank tab opens in EDIT MODE and a bound one does not — the state half
+    /// of the focus rule, which is what the omnibox reads to decide whether it
+    /// is showing a draft or the tab's URL.
+    #[test]
+    fn a_blank_open_arms_the_address_draft_and_a_bound_one_leaves_it_alone() {
+        let mut shell = shell_with_surface(&[("https://page/", None)]);
+        shell.web_surface_open_tab("local://ws", &WebTabOpenRequest::blank());
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_draft.as_deref(),
+            Some(""),
+            "a blank tab opens with the address bar in edit mode"
+        );
+
+        shell
+            .open_command_tab("local://ws", &WebTabOpenRequest::command(true))
+            .expect("surface is live");
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_draft, None,
+            "a tab with a URL on its way shows that URL, not an empty edit box"
+        );
+    }
+
+    /// ONE spelling of each omnibox id, so the mount and the focus call can
+    /// never name different elements — a mismatch there fails silently, and the
+    /// user just finds their typing landing somewhere else.
+    #[test]
+    fn one_owner_names_the_omnibox_input_for_both_tab_modes() {
+        assert_eq!(web_omnibox_input_id(true, "any-host"), "ws-rail-address");
+        assert_eq!(web_omnibox_input_id(false, "host-7"), "host-7-ws-address");
+
+        let product = product_source();
+        // The two literals may appear ONCE each: in the id owner itself. A
+        // second spelling anywhere is the bug this owner exists to remove.
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("\"ws-rail-address\""))
+                .count(),
+            1,
+            "the rail omnibox id belongs to `web_omnibox_input_id` alone",
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("-ws-address\""))
+                .count(),
+            1,
+            "the classic omnibox id belongs to `web_omnibox_input_id` alone",
+        );
+        // And the focus path reads it from the shell's own resolver rather than
+        // rebuilding it.
+        let focus = function_body(&product, "fn focus_web_omnibox(");
+        assert!(
+            focus.contains("active_web_omnibox_input_id()"),
+            "the focus helper must ask the shell which omnibox is mounted:\n{focus}"
+        );
+    }
+
     #[test]
     fn a_folder_menu_offers_rename_the_right_toggle_word_and_a_named_close() {
         let tabs = vec![tab(0, "app", None, true)];
-        let open = web_tab_menu_items(
+        let open = menu_items(
             &tabs,
             &[folder("f1", "Work", false)],
             0,
@@ -166010,7 +168470,7 @@ mod webtabs_menu_switcher_locks {
                 .map(|item| item.label.clone()),
             Some("Collapse".to_string()),
         );
-        let collapsed = web_tab_menu_items(
+        let collapsed = menu_items(
             &tabs,
             &[folder("f1", "Work", true)],
             0,
@@ -166029,11 +168489,22 @@ mod webtabs_menu_switcher_locks {
             .find(|item| item.id == "webfolder-close-tabs")
             .expect("the close verb is drawn");
         assert!(empty.disabled);
-        assert_eq!(empty.label, "Close 0 tabs — this folder is empty");
+        assert_eq!(empty.label, "Close 0 tabs", "the count is the NAME's job");
+        assert_eq!(
+            empty.reason.as_deref(),
+            Some("this folder is empty"),
+            "…and the reason is the tooltip's"
+        );
+        assert_eq!(
+            empty.tooltip(),
+            "Close 0 tabs — this folder is empty",
+            "the two meet in the hover text, which is where the user reads the \
+             whole sentence"
+        );
 
         // A folder the tree does not have gets no menu at all.
         assert!(
-            web_tab_menu_items(&tabs, &[], 0, &WebTabMenuTarget::Folder("gone".to_string()))
+            menu_items(&tabs, &[], 0, &WebTabMenuTarget::Folder("gone".to_string()))
                 .is_empty()
         );
         // Routing is target-scoped: a tab row cannot reach a folder verb.
@@ -166183,12 +168654,17 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_surface(&[("https://a/", None)]);
         assert!(!chrome_transient_over_viewport(&shell.snapshot()));
 
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         assert!(chrome_transient_over_viewport(&shell.snapshot()));
         shell.close_web_tab_context_menu();
         assert!(!chrome_transient_over_viewport(&shell.snapshot()));
 
-        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Strip, (0.0, 0.0));
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (0.0, 0.0));
         assert!(chrome_transient_over_viewport(&shell.snapshot()));
         shell.close_web_profile_switcher();
         assert!(!chrome_transient_over_viewport(&shell.snapshot()));
@@ -166207,7 +168683,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn the_app_tab_cannot_be_duplicated() {
         let tabs = vec![tab(0, "app", None, true), tab(1, "page", None, false)];
-        let duplicate = web_tab_menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(0))
+        let duplicate = menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(0))
             .into_iter()
             .find(|item| item.id == "webtab-duplicate")
             .expect("the duplicate item is drawn, inert");
@@ -166216,7 +168692,11 @@ mod webtabs_menu_switcher_locks {
             "the app's own tab is the app, not a page to copy"
         );
         assert!(
-            duplicate.label.contains("not a page to copy"),
+            duplicate.label == "Duplicate tab"
+                && duplicate
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a page to copy")),
             "a greyed item must SAY why: {}",
             duplicate.label
         );
@@ -166225,7 +168705,7 @@ mod webtabs_menu_switcher_locks {
             "a chord must never reach a verb the mouse cannot"
         );
         assert!(
-            !web_tab_menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(1))
+            !menu_items(&tabs, &[], 0, &WebTabMenuTarget::Tab(1))
                 .into_iter()
                 .find(|item| item.id == "webtab-duplicate")
                 .expect("a user tab CAN be duplicated")
@@ -166276,7 +168756,7 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(snapshot.web_surface_profiles.get("local://ws"), None);
         picking.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Rail,
+            WebSurfaceChromeAnchor::Rail,
             (0.0, 0.0),
         );
         assert!(
@@ -166294,7 +168774,7 @@ mod webtabs_menu_switcher_locks {
             owner,
             "the rail badge reads the owner, not a copy of the question"
         );
-        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Strip, (0.0, 0.0));
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (0.0, 0.0));
         assert_eq!(
             shell
                 .snapshot()
@@ -166539,9 +169019,12 @@ mod webtabs_menu_switcher_locks {
     /// exactly how the picker's mount slipped through the first cut: it named no
     /// band AND was fed physical px, and neither lock could see it.
     const CONTEXT_MENU_MOUNTS: [(&str, &str); 5] = [
+        // The tab menu, like the profile dropdown, is ONE menu with TWO anchors
+        // — the rail's rows and the classic strip's tabs — so its band is a
+        // match on the anchor rather than a constant.
         (
             "if let Some(menu) = snapshot.web_tab_context_menu.clone()",
-            "band: Some(context_menu_rail_band),",
+            "band: match menu.anchor {",
         ),
         (
             "if let Some(menu) = snapshot.app_pane_context_menu.clone()",
@@ -166574,7 +169057,7 @@ mod webtabs_menu_switcher_locks {
         // The buttons' enablement comes from the tab's engine reading.
         let mut shell = shell_with_surface(&[("https://a.example/", None)]);
         let tab_id = shell.web_surfaces["local://ws"].tabs[1].id;
-        shell.web_surface_select_tab("local://ws", tab_id);
+        shell.web_surface_select_tab("local://ws", tab_id, WebTabSelect::User);
 
         // Nothing observed yet: a tab with no webview offers no history.
         let overlay = shell
@@ -166742,7 +169225,7 @@ mod webtabs_menu_switcher_locks {
 
         // Close the FIRST user tab (index 1) while it is active: the selection
         // must move RIGHT, to what is now in its slot — not left onto the app.
-        shell.web_surface_select_tab("local://ws", ids[1]);
+        shell.web_surface_select_tab("local://ws", ids[1], WebTabSelect::User);
         shell.web_surface_close_tab("local://ws", ids[1]);
         assert_eq!(
             shell.web_surfaces["local://ws"].active_tab, ids[2],
@@ -166752,7 +169235,7 @@ mod webtabs_menu_switcher_locks {
         // Close the LAST tab while active: there is nothing to the right, so the
         // left neighbour is the honest answer.
         let last = *ids.last().expect("a last tab");
-        shell.web_surface_select_tab("local://ws", last);
+        shell.web_surface_select_tab("local://ws", last, WebTabSelect::User);
         shell.web_surface_close_tab("local://ws", last);
         assert_eq!(
             shell.web_surfaces["local://ws"].active_tab, ids[2],
@@ -166807,13 +169290,21 @@ mod webtabs_menu_switcher_locks {
             "…with its egress deliberately unresolved, for the dispatch to finish"
         );
 
-        // The dispatch half: it must SELECT what it duplicated.
+        // The dispatch half: it must SELECT what it duplicated, and the
+        // selection must be the OPENED gesture. A `WebTabSelect::User` here
+        // would forget every opener group the instant a duplicate is made, so
+        // the second duplicate of one tab would land between the original and
+        // the first copy — the cascade collapsing on its own first hop.
         let dispatch = function_body(&product_source(), "fn dispatch_web_tab_menu_action(");
         assert!(
             dispatch.contains("web_surface_duplicate_tab(&session_path, tab_id)")
-                && dispatch.contains("select_web_surface_tab(state, session_path.clone(), new_id)"),
-            "the dispatch must duplicate AND select — selection is what resolves \
-             the copy's URL:\n{dispatch}"
+                && dispatch.contains(
+                    "select_web_surface_tab(state, session_path.clone(), new_id, WebTabSelect::Opened)"
+                ),
+            "the dispatch must duplicate AND select, as an OPENED selection — \
+             selection is what resolves the copy's URL, and calling it a user \
+             gesture would expire the opener groups the placement model runs \
+             on:\n{dispatch}"
         );
     }
 
@@ -166990,11 +169481,11 @@ mod webtabs_menu_switcher_locks {
             .expect("the dropdown mount");
         let arms = product[at..at + 24].join("\n");
         assert!(
-            arms.contains("WebProfileSwitcherAnchor::Rail => Some(context_menu_rail_band),"),
+            arms.contains("WebSurfaceChromeAnchor::Rail => Some(context_menu_rail_band),"),
             "the rail anchor must be banded:\n{arms}"
         );
         assert!(
-            arms.contains("WebProfileSwitcherAnchor::Strip => None,"),
+            arms.contains("WebSurfaceChromeAnchor::Strip => None,"),
             "the strip anchor must NOT be banded — there is no band below the \
              strip to be inside of:\n{arms}"
         );
@@ -167021,7 +169512,7 @@ mod webtabs_menu_switcher_locks {
 
         shell.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Strip,
+            WebSurfaceChromeAnchor::Strip,
             (820.0, 90.0),
         );
         assert!(
@@ -167052,7 +169543,7 @@ mod webtabs_menu_switcher_locks {
         // RAIL anchors: no stash.
         shell.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Rail,
+            WebSurfaceChromeAnchor::Rail,
             (1500.0, 40.0),
         );
         assert!(
@@ -167061,24 +169552,54 @@ mod webtabs_menu_switcher_locks {
              the page for nothing"
         );
         shell.close_web_profile_switcher();
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (1500.0, 300.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (1500.0, 300.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         assert!(
             !shell.has_modal_over_viewport(),
             "a rail ROW menu must not stash the page either"
         );
         shell.close_web_tab_context_menu();
 
-        // The pure membership rule, both halves.
-        assert!(strip_dropdown_over_viewport(true, None));
+        // …and the SAME menu raised from the classic STRIP is a stash member,
+        // because there it hangs over pure page with no band to save it.
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (400.0, 40.0),
+            WebSurfaceChromeAnchor::Strip,
+        );
+        assert!(
+            shell.has_modal_over_viewport(),
+            "a STRIP-anchored tab menu must stash the page, or it is drawn \
+             underneath it and the user sees nothing"
+        );
+        // The strip-scoped closer must be able to take it, or Escape would
+        // report the strip dropdown as the top modal and then close nothing.
+        shell.close_strip_anchored_dropdowns();
+        assert!(shell.web_tab_context_menu.is_none());
+
+        // The pure membership rule, every half.
+        assert!(strip_dropdown_over_viewport(true, None, None));
         assert!(strip_dropdown_over_viewport(
             false,
-            Some(WebProfileSwitcherAnchor::Strip)
+            Some(WebSurfaceChromeAnchor::Strip),
+            None
+        ));
+        assert!(strip_dropdown_over_viewport(
+            false,
+            None,
+            Some(WebSurfaceChromeAnchor::Strip)
         ));
         assert!(!strip_dropdown_over_viewport(
             false,
-            Some(WebProfileSwitcherAnchor::Rail)
+            Some(WebSurfaceChromeAnchor::Rail),
+            Some(WebSurfaceChromeAnchor::Rail)
         ));
-        assert!(!strip_dropdown_over_viewport(false, None));
+        assert!(!strip_dropdown_over_viewport(false, None, None));
 
         // What that membership BUYS is an unmap in legacy — the only thing that
         // reliably clears a native surface's pixels — and nothing under glass,
@@ -167274,7 +169795,7 @@ mod webtabs_menu_switcher_locks {
     fn dismissing_a_strip_dropdown_leaves_a_rail_anchored_switcher_alone() {
         let mut shell = shell_with_filed_tab();
         shell.toggle_web_tab_overflow();
-        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Rail, (1500.0, 40.0));
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (1500.0, 40.0));
         assert!(shell.has_modal_over_viewport(), "the strip dropdown is the modal");
 
         shell.close_strip_anchored_dropdowns();
@@ -167292,7 +169813,7 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_filed_tab();
         shell.open_web_profile_switcher(
             "local://ws",
-            WebProfileSwitcherAnchor::Strip,
+            WebSurfaceChromeAnchor::Strip,
             (820.0, 90.0),
         );
         shell.close_strip_anchored_dropdowns();
@@ -168331,7 +170852,12 @@ mod menu_dismissal_locks {
             "https://a/",
             None,
         )]);
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (0.0, 0.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (0.0, 0.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         let open = shell.snapshot();
         assert!(!open.web_tab_menu_items.is_empty());
         assert!(open.web_tab_context_menu.is_some());
@@ -168482,11 +171008,16 @@ mod menu_dismissal_locks {
         let mut cases = Vec::new();
 
         let (mut shell, _row) = shell_with_every_menu_available();
-        shell.open_web_profile_switcher("local://ws", WebProfileSwitcherAnchor::Strip, (8.0, 9.0));
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (8.0, 9.0));
         cases.push((ShellMenu::WebProfile, shell));
 
         let (mut shell, _row) = shell_with_every_menu_available();
-        shell.open_web_tab_context_menu("local://ws", WebTabMenuTarget::Tab(1), (8.0, 9.0));
+        shell.open_web_tab_context_menu(
+            "local://ws",
+            WebTabMenuTarget::Tab(1),
+            (8.0, 9.0),
+            WebSurfaceChromeAnchor::Rail,
+        );
         cases.push((ShellMenu::WebTab, shell));
 
         let (mut shell, row) = shell_with_every_menu_available();
