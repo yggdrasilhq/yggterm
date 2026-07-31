@@ -642,6 +642,33 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
     }
 }
 
+/// Every key a JS terminal event may carry that must never reach a trace.
+///
+/// One list, because the redaction has exactly one caller and adding a secret
+/// to the wire must mean adding it here in the same edit.
+const TRACE_REDACTED_KEYS: &[&str] = &["control_token"];
+
+/// Blank the secrets out of an UNPARSEABLE event before it is handed to
+/// [`TerminalJsEvent::Ignored`].
+///
+/// `Ignored` exists so a malformed event is visible instead of silent, and its
+/// `value` is traced VERBATIM by the shell. That is the right call for a
+/// diagnostic — and it is also a credential leak the moment the wire carries
+/// one, because a payload that fails to deserialize for ANY reason (a bad pane
+/// entry, a type that moved) dumps every sibling field with it. The declare's
+/// own trace has been secret-free since the token was introduced; this closes
+/// the door the failure path left open beside it.
+fn redact_secrets_for_trace(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        for key in TRACE_REDACTED_KEYS {
+            if let Some(slot) = object.get_mut(*key) {
+                *slot = Value::String("[redacted]".to_string());
+            }
+        }
+    }
+    value
+}
+
 impl<'de> Deserialize<'de> for TerminalJsEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -653,7 +680,7 @@ impl<'de> Deserialize<'de> for TerminalJsEvent {
                 Ok(event) => event.into(),
                 Err(error) => TerminalJsEvent::Ignored {
                     reason: error.to_string(),
-                    value,
+                    value: redact_secrets_for_trace(value),
                 },
             },
         )
@@ -895,5 +922,56 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An event that fails to parse is traced VERBATIM, so the failure path is
+    /// the one place a credential can escape a channel whose success path was
+    /// audited. A bad `panes` entry is the realistic trigger: nothing about it
+    /// concerns the token, and without this the whole declare — token included
+    /// — lands in `event-trace.jsonl`.
+    #[test]
+    fn an_unparseable_declare_never_traces_the_control_token() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "sidebar_contribution",
+            "action": "declare",
+            "session": "local://app",
+            "control": "http://127.0.0.1:9999",
+            "control_token": "s3cr3t-token-value",
+            // `panes` must be an array; a bare string fails the whole payload.
+            "panes": "not-an-array",
+        }))
+        .expect("a malformed event degrades to Ignored rather than erroring");
+        let TerminalJsEvent::Ignored { value, .. } = event else {
+            panic!("a malformed sidebar declare must land in Ignored");
+        };
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("s3cr3t-token-value"),
+            "the token must never survive into a traced value:\n{rendered}"
+        );
+        assert_eq!(value["control_token"], json!("[redacted]"));
+        // Redaction is surgical: the diagnostic is worthless if it blanks the
+        // fields someone is reading the trace to see.
+        assert_eq!(value["control"], json!("http://127.0.0.1:9999"));
+        assert_eq!(value["session"], json!("local://app"));
+    }
+
+    /// The redaction list and the wire type must not drift apart: a secret
+    /// added to the declare without a line in `TRACE_REDACTED_KEYS` leaks.
+    #[test]
+    fn every_redacted_key_is_a_real_wire_field() {
+        let source = include_str!("terminal_protocol.rs");
+        for key in TRACE_REDACTED_KEYS {
+            assert!(
+                source.contains(&format!("{key}: Option<String>")),
+                "`{key}` is redacted but is not a field of the wire type — the list is stale"
+            );
+        }
     }
 }
