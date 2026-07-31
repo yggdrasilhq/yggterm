@@ -25,6 +25,8 @@ use std::rc::Rc;
 
 use gtk::gdk;
 use gtk::prelude::*;
+
+use crate::web_surface_clipboard_image_paste::CLIPBOARD_IMAGE_PASTE_SHIM_JS;
 use wry::{
     dpi::{LogicalPosition, LogicalSize, Position, Size},
     http::{Request, Response},
@@ -2623,6 +2625,12 @@ fn build_popup_webview(
         // (and the async clipboard API generally) fails silently, which is
         // exactly what the user hit.
         .with_clipboard(true)
+        // …and the grant alone is NOT an image paste: WebKitGTK hands the page
+        // an EMPTY DataTransfer for an image-only clipboard (measured, and
+        // reproduced in a vanilla webkit2gtk window with none of this crate in
+        // the process). All frames, page's own world — the page's own listeners
+        // are who this is for. See `CLIPBOARD_IMAGE_PASTE_SHIM_JS`.
+        .with_initialization_script_for_main_only(CLIPBOARD_IMAGE_PASTE_SHIM_JS, false)
         .with_devtools(true)
         // NO url: WebKit loads the request that asked for this window into the
         // view we hand back. Loading it ourselves would race that navigation.
@@ -3175,6 +3183,13 @@ impl WebSurfaceHost {
         // (and the async clipboard API generally) fails silently, which is
         // exactly what the user hit.
         .with_clipboard(true)
+            // …and the grant alone is NOT an image paste: WebKitGTK hands the
+            // page an EMPTY DataTransfer for an image-only clipboard (measured,
+            // and reproduced in a vanilla webkit2gtk window with none of this
+            // crate in the process). All frames, page's own world — the page's
+            // own listeners are who this is for.
+            // See `CLIPBOARD_IMAGE_PASTE_SHIM_JS`.
+            .with_initialization_script_for_main_only(CLIPBOARD_IMAGE_PASTE_SHIM_JS, false)
             .with_devtools(true)
             // Every surface reports `window.close()`. A normal tab's request is
             // REFUSED by the shell (Chrome's rule), but the shell can only refuse

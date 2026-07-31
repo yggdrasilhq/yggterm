@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Fixed: pasting an image into a web app now works.** Ctrl+V of a screenshot
+  into a chat composer (open-webui was the report) did nothing, while pasting
+  text was fine. WebKitGTK hands the page an EMPTY `clipboardData` for an
+  image-only clipboard — measured, and reproduced in a bare webkit2gtk window
+  with no yggterm in the process, so the defect is the engine's: its paste
+  DataTransfer never carries a file at all. The image IS reachable through
+  `navigator.clipboard.read()`, which works because every surface is already
+  built with the clipboard grant, so every page surface (and every popup one
+  opens, every frame) now re-delivers the paste with the file the engine hid. A
+  paste the engine got right is untouched, text pastes are untouched, and an
+  image nobody claims still lands in the editor exactly where the engine would
+  have put it.
 - **Fixed: a Claude Code viewport no longer stays broken at the bottom until you
   type a slash.** The reveal screen-reconcile is what repairs a wrong frame, and
   it was gated on 1.2 s of output silence with a rearm that had no ceiling — so
