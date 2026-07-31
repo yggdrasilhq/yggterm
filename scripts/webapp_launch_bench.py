@@ -71,6 +71,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -222,7 +223,7 @@ def run_webkit(probe: pathlib.Path, url: str, profile: pathlib.Path, timeout_ms:
 # --------------------------------------------------------------------------
 
 
-async def _cdp_collect(ws_url: str, timeout_s: float) -> dict:
+async def _cdp_collect(ws_url: str, timeout_s: float, host: str = "") -> dict:
     import websockets
 
     async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
@@ -240,10 +241,21 @@ async def _cdp_collect(ws_url: str, timeout_s: float) -> dict:
                         raise RuntimeError(raw["error"])
                     return raw.get("result", {})
 
+        # `document.readyState === "complete"` is NOT enough on its own. A page
+        # target exists (and already advertises the destination URL) while its
+        # document is still the initial about:blank, which reports `complete`
+        # immediately. Collecting there yields a well-formed report of zeroes
+        # that reads as "Chromium loaded this instantly". The real edge is a
+        # navigation entry that has actually finished, on the right origin.
+        ready = (
+            "(function(){var n=performance.getEntriesByType('navigation')[0];"
+            "return !!n && n.loadEventEnd > 0 && document.readyState === 'complete'"
+            "%s;})()"
+        ) % (" && location.host.indexOf(%r) !== -1" % host if host else "")
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            res = await call("Runtime.evaluate", {"expression": "document.readyState", "returnByValue": True})
-            if res.get("result", {}).get("value") == "complete":
+            res = await call("Runtime.evaluate", {"expression": ready, "returnByValue": True})
+            if res.get("result", {}).get("value") is True:
                 break
             await asyncio.sleep(0.05)
         # One turn of the task queue so loadEventEnd is populated, exactly like
@@ -286,22 +298,36 @@ def run_chromium(binary: str, url: str, profile: pathlib.Path, timeout_ms: int, 
         if port is None:
             return {"ok": False, "error": "chromium never wrote DevToolsActivePort"}
 
+        # Pick the target showing OUR url. Taking `page_targets[0]` blindly is
+        # wrong and silently so: Chromium's first run also opens a welcome /
+        # new-tab page, and attaching to that yields a perfectly well-formed
+        # report full of zeroes — loadEventEnd 0, no resources — which reads as
+        # "Chromium loaded this instantly" rather than as "you measured the
+        # wrong tab". It did exactly that on the first real-site run here.
+        host = urllib.parse.urlsplit(url).netloc or url
         target = None
         while time.monotonic() < deadline:
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as resp:
                     targets = json.loads(resp.read())
-                page_targets = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
-                if page_targets:
-                    target = page_targets[0]
+                page_targets = [
+                    t for t in targets
+                    if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+                ]
+                mine = [t for t in page_targets if host and host in (t.get("url") or "")]
+                if mine:
+                    target = mine[0]
                     break
             except Exception:
                 pass
             time.sleep(0.02)
         if target is None:
-            return {"ok": False, "error": "no chromium page target appeared"}
+            return {
+                "ok": False,
+                "error": f"no chromium page target for {host} appeared (never navigated?)",
+            }
 
-        page = asyncio.run(_cdp_collect(target["webSocketDebuggerUrl"], timeout_ms / 1000.0))
+        page = asyncio.run(_cdp_collect(target["webSocketDebuggerUrl"], timeout_ms / 1000.0, host))
         # Same flush grace as the WebKit arm. Both engines write their disk
         # cache asynchronously; killing either one early makes the NEXT run
         # measure a cold cache while calling itself warm.
