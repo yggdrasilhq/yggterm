@@ -223,7 +223,8 @@ use yggterm_server::{
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
-    RailHeader, RailScrollBody, RailSectionTitle, RowTreeDrop, RowTreeRow,
+    ROW_DRAG_CLICK_SUPPRESS_MS, RailHeader, RailScrollBody, RailSectionTitle, RowDragGesture,
+    RowDropTarget, RowTreeDrop, RowTreeRow,
     SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
     ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
@@ -1362,6 +1363,13 @@ struct WebTabFolder {
     name: String,
     #[serde(default)]
     collapsed: bool,
+    /// The folder this folder lives in; `None` = a root folder.
+    ///
+    /// A folder holds folders, arbitrarily deep — the cwd tree's own rule
+    /// (user-reported 2026-07-31). Absent in a store written before nesting
+    /// existed, which reads back as the flat single level those stores meant.
+    #[serde(default)]
+    parent: Option<String>,
 }
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
@@ -3278,7 +3286,27 @@ fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
 #[cfg(test)]
 mod app_pane_reorder_tests {
     use super::*;
-    use yggui::DRAG_BEGIN_THRESHOLD_PX;
+    use yggui::{DRAG_BEGIN_THRESHOLD_PX, ROW_DRAG_SPRING_MS};
+
+    /// The PRODUCT half of this file — test modules stripped. A source scan
+    /// that read its own assertions would be satisfied by the needle it
+    /// spells, which is how a lock rots into a tautology.
+    fn product_source() -> String {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !product.contains("mod app_pane_reorder_tests"),
+            "the scan is reading this test module"
+        );
+        product
+    }
 
     fn shell() -> ShellState {
         ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
@@ -3295,7 +3323,7 @@ mod app_pane_reorder_tests {
     /// The real gesture: press, then travel past the threshold. Every drag the
     /// user can perform goes through both steps, so every test does too.
     fn drag_row(shell: &mut ShellState, pane_id: &str, row_id: &str) {
-        shell.arm_app_pane_row_drag(pane_id.to_string(), row_id.to_string(), (0.0, 0.0));
+        shell.arm_app_pane_row_drag(pane_id.to_string(), row_id.to_string(), row_id.to_string(), (0.0, 0.0));
         assert!(
             shell.maybe_begin_app_pane_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)),
             "the pointer travelled past the threshold"
@@ -3353,7 +3381,7 @@ mod app_pane_reorder_tests {
         let mut shell = shell();
         drag_row(&mut shell, "notes", "a");
         assert_eq!(shell.take_app_pane_row_drop(&rows), None);
-        assert!(shell.app_pane_row_drag.is_none());
+        assert!(shell.row_drag.is_none());
     }
 
     // Rails are per-app. A row must never be dropped into another pane's list —
@@ -3420,8 +3448,8 @@ mod app_pane_reorder_tests {
             !shell.app_pane_row_is_dragging("notes", "a"),
             "a released row must not stay dimmed"
         );
-        assert!(shell.app_pane_row_drag.is_none());
-        assert!(shell.app_pane_row_drop_target.is_none());
+        assert!(shell.row_drag.is_none());
+        assert!(shell.row_drag.is_none());
     }
 
     // The second face of the same defect: with the gesture stuck, merely moving
@@ -3432,7 +3460,7 @@ mod app_pane_reorder_tests {
     fn a_press_that_never_travels_is_a_click_not_a_drag() {
         let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
-        shell.arm_app_pane_row_drag("notes".into(), "a".into(), (100.0, 100.0));
+        shell.arm_app_pane_row_drag("notes".into(), "a".into(), "A".into(), (100.0, 100.0));
 
         // A pixel of jitter is not a drag.
         assert!(!shell.maybe_begin_app_pane_row_drag((101.0, 100.0)));
@@ -3451,7 +3479,7 @@ mod app_pane_reorder_tests {
             None,
             "releasing a click must never reorder anything"
         );
-        assert!(shell.app_pane_row_drag.is_none(), "and it still clears");
+        assert!(shell.row_drag.is_none(), "and it still clears");
     }
 
     // One drag threshold for the whole window. The rail began dragging on
@@ -3459,7 +3487,7 @@ mod app_pane_reorder_tests {
     #[test]
     fn the_rail_and_the_tree_share_one_drag_threshold() {
         let mut shell = shell();
-        shell.arm_app_pane_row_drag("notes".into(), "a".into(), (0.0, 0.0));
+        shell.arm_app_pane_row_drag("notes".into(), "a".into(), "A".into(), (0.0, 0.0));
         assert!(
             !shell.maybe_begin_app_pane_row_drag((DRAG_BEGIN_THRESHOLD_PX - 0.5, 0.0)),
             "under the shared threshold is still a click"
@@ -3582,6 +3610,285 @@ mod app_pane_reorder_tests {
         assert_eq!(row_drop_placement_for_offset(26.0, true), DragDropPlacement::After);
     }
 
+    // ==================================================================
+    // THE DRAG UX IS ONE COMPONENT — the reuse doctrine as a lock.
+    //
+    // A contributed pane (yedit's notes among them) declares JSON and no
+    // Rust. Every affordance below therefore has to come from the shared
+    // gesture, or it does not reach yedit at all. Each of these fails RED if
+    // the behaviour retreats into a surface's own code.
+    // ==================================================================
+
+    /// The whole window has ONE drag gesture, because there is one pointer. A
+    /// second `Option<…RowDrag>` beside it is how the rail and the panes came
+    /// to disagree about the threshold in the first place.
+    #[test]
+    fn there_is_exactly_one_row_drag_state_in_the_shell() {
+        let source = product_source();
+        let start = source
+            .find("struct ShellState {")
+            .expect("the shell state exists");
+        let state = &source[start..];
+        let end = state.find("\n}\n").unwrap_or(state.len());
+        let state = &state[..end];
+        assert_eq!(
+            state.matches("row_drag: Option<RowDragGesture>").count(),
+            1,
+            "one gesture, from yggui"
+        );
+        // …and the render snapshot carries exactly that one, not a projection
+        // of its own.
+        assert_eq!(
+            source.matches("row_drag: Option<RowDragGesture>").count(),
+            2,
+            "the state's field and the render snapshot's copy of it — no third"
+        );
+        for banned in ["AppPaneRowDrag", "WebTabRowDrag", "app_pane_row_drop_target:"] {
+            assert!(
+                !state.contains(banned),
+                "the per-surface drag state is back: {banned}"
+            );
+        }
+    }
+
+    /// The GHOST. The cwd tree has always drawn a card under the pointer; the
+    /// rail and the contributed panes drew nothing, so a drag out of the list
+    /// looked like a drag that had died. It is drawn ONCE, at the window root,
+    /// from the one gesture — a per-surface ghost would be a third card.
+    #[test]
+    fn a_live_row_drag_draws_the_shared_ghost_card_at_the_window_root() {
+        let mut shell = shell();
+        shell.arm_row_drag("notes".into(), "a".into(), "Note A".into(), (10.0, 10.0));
+        assert!(
+            shell.row_drag.as_ref().is_some_and(|drag| !drag.begun),
+            "an armed press has no ghost yet — it is still a click"
+        );
+        assert!(shell.maybe_begin_row_drag((10.0 + DRAG_BEGIN_THRESHOLD_PX, 10.0)));
+        let drag = shell.row_drag.as_ref().expect("gesture");
+        assert!(drag.begun);
+        assert_eq!(drag.label, "Note A", "the ghost says what is moving");
+        // …and a CONTRIBUTED pane's row carries its own title into it, so
+        // yedit's ghost reads "n3.md", not a generic "Move row".
+        let pane_render = product_source();
+        let start = pane_render
+            .find("AppPaneWidget::ListRow { id, title,")
+            .expect("the contributed list-row render");
+        let row = &pane_render[start..];
+        let row = &row[..row.find("AppPaneWidget::Markdown").expect("row arm end")];
+        assert!(
+            row.contains("let row_label = title.clone();")
+                && row.contains("row_label.clone(),"),
+            "a contributed row's title must reach the shared ghost:\n{row}"
+        );
+        // The root tracks the pointer, so the card does not freeze at the edge
+        // of the list that owns the gesture.
+        shell.track_row_drag_pointer((400.0, 320.0));
+        assert_eq!(shell.row_drag.as_ref().expect("gesture").pointer, (400.0, 320.0));
+
+        let source = product_source();
+        let root = source
+            .find("if !snapshot.drag_paths.is_empty() {")
+            .expect("the cwd tree's ghost is drawn at the window root");
+        let root = &source[root..root + 2_000];
+        assert!(
+            root.contains("snapshot.row_drag.as_ref().filter(|drag| drag.begun)"),
+            "the row lists' ghost is drawn beside the tree's, at the same root:\n{root}"
+        );
+        assert_eq!(
+            source.matches("DragGhostCard {").count(),
+            2,
+            "exactly two ghost call sites — the tree's DragGhost and this one"
+        );
+    }
+
+    /// The ghost's hint names the row it would land on, in one sentence owned
+    /// once. `Into` is "inside", which is the word the cwd tree's ghost uses.
+    #[test]
+    fn the_ghost_hint_names_the_landing() {
+        let target = |placement| RowDropTarget {
+            scope: "notes".into(),
+            row_id: "f1".into(),
+            label: "Work".into(),
+            placement,
+        };
+        assert_eq!(
+            row_drop_target_hint(&target(DragDropPlacement::Into)),
+            "Drop inside Work"
+        );
+        assert_eq!(
+            row_drop_target_hint(&target(DragDropPlacement::Before)),
+            "Drop before Work"
+        );
+        assert_eq!(
+            row_drop_target_hint(&target(DragDropPlacement::After)),
+            "Drop after Work"
+        );
+        // A row with no name still names something the user can see.
+        assert_eq!(
+            row_drop_target_hint(&RowDropTarget {
+                scope: "notes".into(),
+                row_id: "f1".into(),
+                label: "  ".into(),
+                placement: DragDropPlacement::Into,
+            }),
+            "Drop inside f1"
+        );
+    }
+
+    /// A committed drag swallows the click its OWN release produces. Without
+    /// this, moving a row also activated it — you dragged a note and were
+    /// switched into it. The cwd tree has always suppressed this window.
+    #[test]
+    fn a_committed_drag_swallows_its_own_click() {
+        let rows = flat_rows(&["a", "b", "c"]);
+        let mut moved = shell();
+        drag_row(&mut moved, "notes", "c");
+        moved.hover_app_pane_row_drop("notes", "a", DragDropPlacement::Before);
+        assert!(moved.take_app_pane_row_drop(&rows).is_some());
+        assert!(
+            moved.consume_suppressed_row_click(),
+            "the release's own click is swallowed"
+        );
+        assert!(
+            !moved.consume_suppressed_row_click(),
+            "…exactly one click, never the next real one"
+        );
+
+        // A drag that moved NOTHING must not swallow anything: the user's
+        // click was a click.
+        let mut idle = shell();
+        drag_row(&mut idle, "notes", "a");
+        assert_eq!(idle.take_app_pane_row_drop(&rows), None);
+        assert!(!idle.consume_suppressed_row_click());
+    }
+
+    /// ESCAPE abandons a live drag, for every row list at once.
+    #[test]
+    fn escape_abandons_a_live_drag() {
+        let mut shell = shell();
+        drag_row(&mut shell, "notes", "a");
+        assert!(shell.row_drag.is_some());
+        shell.clear_app_pane_row_drag();
+        assert!(shell.row_drag.is_none());
+
+        let source = product_source();
+        let root = source
+            .find("if evt.key() == Key::Escape && state.read().row_drag.is_some()")
+            .map(|index| source[index..index + 400].to_string())
+            .expect("the shell root's keydown abandons a live drag");
+        assert!(
+            root.contains("clear_app_pane_row_drag()"),
+            "escape must clear the ONE gesture:\n{root}"
+        );
+    }
+
+    /// SPRING-LOAD reaches a contributed pane, which is the only way it can
+    /// reach yedit: yggterm decides WHEN, the app owns what "expand" means, so
+    /// the answer is the row's own `expand_action`.
+    #[test]
+    fn resting_inside_a_shut_group_springs_it_open_for_a_contributed_pane() {
+        let mut shell = shell();
+        drag_row(&mut shell, "notes", "a");
+        assert_eq!(
+            shell.hover_app_pane_row_drop_group(
+                "notes",
+                "f1",
+                "Work",
+                DragDropPlacement::Into,
+                true,
+            ),
+            None,
+            "arriving is not resting"
+        );
+        // Rewind the dwell rather than sleeping: the engine is timestamped, so
+        // the arrival is restated as having happened a spring ago.
+        if let Some(drag) = shell.row_drag.as_mut() {
+            drag.target = None;
+            let arrived = current_millis().saturating_sub(ROW_DRAG_SPRING_MS + 1);
+            drag.hover("notes", "other", "Other", DragDropPlacement::After, false, arrived);
+            drag.hover("notes", "f1", "Work", DragDropPlacement::Into, true, arrived);
+        }
+        assert_eq!(
+            shell.hover_app_pane_row_drop_group(
+                "notes",
+                "f1",
+                "Work",
+                DragDropPlacement::Into,
+                true,
+            ),
+            Some("f1".to_string()),
+            "a shut group opens under a resting drag"
+        );
+
+        // …and the render POSTs the pane's own expand action when it does.
+        let source = product_source();
+        let anchor = source
+            .find("hover_app_pane_row_drop_group(")
+            .and_then(|start| source[start..].find("if sprung.is_some()"))
+            .is_some();
+        assert!(
+            anchor,
+            "the pane render must act on the spring by POSTing `expand_action`"
+        );
+    }
+
+    /// A drag that wanders out of the list forgets its TARGET but keeps the
+    /// GESTURE. Ending it on leave made the drag impossible to complete,
+    /// because row-to-row movement inside a list produces leave events too.
+    #[test]
+    fn leaving_the_list_forgets_the_target_not_the_gesture() {
+        let mut shell = shell();
+        drag_row(&mut shell, "notes", "a");
+        shell.hover_app_pane_row_drop("notes", "b", DragDropPlacement::After);
+        assert!(shell.app_pane_row_drop_edge("notes", "b").is_some());
+        shell.forget_row_drag_target();
+        assert_eq!(shell.app_pane_row_drop_edge("notes", "b"), None);
+        assert!(
+            shell.app_pane_row_is_dragging("notes", "a"),
+            "the row is still being dragged, and still dimmed"
+        );
+    }
+
+    /// A GROUP row's disclosure control lives in the TRAILING expander slot —
+    /// the cwd tree's own placement — and its LEADING icon is the tree's folder
+    /// glyph, filled when open. A pane declares `expanded`; what a group LOOKS
+    /// like is yggterm's answer, and there is one of it.
+    #[test]
+    fn a_contributed_group_row_wears_the_trees_folder_glyph() {
+        let source = product_source();
+        let start = source
+            .find("AppPaneWidget::ListRow { id, title,")
+            .expect("the contributed list-row render");
+        let row = &source[start..];
+        let row = &row[..row
+            .find("AppPaneWidget::Markdown")
+            .expect("the row arm ends where the next widget arm begins")];
+        assert!(
+            row.contains("RowFolderIcon { expanded: row_expanded }"),
+            "a group row's icon is the SHARED folder glyph:\n{row}"
+        );
+        assert!(
+            row.contains("expander: expander_slot"),
+            "…and its chevron rides the shared trailing expander slot"
+        );
+        assert!(
+            row.contains("RowDisclosureChevron { expanded: row_expanded }"),
+            "…which draws the SHARED chevron"
+        );
+        // The glyph has exactly one owner. Two inlined folder paths in the file
+        // would be the drift this lane exists to end.
+        assert_eq!(
+            source.matches("M2.1 5.45C2.1 4.78726").count(),
+            1,
+            "the outline folder path is drawn in exactly one place"
+        );
+        assert_eq!(
+            source.matches("M1.9 5.2C1.9 4.59249").count(),
+            1,
+            "and so is the filled one"
+        );
+    }
+
     /// `depth` in draw order IS the tree — the one structural encoding a
     /// contributed pane has. A flat pane (no depth, no `expanded`) must project
     /// to exactly the list it always was, or every app that predates this field
@@ -3634,35 +3941,12 @@ mod app_pane_reorder_tests {
     }
 }
 
-/// A contributed rail row's reorder gesture.
+/// The row-drag SCOPE of yggterm's own tab rail.
 ///
-/// TWO phases, the same shape the cwd tree's `PendingTreeDrag` → `drag_paths`
-/// pair has always had: ARMED on mousedown (the press may still turn out to be
-/// a click) and BEGUN once the pointer clears
-/// [`yggui::DRAG_BEGIN_THRESHOLD_PX`]. Only a begun gesture dims its row or
-/// accepts a drop target.
-#[derive(Debug, Clone, PartialEq)]
-struct AppPaneRowDrag {
-    pane_id: String,
-    row_id: String,
-    /// Where the press landed, so the threshold is measured from the press and
-    /// not from wherever the last move happened to be reported.
-    origin: (f64, f64),
-    begun: bool,
-}
-
-/// The WebTabs rail's reorder gesture. The SAME two-phase shape
-/// [`AppPaneRowDrag`] has — armed on press, begun once the pointer clears
-/// [`yggui::DRAG_BEGIN_THRESHOLD_PX`] — because one window must not have two
-/// drag grammars. The rail's own gesture used to begin on contact and could
-/// only ever re-parent; it never re-indexed anything.
-#[derive(Debug, Clone, PartialEq)]
-struct WebTabRowDrag {
-    /// [`web_tab_row_id`] of the row under the press.
-    row_id: String,
-    origin: (f64, f64),
-    begun: bool,
-}
+/// A scope names a row LIST, so a drag can never cross from one list into
+/// another. Contributed panes use their pane id; the rail is yggterm's own, so
+/// it needs a name that no app can mint. Prefixed for exactly that reason.
+const WEB_TAB_RAIL_DRAG_SCOPE: &str = "!yggterm/web-tabs";
 
 /// Half a rail row's height: above it a drop lands BEFORE the row, below it
 /// AFTER. The cwd tree uses 12px bands around a 36px row; a rail row is the
@@ -4008,11 +4292,13 @@ fn web_tab_row_target(row_id: &str) -> Option<WebTabMenuTarget> {
 
 /// One row of the tab tree, in DRAW ORDER — the rail's whole model.
 ///
-/// Folders come FIRST, each followed by the tabs filed in it, and the loose
+/// Folders come FIRST at every level: a folder is followed by its own
+/// sub-folders (recursively) and then by the tabs filed in it, and the loose
 /// tabs follow them all (user-reported 2026-07-30: "folders above tabs"). A
-/// row inside a COLLAPSED folder is in here with `visible: false`: it must not
-/// be drawn, but it must still be in the model, or a reorder elsewhere in the
-/// rail would silently drop every tab the user had folded away.
+/// row inside a COLLAPSED folder — at any depth — is in here with
+/// `visible: false`: it must not be drawn, but it must still be in the model,
+/// or a reorder elsewhere in the rail would silently drop every tab the user
+/// had folded away.
 #[derive(Debug, Clone, PartialEq)]
 struct WebTabRailRow {
     row: WebTabMenuTarget,
@@ -4031,57 +4317,85 @@ impl WebTabRailRow {
 
 /// The tab tree as one ordered row list. Pure over the overlay view, so the
 /// ordering rule is unit-tested without a webview.
+///
+/// Depth is unbounded: a folder holds folders. The walk is bounded by the
+/// folder count so a store whose `parent` links form a cycle (hand-edited, or
+/// written by a future version) renders the reachable rows and stops, rather
+/// than hanging the render thread.
 fn web_tab_rail_rows(
     folders: &[WebTabFolder],
     tabs: &[WebSurfaceOverlayTabView],
 ) -> Vec<WebTabRailRow> {
-    let mut rows = Vec::with_capacity(folders.len() + tabs.len());
-    for folder in folders {
-        rows.push(WebTabRailRow {
-            row: WebTabMenuTarget::Folder(folder.id.clone()),
-            depth: 0,
-            visible: true,
-        });
-        for tab in tabs
+    fn push_level(
+        parent: Option<&str>,
+        depth: u32,
+        visible: bool,
+        folders: &[WebTabFolder],
+        tabs: &[WebSurfaceOverlayTabView],
+        rows: &mut Vec<WebTabRailRow>,
+        emitted: &mut HashSet<String>,
+    ) {
+        for folder in folders
             .iter()
-            .filter(|tab| tab.folder.as_deref() == Some(folder.id.as_str()))
+            .filter(|folder| folder.parent.as_deref() == parent)
         {
+            if !emitted.insert(folder.id.clone()) {
+                continue;
+            }
+            rows.push(WebTabRailRow {
+                row: WebTabMenuTarget::Folder(folder.id.clone()),
+                depth,
+                visible,
+            });
+            push_level(
+                Some(folder.id.as_str()),
+                depth + 1,
+                visible && !folder.collapsed,
+                folders,
+                tabs,
+                rows,
+                emitted,
+            );
+        }
+        for tab in tabs.iter().filter(|tab| tab.folder.as_deref() == parent) {
             rows.push(WebTabRailRow {
                 row: WebTabMenuTarget::Tab(tab.id),
-                depth: 1,
-                visible: !folder.collapsed,
+                depth,
+                visible,
             });
         }
     }
-    for tab in tabs.iter().filter(|tab| tab.folder.is_none()) {
-        rows.push(WebTabRailRow {
-            row: WebTabMenuTarget::Tab(tab.id),
-            depth: 0,
-            visible: true,
-        });
-    }
+    let mut rows = Vec::with_capacity(folders.len() + tabs.len());
+    let mut emitted = HashSet::new();
+    push_level(None, 0, true, folders, tabs, &mut rows, &mut emitted);
     rows
 }
 
-/// The rail's rows as the SHARED reorder engine sees them. A folder is a GROUP
-/// (a tab can be dropped inside it); a tab is a leaf.
+/// The rail's rows as the SHARED reorder engine sees them: DEPTH IN DRAW ORDER
+/// becomes the parent link — a row's parent is the nearest preceding row of
+/// smaller depth — exactly as a contributed pane's `list-row`s are read
+/// ([`app_pane_row_tree`]). A folder is a GROUP (something dropped inside it
+/// becomes its child); a tab is a leaf.
+///
+/// One rule for both surfaces, so the rail cannot come to disagree with a
+/// contributed pane about what nesting means.
 fn web_tab_rail_row_tree(rows: &[WebTabRailRow]) -> Vec<RowTreeRow> {
-    let mut parent: Option<String> = None;
+    let mut ancestors: Vec<(u32, String)> = Vec::new();
     rows.iter()
         .map(|row| {
-            if row.depth == 0 {
-                parent = row.is_folder().then(|| row.id());
-                RowTreeRow {
-                    id: row.id(),
-                    parent: None,
-                    group: row.is_folder(),
-                }
-            } else {
-                RowTreeRow {
-                    id: row.id(),
-                    parent: parent.clone(),
-                    group: false,
-                }
+            while ancestors
+                .last()
+                .is_some_and(|(depth, _)| *depth >= row.depth)
+            {
+                ancestors.pop();
+            }
+            let parent = ancestors.last().map(|(_, id)| id.clone());
+            let id = row.id();
+            ancestors.push((row.depth, id.clone()));
+            RowTreeRow {
+                id,
+                parent,
+                group: row.is_folder(),
             }
         })
         .collect()
@@ -13173,21 +13487,20 @@ struct ShellState {
     /// second `Option<u64>` beside it for tabs would be a second answer to
     /// "what is being renamed right now", and the rail can only rename one row.
     web_tab_rename: Option<(String, String)>,
-    /// The rail row being dragged. Same two-phase shape as [`AppPaneRowDrag`]
-    /// (armed on press, begun once the pointer clears the shared threshold),
-    /// because a press that has not travelled is still a click — the rail used
-    /// to start a drag on contact.
-    web_tab_drag: Option<WebTabRowDrag>,
-    /// `(rail row id, placement)` the drag is currently over. `None` = over
-    /// nothing, which makes the release a no-op rather than a silent move.
-    web_tab_drop_target: Option<(String, DragDropPlacement)>,
-    /// A contributed rail row's reorder gesture. Only rows whose app declared
-    /// `reorder_action` ever land here. See [`AppPaneRowDrag`].
-    app_pane_row_drag: Option<AppPaneRowDrag>,
-    /// Where that drag currently hovers: `(pane id, row id, placement)`. The
-    /// row draws the drop line; release commits. `None` over a non-reorderable
-    /// row, which makes the release a no-op rather than a guess.
-    app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
+    /// THE row-drag gesture — ONE, because there is one pointer.
+    ///
+    /// The WebTabs rail ([`WEB_TAB_RAIL_DRAG_SCOPE`]) and every contributed app
+    /// pane (scope = the pane id) drive this same [`yggui::RowDragGesture`]:
+    /// the press-travel threshold, the dim, the drop target, the ghost's
+    /// pointer, the spring-load dwell and the release rules are one
+    /// implementation, not one per surface. They were two, and they disagreed —
+    /// the rail began dragging on contact while the cwd tree waited 6px.
+    row_drag: Option<RowDragGesture>,
+    /// A drag has just committed; swallow the click its own release produces
+    /// until this instant. The cwd tree has always done this
+    /// (`suppress_tree_click_until_ms`); without it, dragging a rail row also
+    /// activated it — you moved a tab and were switched to it.
+    row_drag_click_suppressed_until_ms: u64,
     /// The user's raw TOGGLE of the classic strip's overflow menu (the tabs that
     /// live in folders).
     ///
@@ -13699,10 +14012,7 @@ struct RenderSnapshot {
     copy_edit_dialog: Option<CopyEditDialog>,
     pending_classic_tabs_switch: bool,
     web_tab_rename: Option<(String, String)>,
-    web_tab_drag: Option<WebTabRowDrag>,
-    web_tab_drop_target: Option<(String, DragDropPlacement)>,
-    app_pane_row_drag: Option<AppPaneRowDrag>,
-    app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
+    row_drag: Option<RowDragGesture>,
     web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -15089,10 +15399,8 @@ impl ShellState {
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
+            row_drag_click_suppressed_until_ms: 0,
             web_tab_overflow_toggled: false,
             tree_rename_path: None,
             tree_rename_depth: None,
@@ -16024,10 +16332,7 @@ impl ShellState {
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             pending_classic_tabs_switch: self.pending_classic_tabs_switch,
             web_tab_rename: self.web_tab_rename.clone(),
-            web_tab_drag: self.web_tab_drag.clone(),
-            web_tab_drop_target: self.web_tab_drop_target.clone(),
-            app_pane_row_drag: self.app_pane_row_drag.clone(),
-            app_pane_row_drop_target: self.app_pane_row_drop_target.clone(),
+            row_drag: self.row_drag.clone(),
             // The GATED reader, never the raw toggle: the render pass, the modal
             // precedence and the transient cover all read this one snapshot
             // field, so none of them can believe in a menu the strip is not
@@ -18574,15 +18879,37 @@ impl ShellState {
     /// is not organization, so the tree asks for one at birth (the cwd tree's
     /// grammar).
     fn web_tab_new_folder(&mut self, session_path: &str) {
+        self.web_tab_new_folder_in(session_path, None);
+    }
+
+    /// …and the nesting form: a new folder INSIDE `parent`. A folder holds
+    /// folders, so "New folder" has to be reachable from a folder row too, or
+    /// nesting would exist only for rows the user could already drag.
+    fn web_tab_new_folder_in(&mut self, session_path: &str, parent: Option<String>) {
         let id = format!("f{}", current_millis());
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             if surface.folders.iter().any(|folder| folder.id == id) {
                 return;
             }
+            let parent = parent.filter(|parent_id| {
+                surface.folders.iter().any(|folder| &folder.id == parent_id)
+            });
+            // A folder born inside a SHUT folder would be invisible, and its
+            // rename field with it. Opening the parent is what the gesture
+            // meant.
+            if let Some(parent_id) = parent.as_deref()
+                && let Some(parent_folder) = surface
+                    .folders
+                    .iter_mut()
+                    .find(|folder| folder.id == parent_id)
+            {
+                parent_folder.collapsed = false;
+            }
             surface.folders.push(WebTabFolder {
                 id: id.clone(),
                 name: WEB_TAB_NEW_FOLDER_NAME.to_string(),
                 collapsed: false,
+                parent,
             });
         } else {
             return;
@@ -18665,10 +18992,25 @@ impl ShellState {
     /// destroy content.
     fn web_tab_delete_folder(&mut self, session_path: &str, folder_id: &str) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            // What the folder HELD moves up one level, exactly where the
+            // folder itself was. Deleting organization must never destroy
+            // content, and with nesting that includes sub-folders: orphaning
+            // them to a dangling parent id would hide their tabs from the
+            // draw walk, which reads as data loss.
+            let grandparent = surface
+                .folders
+                .iter()
+                .find(|folder| folder.id == folder_id)
+                .and_then(|folder| folder.parent.clone());
             surface.folders.retain(|folder| folder.id != folder_id);
+            for folder in &mut surface.folders {
+                if folder.parent.as_deref() == Some(folder_id) {
+                    folder.parent = grandparent.clone();
+                }
+            }
             for tab in &mut surface.tabs {
                 if tab.folder.as_deref() == Some(folder_id) {
-                    tab.folder = None;
+                    tab.folder = grandparent.clone();
                 }
             }
         }
@@ -18724,78 +19066,64 @@ impl ShellState {
     ///
     /// The APP TAB is never a drag source. It is the app's own row, `tabs[0]`,
     /// and it stays there.
-    fn arm_web_tab_row_drag(&mut self, row_id: String, pointer: (f64, f64)) {
+    fn arm_web_tab_row_drag(&mut self, row_id: String, label: String, pointer: (f64, f64)) {
         if web_tab_row_target(&row_id) == Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID)) {
             return;
         }
-        self.web_tab_drag = Some(WebTabRowDrag {
+        self.arm_row_drag(
+            WEB_TAB_RAIL_DRAG_SCOPE.to_string(),
             row_id,
-            origin: pointer,
-            begun: false,
-        });
-        self.web_tab_drop_target = None;
+            label,
+            pointer,
+        );
     }
 
     fn maybe_begin_web_tab_row_drag(&mut self, pointer: (f64, f64)) -> bool {
-        let Some(drag) = self.web_tab_drag.as_mut() else {
-            return false;
-        };
-        if drag.begun {
-            return true;
-        }
-        if !drag_threshold_reached(drag.origin, pointer) {
-            return false;
-        }
-        drag.begun = true;
-        true
+        self.maybe_begin_row_drag(pointer)
     }
 
     /// Hover `row_id` at `placement` while a drag is live.
     ///
-    /// Two coercions, both because the rail's TREE IS TWO LEVELS DEEP by
-    /// construction — a folder holds tabs, and `WebSurfaceTab::folder` is one
-    /// optional id, not a path:
+    /// The coercions keep the promise that the mark drawn is the landing, and
+    /// they follow from the rail's ONE ordering rule — folders above tabs, at
+    /// every level:
     ///
-    /// - a FOLDER dragged over a folder can only land beside it, never inside;
+    /// - a FOLDER may now go INSIDE another folder (`WebTabFolder::parent`
+    ///   makes the tree arbitrarily deep; the shared engine already refuses a
+    ///   folder into its own descendant) — but it still has no resting place
+    ///   among the loose tabs, so a folder over a TAB row finds no target;
+    /// - a TAB dropped anywhere on a FOLDER row goes INSIDE it;
     /// - nothing lands above the app tab, which owns `tabs[0]`.
-    fn hover_web_tab_row_drop(&mut self, row_id: &str, placement: DragDropPlacement) {
-        let Some(drag) = self.web_tab_drag.as_ref().filter(|drag| drag.begun) else {
-            return;
-        };
-        if drag.row_id == row_id {
-            self.web_tab_drop_target = None;
-            return;
-        }
-        let dragging_folder = matches!(
-            web_tab_row_target(&drag.row_id),
-            Some(WebTabMenuTarget::Folder(_))
-        );
+    ///
+    /// `collapsed` says the hovered row is a SHUT folder, which is what the
+    /// shared engine springs open after a dwell. Returns the folder to open.
+    fn hover_web_tab_row_drop(
+        &mut self,
+        row_id: &str,
+        label: &str,
+        placement: DragDropPlacement,
+        collapsed: bool,
+    ) -> Option<String> {
+        let dragging_folder = self.row_drag.as_ref().is_some_and(|drag| {
+            drag.scope == WEB_TAB_RAIL_DRAG_SCOPE
+                && matches!(
+                    web_tab_row_target(&drag.row_id),
+                    Some(WebTabMenuTarget::Folder(_))
+                )
+        });
         let placement = match (dragging_folder, web_tab_row_target(row_id)) {
-            // A FOLDER moves among FOLDERS. The rail is two bands — folders
-            // above, loose tabs below — so "between two tabs" is not a place a
-            // folder can be, and a folder has nowhere to go inside another one
-            // (`WebSurfaceTab::folder` is one optional id, not a path).
-            (true, Some(WebTabMenuTarget::Folder(_))) => match placement {
-                DragDropPlacement::Into => DragDropPlacement::After,
-                other => other,
-            },
+            (true, Some(WebTabMenuTarget::Folder(_))) => placement,
             (true, _) => {
-                self.web_tab_drop_target = None;
-                return;
+                if let Some(drag) = self.row_drag.as_mut() {
+                    drag.target = None;
+                }
+                return None;
             }
-            // A TAB dropped anywhere on a FOLDER row goes INSIDE it. The bands
-            // mean a tab cannot come to rest between two folders, and a drop
-            // line promising otherwise would land the row somewhere else —
-            // DESIGN.md: the final placement must match the visible indicator.
             (false, Some(WebTabMenuTarget::Folder(_))) => DragDropPlacement::Into,
-            // Nothing lands above the app tab, which owns `tabs[0]`.
             (false, Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID))) => DragDropPlacement::After,
             (false, _) => placement,
         };
-        let next = Some((row_id.to_string(), placement));
-        if self.web_tab_drop_target != next {
-            self.web_tab_drop_target = next;
-        }
+        self.hover_row_drag(WEB_TAB_RAIL_DRAG_SCOPE, row_id, label, placement, collapsed)
     }
 
     /// Commit the drag onto whatever row it is hovering. A drag that ends over
@@ -18805,17 +19133,16 @@ impl ShellState {
     /// `rows` is the rail's WHOLE row tree, collapsed folders' tabs included —
     /// see [`web_tab_rail_rows`].
     fn end_web_tab_row_drag(&mut self, rows: &[RowTreeRow]) {
-        let drag = self.web_tab_drag.take();
-        let target = self.web_tab_drop_target.take();
-        let Some(drag) = drag.filter(|drag| drag.begun) else {
+        let Some(drag) = self.row_drag.take() else {
             return;
         };
-        let Some((target_row, placement)) = target else {
+        if drag.scope != WEB_TAB_RAIL_DRAG_SCOPE {
+            return;
+        }
+        let Some(drop) = drag.resolve(rows) else {
             return;
         };
-        let Some(drop) = reorder_row_tree(rows, &drag.row_id, &target_row, placement) else {
-            return;
-        };
+        self.suppress_click_after_row_drag();
         let Some(session) = self.active_web_surface_session() else {
             return;
         };
@@ -18823,21 +19150,19 @@ impl ShellState {
     }
 
     fn clear_web_tab_row_drag(&mut self) {
-        self.web_tab_drag = None;
-        self.web_tab_drop_target = None;
+        self.row_drag = None;
     }
 
     fn web_tab_row_is_dragging(&self, row_id: &str) -> bool {
-        self.web_tab_drag
+        self.row_drag
             .as_ref()
-            .is_some_and(|drag| drag.begun && drag.row_id == row_id)
+            .is_some_and(|drag| drag.is_dragging(WEB_TAB_RAIL_DRAG_SCOPE, row_id))
     }
 
     fn web_tab_row_drop_edge(&self, row_id: &str) -> Option<DragDropPlacement> {
-        self.web_tab_drop_target
+        self.row_drag
             .as_ref()
-            .filter(|(row, _)| row == row_id)
-            .map(|(_, placement)| *placement)
+            .and_then(|drag| drag.drop_edge(WEB_TAB_RAIL_DRAG_SCOPE, row_id))
     }
 
     /// Adopt a resolved drop: the moved row's new parent, and the whole rail's
@@ -18854,16 +19179,30 @@ impl ShellState {
         let Some(surface) = self.web_surfaces.get_mut(session_path) else {
             return;
         };
-        if let Some(WebTabMenuTarget::Tab(tab_id)) = web_tab_row_target(moved)
-            && tab_id != WEB_TAB_APP_TAB_ID
-        {
-            let folder = match drop.parent.as_deref().and_then(web_tab_row_target) {
-                Some(WebTabMenuTarget::Folder(folder_id)) => Some(folder_id),
-                _ => None,
-            };
-            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                tab.folder = folder;
+        let new_folder = match drop.parent.as_deref().and_then(web_tab_row_target) {
+            Some(WebTabMenuTarget::Folder(folder_id)) => Some(folder_id),
+            _ => None,
+        };
+        match web_tab_row_target(moved) {
+            Some(WebTabMenuTarget::Tab(tab_id)) if tab_id != WEB_TAB_APP_TAB_ID => {
+                if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.folder = new_folder;
+                }
             }
+            // A FOLDER re-files into another folder — that is nesting. The
+            // engine has already refused the one move that would erase a
+            // subtree (a folder into its own descendant), so by the time a
+            // parent arrives here it is a real one.
+            Some(WebTabMenuTarget::Folder(folder_id)) => {
+                if let Some(folder) = surface
+                    .folders
+                    .iter_mut()
+                    .find(|folder| folder.id == folder_id)
+                {
+                    folder.parent = new_folder;
+                }
+            }
+            _ => {}
         }
         let rank = |row_id: &str| drop.order.iter().position(|id| id == row_id);
         surface.folders.sort_by_key(|folder| {
@@ -20082,14 +20421,96 @@ impl ShellState {
     /// has moved [`yggui::DRAG_BEGIN_THRESHOLD_PX`]. Every click on a note row
     /// used to start a drag outright, which is why an ordinary click could dim
     /// the row and, on release, commit a reorder the user never gestured.
-    fn arm_app_pane_row_drag(&mut self, pane_id: String, row_id: String, pointer: (f64, f64)) {
-        self.app_pane_row_drag = Some(AppPaneRowDrag {
-            pane_id,
-            row_id,
-            origin: pointer,
-            begun: false,
-        });
-        self.app_pane_row_drop_target = None;
+    fn arm_app_pane_row_drag(
+        &mut self,
+        pane_id: String,
+        row_id: String,
+        label: String,
+        pointer: (f64, f64),
+    ) {
+        self.arm_row_drag(pane_id, row_id, label, pointer);
+    }
+
+    /// ARM the ONE row-drag gesture, whichever list the row belongs to.
+    /// `label` is what the drag ghost will say.
+    fn arm_row_drag(&mut self, scope: String, row_id: String, label: String, pointer: (f64, f64)) {
+        self.row_drag = Some(RowDragGesture::arm(scope, row_id, label, pointer));
+    }
+
+    /// Promote the armed press to a live drag once it clears the shared
+    /// threshold, tracking the pointer for the ghost. Dismisses any open row
+    /// menu on the transition: a menu left standing over a moving row is the
+    /// stale-overlay bug class.
+    fn maybe_begin_row_drag(&mut self, pointer: (f64, f64)) -> bool {
+        let Some(drag) = self.row_drag.as_mut() else {
+            return false;
+        };
+        let was_begun = drag.begun;
+        if !drag.maybe_begin(pointer) {
+            return false;
+        }
+        if !was_begun {
+            self.close_app_pane_context_menu();
+            // …and the rail's own row menu, which is a different overlay with
+            // the same problem: a menu left standing over a moving row.
+            self.web_tab_context_menu = None;
+        }
+        true
+    }
+
+    /// Hover a row of `scope` while the gesture is live, and act on whatever
+    /// the shared engine decides — today, springing a collapsed group open
+    /// under the pointer. `expand` is how THIS list opens a row.
+    fn hover_row_drag(
+        &mut self,
+        scope: &str,
+        row_id: &str,
+        label: &str,
+        placement: DragDropPlacement,
+        group_collapsed: bool,
+    ) -> Option<String> {
+        let now = current_millis();
+        let hover = self
+            .row_drag
+            .as_mut()
+            .map(|drag| drag.hover(scope, row_id, label, placement, group_collapsed, now))?;
+        hover.spring_open
+    }
+
+    /// A drag has wandered out of the list: forget the TARGET but keep the
+    /// gesture. Releasing outside then lands nothing, which is the
+    /// "released over nothing is abandoned" rule; ending the gesture here
+    /// instead would make the drag impossible to complete, because moving from
+    /// row to row inside a list produces leave events too.
+    fn forget_row_drag_target(&mut self) {
+        if let Some(drag) = self.row_drag.as_mut() {
+            drag.target = None;
+        }
+    }
+
+    /// Keep the ghost under the pointer wherever the pointer goes. Called from
+    /// the shell ROOT, so the ghost does not freeze at the edge of the list
+    /// that owns the gesture.
+    fn track_row_drag_pointer(&mut self, pointer: (f64, f64)) {
+        if let Some(drag) = self.row_drag.as_mut() {
+            drag.maybe_begin(pointer);
+        }
+    }
+
+    /// A drag has committed: swallow the click its own release produces.
+    fn suppress_click_after_row_drag(&mut self) {
+        self.row_drag_click_suppressed_until_ms =
+            current_millis().saturating_add(ROW_DRAG_CLICK_SUPPRESS_MS);
+    }
+
+    /// Was the click that just arrived the tail of a committed drag? Consumes
+    /// the window, so exactly one click is swallowed.
+    fn consume_suppressed_row_click(&mut self) -> bool {
+        if current_millis() < self.row_drag_click_suppressed_until_ms {
+            self.row_drag_click_suppressed_until_ms = 0;
+            return true;
+        }
+        false
     }
 
     /// Promote an armed press to a live drag once it clears the threshold.
@@ -20097,18 +20518,7 @@ impl ShellState {
     /// this point: a menu left standing over a moving row is the stale-overlay
     /// bug class.
     fn maybe_begin_app_pane_row_drag(&mut self, pointer: (f64, f64)) -> bool {
-        let Some(drag) = self.app_pane_row_drag.as_mut() else {
-            return false;
-        };
-        if drag.begun {
-            return true;
-        }
-        if !drag_threshold_reached(drag.origin, pointer) {
-            return false;
-        }
-        drag.begun = true;
-        self.close_app_pane_context_menu();
-        true
+        self.maybe_begin_row_drag(pointer)
     }
 
     /// Hover `row_id` at `placement` while a drag is live. Ignored unless the
@@ -20121,20 +20531,23 @@ impl ShellState {
         pane_id: &str,
         row_id: &str,
         placement: DragDropPlacement,
-    ) {
-        let Some(drag) = self.app_pane_row_drag.as_ref().filter(|drag| drag.begun) else {
-            return;
-        };
-        if drag.pane_id != pane_id || drag.row_id == row_id {
-            // Over itself is not a target; leaving it `None` is what makes the
-            // release a no-op instead of a POST that changes nothing.
-            self.app_pane_row_drop_target = None;
-            return;
-        }
-        let next = Some((pane_id.to_string(), row_id.to_string(), placement));
-        if self.app_pane_row_drop_target != next {
-            self.app_pane_row_drop_target = next;
-        }
+    ) -> Option<String> {
+        self.hover_app_pane_row_drop_group(pane_id, row_id, "", placement, false)
+    }
+
+    /// …and the form the render calls, which knows whether the hovered row is a
+    /// SHUT group. Returns the row the shared engine wants sprung open, if any;
+    /// the pane opens it by POSTing its own `expand_action`, which is the only
+    /// thing about expansion yggterm does not own.
+    fn hover_app_pane_row_drop_group(
+        &mut self,
+        pane_id: &str,
+        row_id: &str,
+        label: &str,
+        placement: DragDropPlacement,
+        group_collapsed: bool,
+    ) -> Option<String> {
+        self.hover_row_drag(pane_id, row_id, label, placement, group_collapsed)
     }
 
     /// End the gesture and report what it meant: `(pane, moved row, new parent,
@@ -20153,37 +20566,33 @@ impl ShellState {
         &mut self,
         rows: &[RowTreeRow],
     ) -> Option<(String, String, Option<String>, Vec<String>)> {
-        let drag = self.app_pane_row_drag.take();
-        let target = self.app_pane_row_drop_target.take();
-        let drag = drag.filter(|drag| drag.begun)?;
-        let (target_pane, target_row, placement) = target?;
-        if target_pane != drag.pane_id {
-            return None;
+        let drag = self.row_drag.take()?;
+        let drop = drag.resolve(rows);
+        if drop.is_some() {
+            self.suppress_click_after_row_drag();
         }
-        let drop = reorder_row_tree(rows, &drag.row_id, &target_row, placement)?;
-        Some((drag.pane_id, drag.row_id, drop.parent, drop.order))
+        let drop = drop?;
+        Some((drag.scope, drag.row_id, drop.parent, drop.order))
     }
 
     fn clear_app_pane_row_drag(&mut self) {
-        self.app_pane_row_drag = None;
-        self.app_pane_row_drop_target = None;
+        self.row_drag = None;
     }
 
     /// Is `row_id` the row the pointer would drop onto right now, and on which
     /// side? Drives the drop line the row draws.
     fn app_pane_row_drop_edge(&self, pane_id: &str, row_id: &str) -> Option<DragDropPlacement> {
-        self.app_pane_row_drop_target
+        self.row_drag
             .as_ref()
-            .filter(|(pane, row, _)| pane == pane_id && row == row_id)
-            .map(|(_, _, placement)| *placement)
+            .and_then(|drag| drag.drop_edge(pane_id, row_id))
     }
 
     /// Is this row the live drag's subject? Only a BEGUN gesture counts — an
     /// armed press must look exactly like a click until it travels.
     fn app_pane_row_is_dragging(&self, pane_id: &str, row_id: &str) -> bool {
-        self.app_pane_row_drag
+        self.row_drag
             .as_ref()
-            .is_some_and(|drag| drag.begun && drag.pane_id == pane_id && drag.row_id == row_id)
+            .is_some_and(|drag| drag.is_dragging(pane_id, row_id))
     }
     // ===== the DOCUMENT SURFACE's schema channel =====
     // A viewport-placement pane rendered as shell DOM in the main viewport.
@@ -49552,23 +49961,32 @@ fn describe_app_state_snapshot(
             // ever be argued from a screenshot: `dragging` is exactly the flag
             // that paints the dim, and `armed` distinguishes a press that has
             // not travelled (a click) from a live drag.
-            "app_pane_row_drag": shell.app_pane_row_drag.as_ref().map(|drag| {
+            "app_pane_row_drag": shell.row_drag.as_ref().map(|drag| {
                 json!({
-                    "pane": drag.pane_id,
+                    "pane": drag.scope,
                     "row": drag.row_id,
+                    "label": drag.label,
                     "armed": !drag.begun,
                     "dragging": drag.begun,
+                    // The ghost's position, so "the card is stuck / lagging"
+                    // is decidable without a screenshot.
+                    "pointer": { "x": drag.pointer.0, "y": drag.pointer.1 },
                 })
             }),
-            "app_pane_row_drop_target": shell.app_pane_row_drop_target.as_ref().map(
-                |(pane, row, placement)| {
+            "app_pane_row_drop_target": shell.row_drag.as_ref().and_then(|drag| {
+                drag.target.as_ref().map(|target| {
                     json!({
-                        "pane": pane,
-                        "row": row,
-                        "placement": format!("{placement:?}"),
+                        "pane": target.scope,
+                        "row": target.row_id,
+                        "label": target.label,
+                        "placement": format!("{:?}", target.placement),
                     })
-                },
-            ),
+                })
+            }),
+            // A drag that just committed swallows its own release's click for
+            // this long. Exported because "my drag also opened the row" and
+            // "my click did nothing" are the two ways this can be wrong.
+            "row_drag_click_suppressed_until_ms": shell.row_drag_click_suppressed_until_ms,
             "terminal_attach_in_flight": shell
                 .terminal_attach_in_flight
                 .iter()
@@ -75753,14 +76171,12 @@ fn app() -> Element {
                 // cleared, so this only catches the releases that landed outside
                 // the pane entirely (over the terminal, the tree, the titlebar).
                 // A gesture must never outlive the mouse button.
-                if state.read().app_pane_row_drag.is_some() {
-                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
-                }
                 // …and so does the WebTabs rail's, for the same reason and by
                 // the same route: the rail's own container takes a real drop
                 // first, so this only catches a release that landed outside it.
-                if state.read().web_tab_drag.is_some() {
-                    state.with_mut(|shell| shell.clear_web_tab_row_drag());
+                // ONE gesture for both, so ONE exit.
+                if state.read().row_drag.is_some() {
+                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
                 }
                 state.with_mut(|shell| shell.finish_sidebar_resize());
                 state.with_mut(|shell| shell.finish_rail_resize());
@@ -75789,8 +76205,26 @@ fn app() -> Element {
                 if state.read().rail_resize_drag.is_some() {
                     state.with_mut(|shell| shell.handle_rail_resize_pointer(pointer.x));
                 }
+                // The row-drag ghost follows the pointer everywhere, not only
+                // over the rows that own the gesture — the cwd tree's ghost has
+                // always tracked from the window root, and a ghost that froze
+                // at the list edge would read as a dropped drag.
+                if primary_down && state.read().row_drag.is_some() {
+                    state.with_mut(|shell| {
+                        shell.track_row_drag_pointer((pointer.x, pointer.y));
+                    });
+                }
             },
             onkeydown: move |evt| {
+                // ESCAPE ABANDONS A LIVE DRAG, for every row list at once —
+                // the way out of a gesture you did not mean to start. It runs
+                // before the accelerators below because a drag in flight is a
+                // modal state: nothing else should read this key.
+                if evt.key() == Key::Escape && state.read().row_drag.is_some() {
+                    evt.prevent_default();
+                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                    return;
+                }
                 // KeyTips chord walking now lives in the below-the-webview JS
                 // bridge (keytip_apply_bridge_message), so it works from a
                 // focused terminal too; this DOM handler only carries the
@@ -77474,6 +77908,30 @@ fn app() -> Element {
                 if !snapshot.drag_paths.is_empty() {
                     DragGhost {
                         snapshot: snapshot.clone(),
+                    }
+                }
+                // The SAME ghost the cwd tree has always drawn, for the row
+                // lists that had none: the WebTabs rail and every contributed
+                // pane. Drawn HERE, once, from the one gesture — a per-surface
+                // ghost would be a third card that could drift from the other
+                // two, and the pointer leaves the list long before the drop.
+                if let Some(drag) = snapshot.row_drag.as_ref().filter(|drag| drag.begun) {
+                    DragGhostCard {
+                        x: drag.pointer.0,
+                        y: drag.pointer.1,
+                        primary_label: if drag.label.is_empty() {
+                            "Move row".to_string()
+                        } else {
+                            drag.label.clone()
+                        },
+                        extra_count: 0,
+                        target_hint: drag.target.as_ref().map(row_drop_target_hint),
+                        palette: DragGhostPalette {
+                            text: snapshot.palette.text,
+                            muted: snapshot.palette.muted,
+                            accent: snapshot.palette.accent,
+                            accent_soft: snapshot.palette.accent_soft,
+                        },
                     }
                 }
             }
@@ -80188,6 +80646,11 @@ fn SessionStyleRow(
     /// on the selected row — pass both and the row picks. Defaults to
     /// `text_color` when unset.
     #[props(default)] icon_color: Option<String>,
+    /// The trailing DISCLOSURE control of a group row, and the cwd tree's own
+    /// placement for it: after the badge, ALWAYS visible — unlike `actions`,
+    /// which are hover-revealed verbs. A row's expand/collapse is not a verb
+    /// you have to hover to discover.
+    #[props(default)] expander: Option<Element>,
     #[props(default)] actions: Option<Element>,
     #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
     #[props(default)] onmousedown: Option<EventHandler<MouseEvent>>,
@@ -80291,6 +80754,13 @@ fn SessionStyleRow(
                         badge_color.as_deref().unwrap_or(&text_color),
                     ),
                     "{badge_text}"
+                }
+            }
+            if let Some(expander) = expander {
+                span {
+                    "data-session-row-expander": "1",
+                    style: "display:inline-flex; align-items:center; gap:2px; flex:0 0 auto;",
+                    {expander}
                 }
             }
             if let Some(actions) = actions {
@@ -81193,6 +81663,22 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
         }
     }
 }
+/// What the drag ghost says about where the release would land — the same
+/// sentence the cwd tree's ghost has always shown ("Drop inside Work"), from
+/// one owner so a row list and the tree cannot phrase it two ways.
+fn row_drop_target_hint(target: &RowDropTarget) -> String {
+    let placement = match target.placement {
+        DragDropPlacement::Before => "before",
+        DragDropPlacement::Into => "inside",
+        DragDropPlacement::After => "after",
+    };
+    let name = if target.label.trim().is_empty() {
+        target.row_id.as_str()
+    } else {
+        target.label.trim()
+    };
+    format!("Drop {placement} {name}")
+}
 #[component]
 fn ClaudeCodeTreeIcon() -> Element {
     rsx! {
@@ -81369,7 +81855,25 @@ fn TreeIcon(spec: TreeIconSpec) -> Element {
             }
         };
     }
-    if spec == TreeIconSpec::FolderOpen {
+    rsx! { RowFolderIcon { expanded: spec == TreeIconSpec::FolderOpen } }
+}
+
+/// The tree's FOLDER GLYPH — the one icon in the product that says "this row
+/// holds other rows", and whose FILL says whether it is open.
+///
+/// FILLED = expanded, OUTLINE = collapsed. That is the cwd tree's own answer
+/// and it is now the only one: the WebTabs rail's folders and a contributed
+/// pane's groups draw this same component, so a folder three pixels from a
+/// cwd-tree folder cannot look like a different kind of thing (user-reported
+/// 2026-07-31, "just like yggterm cwdtree").
+///
+/// The DISCLOSURE CHEVRON survives alongside it, also the cwd tree's answer: a
+/// group row carries the folder glyph in its leading icon slot and a chevron in
+/// its trailing expander. The fill is the state at rest; the chevron is the
+/// control.
+#[component]
+fn RowFolderIcon(expanded: bool) -> Element {
+    if expanded {
         rsx! {
             svg {
                 width: "19",
@@ -113549,7 +114053,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
 
             // The row's own vocabulary, resolved once so the rsx below has one
             // shape for both kinds.
-            let (label, selected, badge, expanded, dot, actions, on_activate) = match &row.row {
+            let (label, selected, badge, expanded, dot, icon, expander, actions, on_activate) = match &row.row {
                 WebTabMenuTarget::Folder(folder_id) => {
                     let name = folders
                         .get(folder_id)
@@ -113561,6 +114065,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     let count = folder_counts.get(folder_id).copied().unwrap_or(0);
                     let (toggle_path, toggle_id) = (session_path.clone(), folder_id.clone());
                     let (add_path, add_id) = (session_path.clone(), folder_id.clone());
+                    let (sub_path, sub_id) = (session_path.clone(), folder_id.clone());
                     let (delete_path, delete_id) = (session_path.clone(), folder_id.clone());
                     let (chevron_path, chevron_id) = (session_path.clone(), folder_id.clone());
                     (
@@ -113568,6 +114073,14 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         false,
                         Some(count.to_string()),
                         Some(expanded),
+                        // No dot on a folder — but the slot is still laid out
+                        // by the shared row, so a folder and the rows under it
+                        // start their titles at one x.
+                        rsx! {},
+                        // THE folder glyph, from its one owner: filled when the
+                        // folder is open, outline when it is shut, exactly as
+                        // the cwd tree three pixels away draws it.
+                        rsx! { RowFolderIcon { expanded } },
                         rsx! {
                             button {
                                 "data-web-tab-folder-expand": "{folder_id}",
@@ -113583,6 +114096,34 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             }
                         },
                         rsx! {
+                            button {
+                                "data-web-tab-folder-new-folder": "{folder_id}",
+                                style: session_row_action_button_style(palette.text),
+                                // A folder holds folders. Without a way to MAKE
+                                // one inside another, nesting would exist only
+                                // for folders that already happened to be there.
+                                title: "New folder inside this folder",
+                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    let (path, id) = (sub_path.clone(), sub_id.clone());
+                                    state.with_mut(|shell| {
+                                        shell.web_tab_new_folder_in(&path, Some(id))
+                                    });
+                                },
+                                svg {
+                                    width: "12",
+                                    height: "12",
+                                    view_box: "0 0 14 14",
+                                    fill: "none",
+                                    path {
+                                        d: "M1.9 4.05a1 1 0 0 1 1-1h2.35l1.2 1.4h4.65a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1H2.9a1 1 0 0 1-1-1V4.05Z",
+                                        stroke: "currentColor",
+                                        stroke_width: "1.2",
+                                        stroke_linejoin: "round",
+                                    }
+                                }
+                            }
                             button {
                                 "data-web-tab-folder-add": "{folder_id}",
                                 style: session_row_action_button_style(palette.text),
@@ -113604,10 +114145,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             button {
                                 "data-web-tab-folder-delete": "{folder_id}",
                                 style: session_row_action_button_style(palette.text),
-                                // Says what it does: the folder goes, the tabs
-                                // come back to the root. Deleting organization
-                                // must never delete content.
-                                title: "Delete folder (its tabs return to the root)",
+                                // Says what it does: the folder goes, what it
+                                // held moves up one level. Deleting
+                                // organization must never delete content.
+                                title: "Delete folder (its contents move up one level)",
                                 onmousedown: |evt: MouseEvent| evt.stop_propagation(),
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
@@ -113619,7 +114160,15 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         },
                         EventHandler::new(move |_| {
                             let (path, id) = (toggle_path.clone(), toggle_id.clone());
-                            state.with_mut(|shell| shell.web_tab_toggle_folder(&path, &id));
+                            state.with_mut(|shell| {
+                                // The release that commits a drag is also a
+                                // click. One drag must not also toggle the
+                                // folder it landed on.
+                                if shell.consume_suppressed_row_click() {
+                                    return;
+                                }
+                                shell.web_tab_toggle_folder(&path, &id);
+                            });
                         }),
                     )
                 }
@@ -113639,6 +114188,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 style: web_tab_loading_dot_style(loading),
                             }
                         },
+                        rsx! {},
+                        rsx! {},
                         rsx! {
                             // The app tab gets NO ✕. Its ✕ used to QUIT ychrome
                             // (a Ctrl+C to the app) while this same row's menu
@@ -113664,6 +114215,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             }
                         },
                         EventHandler::new(move |_| {
+                            // A drag's own release is also a click: moving a
+                            // tab must not also switch to it.
+                            if state.with_mut(|shell| shell.consume_suppressed_row_click()) {
+                                return;
+                            }
                             select_web_surface_tab(
                                 state,
                                 select_path.clone(),
@@ -113679,6 +114235,10 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             let menu_target = row.row.clone();
             let rename_target = row_id.clone();
             let (down_row, move_row) = (row_id.clone(), row_id.clone());
+            let (down_label, move_label) = (label.clone(), label.clone());
+            // A SHUT folder is what spring-load opens under a hovering drag.
+            let row_collapsed = expanded == Some(false);
+            let spring_path = session_path.clone();
             rsx! {
                 div {
                     key: "webrow-{row_id}",
@@ -113712,9 +114272,9 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         }
                         // ARM only: a press that has not travelled is a click.
                         let pointer = evt.client_coordinates();
-                        let down_row = down_row.clone();
+                        let (down_row, down_label) = (down_row.clone(), down_label.clone());
                         state.with_mut(|shell| {
-                            shell.arm_web_tab_row_drag(down_row, (pointer.x, pointer.y));
+                            shell.arm_web_tab_row_drag(down_row, down_label, (pointer.x, pointer.y));
                         });
                     },
                     onmousemove: move |evt: MouseEvent| {
@@ -113729,12 +114289,26 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             evt.element_coordinates().y,
                             is_folder,
                         );
-                        let move_row = move_row.clone();
+                        let (move_row, spring_path) = (move_row.clone(), spring_path.clone());
                         state.with_mut(|shell| {
                             if !shell.maybe_begin_web_tab_row_drag((pointer.x, pointer.y)) {
                                 return;
                             }
-                            shell.hover_web_tab_row_drop(&move_row, placement);
+                            // SPRING-LOAD, from the shared engine's dwell: rest
+                            // inside a shut folder and it opens under the drag,
+                            // so filing a tab two levels down is one gesture
+                            // instead of drop-open-drag-again per level.
+                            if let Some(sprung) = shell.hover_web_tab_row_drop(
+                                &move_row,
+                                &move_label,
+                                placement,
+                                row_collapsed,
+                            )
+                                && let Some(WebTabMenuTarget::Folder(folder_id)) =
+                                    web_tab_row_target(&sprung)
+                            {
+                                shell.web_tab_toggle_folder(&spring_path, &folder_id);
+                            }
                         });
                     },
                     SessionStyleRow {
@@ -113748,6 +114322,13 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         badge,
                         badge_color: Some(palette.muted.to_string()),
                         dot,
+                        icon,
+                        // The cwdtree's icon rule: muted at rest, text color on
+                        // the selected row.
+                        icon_color: Some(
+                            if selected { palette.text } else { palette.muted }.to_string(),
+                        ),
+                        expander,
                         actions,
                         onclick: on_activate,
                         // Double-click renames, exactly as the cwd tree's rows
@@ -113803,7 +114384,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // produces leave events too, and abandoning on those made the drag
             // impossible to complete.
             onmouseleave: move |_| {
-                state.with_mut(|shell| shell.web_tab_drop_target = None);
+                state.with_mut(|shell| shell.forget_row_drag_target());
             },
             // Zen-style omnibox: in vertical-tabs mode the address bar leaves the
             // viewport and lives here, at the top of the tab tree. Same component
@@ -115386,13 +115967,20 @@ fn AppPaneRailBody(
                                 } else {
                                     (None, false)
                                 };
-                                // A GROUP's leading slot is its disclosure chevron;
-                                // a leaf's is its status dot.
-                                let leading_slot: Option<Element> = if row_is_group {
+                                // Every row's leading slot is its status dot —
+                                // groups included, so a folder and the rows
+                                // under it start their titles at one x. The
+                                // disclosure chevron rides the TRAILING
+                                // expander slot, which is where the cwd tree
+                                // has always put it.
+                                let leading_slot: Option<Element> =
+                                    app_pane_row_status_dot_style(palette, &status)
+                                        .map(|dot| rsx! { span { style: "{dot}" } });
+                                let expander_slot: Option<Element> = row_is_group.then(|| {
                                     let (expand_pane, expand_action, expand_row) =
                                         (pane_id.clone(), expand_action.clone(), id.clone());
                                     let on_expand = on_app_pane_action.clone();
-                                    Some(rsx! {
+                                    rsx! {
                                         button {
                                             "data-app-pane-row-expand": "{expand_row}",
                                             style: row_disclosure_button_style(palette.muted),
@@ -115411,10 +115999,20 @@ fn AppPaneRailBody(
                                             },
                                             RowDisclosureChevron { expanded: row_expanded }
                                         }
-                                    })
+                                    }
+                                });
+                                // A row that DECLARED itself a group and named
+                                // no icon of its own gets the tree's folder
+                                // glyph, filled or outline by its own
+                                // `expanded`. The app said "I hold rows"; what
+                                // that LOOKS like is yggterm's to answer, and
+                                // it must be the one answer the cwd tree gives.
+                                let icon_slot: Option<Element> = if !icon.is_empty() {
+                                    Some(app_pane_row_icon(&icon))
+                                } else if row_is_group {
+                                    Some(rsx! { RowFolderIcon { expanded: row_expanded } })
                                 } else {
-                                    app_pane_row_status_dot_style(palette, &status)
-                                        .map(|dot| rsx! { span { style: "{dot}" } })
+                                    None
                                 };
                                 rsx! {
                                     div {
@@ -115448,6 +116046,9 @@ fn AppPaneRailBody(
                                         // tree already proved the pointer path.
                                         onmousedown: {
                                             let (pane_id, row_id) = (pane_id.clone(), id.clone());
+                                            // The ghost says what is moving, so the
+                                            // row's own title rides the gesture.
+                                            let row_label = title.clone();
                                             let mut state = state;
                                             move |evt: MouseEvent| {
                                                 if !reorderable
@@ -115463,6 +116064,7 @@ fn AppPaneRailBody(
                                                     shell.arm_app_pane_row_drag(
                                                         pane_id.clone(),
                                                         row_id.clone(),
+                                                        row_label.clone(),
                                                         (pointer.x, pointer.y),
                                                     );
                                                 });
@@ -115470,6 +116072,9 @@ fn AppPaneRailBody(
                                         },
                                         onmousemove: {
                                             let (pane_id, row_id) = (pane_id.clone(), id.clone());
+                                            let row_title = title.clone();
+                                            let expand_action = expand_action.clone();
+                                            let on_spring = on_app_pane_action.clone();
                                             let mut state = state;
                                             move |evt: MouseEvent| {
                                                 if !reorderable {
@@ -115494,18 +116099,32 @@ fn AppPaneRailBody(
                                                     evt.element_coordinates().y,
                                                     row_is_group,
                                                 );
-                                                state.with_mut(|shell| {
+                                                let sprung = state.with_mut(|shell| {
                                                     if !shell.maybe_begin_app_pane_row_drag((
                                                         pointer.x, pointer.y,
                                                     )) {
-                                                        return;
+                                                        return None;
                                                     }
-                                                    shell.hover_app_pane_row_drop(
+                                                    // SPRING-LOAD from the shared
+                                                    // engine's dwell. yggterm decides
+                                                    // WHEN; the app owns what
+                                                    // "expand" means, so the answer
+                                                    // is its own `expand_action`.
+                                                    shell.hover_app_pane_row_drop_group(
                                                         &pane_id,
                                                         &row_id,
+                                                        &row_title,
                                                         placement,
-                                                    );
+                                                        row_is_group && !row_expanded,
+                                                    )
                                                 });
+                                                if sprung.is_some() && !expand_action.is_empty() {
+                                                    on_spring.call((
+                                                        pane_id.clone(),
+                                                        expand_action.clone(),
+                                                        Some(row_id.clone()),
+                                                    ));
+                                                }
                                             }
                                         },
                                         onmouseup: {
@@ -115551,7 +116170,7 @@ fn AppPaneRailBody(
                                             let mut state = state;
                                             move |_: MouseEvent| {
                                                 state.with_mut(|shell| {
-                                                    shell.app_pane_row_drop_target = None;
+                                                    shell.forget_row_drag_target();
                                                 });
                                             }
                                         },
@@ -115608,18 +116227,29 @@ fn AppPaneRailBody(
                                         // slot either way, so a folder and the rows
                                         // under it start their titles at one x.
                                         dot: leading_slot,
-                                        icon: (!icon.is_empty()).then(|| app_pane_row_icon(&icon)),
+                                        icon: icon_slot,
                                         // The cwdtree's icon rule: muted at
                                         // rest, text color on the selected row.
                                         icon_color: Some(
                                             if selected { palette.text } else { palette.muted }
                                                 .to_string(),
                                         ),
+                                        expander: expander_slot,
                                         onclick: clickable.then(|| {
                                             let (pane_id, action, row_id) =
                                                 (pane_id.clone(), row_action.clone(), id.clone());
                                             let on_app_pane_action = on_app_pane_action.clone();
+                                            let mut state = state;
                                             EventHandler::new(move |_| {
+                                                // A drag's own release is also a
+                                                // click. Moving a row must not
+                                                // also open it — the cwd tree
+                                                // has always swallowed this.
+                                                if state.with_mut(|shell| {
+                                                    shell.consume_suppressed_row_click()
+                                                }) {
+                                                    return;
+                                                }
                                                 on_app_pane_action.call((
                                                     pane_id.clone(),
                                                     action.clone(),
@@ -124029,6 +124659,7 @@ mod tests {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             }],
             tabs: vec![
                 saved_tab("https://a.example/", None),
@@ -124247,6 +124878,7 @@ mod tests {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             }],
             tabs: vec![
                 saved_app_tab("https://x.example/page", true),
@@ -124591,6 +125223,7 @@ mod tests {
             id: "f1".to_string(),
             name: "Work".to_string(),
             collapsed: false,
+            parent: None,
         });
         let mut filed = surface.tabs[0].clone();
         filed.id = 1;
@@ -128324,6 +128957,7 @@ mod tests {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             }],
             tabs: vec![
                 saved_tab("https://loose.example/", None),
@@ -128635,6 +129269,7 @@ mod tests {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             }],
             tabs: vec![
                 saved_app_tab(page, true),
@@ -128683,6 +129318,7 @@ mod tests {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             }],
             tabs: vec![
                 saved_app_tab("https://x.example/page", true),
@@ -158368,10 +159004,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159025,10 +159658,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159217,10 +159847,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159409,10 +160036,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159604,10 +160228,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159803,10 +160424,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -159994,10 +160612,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -160185,10 +160800,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -160410,10 +161022,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -160604,10 +161213,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -160830,10 +161436,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -161233,10 +161836,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
-            web_tab_drag: None,
-            web_tab_drop_target: None,
-            app_pane_row_drag: None,
-            app_pane_row_drop_target: None,
+            row_drag: None,
             active_session_kind: None,
             web_tab_overflow_open: false,
             active_web_surface_app_name: None,
@@ -167277,6 +167877,7 @@ mod webtabs_menu_switcher_locks {
             id: id.to_string(),
             name: name.to_string(),
             collapsed,
+            parent: None,
         }
     }
 
@@ -167560,6 +168161,7 @@ mod webtabs_menu_switcher_locks {
                 id: "f1".to_string(),
                 name: "Work".to_string(),
                 collapsed: false,
+                parent: None,
             });
         shell
     }
@@ -167605,12 +168207,12 @@ mod webtabs_menu_switcher_locks {
     /// The whole gesture, on the state machine the render drives.
     fn drag_rail_row(shell: &mut ShellState, row: &str, onto: &str, placement: DragDropPlacement) {
         let tree = rail_tree_of(shell);
-        shell.arm_web_tab_row_drag(row.to_string(), (0.0, 0.0));
+        shell.arm_web_tab_row_drag(row.to_string(), row.to_string(), (0.0, 0.0));
         assert!(
             shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)),
             "the pointer travelled past the shared threshold"
         );
-        shell.hover_web_tab_row_drop(onto, placement);
+        shell.hover_web_tab_row_drop(onto, onto, placement, false);
         shell.end_web_tab_row_drag(&tree);
     }
 
@@ -167700,14 +168302,14 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_folder();
 
         // A TAB anywhere on a folder row: INSIDE.
-        shell.arm_web_tab_row_drag("tab:3".to_string(), (0.0, 0.0));
+        shell.arm_web_tab_row_drag("tab:3".to_string(), "tab:3".to_string(), (0.0, 0.0));
         assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
         for band in [
             DragDropPlacement::Before,
             DragDropPlacement::Into,
             DragDropPlacement::After,
         ] {
-            shell.hover_web_tab_row_drop("folder:f1", band);
+            shell.hover_web_tab_row_drop("folder:f1", "Work", band, false);
             assert_eq!(
                 shell.web_tab_row_drop_edge("folder:f1"),
                 Some(DragDropPlacement::Into),
@@ -167727,10 +168329,11 @@ mod webtabs_menu_switcher_locks {
                 id: "f2".to_string(),
                 name: "Later".to_string(),
                 collapsed: false,
+                parent: None,
             });
-        shell.arm_web_tab_row_drag("folder:f2".to_string(), (0.0, 0.0));
+        shell.arm_web_tab_row_drag("folder:f2".to_string(), "Later".to_string(), (0.0, 0.0));
         assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
-        shell.hover_web_tab_row_drop("tab:3", DragDropPlacement::After);
+        shell.hover_web_tab_row_drop("tab:3", "loose", DragDropPlacement::After, false);
         assert_eq!(shell.web_tab_row_drop_edge("tab:3"), None);
         let before = rail_order(&shell);
         let tree = rail_tree_of(&shell);
@@ -167744,10 +168347,10 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_folder();
         let tree = rail_tree_of(&shell);
 
-        shell.arm_web_tab_row_drag("tab:3".to_string(), (100.0, 100.0));
+        shell.arm_web_tab_row_drag("tab:3".to_string(), "loose".to_string(), (100.0, 100.0));
         assert!(!shell.maybe_begin_web_tab_row_drag((101.0, 100.0)), "jitter is a click");
         assert!(!shell.web_tab_row_is_dragging("tab:3"), "an armed press does not dim");
-        shell.hover_web_tab_row_drop("folder:f1", DragDropPlacement::Into);
+        shell.hover_web_tab_row_drop("folder:f1", "Work", DragDropPlacement::Into, false);
         assert_eq!(
             shell.web_tab_row_drop_edge("folder:f1"),
             None,
@@ -167758,15 +168361,16 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(rail_rows_of(&shell), before, "releasing a click moves nothing");
 
         // The app tab is `tabs[0]` and stays there.
-        shell.arm_web_tab_row_drag("tab:0".to_string(), (0.0, 0.0));
-        assert!(shell.web_tab_drag.is_none(), "the app tab is not a drag source");
+        shell.arm_web_tab_row_drag("tab:0".to_string(), "ychrome".to_string(), (0.0, 0.0));
+        assert!(shell.row_drag.is_none(), "the app tab is not a drag source");
     }
 
-    /// The tab tree is TWO levels by construction (`WebSurfaceTab::folder` is
-    /// one optional id, not a path), so the two coercions that keep it that way
-    /// are part of the contract, not defensive noise.
+    /// NESTED FOLDERS (user-reported 2026-07-31: "Folders can have nested
+    /// folders too"). A folder holds folders, arbitrarily deep — and the ONE
+    /// move that must never be allowed is a folder into its own descendant,
+    /// which would erase the whole subtree from the draw walk.
     #[test]
-    fn the_tab_tree_stays_two_levels_and_the_app_tab_stays_first() {
+    fn a_folder_can_be_filed_inside_another_folder() {
         let mut shell = shell_with_folder();
         shell
             .web_surfaces
@@ -167777,23 +168381,158 @@ mod webtabs_menu_switcher_locks {
                 id: "f2".to_string(),
                 name: "Later".to_string(),
                 collapsed: false,
+                parent: None,
             });
 
-        // A folder dropped INSIDE a folder lands BESIDE it instead.
-        shell.arm_web_tab_row_drag("folder:f2".to_string(), (0.0, 0.0));
-        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
-        shell.hover_web_tab_row_drop("folder:f1", DragDropPlacement::Into);
+        drag_rail_row(&mut shell, "folder:f2", "folder:f1", DragDropPlacement::Into);
         assert_eq!(
-            shell.web_tab_row_drop_edge("folder:f1"),
-            Some(DragDropPlacement::After),
-            "a folder cannot be filed in a folder — the model has nowhere to put it"
+            shell.web_surfaces["local://ws"]
+                .folders
+                .iter()
+                .find(|folder| folder.id == "f2")
+                .and_then(|folder| folder.parent.clone())
+                .as_deref(),
+            Some("f1"),
+            "a folder dropped inside a folder IS inside it"
         );
-        shell.clear_web_tab_row_drag();
+        assert_eq!(
+            rail_rows_of(&shell)
+                .into_iter()
+                .map(|(id, depth, _)| (id, depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("folder:f1".to_string(), 0),
+                // Folders above tabs AT EVERY LEVEL: the sub-folder precedes
+                // its parent's own tabs.
+                ("folder:f2".to_string(), 1),
+                ("tab:1".to_string(), 1),
+                ("tab:2".to_string(), 1),
+                ("tab:0".to_string(), 0),
+                ("tab:3".to_string(), 0),
+                ("tab:4".to_string(), 0),
+            ],
+            "the nested folder is drawn one level in"
+        );
 
-        // And nothing lands above the app tab.
-        shell.arm_web_tab_row_drag("tab:3".to_string(), (0.0, 0.0));
+        // …and a tab filed into the NESTED folder sits two levels deep.
+        drag_rail_row(&mut shell, "tab:3", "folder:f2", DragDropPlacement::Into);
+        assert_eq!(
+            rail_rows_of(&shell)
+                .into_iter()
+                .find(|(id, _, _)| id == "tab:3")
+                .map(|(_, depth, _)| depth),
+            Some(2),
+            "depth is unbounded, not capped at one"
+        );
+    }
+
+    /// The refusal. `row_tree_descends_from` is consulted on the RAIL path, not
+    /// only in the engine's own tests: a folder dropped onto something inside
+    /// itself must move nothing at all.
+    #[test]
+    fn a_folder_cannot_be_dropped_into_its_own_descendant() {
+        let mut shell = shell_with_folder();
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(WebTabFolder {
+                id: "f2".to_string(),
+                name: "Later".to_string(),
+                collapsed: false,
+                parent: Some("f1".to_string()),
+            });
+        let before = rail_rows_of(&shell);
+
+        // f1 holds f2. Dropping f1 INSIDE f2 would make f1 its own grandchild.
+        drag_rail_row(&mut shell, "folder:f1", "folder:f2", DragDropPlacement::Into);
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .folders
+                .iter()
+                .find(|folder| folder.id == "f1")
+                .and_then(|folder| folder.parent.clone()),
+            None,
+            "f1 stays at the root — a folder is never its own descendant"
+        );
+        // …and the deeper case: f1 onto a TAB filed inside f2's parent.
+        drag_rail_row(&mut shell, "folder:f1", "tab:1", DragDropPlacement::Before);
+        assert_eq!(rail_rows_of(&shell), before, "nothing moved at all");
+    }
+
+    /// Deleting a folder must never take its contents with it — and with
+    /// nesting that includes its SUB-folders, which would otherwise point at a
+    /// parent that no longer exists and vanish from the draw walk.
+    #[test]
+    fn deleting_a_folder_lifts_its_contents_one_level() {
+        let mut shell = shell_with_folder();
+        {
+            let surface = shell.web_surfaces.get_mut("local://ws").expect("surface");
+            surface.folders.push(WebTabFolder {
+                id: "f2".to_string(),
+                name: "Later".to_string(),
+                collapsed: false,
+                parent: Some("f1".to_string()),
+            });
+        }
+        shell.web_tab_delete_folder("local://ws", "f1");
+        let surface = &shell.web_surfaces["local://ws"];
+        assert_eq!(
+            surface
+                .folders
+                .iter()
+                .find(|folder| folder.id == "f2")
+                .and_then(|folder| folder.parent.clone()),
+            None,
+            "the sub-folder rises to where its parent was, never orphaned"
+        );
+        assert!(
+            surface
+                .tabs
+                .iter()
+                .all(|tab| tab.folder.as_deref() != Some("f1")),
+            "and the tabs come with it"
+        );
+        assert_eq!(surface.tabs.len(), 5, "no tab was closed");
+    }
+
+    /// Nesting has to SURVIVE. A folder tree that forgets its shape on restart
+    /// is not organization.
+    #[test]
+    fn folder_nesting_round_trips_through_the_store() {
+        let store = WebTabStore {
+            folders: vec![
+                folder("f1", "Work", false),
+                WebTabFolder {
+                    id: "f2".to_string(),
+                    name: "Later".to_string(),
+                    collapsed: true,
+                    parent: Some("f1".to_string()),
+                },
+            ],
+            tabs: Vec::new(),
+        };
+        let json = serde_json::to_string(&store).expect("encode");
+        let back: WebTabStore = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.folders[1].parent.as_deref(), Some("f1"));
+        // …and a store written BEFORE nesting existed reads back flat, which is
+        // exactly what it meant.
+        let legacy: WebTabStore = serde_json::from_str(
+            r#"{"folders":[{"id":"f1","name":"Work"}],"tabs":[]}"#,
+        )
+        .expect("decode legacy");
+        assert_eq!(legacy.folders[0].parent, None);
+    }
+
+    /// The app tab owns `tabs[0]` at every depth: nothing lands above it, and
+    /// no reorder can displace it.
+    #[test]
+    fn the_app_tab_stays_first_whatever_the_order_says() {
+        let mut shell = shell_with_folder();
+        shell.arm_web_tab_row_drag("tab:3".to_string(), "loose".to_string(), (0.0, 0.0));
         assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
-        shell.hover_web_tab_row_drop("tab:0", DragDropPlacement::Before);
+        shell.hover_web_tab_row_drop("tab:0", "ychrome", DragDropPlacement::Before, false);
         assert_eq!(
             shell.web_tab_row_drop_edge("tab:0"),
             Some(DragDropPlacement::After),
@@ -167805,6 +168544,45 @@ mod webtabs_menu_switcher_locks {
             shell.web_surfaces["local://ws"].tabs[0].id,
             WEB_TAB_APP_TAB_ID,
             "…and it still does after the drop"
+        );
+    }
+
+    /// "New folder" reaches INSIDE a folder, or nesting would exist only for
+    /// folders that already happened to be there.
+    #[test]
+    fn a_new_folder_can_be_born_inside_a_folder() {
+        let mut shell = shell_with_folder();
+        shell.web_tab_toggle_folder("local://ws", "f1");
+        assert!(
+            shell.web_surfaces["local://ws"].folders[0].collapsed,
+            "the parent starts SHUT"
+        );
+        shell.web_tab_new_folder_in("local://ws", Some("f1".to_string()));
+        let surface = &shell.web_surfaces["local://ws"];
+        let born = surface.folders.last().expect("the new folder");
+        assert_eq!(born.parent.as_deref(), Some("f1"));
+        assert!(
+            !surface.folders[0].collapsed,
+            "…and its parent opened, or the new row and its rename field would \
+             be invisible"
+        );
+        assert_eq!(
+            shell.web_tab_rename.as_ref().map(|(id, _)| id.clone()),
+            Some(web_tab_row_id(&WebTabMenuTarget::Folder(born.id.clone()))),
+            "it opens straight into rename, like every folder born in this tree"
+        );
+        // A parent the surface does not hold is not a parent. (A fresh shell:
+        // folder ids are minted from the clock, so two folders born in the
+        // same millisecond would collide.)
+        let mut other = shell_with_folder();
+        other.web_tab_new_folder_in("local://ws", Some("nope".to_string()));
+        assert_eq!(
+            other.web_surfaces["local://ws"]
+                .folders
+                .last()
+                .and_then(|folder| folder.parent.clone()),
+            None,
+            "a dangling parent would hide the folder from the draw walk"
         );
     }
 
@@ -167891,6 +168669,18 @@ mod webtabs_menu_switcher_locks {
             rail.contains("RowDisclosureChevron { expanded }"),
             "the folder's triangle is the SHARED chevron, not a private glyph"
         );
+        // …and the FOLDER GLYPH beside it, from the same one owner the cwd
+        // tree draws. A rail that drew its own folder path would be the one
+        // thing the user reported: a tree that does not look like the tree
+        // three pixels away.
+        assert!(
+            rail.contains("RowFolderIcon { expanded }"),
+            "a folder row's icon is the SHARED folder glyph:\n{rail}"
+        );
+        assert!(
+            !rail.contains("M1.9 5.2C1.9"),
+            "the rail must not inline a folder path of its own"
+        );
         for private in ["▸", "▾", "padding:6px 8px", "margin-top:6px"] {
             assert!(
                 !rail.contains(private),
@@ -167901,12 +168691,17 @@ mod webtabs_menu_switcher_locks {
             rail.contains("row_drop_placement_for_offset("),
             "the drop bands come from the ONE band rule"
         );
-        // The rail resolves a drop through the shared engine — via the state
-        // method, which is where the engine is called.
+        // The rail resolves a drop through the shared GESTURE, which is the one
+        // caller of the one reorder engine. Going straight to `reorder_row_tree`
+        // here would be a second drag implementation wearing the engine's hat.
         let end = function_body(&product, "fn end_web_tab_row_drag(");
         assert!(
-            end.contains("reorder_row_tree(rows, &drag.row_id, &target_row, placement)"),
+            end.contains("drag.resolve(rows)"),
             "the rail must not order rows by an arithmetic of its own:\n{end}"
+        );
+        assert!(
+            !end.contains("reorder_row_tree("),
+            "…and it reaches the engine THROUGH the shared gesture, never around it"
         );
         // The app tab keeps no rename gesture: it is the app's row.
         assert!(

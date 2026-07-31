@@ -68,6 +68,24 @@ symbol rather than trusting a line number:**
   drag both reorders and re-parents, folders and tabs rename in place by
   double-click or the row menu, and "New folder" opens with its placeholder
   selected.
+  **The user's three follow-up gaps are also FIXED**, on
+  `lane/dev/rail-folder-icons-nesting`: (1) a group row now wears the cwd
+  tree's FOLDER GLYPH (`RowFolderIcon`, filled = open / outline = shut) in its
+  leading slot with the chevron in a new always-visible trailing `expander`
+  slot, exactly as the cwd tree does — one owner, and contributed panes
+  inherit it; (2) the whole drag EXPERIENCE is one object,
+  `yggui::RowDragGesture`, which every row list drives: ghost card, dim, drop
+  line/ring, spring-loaded auto-expand, Escape-to-cancel, release-over-nothing,
+  and a committed drop no longer also clicking the row. yedit gets all of it
+  with zero app-side change; (3) `WebTabFolder::parent` makes rail folders
+  nest arbitrarily deep, with the descendant-drop refusal proven on the rail
+  path and the nesting round-tripping through `tabs.json`.
+  **Known limit, stated honestly:** spring-load and every hover rule are driven
+  by pointer MOVE events, so a pointer held perfectly still (zero motion, not
+  even sub-pixel jitter) over a shut folder never re-fires the hover and the
+  folder does not spring. Real pointers jitter; an automated pointer that
+  issues exactly one move does not. If this ever bites a user, the fix is a
+  render-loop tick that re-evaluates the dwell, not a second hover path.
 - **Downloads have no destination choice, no progress, and lie about history.**
   `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
   every terminal in the app (staged destination + async picker is the shape).
