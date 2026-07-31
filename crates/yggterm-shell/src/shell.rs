@@ -1072,6 +1072,29 @@ const MENU_SURFACE_CSS: &str = r#"
     box-shadow: none;
 }
 "#;
+/// The keyboard focus ring for FORM dialogs (spec §12.4 clause 5, DESIGN.md ▸
+/// Control language ▸ Keyboard focus ring). A dialog operated by focus rather
+/// than by badges is worthless if you cannot see where the keyboard is.
+///
+/// Scoped to a form dialog's own subtree on purpose: the rest of the shell is
+/// driven by the ALT layer, where the badge IS the indicator, and a global ring
+/// would fight it. `:focus-visible` keeps it off mouse clicks, and the ring is
+/// drawn OUTSIDE the control (`outline-offset`) so a colour chip's own colour is
+/// never altered by the thing pointing at it.
+const FORM_DIALOG_FOCUS_CSS: &str = r#"
+[data-yggterm-modal-root] :focus-visible {
+    outline: 2px solid var(--yggterm-focus-ring, rgba(95, 168, 255, 0.95));
+    outline-offset: 2px;
+    border-radius: inherit;
+}
+/* The group's SELECTED item and the FOCUSED item must read differently, or the
+   user cannot tell what Space would do (DESIGN.md). Selection is the item's own
+   fill/border, drawn by the renderer; focus is this ring and nothing else. */
+[data-keynav-group] [data-keynav-item]:focus-visible {
+    outline: 2px solid var(--yggterm-focus-ring, rgba(95, 168, 255, 0.95));
+    outline-offset: 3px;
+}
+"#;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -25250,7 +25273,19 @@ impl ShellState {
     fn close_titlebar_overflow_menu(&mut self) {
         self.titlebar_overflow_menu_open = false;
     }
+    /// §12.4 — the ALT layer stops at a FORM dialog's boundary, exactly as
+    /// Excel's does at Format Cells. Asked here rather than at each caller so
+    /// every door into the layer (the clean tap, the host relay, the agent verb)
+    /// refuses identically.
+    fn alt_overlay_refused_by_form_dialog(&self) -> bool {
+        self.top_modal()
+            .map(|modal| modal.keyboard_mode() == ModalKeyboardMode::Form)
+            .unwrap_or(false)
+    }
     fn activate_alt_overlay(&mut self) {
+        if self.alt_overlay_refused_by_form_dialog() {
+            return;
+        }
         self.alt_overlay_active = true;
         self.alt_overlay_sequence.clear();
         // A fresh open starts with a fresh derivation: the bridge re-runs the
@@ -35497,14 +35532,26 @@ fn queue_copy_edit_for_active_session(mut state: Signal<ShellState>, field: Copy
 /// species of lie the ALT layer exists to end (spec §12.3).
 fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
     match top {
-        // Both editors are FORMS: Enter belongs to the field being edited (a
-        // rebind, a colour), never to a primary button, so only Escape is
-        // advertised — and only Escape is acted on below.
+        // FORM mode (§12.4) advertises the NAVIGATION, because that is what the
+        // user has to know there: the badges are deliberately absent, so without
+        // this the bar would be silent about the only way to move.
+        TopModal::ThemeEditor => &[
+            ("Tab", "move"),
+            ("↑↓", "within group"),
+            ("Space", "pick"),
+            ("Esc", "close"),
+        ],
+        TopModal::CopyEdit => &[
+            ("Tab", "move"),
+            ("Enter", "save"),
+            ("Esc", "cancel"),
+        ],
+        // The KeyTips editor is a GRID and stays in Command mode: a letter is
+        // random access where Tab would be 34 presses. Enter belongs to the
+        // rebind field it is typed in, so it is not advertised.
         TopModal::KeymapEditor => &[("Esc", "close")],
-        TopModal::ThemeEditor => &[("Esc", "close")],
         TopModal::Fido2 => &[("Esc", "dismiss")],
         TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
-        TopModal::CopyEdit => &[("Enter", "save"), ("Esc", "cancel")],
         TopModal::ClassicTabsSwitch => &[("Enter", "switch"), ("Esc", "cancel")],
         TopModal::StripDropdown => &[("Esc", "close")],
     }
@@ -37213,7 +37260,54 @@ enum TopModal {
     StripDropdown,
 }
 
+/// How a dialog is operated by the keyboard (spec §12.4). KeyTips are a RIBBON
+/// mechanism — a command surface, where a letter acts and the layer dismisses.
+/// A dialog full of fields is an EDITING surface, where you land on a control
+/// and stay there; Windows gives those two jobs different models on purpose, and
+/// Excel's own KeyTip overlay never paints inside Format Cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModalKeyboardMode {
+    /// §12.3's badge layer: every control lettered, one keystroke acts.
+    Command,
+    /// Focus-first, the Windows way: focus enters on open, Tab is trapped inside,
+    /// a group is one tab stop with arrows moving within it. The ALT layer
+    /// REFUSES to open over these — a layer that could only move focus would be
+    /// the same lie as a badge on a dead letter.
+    Form,
+}
+
+impl ModalKeyboardMode {
+    /// The value stamped on the modal marker, so the one JS bridge knows which
+    /// contract to enforce without a second table of its own.
+    fn as_str(self) -> &'static str {
+        match self {
+            ModalKeyboardMode::Command => "command",
+            ModalKeyboardMode::Form => "form",
+        }
+    }
+}
+
 impl TopModal {
+    /// Which keyboard contract this dialog honours (§12.4) — the fourth column of
+    /// the ONE table, beside the kind, the walk root and the scope label.
+    ///
+    /// The split is what the dialog is FOR, not how big it is. `KeymapEditor` is
+    /// the interesting case and it stays Command deliberately: it is a 17-row
+    /// grid where a letter is random access and Tab would be 34 presses.
+    fn keyboard_mode(self) -> ModalKeyboardMode {
+        match self {
+            // Editing surfaces: fields to type in, chips to pick, a slider to
+            // nudge. Landing on the control is the beginning of the work.
+            TopModal::ThemeEditor | TopModal::CopyEdit => ModalKeyboardMode::Form,
+            // Command surfaces: pick one of a few actions and be done.
+            TopModal::KeymapEditor
+            | TopModal::Fido2
+            | TopModal::Delete
+            | TopModal::ClassicTabsSwitch
+            | TopModal::StripDropdown => ModalKeyboardMode::Command,
+        }
+    }
+
     /// The modal's KIND string — ONE table read by three places that must never
     /// disagree: the `data-yggterm-modal-open` marker, the `data-yggterm-modal-root`
     /// subtree the §12.2 walk confines itself to, and the ALT layer's modal scope
@@ -39283,6 +39377,23 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
     var modal = document.querySelector('[data-yggterm-modal-open]');
     return modal ? (modal.getAttribute('data-yggterm-modal-open') || '') : '';
   };
+  // §12.4 — the FOCUS ORDER of a form dialog, and the ONE definition of it: the
+  // trap, the group walk, the autofocus head and the audit's reachable-by-focus
+  // count all ask this, so none of them can disagree about what "in the focus
+  // order" means. A group is ONE stop (roving tabindex, so its unselected items
+  // carry tabindex=-1 and drop out here by construction).
+  window.__yggtermFormTabbables = function(root){
+    var sel = 'button, [role=button], a[href], input, select, textarea, [tabindex]';
+    return Array.prototype.slice.call(root.querySelectorAll(sel)).filter(function(el){
+      if (el.disabled) { return false; }
+      if (el.getAttribute('tabindex') === '-1') { return false; }
+      if (!el.getClientRects().length) { return false; }
+      var cs = window.getComputedStyle(el);
+      if (cs && (cs.visibility === 'hidden' || cs.display === 'none'
+                 || parseFloat(cs.opacity || '1') === 0 || cs.pointerEvents === 'none')) { return false; }
+      return true;
+    });
+  };
   window.__yggtermKeytipWalk = function(mode){
     function visibleInteractable(el){
       if (el.disabled) { return false; }
@@ -39301,11 +39412,16 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
     }
     var scope = 'root';
     var root = document;
+    var modalMode = 'command';
     var marker = document.querySelector('[data-yggterm-modal-open]');
     if (marker) {
       var kind = marker.getAttribute('data-yggterm-modal-open') || '';
       var modalRoot = document.querySelector('[data-yggterm-modal-root="' + kind + '"]');
-      if (modalRoot) { root = modalRoot; scope = 'modal:' + kind; }
+      if (modalRoot) {
+        root = modalRoot;
+        scope = 'modal:' + kind;
+        modalMode = marker.getAttribute('data-yggterm-modal-mode') || 'command';
+      }
     } else {
       // A floating MENU is a container too (§4): while one is up the layer is
       // showing that menu's level, so deriving letters for the chrome BEHIND it
@@ -39333,6 +39449,48 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
     // Audit mode: the SAME classification, counted instead of skipped.
     var reachableDeclared = 0, reachableDerived = 0, derivedStamped = 0;
     var excusedEntries = [], derivedEntries = [], orphans = [], unbadged = [];
+    // §12.4 clause 8 — a FORM dialog is measured by the mode it declares: there
+    // are no badges there by design, and a control is reachable when it is in
+    // the focus order. Judged by the ONE definition of that order
+    // (`__yggtermFormTabbables`), so the audit and the trap cannot disagree.
+    // Without this the metric would call the new mode broken exactly BECAUSE it
+    // works — the §12.1 lesson, in the other direction.
+    if (modalMode === 'form') {
+      var stops = window.__yggtermFormTabbables ? window.__yggtermFormTabbables(root) : [];
+      var unreachable = [];
+      all.forEach(function(el){
+        if (el.hasAttribute('data-keytip-exempt')) {
+          excusedEntries.push({ scope: scope, label: labelOf(el),
+            reason: el.getAttribute('data-keytip-exempt') || '(no reason)' });
+          return;
+        }
+        // An item of a GROUP is reachable through its group's stop plus the
+        // arrows (clause 3), so roving tabindex=-1 is correct, not a hole.
+        var inGroup = el.closest && el.closest('[data-keynav-group]');
+        if (stops.indexOf(el) >= 0 || inGroup) { return; }
+        unreachable.push({ scope: scope, label: labelOf(el) });
+      });
+      return {
+        scope: scope,
+        mode: modalMode,
+        visible_interactables: all.length,
+        reachable: all.length - excusedEntries.length - unreachable.length,
+        reachable_by_focus: all.length - excusedEntries.length - unreachable.length,
+        reachable_declared: 0,
+        reachable_derived: 0,
+        excused: excusedEntries.length,
+        excused_entries: excusedEntries.slice(0, 300),
+        focus_stops: stops.length,
+        orphan_count: unreachable.length,
+        orphans: unreachable.slice(0, 300),
+        subtree_exempt_stamps: [],
+        derived_stamped: 0,
+        unbadged_count: 0,
+        unbadged: [],
+        violations: unreachable.length,
+        derived: []
+      };
+    }
     all.forEach(function(el){
       if (el.hasAttribute('data-keytip-node')) { reachableDeclared++; return; }
       if (el.querySelector('[data-keytip-node]')) { reachableDeclared++; return; }
@@ -39370,6 +39528,7 @@ const KEYTIP_INTERACTABLE_WALK_JS: &str = r#"(function(){
     });
     return {
       scope: scope,
+      mode: modalMode,
       visible_interactables: all.length,
       reachable: reachableDeclared + reachableDerived,
       reachable_declared: reachableDeclared,
@@ -39426,6 +39585,15 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   // decides). Escape is intercepted ONLY while this is up, so a terminal with no
   // menu over it keeps every Escape it is sent.
   function menuOpen(){ return !!document.querySelector('[data-yggterm-menu-open]'); }
+  // The FORM dialog on top, if any, and its subtree (§12.4). Both halves come
+  // off the one marker Rust renders from `TopModal::keyboard_mode`, so the
+  // bridge keeps no list of its own about which dialogs are forms.
+  function formModalRoot(){
+    var marker = document.querySelector('[data-yggterm-modal-open]');
+    if (!marker || marker.getAttribute('data-yggterm-modal-mode') !== 'form') { return null; }
+    var kind = marker.getAttribute('data-yggterm-modal-open') || '';
+    return document.querySelector('[data-yggterm-modal-root="' + kind + '"]');
+  }
   // A focused text field owns Backspace/Enter — they are editing there, not
   // dialog keys. contenteditable counts; a checkbox/button does not.
   function editingText(){
@@ -39474,6 +39642,46 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     }
     armed = false; // any non-ALT key cancels tap candidacy
     if (!overlayOpen()) {
+      // §12.4 — a FORM dialog is operated by FOCUS, the Windows way. Two things
+      // the browser will not do for us: keep Tab inside the dialog, and treat a
+      // control group as one stop with arrows moving within it. Everything else
+      // (typing, Space, a range input's own arrows) is native and untouched.
+      var formRoot = formModalRoot();
+      if (formRoot && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key === 'Tab') {
+          var stops = window.__yggtermFormTabbables ? window.__yggtermFormTabbables(formRoot) : [];
+          if (stops.length) {
+            e.preventDefault(); e.stopPropagation();
+            var here = stops.indexOf(document.activeElement);
+            // Focus outside the dialog (it just opened, or something stole it)
+            // enters at the head rather than jumping to the end.
+            var step = e.shiftKey ? -1 : 1;
+            var next = here < 0 ? (e.shiftKey ? stops.length - 1 : 0)
+                                : (here + step + stops.length) % stops.length;
+            stops[next].focus();
+          }
+          return;
+        }
+        // Arrows/Home/End INSIDE a group: one stop, N items (§12.4 clause 3).
+        var group = document.activeElement && document.activeElement.closest
+          ? document.activeElement.closest('[data-keynav-group]') : null;
+        if (group && ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].indexOf(e.key) >= 0) {
+          var items = Array.prototype.slice.call(group.querySelectorAll('[data-keynav-item]'));
+          if (items.length) {
+            e.preventDefault(); e.stopPropagation();
+            var at = items.indexOf(document.activeElement);
+            var to;
+            if (e.key === 'Home') { to = 0; }
+            else if (e.key === 'End') { to = items.length - 1; }
+            else {
+              var delta = (e.key === 'ArrowLeft' || e.key === 'ArrowUp') ? -1 : 1;
+              to = at < 0 ? 0 : (at + delta + items.length) % items.length;
+            }
+            items[to].focus();
+          }
+          return;
+        }
+      }
       // §12.3: a modal owns the dialog keys even with the overlay CLOSED — the
       // overlay dismisses the instant a chord dispatches, so without this a
       // chord-opened modal accepts nothing and the flow ends at the mouse.
@@ -39606,6 +39814,29 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   // makes a chord-opened modal's buttons carry letters. On the CLOSE edge the
   // derived stamps go with the overlay; the Rust map's half of that clear lives
   // in clear_alt_overlay, same edge, each owner its own half.
+  // §12.4 clause 1 — the keyboard lives INSIDE a form dialog. Owned here, on the
+  // tick, and not on a Rust state edge: the state flips one render BEFORE the
+  // dialog exists in the DOM, so an edge-triggered focus finds nothing and the
+  // keyboard is left on whatever opened the dialog (measured: ALT,G,I left focus
+  // on the settings row's "Edit Theme" button). Asking the DOM instead is
+  // self-healing — it also re-seats focus if a re-render throws it away — and a
+  // modal owns the screen by definition, so focus outside it is never right.
+  function ktFormFocusTick(){
+    var root = formModalRoot();
+    if (!root) { return; }
+    var active = document.activeElement;
+    if (active && root.contains(active)) { return; }
+    var stops = window.__yggtermFormTabbables ? window.__yggtermFormTabbables(root) : [];
+    var head = root.querySelector('[data-yggterm-modal-autofocus]');
+    if (head && stops.indexOf(head) < 0) {
+      // The head named a GROUP (a div is not focusable): enter at its own first
+      // stop, which roving tabindex makes the selected item.
+      var inner = window.__yggtermFormTabbables ? window.__yggtermFormTabbables(head) : [];
+      head = inner[0] || null;
+    }
+    if (!head) { head = stops[0]; }
+    if (head && head.focus) { head.focus(); }
+  }
   var ktLastOverlayOpen = false;
   var ktLastSignature = '';
   function ktSurfaceTick(){
@@ -39628,7 +39859,7 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     if (!open) { ktLastSignature = ''; }
     ktLastOverlayOpen = open;
   }
-  window.setInterval(function(){ ktSurfaceTick(); ktPaint(); }, 90);
+  window.setInterval(function(){ ktSurfaceTick(); ktFormFocusTick(); ktPaint(); }, 90);
 })();"#;
 /// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
 /// generated from the EFFECTIVE accelerators (shipping defaults + the user's
@@ -40509,8 +40740,16 @@ fn follow_chord_into_modal(mut state: Signal<ShellState>) {
         if shell.alt_overlay_active {
             return;
         }
-        if let Some(kind) = shell.top_modal().map(|modal| modal.kind()) {
-            shell.descend_alt_overlay_into_modal(kind);
+        let Some(modal) = shell.top_modal() else {
+            return;
+        };
+        match modal.keyboard_mode() {
+            ModalKeyboardMode::Command => shell.descend_alt_overlay_into_modal(modal.kind()),
+            // §12.4: a FORM dialog does not take badges, it takes the FOCUS —
+            // and the bridge seats it (`ktFormFocusTick`), because the dialog
+            // does not exist in the DOM yet on the tick this runs. Declining to
+            // descend is the whole of this arm's job.
+            ModalKeyboardMode::Form => {}
         }
     });
 }
@@ -73632,8 +73871,15 @@ fn app() -> Element {
     use_effect(move || {
         apply_linux_always_on_top_state(&always_on_top_desktop, always_on_top);
     });
-    let shell_document_css =
-        "html, body, #main { margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; } \
+    // The focus ring's colour is the theme accent, published once as a CSS var
+    // so `FORM_DIALOG_FOCUS_CSS` stays a static sheet and still follows the
+    // theme (DESIGN.md ▸ Keyboard focus ring).
+    let focus_ring_var = format!(
+        ":root {{ --yggterm-focus-ring: {}; }} ",
+        snapshot.palette.accent
+    );
+    let shell_document_css = focus_ring_var
+        + &"html, body, #main { margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; } \
          body { overscroll-behavior:none; } \
          [data-yggterm-app-control-backgrounded=\"true\"] .yggterm-loading-dot, \
          [data-yggterm-app-control-backgrounded=\"true\"] .yggterm-tree-spinner, \
@@ -73965,6 +74211,7 @@ fn app() -> Element {
             style { "{DOCUMENT_SURFACE_STANDDOWN_CSS}" }
             style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
+            style { "{FORM_DIALOG_FOCUS_CSS}" }
             style { "{WEB_SURFACE_VTAB_CSS}" }
             style { "{shell_document_css}" }
             // KeyTips chord breadcrumb: shows the leader + the chord typed so far
@@ -75254,6 +75501,10 @@ fn app() -> Element {
                         // `data-yggterm-modal-root` subtree stamps and the ALT
                         // layer's modal scope.
                         "data-yggterm-modal-open": top_modal.kind(),
+                        // …and the keyboard contract it honours (§12.4), so the
+                        // one bridge enforces Form mode's trap without keeping a
+                        // second list of which dialogs are which.
+                        "data-yggterm-modal-mode": top_modal.keyboard_mode().as_str(),
                         "data-keytip-exempt": "modal-marker",
                         style: "display:none;",
                     }
@@ -115957,6 +116208,9 @@ fn CopyEditOverlay(
                     if is_summary {
                         textarea {
                             "data-copy-edit-input": "summary",
+                            // §12.4 clause 1 — the keyboard arrives in the
+                            // field, not on Cancel: typing is why the dialog opened.
+                            "data-yggterm-modal-autofocus": "1",
                             value: "{dialog.value}",
                             style: format!(
                                 "min-height:132px; resize:vertical; border:none; border-radius:8px; padding:11px 12px; \
@@ -115971,6 +116225,9 @@ fn CopyEditOverlay(
                     } else {
                         input {
                             "data-copy-edit-input": "title",
+                            // §12.4 clause 1 — the keyboard arrives in the
+                            // field, not on Cancel: typing is why the dialog opened.
+                            "data-yggterm-modal-autofocus": "1",
                             r#type: "text",
                             value: "{dialog.value}",
                             style: format!(
@@ -116454,13 +116711,25 @@ fn ThemeEditorOverlay(
                     div {
                         style: "display:flex; align-items:center; gap:8px;",
                         div {
+                            // §12.4 clause 3 — a group is ONE tab stop: Tab lands
+                            // on the SELECTED segment (roving tabindex, rendered
+                            // from the same state the styling reads) and ←/→ move
+                            // between them. Also the dialog's autofocus head: the
+                            // keyboard should arrive at the choice, not at the ✕
+                            // that merely happens to come next in the DOM.
+                            "data-keynav-group": "theme-mode",
+                            "data-yggterm-modal-autofocus": "1",
                             style: segmented_control_track_style(snapshot.palette),
                             button {
+                                "data-keynav-item": "light",
+                                tabindex: if snapshot.settings.theme == UiTheme::ZedLight { "0" } else { "-1" },
                                 style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedLight),
                                 "Light"
                             }
                             button {
+                                "data-keynav-item": "dark",
+                                tabindex: if snapshot.settings.theme == UiTheme::ZedDark { "0" } else { "-1" },
                                 style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedDark),
                                 "Dark"
@@ -116590,10 +116859,19 @@ fn ThemeEditorOverlay(
                     div {
                         style: "flex:1 1 266px; display:flex; flex-direction:column; gap:12px; min-width:min(100%, 252px);",
                         div {
+                            // §12.4 clause 3 — the stop chips are one group: Tab
+                            // lands on the SELECTED chip, arrows walk the stops.
+                            "data-keynav-group": "theme-stops",
                             style: "display:flex; flex-wrap:wrap; gap:8px;",
                             for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
                                 button {
                                     key: "theme-chip-{index}",
+                                    "data-keynav-item": "stop-{index}",
+                                    // Roving tabindex from the SAME selection the
+                                    // styling below reads — one source, so the
+                                    // ring can never land on an unselected chip.
+                                    tabindex: if snapshot.theme_editor_selected_stop == Some(index)
+                                        || (snapshot.theme_editor_selected_stop.is_none() && index == 0) { "0" } else { "-1" },
                                     style: format!(
                                         "display:flex; align-items:center; gap:8px; height:32px; padding:0 10px; border:none; border-radius:999px; \
                                          background:{}; color:{}; box-shadow:{};",
@@ -116627,10 +116905,15 @@ fn ThemeEditorOverlay(
                                 "Color Library"
                             }
                             div {
+                                // §12.4 clause 3 — the library is one group; no
+                                // swatch is "selected", so the first is the stop.
+                                "data-keynav-group": "theme-library",
                                 style: "display:flex; flex-wrap:wrap; gap:8px;",
-                                for swatch in THEME_EDITOR_SWATCHES {
+                                for (swatch_index, swatch) in THEME_EDITOR_SWATCHES.iter().enumerate() {
                                     button {
                                         key: "theme-swatch-{swatch}",
+                                        "data-keynav-item": "swatch-{swatch_index}",
+                                        tabindex: if swatch_index == 0 { "0" } else { "-1" },
                                         style: format!(
                                             "width:24px; height:24px; border-radius:999px; border:2px solid rgba(255,255,255,0.92); background:{}; box-shadow:0 8px 16px rgba(45,67,88,0.12);",
                                             swatch
@@ -167429,9 +167712,35 @@ mod keytips_inversion_locks {
             ),
             "the interactable selector is the walk's one definition"
         );
+        // Exemption is per-element (§12.1). The ban was written as "no `.closest(`
+        // anywhere", which was right while the walk had one job; §12.4's form
+        // mode legitimately asks an ANCESTOR question (is this control inside a
+        // keynav group?). So the ban is now on what it always meant: no ancestor
+        // lookup may ever answer the EXEMPTION question, and the only allowed
+        // `closest` argument is the group one.
+        for (position, _) in walk.match_indices(".closest(") {
+            let argument = &walk[position + ".closest(".len()..]
+                [..walk[position + ".closest(".len()..].find(')').unwrap_or(0)];
+            assert_eq!(
+                argument, "'[data-keynav-group]'",
+                "the walk may only ask `closest` about a keynav group; \
+                 an ancestor must never answer the exemption question (§12.1)"
+            );
+        }
         assert!(
-            !walk.contains(".closest("),
-            "exemption is per-element (§12.1): the walk must never consult an ancestor's stamp"
+            walk.contains("el.hasAttribute('data-keytip-exempt')"),
+            "the exemption test is the element's OWN stamp"
+        );
+        // ⛔ The walk's PARAMETER is `mode` (derive|audit). A `var mode` inside
+        // it does not shadow — it REASSIGNS the parameter, so `mode === 'derive'`
+        // stops matching and derivation silently dies while the audit still
+        // answers. That is exactly what happened when §12.4's modal keyboard
+        // mode arrived wearing the same name; no scanning lock could see it, a
+        // live probe did (tips=0 with derived=24). The name is now reserved.
+        assert!(
+            !walk.contains("var mode"),
+            "the walk's `mode` parameter must never be re-declared — a second \
+             `var mode` reassigns it and kills derive mode silently"
         );
         // Derive mode: declared (self, then descendant marker) precedes exempt.
         let derive_self = walk
@@ -167806,8 +168115,14 @@ mod keytips_inversion_locks {
         assert!(
             follow.contains("if shell.alt_overlay_active {")
                 && follow.contains("shell.top_modal()")
-                && follow.contains("descend_alt_overlay_into_modal(kind)"),
-            "the follow is: layer dismissed + a dialog now on top => descend into it:\n{follow}"
+                && follow.contains("descend_alt_overlay_into_modal(modal.kind())"),
+            "the follow is: layer dismissed + a COMMAND dialog now on top => descend into it:\n{follow}"
+        );
+        // §12.4: a FORM dialog takes the FOCUS instead of the badges, so this
+        // arm must DECLINE to descend (the bridge seats the keyboard).
+        assert!(
+            follow.contains("ModalKeyboardMode::Form => {}"),
+            "a chord that opens a form dialog must not badge it:\n{follow}"
         );
         // An ACCELERATOR must not raise the layer — §11 is flat by design.
         let bridge = function_body(&product, "fn keytip_apply_bridge_message(");
@@ -167858,6 +168173,129 @@ mod keytips_inversion_locks {
         );
         shell.clear_alt_overlay();
         assert_eq!(shell.alt_overlay_modal_scope, None);
+    }
+
+    /// LOCK 6f — §12.4: every dialog declares ONE keyboard mode on the ONE
+    /// table, and a FORM dialog gets the focus contract instead of the badge
+    /// layer. The user's call, reached at the theme editor: KeyTips are a ribbon
+    /// (command) mechanism, and a dialog full of fields is an editing surface,
+    /// which is why Excel's overlay never paints inside Format Cells.
+    #[test]
+    fn every_dialog_declares_one_keyboard_mode_and_forms_take_the_focus() {
+        // The mode is a column of the one table, not a list somewhere else.
+        assert_eq!(TopModal::ThemeEditor.keyboard_mode(), ModalKeyboardMode::Form);
+        assert_eq!(TopModal::CopyEdit.keyboard_mode(), ModalKeyboardMode::Form);
+        assert_eq!(
+            TopModal::KeymapEditor.keyboard_mode(),
+            ModalKeyboardMode::Command,
+            "a 17-row grid keeps random access — Tab would be 34 presses"
+        );
+        assert_eq!(TopModal::Delete.keyboard_mode(), ModalKeyboardMode::Command);
+        // The layer REFUSES over a form dialog, at the one door every opener
+        // goes through (clean tap, host relay, agent verb).
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://active");
+        let mut shell = ShellState::new(bootstrap);
+        shell.theme_editor_open = true;
+        assert!(shell.alt_overlay_refused_by_form_dialog());
+        shell.activate_alt_overlay();
+        assert!(
+            !shell.alt_overlay_active,
+            "the ALT layer must stop at a form dialog's boundary (§12.4 clause 7)"
+        );
+        shell.theme_editor_open = false;
+        shell.activate_alt_overlay();
+        assert!(shell.alt_overlay_active, "…and open normally once it is gone");
+        // The mode reaches the DOM so the bridge needs no table of its own.
+        let product = product_source();
+        assert!(
+            product.iter().any(|line| line
+                .contains("\"data-yggterm-modal-mode\": top_modal.keyboard_mode().as_str(),")),
+            "the marker must publish the declared mode"
+        );
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .contains("marker.getAttribute('data-yggterm-modal-mode') !== 'form'"),
+            "the bridge must read the mode off that marker, never guess by kind"
+        );
+    }
+
+    /// LOCK 6g — the Form-mode contract's three mechanisms exist: focus enters
+    /// on the open edge, Tab is TRAPPED inside the dialog, and a keynav group is
+    /// one stop with arrows moving within it (§12.4 clauses 1-3).
+    #[test]
+    fn a_form_dialog_traps_tab_and_walks_its_groups() {
+        let product = product_source();
+        // Clause 1: ONE owner, and it is the bridge tick — not a Rust state
+        // edge. Measured: the state flips a render BEFORE the dialog exists, so
+        // an edge-triggered focus found nothing and left the keyboard on the
+        // settings button that opened it. Asking the DOM is self-healing.
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("function ktFormFocusTick(){")
+                && ALT_TAP_LISTENER_JS_TEMPLATE.contains("ktFormFocusTick();"),
+            "a form dialog must take the keyboard from the tick that can see it"
+        );
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("if (active && root.contains(active)) { return; }"),
+            "…and must not steal focus back from a control inside the dialog"
+        );
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("root.querySelector('[data-yggterm-modal-autofocus]')")
+                && ALT_TAP_LISTENER_JS_TEMPLATE.contains("__yggtermFormTabbables"),
+            "the head is the dialog's declared one, else the first stop in the ONE focus order"
+        );
+        assert!(
+            !product.iter().any(|line| line.contains("fn focus_form_dialog(")),
+            "the Rust focus helper is gone — one owner, the bridge"
+        );
+        // Clause 2: the trap. Tab inside a form dialog never leaves it.
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("if (e.key === 'Tab') {")
+                && ALT_TAP_LISTENER_JS_TEMPLATE
+                    .contains("var next = here < 0 ? (e.shiftKey ? stops.length - 1 : 0)"),
+            "Tab must cycle inside the form dialog (wrapping), not walk into the chrome behind it"
+        );
+        // Clause 3: a group is one stop, arrows move within it.
+        assert!(
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains("closest('[data-keynav-group]')")
+                && ALT_TAP_LISTENER_JS_TEMPLATE.contains("querySelectorAll('[data-keynav-item]')"),
+            "arrows/Home/End must move within a keynav group"
+        );
+        // …and the theme editor actually declares its groups with roving
+        // tabindex, or the trap has nothing to walk.
+        for group in ["theme-mode", "theme-stops", "theme-library"] {
+            assert!(
+                product
+                    .iter()
+                    .any(|line| line.contains(&format!("\"data-keynav-group\": \"{group}\""))),
+                "the theme editor must declare its `{group}` group (§12.4 clause 3)"
+            );
+        }
+        assert!(
+            product.iter().any(|line| line.contains("\"data-keynav-item\": \"stop-{index}\"")),
+            "a group's items must be marked, or arrows have nothing to walk"
+        );
+        // Clause 5: the ring exists and is scoped to dialogs, per DESIGN.md.
+        assert!(
+            FORM_DIALOG_FOCUS_CSS.contains("[data-yggterm-modal-root] :focus-visible")
+                && FORM_DIALOG_FOCUS_CSS.contains("outline-offset"),
+            "a form dialog must show where the keyboard is"
+        );
+        // Clause 6: the hint bar advertises the NAVIGATION in form mode.
+        let hints = modal_key_hints(TopModal::ThemeEditor);
+        assert!(
+            hints.iter().any(|(key, _)| *key == "Tab"),
+            "a form dialog's hint bar must name the way to move"
+        );
+        assert!(
+            !hints.iter().any(|(key, _)| *key == "Enter"),
+            "…and must not advertise an Enter the dispatcher does not act on"
+        );
+        // Clause 8: the audit measures the declared mode.
+        assert!(
+            KEYTIP_INTERACTABLE_WALK_JS.contains("if (modalMode === 'form') {")
+                && KEYTIP_INTERACTABLE_WALK_JS.contains("reachable_by_focus:"),
+            "the audit must count a form dialog by its FOCUS order, not by badges"
+        );
     }
 
     /// LOCK 6e — §8 holds on the START PAGE too: an unbounded list's per-row

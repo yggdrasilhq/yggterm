@@ -608,6 +608,73 @@ order decides precedence: the editors sit above the dialogs), which also puts
 them in `chrome_transient_over_viewport` and the web-surface stash, the two
 lists that answer the same question for the two stacking modes.
 
+### 12.4 Two keyboard modes for dialogs (user-settled 2026-07-31)
+
+The user, on reaching the theme editor with `ALT,G,E`:
+
+> *"In these types of complex modals the ALT+ layer should break as it has, but
+> inside modals we need to decide how the keyboard interface should be. Excel had
+> more dialogs like this for complex settings like custom formatting. In those
+> dialogs the ALT+ layer does not really work, but those are excellently designed
+> with Windows guidelines — arrow buttons and tabs work like a charm."*
+
+That is the correct reading of the model we borrowed, and it is not an exception
+to it. **KeyTips are a RIBBON mechanism, and a ribbon is a COMMAND surface**:
+press a letter, something happens, the layer dismisses. **A dialog like Format
+Cells is an EDITING surface**: you land on a control and stay there, adjusting
+it. Windows gives those two jobs different keyboard models on purpose, and the
+KeyTip overlay never paints inside Format Cells — nobody experiences that as the
+keyboard giving up.
+
+Our theme editor is squarely the second kind: a direct-manipulation gradient pad,
+three grouped chip sets, a spinner with a slider. Twenty badges scattered over a
+design surface would each only *focus* something the user must then nudge with
+arrows anyway.
+
+**THE RULE: every modal declares its keyboard mode, as one more field on the ONE
+`TopModal` table** that already owns the marker kind, the walk root and the scope
+label. No judgement at a callsite, no second encoding, and moving a dialog
+between modes is a one-line change once we have lived with it.
+
+| Mode | For | Keyboard |
+|---|---|---|
+| **Command** | confirm/choice dialogs: Close Terminal?, Delete, Passkey, classic-tabs, dropdowns, the KeyTips editor's grid | §12.3's badge layer — letters on every control, one keystroke acts |
+| **Form** | editing dialogs: the theme editor, and every custom-format-class dialog we grow | focus-first, the Windows way (below). The ALT layer **refuses to open** over it |
+
+**The Form-mode contract**, each clause testable:
+
+1. **Focus enters on open** — the dialog's first control, never `<body>`. One
+   owner, driven off the modal-open edge, so no dialog can forget.
+2. **Tab / Shift+Tab cycle INSIDE the dialog and never escape it.** A focus trap
+   is what makes the mode true; without it Tab walks into the chrome behind a
+   dialog that is supposed to own the screen.
+3. **A group is ONE tab stop.** Light/Dark, the stop chips, the colour library:
+   Tab lands on the group's *selected* item (roving `tabindex`, rendered from
+   the same selection state the styling reads), and ←/→/↑/↓ move within it,
+   Home/End to the ends. This is the ARIA composite-widget pattern and it is
+   exactly what Windows means by a control group.
+4. **Space activates the focused control; Enter is the primary action where one
+   exists; Escape closes.** The last two stay at the §12.3 modal boundary — one
+   dispatcher, both modes.
+5. **A visible focus ring.** The mode is worthless if you cannot see where you
+   are; the ring is specified in DESIGN.md, not invented per dialog.
+6. **The hint bar tells the truth for the mode it is in** (`Tab move · ↑↓ adjust
+   · Space pick · Esc close`), from the same one table beside the dispatcher that
+   already forbids advertising a key the dispatcher swallows.
+7. **A clean ALT tap over a Form dialog is a NO-OP**, and says so when an agent
+   asks. Opening a layer that can only move focus would be the same species of
+   lie as a badge on a dead letter — the honest behaviour is the one Excel has:
+   the layer stops at this boundary.
+8. **The audit measures the mode a dialog declares** (§12): in a Form dialog a
+   control is reachable when it is in the focus order, so the audit counts
+   `reachable_by_focus`, and a control that is NOT tabbable is the violation.
+   Without this the metric would call the new mode broken precisely because it
+   works.
+
+Direct-manipulation surfaces (the gradient pad) get a follow-on rather than a
+blocker: the stops become a list Tab can enter, with arrows nudging the selected
+stop. Until then the pad is reachable by its chips and its Add/Remove buttons.
+
 ## 13. Invariants (each one testable)
 
 1. Assignment is a pure function of `(ordered declarations, keymap, pins)`.
@@ -626,6 +693,10 @@ lists that answer the same question for the two stacking modes.
     buttons carry letters and no letter reaches the chrome behind it.
 13. A tip is reachable: a two-letter tip's prefix is never also a tip in the
     same scope (§5 step 7), so no element on a crowded surface is unbadgeable.
+14. A dialog is operable by keyboard in exactly ONE declared mode (§12.4), and
+    the audit measures the mode it declares — badges in Command mode, the focus
+    order in Form mode. A Form dialog traps Tab and never leaks focus to the
+    chrome behind it.
 7. Held ALT+key in a focused terminal always reaches the PTY.
 8. No shell accelerator is a bare `Ctrl+<letter>` — the PTY keeps them (§11.2).
 9. No chord is hardcoded at a callsite; the registry owns every binding in both layers.
