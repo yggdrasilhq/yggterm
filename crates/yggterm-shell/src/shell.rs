@@ -3885,9 +3885,12 @@ mod app_pane_reorder_tests {
     /// was in. Hiding it was never enough; it has to leave the flex line.
     #[test]
     fn the_trailing_verbs_are_out_of_flow_so_the_title_keeps_the_whole_row() {
-        let anchor = session_row_actions_anchor_style();
+        let anchor = session_row_actions_anchor_style(6);
         assert!(anchor.contains("width:0px;"), "{anchor}");
         assert!(anchor.contains("flex:0 0 0px;"), "{anchor}");
+        // A zero-WIDTH item is not a zero-COST item: flex `gap` still charges
+        // the title one gap for it, which is the last 6px of "the entire width".
+        assert!(anchor.contains("margin-left:-6px;"), "{anchor}");
         assert!(
             anchor.contains("position:relative;"),
             "the verbs are positioned against the anchor, so it must be the \
@@ -81126,8 +81129,20 @@ const SESSION_ROW_ACTIONS_FADE_PX: u32 = 22;
 /// It is an anchor rather than the row itself so the verbs land to the LEFT of
 /// the always-visible `expander` — a hover must never cover the disclosure
 /// chevron, which is permanent chrome, not a hover-revealed verb.
-fn session_row_actions_anchor_style() -> String {
-    "position:relative; align-self:stretch; width:0px; min-width:0px; flex:0 0 0px;".to_string()
+///
+/// `row_gap_px` is the gap of the flex line the anchor is placed in, and it is
+/// taken straight back out again as a negative margin. A zero-WIDTH item is not
+/// a zero-COST item: flex `gap` applies between every pair of items, so an
+/// anchor sitting between the title and the expander was still charging the
+/// title one gap (measured live 2026-08-01: a rail title stopped at 2540 where
+/// the app tab's — the one row with no verbs at all — reached 2546). Cancelling
+/// it makes "the entire width" literally true, and it also keeps a group row's
+/// title-to-chevron distance at ONE gap instead of two.
+fn session_row_actions_anchor_style(row_gap_px: u32) -> String {
+    format!(
+        "position:relative; align-self:stretch; width:0px; min-width:0px; flex:0 0 0px; \
+         margin-left:-{row_gap_px}px;"
+    )
 }
 
 /// The revealed verbs themselves: out of flow, pinned to the anchor's trailing
@@ -81342,7 +81357,7 @@ fn SessionStyleRow(
                 // the floating verbs must land to its LEFT and never cover it.
                 span {
                     "data-session-row-actions-anchor": "1",
-                    style: session_row_actions_anchor_style(),
+                    style: session_row_actions_anchor_style(metrics.gap_px),
                     span {
                         "data-session-row-actions": "1",
                         style: session_row_actions_style(),
@@ -82103,7 +82118,9 @@ fn SidebarRow(
                     // title nothing the rest of the time.
                     span {
                     "data-session-row-actions-anchor": "1",
-                    style: session_row_actions_anchor_style(),
+                    // 6, because the cluster this anchor sits in is the row's
+                    // own `gap:6px` line, not the shared metrics' 8.
+                    style: session_row_actions_anchor_style(6),
                     span {
                     "data-session-row-actions": "1",
                     style: session_row_actions_style(),
