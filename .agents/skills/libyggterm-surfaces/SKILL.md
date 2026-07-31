@@ -633,6 +633,51 @@ reference doc `docs/alt-keytips.md`.
   first and only consumer of the registry in 2.x, per the campaign's
   extraction-not-construction sequencing.
 
+### A shell key that must survive a FOCUSED CHILD (2026-07-31)
+
+Everything above lives **inside the shell webview** — the DOM `onkeydown` and the
+below-the-webview JS bridge alike. Both are deaf the whole time a native GTK
+child (a page webview, a popup) holds the keyboard, which is the normal state
+while browsing. Two user-reported bugs were the same deafness: Ctrl+F did
+nothing, and F11 entered a mode with no chrome that F11 could not leave.
+
+The fix is a **chord claimer on the TOPLEVEL WINDOW**, and the layer is
+load-bearing. Measured on the real arrangement (GtkWindow > GtkOverlay >
+GtkFixed > WebKitWebView, real X key events, the page reporting its own
+`keydown` list): the window's `key-press-event` fires BEFORE the focused child's,
+and a window handler returning `Propagation::Stop` consumes the key so
+completely that the page's own listener never runs. A per-surface handler would
+have to be remembered at every door a focusable child is built through — there
+are already two — and a forgotten door silently re-traps the user.
+
+- **The claim table is DATA the shell pushes**, exactly like the JS bridge's
+  accelerator set: `claimed_chords_for(&KeymapConfig)` in `shell.rs` →
+  `DesktopContext::set_web_surface_claimed_chords` → `ClaimedChord` rows the host
+  matches. The host knows no key's MEANING. Rebuilt on every keymap edge, so a
+  rebound accelerator is claimed at the user's chord.
+- **`page_only`** is what keeps a bare `Ctrl+<letter>` legal: `Ctrl+F` is claimed
+  only while a PAGE surface owns the keyboard (a window-level claim would eat
+  readline's forward-char in every terminal). Anything PTY-safe —
+  `assert_accels_pty_safe` — needs no such condition, and an ESCAPE key must not
+  have one.
+- **`focus_shell`** decides whether the keyboard comes home before the relay.
+  True for a chord whose target is a shell DOM control (the find field cannot
+  take a keystroke while a child holds the toplevel focus); false for a chord
+  that only runs a command.
+- **The relay has NO modal guard**, unlike the ALT-tap relay: an escape key that
+  stands down whenever something is on screen fails exactly when it is needed.
+- **The terminus is shared.** `web.find` opens the find bar; every other id is a
+  keytip command id dispatched through `dispatch_keytip_node`, the same call the
+  accelerator bridge makes — one command, however the key arrived.
+- **A new chord is one row plus one terminus arm.** Nothing in the vendored host
+  changes.
+
+⚠ **Chrome that floats over a page must declare `data-covers-web-surface`.**
+Under glass the input region is the window MINUS the page holes PLUS the declared
+covers, so undeclared floating chrome is visible and unclickable. This bit the
+fullscreen window-controls strip — the only chrome distraction-free mode renders,
+and therefore the only mouse route out of it.
+
 ## The launcher registry — SHIPPED 2026-07-10
 
 A fifth surface, and the only one that does NOT ride OSC 7717: an app that is
