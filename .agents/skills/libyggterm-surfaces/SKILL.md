@@ -272,10 +272,25 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     a no-op drop POSTs nothing and the rows only move when the app says they
     did. A row without `reorder_action` is neither a drag source nor a drop
     target, so fixed rows cannot be shuffled into a list they do not belong to.
-    The gesture needs no app cooperation: the press becomes a drag only after
-    the pointer travels `yggui::DRAG_BEGIN_THRESHOLD_PX` (so a click stays a
-    click), and releasing anywhere — over a heading, the footer, outside the
-    pane — ends it.
+    **The whole drag EXPERIENCE needs no app cooperation, and cannot be had any
+    other way** — it lives in `yggui::RowDragGesture`, the one gesture every row
+    list in the product drives (the ychrome tab rail included), so declaring
+    `reorder_action` is all an app ever does to get it:
+    - the press becomes a drag only after the pointer travels
+      `yggui::DRAG_BEGIN_THRESHOLD_PX`, so a click stays a click;
+    - the dragged row DIMS through the shared row engine;
+    - a floating GHOST CARD follows the pointer from the window root, naming
+      the row and the landing ("Drop inside Work");
+    - the drop indicator is a 2px accent LINE on the receiving edge, or a 2px
+      accent RING when the drop lands INSIDE a group;
+    - a SHUT group springs open when a drag rests inside it for
+      `yggui::ROW_DRAG_SPRING_MS` — yggterm decides when and POSTs the row's own
+      `expand_action`, so the app still owns collapse state;
+    - ESCAPE abandons the drag; releasing over nothing abandons it; leaving the
+      list forgets the target but keeps the gesture;
+    - the release that commits a drop does NOT also fire the row's
+      `row_action` — moving a row never also opens it.
+    Releasing anywhere — over a heading, the footer, outside the pane — ends it.
   - **`list-row` TREES — `depth`, `expanded`, `expand_action` (2026-07-31, the
     ychrome tab rail was the forcing consumer):** a contributed pane is a TREE,
     not only a list. `depth` (default `0`) indents the row through the shared
@@ -283,11 +298,15 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     is the nearest preceding row with a smaller depth. There is no nested
     `children` array on purpose: the schema is already a flat `Vec` in draw
     order, and nesting would mean every renderer flattened it again.
-    `expanded: true|false` PRESENT ⇒ the row is a GROUP: it draws the tree's
-    disclosure chevron in its status slot and it **accepts a drop inside**.
-    Absent ⇒ a leaf, and the row behaves exactly as `list-row` always has, which
-    is why every pane written before this is unchanged. `expand_action` fires
-    with the row's id when the chevron is clicked; the app owns collapse state.
+    `expanded: true|false` PRESENT ⇒ the row is a GROUP: it wears the cwd tree's
+    FOLDER GLYPH in its leading icon slot (filled when open, outline when shut)
+    and the tree's DISCLOSURE CHEVRON in its trailing expander slot, and it
+    **accepts a drop inside**. A group that declares its own `icon` keeps it;
+    the folder glyph is the default, not an override. Absent ⇒ a leaf, and the
+    row behaves exactly as `list-row` always has, which is why every pane
+    written before this is unchanged. `expand_action` fires with the row's id
+    when the chevron is clicked AND when a drag springs the group open; the app
+    owns collapse state. Depth is UNBOUNDED — a group may hold groups.
     A drop now POSTs `values.parent` alongside `values.order` — the id of the
     group the row landed in, or `""` for the pane's root band (which is every
     drop a pane without groups can produce). `values.order` still carries only

@@ -4,6 +4,32 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Fixed: the tab rail now LOOKS like the cwd tree, and every row list shares
+  the tree's drag.** The rail had become a tree structurally but still read as
+  something else: its folders drew a bare triangle where the cwd tree three
+  pixels away draws a **folder icon — filled when open, outline when shut** —
+  and its drag was missing most of what makes the tree's drag feel like
+  yggterm's. Both are now single-owner components. A folder row wears the
+  folder glyph in its leading slot and the disclosure chevron in a new
+  always-visible trailing slot, exactly as the cwd tree does.
+  **The whole drag experience is now ONE object** (`yggui::RowDragGesture`) that
+  the rail, every contributed app pane, and anything added later all drive —
+  because there is one pointer. That means, everywhere at once: a floating
+  **drag ghost** that follows the pointer from the window root and names where
+  the row will land; **spring-loaded folders** — rest a drag inside a shut
+  folder and it opens under you, so filing something two levels down is one
+  gesture instead of drop-open-drag-again per level; **Escape to abandon** a
+  drag; and a drop that no longer also *clicks* the row it moved (dragging a
+  tab used to switch you to it). Contributed panes — yedit's notes among them —
+  inherit all of it with no app-side change: declaring `reorder_action` is the
+  whole opt-in.
+- **New: folders inside folders, in the tab rail.** A folder can hold folders,
+  arbitrarily deep — drag one in, or use the new "New folder inside this
+  folder" button on any folder row. Folders still sit above loose tabs at every
+  level, the nesting survives a restart, and a folder can never be dropped into
+  its own descendant. Deleting a folder now lifts its contents — sub-folders
+  included — up one level instead of only rescuing its tabs.
+
 - **Fixed: the vertical tab rail IS the cwd tree now.** It hand-rolled its own
   folder tree — a fourth tree in the product — and its drag could only ever
   re-parent a tab; dropping one beside another did nothing. Every rail row,

@@ -13,12 +13,13 @@ pub use chrome::{
     search_field_shell_style, search_input_style,
 };
 pub use drag_tree::{
-    DRAG_BEGIN_THRESHOLD_PX, DragDropPlacement, DragDropTarget, RowTreeDrop, RowTreeRow,
+    DRAG_BEGIN_THRESHOLD_PX, DragDropPlacement, DragDropTarget, ROW_DRAG_CLICK_SUPPRESS_MS,
+    ROW_DRAG_SPRING_MS, RowDragGesture, RowDragHover, RowDropTarget, RowTreeDrop, RowTreeRow,
     TreeDropPlacement, TreeReorderItem, TreeReorderPlanItem, build_tree_reorder_plan,
     canonical_tree_leaf_name, drag_threshold_reached, join_tree_child_path,
     ordered_tree_child_path, reorder_row_tree, resolve_drag_drop_target,
-    resolve_tree_drop_placement, staging_tree_child_path, tree_parent_path, tree_path_contains,
-    valid_drop_target,
+    resolve_tree_drop_placement, row_tree_descends_from, staging_tree_child_path, tree_parent_path,
+    tree_path_contains, valid_drop_target,
 };
 pub use drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
 pub use motion::{

@@ -421,9 +421,205 @@ pub fn reorder_row_tree(
     })
 }
 
+/// How long the pointer must rest INSIDE a collapsed group before the group
+/// springs open under the drag.
+///
+/// ONE number for every row list. Without it a collapsed folder is a wall: the
+/// only way to file a row deep in the tree is to drop it, open the folder, and
+/// drag it again — once per level. Long enough that merely crossing a folder on
+/// the way somewhere else does not disturb it.
+pub const ROW_DRAG_SPRING_MS: u64 = 550;
+
+/// How long after a committed drag a click on the same row is swallowed.
+///
+/// The release that commits a reorder is also a `click`, and a row whose click
+/// ACTIVATES something (opens a tab, opens a note) would otherwise do both. The
+/// cwd tree has always suppressed this window (`suppress_tree_click_until_ms`);
+/// the rail and the contributed panes did not, so a drag inside them also
+/// switched the user to the row they had just moved.
+pub const ROW_DRAG_CLICK_SUPPRESS_MS: u64 = 220;
+
+/// The row a live drag would land on, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowDropTarget {
+    /// Which row LIST — a contributed pane's id, or whatever name the host
+    /// surface gives its own list. A target in another list is not a target.
+    pub scope: String,
+    pub row_id: String,
+    /// What the target row is CALLED, for the ghost's "Drop inside Work" hint.
+    /// Carried on the target because the ghost is drawn at the window root and
+    /// has no other way back to the row the pointer is over.
+    pub label: String,
+    pub placement: DragDropPlacement,
+}
+
+/// What a hover CHANGED, for the surface to act on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowDragHover {
+    /// A collapsed group the pointer has now rested inside long enough: open
+    /// it. The engine only decides WHEN; expanding a row means something
+    /// different in each surface (a folder's `collapsed` flag, the cwd tree's
+    /// expanded-path set, a contributed pane's `expand_action`), so the surface
+    /// performs it. Fires at most once per group per gesture.
+    pub spring_open: Option<String>,
+}
+
+/// THE row-drag gesture — one for the whole window, because there is one
+/// pointer.
+///
+/// Every row list in the product drives this: the WebTabs rail, every
+/// contributed app pane (yedit's notes among them), and any future one. They do
+/// not each keep a drag state of their own, which is how the rail came to begin
+/// dragging on contact while the cwd tree waited 6px, and how the rail's dim,
+/// its drop line and its "released over nothing" rule each had to be
+/// rediscovered. A surface supplies its `scope`, its rows and its own meaning
+/// for "expand"; everything else — the press-travel threshold, the ghost, the
+/// dim, the drop target, the spring-load dwell, the post-drop click
+/// suppression — is here, once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowDragGesture {
+    pub scope: String,
+    pub row_id: String,
+    /// What the ghost card says. Carried on the gesture because the ghost is
+    /// drawn at the window root, far from the row that started it.
+    pub label: String,
+    /// Where the press landed, so the threshold is measured from the press and
+    /// not from wherever the last move happened to be reported.
+    pub origin: (f64, f64),
+    /// Where the pointer is NOW — the ghost follows this.
+    pub pointer: (f64, f64),
+    /// Has the press travelled far enough to be a drag? An armed press dims
+    /// nothing and accepts no target: it is still a click.
+    pub begun: bool,
+    pub target: Option<RowDropTarget>,
+    /// The collapsed group the pointer is resting inside, and when it arrived.
+    spring: Option<(String, u64)>,
+    /// Groups already sprung open by THIS gesture, so a folder the user closed
+    /// again mid-drag is not immediately re-opened.
+    sprung: Vec<String>,
+}
+
+impl RowDragGesture {
+    /// ARM a press. Not yet a drag — see [`RowDragGesture::maybe_begin`].
+    pub fn arm(
+        scope: impl Into<String>,
+        row_id: impl Into<String>,
+        label: impl Into<String>,
+        pointer: (f64, f64),
+    ) -> Self {
+        Self {
+            scope: scope.into(),
+            row_id: row_id.into(),
+            label: label.into(),
+            origin: pointer,
+            pointer,
+            begun: false,
+            target: None,
+            spring: None,
+            sprung: Vec::new(),
+        }
+    }
+
+    /// Promote an armed press to a live drag once it clears
+    /// [`DRAG_BEGIN_THRESHOLD_PX`], and track the pointer for the ghost.
+    /// Returns whether the gesture is live.
+    pub fn maybe_begin(&mut self, pointer: (f64, f64)) -> bool {
+        self.pointer = pointer;
+        if self.begun {
+            return true;
+        }
+        if !drag_threshold_reached(self.origin, pointer) {
+            return false;
+        }
+        self.begun = true;
+        true
+    }
+
+    /// Hover a row while the drag is live.
+    ///
+    /// `group_collapsed` says the hovered row is a group that is currently
+    /// SHUT — the only case spring-load applies to. A hover over a different
+    /// row, or a different placement, restarts the dwell.
+    pub fn hover(
+        &mut self,
+        scope: &str,
+        row_id: &str,
+        label: &str,
+        placement: DragDropPlacement,
+        group_collapsed: bool,
+        now_ms: u64,
+    ) -> RowDragHover {
+        let mut result = RowDragHover::default();
+        if !self.begun || self.scope != scope || self.row_id == row_id {
+            // Over itself, or over another list, is not a target. Leaving it
+            // `None` is what makes the release a no-op instead of a move
+            // nobody gestured.
+            self.target = None;
+            self.spring = None;
+            return result;
+        }
+        self.target = Some(RowDropTarget {
+            scope: scope.to_string(),
+            row_id: row_id.to_string(),
+            label: label.to_string(),
+            placement,
+        });
+        let springable = group_collapsed
+            && placement == DragDropPlacement::Into
+            && !self.sprung.iter().any(|id| id == row_id);
+        if !springable {
+            self.spring = None;
+            return result;
+        }
+        match self.spring.as_ref() {
+            Some((id, since)) if id == row_id => {
+                if now_ms.saturating_sub(*since) >= ROW_DRAG_SPRING_MS {
+                    self.spring = None;
+                    self.sprung.push(row_id.to_string());
+                    result.spring_open = Some(row_id.to_string());
+                }
+            }
+            _ => self.spring = Some((row_id.to_string(), now_ms)),
+        }
+        result
+    }
+
+    /// Is `row_id` the row the pointer would drop onto right now, and on which
+    /// side? Drives the drop line the row draws.
+    pub fn drop_edge(&self, scope: &str, row_id: &str) -> Option<DragDropPlacement> {
+        self.target
+            .as_ref()
+            .filter(|target| target.scope == scope && target.row_id == row_id)
+            .map(|target| target.placement)
+    }
+
+    /// Is this row the live drag's subject? Only a BEGUN gesture counts — an
+    /// armed press must look exactly like a click until it travels.
+    pub fn is_dragging(&self, scope: &str, row_id: &str) -> bool {
+        self.begun && self.scope == scope && self.row_id == row_id
+    }
+
+    /// Resolve the gesture against the list's rows. `None` for a drag that
+    /// never travelled, never found a target, or changed nothing.
+    pub fn resolve(&self, rows: &[RowTreeRow]) -> Option<RowTreeDrop> {
+        if !self.begun {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        if target.scope != self.scope {
+            return None;
+        }
+        reorder_row_tree(rows, &self.row_id, &target.row_id, target.placement)
+    }
+}
+
 /// Does `id` sit anywhere under `ancestor`? Bounded by the row count so a
 /// malformed parent cycle terminates instead of hanging the render thread.
-fn row_tree_descends_from(rows: &[RowTreeRow], id: &str, ancestor: &str) -> bool {
+///
+/// Public because a surface that files rows by a stored parent id (the WebTabs
+/// rail's folders) has to refuse the same move [`reorder_row_tree`] refuses,
+/// and two answers to "is this my own descendant" is exactly one too many.
+pub fn row_tree_descends_from(rows: &[RowTreeRow], id: &str, ancestor: &str) -> bool {
     let mut cursor = Some(id.to_string());
     for _ in 0..=rows.len() {
         let Some(current) = cursor else {
@@ -742,6 +938,143 @@ mod tests {
             drop.order.len(),
             rail().len(),
             "every row comes back, visible or not"
+        );
+    }
+
+    // ===================================================================
+    // THE one drag gesture. Every row list drives this object, so these are
+    // locks on the rail, on every contributed pane, and on anything added
+    // later — not on one surface's copy of the rules.
+    // ===================================================================
+
+    fn armed() -> RowDragGesture {
+        RowDragGesture::arm("notes", "a", "A", (100.0, 100.0))
+    }
+
+    #[test]
+    fn a_press_is_a_click_until_it_travels_the_shared_threshold() {
+        let mut drag = armed();
+        assert!(!drag.maybe_begin((101.0, 100.0)));
+        assert!(!drag.begun, "an armed press must not dim its row");
+        drag.hover("notes", "b", "b", DragDropPlacement::After, false, 0);
+        assert_eq!(
+            drag.drop_edge("notes", "b"),
+            None,
+            "an armed press accepts no drop target"
+        );
+        assert!(drag.maybe_begin((100.0 + DRAG_BEGIN_THRESHOLD_PX, 100.0)));
+    }
+
+    // The ghost follows the pointer, so the pointer has to be on the gesture:
+    // it is drawn at the window root, nowhere near the row that started it.
+    #[test]
+    fn the_gesture_tracks_the_pointer_for_the_ghost() {
+        let mut drag = armed();
+        assert_eq!(drag.pointer, drag.origin);
+        drag.maybe_begin((140.0, 180.0));
+        assert_eq!(drag.pointer, (140.0, 180.0));
+        // …including while still armed, so the ghost appears exactly where the
+        // drag becomes one.
+        let mut armed_only = armed();
+        armed_only.maybe_begin((101.0, 100.0));
+        assert_eq!(armed_only.pointer, (101.0, 100.0));
+    }
+
+    #[test]
+    fn a_hover_in_another_list_is_not_a_target() {
+        let mut drag = armed();
+        drag.maybe_begin((200.0, 100.0));
+        drag.hover("tabs", "b", "b", DragDropPlacement::After, false, 0);
+        assert_eq!(drag.drop_edge("tabs", "b"), None);
+        assert!(drag.target.is_none());
+    }
+
+    #[test]
+    fn hovering_the_dragged_row_itself_is_not_a_target() {
+        let mut drag = armed();
+        drag.maybe_begin((200.0, 100.0));
+        drag.hover("notes", "a", "a", DragDropPlacement::After, false, 0);
+        assert_eq!(drag.drop_edge("notes", "a"), None);
+    }
+
+    // SPRING-LOAD. A collapsed folder used to be a wall: filing a row two
+    // levels down meant dropping it, opening the folder, and dragging again.
+    #[test]
+    fn resting_inside_a_collapsed_group_springs_it_open() {
+        let mut drag = armed();
+        drag.maybe_begin((200.0, 100.0));
+        // Arriving is not resting.
+        assert_eq!(
+            drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, 1_000)
+                .spring_open,
+            None
+        );
+        assert_eq!(
+            drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, 1_000 + ROW_DRAG_SPRING_MS - 1)
+                .spring_open,
+            None,
+            "crossing a folder on the way somewhere else must not disturb it"
+        );
+        assert_eq!(
+            drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, 1_000 + ROW_DRAG_SPRING_MS)
+                .spring_open,
+            Some("f1".to_string())
+        );
+        // Once per group per gesture: a folder the user shut again mid-drag
+        // must not immediately re-open.
+        assert_eq!(
+            drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, 9_999)
+                .spring_open,
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_inside_of_a_shut_group_springs() {
+        let now = 1_000;
+        for (collapsed, placement) in [
+            (false, DragDropPlacement::Into),
+            (true, DragDropPlacement::Before),
+            (true, DragDropPlacement::After),
+        ] {
+            let mut drag = armed();
+            drag.maybe_begin((200.0, 100.0));
+            drag.hover("notes", "f1", "f1", placement, collapsed, now);
+            assert_eq!(
+                drag.hover("notes", "f1", "f1", placement, collapsed, now + ROW_DRAG_SPRING_MS * 4)
+                    .spring_open,
+                None,
+                "collapsed={collapsed} placement={placement:?}"
+            );
+        }
+    }
+
+    // Leaving the folder resets the dwell — otherwise a pointer that toured
+    // three folders would open the first one it came back to instantly.
+    #[test]
+    fn leaving_a_group_restarts_the_spring_dwell() {
+        let mut drag = armed();
+        drag.maybe_begin((200.0, 100.0));
+        drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, 0);
+        drag.hover("notes", "f2", "f2", DragDropPlacement::Into, true, 100);
+        assert_eq!(
+            drag.hover("notes", "f1", "f1", DragDropPlacement::Into, true, ROW_DRAG_SPRING_MS + 50)
+                .spring_open,
+            None
+        );
+    }
+
+    #[test]
+    fn a_gesture_resolves_against_the_lists_rows() {
+        let rows: Vec<RowTreeRow> = ["a", "b", "c"].iter().map(|id| RowTreeRow::leaf(*id)).collect();
+        let mut drag = RowDragGesture::arm("notes", "c", "C", (0.0, 0.0));
+        assert_eq!(drag.resolve(&rows), None, "an armed press resolves nothing");
+        drag.maybe_begin((0.0, DRAG_BEGIN_THRESHOLD_PX));
+        assert_eq!(drag.resolve(&rows), None, "…and neither does a drag with no target");
+        drag.hover("notes", "a", "a", DragDropPlacement::Before, false, 0);
+        assert_eq!(
+            drag.resolve(&rows).map(|drop| drop.order),
+            Some(ids(&["c", "a", "b"]))
         );
     }
 
