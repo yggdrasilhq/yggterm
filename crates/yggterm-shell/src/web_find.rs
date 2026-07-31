@@ -367,6 +367,37 @@ pub fn return_focus_to_lender(origin: &FindFocusOrigin) -> FindFocusTarget {
     to
 }
 
+/// Does handing the keyboard to `target` require the shell to MOVE it, or is
+/// letting go of the field the whole of the give-back?
+///
+/// The distinction is not cosmetic: [`return_focus_to_lender`] publishes a
+/// `FocusMoved` for every close, so a target this says `true` about and the
+/// shell then does nothing for is a ledger entry describing a move nobody made
+/// — verbatim the lie the ledger's one-writer rule exists to forbid.
+///
+/// ⚠ **`Page` is `true`, and it did not always behave as if it were.** When the
+/// only door to the bar was the shell's own `onkeydown`, a `Page` lender had
+/// never actually held the toplevel's keyboard — the shell webview had — so
+/// blurring the field really was the whole give-back. The GTK chord claimer
+/// changed that: it fires precisely BECAUSE the page webview owns the keyboard,
+/// and the relay takes that keyboard away to put it in the field. A close that
+/// only blurred would leave the page the user is reading with no keyboard at
+/// all — no PageUp, no PageDown, no typing into the form they were filling —
+/// until they clicked it, which is the same defect `WebSurfaceHost::focus`
+/// exists to fix on the reveal edge.
+///
+/// `Chrome` stays `false` because it means "nobody in particular": it is the
+/// origin an AGENT-opened bar records, and that bar never took the keyboard, so
+/// there is nothing to give back.
+pub fn give_back_moves_the_keyboard(target: &FindFocusTarget) -> bool {
+    match target {
+        FindFocusTarget::FindInput => true,
+        FindFocusTarget::Terminal(_) => true,
+        FindFocusTarget::Page => true,
+        FindFocusTarget::Chrome => false,
+    }
+}
+
 /// How many events the ring keeps. Big enough for a whole open->type->close
 /// burst plus slack, small enough that it can never be a leak.
 pub const FIND_TRACE_CAPACITY: usize = 128;
@@ -1187,6 +1218,134 @@ mod tests {
             ],
             "the two moves the bar may make, recorded where they are ordered"
         );
+    }
+
+    // -- LOCK: the PAGE-CHORD door -----------------------------------------
+    //
+    // Ctrl+F now reaches the bar from a focused page webview, claimed at the
+    // GTK level because the shell's own listeners are deaf there. That door
+    // changes two things this module owns: a `Page` lender really did hold the
+    // keyboard (so the give-back is a MOVE, not a blur), and the way back into
+    // a bar the user clicked out of is another Ctrl+F, because an unfocused bar
+    // claims nothing.
+
+    /// A give-back to a PAGE is a real focus move, and `Chrome` is not.
+    ///
+    /// The ledger publishes a `FocusMoved` for every close
+    /// ([`return_focus_to_lender`]). If the shell answers a `Page` target with
+    /// nothing but a blur, that entry describes a move nobody made — the exact
+    /// lie the one-writer rule exists to forbid — and the user's page is left
+    /// with no keyboard until they click it.
+    #[test]
+    fn a_page_lender_gets_a_real_give_back_and_chrome_does_not() {
+        assert!(
+            give_back_moves_the_keyboard(&FindFocusTarget::Page),
+            "Ctrl+F on a focused page TAKES that page's keyboard to put it in \
+             the field; closing must put it back"
+        );
+        assert!(
+            give_back_moves_the_keyboard(&FindFocusTarget::Terminal(
+                "local://ws".to_string()
+            )),
+            "the terminal lender was already a real move and stays one"
+        );
+        assert!(
+            !give_back_moves_the_keyboard(&FindFocusTarget::Chrome),
+            "an agent-opened bar records Chrome and never took the keyboard — \
+             there is nothing to give back, and moving focus on its close would \
+             be the agent stealing the human's keyboard at teardown"
+        );
+        // And the origin a page-chord open records maps to that target.
+        assert_eq!(
+            FindFocusTarget::from(&FindFocusOrigin::Page),
+            FindFocusTarget::Page
+        );
+    }
+
+    /// What Escape / Enter / Shift+Enter do once the bar has been opened from a
+    /// focused page — including after the user clicks back into that page.
+    ///
+    /// The relay hands the shell webview the keyboard before opening the bar,
+    /// so the field holds it and all three keys are the bar's, through the same
+    /// `route_key` the shell's own door uses. The instant the user clicks back
+    /// into the PAGE the bar is unfocused and claims NOTHING — Escape included.
+    /// That is not an oversight: a bar that kept Escape while the page had the
+    /// keyboard would be a bar that also kept it from the terminal beneath, and
+    /// `find_bar_blocks_terminal_input` is keyed on the very same flag. The way
+    /// back in is another Ctrl+F, which re-focuses the bar it finds.
+    #[test]
+    fn the_page_chord_door_leaves_the_bar_holding_escape_enter_and_shift_enter() {
+        let mut find = WebFindState::open("local://ws", FindFocusOrigin::Page);
+        assert!(
+            find.bar_focused,
+            "the relay grabs the keyboard for the shell and the field takes it"
+        );
+        assert_eq!(
+            find.route_key(&FindKey::Enter),
+            FindRoute::Bar(FindKeyAction::Next)
+        );
+        assert_eq!(
+            find.route_key(&FindKey::ShiftEnter),
+            FindRoute::Bar(FindKeyAction::Prev)
+        );
+        assert_eq!(
+            find.route_key(&FindKey::Escape),
+            FindRoute::Bar(FindKeyAction::Close)
+        );
+
+        // The user clicks back into the page: the bar is still on screen, and
+        // it claims nothing at all.
+        find.bar_focused = false;
+        for key in [FindKey::Enter, FindKey::ShiftEnter, FindKey::Escape] {
+            assert_eq!(
+                find.route_key(&key),
+                FindRoute::NotOurs,
+                "an unfocused bar claims no keys — the page (or the terminal \
+                 beneath it) owns them, {key:?} included"
+            );
+        }
+        assert!(
+            !find_bar_blocks_terminal_input(find.bar_focused),
+            "…and the terminal gate is keyed on the SAME flag, which is why \
+             the bar cannot be allowed to keep Escape here"
+        );
+
+        // Ctrl+F again: the way back in. The shell's opener re-focuses the bar
+        // it finds and must not forget who lent the keyboard.
+        find.bar_focused = true;
+        assert_eq!(
+            find.origin,
+            FindFocusOrigin::Page,
+            "a re-open must not rewrite the lender — the page is still owed its \
+             keyboard back"
+        );
+        assert_eq!(
+            find.route_key(&FindKey::Escape),
+            FindRoute::Bar(FindKeyAction::Close)
+        );
+    }
+
+    /// The bar's key contract has FOUR members and no more.
+    ///
+    /// Named here because the page-chord door invites inventing bindings the
+    /// product does not have: there is no Ctrl+G and no F3 anywhere in
+    /// `keytip::DEFAULT_ACCELERATORS` or in the bar, so "find next" is Enter and
+    /// nothing else. A key that is not one of the four is `Other`, and `Other`
+    /// is `NotOurs` even with the field focused.
+    #[test]
+    fn the_bar_claims_four_keys_and_invents_none() {
+        let find = WebFindState::open("local://ws", FindFocusOrigin::Page);
+        assert_eq!(
+            find.route_key(&FindKey::Char("f".to_string())),
+            FindRoute::Bar(FindKeyAction::Type("f".to_string()))
+        );
+        for invented in ["F3", "ArrowDown", "Tab"] {
+            assert_eq!(
+                find.route_key(&FindKey::Other(invented.to_string())),
+                FindRoute::NotOurs,
+                "{invented} is not a find binding this product has"
+            );
+        }
     }
 
     #[test]
