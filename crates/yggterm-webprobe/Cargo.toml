@@ -1,0 +1,26 @@
+[package]
+name = "yggterm-webprobe"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish = false
+
+# Launch-decomposition instrument for web surfaces. Deliberately a SEPARATE
+# binary and not a `yggterm server` verb: it must be able to construct a
+# WebContext + WebView from nothing, in a process whose whole lifetime is one
+# launch, which is precisely what an in-app probe cannot do.
+[[bin]]
+name = "yggterm-webprobe"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wry = "0.55"
+gtk = "0.18"
+# Direct engine access for the --adblock arm, which times WebKit's content
+# filter store. Pinned to the same versions wry itself depends on so the probe
+# measures the engine the app links, not a second one.
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+webkit2gtk-sys = "=2.0.2"
