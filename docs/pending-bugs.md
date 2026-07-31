@@ -201,6 +201,32 @@ detector found nothing precisely because on Wayland there is nothing to find.
   shadows it, and `prewarmGlobally()` is Cocoa-only.
 
 
+- **★★ `web do click --css` MIS-CLICKS A HIDDEN DUPLICATE — the same ancestor-hit
+  bug the engine just fixed, still live in the surface plane** (found 2026-07-31
+  by `lane/dev/engine-click-hittable` while fixing ychrome's copy; **not fixed
+  here**, because three lanes were editing `shell.rs` at the time).
+  Two defects, both in `crates/yggterm-shell/src/shell.rs` — grep the symbols,
+  the numbers move:
+  1. `var onTarget = hit===el || (el.contains&&el.contains(hit)) || (hit&&hit.contains&&hit.contains(el));`
+     (was ~`:57306`). ⛔ **`<body>` contains every element on the page**, so the
+     third clause accepts *any* candidate on *any* normal page. A click that
+     lands on an ANCESTOR reaches the ancestor, not the node you named. Drop the
+     clause: `hit === el || el.contains(hit)`.
+  2. `web_css_matcher_js` (was ~`:57378`) does `querySelectorAll(sel)[nth]` with
+     `hidden:0` **hard-coded and no liveness filter at all**. Only the *Role*
+     matcher runs `__yggLive`.
+  Net effect: on a page with a `visibility:hidden` duplicate ahead of the real
+  control, the decoy passes `visible` (it has a real rect) AND passes `onTarget`
+  (body contains it) and gets the click — reported as success. The plane gets
+  the `0x0` case right and gets role/text targets right; **its CSS path is
+  wrong.** The engine's fixed resolver (`ychrome` `c547aa6`, `src/engine/hit.rs`)
+  is the reference: classify with the liveness predicate, pin, `scrollIntoView`,
+  let the scroll settle, re-measure, then require `hit === el || el.contains(hit)`.
+  ⚠ Keep the refusal vocabulary identical across both planes
+  (`no_hittable_match`, `detached_node`, `target_moved`, `zero_size_element`) —
+  two planes with different words for the same refusal is the divergence
+  AGENTS.md forbids, and avoiding it is why the engine borrowed these names.
+
 ## Standing traps / other open bugs
 
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
