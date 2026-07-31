@@ -1009,3 +1009,169 @@ engine startup. That is the finding.
 > is plainly there in the environ of the WebKit children the GUI forked
 > afterwards, which is where it was verified on guihost. The cache model is already
 > explicit and already correct.
+
+## 10. SPA navigation on open-webui: it is not ours, and it is not the launch bug (2026-07-31)
+
+**The report:** *"the site as given is slow on ychrome but fast on chromium
+apps. The slowness comes when I click something in the sidebar (another chat
+to switch into openwebui)."* The site is open-webui.
+
+⚠ **This is a different bug from §9 and the two must not be merged.** §9's
+~650 ms is WebProcess startup, paid once per surface before navigation begins.
+Clicking a chat in the sidebar starts no process, opens no surface and performs
+no top-level navigation, so none of §9 can reach it. Measured separately,
+root-caused separately, and the causes have nothing in common.
+
+### 10a. The instrument
+
+- `scripts/spa_nav_probe.js` — one engine-agnostic in-page probe. Its spine is
+  a **4 ms self-rescheduling timer**: a timer that cannot fire is a main thread
+  that is busy, so the gap distribution IS the blocking profile, in any engine.
+  Deliberately nothing here uses `longtask`, `event` timing or
+  `long-animation-frame` — Chromium has them, WebKit does not, and a
+  decomposition that only works on one side answers nothing. It also carries a
+  fetch/XHR wrapper, a resource-timing byte sweep, a mutation timeline, an
+  observer-free element-count poll, a forced-reflow accountant with optional
+  stack capture, and an optional pre-click stylesheet for mechanism probes.
+- `scripts/spa_nav_bench.py` — four arms, one probe: `webkit` (plain
+  WebKitGTK via PyGObject, same profile jar and cache model as the app, with
+  **none of yggterm around it**), `chromium` (Helium over CDP, same display,
+  same size, localStorage copied from the WebKit jar so both engines start the
+  app in the same state), `ychrome` (the product path, through
+  `server app web eval`), `layout` (the controlled microbenchmark).
+- `scripts/spa_nav_layout_bench.js` — a flat/deep synthetic document used to
+  price layout SHAPE apart from layout SIZE.
+
+`yggterm-webprobe` could not be reused for this: its whole lifetime is one
+launch, and this bug lives entirely after the launch is over.
+
+### 10b. The numbers
+
+a self-hosted open-webui instance on the LAN, the user's own profile jar, 1600x1000, Xvfb on `dev`,
+32 switches per engine over 8 chats x 2 rounds x {MutationObserver on, off},
+medians. ⚠ `dev` carried `loadavg` 20-30 from other lanes throughout, so the
+absolute figures are inflated; the RATIOS are the result.
+
+| p50 | WebKitGTK 2.52.5 (plain) | Chromium 150 (Helium) | ychrome (under-glass) |
+|---|---|---|---|
+| route change | 158 ms | 49 ms | 567 ms |
+| **first message node in the DOM** | **1,454 ms** | **211 ms** | 1,674 ms |
+| **message list rendered and stable** | **2,086 ms** | **366 ms** | 2,604 ms |
+| **main-thread blocking** | **2,282 ms** | **210 ms** | 3,074 ms |
+| longest single task | 1,334 ms | 161 ms | 1,722 ms |
+| forced full relayout, same DOM | 356 ms | 65 ms | 937 ms |
+| chat payload fetch | ~150 ms | ~150 ms | ~150 ms |
+| DOM after switch | 4,132 nodes | 4,128 nodes | 3,656 nodes |
+
+**The user's felt latency is the "rendered and stable" row: 2.1 s against
+0.37 s, 5.7x.** Blocking is **96.6% of WebKit's wall time and 15.4% of
+Chromium's** (per-run medians; WebKit's worst run 98.5%, its best 84%) — so this is a busy main thread, not the network, not paint, and
+not scheduling. The chat payload arrives in ~150 ms on both engines and the
+route changes in ~50-160 ms; everything after that is one enormous synchronous
+task. A representative WebKit timeline, gaps as `[start_ms, duration_ms]`:
+
+```
+[0, 161] [224, 1994] [2218, 657] [2880, 585] [3509, 682]
+```
+
+**`ychrome` is the same order as plain WebKit, not worse in kind.** It reads
+~1.25x the plain arm, but its driver polls the result back through
+`server app web eval` every 400 ms, which runs JS on the page's own main
+thread — an observer cost the other two arms do not carry. Treat that column
+as an order-of-magnitude check. What it establishes is the only thing it needs
+to: **the deficit is fully present with no yggterm in the picture at all.**
+
+### 10c. The root cause
+
+> **open-webui's chat-switch effect flush takes about four geometry reads while
+> the DOM is dirty. Each one forces a synchronous style recalc + layout of the
+> whole document, and on this document WebKitGTK needs ~180-500 ms per forced
+> layout where Chromium needs ~6-65 ms. Four of them is the 1.2-2.5 s task.**
+
+Instrumenting the layout-forcing accessors (`spa_nav_probe.js`, `opts.reflow`)
+puts **66% of WebKit's blocking time inside those getters**, and naming the
+callers via `opts.stack_for` names the exact call sites in the app bundle:
+
+| accessor | calls/switch | direct caller | WebKit |
+|---|---|---|---|
+| `scrollWidth` | 3 | `_app/immutable/chunks/ci5FwYEI.js:61` — a Svelte effect doing `el.scrollLeft = el.scrollWidth` on a horizontal scroller | **162 ms/call** |
+| `clientWidth` | 1 | `ci5FwYEI.js:126` — restoring the chat-controls pane width from `localStorage.chatControlsSize` | **273 ms/call** |
+| `clientWidth`/`getBoundingClientRect` | ~380 | ProseMirror `updateState`/`scrollToSelection` (`BEpREC_0.js`) | **0.0 ms** |
+
+Note the third row, because it corrected a wrong first hypothesis: the editor
+performs by far the most reads and costs **nothing**, because by then layout is
+already clean. Volume is not the problem; *when* a read happens is.
+
+**And the amplifier is the app's own stylesheets, not its size.** Same page,
+same 3,863-node DOM, WebKit, stylesheets toggled off and back on in place:
+
+| | 18 sheets / 1,438 rules | `styleSheets[i].disabled = true` |
+|---|---|---|
+| forced full layout | **475 ms** | 156 ms |
+| `scrollWidth` after a mutation | **181 ms** | **0 ms** |
+
+### 10d. Four falsifications, all recorded because three of them changed the answer
+
+1. **"Your MutationObserver is the cost."** Ruled out: the `observe:"none"`
+    arm settles on an element-count poll instead, and reads blocking p50 2,307
+    against 2,260 with the observer. No difference.
+2. **"Your reflow wrappers are the cost."** Ruled out by running the identical
+    wrappers on Chromium: **same page, same call counts** (`scrollWidth` 64 in
+    both arms, `scrollTo` 48 in both) and **28 ms of wrapper-measured time
+    against WebKit's 1,825 ms**. A wrapper cannot be 65x more expensive in one
+    engine. Corroborated by the un-wrapped root-font-size probe, which
+    reproduces the ratio without touching any accessor.
+3. **"It is DOM size — WebKit's layout is just slow."** ⛔ **FALSE, and this is
+    the one worth keeping.** On a flat `rem`-based synthetic document WebKit's
+    full layout is only **1.0x-2.5x** Chromium's — 1,004 nodes: 33 ms vs
+    13 ms; 8,004 nodes of long text: **282 ms vs 276 ms, i.e. 1.02x** — and a
+    `scrollWidth`-while-dirty read costs **10 ms vs 3 ms**. At 40 levels of nested flexbox — the real app's depth — WebKit
+    costs *less* per node than flat. The engines are broadly comparable at raw
+    layout. The 40x is specific to this document's style resolution.
+4. **"`contain: layout style` on the message list will scope the invalidation."**
+    ⛔ **FALSE — do not ship this.** A 24-run interleaved A/B (control and
+    contained alternating, so both arms see the same host load) moved nothing:
+    blocking 2,348 → 2,288, content-settle 1,843 → 2,013, forced layout
+    324 → 333. There is no cheap CSS lever here.
+
+⚠ **And one instrument bug, caught in flight, recorded so it is not
+reintroduced.** The layout microbenchmark originally alternated the root
+font-size between two fixed values and took a median; from the third rep on it
+was assigning a string the style already held, which invalidates nothing. It
+reported **0.0 ms in Chromium and 58 ms in WebKit** and both were fiction. The
+fixture also used absolute lengths, so a root font-size change legitimately
+invalidated nothing in Chromium — the real app is Tailwind, i.e. `rem`
+everywhere. Both are fixed in `spa_nav_layout_bench.js` with the reasoning in
+the comment. **A "no measurable difference" result is exactly what a broken
+invalidation looks like; check that the probe still dirties what it claims to.**
+
+### 10e. Ranked, and what we can actually do
+
+| # | term | measured share of the 2.1 s | ours? |
+|---|---|---|---|
+| 1 | ~4 forced full layouts, at 180-500 ms each on this document | ~66% of blocking | **no** — app schedules them, engine prices them |
+| 2 | the rest of the app's render JS (Svelte + markdown + sanitize) | ~34% of blocking | **no** |
+| 3 | route change + chat payload fetch | ~300 ms, same on both engines | **no** |
+| 4 | ychrome / under-glass hosting | not separable from its own probe cost | ~0 in kind |
+
+**The honest answer is that this is open-webui's JS meeting WebKitGTK's style
+resolution, and there is nothing in yggterm to fix.** That is a result, not a
+failure: it stops us optimising the wrong layer, and it is the reason this
+section leads with the plain-engine arm rather than with ychrome.
+
+What is left open, and exactly what would settle it: **why does style
+resolution against 1,438 rules cost WebKit ~180 ms on 3,863 elements when the
+same engine resolves a rule-free document of twice the size in ~10 ms?** The
+stylesheet ablation proves the sheets are the amplifier but not which
+construct in them is. Settling it needs either a WebKit build with
+`--enable-developer-mode` style-recalc counters, or a bisect of the served CSS
+(disable sheets one at a time, then rule ranges within the guilty one) using
+the same `spa_nav_probe.js` ablation harness. Neither is a yggterm change; both
+would produce an upstream bug report worth filing — against open-webui for
+reading `scrollWidth` inside an effect, and against WebKitGTK for the style
+cost.
+
+⛔ **Do not reach for a per-site CSS shim in ychrome site-lore on the strength
+of this section.** The one containment shim that looked obvious was measured
+and does nothing (falsification 4). Any future shim needs the same A/B before
+it ships.
