@@ -330,13 +330,52 @@ flattened into the parent list, where it pushes the item's own verbs off the
 bottom; and it must not become a second popover, which is a second thing to
 place, dismiss, theme and badge.
 
-##### An unavailable verb is shown, dimmed, and says why
+##### An unavailable verb is shown, dimmed, and says why — in the tooltip
 
 Never omit an item because it would not work right now. A menu whose shape
 depends on state teaches the user that a verb exists only by accident, and an
-item that just goes dim is indistinguishable from a bug. Dim it and put the
-reason in the label itself. A dimmed item also loses its accelerator — the
-keyboard must never reach a verb the mouse cannot.
+item that just goes dim is indistinguishable from a bug. Dim it and give it a
+reason. A dimmed item also loses its accelerator — the keyboard must never reach
+a verb the mouse cannot.
+
+**The reason belongs in the tooltip, never in the label.** A label is the
+command's NAME; our justification for dimming it is not part of that name, and
+the user must never read one as the other. Appending it produced entries like
+`Close tab — this is the app's own tab; quitting the app closes it` in a menu
+~216px wide, which rendered as `Close tab — this is the app's own ta…` — not one
+dimmed verb in the menu could be read.
+
+Follow through on the same rule for anything else that is *about* a command
+rather than its name: a consequence worth stating ("its tabs return to the
+root") is a note on the tooltip, not a parenthetical in the label.
+
+##### A label must fit the narrowest menu we draw
+
+Menus are narrow — a rail-banded menu is about 216px, and the icon column and
+padding take ~60 of that. Any label the shell authors has to fit what is left.
+Ellipsis and a tooltip are the safety net for labels carrying *user* text (a
+folder's name, a page title), whose length is not ours to choose; they are not a
+licence to write long ones.
+
+Every entry carries a `title` regardless, so a name the box did have to
+ellipsize is still readable somewhere.
+
+##### A heading only when it says what the row cannot
+
+A context menu opens at the pointer, directly under the row it was raised on —
+a row that is highlighted and already showing its own name. Repeating that name
+as the menu's header stacks the same words twice and spends a line of a narrow
+box on nothing.
+
+So a heading has to earn its place by saying something no row on screen does:
+
+- **which page** you have walked into (`Move to folder`)
+- **how many** rows the menu will act on (`3 selected items`)
+- **which surface** raised it, when the surface has no labelled row at all
+  (`Terminal`, `Editor`, `Profile`)
+
+A menu with nothing of that kind to say draws no header at all, and takes the
+whole row with it — not a blank band of padding where the header used to be.
 
 ##### Undo, not "are you sure?"
 

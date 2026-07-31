@@ -3059,6 +3059,9 @@ impl AppPaneContextMenu {
                 // shell has no idea what any of them mean — so it draws no
                 // icon column here rather than guessing a mark per verb.
                 icon: None,
+                // …and for the same reason it invents no reason: the tooltip
+                // falls back to the label, which the app authored.
+                reason: None,
             })
             .collect()
     }
@@ -15303,12 +15306,16 @@ impl ShellState {
                     saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
                 );
                 let selected_count = drag_paths.len().max(1);
+                // A heading only when it says something the row does not. A
+                // MULTI-selection does: the menu acts on three things and no
+                // single row shows that. One row's own label does not — the row
+                // is directly above the menu, highlighted, saying it already.
                 let title = if selected_count > 1
                     && drag_paths.iter().any(|path| path == &row.full_path)
                 {
                     format!("{selected_count} selected items")
                 } else {
-                    row.label.clone()
+                    String::new()
                 };
                 (items, title)
             }
@@ -47194,6 +47201,19 @@ const CONTEXT_MENU_MIN_BAND_WIDTH_PX: f64 = 96.0;
 /// The natural minimum box, so a two-item menu is not a sliver. Border-box, like
 /// the max — see [`context_menu_surface_style`].
 const CONTEXT_MENU_MIN_BOX_PX: f64 = 200.0;
+/// How much of a menu entry's width is NOT label: the surface's own padding, the
+/// entry's horizontal padding, and the icon slot with its gap.
+///
+/// Named because a lock reads it. "Does this label fit the narrowest menu the app
+/// draws" is a question about geometry, and a lock that answered it with a magic
+/// number would go quietly wrong the day the padding changes.
+const CONTEXT_MENU_ITEM_TEXT_INSET_PX: f64 = 12.0 + 24.0 + 25.0;
+/// A rough average advance for the menu's 12px, 600-weight interface font.
+///
+/// Deliberately approximate — this is the budget for a length lock, not a
+/// layout. It only has to be close enough to catch a label that is four times
+/// too long, which is the failure the user photographed.
+const CONTEXT_MENU_LABEL_CHAR_PX: f64 = 6.6;
 /// THE width owner for a context menu.
 ///
 /// Both halves of the decision read this one number: [`context_menu_placement`]
@@ -76352,7 +76372,9 @@ fn app() -> Element {
                         band: Some(context_menu_rail_band),
                         palette: snapshot.palette,
                         items: menu.menu_items(),
-                        menu_title: menu.title.clone(),
+                        // The contributed ROW's own label, which the row is
+                        // saying right above this menu. No heading.
+                        menu_title: String::new(),
                         keytip_tree: snapshot.keytip_tree.clone(),
                         alt_overlay_active: false,
                         alt_overlay_sequence: String::new(),
@@ -115685,6 +115707,16 @@ struct RowMenuItem {
     /// state teaches a verb exists only by accident; greying it out with the
     /// reason teaches what would make it available.
     disabled: bool,
+    /// WHY the item is inert, or a note a live item carries — for the TOOLTIP,
+    /// never for the label.
+    ///
+    /// It used to be appended to the label (`"Close tab — this is the app's own
+    /// tab; quitting the app closes it"`), which made every dimmed row four
+    /// times too long for the menu box and clipped it mid-word — the user's
+    /// screenshot, and a menu in which not one dimmed verb could be READ. The
+    /// reason is a hint about a command; it is not the command's name, and the
+    /// user must never read our justification as if it were the verb.
+    reason: Option<String>,
     /// The leading mark, when this menu draws an icon column.
     ///
     /// `None` is the default and stays the default for four of the five menus:
@@ -115705,6 +115737,7 @@ impl RowMenuItem {
             separator: false,
             disabled: false,
             icon: None,
+            reason: None,
         }
     }
     fn hinted(id: impl Into<String>, label: impl Into<String>, hint: Option<char>) -> Self {
@@ -115717,6 +115750,7 @@ impl RowMenuItem {
             separator: false,
             disabled: false,
             icon: None,
+            reason: None,
         }
     }
     fn icon(mut self, icon: MenuIcon) -> Self {
@@ -115731,15 +115765,39 @@ impl RowMenuItem {
         self.emphasized = true;
         self
     }
-    /// Grey the item out and SAY WHY, in the label itself. The reason is not
+    /// Grey the item out and SAY WHY — in the TOOLTIP. The reason is not
     /// decoration: an item that just goes dim is indistinguishable from a bug.
+    /// But it is not the item's NAME either; appending it to the label is what
+    /// made a 216px menu render `Close tab — this is the app's own ta…` and
+    /// left the user with no readable verb at all.
+    ///
     /// A disabled item also loses its accelerator — a chord must never reach a
     /// verb the mouse cannot.
-    fn disabled(mut self, reason: impl AsRef<str>) -> Self {
+    fn disabled(mut self, reason: impl Into<String>) -> Self {
         self.disabled = true;
         self.hint = None;
-        self.label = format!("{} — {}", self.label, reason.as_ref());
+        self.reason = Some(reason.into());
         self
+    }
+    /// A note a LIVE item carries, for the same tooltip slot. Used where the
+    /// consequence matters more than the verb reads — "Delete folder" needs to
+    /// say that the tabs survive, and it needs to say it somewhere other than
+    /// in its own name.
+    fn note(mut self, note: impl Into<String>) -> Self {
+        self.reason = Some(note.into());
+        self
+    }
+    /// The hover text for this entry.
+    ///
+    /// The reason when there is one; otherwise the LABEL, so an entry the box
+    /// had to ellipsize is still readable somewhere. A menu must never show a
+    /// name it cannot show in full and offer no way to read the rest.
+    fn tooltip(&self) -> String {
+        match (&self.reason, self.disabled) {
+            (Some(reason), true) => format!("{} — {reason}", self.label),
+            (Some(note), false) => format!("{} — {note}", self.label),
+            (None, _) => self.label.clone(),
+        }
     }
     fn divider() -> Self {
         Self {
@@ -115751,6 +115809,7 @@ impl RowMenuItem {
             separator: true,
             disabled: false,
             icon: None,
+            reason: None,
         }
     }
 }
@@ -116116,17 +116175,15 @@ fn web_tab_menu_items(
             } else {
                 close
             });
-            // The row's hover 🗑 had no keyboard or menu route at all. Its label
-            // is the button's tooltip verbatim: deleting organization must never
-            // read as deleting content.
+            // The row's hover 🗑 had no keyboard or menu route at all. The
+            // consequence rides the TOOLTIP, where the reasons live: deleting
+            // organization must never read as deleting content, and it must not
+            // say so in a name four times too wide for the box.
             items.push(
-                RowMenuItem::new(
-                    "webfolder-delete",
-                    "Delete folder (its tabs return to the root)",
-                    'd',
-                )
-                .icon(MenuIcon::Trash)
-                .destructive(),
+                RowMenuItem::new("webfolder-delete", "Delete folder", 'd')
+                    .icon(MenuIcon::Trash)
+                    .destructive()
+                    .note("its tabs return to the root"),
             );
         }
     }
@@ -116177,25 +116234,18 @@ fn web_tab_move_page_items(
 /// The menu heading: the row the user right-clicked, named — and on a submenu
 /// page, what that page is for.
 fn web_tab_menu_title(
-    tabs: &[WebSurfaceOverlayTabView],
-    folders: &[WebTabFolder],
-    target: &WebTabMenuTarget,
+    _tabs: &[WebSurfaceOverlayTabView],
+    _folders: &[WebTabFolder],
+    _target: &WebTabMenuTarget,
     page: WebTabMenuPage,
 ) -> String {
-    if page == WebTabMenuPage::MoveToFolder {
-        return "Move to folder".to_string();
-    }
-    match target {
-        WebTabMenuTarget::Tab(tab_id) => tabs
-            .iter()
-            .find(|tab| tab.id == *tab_id)
-            .map(|tab| tab.label.clone())
-            .unwrap_or_else(|| "Tab".to_string()),
-        WebTabMenuTarget::Folder(folder_id) => folders
-            .iter()
-            .find(|folder| &folder.id == folder_id)
-            .map(|folder| folder.name.clone())
-            .unwrap_or_else(|| "Folder".to_string()),
+    match page {
+        // Which PAGE you are on — something no row on screen says.
+        WebTabMenuPage::MoveToFolder => "Move to folder".to_string(),
+        // The row's own name, which the row is saying directly above the menu,
+        // highlighted. Repeating it stacked the same words twice and spent a
+        // line of a 216px box on nothing (the user's screenshot).
+        WebTabMenuPage::Root => String::new(),
     }
 }
 
@@ -117720,9 +117770,19 @@ fn ContextMenuOverlay(
                     evt.prevent_default();
                     evt.stop_propagation();
                 },
-                div {
-                    style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                    "{menu_title}"
+                // A HEADING ONLY WHEN IT EARNS ITS PLACE. A menu raised ON a row
+                // is drawn directly under that row, which is highlighted and
+                // already says its own name — repeating it stacks the same words
+                // twice (the user's screenshot) and costs a line of a box that
+                // is only ~216px wide. An empty title is a mount saying "the
+                // thing this acts on is right there"; the mounts that DO pass
+                // one are saying something the row cannot — which page you are
+                // on, how many rows are selected, or which surface this is.
+                if !menu_title.trim().is_empty() {
+                    div {
+                        style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                        "{menu_title}"
+                    }
                 }
                 for item in items.iter().cloned() {
                     if item.separator {
@@ -117743,6 +117803,9 @@ fn ContextMenuOverlay(
                             key: "item-{item.id}",
                             "data-context-menu-action": "{item.id}",
                             "data-context-menu-disabled": "{item.disabled}",
+                            // WHY it is inert, or the whole label when the box
+                            // had to ellipsize it. Never in the label itself.
+                            title: item.tooltip(),
                             class: "yggterm-menu-item",
                             // ONE style owner (`context_menu_item_style`) routes
                             // every branch through the shared style engine, so
@@ -166575,7 +166638,8 @@ mod webtabs_menu_switcher_locks {
             "splitting the ACTIVE tab against itself is not a split"
         );
         assert!(
-            split.label.contains("this IS the active tab"),
+            split.label == "Split with active tab"
+                && split.reason.as_deref() == Some("this IS the active tab"),
             "a disabled item must say WHY: {}",
             split.label
         );
@@ -167197,7 +167261,12 @@ mod webtabs_menu_switcher_locks {
             .iter()
             .find(|item| item.id == "webtab-move-root")
             .expect("Root is a destination on the page");
-        assert!(home.disabled && home.label.contains("already here"));
+        assert!(
+            home.disabled
+                && home.label == "Root"
+                && home.reason.as_deref() == Some("already here"),
+            "the LABEL is the destination's name; the reason is the tooltip's: {home:?}"
+        );
         // The page never carries a tab verb — a submenu that still offered
         // "Close tab" would be the flattening back again, upside down.
         assert!(
@@ -167223,9 +167292,10 @@ mod webtabs_menu_switcher_locks {
             .find(|item| item.id == "webtab-move:f1")
             .expect("its own folder is listed");
         assert!(
-            home.disabled && home.label.contains("already here"),
-            "{}",
-            home.label
+            home.disabled
+                && home.label == "Work"
+                && home.reason.as_deref() == Some("already here"),
+            "{home:?}"
         );
 
         // The APP tab is the app's: it cannot be closed or filed, and the menu
@@ -167388,10 +167458,9 @@ mod webtabs_menu_switcher_locks {
                 .unwrap_or_else(|| panic!("{id} is drawn"));
             assert!(item.disabled, "{id} must be inert on a blank tab");
             assert!(
-                item.label.contains("has not gone anywhere")
-                    || item.label.contains("no address to copy"),
-                "{} must SAY why",
-                item.label
+                item.reason.as_deref() == Some("this tab has not gone anywhere yet")
+                    || item.reason.as_deref() == Some("this tab has no address to copy"),
+                "{id} must SAY why — in the tooltip, never in the name: {item:?}"
             );
             assert!(
                 context_menu_click_action(item).is_none(),
@@ -167476,7 +167545,12 @@ mod webtabs_menu_switcher_locks {
             .into_iter()
             .find(|item| item.id == "webtab-close-below")
             .expect("the verb is still drawn");
-        assert!(last.disabled && last.label.contains("nothing is below"));
+        assert!(
+            last.disabled
+                && last.label == "Close 0 tabs below"
+                && last.reason.as_deref() == Some("nothing is below this one here"),
+            "{last:?}"
+        );
     }
 
     /// UNDO, which is the answer this menu gives instead of a confirmation
@@ -167719,6 +167793,161 @@ mod webtabs_menu_switcher_locks {
             overlay.contains("context_menu_has_icons(&items)")
                 && overlay.contains("if menu_has_icons {"),
             "the column is a property of the menu, asked once:\n{overlay}"
+        );
+    }
+
+
+    /// A LABEL IS THE COMMAND'S NAME. Never our justification for dimming it.
+    ///
+    /// The reason used to be appended to the label, and the user's screenshot is
+    /// what that costs: a 216px menu rendering `Close tab — this is the app's
+    /// own ta…`, `Duplicate tab — the app's own tab i…`, `Split with active tab
+    /// — this IS the ac…`, `Move to folder — the app's tab belo…`. Not one
+    /// dimmed verb in that menu could be READ. The placement was never at fault
+    /// — the box was measured inside its band, and it clipped correctly. The
+    /// labels were four times too long for any box.
+    #[test]
+    fn a_menu_label_never_carries_its_own_reason_and_never_outgrows_the_box() {
+        // Every shape of every tab menu, including the app tab, whose four
+        // dimmed verbs are the ones in the screenshot.
+        let tabs = vec![
+            tab(0, "app", None, false),
+            tab(1, "one", None, true),
+            tab(2, "filed", Some("f1"), false),
+        ];
+        let folders = vec![folder("f1", "Work", false), folder("f2", "Play", true)];
+        let mut every: Vec<RowMenuItem> = Vec::new();
+        for target in [
+            WebTabMenuTarget::Tab(0),
+            WebTabMenuTarget::Tab(1),
+            WebTabMenuTarget::Tab(2),
+            WebTabMenuTarget::Folder("f1".to_string()),
+            WebTabMenuTarget::Folder("f2".to_string()),
+        ] {
+            every.extend(menu_items(&tabs, &folders, 1, &target));
+            every.extend(web_tab_menu_items(
+                &tabs,
+                &folders,
+                1,
+                &target,
+                WebTabMenuPage::MoveToFolder,
+                3,
+            ));
+        }
+        every.extend(viewport_menu_items(ViewportMenuKind::Terminal));
+        every.extend(viewport_menu_items(ViewportMenuKind::Document));
+        assert!(every.len() > 40, "the sweep must actually cover the menus");
+
+        for item in every.iter().filter(|item| !item.separator) {
+            // The em-dash join IS the old bug, spelled.
+            assert!(
+                !item.label.contains(" — "),
+                "`{}` reads our justification as if it were the command",
+                item.label,
+            );
+            // …and nothing goes dim in silence: an item that just greys out is
+            // indistinguishable from a bug, so the reason has to exist —
+            // somewhere the user can reach it, which is now the tooltip.
+            if item.disabled {
+                assert!(
+                    item.reason.is_some(),
+                    "`{}` is dimmed and says nothing about why",
+                    item.label,
+                );
+                assert!(
+                    item.tooltip().contains(" — "),
+                    "…and the hover text is where the whole sentence lives: {item:?}",
+                );
+                assert!(
+                    item.hint.is_none(),
+                    "a dimmed item keeps no accelerator: {item:?}",
+                );
+            }
+            // A tooltip always says at least the name, so a label the box had to
+            // ellipsize is still readable somewhere.
+            assert!(item.tooltip().starts_with(&item.label), "{item:?}");
+        }
+
+        // AND IT FITS. The narrowest menu the app draws is the one banded to the
+        // rail; everything the SHELL authors must fit inside it, or we are back
+        // to a name the user cannot read. Labels carrying USER text — a folder's
+        // name on the move page — are exempt: their length is not ours to
+        // choose, which is exactly what the ellipsis and the tooltip are for.
+        let drawable = context_menu_width(Some(rail_context_menu_band(
+            1920.0,
+            RAIL_MIN_WIDTH as f64,
+            1.0,
+        ))) - CONTEXT_MENU_ITEM_TEXT_INSET_PX;
+        let budget = (drawable / CONTEXT_MENU_LABEL_CHAR_PX) as usize;
+        assert!(budget >= 20, "the budget itself went implausible: {budget}");
+        for item in every
+            .iter()
+            .filter(|item| !item.separator && !item.id.starts_with("webtab-move:"))
+        {
+            assert!(
+                item.label.chars().count() <= budget,
+                "`{}` is {} chars and the narrowest menu draws about {budget} — \
+                 put the rest in `note`/`disabled`, which is the tooltip",
+                item.label,
+                item.label.chars().count(),
+            );
+        }
+    }
+
+    /// A HEADING ONLY WHEN IT EARNS ITS PLACE.
+    ///
+    /// The screenshot shows `Statistical Power / Open WebUI` twice, stacked: the
+    /// rail row, highlighted, and the menu's own header immediately below it.
+    /// A menu drawn ON a row must not repeat that row's name.
+    #[test]
+    fn a_menu_heading_says_only_what_the_row_underneath_it_cannot() {
+        let tabs = vec![tab(0, "app", None, false), tab(1, "one", None, true)];
+        let folders = vec![folder("f1", "Work", false)];
+        for target in [
+            WebTabMenuTarget::Tab(0),
+            WebTabMenuTarget::Tab(1),
+            WebTabMenuTarget::Folder("f1".to_string()),
+        ] {
+            assert_eq!(
+                web_tab_menu_title(&tabs, &folders, &target, WebTabMenuPage::Root),
+                "",
+                "the row is directly above the menu, selected, saying this already"
+            );
+        }
+        // A PAGE label is not a repeat — no row on screen says which page you
+        // walked into.
+        assert_eq!(
+            web_tab_menu_title(
+                &tabs,
+                &folders,
+                &WebTabMenuTarget::Tab(1),
+                WebTabMenuPage::MoveToFolder
+            ),
+            "Move to folder",
+        );
+        // Nor is a SURFACE's name: the terminal canvas has no labelled row.
+        assert_eq!(viewport_menu_title(ViewportMenuKind::Terminal), "Terminal");
+
+        let product = product_source();
+        // The cwd tree's heading follows the same rule: a multi-selection says
+        // something ("3 selected items"), one row's own label does not.
+        let snapshot = function_body(&product, "fn snapshot(");
+        assert!(
+            snapshot.contains("format!(\"{selected_count} selected items\")")
+                && snapshot.contains("} else {\n                    String::new()\n                };"),
+            "the tree's single-row menu must carry no heading",
+        );
+        // A contributed pane's rows are rows too.
+        assert!(
+            handler_body(&product, "if let Some(menu) = snapshot.app_pane_context_menu", "menu_title:")
+                .contains("String::new()"),
+        );
+        // …and the overlay actually SKIPS an empty one rather than drawing a
+        // blank band of padding where the heading used to be.
+        let overlay = function_body(&product, "fn ContextMenuOverlay(");
+        assert!(
+            overlay.contains("if !menu_title.trim().is_empty() {"),
+            "an absent heading must take its whole row with it:\n{overlay}"
         );
     }
 
@@ -168260,7 +168489,18 @@ mod webtabs_menu_switcher_locks {
             .find(|item| item.id == "webfolder-close-tabs")
             .expect("the close verb is drawn");
         assert!(empty.disabled);
-        assert_eq!(empty.label, "Close 0 tabs — this folder is empty");
+        assert_eq!(empty.label, "Close 0 tabs", "the count is the NAME's job");
+        assert_eq!(
+            empty.reason.as_deref(),
+            Some("this folder is empty"),
+            "…and the reason is the tooltip's"
+        );
+        assert_eq!(
+            empty.tooltip(),
+            "Close 0 tabs — this folder is empty",
+            "the two meet in the hover text, which is where the user reads the \
+             whole sentence"
+        );
 
         // A folder the tree does not have gets no menu at all.
         assert!(
@@ -168452,7 +168692,11 @@ mod webtabs_menu_switcher_locks {
             "the app's own tab is the app, not a page to copy"
         );
         assert!(
-            duplicate.label.contains("not a page to copy"),
+            duplicate.label == "Duplicate tab"
+                && duplicate
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a page to copy")),
             "a greyed item must SAY why: {}",
             duplicate.label
         );
