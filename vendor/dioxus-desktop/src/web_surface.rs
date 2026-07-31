@@ -848,11 +848,37 @@ mod adblock {
                     let text = found.to_string_lossy();
                     if text.starts_with(IDENTIFIER_PREFIX) && found != keep.as_c_str() {
                         eprintln!("yggterm adblock: dropping stale generation {text}");
+                        // ⛔ THE CALLBACK IS NOT OPTIONAL. Passing `None` here
+                        // makes WebKit fail `assertion 'callback' failed` and
+                        // return WITHOUT removing anything — so every stale
+                        // generation survived and each one is ~95 MB of
+                        // bytecode on disk. Live-caught 2026-07-31: the log
+                        // said "dropping stale generation …" immediately
+                        // followed by the CRITICAL, and the file was still
+                        // there. A GLib CRITICAL is not fatal by default,
+                        // which is exactly why this looked like it worked.
+                        unsafe extern "C" fn removed(
+                            source: *mut gtk::glib::gobject_ffi::GObject,
+                            result: *mut gtk::gio::ffi::GAsyncResult,
+                            _user_data: gtk::glib::ffi::gpointer,
+                        ) {
+                            // Finish or the GTask leaks; the outcome is
+                            // advisory — a generation we failed to drop is
+                            // disk we reclaim next launch, not a broken filter.
+                            let store = source as *mut wk::WebKitUserContentFilterStore;
+                            unsafe {
+                                wk::webkit_user_content_filter_store_remove_finish(
+                                    store,
+                                    result,
+                                    std::ptr::null_mut(),
+                                );
+                            }
+                        }
                         wk::webkit_user_content_filter_store_remove(
                             store,
                             found.as_ptr(),
                             std::ptr::null_mut(),
-                            None,
+                            Some(removed),
                             std::ptr::null_mut(),
                         );
                     }
