@@ -2406,6 +2406,86 @@ symbol rather than trusting a line number:**
     unit tests again** — the locks prove the wiring, not that WebKit delivers a
     middle-click as a `LinkClicked` NavigationAction on this engine build.
 
+## ⭐ 3.0.0 RELEASE BLOCKER — the product does not build for Windows or macOS
+
+**Verified 2026-07-31, live against GitHub Actions.** Every `release.yml` run has
+ended in `failure` since ≥2.8.14. The Linux jobs pass, so the red went unread and
+the failure has now outlived twenty releases. Two separable facts:
+
+1. **Windows x86_64/aarch64 and macOS aarch64 fail to COMPILE** — not to package.
+   Run 29164529909 (v2.11.0) ends with `could not compile yggterm-server (lib) due
+   to 7 previous errors`. The errors are one shape: the versioned-unix-socket
+   daemon layer is `#[cfg(unix)]` on its DEFINITIONS while its CALLERS are
+   unguarded. Confirmed still true on `main` today —
+   `ServerEndpoint::UnixSocket` carries `#[cfg(unix)]` (daemon.rs:934) but is
+   matched unconditionally at daemon.rs:432, 811, 816, 962; likewise
+   `parse_versioned_server_socket_name` (daemon.rs:349),
+   `versioned_server_socket_alias_candidates` (daemon.rs:363),
+   `retire_stale_daemons`, `run_duplicate_legacy_owned_runtime_prune`, and
+   `env_flag_truthy`. **Fix = give the socket/daemon-topology layer a windows arm
+   or gate the call sites, not more `#[cfg]` on definitions.** A CI job that
+   `cargo check`s the windows target on every PR is the lock — without it this
+   regresses the moment it is fixed.
+2. **No GitHub release has published since v2.11.0 (2026-07-11).** guihost runs
+   2.12.19. Eight versions exist only as local binaries and fleet `scp`s.
+
+Cross-platform is IN SCOPE for 3.0.0 (user-confirmed 2026-07-31), which makes
+this the release's critical path, not a background annoyance. Recovered from the
+archived memory `ci-release-cross-platform-failing`.
+
+## Residual threads recovered from archived memory (2026-07-31)
+
+These were root-caused in past sessions, never closed, and were sitting in
+memory files that no session indexed. They are transplanted here so the SSOT is
+actually the SSOT. **⚠ Every one is UNVERIFIED against today's build** — the
+newest is 3 weeks old and much has shipped since. Re-check before working one;
+some are certainly fixed already. Full narrative for each is in
+`~/.claude/memory-archive/-home-user-gh-yggterm/<slug>.md`.
+
+- **Broken-bottom during a working turn** (`finding-broken-bottom-reconcile-starved-during-work`)
+  — content-scoop on resize + daemon-screen reconcile double-gated off for the
+  whole turn, so redraw/Esc only repaint an already-wrong client buffer.
+  ROOT-CAUSED 2026-06-17, explicitly NOT fixed. Related and also open:
+  `sidebugs-webgl-artifacts-stale-frame-on-switch` calls stale-frames-after-switch
+  "the biggest remaining UX bug".
+- **LIVE-path frame corruption** (`finding-client-buffer-garble-attach-seed-and-live-path`)
+  — the attach-seed half was fixed in 2.10.4; the live-path half was left open
+  with probes already shipped to convict it.
+- **New-codex-session UUIDv4 identity drift** (`finding-new-codex-session-bug-class`)
+  — the rebind sets `session.id` to codex's ULID but never rekeys the map, so key
+  and identity split. Named as the single cause of three symptoms. Not fixed.
+  `finding-uuidv4-codex-session-drift` (still in memory/, cited by code) holds the
+  Stage-2 remote-codex rebind that was never done.
+- **Daemon-side `launch_phase` stuck at RemoteBootstrap** (`finding-stale-phase-15s-remount-blink`)
+  — the GUI half shipped 2026-07-07; the daemon half was left open. This is
+  plausibly the same wedge as ROUND 30's §THE WEDGE — check before treating them
+  as two bugs.
+- **`app_render_storm` cause** (`finding-render-storm-autopsy-armed-run4`) — fired
+  21× in 10 days, all unattributed; a self-arming autopsy was shipped to catch it
+  and the autopsies were never read.
+- **codex composer split background** (`finding-codex-composer-bg-split-reflow`) —
+  xterm.js reflow on column resize drops cells' bg attribute. Root-caused, fix
+  pending, flagged trap-zone.
+- **OSC 52 double copy-chime + replay refire** (`finding-osc52-copy-chime-replay-refire`)
+  — no dedupe and no replay-suppression, so every reattach re-parses the embedded
+  OSC. Root-caused code-grounded, never live-verified.
+- **ibus cumulative input fix never landed** (`finding-ibus-cumulative-input`) —
+  `GTK_IM_MODULE=gtk-im-context-simple`; fix was built in the 2.9.41 tree and
+  never committed. An end user hit this.
+- **Shipped-but-never-live-confirmed:** `finding-cc-blink-partial-2026-frame-flush`
+  (2.9.38), `finding-codex-select-scroll-kick` (2.9.32),
+  `finding-remote-cc-mislabeled-codex-gone-message` (2.9.50, deploy-pending).
+- **Owed proofs:** full passkey crypto E2E against a real RP
+  (`finding-passkey-browser-slice-shipped`) — gated on a vault unlock; guihost GUI
+  '+'-menu render proof (`finding-launcher-registry-one-app-registry`).
+- **Rows lost across a daemon swap** (`project-resume-after-2100-daemon-swap`) — 3
+  live rows lost, 2 of them keep-alive, with a rescue file. Same family as
+  `finding-daemon-handoff-drops-live-rows` (still in memory/, code-cited).
+- **ychrome queued slices** (`campaign-zoom-system-rework`) — per-site zoom,
+  settings pane, session buddy, vertical tabs.
+- **Non-code todos** (`project-blackboard-clearing-2026-07-16`) —
+  awesome_steer_prompts repo, app-infra forecast.
+
 ## Diagnostics available
 
 - `~/.yggterm/event-trace*.jsonl` — up to 3 days of trace generations (2.10.2).
