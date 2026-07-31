@@ -309,6 +309,29 @@ Avoid:
 
 Spec: `docs/alt-keytips.md`.
 
+#### Keyboard focus ring (dialogs in Form mode)
+
+A dialog that is operated by focus rather than by badges (`docs/alt-keytips.md`
+§12.4 — the theme editor and every custom-format-class dialog after it) must show
+where the keyboard is. The ring is one treatment, not a per-dialog invention:
+
+- a 2px ring in the theme accent, offset 2px outside the control, following the
+  control's own corner radius
+- shown for keyboard focus only (`:focus-visible`), so a mouse click does not
+  leave rings scattered behind the pointer
+- on a colour chip or swatch, the ring sits OUTSIDE the swatch so it never
+  changes the colour being judged
+- the focused item of a group is the one Tab returns to (roving `tabindex`), so
+  the ring and the selection styling must be visibly different: selection is the
+  chip's own fill/border, focus is the ring around it
+
+Avoid:
+
+- removing the ring for looks (`outline: none` with nothing in its place)
+- a ring so faint it cannot be found on a busy dialog
+- reusing the selection treatment as the focus treatment — the user then cannot
+  tell what pressing Space would do
+
 ### Motion and interaction
 
 Motion should be functional, not decorative.
