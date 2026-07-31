@@ -127,15 +127,10 @@ pub fn messages_payload(session_path: &str) -> Result<serde_json::Value> {
     let Some(path) = local_transcript_path_for_session(session_path)? else {
         return Ok(serde_json::json!({ "messages": [], "cwd": null, "working": false }));
     };
-    let descriptor = yggterm_core::agent_cli_for_store_session_file(&path.display().to_string());
-    let messages = match descriptor.map(|descriptor| descriptor.kind) {
-        Some(yggterm_core::SessionKind::Codex) | Some(yggterm_core::SessionKind::CodexLiteLlm) => {
-            yggterm_core::read_codex_transcript_messages(&path)?
-        }
-        // Claude Code, and the `local://` uuid path that resolved into CC's
-        // store without going through the file-shaped branch.
-        _ => yggterm_core::read_claude_code_transcript_messages(&path)?,
-    };
+    // ONE owner of "which CLI wrote this file" — the reader's own registry
+    // dispatch. This used to re-answer it here, which is a second encoding of a
+    // decision that has exactly one right answer.
+    let messages = yggterm_core::read_agent_transcript_messages(&path)?;
     let session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
