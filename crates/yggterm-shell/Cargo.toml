@@ -64,3 +64,10 @@ objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"]
 # instead of re-encoding `removed-rows.json` on this side, and turns the door on
 # for TESTS only — resolver 2 keeps dev-dependency features out of `cargo build`.
 yggterm-server = { path = "../yggterm-server", features = ["test-support"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `tests/clipboard_image_paste.rs` RUNS the shipped page-surface paste shim
+# instead of grepping it. JavaScriptCore is already linked into this crate
+# (webkit2gtk depends on it), so the lock costs no new native dependency and
+# needs no display.
+javascriptcore-rs = "1.1"

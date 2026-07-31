@@ -172,6 +172,8 @@ jobs:
           cargo test -p yggterm-shell --no-default-features viewport_surface_problem_demotes_latched_ready_attempt
           cargo test -p yggterm-shell --no-default-features retained_remote_lost_scrollback_invalidates_live_host
           cargo test -p yggterm-shell --no-default-features retained_fault_bootstrap_uses_live_active_session_when_snapshot_is_stale
+          cargo test -p yggterm-shell --no-default-features clipboard_image_paste_shim_hands_the_page_the_file_the_engine_hid
+          cargo test -p yggterm-shell --no-default-features every_page_opening_surface_stages_the_clipboard_image_paste_shim
           python3 -m py_compile scripts/live_mode_cycle_check.py
           python3 -m py_compile scripts/smoke_xterm_embed_faults.py
           python3 -m py_compile scripts/smoke_terminal_status_input.py
