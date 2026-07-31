@@ -58,15 +58,16 @@ page never taking the keyboard, dead back/forward). **These remain, each already
 root-caused — read the mechanism before opening the file, and grep the named
 symbol rather than trusting a line number:**
 
-- **The vertical tab rail is not the cwdtree, and the user asked for it to be.**
-  It hand-rolls its own folder tree and does not use `yggui::drag_tree` — a
-  fourth tree in the product. The load-bearing gap is the widget schema:
-  `AppPaneWidget::ListRow` has no `depth`/`children`/`expanded`, so contributed
-  panes are FLAT by construction, while `SessionStyleRow` already accepts
-  `depth`. Add those plus an expand action, and let the app drag resolver permit
-  `Into` (it is hard-wired to `reorder_flat_list` today). Then: folders ABOVE
-  tabs, renamable tab rows, working drag, and "New folder" text selected on
-  create. Reuse doctrine applies — no new components.
+- ~~**The vertical tab rail is not the cwdtree.**~~ **FIXED** on
+  `lane/dev/rail-is-the-cwdtree` — awaiting the user's own eyes. There is ONE
+  row-tree ordering engine now (`yggui::reorder_row_tree`; the flat helper is
+  gone, a flat list being the degenerate case), `AppPaneWidget::ListRow` carries
+  `depth`/`expanded`/`expand_action` so contributed panes are trees too, and
+  `WebTabsRailBody` draws every row — folder and tab alike — through
+  `SessionStyleRow` + the shared `RowDisclosureChevron`. Folders sit above tabs,
+  drag both reorders and re-parents, folders and tabs rename in place by
+  double-click or the row menu, and "New folder" opens with its placeholder
+  selected.
 - **Downloads have no destination choice, no progress, and lie about history.**
   `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
   every terminal in the app (staged destination + async picker is the shape).

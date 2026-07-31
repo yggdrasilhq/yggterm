@@ -276,6 +276,24 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     the pointer travels `yggui::DRAG_BEGIN_THRESHOLD_PX` (so a click stays a
     click), and releasing anywhere — over a heading, the footer, outside the
     pane — ends it.
+  - **`list-row` TREES — `depth`, `expanded`, `expand_action` (2026-07-31, the
+    ychrome tab rail was the forcing consumer):** a contributed pane is a TREE,
+    not only a list. `depth` (default `0`) indents the row through the shared
+    row engine, and structure is carried by DEPTH IN DRAW ORDER — a row's parent
+    is the nearest preceding row with a smaller depth. There is no nested
+    `children` array on purpose: the schema is already a flat `Vec` in draw
+    order, and nesting would mean every renderer flattened it again.
+    `expanded: true|false` PRESENT ⇒ the row is a GROUP: it draws the tree's
+    disclosure chevron in its status slot and it **accepts a drop inside**.
+    Absent ⇒ a leaf, and the row behaves exactly as `list-row` always has, which
+    is why every pane written before this is unchanged. `expand_action` fires
+    with the row's id when the chevron is clicked; the app owns collapse state.
+    A drop now POSTs `values.parent` alongside `values.order` — the id of the
+    group the row landed in, or `""` for the pane's root band (which is every
+    drop a pane without groups can produce). `values.order` still carries only
+    the REORDERABLE rows, so a fixed row never appears in a list the app is
+    about to adopt. Drop bands: a leaf splits at its midpoint (before/after); a
+    group has a narrow edge band at each end and files everything between them.
 - **Act**: a click `POST`s `{pane, action, values, value_keys}` to
   `<control>/action`; `value_keys` names which buffer each draft in `values`
   came from (see `value_key` above). The app performs it on its own host and
