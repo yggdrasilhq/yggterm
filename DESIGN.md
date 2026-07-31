@@ -525,6 +525,20 @@ functions and the `SessionStyleRow` component in shell.rs.
 - New list surfaces MUST consume the engine (component, or the style functions
   when the interactivity is bespoke, as the cwdtree row does). Do not write a
   fourth row style.
+- **A row list is a TREE, and there is one of them.** Nesting is `depth` on the
+  row (indent comes from `session_row_metrics`, never a hand-written padding),
+  and the GROUP marker is the shared `RowDisclosureChevron` in the row's LEADING
+  slot — the same slot a leaf's status dot sits in, so a folder and the rows
+  under it start their titles at one x. The cwdtree sidebar, the WebTabs rail
+  and contributed `list-row` panes all draw this way; a surface that grows its
+  own triangle or its own indent arithmetic is the bug this rule exists to
+  prevent (the rail hand-rolled both until 2026-07-31).
+- **Folders sit ABOVE loose rows** in any list that has both (user, 2026-07-30).
+  Organization first, then the working set.
+- **Renaming happens IN PLACE**, in the row, with the existing text SELECTED —
+  a row born with a placeholder name ("New folder") must take the first
+  keystroke as a replacement. Double-click is the gesture; the row's context
+  menu is the discoverable route to the same thing.
 
 ### Drag and drop
 
@@ -536,6 +550,13 @@ If a project has drag-and-drop tree or list reordering:
 - adjacent snap boundaries must behave predictably
 - multi-select drag can use stacked-card visuals
 - the final placement must match the visible snap indicator exactly
+- **before/after draw as a 2px accent LINE on the edge that will receive the
+  row; inside draws as a 2px accent RING around the whole group.** A line under
+  a folder header would promise "beside the folder" while the drop lands in it.
+- **One drag grammar per window.** A press is a click until the pointer travels
+  `yggui::DRAG_BEGIN_THRESHOLD_PX`; a drop is resolved by
+  `yggui::reorder_row_tree` (a flat list is its degenerate case). A surface with
+  its own ordering arithmetic is a second source of truth for order.
 
 ### Web View Surfaces
 
