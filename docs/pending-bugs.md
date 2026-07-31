@@ -229,6 +229,32 @@ detector found nothing precisely because on Wayland there is nothing to find.
 
 ## Standing traps / other open bugs
 
+- **★★ `server app web` EXISTS ON THE GUI BINARY AND NOT ON `yggterm-headless`
+  — the split-dispatch trap, still open (found 2026-07-31, openwebui-spa-nav
+  lane).** `yggterm-headless server app web <anything>` answers
+  **`unsupported app control command: web`**; the identical command on the
+  `yggterm` binary is accepted and works. The arm is implemented once, at
+  `apps/yggterm/src/main.rs:3337 ("web" => …)`, and has no twin in
+  `apps/yggterm/src/bin/yggterm-headless.rs`, whose `server app` match falls
+  through to `other => anyhow::bail!("unsupported app control command: {other}")`
+  at line 2720. Reproduced against a 2.12.19 GUI in an under-glass sandbox: the
+  GUI binary returned `accepted:true` with a real `value` for
+  `web eval`/`web frames`; `yggterm-headless` refused both.
+  **Why it matters more than it looks:** `yggterm-headless` is the binary
+  AGENTS reach for — CLAUDE.md and the skills point there — so the entire
+  web-surface verb plane reads as missing to an agent that follows the docs,
+  and `server app web --help` prints the STATIC app-usage string that does not
+  list `web` either (already noted at `docs/agent-control-plane.md:1403`), so
+  the refusal looks like "this feature does not exist" rather than "wrong
+  binary". The file already carries the correct doctrine in the `keytips` arm
+  right above the bail: *"the headless binary is the one agents actually reach
+  for, and a verb that exists on only one binary is the split-dispatch trap."*
+  Fix = mirror the `web` arm into `yggterm-headless.rs` (both binaries, one
+  owner) and make the usage string enumerate it. **Deliberately not fixed in
+  the lane that found it** — that lane's diff is instruments and docs, and this
+  wants its own change plus a lock asserting verb parity between the two
+  dispatch tables.
+
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
   refuse-exit landmine (user-reported 2026-07-30 night; live-diagnosed and
   CURED on the live host, the DESIGN fix still owed).** Deploying a new
