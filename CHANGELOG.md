@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The session Web View shows the whole session now — including what the agent
+  DID.** It used to show prose only, and for every Claude Code session it showed
+  neither: the reader behind it called Codex's parser on whatever file it was
+  handed, a CC transcript shares no record type with a Codex rollout, so it
+  parsed to zero messages *silently* and the surface fell back to a hardcoded
+  "Resume Codex session &lt;uuid&gt;." placeholder. That placeholder was the Web View
+  for every CC session, on both machines. A live LOCAL agent session was worse
+  still: its hydration path was an empty `{}`, so the toggle was there, it was
+  clickable, and it opened onto nothing.
+  Both are fixed, and the model underneath grew the axis it was missing. A
+  transcript is now read as a **timeline**: prose, the agent's reasoning, and
+  **tool calls as first-class collapsible rows** — `[mark] Tool — the command`
+  on one line, folded, with `+N −M` when the call changed something and its
+  changed files as chips when you open it. That is most of a session: roughly
+  57% of a Codex rollout and 96% of a Claude Code transcript is the agent
+  working, and all of it used to be dropped before it reached the screen.
+  Every message also has a **Copy** button, and a long transcript loads from the
+  tail rather than whole.
+
 - **Fixed: the tab rail now LOOKS like the cwd tree, and every row list shares
   the tree's drag.** The rail had become a tree structurally but still read as
   something else: its folders drew a bare triangle where the cwd tree three
