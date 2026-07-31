@@ -312,6 +312,23 @@ as its live-verified fix.
   wrong. Noted while investigating tearing; not itself known to be a defect,
   but it silently invalidates a premise agents keep reusing.
 
+- **⚠ FLAKY UNDER LOAD: `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
+  (seen 2026-07-31 at load average **37.5**, with seven lanes building in
+  parallel). It spawns `sleep 30` and asserts the child reads as running;
+  the failing assertion is `render_probe.rs:1905`, the FIRST one. Re-run in
+  isolation: **5/5 green**, and the full suite was green 20 minutes earlier, so
+  it is load-induced, not a regression — no lane touched this file.
+  **Not diagnosed, and worth diagnosing rather than retrying.**
+  `process_still_running` (`render_probe.rs:741-749`) is narrow: it fails only if
+  `/proc/<pid>/stat` is unreadable, `stat.pid != pid`, `stat.comm != comm`, or the
+  state is `Z`/`X`. The test reads `comm` from `/proc` itself at :1901 and then
+  passes it straight back, so a comm mismatch implies the value CHANGED between
+  two adjacent reads — i.e. the first read caught the child mid-`spawn`, before
+  `exec` replaced its `comm`. If that is it, the product code is fine and the
+  TEST is racy; but this is a **liveness probe** in a project whose central
+  lesson is that instruments lie, so "probably just flaky" is not an acceptable
+  resting place. Prove which side is wrong before trusting either.
+
 ## Standing traps / other open bugs
 
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
