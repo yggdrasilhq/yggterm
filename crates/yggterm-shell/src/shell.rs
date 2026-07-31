@@ -100688,6 +100688,20 @@ fn terminal_eval_script_with_canvas_renderer(
                                 env_id: typeof payload.env_id === 'string'
                                     ? payload.env_id
                                     : null,
+                                // THE ONE SECRET A DECLARE CARRIES, and the one
+                                // field this forwarder forgot for three days: the
+                                // Rust wire type grew `control_token` on
+                                // 2026-07-28 and this object was not updated, so
+                                // every LIVE declare arrived tokenless and every
+                                // GUI-only route answered 403 — while the daemon,
+                                // which parses the same OSC in Rust, held the
+                                // token perfectly. It must be forwarded and NEVER
+                                // traced; `the_js_forwarder_copies_every_sidebar
+                                // _declare_field` now fails if a wire field is
+                                // added without a line here.
+                                control_token: typeof payload.control_token === 'string'
+                                    ? payload.control_token
+                                    : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
                                     .map((pane) => ({{
@@ -137444,6 +137458,59 @@ mod tests {
             !payload.contains("control_token"),
             "the declare's trace payload must never carry the token:\n{payload}"
         );
+    }
+
+    /// THE FIELD-BY-FIELD FORWARDER, LOCKED.
+    ///
+    /// The webview parses OSC 7717 in JS and hands Rust a HAND-BUILT object, so
+    /// a field added to the Rust wire type arrives `null` until someone copies
+    /// it across. The forwarder says so in a comment, and the comment was not
+    /// enough: `control_token` was added to the wire type on 2026-07-28 and
+    /// missed there, so for three days every LIVE declare built a tokenless
+    /// contribution and settings/vault answered 403 — while the daemon, parsing
+    /// the same OSC bytes in Rust, held the token perfectly. That asymmetry is
+    /// what made it so hard to see: every instrument that read the DAEMON said
+    /// the token was fine.
+    ///
+    /// So the rule is held here now: every field of the wire variant must
+    /// appear in the JS object.
+    #[test]
+    fn the_js_forwarder_copies_every_sidebar_declare_field() {
+        let protocol = include_str!("terminal_protocol.rs");
+        let wire = protocol
+            .split("    SidebarContribution {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    },").next())
+            .expect("the sidebar wire variant is present");
+        let fields: Vec<&str> = wire
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('/') && !line.starts_with('#'))
+            .filter_map(|line| line.strip_suffix(','))
+            .filter_map(|line| line.split_once(": "))
+            .map(|(name, _)| name)
+            .collect();
+        // If the variant's shape moves, this lock must fail LOUDLY rather than
+        // quietly scraping zero fields and passing forever.
+        assert!(
+            fields.len() >= 10,
+            "the field scrape found only {fields:?} — the wire variant moved and this lock went blind"
+        );
+        let source = include_str!("shell.rs");
+        let forwarder = source
+            .split("kind: 'sidebar_contribution',")
+            .nth(1)
+            .and_then(|rest| rest.split("return true;").next())
+            .expect("the JS sidebar forwarder is present");
+        for field in fields {
+            // `action` rides as an ES shorthand, so accept either form.
+            assert!(
+                forwarder.contains(&format!("{field}:")) || forwarder.contains(&format!("{field},")),
+                "the JS OSC forwarder drops `{field}`: a field added to the Rust wire type must be \
+                 copied across here too, or every live declare arrives with it null — which is \
+                 exactly how the control token was lost"
+            );
+        }
     }
 
 
