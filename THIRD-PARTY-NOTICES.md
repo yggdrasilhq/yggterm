@@ -36,6 +36,36 @@ already vendors `wry` and `dioxus-desktop` under `vendor/`, so vendoring is a
 normal move rather than an exotic one. Vendoring an MPL crate to patch it is the
 case to watch.
 
+## Vendored source — T3 Code's timeline renderer
+
+`third_party/t3code-timeline/` contains source **copied verbatim** from
+**T3 Code** (<https://github.com/pingdotgg/t3code>, © 2026 T3 Tools Inc.),
+**MIT**, at upstream commit `9e29c9d72895022322da52d8e961b38702bad9cc`
+(recorded in that directory's `UPSTREAM_COMMIT`). It landed in `5fb438e`.
+
+MIT permits the reuse and **requires the copyright and permission notice to
+travel with the copy** — `third_party/t3code-timeline/LICENSE.t3code` is that
+notice and must not be deleted. `NOTICE.md` beside it states the same rule.
+
+⚠ **This entry was missing until 2026-08-01.** The directory carried its own
+correct notices, but this file — the one a redistributor reads — did not name
+it. A per-directory licence that the top-level notices never mention is the
+kind of gap an audit is supposed to catch, so: **any vendored tree under
+`third_party/` must be listed here in the same commit that adds it.**
+
+⛔ **Distinguish this from work merely INSPIRED by t3code.** yggterm's own
+session timeline (the `Rendered` "Web View" surface) is native Rust + Dioxus,
+written from the *ideas* — a heterogeneous entry timeline, foldable tool rows,
+diff-stat labels. Ideas are not copyrightable and that work owes nothing. This
+section covers only the directory that holds an actual copy. The same
+distinction is drawn, at length, in ychrome's `THIRD-PARTY-NOTICES.md`
+(§"Scriptlets — reimplemented, not copied" and §SponsorBlock).
+
+⚠ **The vendored tree is currently DEAD CODE**: `transcript_view::spawn()` has
+no callers and the npm bundle is never built. Dead or not, while the files are
+in the repository the obligation above stands. If it is ever removed, remove
+this section in the same commit.
+
 ## No filter data lives here
 
 ⚠ **Read this before adding any.** yggterm once shipped
