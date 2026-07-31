@@ -9277,6 +9277,45 @@ async fn web_surface_native_reconcile_loop(
                 json!({ "active": under_glass }),
             );
         }
+        // WHICH surface, if any, WebKit has taken into element fullscreen —
+        // the engine's own answer (`enter-fullscreen`/`leave-fullscreen`), read
+        // ONCE per tick. Nothing else in the shell may decide this. Read at the
+        // TOP of the tick on purpose: the placement half below needs the
+        // geometry eval and the eval is documented starvable, but the chrome
+        // half does not need it at all — and chrome painted over a fullscreen
+        // video is the more visible of the two failures.
+        let fullscreen_native_id = desktop.web_surface_fullscreen();
+        // CHROME'S HALF OF FULLSCREEN. `web_surface_place_page_rect` already
+        // suppresses every chrome claim and hands a fullscreen page the whole
+        // window — but a claim is GEOMETRY. Suppressing it stops chrome from
+        // moving or shrinking the page and does nothing else, and under glass
+        // the page sits at the BACK of the z-order, so the session tree, the tab
+        // rail and the window controls went on painting straight over the video
+        // (user report, 2026-07-31). The render cannot read the engine, so the
+        // ONE owner is mirrored onto ShellState here, change-gated. Gated on the
+        // APPLIED surfaces this loop already publishes, so a fullscreen page
+        // nobody is being shown (soft stash, background hold) never blanks the
+        // chrome — the same predicate the paint/input holes use.
+        {
+            let page_fullscreen = fullscreen_native_id.is_some_and(|native_id| {
+                applied.values().any(|entry| {
+                    entry.native_id == native_id
+                        && entry.visible
+                        && entry.stashed_at_ms.is_none()
+                })
+            });
+            if state.peek().page_fullscreen != page_fullscreen {
+                let mut writable = state;
+                writable.with_mut(|shell| shell.page_fullscreen = page_fullscreen);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "page_fullscreen",
+                    json!({ "active": page_fullscreen, "native_id": fullscreen_native_id }),
+                );
+            }
+        }
         // The native fill under every surface container — what shows in the
         // instant between a webview being placed and its first frame landing.
         //
@@ -9657,10 +9696,10 @@ async fn web_surface_native_reconcile_loop(
                 continue;
             }
         };
-        // WHICH surface, if any, WebKit has taken into element fullscreen —
-        // the engine's own answer (`enter-fullscreen`/`leave-fullscreen`), read
-        // once per tick. Nothing else in the shell may decide this.
-        let fullscreen_native_id = desktop.web_surface_fullscreen();
+        // `fullscreen_native_id` — the engine's element-fullscreen owner — was
+        // read once at the top of this tick and is the SAME value the chrome
+        // mirror used. Placement and chrome can never disagree about who owns
+        // the screen because there is only one read.
         for (session_path, active_tab, tabs, policy_gate) in desired {
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
@@ -12404,6 +12443,20 @@ struct ShellState {
     last_action: String,
     maximized: bool,
     fullscreen: bool,
+    /// A web page WebKit has taken into ELEMENT fullscreen owns the whole window.
+    ///
+    /// A MIRROR, never a decision: the surface reconciler copies it from
+    /// `DesktopContext::web_surface_fullscreen()` — the engine's own
+    /// `enter-fullscreen`/`leave-fullscreen` answer, which is the only thing
+    /// allowed to decide that a page is fullscreen — so the RENDER can see a
+    /// fact only the reconcile loop can read. One writer, no second encoding.
+    ///
+    /// Deliberately NOT folded into `fullscreen` above. That one is the user's
+    /// sticky distraction-free mode: they toggle it, app-control reports it, and
+    /// leaving a fullscreen video must restore exactly what they had rather than
+    /// switch distraction-free off. The two STATES stay apart; only the chrome
+    /// GATE they feed is shared ([`RenderSnapshot::chrome_hidden`]).
+    page_fullscreen: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
@@ -13241,7 +13294,13 @@ struct RenderSnapshot {
     settings: AppSettings,
     install_context: InstallContext,
     maximized: bool,
+    /// The user's sticky distraction-free mode. Read it ONLY where the answer
+    /// really is "did the user ask for distraction-free" — the exit affordance
+    /// and the window-control icon. Every CHROME gate reads
+    /// [`RenderSnapshot::chrome_hidden`] instead.
     fullscreen: bool,
+    /// A page is in element fullscreen (mirror of [`ShellState::page_fullscreen`]).
+    page_fullscreen: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     titlebar_new_menu_open: bool,
@@ -13333,6 +13392,53 @@ struct RenderSnapshot {
     shell_gradient_background_repeat: String,
     shell_material_blur_px: f32,
 }
+
+/// Does the shell paint chrome at all right now?
+///
+/// ONE question with TWO reasons, and no gate may care which: the user turned
+/// distraction-free mode on, or a page took element fullscreen and owns the
+/// window. Every piece of shell chrome — resize handles, titlebar, session
+/// tree, rail — is gated on THIS, so a surface cannot be hidden for one reason
+/// and left painting for the other.
+///
+/// That divergence WAS the bug (2026-07-31, fullscreen YouTube): the placement
+/// rule already suppressed every chrome CLAIM and handed a fullscreen page the
+/// whole window (`web_surface_place_page_rect`), but suppressing a claim is
+/// GEOMETRY — it stops chrome moving the page and nothing else. Under glass the
+/// page sits at the BACK of the z-order, so the tree, the rail and the window
+/// controls went on painting straight over the video.
+///
+/// Pure so the truth table is lockable without a whole `RenderSnapshot`, and so
+/// the two states can be proven to stay APART: distraction-free is the user's
+/// and sticky, page-fullscreen is the engine's and transient, and leaving a
+/// video may not change the first.
+fn shell_chrome_hidden(distraction_free: bool, page_fullscreen: bool) -> bool {
+    distraction_free || page_fullscreen
+}
+
+/// Should the floating exit-distraction-free control be on screen?
+///
+/// The ONLY mouse route out of distraction-free mode, so it is not chrome that
+/// hides with the rest — distraction-free ADDS it, and gating it on
+/// [`shell_chrome_hidden`] would delete the exit from the very mode it exits.
+/// It does stand down under a fullscreen page: that page owns every pixel, and
+/// the route out of IT belongs to the engine (WebKit keeps its own Escape
+/// binding — see `connect_fullscreen_signals`), after which this comes straight
+/// back with distraction-free untouched.
+fn distraction_free_exit_visible(distraction_free: bool, page_fullscreen: bool) -> bool {
+    distraction_free && !page_fullscreen
+}
+
+impl RenderSnapshot {
+    /// This render's answer to [`shell_chrome_hidden`].
+    fn chrome_hidden(&self) -> bool {
+        shell_chrome_hidden(self.fullscreen, self.page_fullscreen)
+    }
+    /// This render's answer to [`distraction_free_exit_visible`].
+    fn distraction_free_exit_visible(&self) -> bool {
+        distraction_free_exit_visible(self.fullscreen, self.page_fullscreen)
+    }
+}
 type SharedSnapshot = Arc<RenderSnapshot>;
 
 #[derive(Clone, PartialEq)]
@@ -13343,6 +13449,11 @@ struct TerminalCanvasSnapshot {
     terminal_light_theme_name: String,
     terminal_dark_theme_name: String,
     fullscreen: bool,
+    /// A page is in element fullscreen (mirror of [`ShellState::page_fullscreen`]).
+    /// The viewport's OWN chrome — the tab strip, the omnibox, the find bar —
+    /// draws inside this component, above the page under glass, so it has to
+    /// answer the same question the shell's outer gates do.
+    page_fullscreen: bool,
     active_summary: Option<String>,
     active_view_mode: WorkspaceViewMode,
     active_session_path: Option<String>,
@@ -13369,6 +13480,7 @@ impl TerminalCanvasSnapshot {
             terminal_light_theme_name: snapshot.settings.terminal_light_theme_name.clone(),
             terminal_dark_theme_name: snapshot.settings.terminal_dark_theme_name.clone(),
             fullscreen: snapshot.fullscreen,
+            page_fullscreen: snapshot.page_fullscreen,
             active_summary: snapshot.active_summary.clone(),
             active_view_mode: snapshot.active_view_mode,
             active_session_path: snapshot.active_session_path.clone(),
@@ -14489,6 +14601,7 @@ impl ShellState {
             last_action: "ready".to_string(),
             maximized: initial_window_maximized,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
@@ -15525,6 +15638,7 @@ impl ShellState {
             install_context: self.bootstrap.install_context.clone(),
             maximized: self.maximized,
             fullscreen: self.fullscreen,
+            page_fullscreen: self.page_fullscreen,
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
             titlebar_new_menu_open: self.titlebar_new_menu_open,
@@ -74852,7 +74966,17 @@ fn app() -> Element {
         .revealed(right_rail_auto_hide, rail_autohide_pinned(&snapshot))
         && right_rail_auto_hide;
     let maximized = snapshot.maximized;
+    // Distraction-free mode: the user's, sticky. Used ONLY where the question
+    // really is "did the user ask for distraction-free" — the window-control
+    // icon and the exit affordance below.
     let fullscreen = snapshot.fullscreen;
+    // …and the chrome gate every surface shares. A page in ELEMENT fullscreen
+    // owns the window exactly as distraction-free mode does, so it hides the
+    // same chrome through the same gate; two conditions would be two lists of
+    // "what chrome is", and the one that got forgotten is what painted the
+    // session tree over the user's video.
+    let chrome_hidden = snapshot.chrome_hidden();
+    let distraction_free_exit_visible = snapshot.distraction_free_exit_visible();
     let shell_radius = if maximized {
         0
     } else {
@@ -75579,10 +75703,10 @@ fn app() -> Element {
                         linux_transparent_window,
                     ),
                 }
-                if !fullscreen {
+                if !chrome_hidden {
                     WindowResizeHandles {}
                 }
-                if !fullscreen {
+                if !chrome_hidden {
                     div {
                         "data-yggterm-titlebar": "1",
                         "data-titlebar-auto-hide-enabled": if titlebar_auto_hide_enabled { "true" } else { "false" },
@@ -75964,12 +76088,18 @@ fn app() -> Element {
                         },
                     }
                 }
-                if fullscreen {
+                if distraction_free_exit_visible {
                     div {
                         // ⚠ THE ONLY MOUSE ROUTE OUT OF DISTRACTION-FREE MODE.
                         // In this mode the titlebar and sidebar are not
                         // rendered at all, so this floating strip carries the
-                        // exit-fullscreen control and nothing else does.
+                        // exit-fullscreen control and nothing else does. Which
+                        // is why it is gated on `distraction_free_exit_visible`
+                        // and not on `chrome_hidden`: hiding it whenever chrome
+                        // hides would delete the exit from the very mode it
+                        // exits. It DOES stand down under a fullscreen page —
+                        // that page owns every pixel and the engine owns the way
+                        // out of it (Escape) — and comes back untouched after.
                         //
                         // It therefore MUST declare itself a cover. Under glass
                         // (the standard presentation path) the input region is
@@ -76017,7 +76147,7 @@ fn app() -> Element {
                         titlebar_auto_hide_enabled,
                         titlebar_revealed,
                     ),
-                    if !fullscreen {
+                    if !chrome_hidden {
                         Sidebar {
                         snapshot: sidebar_snapshot,
                         autohide: left_sidebar_autohide,
@@ -76255,7 +76385,7 @@ fn app() -> Element {
                             },
                         }
                     }
-                    if !fullscreen {
+                    if !chrome_hidden {
                         RightRail {
                             snapshot: metadata_snapshot,
                             autohide: right_rail_autohide,
@@ -83932,6 +84062,15 @@ fn TerminalCanvas(
     let terminal_frame = terminal_frame_style(snapshot.fullscreen);
     let terminal_shell_padding = terminal_frame.padding.to_string();
     let terminal_shell_radius = terminal_frame.shell_radius.to_string();
+    // The viewport's OWN chrome — the tab strip, the omnibox, the find bar —
+    // stands down for a page in element fullscreen, for the same reason the
+    // shell's outer chrome does: under glass it draws OVER the page, and the
+    // page owns every pixel of the window. Note this is NOT gated on
+    // distraction-free mode: that mode deliberately keeps a browser browsable
+    // (you still need the address bar), so this is a genuinely different
+    // question from `RenderSnapshot::chrome_hidden` and not a second spelling
+    // of it. Element fullscreen is the only reason these three go away.
+    let web_chrome_hidden = snapshot.page_fullscreen;
     // The web overlay is a TENANT of this viewport (it lives inside the shell
     // root and follows a resize or a split), but unlike a terminal it takes NO
     // inset and NO radius: a browser page runs flush to the viewport's edges.
@@ -92854,12 +92993,17 @@ fn TerminalCanvas(
                             // all share ONE vertical center line.
                             // Top tab bar. In vertical-tabs mode it collapses
                             // away (max-height→0) — the tabs live in the rail.
+                            // A page in element fullscreen collapses it the
+                            // SAME way rather than unmounting it: the collapse
+                            // is already the strip's own vocabulary, it costs no
+                            // remount, and the transition carries it out of the
+                            // way and back.
                             style: format!(
                                 "display:flex; align-items:stretch; gap:2px; padding:{}; {} box-sizing:border-box; \
                                  background:linear-gradient(rgba(127,127,127,0.16), rgba(127,127,127,0.16)), {}; user-select:none; overflow:hidden; \
                                  transition:max-height 0.18s ease, padding 0.18s ease;",
-                                if web_overlay.vertical_tabs { "0 8px" } else { "6px 8px 0" },
-                                if web_overlay.vertical_tabs { "max-height:0; min-height:0;" } else { "max-height:60px; min-height:35px;" },
+                                if web_overlay.vertical_tabs || web_chrome_hidden { "0 8px" } else { "6px 8px 0" },
+                                if web_overlay.vertical_tabs || web_chrome_hidden { "max-height:0; min-height:0;" } else { "max-height:60px; min-height:35px;" },
                                 // The tint used to composite over the frame
                                 // wrapper's fill; baking the frame color in
                                 // keeps the strip identical when that wrapper
@@ -93178,8 +93322,10 @@ fn TerminalCanvas(
                         // mode the tabs AND this bar move to the tab-tree rail
                         // (the Zen-style omnibox at the rail top), leaving the
                         // viewport chrome-free below the collapsed strip. One
-                        // implementation, two homes — see `WebOmniboxBar`.
-                        if !web_overlay.vertical_tabs {
+                        // implementation, two homes — see `WebOmniboxBar`. In
+                        // element fullscreen it has no home at all: the page owns
+                        // the window (the rail copy goes with the rail).
+                        if !web_overlay.vertical_tabs && !web_chrome_hidden {
                             WebOmniboxBar {
                                 state,
                                 session_path: web_surface_session_path.clone(),
@@ -93196,8 +93342,15 @@ fn TerminalCanvas(
                         // omnibox may move to the rail, but find belongs over
                         // the page it is searching. Its flow row shrinks the
                         // `[data-ws-page]` rect below, so the native surface
-                        // follows it down instead of being covered by it.
-                        if let Some(find) = web_overlay.find.clone() {
+                        // follows it down instead of being covered by it. In
+                        // element fullscreen there is no rect to shrink — the
+                        // page IS the window — so the bar would simply lie
+                        // across the top of the video; it stands down and the
+                        // query survives in `WebSurfaceUiState::find` for when
+                        // the page hands the window back.
+                        if let Some(find) =
+                            web_overlay.find.clone().filter(|_| !web_chrome_hidden)
+                        {
                             WebFindBar {
                                 state,
                                 session_path: web_surface_session_path.clone(),
@@ -124786,11 +124939,23 @@ mod tests {
                 "the floating window-controls strip must declare itself a cover — \
                  undeclared chrome over a page is visible and unclickable",
             );
-        let before = &product[at.saturating_sub(1400)..at];
+        let before = &product[at.saturating_sub(1800)..at];
         assert!(
-            before.contains("if fullscreen {"),
-            "…and that declaration belongs to the FULLSCREEN strip, which is the \
-             only chrome that mode renders:\n{before}"
+            before.contains("if distraction_free_exit_visible {"),
+            "…and that declaration belongs to the strip distraction-free mode \
+             renders, which is the only chrome that mode has:\n{before}"
+        );
+        // …and THAT gate is distraction-free's own, spelled out. It is allowed
+        // to narrow for exactly one thing — a page that has taken the whole
+        // window, which carries its own way out (WebKit keeps its Escape
+        // binding, `connect_fullscreen_signals`) and hands the strip straight
+        // back on exit. Any other term added here is a mode with no way out.
+        assert!(
+            product.contains(
+                "fn distraction_free_exit_visible(distraction_free: bool, page_fullscreen: bool) -> bool {\n    distraction_free && !page_fullscreen\n}"
+            ),
+            "the exit strip's gate changed shape — distraction-free mode must \
+             render its ONLY mouse route out whenever no page owns the window"
         );
         let after = &product[at..at + 1600];
         assert!(
@@ -157200,6 +157365,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -157856,6 +158022,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -158047,6 +158214,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -158238,6 +158406,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -158432,6 +158601,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -158630,6 +158800,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -158820,6 +158991,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -159010,6 +159182,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -159234,6 +159407,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -159427,6 +159601,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -159652,6 +159827,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -160054,6 +160230,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
             maximized: false,
             fullscreen: false,
+            page_fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
@@ -172990,6 +173167,149 @@ mod web_surface_immersion_locks {
             assert!(
                 rails.contains(stamp),
                 "the rail stopped stamping what the geometry eval samples: {stamp}"
+            );
+        }
+    }
+
+    // -- LOCK 12 -- CHROME'S HALF OF FULLSCREEN.
+    //
+    // Suppressing every chrome CLAIM (LOCK 3) is geometry: it stops chrome
+    // moving the page and nothing else. Under glass the page is at the BACK of
+    // the z-order, so a shell that still RENDERS its tree, its rail and its
+    // window controls paints them straight over the fullscreen video — which is
+    // exactly what the user photographed on 2026-07-31. These locks own the
+    // second half: the shell stops drawing.
+    #[test]
+    fn chrome_hides_for_either_reason_and_the_two_reasons_stay_apart() {
+        // The gate: distraction-free OR a page on the whole screen. Every piece
+        // of shell chrome reads THIS, so neither reason can be honoured by one
+        // surface and forgotten by another.
+        assert!(!shell_chrome_hidden(false, false), "idle shell paints chrome");
+        assert!(
+            shell_chrome_hidden(true, false),
+            "distraction-free must still hide chrome"
+        );
+        assert!(
+            shell_chrome_hidden(false, true),
+            "a page in element fullscreen must hide chrome — this IS the bug"
+        );
+        assert!(shell_chrome_hidden(true, true));
+
+        // The exit affordance is the ONE piece that is not chrome-to-hide:
+        // distraction-free ADDS it, so it may not ride the gate above.
+        assert!(
+            distraction_free_exit_visible(true, false),
+            "distraction-free must keep its only mouse route out"
+        );
+        assert!(
+            !distraction_free_exit_visible(false, false),
+            "…and must not float an exit control when there is nothing to exit"
+        );
+        assert!(
+            !distraction_free_exit_visible(true, true),
+            "a fullscreen page owns every pixel, including the exit strip's"
+        );
+        assert!(!distraction_free_exit_visible(false, true));
+    }
+
+    /// RESTORE. Element fullscreen is transient and engine-driven; distraction-
+    /// free is sticky and the user's. Leaving a video must hand back EXACTLY the
+    /// chrome posture that was there — including distraction-free itself, which
+    /// is why the two are separate inputs and not one merged flag.
+    #[test]
+    fn leaving_element_fullscreen_restores_the_users_own_chrome_posture() {
+        for distraction_free in [false, true] {
+            let before = (
+                shell_chrome_hidden(distraction_free, false),
+                distraction_free_exit_visible(distraction_free, false),
+            );
+            let during = (
+                shell_chrome_hidden(distraction_free, true),
+                distraction_free_exit_visible(distraction_free, true),
+            );
+            let after = (
+                shell_chrome_hidden(distraction_free, false),
+                distraction_free_exit_visible(distraction_free, false),
+            );
+            assert_eq!(
+                during.0, true,
+                "chrome must be hidden while a page owns the window \
+                 (distraction_free={distraction_free})"
+            );
+            assert_eq!(
+                after, before,
+                "leaving element fullscreen must restore the exact prior chrome \
+                 posture (distraction_free={distraction_free})"
+            );
+        }
+        // The load-bearing half of "restore": a user who was NOT in
+        // distraction-free is not in it afterwards, and one who WAS still is.
+        assert!(
+            !shell_chrome_hidden(false, false),
+            "a fullscreen video must not leave the shell in distraction-free"
+        );
+        assert!(
+            shell_chrome_hidden(true, false),
+            "…nor take a user out of the distraction-free mode they chose"
+        );
+    }
+
+    // -- WIRING for LOCK 12 -- the reconciler feed and every gate it drives.
+    //
+    // The pure gate above is worthless if the render does not call it or the
+    // loop never publishes the fact. Both seams are PRODUCTION needles: a gate
+    // that reverts to `if !fullscreen` (chrome back over the video) or a
+    // reconciler that stops mirroring the engine reddens here while the truth
+    // table stays green.
+    #[test]
+    fn the_chrome_gate_is_fed_by_the_engine_and_worn_by_every_surface() {
+        let scanned = product(&shell_source());
+        for needle in [
+            // THE FEED. The engine's own answer, mirrored onto ShellState by the
+            // reconciler and nothing else — `web_surface_fullscreen()` is the
+            // single owner of "a page is fullscreen" and this is its only
+            // publication into the render.
+            "writable.with_mut(|shell| shell.page_fullscreen = page_fullscreen);",
+            "let page_fullscreen = fullscreen_native_id.is_some_and(|native_id| {",
+            // ...gated on the surface actually being SHOWN, the same predicate
+            // the paint/input holes use — a fullscreen page in the soft stash
+            // must not blank the chrome of the session the user switched to.
+            "&& entry.visible\n                        && entry.stashed_at_ms.is_none()",
+            // ...carried to the render through the snapshot chain.
+            "page_fullscreen: self.page_fullscreen,",
+            "page_fullscreen: snapshot.page_fullscreen,",
+            "let chrome_hidden = snapshot.chrome_hidden();",
+            "let distraction_free_exit_visible = snapshot.distraction_free_exit_visible();",
+            // EVERY SURFACE IN THE PHOTOGRAPH, each wearing the shared gate.
+            // Anchored on the gate plus what it guards, so a surface cannot be
+            // silently moved back onto the distraction-free-only condition.
+            "if !chrome_hidden {\n                    WindowResizeHandles {}",
+            "if !chrome_hidden {\n                    div {\n                        \"data-yggterm-titlebar\": \"1\",",
+            "if !chrome_hidden {\n                        Sidebar {",
+            "if !chrome_hidden {\n                        RightRail {",
+            // ...and the exit affordance on its own, narrower gate.
+            "if distraction_free_exit_visible {",
+            // The viewport's OWN chrome: tab strip (collapsed the way vertical
+            // mode collapses it), omnibox, find bar.
+            "let web_chrome_hidden = snapshot.page_fullscreen;",
+            "if web_overlay.vertical_tabs || web_chrome_hidden { \"max-height:0; min-height:0;\" }",
+            "if !web_overlay.vertical_tabs && !web_chrome_hidden {",
+            "web_overlay.find.clone().filter(|_| !web_chrome_hidden)",
+        ] {
+            assert!(
+                scanned.contains(needle),
+                "the fullscreen chrome gate lost a seam: {needle}"
+            );
+        }
+        // ...and what must NOT come back: a chrome surface gated on
+        // distraction-free ALONE. `if fullscreen {` is still legal exactly once
+        // — nowhere, now that the exit strip reads its own predicate — and
+        // `if !fullscreen {` not at all.
+        for forbidden in ["if !fullscreen {", "if fullscreen {\n                    div {"] {
+            assert!(
+                !scanned.contains(forbidden),
+                "a chrome surface went back to the distraction-free-only gate \
+                 ({forbidden}) — under glass that paints it over a fullscreen page"
             );
         }
     }
