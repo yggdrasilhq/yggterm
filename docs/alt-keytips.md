@@ -631,17 +631,43 @@ three grouped chip sets, a spinner with a slider. Twenty badges scattered over a
 design surface would each only *focus* something the user must then nudge with
 arrows anyway.
 
+⛔ **CORRECTED THE SAME DAY, and the correction is the load-bearing part.** The
+first cut made the modes EXCLUSIVE: a form dialog refused the badge layer
+outright. The user overruled it within the hour, and was right:
+
+> *"The modals should show keytips on its ALT+ layer. The modal navigation
+> otherwise becomes buggy … Modals should have their own ALT+ layer. In other
+> words, when entering a modal with an ALT+ mode on triggers its alt mode on. On
+> entering with mouse, pressing ALT once will trigger the modal's ALT+ mode on.
+> This is unified architecture. But the user may continue to use our already
+> implemented dotted-highlight element with arrows and tabs architecture too."*
+
+A dialog you cannot badge is a hole in a layer whose whole promise is that every
+affordance is one chord away, and a hole is worse than either design on its own.
+So **both routes exist in every dialog**:
+
+- the dialog has **its own ALT layer** — inherited when a chord opened it, or
+  turned on by one ALT tap when the mouse did — with derivation confined to the
+  dialog, and
+- the **focus path** works the whole time: Tab, Shift+Tab, arrows within a group,
+  with the indicator travelling visibly.
+
+They do not fight, because they are captured at different keys: letters walk the
+chord, Tab/arrows move the focus, and `Enter`/`Escape` mean the same thing in
+both (§12.3's one dispatcher). **The badge layer must never eat the dialog's own
+Tab** — that is what "the modal navigation becomes buggy" meant.
+
 **THE RULE: every modal declares its keyboard mode, as one more field on the ONE
 `TopModal` table** that already owns the marker kind, the walk root and the scope
-label. No judgement at a callsite, no second encoding, and moving a dialog
-between modes is a one-line change once we have lived with it.
+label. The mode is no longer exclusive; it tunes two things only.
 
-| Mode | For | Keyboard |
+| Mode | For | What the mode decides |
 |---|---|---|
-| **Command** | confirm/choice dialogs: Close Terminal?, Delete, Passkey, classic-tabs, dropdowns, the KeyTips editor's grid | §12.3's badge layer — letters on every control, one keystroke acts |
-| **Form** | editing dialogs: the theme editor, and every custom-format-class dialog we grow | focus-first, the Windows way (below). The ALT layer **refuses to open** over it |
+| **Command** | confirm/choice dialogs: Close Terminal?, Delete, Passkey, classic-tabs, dropdowns, the KeyTips editor's grid | the keyboard is NOT seated on open; the hint bar leads with `Enter`/`Esc` |
+| **Form** | editing dialogs: the theme editor, the copy/summary editor | the keyboard IS seated inside on open; the hint bar leads with `Tab`/arrows |
 
-**The Form-mode contract**, each clause testable:
+**The focus contract** (available in every dialog; SEATED on open only in Form
+mode), each clause testable:
 
 1. **Focus enters on open** — the dialog's first control, never `<body>`. One
    owner, driven off the modal-open edge, so no dialog can forget.
@@ -661,15 +687,23 @@ between modes is a one-line change once we have lived with it.
 6. **The hint bar tells the truth for the mode it is in** (`Tab move · ↑↓ adjust
    · Space pick · Esc close`), from the same one table beside the dispatcher that
    already forbids advertising a key the dispatcher swallows.
-7. **A clean ALT tap over a Form dialog is a NO-OP**, and says so when an agent
-   asks. Opening a layer that can only move focus would be the same species of
-   lie as a badge on a dead letter — the honest behaviour is the one Excel has:
-   the layer stops at this boundary.
-8. **The audit measures the mode a dialog declares** (§12): in a Form dialog a
-   control is reachable when it is in the focus order, so the audit counts
-   `reachable_by_focus`, and a control that is NOT tabbable is the violation.
-   Without this the metric would call the new mode broken precisely because it
-   works.
+7. **A clean ALT tap inside a dialog turns THAT dialog's layer on** (the
+   correction above). The layer never opens over the chrome behind a dialog:
+   `activate_alt_overlay` reads `top_modal` and lands in the modal scope.
+8. **The audit reports BOTH routes** (§12): the badge counts as everywhere else,
+   plus `focus_stops` — how many stops Tab offers on this surface. An element
+   that is neither badged nor in the focus order is the violation.
+
+⚠ **The indicator cannot be left to `:focus-visible` alone.** Measured on the
+live theme editor: every control read `outline-style: none`, for two independent
+reasons. `:focus-visible` does not match focus that was seated
+*programmatically*, so a dialog opened with the MOUSE showed no indicator at all;
+and `outline:none` is set INLINE on many controls, where it beats any stylesheet
+selector. So our own machinery stamps `data-keynav="1"` on the dialog the instant
+it moves focus (cleared by a pointer press inside), the ring keys off plain
+`:focus` under that stamp, and it is `!important` — the one place that is
+justified, because an invisible focus indicator is not a style preference, it is
+the navigation being broken.
 
 Direct-manipulation surfaces (the gradient pad) get a follow-on rather than a
 blocker: the stops become a list Tab can enter, with arrows nudging the selected
@@ -693,10 +727,11 @@ stop. Until then the pad is reachable by its chips and its Add/Remove buttons.
     buttons carry letters and no letter reaches the chrome behind it.
 13. A tip is reachable: a two-letter tip's prefix is never also a tip in the
     same scope (§5 step 7), so no element on a crowded surface is unbadgeable.
-14. A dialog is operable by keyboard in exactly ONE declared mode (§12.4), and
-    the audit measures the mode it declares — badges in Command mode, the focus
-    order in Form mode. A Form dialog traps Tab and never leaks focus to the
-    chrome behind it.
+14. Every dialog offers BOTH keyboard routes (§12.4): its own ALT layer, and a
+    focus path that traps Tab inside it. The declared mode tunes seating and the
+    hint bar, never whether a route exists. The badge layer never eats the
+    dialog's Tab or arrows, and the focus indicator is visible whenever the
+    keyboard moved focus.
 7. Held ALT+key in a focused terminal always reaches the PTY.
 8. No shell accelerator is a bare `Ctrl+<letter>` — the PTY keeps them (§11.2).
 9. No chord is hardcoded at a callsite; the registry owns every binding in both layers.
