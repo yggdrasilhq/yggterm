@@ -311,14 +311,21 @@ Spec: `docs/alt-keytips.md`.
 
 #### Keyboard focus ring (dialogs in Form mode)
 
-A dialog that is operated by focus rather than by badges (`docs/alt-keytips.md`
-§12.4 — the theme editor and every custom-format-class dialog after it) must show
-where the keyboard is. The ring is one treatment, not a per-dialog invention:
+Every dialog offers two keyboard routes (`docs/alt-keytips.md` §12.4): its own
+ALT+ badge layer, and a focus path with Tab and arrows. Whenever the second one
+is in use the dialog must show where the keyboard is. The ring is one treatment,
+not a per-dialog invention:
 
 - a 2px ring in the theme accent, offset 2px outside the control, following the
   control's own corner radius
-- shown for keyboard focus only (`:focus-visible`), so a mouse click does not
-  leave rings scattered behind the pointer
+- shown for keyboard focus only, and NOT by `:focus-visible` alone: that
+  pseudo-class does not match focus seated programmatically, so a dialog opened
+  with the mouse showed no indicator at all. The dialog is stamped the moment our
+  keyboard machinery moves focus, and the stamp clears on a pointer press inside
+  — so a mouse click still leaves no rings scattered behind the pointer
+- it overrides an inline `outline:none` (many controls set one), because an
+  invisible focus indicator is not a style preference, it is the navigation
+  being broken
 - on a colour chip or swatch, the ring sits OUTSIDE the swatch so it never
   changes the colour being judged
 - the focused item of a group is the one Tab returns to (roving `tabindex`), so
