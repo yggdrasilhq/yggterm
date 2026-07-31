@@ -186,7 +186,8 @@ use yggterm_server::{
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ScreenshotTarget,
-    ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
+    ManagedSessionView, PersistedDaemonState, PreviewBlockKind, PreviewTone,
+    ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
@@ -15206,7 +15207,8 @@ fn clamp_rail_width(width: f32) -> f32 {
 #[derive(Default)]
 struct PreviewBlockCache {
     order: VecDeque<u64>,
-    entries: HashMap<u64, Vec<SessionPreviewBlock>>,
+    // Keyed rows, not bare blocks: the raw index is part of what is cached.
+    entries: HashMap<u64, Vec<(usize, SessionPreviewBlock)>>,
 }
 #[derive(Default)]
 struct PreviewContentCache {
@@ -40324,6 +40326,15 @@ fn preview_block_cache_key(blocks: &[SessionPreviewBlock]) -> u64 {
         }
         .hash(&mut hasher);
         block.timestamp.hash(&mut hasher);
+        // FOLD STATE IS PART OF THE KEY. Toggling a row changes nothing else
+        // about it, so a key blind to `folded` hands back the pre-toggle list
+        // and the row the user just clicked stays shut — live-caught on guihost
+        // 2026-08-01, with the daemon correctly holding the block open.
+        block.folded.hash(&mut hasher);
+        // The activity is part of a block's identity: two `Read` calls have the
+        // same clamped output and differ ONLY in their headline, so a key blind
+        // to the activity hands back the wrong cached list.
+        preview_block_activity_signature(block).hash(&mut hasher);
         for line in &block.lines {
             line.hash(&mut hasher);
             0xff_u8.hash(&mut hasher);
@@ -40352,16 +40363,25 @@ fn preview_content_cache_key(lines: &[String]) -> u64 {
     }
     hasher.finish()
 }
-fn preview_run_cache_key(blocks: &[SessionPreviewBlock], start_index: usize) -> u64 {
+fn preview_run_cache_key(rows: &[(usize, SessionPreviewBlock)]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    start_index.hash(&mut hasher);
-    for block in blocks {
+    for (raw_index, block) in rows {
+        raw_index.hash(&mut hasher);
         match block.tone {
             PreviewTone::User => 1_u8,
             PreviewTone::Assistant => 2_u8,
         }
         .hash(&mut hasher);
         block.timestamp.hash(&mut hasher);
+        // FOLD STATE IS PART OF THE KEY. Toggling a row changes nothing else
+        // about it, so a key blind to `folded` hands back the pre-toggle list
+        // and the row the user just clicked stays shut — live-caught on guihost
+        // 2026-08-01, with the daemon correctly holding the block open.
+        block.folded.hash(&mut hasher);
+        // The activity is part of a block's identity: two `Read` calls have the
+        // same clamped output and differ ONLY in their headline, so a key blind
+        // to the activity hands back the wrong cached list.
+        preview_block_activity_signature(block).hash(&mut hasher);
         for line in &block.lines {
             line.hash(&mut hasher);
             0xff_u8.hash(&mut hasher);
@@ -40731,6 +40751,33 @@ fn collapse_preview_image_markup(text: &str) -> String {
 fn normalize_preview_semantic_text(text: &str) -> String {
     collapse_preview_image_markup(text).to_ascii_lowercase()
 }
+/// A block's activity as one comparable string. Empty for prose.
+///
+/// The ONE owner of "what distinguishes two activity blocks", used by the
+/// preview cache keys and by the adjacent-duplicate filter. Those derived
+/// identity from `lines` alone, which is the same question with a wrong answer
+/// once a block's meaning can live outside its lines.
+fn preview_block_activity_signature(block: &SessionPreviewBlock) -> String {
+    match block.activity.as_ref() {
+        Some(activity) => format!(
+            "{}:{}:{}:{}:{}:{}",
+            activity.tool,
+            activity.headline,
+            activity.changed_files.join(","),
+            activity.added_lines,
+            activity.removed_lines,
+            activity.failed
+        ),
+        None => String::new(),
+    }
+}
+/// Whether this block carries meaning outside its `lines`.
+///
+/// A tool call with no output yet is still a tool call the reader must see —
+/// the emptiness rules below were written when a block WAS its lines.
+fn preview_block_is_activity(block: &SessionPreviewBlock) -> bool {
+    block.kind != PreviewBlockKind::Message
+}
 fn preview_block_text(block: &SessionPreviewBlock) -> String {
     block
         .lines
@@ -40795,7 +40842,19 @@ fn preview_block_is_scaffold_only(block: &SessionPreviewBlock) -> bool {
     }
     saw_line
 }
-fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
+/// The blocks the Web View draws, each carrying ITS INDEX IN THE SESSION'S OWN
+/// BLOCK LIST — never its position in this filtered result.
+///
+/// A row's fold state is toggled by index THROUGH THE DAEMON, which owns the
+/// unfiltered list. This function drops scaffold, placeholder and adjacent
+/// duplicate blocks, so a position here is not a position there: measured live
+/// on a real Claude Code transcript (guihost, 2026-08-01) the daemon held 977
+/// blocks and this returned 966, and clicking the 542nd visible row folded the
+/// daemon's 531st. With two blocks that drift was invisible; with a timeline of
+/// tool calls it is the whole affordance. The identity travels WITH the row.
+fn visible_preview_block_rows(
+    session: &ManagedSessionView,
+) -> Vec<(usize, SessionPreviewBlock)> {
     if preview_should_hide_stale_placeholder_content(session) {
         return Vec::new();
     }
@@ -40813,20 +40872,22 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         .preview
         .blocks
         .iter()
-        .filter_map(|block| {
+        .enumerate()
+        .filter_map(|(raw_index, block)| {
             let cleaned_lines = block
                 .lines
                 .iter()
                 .filter(|line| !is_preview_scaffold_line(line))
                 .cloned()
                 .collect::<Vec<_>>();
-            if cleaned_lines.is_empty() {
+            let carries_activity = preview_block_is_activity(block);
+            if cleaned_lines.is_empty() && !carries_activity {
                 return None;
             }
             let mut cleaned = block.clone();
             cleaned.lines = cleaned_lines;
             let compact = preview_block_text(&cleaned);
-            if compact.is_empty() {
+            if compact.is_empty() && !carries_activity {
                 return None;
             }
             let lower = compact.to_ascii_lowercase();
@@ -40855,21 +40916,25 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             {
                 return None;
             }
-            Some(cleaned)
+            Some((raw_index, cleaned))
         })
         .collect::<Vec<_>>();
     let mut deduped = Vec::with_capacity(visible.len());
     let mut last_signature = None::<(PreviewTone, String)>;
-    for block in visible.into_iter() {
+    for (raw_index, block) in visible.into_iter() {
         let signature = (
             block.tone,
-            normalize_preview_semantic_text(&preview_block_text(&block)),
+            format!(
+                "{}|{}",
+                preview_block_activity_signature(&block),
+                normalize_preview_semantic_text(&preview_block_text(&block))
+            ),
         );
         if last_signature.as_ref() == Some(&signature) {
             continue;
         }
         last_signature = Some(signature);
-        deduped.push(block);
+        deduped.push((raw_index, block));
     }
     let mut visible = deduped;
     if visible.is_empty()
@@ -40880,7 +40945,15 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             .iter()
             .all(preview_block_is_scaffold_only)
     {
-        visible = session.preview.blocks.clone();
+        // The everything-was-filtered escape hatch shows the raw list, so here
+        // the two index spaces coincide by construction.
+        visible = session
+            .preview
+            .blocks
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect();
     }
     if let Ok(mut cache) = preview_block_cache().lock() {
         cache.entries.insert(key, visible.clone());
@@ -40895,6 +40968,14 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         }
     }
     visible
+}
+/// The visible blocks alone. A projection of [`visible_preview_block_rows`], so
+/// there is exactly one filter and one place that decides what a reader sees.
+fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
+    visible_preview_block_rows(session)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect()
 }
 fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -> bool {
     if !session.session_path.starts_with("remote-session://") {
@@ -41172,8 +41253,13 @@ fn preview_scroll_to_latest_script(session_path: &str) -> String {
 }})();"#
     )
 }
-fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
-    let key = preview_run_cache_key(blocks, start_index);
+/// Group consecutive same-tone rows into runs.
+///
+/// Each row arrives as `(raw_index, block)`: `block_ix` is the index the DAEMON
+/// knows this block by, carried through the filter and the virtual window, never
+/// re-derived from a position in either.
+fn group_preview_runs(rows: &[(usize, SessionPreviewBlock)]) -> Vec<PreviewRun> {
+    let key = preview_run_cache_key(rows);
     if let Ok(mut cache) = preview_run_cache().lock() {
         if let Some(hit) = cache.entries.get(&key).cloned() {
             if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
@@ -41185,8 +41271,7 @@ fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec
     }
     let mut runs: Vec<PreviewRun> = Vec::new();
     let mut last_date_key = None::<(i32, u8, u8)>;
-    for (offset, block) in blocks.iter().cloned().enumerate() {
-        let ix = start_index + offset;
+    for (ix, block) in rows.iter().cloned() {
         let display_timestamp =
             format_preview_timestamp_label(&block.timestamp, &mut last_date_key);
         if let Some(last) = runs.last_mut()
@@ -43362,11 +43447,14 @@ fn search_content_hits(
                     label: "Summary".to_string(),
                 });
             }
-            for (ix, block) in visible_preview_blocks(session).iter().enumerate() {
+            // The RAW index, because that is what the rendered row's dom id is
+            // built from — a hit keyed by its position in the filtered list
+            // scrolls to whatever row happens to sit at that number.
+            for (raw_ix, block) in visible_preview_block_rows(session).iter() {
                 let haystack = block.lines.join("\n");
                 if text_matches_search_terms(&haystack, &terms) {
                     hits.push(SearchContentHit {
-                        dom_id: preview_block_dom_id(&session.id, ix),
+                        dom_id: preview_block_dom_id(&session.id, *raw_ix),
                         label: block.timestamp.clone(),
                     });
                 }
@@ -82483,7 +82571,11 @@ fn MainSurface(
                 }
             }
         } else {
-            let visible_blocks = visible_preview_blocks(&session);
+            let visible_rows = visible_preview_block_rows(&session);
+            let visible_blocks = visible_rows
+                .iter()
+                .map(|(_, block)| block.clone())
+                .collect::<Vec<_>>();
             let rendered_sections = preview_rendered_sections(&session);
             let conversation_provider = conversation_provider_model_for_session(&session);
             let preview_failure = snapshot.preview_failure.clone();
@@ -82504,9 +82596,9 @@ fn MainSurface(
                 } else {
                     preview_window
                 };
-            let rendered_blocks =
-                visible_blocks[preview_window.start_index..preview_window.end_index].to_vec();
-            let grouped_runs = group_preview_runs(&rendered_blocks, preview_window.start_index);
+            let rendered_rows =
+                visible_rows[preview_window.start_index..preview_window.end_index].to_vec();
+            let grouped_runs = group_preview_runs(&rendered_rows);
             let preview_context_available =
                 !grouped_runs.is_empty() || !rendered_sections.is_empty();
             let terminal_resume_context_fallback =
@@ -82842,6 +82934,9 @@ fn MainSurface(
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
+                                        on_copy_block: move |text: String| {
+                                            copy_preview_block_text(state, text);
+                                        },
                                     }
                                 } else {
                                     div {
@@ -83212,6 +83307,7 @@ fn ConversationWebView(
     latest_anchor_key: String,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
+    on_copy_block: EventHandler<String>,
 ) -> Element {
     let read_only_attr = provider.read_only.to_string();
     let can_send_attr = provider.can_send.to_string();
@@ -83275,6 +83371,7 @@ fn ConversationWebView(
                     run: run.clone(),
                     palette,
                     on_toggle_block: move |ix| on_toggle_block.call(ix),
+                    on_copy_block: move |text: String| on_copy_block.call(text),
                 }
             }
             if preview_window.bottom_spacer_px > 0.0 {
@@ -84580,6 +84677,7 @@ fn PreviewRunBlock(
     run: PreviewRun,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
+    on_copy_block: EventHandler<String>,
 ) -> Element {
     let user_run = run.tone == PreviewTone::User;
     let row_justify = if user_run { "flex-end" } else { "center" };
@@ -84684,40 +84782,358 @@ fn PreviewRunBlock(
                                     "border:none !important; outline:none !important; box-shadow:none !important; background:transparent !important;".to_string()
                                 }
                             ),
-                            div {
-                                "data-preview-timestamp": "1",
-                                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                                if !entry.display_timestamp.trim().is_empty() {
-                                    div {
-                                        style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
-                                        "{entry.display_timestamp}"
-                                    }
-                                } else {
-                                    div { style: "flex:1 1 auto;" }
-                                }
-                                if entry.block.folded || entry.block.lines.len() > 8 {
-                                    button {
-                                        style: format!(
-                                            "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
-                                            palette.muted
-                                        ),
-                                        onclick: move |_| on_toggle_block.call(entry.block_ix),
-                                        {if entry.block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
-                                    }
-                                }
-                            }
-                            if entry.block.folded {
-                                div {
-                                    style: format!("font-size:11px; color:{};", palette.muted),
-                                    "{entry.block.lines.len()} lines hidden"
+                            if preview_block_is_activity(&entry.block) {
+                                PreviewActivityBlock {
+                                    block: entry.block.clone(),
+                                    block_ix: entry.block_ix,
+                                    palette,
+                                    on_toggle: on_toggle_block,
                                 }
                             } else {
-                                PreviewContent { lines: entry.block.lines.clone(), palette }
+                                div {
+                                    "data-preview-timestamp": "1",
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
+                                    if !entry.display_timestamp.trim().is_empty() {
+                                        div {
+                                            style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
+                                            "{entry.display_timestamp}"
+                                        }
+                                    } else {
+                                        div { style: "flex:1 1 auto;" }
+                                    }
+                                    // Per-message copy. A transcript exists to be
+                                    // taken somewhere else; a reader that can only
+                                    // be read from makes the user re-select prose
+                                    // by hand out of a virtualised list.
+                                    PreviewCopyButton {
+                                        text: entry.block.lines.join("\n"),
+                                        palette,
+                                        on_copy: on_copy_block,
+                                    }
+                                    if entry.block.folded || entry.block.lines.len() > 8 {
+                                        button {
+                                            style: format!(
+                                                "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
+                                                palette.muted
+                                            ),
+                                            onclick: move |_| on_toggle_block.call(entry.block_ix),
+                                            {if entry.block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
+                                        }
+                                    }
+                                }
+                                if entry.block.folded {
+                                    div {
+                                        style: format!("font-size:11px; color:{};", palette.muted),
+                                        "{entry.block.lines.len()} lines hidden"
+                                    }
+                                } else {
+                                    PreviewContent { lines: entry.block.lines.clone(), palette }
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+}
+/// Copy a Web View block's text through the app's ONE clipboard owner.
+///
+/// Not a second writer: `set_native_clipboard_contents` is the same path the
+/// terminal selection and the web surface's "copy URL" take, so a copy here
+/// cannot fight them for the X11 selection. A failure is NAMED — a copy that
+/// silently did nothing is discovered at the paste, somewhere else entirely.
+fn copy_preview_block_text(mut state: Signal<ShellState>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let copied = set_native_clipboard_contents(state, &YgguiClipboardContents::Text { text });
+    state.with_mut(|shell| match copied {
+        Ok(_) => shell.push_notification(
+            NotificationTone::Success,
+            "Message Copied",
+            "The message is on the clipboard.".to_string(),
+        ),
+        Err(error) => shell.push_notification(
+            NotificationTone::Warning,
+            "Could Not Copy Message",
+            error.to_string(),
+        ),
+    });
+}
+/// Which mark a tool wears. A NAMED SET with one owner (DESIGN.md: marks come
+/// from a named set, never path data invented at the call site) — and it is
+/// keyed by what the tool DOES, not by its name, so a CLI that calls its shell
+/// tool `exec_command` and one that calls it `Bash` wear the same mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewActivityMark {
+    Command,
+    FileChange,
+    FileRead,
+    Search,
+    Thinking,
+    Generic,
+}
+fn preview_activity_mark(block: &SessionPreviewBlock) -> PreviewActivityMark {
+    if block.kind == PreviewBlockKind::Reasoning {
+        return PreviewActivityMark::Thinking;
+    }
+    let Some(activity) = block.activity.as_ref() else {
+        return PreviewActivityMark::Generic;
+    };
+    if !activity.changed_files.is_empty() && (activity.added_lines + activity.removed_lines) > 0 {
+        return PreviewActivityMark::FileChange;
+    }
+    match activity.tool.to_ascii_lowercase().as_str() {
+        "bash" | "exec" | "exec_command" | "shell" | "write_stdin" | "wait" => {
+            PreviewActivityMark::Command
+        }
+        "edit" | "write" | "apply_patch" | "notebookedit" => PreviewActivityMark::FileChange,
+        "read" | "view_image" => PreviewActivityMark::FileRead,
+        "grep" | "glob" | "web_search" | "toolsearch" | "webfetch" => PreviewActivityMark::Search,
+        _ => PreviewActivityMark::Generic,
+    }
+}
+/// The mark itself. One box, one stroke weight, `currentColor` so the row's own
+/// tone reaches the glyph without a second palette.
+#[component]
+fn PreviewActivityGlyph(mark: PreviewActivityMark) -> Element {
+    let path = match mark {
+        // a terminal chevron + rule
+        PreviewActivityMark::Command => "M3.2 4.4 6 7.2 3.2 10M7.4 10.4h4.6",
+        // a pencil over a page edge
+        PreviewActivityMark::FileChange => "M4 11.6h2.2l5-5a1.2 1.2 0 0 0-1.7-1.7l-5 5V11.6Z",
+        // an eye
+        PreviewActivityMark::FileRead => "M1.8 7.5S3.9 3.9 7.5 3.9s5.7 3.6 5.7 3.6-2.1 3.6-5.7 3.6S1.8 7.5 1.8 7.5Z",
+        // a magnifier
+        PreviewActivityMark::Search => "M6.8 10.4a3.6 3.6 0 1 0 0-7.2 3.6 3.6 0 0 0 0 7.2ZM9.6 9.6l2.6 2.6",
+        // a thought curve
+        PreviewActivityMark::Thinking => "M3 8.6a2 2 0 0 1 1.2-3.7 2.6 2.6 0 0 1 5-.5 2 2 0 0 1 .4 3.9M5 11.4h5",
+        // a wrench
+        PreviewActivityMark::Generic => "M10.6 3.4a2.8 2.8 0 0 0-3.5 3.5l-3.6 3.6 1.4 1.4 3.6-3.6a2.8 2.8 0 0 0 3.5-3.5L10.1 6.4 8.6 4.9Z",
+    };
+    rsx! {
+        svg {
+            width: "13",
+            height: "13",
+            view_box: "0 0 15 15",
+            fill: "none",
+            path {
+                d: "{path}",
+                stroke: "currentColor",
+                stroke_width: "1.25",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+            }
+        }
+    }
+}
+/// The tone a tool row wears. A failed call leans toward WARNING; it never takes
+/// the status vocabulary's `RED`, which means a dead runtime (DESIGN.md) — a
+/// command exiting non-zero is a normal event in a working session.
+fn preview_activity_row_color(palette: Palette, failed: bool) -> String {
+    if failed {
+        PREVIEW_ACTIVITY_FAILED_COLOR.to_string()
+    } else {
+        palette.muted.to_string()
+    }
+}
+const PREVIEW_ACTIVITY_FAILED_COLOR: &str = "#b4525f";
+/// The diff stat's two colours. Named here rather than spelled at the call site
+/// so the added/removed pair has ONE owner — and the removed side deliberately
+/// REUSES the failed-call colour: both mean "this went away", and a third red
+/// in one row would read as a third meaning.
+const PREVIEW_DIFF_ADDED_COLOR: &str = "#2f855a";
+const PREVIEW_DIFF_REMOVED_COLOR: &str = PREVIEW_ACTIVITY_FAILED_COLOR;
+/// The folded tool row's style. ONE owner, and every branch emits the IDENTICAL
+/// property-key set — Dioxus applies `style` property-by-property and never
+/// clears a key a later render omits, so a branch that drops one leaves the
+/// previous branch's value painted (DESIGN.md; two live bugs in this repo).
+fn preview_activity_row_style(palette: Palette, failed: bool) -> String {
+    format!(
+        "display:flex; align-items:center; gap:8px; width:100%; box-sizing:border-box; \
+         padding:3px 6px; border:none; border-radius:8px; background:transparent; \
+         text-align:left; cursor:pointer; color:{}; \
+         font-family:'JetBrains Mono', 'Iosevka Term', ui-monospace, monospace; \
+         font-size:11px; line-height:1.55;",
+        preview_activity_row_color(palette, failed)
+    )
+}
+/// The folded row's LABEL style. Same rule: one key set, two value sets.
+fn preview_activity_label_style(palette: Palette, failed: bool) -> String {
+    format!(
+        "flex:0 0 auto; font-weight:700; letter-spacing:0.01em; color:{};",
+        if failed {
+            PREVIEW_ACTIVITY_FAILED_COLOR.to_string()
+        } else {
+            palette.text.to_string()
+        }
+    )
+}
+/// A tool call or a reasoning turn, as ONE row that folds.
+///
+/// The single biggest thing the flat preview model could not draw. Folded it is
+/// `[mark] Tool — headline` on one line with its diff stat; the whole row is the
+/// control, because expand/collapse is not something a reader should have to
+/// hover to discover (DESIGN.md, the expander slot rule).
+///
+/// ⚠ Every style below emits a FIXED key set and varies only VALUES. Dioxus
+/// applies `style` property-by-property and never clears a key a later render
+/// omits, so a branch that drops a key leaves the previous branch's value
+/// painted (DESIGN.md, the sidebar-panel lesson).
+#[component]
+fn PreviewActivityBlock(
+    block: SessionPreviewBlock,
+    block_ix: usize,
+    palette: Palette,
+    on_toggle: EventHandler<usize>,
+) -> Element {
+    let activity = block.activity.clone().unwrap_or_default();
+    let is_reasoning = block.kind == PreviewBlockKind::Reasoning;
+    let mark = preview_activity_mark(&block);
+    let label = if is_reasoning {
+        "Thinking".to_string()
+    } else {
+        activity.tool.clone()
+    };
+    let headline = if is_reasoning {
+        block
+            .lines
+            .first()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        activity.headline.clone()
+    };
+    let tooltip = if headline.trim().is_empty() {
+        label.clone()
+    } else {
+        format!("{label} — {headline}")
+    };
+    let changed = activity.changed_files.clone();
+    let stat_visible = activity.added_lines + activity.removed_lines > 0;
+    let row_style = preview_activity_row_style(palette, activity.failed);
+    rsx! {
+        div {
+            "data-preview-activity": "1",
+            "data-preview-activity-tool": "{label}",
+            "data-preview-activity-folded": if block.folded { "1" } else { "0" },
+            style: "display:flex; flex-direction:column; gap:4px; width:100%; min-width:0;",
+            button {
+                style: "{row_style}",
+                title: "{tooltip}",
+                onclick: move |_| on_toggle.call(block_ix),
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; \
+                            width:15px; height:15px; flex:0 0 auto; opacity:0.9;",
+                    PreviewActivityGlyph { mark }
+                }
+                span {
+                    style: preview_activity_label_style(palette, activity.failed),
+                    "{label}"
+                }
+                span {
+                    // The headline is USER text of unbounded length; it
+                    // ellipsizes and keeps its tooltip rather than wrapping the
+                    // row into a paragraph.
+                    style: "flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; \
+                            white-space:nowrap; opacity:0.86;",
+                    "{headline}"
+                }
+                if stat_visible {
+                    span {
+                        "data-preview-diff-stat": "1",
+                        style: "flex:0 0 auto; display:inline-flex; gap:6px; font-weight:700;",
+                        span {
+                            style: format!("color:{PREVIEW_DIFF_ADDED_COLOR};"),
+                            "+{activity.added_lines}"
+                        }
+                        span {
+                            style: format!("color:{PREVIEW_DIFF_REMOVED_COLOR};"),
+                            "−{activity.removed_lines}"
+                        }
+                    }
+                }
+                span {
+                    style: "flex:0 0 auto; opacity:0.6;",
+                    {if block.folded { "▸" } else { "▾" }}
+                }
+            }
+            if !block.folded {
+                div {
+                    style: format!(
+                        "display:flex; flex-direction:column; gap:6px; margin:0 0 4px 23px; \
+                         padding:8px 10px; border-radius:8px; background:{}; color:{}; \
+                         font-family:'JetBrains Mono', 'Iosevka Term', ui-monospace, monospace; \
+                         font-size:11px; line-height:1.6;",
+                        palette.accent_soft, palette.text
+                    ),
+                    if !changed.is_empty() {
+                        div {
+                            style: "display:flex; flex-wrap:wrap; gap:6px;",
+                            for path in changed.iter().take(PREVIEW_CHANGED_FILE_CHIP_LIMIT) {
+                                span {
+                                    key: "{path}",
+                                    title: "{path}",
+                                    style: format!(
+                                        "max-width:100%; overflow:hidden; text-overflow:ellipsis; \
+                                         white-space:nowrap; padding:2px 7px; border-radius:6px; \
+                                         background:rgba(255,255,255,0.62); color:{};",
+                                        palette.muted
+                                    ),
+                                    {preview_changed_file_label(path)}
+                                }
+                            }
+                            if changed.len() > PREVIEW_CHANGED_FILE_CHIP_LIMIT {
+                                span {
+                                    style: format!("padding:2px 4px; color:{};", palette.muted),
+                                    "+{changed.len() - PREVIEW_CHANGED_FILE_CHIP_LIMIT}"
+                                }
+                            }
+                        }
+                    }
+                    if block.lines.is_empty() {
+                        div {
+                            style: format!("opacity:0.7; color:{};", palette.muted),
+                            "No output recorded."
+                        }
+                    } else {
+                        div {
+                            style: "white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
+                            {block.lines.join("\n")}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+/// How many changed-file chips an expanded tool block draws before it counts.
+const PREVIEW_CHANGED_FILE_CHIP_LIMIT: usize = 4;
+/// A changed file as a chip label: the trailing path, not the whole absolute
+/// path, which is the same for every file in a repo and pushes the part that
+/// identifies it off the end.
+fn preview_changed_file_label(path: &str) -> String {
+    let parts = path.rsplit('/').take(2).collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return path.to_string();
+    }
+    format!("{}/{}", parts[1], parts[0])
+}
+/// Per-message copy.
+#[component]
+fn PreviewCopyButton(text: String, palette: Palette, on_copy: EventHandler<String>) -> Element {
+    rsx! {
+        button {
+            "data-preview-copy": "1",
+            style: format!(
+                "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; \
+                 padding:0; cursor:pointer; margin-left:auto;",
+                palette.muted
+            ),
+            title: "Copy this message",
+            onclick: move |_| on_copy.call(text.clone()),
+            "Copy"
         }
     }
 }
@@ -134108,6 +134524,271 @@ mod tests {
             }
         }
     }
+    /// A local agent session with an empty preview, for the visible-block filter.
+    /// Deliberately LOCAL: `preview_should_hide_stale_placeholder_content` blanks
+    /// a `remote-session://` row whose hydration is not `full`/`scan`, which would
+    /// make the assertions below pass for the wrong reason.
+    fn preview_probe_session() -> ManagedSessionView {
+        let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+        session.session_path = "local://preview-probe".to_string();
+        session.ssh_target = None;
+        session
+    }
+
+    /// ★ The same fixed-property-key invariant, for the Web View's tool row.
+    ///
+    /// A failed tool call and a normal one differ only in VALUES. If the failed
+    /// branch ever grows a key the normal branch lacks, a row that once failed
+    /// keeps that property forever — the ghost-rail bug, in a list where rows are
+    /// recycled by a virtual window.
+    #[test]
+    fn preview_activity_style_keys_are_identical_across_failure_states() {
+        let keys = |style: &str| -> Vec<String> {
+            let mut ks: Vec<String> = style
+                .split(';')
+                .filter_map(|decl| decl.split(':').next())
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            ks.sort();
+            ks
+        };
+        for theme in [UiTheme::ZedLight, UiTheme::ZedDark] {
+            let p = palette(theme);
+            assert_eq!(
+                keys(&preview_activity_row_style(p, false)),
+                keys(&preview_activity_row_style(p, true)),
+                "{theme:?} row keys"
+            );
+            assert_eq!(
+                keys(&preview_activity_label_style(p, false)),
+                keys(&preview_activity_label_style(p, true)),
+                "{theme:?} label keys"
+            );
+            // …and the values DO differ, or the test above is vacuous.
+            assert_ne!(
+                preview_activity_row_style(p, false),
+                preview_activity_row_style(p, true)
+            );
+        }
+    }
+
+    /// ★ A row's fold index is the DAEMON'S, not its position in what survived
+    /// the render filter.
+    ///
+    /// The Web View filters scaffold, placeholders and adjacent duplicates out
+    /// of the daemon's block list, then folds/unfolds a row by sending an INDEX
+    /// back to the daemon — which owns the unfiltered list. Measured live on a
+    /// real Claude Code transcript (guihost, 2026-08-01): 977 blocks held, 966
+    /// drawn, and clicking the 542nd drawn row folded the daemon's 531st. With
+    /// two blocks the drift was invisible; with a timeline of hundreds of tool
+    /// calls it is the whole affordance.
+    ///
+    /// So the identity travels WITH the row, and this locks that: drop one block
+    /// in the middle and every row after it must keep its ORIGINAL number.
+    #[test]
+    fn a_visible_rows_index_is_the_daemons_not_its_position_after_filtering() {
+        let mut session = preview_probe_session();
+        session.preview.blocks = vec![
+            SessionPreviewBlock::message(
+                "USER",
+                "now".to_string(),
+                PreviewTone::User,
+                vec!["rename the flag".to_string()],
+            ),
+            // Dropped by the scaffold filter — the block that makes the two
+            // index spaces disagree.
+            SessionPreviewBlock::message(
+                "ASSISTANT",
+                "now".to_string(),
+                PreviewTone::Assistant,
+                vec!["Launch command prepared: /bin/bash".to_string()],
+            ),
+            SessionPreviewBlock::message(
+                "ASSISTANT",
+                "now".to_string(),
+                PreviewTone::Assistant,
+                vec!["Done.".to_string()],
+            ),
+        ];
+
+        let rows = visible_preview_block_rows(&session);
+        assert_eq!(rows.len(), 2, "the scaffold block is filtered: {rows:?}");
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(
+            rows[1].0, 2,
+            "the surviving row keeps the daemon's index, not 1: {rows:?}"
+        );
+        assert_eq!(rows[1].1.lines, vec!["Done.".to_string()]);
+
+        // …and the grouped run the renderer draws carries that same number, so
+        // the toggle the user clicks reaches the block they are looking at.
+        let runs = group_preview_runs(&rows);
+        let indices = runs
+            .iter()
+            .flat_map(|run| run.entries.iter().map(|entry| entry.block_ix))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 2], "{runs:?}");
+
+        // The projection used by every other caller is unchanged.
+        assert_eq!(visible_preview_blocks(&session).len(), 2);
+    }
+
+    /// ★ Toggling a row must actually repaint it.
+    ///
+    /// Both preview caches are keyed by a hash of the blocks. Folding changes
+    /// nothing about a block except `folded`, so a key blind to it returns the
+    /// PRE-TOGGLE list — live-caught on guihost 2026-08-01 with the daemon
+    /// correctly holding the block open and the row still shut on screen.
+    #[test]
+    fn folding_a_row_changes_the_preview_cache_keys() {
+        let block = |folded: bool| SessionPreviewBlock {
+            role: "TOOL",
+            timestamp: "now".to_string(),
+            tone: PreviewTone::Assistant,
+            folded,
+            lines: vec!["output".to_string()],
+            kind: PreviewBlockKind::ToolCall,
+            activity: Some(yggterm_server::PreviewActivity {
+                tool: "Bash".to_string(),
+                headline: "cargo test".to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_ne!(
+            preview_block_cache_key(&[block(true)]),
+            preview_block_cache_key(&[block(false)]),
+            "the visible-block cache must see the fold"
+        );
+        assert_ne!(
+            preview_run_cache_key(&[(0, block(true))]),
+            preview_run_cache_key(&[(0, block(false))]),
+            "the run cache must see the fold"
+        );
+    }
+
+    /// A tool call with no output yet is still a tool call the reader must see.
+    ///
+    /// `visible_preview_blocks` dropped any block whose lines were empty, which
+    /// was right when a block WAS its lines. A tool row's meaning lives on its
+    /// activity — the command it ran — so the emptiness rule has to ask what kind
+    /// of block it is holding.
+    #[test]
+    fn a_tool_call_with_no_output_survives_the_visible_block_filter() {
+        let mut session = preview_probe_session();
+        session.preview.blocks = vec![
+            SessionPreviewBlock::message(
+                "USER",
+                "now".to_string(),
+                PreviewTone::User,
+                vec!["rename the flag".to_string()],
+            ),
+            SessionPreviewBlock {
+                role: "TOOL",
+                timestamp: "now".to_string(),
+                tone: PreviewTone::Assistant,
+                folded: true,
+                lines: Vec::new(),
+                kind: PreviewBlockKind::ToolCall,
+                activity: Some(yggterm_server::PreviewActivity {
+                    tool: "Bash".to_string(),
+                    headline: "cargo test --workspace".to_string(),
+                    ..Default::default()
+                }),
+            },
+        ];
+        let visible = visible_preview_blocks(&session);
+        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert_eq!(visible[1].kind, PreviewBlockKind::ToolCall);
+        assert_eq!(
+            visible[1].activity.as_ref().unwrap().headline,
+            "cargo test --workspace"
+        );
+    }
+
+    /// Two calls to the same tool differ only in their headline once their output
+    /// is clamped to the same note. The visible-block filter drops ADJACENT
+    /// duplicates, so a signature blind to the activity collapses a real pair of
+    /// commands into one row.
+    #[test]
+    fn two_tool_calls_that_differ_only_in_headline_are_not_deduped() {
+        let tool = |headline: &str| SessionPreviewBlock {
+            role: "TOOL",
+            timestamp: "now".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: true,
+            lines: vec!["… 460 more lines".to_string()],
+            kind: PreviewBlockKind::ToolCall,
+            activity: Some(yggterm_server::PreviewActivity {
+                tool: "Bash".to_string(),
+                headline: headline.to_string(),
+                ..Default::default()
+            }),
+        };
+        let mut session = preview_probe_session();
+        session.preview.blocks = vec![tool("cargo build"), tool("cargo test")];
+        let visible = visible_preview_blocks(&session);
+        assert_eq!(visible.len(), 2, "{visible:?}");
+    }
+
+    /// Marks are keyed by what a tool DOES, not by its name, so a CLI that calls
+    /// its shell tool `exec_command` and one that calls it `Bash` wear the same
+    /// mark (DESIGN.md, the named-set rule).
+    #[test]
+    fn the_activity_mark_is_keyed_by_what_the_tool_does() {
+        let tool = |name: &str| SessionPreviewBlock {
+            role: "TOOL",
+            timestamp: "now".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: true,
+            lines: Vec::new(),
+            kind: PreviewBlockKind::ToolCall,
+            activity: Some(yggterm_server::PreviewActivity {
+                tool: name.to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            preview_activity_mark(&tool("Bash")),
+            preview_activity_mark(&tool("exec_command")),
+        );
+        assert_eq!(
+            preview_activity_mark(&tool("Bash")),
+            PreviewActivityMark::Command
+        );
+        assert_eq!(
+            preview_activity_mark(&tool("Edit")),
+            PreviewActivityMark::FileChange
+        );
+        assert_eq!(
+            preview_activity_mark(&tool("Read")),
+            PreviewActivityMark::FileRead
+        );
+        assert_eq!(
+            preview_activity_mark(&tool("Grep")),
+            PreviewActivityMark::Search
+        );
+        let mut thinking = tool("");
+        thinking.kind = PreviewBlockKind::Reasoning;
+        thinking.activity = None;
+        assert_eq!(
+            preview_activity_mark(&thinking),
+            PreviewActivityMark::Thinking
+        );
+    }
+
+    /// A chip shows the identifying tail of a path. Every file in a repo shares
+    /// the same absolute prefix, which pushes the part that names it off the end
+    /// of a chip narrow enough to fit four of them.
+    #[test]
+    fn a_changed_file_chip_keeps_the_identifying_tail() {
+        assert_eq!(
+            preview_changed_file_label("/home/user/gh/yggterm/crates/yggterm-shell/src/shell.rs"),
+            "src/shell.rs"
+        );
+        assert_eq!(preview_changed_file_label("Cargo.toml"), "Cargo.toml");
+    }
+
     // ★ THE fixed-property-key invariant (the docked-rail-ghost fix): the outer
     // AND the card must emit the SAME set of CSS property keys in EVERY mode, so
     // switching modes fully RESETS every property. Dioxus applies `style`
@@ -140784,6 +141465,8 @@ mod tests {
             tone: PreviewTone::Assistant,
             folded: false,
             lines: vec!["Recent assistant response".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         });
         session.metadata.push(SessionMetadataEntry {
             label: "Storage",
@@ -140807,6 +141490,8 @@ mod tests {
             tone: PreviewTone::User,
             folded: false,
             lines: vec!["older transcript head".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         });
         session.preview.blocks.push(SessionPreviewBlock {
             role: "ASSISTANT",
@@ -140814,6 +141499,8 @@ mod tests {
             tone: PreviewTone::Assistant,
             folded: false,
             lines: vec!["latest transcript tail".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         });
         session.metadata.push(SessionMetadataEntry {
             label: "Preview Hydration",
@@ -140839,6 +141526,8 @@ mod tests {
                 tone: PreviewTone::Assistant,
                 folded: false,
                 lines: vec![format!("latest transcript tail {ix}")],
+                kind: PreviewBlockKind::Message,
+                activity: None,
             });
         }
         let latest_window = preview_latest_materialized_window(
@@ -140884,6 +141573,8 @@ mod tests {
             tone: PreviewTone::Assistant,
             folded: false,
             lines: vec!["latest transcript tail".to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         });
         session.metadata.push(SessionMetadataEntry {
             label: "Preview Hydration",
@@ -142367,6 +143058,8 @@ mod tests {
                 "```".to_string(),
                 "Runs the focused regression suite.".to_string(),
             ],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         };
         assert_eq!(
             preview_block_excerpt(&block, 120).as_deref(),
@@ -144022,6 +144715,8 @@ mod tests {
                         lines: vec!["Build Excel shortcut UI".to_string()],
                         tone: PreviewTone::User,
                         folded: false,
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     }],
                 },
                 metadata: vec![
@@ -147969,6 +148664,8 @@ mod tests {
                     tone: yggterm_server::PreviewTone::Assistant,
                     folded: false,
                     lines: vec!["timezone migration".to_string()],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: Vec::new(),
@@ -148312,6 +149009,8 @@ mod tests {
                         "Target: /home/user".to_string(),
                         "Command: /bin/bash".to_string(),
                     ],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: Vec::new(),
@@ -148357,6 +149056,8 @@ mod tests {
                     tone: yggterm_server::PreviewTone::Assistant,
                     folded: false,
                     lines: vec!["still loading".to_string()],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -148406,6 +149107,8 @@ mod tests {
                         tone: yggterm_server::PreviewTone::Assistant,
                         folded: false,
                     lines: vec!["Refreshing Web View…".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     yggterm_server::SessionPreviewBlock {
                         role: "assistant",
@@ -148416,6 +149119,8 @@ mod tests {
                             "Preparing the remote Web View surface and waiting for transcript hydration."
                                 .to_string(),
                         ],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -148466,6 +149171,8 @@ mod tests {
                         tone: yggterm_server::PreviewTone::User,
                         folded: false,
                         lines: vec!["What should I set as the Android tracking URL?".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     yggterm_server::SessionPreviewBlock {
                         role: "ASSISTANT",
@@ -148473,6 +149180,8 @@ mod tests {
                         tone: yggterm_server::PreviewTone::Assistant,
                         folded: false,
                         lines: vec!["Use http://trac.example.com:5055 on LAN.".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -148524,6 +149233,8 @@ mod tests {
                         tone: yggterm_server::PreviewTone::User,
                         folded: false,
                         lines: vec!["Read the transcript in Web View.".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                     yggterm_server::SessionPreviewBlock {
                         role: "ASSISTANT",
@@ -148531,6 +149242,8 @@ mod tests {
                         tone: yggterm_server::PreviewTone::Assistant,
                         folded: false,
                         lines: vec!["I will hydrate the full JSONL in the background.".to_string()],
+                        kind: PreviewBlockKind::Message,
+                        activity: None,
                     },
                 ],
             },
@@ -148589,6 +149302,8 @@ mod tests {
                     tone: yggterm_server::PreviewTone::Assistant,
                     folded: false,
                     lines: vec!["Readable recent scan text.".to_string()],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: Vec::new(),
@@ -157140,6 +157855,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tone,
             folded: false,
             lines: vec![text.to_string()],
+            kind: PreviewBlockKind::Message,
+            activity: None,
         }
     }
 
@@ -165264,6 +165981,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     tone: PreviewTone::Assistant,
                     folded: false,
                     lines: heavy_preview_lines.clone(),
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -165313,6 +166032,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     tone: PreviewTone::Assistant,
                     folded: false,
                     lines: heavy_preview_lines,
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![SessionMetadataEntry {
@@ -166809,6 +167530,8 @@ Shared connection to 192.0.2.14 closed.\r\n";
                     lines: vec![
                         "I will inspect the wireless logs and hostapd state first.".to_string(),
                     ],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: Vec::new(),
@@ -166956,6 +167679,8 @@ Shared connection to 192.0.2.14 closed.\r\n";
                     lines: vec![
                         "This Codex session stays attached to the daemon and opens inline in the main terminal viewport.".to_string(),
                     ],
+                    kind: PreviewBlockKind::Message,
+                    activity: None,
                 }],
             },
             metadata: vec![yggterm_server::SessionMetadataEntry {
