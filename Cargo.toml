@@ -10,6 +10,16 @@ members = [
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",
   "crates/emd-renderer",
+  # ⛔ A LOCK THAT NEVER RUNS IS NOT A LOCK. This vendored crate holds 67
+  # tests — 64 of them in web_surface.rs, covering the adblock content-filter
+  # FFI, under-glass restacking, the find controller and the seat observer —
+  # and for as long as it was only a `[patch.crates-io]` path dependency,
+  # `cargo test` at the root never ran a single one of them. CI never named
+  # them either (it names individual tests in the other crates, one per line).
+  # Caught 2026-07-31 by the clipboard-image-paste lane, whose predecessor
+  # lock `every_page_surface_is_built_able_to_paste` had been green for weeks
+  # while being structurally incapable of failing.
+  "vendor/dioxus-desktop",
 ]
 resolver = "2"
 
