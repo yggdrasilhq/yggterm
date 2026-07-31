@@ -6,6 +6,7 @@ members = [
   "crates/yggterm-server",
   "crates/yggui",
   "crates/yggterm-shell",
+  "crates/yggterm-webprobe",
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",
