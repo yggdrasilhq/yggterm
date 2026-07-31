@@ -386,6 +386,18 @@ impl DesktopService {
         }
     }
 
+    /// Replace the CHORD CLAIM TABLE the window-level claimer matches against
+    /// (see `web_surface::ClaimedChord`). The shell owns what is claimed; the
+    /// host only matches and relays.
+    pub fn set_web_surface_claimed_chords(
+        &self,
+        chords: Vec<crate::web_surface::ClaimedChord>,
+    ) {
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_claimed_chords(chords);
+        }
+    }
+
     /// Hand keyboard focus to a page webview — the GIVE-BACK half of the
     /// ALT-layer focus loan (the tap notifier grabs focus for the shell; when
     /// the KeyTips layer closes over a revealed surface, focus returns here).
