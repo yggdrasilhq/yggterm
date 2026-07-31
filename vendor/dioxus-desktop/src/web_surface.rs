@@ -1446,6 +1446,20 @@ pub struct WebSurfaceHost {
     /// focus to the shell and opens the KeyTips layer; the shell gives focus
     /// back when the layer closes.
     alt_tap: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    /// A shell CHORD claimed on the TOPLEVEL WINDOW (see [`ClaimedChord`]) —
+    /// `Ctrl+F` and `F11` today. Same deafness as the ALT tap and the same
+    /// three hops out, one level higher: the claimer consumes the key above
+    /// every focused child, the notifier optionally hands keyboard focus to the
+    /// shell and relays the chord's ID in, and the shell's one terminus decides
+    /// what it means. Unlike the tap, the key is CONSUMED — a claimed chord
+    /// that also reached the page would run the site's own handler underneath
+    /// the chrome the shell just opened, and a claimed `F11` that also reached
+    /// the page would toggle the page's own fullscreen back.
+    chord: Rc<RefCell<Option<Rc<dyn Fn(ClaimedChord)>>>>,
+    /// The chords the shell has asked for, as data. Rebuilt from the live
+    /// keymap on every bridge (re)install, so an accelerator the user rebinds
+    /// is claimed at its NEW chord without a restart.
+    claimed_chords: Rc<RefCell<Vec<ClaimedChord>>>,
     /// THE surface WebKit has taken into element fullscreen, or `None`.
     ///
     /// One owner for "is a page on the whole screen right now", written only by
@@ -2103,6 +2117,188 @@ fn connect_alt_tap_observer(
             gtk::glib::Propagation::Proceed
         });
     }
+}
+
+/// One chord the SHELL has asked this host to claim from the toplevel window.
+///
+/// **The table is DATA, pushed from the shell** ([`WebSurfaceHost::set_claimed_chords`]),
+/// exactly as the KeyTips bridge is handed its live accelerator set. Nothing
+/// here knows what `f` or `F11` MEAN — that is the shell's business and the
+/// shell's single source of truth (its keymap, including the user's
+/// `keymap.json` rebinds). This layer is a matcher and a relay.
+///
+/// Adding a chord is therefore a ROW in the shell's table plus an arm at the
+/// shell's terminus; nothing in this file changes. `Ctrl+P` (print) is
+/// deliberately absent because there is no print path to route it to yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedChord {
+    /// CONTROL must be held.
+    pub ctrl: bool,
+    /// SHIFT must be held.
+    pub shift: bool,
+    /// ALT must be held.
+    pub alt: bool,
+    /// The canonical key the press must produce — see [`press_key`]: a single
+    /// lowercase character (`"f"`), or a GDK key name for a key that is not a
+    /// character (`"F11"`, `"Page_Up"`).
+    pub key: String,
+    /// The shell's own id for what this chord means, relayed back verbatim.
+    pub id: String,
+    /// Claim it ONLY while a PAGE surface owns the keyboard.
+    ///
+    /// ⚠ This is the flag that keeps a bare `Ctrl+<letter>` legal. A window
+    /// handler sees every key in the app, including keys typed at a terminal,
+    /// and `Ctrl+F` is readline's forward-char — the project asserts that a
+    /// bare Ctrl+letter belongs to the PTY (`assert_accels_pty_safe`). So
+    /// `Ctrl+F` is claimed only when a browser genuinely owns the viewport.
+    /// `F11` is PTY-safe and needs no such condition, which is exactly why the
+    /// distinction is a per-row FLAG and not a property of the mechanism.
+    pub page_only: bool,
+    /// Hand the keyboard to the shell webview before relaying.
+    ///
+    /// True for a chord whose target is a shell DOM control (the find field
+    /// cannot take a keystroke while WebKit's child holds the toplevel focus);
+    /// false for a chord that only runs a command (leaving fullscreen must not
+    /// also take the keyboard off the page the user is reading).
+    pub focus_shell: bool,
+}
+
+/// One key press as the claim rule sees it — GTK-free, so the rule is a unit
+/// test and not something only a live keyboard can falsify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChordPress {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    /// The canonical key, from [`press_key`].
+    key: String,
+}
+
+/// The canonical key string for a GDK keyval.
+///
+/// A character key answers with its character, ASCII-lowercased; anything else
+/// answers with GDK's own key name. Two reasons the fold lives here rather than
+/// in a keyval comparison: with CapsLock on, `Ctrl+f` arrives as keyval `F`
+/// with no SHIFT in the mask, so a keyval test would silently stop claiming;
+/// and a single spelling means the shell's table can be written the way a human
+/// writes a chord.
+fn press_key(keyval: gdk::keys::Key) -> String {
+    canonical_key(
+        keyval.to_unicode(),
+        keyval.name().map(|name| name.to_string()).as_deref(),
+    )
+}
+
+/// The pure half of [`press_key`] — GDK's two answers in, the canonical key out.
+///
+/// Split from the GTK call so the rule that decides `F11` from `f` from
+/// `Escape` is a unit test rather than something only a live keyboard can
+/// falsify. A control character (Escape is `\u{1b}`, Return is `\r`) is NOT a
+/// key name: it falls through to GDK's own name, which is what a chord table
+/// can be written against.
+fn canonical_key(unicode: Option<char>, name: Option<&str>) -> String {
+    match unicode {
+        Some(letter) if !letter.is_control() => letter.to_ascii_lowercase().to_string(),
+        _ => name.unwrap_or_default().to_string(),
+    }
+}
+
+/// THE claim rule. `Some` means the shell takes this key and nothing below the
+/// window sees it; `None` means the press belongs to whoever has focus.
+///
+/// Modifiers must match EXACTLY — a table row for `Ctrl+F` does not claim
+/// `Ctrl+Shift+F` or `Ctrl+Alt+F`, so a chord the product does not have can
+/// never be taken by accident.
+///
+/// **SUPER is not read.** The shell's DOM handler treats META as an accelerator
+/// because that is what a Mac means by one; on this path (Linux/WebKitGTK) the
+/// SUPER key is the compositor's, and claiming `Super+<key>` would take a key
+/// the window manager may already own.
+fn claimed_chord<'a>(
+    table: &'a [ClaimedChord],
+    press: &ChordPress,
+    page_focused: bool,
+) -> Option<&'a ClaimedChord> {
+    table.iter().find(|entry| {
+        entry.ctrl == press.ctrl
+            && entry.shift == press.shift
+            && entry.alt == press.alt
+            && entry.key.eq_ignore_ascii_case(&press.key)
+            && (!entry.page_only || page_focused)
+    })
+}
+
+/// Claim the shell's chords on the TOPLEVEL WINDOW, above every focused child.
+///
+/// **Why the window and not each surface** (measured, not reasoned — a probe
+/// built the real arrangement, GtkWindow > GtkOverlay > GtkFixed >
+/// WebKitWebView, gave the webview the keyboard, and drove real X key events):
+/// the window's `key-press-event` fires BEFORE the focused child's, and a
+/// window handler returning `Propagation::Stop` consumes the key so completely
+/// that the page's own `keydown` listener never runs. Per-surface handlers
+/// would have to be remembered at every door a focusable child is built
+/// through — there are already two, and the day a third is added the user is
+/// silently re-trapped. There is exactly one toplevel.
+///
+/// **This is the fullscreen escape hatch, so it cannot be conditional on a
+/// surface existing.** `F11` claimed here works with a page focused, a terminal
+/// focused, the shell focused, or a child kind that does not exist yet.
+///
+/// A surface that is not visible never counts as "a page owns the keyboard": an
+/// invisible webview holding the toplevel's focus is a defect this product has
+/// already paid for, and letting it satisfy a `page_only` row would be that
+/// defect with a chord on top. It does not suppress the rows that are not
+/// `page_only` — an escape hatch that a stray focus could disarm is not one.
+fn connect_window_chord_claimer(
+    window: &gtk::Window,
+    table: &Rc<RefCell<Vec<ClaimedChord>>>,
+    surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
+    notify: &Rc<RefCell<Option<Rc<dyn Fn(ClaimedChord)>>>>,
+) {
+    let table = table.clone();
+    let surfaces = surfaces.clone();
+    let notify = notify.clone();
+    window.connect_key_press_event(move |window, event| {
+        let mask = event.state();
+        let press = ChordPress {
+            ctrl: mask.contains(gdk::ModifierType::CONTROL_MASK),
+            shift: mask.contains(gdk::ModifierType::SHIFT_MASK),
+            alt: mask.contains(gdk::ModifierType::MOD1_MASK),
+            key: press_key(event.keyval()),
+        };
+        // Does a PAGE own the keyboard right now? Asked of the widget the
+        // toplevel says has focus, against the surfaces this host owns — the
+        // shell's own webview is not among them, so a shell-focused (and
+        // therefore terminal-focused) keyboard reads FALSE and a `page_only`
+        // chord stands down.
+        let page_focused = {
+            use gtk::prelude::GtkWindowExt as _;
+            match window.focused_widget() {
+                Some(focus) => surfaces.borrow().values().any(|surface| {
+                    use wry::WebViewExtUnix as _;
+                    let webkit = surface.webview.webview();
+                    let widget: &gtk::Widget = gtk::prelude::Cast::upcast_ref(&webkit);
+                    gtk::prelude::WidgetExt::is_visible(widget) && *widget == focus
+                }),
+                None => false,
+            }
+        };
+        let claimed = {
+            let table = table.borrow();
+            claimed_chord(&table, &press, page_focused).cloned()
+        };
+        let Some(claimed) = claimed else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        // Cloned out of the cell BEFORE the call: the notifier reaches into the
+        // shell webview, and a borrow held across that is a borrow held across
+        // re-entry.
+        let Some(notify) = notify.borrow().clone() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        notify(claimed);
+        gtk::glib::Propagation::Stop
+    });
 }
 
 fn rect_logical(w: i32, h: i32) -> Rect {
@@ -2883,6 +3079,8 @@ impl WebSurfaceHost {
             next_transfer_id: Rc::new(Cell::new(1)),
             edge_motion: Rc::new(RefCell::new(None)),
             alt_tap: Rc::new(RefCell::new(None)),
+            chord: Rc::new(RefCell::new(None)),
+            claimed_chords: Rc::new(RefCell::new(Vec::new())),
             fullscreen: Rc::new(Cell::new(None)),
             theme_colors: Rc::new(RefCell::new(HashMap::new())),
         }
@@ -2916,6 +3114,27 @@ impl WebSurfaceHost {
     /// observers share this cell.
     pub(crate) fn set_alt_tap_notifier(&self, notify: impl Fn() + 'static) {
         *self.alt_tap.borrow_mut() = Some(Rc::new(notify));
+    }
+
+    /// Install the CHORD notifier (see the `chord` field and [`ClaimedChord`]).
+    /// One registration serves every chord: the notifier is handed WHICH chord
+    /// fired rather than being one callback per key.
+    pub(crate) fn set_chord_notifier(&self, notify: impl Fn(ClaimedChord) + 'static) {
+        *self.chord.borrow_mut() = Some(Rc::new(notify));
+    }
+
+    /// Replace the claim table. The SHELL owns what is claimed; this host only
+    /// matches. Called on every bridge (re)install so a rebound accelerator is
+    /// claimed at its new chord.
+    pub fn set_claimed_chords(&self, chords: Vec<ClaimedChord>) {
+        *self.claimed_chords.borrow_mut() = chords;
+    }
+
+    /// Attach the claimer to the toplevel window. Called ONCE, from the glue
+    /// that owns the window — see [`connect_window_chord_claimer`] for why the
+    /// window and not each surface.
+    pub(crate) fn install_window_chord_claimer(&self, window: &gtk::Window) {
+        connect_window_chord_claimer(window, &self.claimed_chords, &self.surfaces, &self.chord);
     }
 
     /// Paint the native backdrop (the overlay's base child) in the app's
@@ -5261,6 +5480,141 @@ mod alt_tap_locks {
             focus_at < relay_at,
             "focus must be granted BEFORE the tap relay — the overlay opens \
              expecting the keyboard to already be home"
+        );
+    }
+}
+
+/// LOCKS for the CHORD claim RULE — the shell's keys above every focused child.
+///
+/// **Only the pure rule lives here.** `claimed_chord` and `press_key` are
+/// private to this file, so their tests must be; but this crate is a
+/// `[patch.crates-io]` path dependency, not a workspace member, so nothing here
+/// runs under `cargo test --workspace` — it needs `cargo test -p
+/// dioxus-desktop`. The WIRING (one attachment, on the toplevel; consumes only
+/// a claim; the escape hatch cannot be page-only) is locked from
+/// `yggterm-shell`, which already scans this file and does run in the workspace
+/// suite.
+#[cfg(test)]
+mod chord_claim_locks {
+    use super::{ChordPress, ClaimedChord, canonical_key, claimed_chord};
+
+    /// GDK answers a key press two ways; this is which answer wins.
+    ///
+    /// A printable character folds to lowercase — with CapsLock on, `Ctrl+f`
+    /// arrives as keyval `F` with no SHIFT in the mask, so a table written
+    /// against `"f"` would silently stop matching. A control character is NOT a
+    /// key name (Escape is `\u{1b}`, Return is `\r`): those fall through to
+    /// GDK's own name, which is what a chord table can be written against.
+    #[test]
+    fn a_press_canonicalises_to_the_spelling_a_chord_table_uses() {
+        assert_eq!(canonical_key(Some('f'), Some("f")), "f");
+        assert_eq!(canonical_key(Some('F'), Some("F")), "f");
+        assert_eq!(canonical_key(Some('7'), Some("7")), "7");
+        assert_eq!(canonical_key(None, Some("F11")), "F11");
+        assert_eq!(
+            canonical_key(Some('\u{1b}'), Some("Escape")),
+            "Escape",
+            "a control character is not a key name"
+        );
+        assert_eq!(canonical_key(Some('\r'), Some("Return")), "Return");
+        assert_eq!(canonical_key(None, None), "");
+    }
+
+    fn chord(ctrl: bool, shift: bool, alt: bool, key: &str, id: &str, page_only: bool) -> ClaimedChord {
+        ClaimedChord {
+            ctrl,
+            shift,
+            alt,
+            key: key.to_string(),
+            id: id.to_string(),
+            page_only,
+            focus_shell: false,
+        }
+    }
+
+    fn press(ctrl: bool, shift: bool, alt: bool, key: &str) -> ChordPress {
+        ChordPress {
+            ctrl,
+            shift,
+            alt,
+            key: key.to_string(),
+        }
+    }
+
+    fn table() -> Vec<ClaimedChord> {
+        vec![
+            chord(true, false, false, "f", "web.find", true),
+            chord(false, false, false, "F11", "window.fullscreen", false),
+        ]
+    }
+
+    /// Exact modifiers, folded key, and nothing adjacent.
+    #[test]
+    fn a_chord_is_claimed_only_in_the_exact_shape_the_table_asks_for() {
+        let table = table();
+        assert_eq!(
+            claimed_chord(&table, &press(true, false, false, "f"), true).map(|c| c.id.as_str()),
+            Some("web.find")
+        );
+        assert_eq!(
+            claimed_chord(&table, &press(true, false, false, "F"), true).map(|c| c.id.as_str()),
+            Some("web.find"),
+            "CapsLock sends keyval F with no SHIFT in the mask — the key compare \
+             folds case, or the chord silently stops working with CapsLock on"
+        );
+        for (ctrl, shift, alt, why) in [
+            (true, true, false, "Ctrl+Shift+F is not a binding this product has"),
+            (true, false, true, "Ctrl+Alt+F likewise"),
+            (false, false, false, "typing f must never open a find bar"),
+        ] {
+            assert_eq!(
+                claimed_chord(&table, &press(ctrl, shift, alt, "f"), true),
+                None,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            claimed_chord(&table, &press(true, false, false, "g"), true),
+            None,
+            "there is no Ctrl+G in this product — the table is the whole set"
+        );
+    }
+
+    /// ⭐ THE ESCAPE HATCH. `page_only` is what keeps a bare `Ctrl+<letter>`
+    /// off the terminal; it must NOT be what keeps the user in fullscreen.
+    ///
+    /// A window-level claimer sees every key in the app. Ctrl+F stands down
+    /// unless a page owns the keyboard (readline's forward-char belongs to the
+    /// PTY). F11 stands down for nothing: it is the way out of a mode that
+    /// renders no chrome, and a user who cannot leave has no recourse but to
+    /// kill the app — which is what happened.
+    #[test]
+    fn the_fullscreen_escape_is_claimed_whatever_holds_the_keyboard() {
+        let table = table();
+        for page_focused in [true, false] {
+            assert_eq!(
+                claimed_chord(&table, &press(false, false, false, "F11"), page_focused)
+                    .map(|c| c.id.as_str()),
+                Some("window.fullscreen"),
+                "F11 must be claimed with page_focused={page_focused} — an escape \
+                 that only works over a browser is not an escape"
+            );
+        }
+        assert_eq!(
+            claimed_chord(&table, &press(true, false, false, "f"), false),
+            None,
+            "Ctrl+F with NO page focused is the terminal's forward-char and must \
+             never be taken — this is the regression the product guards against"
+        );
+    }
+
+    /// First match wins, and an empty table claims nothing at all — the state
+    /// the host is in before the shell has pushed anything.
+    #[test]
+    fn an_empty_table_claims_nothing() {
+        assert_eq!(
+            claimed_chord(&[], &press(false, false, false, "F11"), false),
+            None
         );
     }
 }

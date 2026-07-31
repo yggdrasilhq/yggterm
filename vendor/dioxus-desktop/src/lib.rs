@@ -33,10 +33,10 @@ mod web_surface;
     target_os = "android"
 )))]
 pub use web_surface::{
-    CookieRecord, EvalFailure, EvalFailureKind, FindAction, INJECTION_CREDIT_TTL_MS,
-    SurfaceCloseRequest, SurfaceDownloadEvent, SurfaceDownloadPhase, SurfaceLiveness,
-    SurfacePopup, SurfaceUserscript, grant_injection_credits, grant_injection_credits_at,
-    note_seat_input, note_seat_input_at, take_seat_input_count,
+    ClaimedChord, CookieRecord, EvalFailure, EvalFailureKind, FindAction,
+    INJECTION_CREDIT_TTL_MS, SurfaceCloseRequest, SurfaceDownloadEvent, SurfaceDownloadPhase,
+    SurfaceLiveness, SurfacePopup, SurfaceUserscript, grant_injection_credits,
+    grant_injection_credits_at, note_seat_input, note_seat_input_at, take_seat_input_count,
 };
 mod webview;
 
