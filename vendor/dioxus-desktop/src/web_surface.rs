@@ -1740,6 +1740,20 @@ pub struct WebSurfaceHost {
     /// `THEME_COLOR_SHIM_JS`). The shell reads it to paint the seam; nothing
     /// here parses it.
     theme_colors: Rc<RefCell<HashMap<u64, String>>>,
+    /// Capture asks the shell has not been told about yet, drained each
+    /// reconcile tick. See the HARDWARE CAPTURE section.
+    media_permission_requests: Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
+    /// Capture asks the ENGINE is still blocked on, by request id. The queue
+    /// above is a notification; this is the obligation — every entry here is a
+    /// page whose `getUserMedia()` promise is hanging, and it leaves only
+    /// through `allow()` or `deny()`.
+    parked_media_permissions: Rc<RefCell<HashMap<u64, ParkedMediaPermission>>>,
+    /// Asks settled with no human answer — surface closed, or deadline passed —
+    /// so the shell can take down a dialog that no longer stands for anything.
+    retired_media_permissions: Rc<RefCell<Vec<u64>>>,
+    /// Request ids. Separate from `next_id` because these are not surfaces and
+    /// sharing the counter would make a trace row ambiguous about which it names.
+    next_media_permission_id: Rc<Cell<u64>>,
 }
 
 /// The top-edge motion zone (window coords, logical px) that forwards to the
@@ -2223,6 +2237,233 @@ thread_local! {
 /// page's question reaches a human (or an agent's log) instead of vanishing.
 pub fn take_script_dialogs() -> Vec<ScriptDialogRecord> {
     SCRIPT_DIALOGS.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+// ---------------------------------------------------------------------------
+// HARDWARE CAPTURE — camera and microphone
+// ---------------------------------------------------------------------------
+//
+// Nothing in this process was ever connected to WebKitGTK's
+// `permission-request` signal, and that — not a missing API — is why the camera
+// never worked.
+//
+// ⚠ MEASURED on the live host (jojo, WebKitGTK 2.52.5, yggterm 2.12.19, before
+// this change), because the obvious guess was wrong: `navigator.mediaDevices`
+// and `getUserMedia` were BOTH already present (`typeof` = `object` /
+// `function`) on a plain `http://127.0.0.1` surface. What actually happened is
+// worse than a rejection — `getUserMedia({audio:true, video:true})` **HUNG
+// FOREVER**: 30 s later the page was still `phase: "asking"` with the promise
+// neither resolved nor rejected. An unanswered `permission-request` is not a
+// deny; it is a page wedged on a question nobody is listening to.
+//
+// (`enumerateDevices()` did resolve, with every `label` and `deviceId` blank —
+// the engine's own privacy default, which this gate must preserve rather than
+// widen. And `RTCPeerConnection` was `undefined`, which is the one setting
+// below whose absence was directly observable.)
+//
+// ⛔ There is exactly ONE rule in this section: **a page never gets the camera
+// or the microphone without a human saying so.** yggterm's window holds live ssh
+// sessions and a password vault; a surface that could open a capture device on
+// its own is a serious defect, not a convenience. So the engine handler NEVER
+// decides. It parks the request, tells the shell, and waits — and every path
+// that is not an explicit approval (an unrecognised state, a dropped decision,
+// a closed surface, a timeout) ends in `deny()`.
+//
+// Where the DECISION lives is deliberately not here. The per-origin memory
+// belongs to the app that owns the surface (ychrome), reached over its control
+// endpoint; this file owns only the engine mechanics, exactly as
+// `connect_script_dialog_guard` owns answering a dialog while the shell owns
+// what a dialog means.
+
+/// What a page reached for when the engine raised `permission-request`.
+///
+/// Only the two capture-adjacent request types are named. Every OTHER
+/// `WebKitPermissionRequest` (geolocation, notifications, pointer lock, DRM key
+/// systems, missing-plugin installs, storage access) is left strictly alone —
+/// see [`connect_media_permission_gate`], which returns `false` for them so the
+/// engine's own default (deny) still applies. Naming them here would be the
+/// first step toward answering them, and none of them is in scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceMediaPermissionKind {
+    /// `getUserMedia()` — LIVE capture off a microphone or a camera. This is the
+    /// one that asks a human.
+    Capture,
+    /// `enumerateDevices()` asking for device LABELS and stable device ids.
+    /// WebKit raises this separately precisely so a page can be told "there are
+    /// two cameras" without being told which two, and the privacy rule every
+    /// browser follows is that labels appear only once capture is already
+    /// allowed for the site. So this NEVER prompts — see the shell's handler.
+    DeviceInfo,
+}
+
+impl SurfaceMediaPermissionKind {
+    /// The wire/trace name. One table, so a trace row and a decision cannot
+    /// disagree about which request they are talking about.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SurfaceMediaPermissionKind::Capture => "capture",
+            SurfaceMediaPermissionKind::DeviceInfo => "device-info",
+        }
+    }
+}
+
+/// A parked capture request, waiting on a human. The engine is blocked on it —
+/// the page's `getUserMedia()` promise is neither resolved nor rejected until
+/// `allow()` or `deny()` is called on the held request.
+struct ParkedMediaPermission {
+    /// The engine object. Held as a strong ref (the signal hands out a borrow),
+    /// because the answer arrives many ticks later.
+    request: webkit2gtk::PermissionRequest,
+    surface_id: u64,
+    /// When this stops waiting and is DENIED. A prompt nobody ever answers must
+    /// not leave the page's promise hanging forever, and must not leave a
+    /// camera-grant offer sitting on screen for an hour.
+    deadline: std::time::Instant,
+}
+
+/// How long a parked request waits for a decision before it is denied.
+///
+/// Matches ychrome's own `CEREMONY_TIMEOUT` for the passkey dialog: the same
+/// human, the same kind of "a modal is up, answer it or don't" wait.
+const MEDIA_PERMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One page's request to reach a capture device, as the shell needs it.
+///
+/// Carries no engine handle: the request itself stays parked in the host, and
+/// the shell answers it by id through [`WebSurfaceHost::resolve_media_permission`].
+/// That keeps the GTK object on the GTK thread and makes "who may answer this"
+/// a single function instead of a pointer the shell could hold past its life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceMediaPermissionRequest {
+    /// Host-local id of the parked request; echoed back to answer it.
+    pub request_id: u64,
+    /// The surface whose page asked. The shell resolves this to the session
+    /// (and therefore to the app whose policy owns the answer).
+    pub surface_id: u64,
+    /// Which ask this is: live capture, or a request for device labels.
+    pub kind: SurfaceMediaPermissionKind,
+    /// The page asked for a microphone.
+    pub audio: bool,
+    /// The page asked for a camera.
+    pub video: bool,
+    /// The surface's top-level document URI at the moment of the ask.
+    ///
+    /// The engine does not expose the requesting frame's origin on this API, and
+    /// the top-level document is the right subject anyway: a cross-origin iframe
+    /// only reaches this signal at all when the embedder handed it
+    /// `allow="camera"`, so the site the human recognises — and the site a
+    /// remembered decision must be keyed to — is the one in the address bar.
+    pub uri: String,
+}
+
+/// Turn the engine's capture capability on for ONE web surface.
+///
+/// Three settings, one place, because they are one capability:
+///
+/// * `enable-media-stream` — WebKitGTK's documented gate for media capture.
+///   ⚠ Set DEFENSIVELY, not because its absence was measured to break anything:
+///   on jojo's WebKitGTK 2.52.5 `navigator.mediaDevices.getUserMedia` was
+///   already exposed and already reached `permission-request` with this
+///   setting untouched. Do not describe it as "the fix" — the gate below is.
+/// * `enable-webrtc` — the peer-connection half, and the one setting here whose
+///   absence WAS directly observable: `window.RTCPeerConnection` read
+///   `undefined` before this line existed. A capture stream you cannot send
+///   anywhere covers only the local-preview case, and every real use of a
+///   camera in a browser (a call, a meeting, a recorder that uploads) is the
+///   other one.
+/// * `enable-media-capabilities` — `navigator.mediaCapabilities`, which the
+///   calling sites feature-detect to pick a codec before they ever ask for a
+///   device.
+///
+/// ⛔ Deliberately NOT in the vendored wry's global `set_webview_settings`, and
+/// for a sharper reason than smooth scrolling's: that path also builds the
+/// TERMINAL SHELL's webview, and the shell's webview has no `permission-request`
+/// gate on it. Turning capture on there would mean the one webview that renders
+/// yggterm's own chrome could reach a camera through whatever the engine's
+/// default answer happens to be. Per surface, behind a gate, or not at all.
+fn apply_media_capture_settings(settings: &webkit2gtk::Settings) {
+    use webkit2gtk::SettingsExt as _;
+    settings.set_enable_media_stream(true);
+    settings.set_enable_webrtc(true);
+    settings.set_enable_media_capabilities(true);
+}
+
+/// Answer `permission-request` on a web surface: park capture asks, leave
+/// everything else to the engine.
+///
+/// Returning `true` from this signal means "handled here"; returning `false`
+/// means the engine applies its own default, which is DENY. So the `false`
+/// branch below is not a gap — it is what keeps geolocation, notifications,
+/// pointer lock and the rest exactly as they were before this file grew a
+/// handler at all. ⛔ Never return `true` for a request this gate did not park:
+/// a `true` with no `allow()`/`deny()` behind it hangs the page, and a blanket
+/// `allow()` would hand the web every permission WebKit has.
+fn connect_media_permission_gate(
+    webkit: &webkit2gtk::WebView,
+    surface_id: u64,
+    requests: &Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
+    parked: &Rc<RefCell<HashMap<u64, ParkedMediaPermission>>>,
+    next_id: &Rc<Cell<u64>>,
+) {
+    use webkit2gtk::glib::prelude::*;
+    use webkit2gtk::{PermissionRequestExt as _, UserMediaPermissionRequestExt as _};
+    use webkit2gtk::{DeviceInfoPermissionRequest, UserMediaPermissionRequest, WebViewExt as _};
+    let requests = requests.clone();
+    let parked = parked.clone();
+    let next_id = next_id.clone();
+    webkit.connect_permission_request(move |view, request| {
+        let (kind, audio, video) = match request.downcast_ref::<UserMediaPermissionRequest>() {
+            Some(media) => (
+                SurfaceMediaPermissionKind::Capture,
+                media.is_for_audio_device(),
+                media.is_for_video_device(),
+            ),
+            None if request.is::<DeviceInfoPermissionRequest>() => {
+                (SurfaceMediaPermissionKind::DeviceInfo, false, false)
+            }
+            // Not ours. The engine's default (deny) still applies, unchanged.
+            None => return false,
+        };
+        // A capture ask for neither device has nothing to grant. Denying it here
+        // is not a policy decision — there is no device in it to decide about —
+        // and it keeps the shell from ever seeing an empty prompt.
+        if kind == SurfaceMediaPermissionKind::Capture && !audio && !video {
+            request.deny();
+            return true;
+        }
+        let request_id = {
+            let next = next_id.get();
+            next_id.set(next + 1);
+            next
+        };
+        let uri = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
+        tracing::info!(
+            surface_id,
+            request_id,
+            kind = kind.as_str(),
+            audio,
+            video,
+            %uri,
+            "web surface: parked a capture permission request"
+        );
+        parked.borrow_mut().insert(
+            request_id,
+            ParkedMediaPermission {
+                request: request.clone(),
+                surface_id,
+                deadline: std::time::Instant::now() + MEDIA_PERMISSION_TIMEOUT,
+            },
+        );
+        requests.borrow_mut().push(SurfaceMediaPermissionRequest {
+            request_id,
+            surface_id,
+            kind,
+            audio,
+            video,
+            uri,
+        });
+        true
+    });
 }
 
 /// Answer JS dialogs on this surface instead of letting WebKit block on one.
@@ -2932,6 +3173,14 @@ struct SurfaceWindowPlumbing {
     popups: Rc<RefCell<Vec<SurfacePopup>>>,
     link_opens: Rc<RefCell<Vec<SurfaceLinkOpen>>>,
     next_id: Rc<Cell<u64>>,
+    // A popup is a page, and a page in a popup can call `getUserMedia()` — an
+    // OAuth-shaped "verify with your camera" window is exactly the shape that
+    // arrives as one. Its gate has to be the SAME gate, or capture would be
+    // silently denied in popups (or, worse, silently allowed if this were ever
+    // wired differently). See the HARDWARE CAPTURE section.
+    media_permission_requests: Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
+    parked_media_permissions: Rc<RefCell<HashMap<u64, ParkedMediaPermission>>>,
+    next_media_permission_id: Rc<Cell<u64>>,
     userscripts: Vec<SurfaceUserscript>,
     adblock_ruleset: Option<std::path::PathBuf>,
 }
@@ -3055,6 +3304,9 @@ fn build_popup_webview(
         fullscreen,
         theme_colors,
         link_opens,
+        media_permission_requests,
+        parked_media_permissions,
+        next_media_permission_id,
         userscripts,
         adblock_ruleset,
         ..
@@ -3141,6 +3393,18 @@ fn build_popup_webview(
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
     attach_surface_message_channel(&webview, popup_id, close_requests, theme_colors);
+    // Capture: the SAME gate a page surface gets, for the same reason a popup
+    // gets the passkey shim — the window a site pops up to "verify you" is
+    // exactly where a camera ask lands. Connected before the settings below
+    // turn the capability on, so there is no instant in this view's life where
+    // `getUserMedia()` is reachable and unanswered.
+    connect_media_permission_gate(
+        &webview.webview(),
+        popup_id,
+        media_permission_requests,
+        parked_media_permissions,
+        next_media_permission_id,
+    );
     let webkit = webview.webview();
     // Same engine-side scroll feel as the surface that opened it (see `open`):
     // smooth scrolling is a per-web-surface setting, never wry-global — the
@@ -3149,6 +3413,7 @@ fn build_popup_webview(
         use webkit2gtk::SettingsExt as _;
         if let Some(settings) = webkit2gtk::WebViewExt::settings(&webkit) {
             settings.set_enable_smooth_scrolling(true);
+            apply_media_capture_settings(&settings);
         }
     }
     {
@@ -3355,6 +3620,10 @@ impl WebSurfaceHost {
             claimed_chords: Rc::new(RefCell::new(Vec::new())),
             fullscreen: Rc::new(Cell::new(None)),
             theme_colors: Rc::new(RefCell::new(HashMap::new())),
+            media_permission_requests: Rc::new(RefCell::new(Vec::new())),
+            parked_media_permissions: Rc::new(RefCell::new(HashMap::new())),
+            retired_media_permissions: Rc::new(RefCell::new(Vec::new())),
+            next_media_permission_id: Rc::new(Cell::new(1)),
         }
     }
 
@@ -3521,6 +3790,9 @@ impl WebSurfaceHost {
             popups: self.popups.clone(),
             link_opens: self.link_opens.clone(),
             next_id: self.next_id.clone(),
+            media_permission_requests: self.media_permission_requests.clone(),
+            parked_media_permissions: self.parked_media_permissions.clone(),
+            next_media_permission_id: self.next_media_permission_id.clone(),
             userscripts: userscripts.to_vec(),
             adblock_ruleset: adblock_ruleset.map(|path| path.to_path_buf()),
         }
@@ -3555,6 +3827,93 @@ impl WebSurfaceHost {
     /// must still complete.
     pub fn downloads_in_flight(&self) -> usize {
         self.downloads_in_flight.borrow().len()
+    }
+
+    /// Drain the capture asks the shell has not seen yet. Each one names a page
+    /// whose `getUserMedia()` (or `enumerateDevices()`) promise is BLOCKED until
+    /// [`Self::resolve_media_permission`] answers it or the deadline denies it.
+    pub fn take_media_permission_requests(&self) -> Vec<SurfaceMediaPermissionRequest> {
+        std::mem::take(&mut self.media_permission_requests.borrow_mut())
+    }
+
+    /// Answer one parked capture ask. `true` ⇒ the page gets the device.
+    ///
+    /// Returns whether a request with that id was still parked — `false` means
+    /// it was already answered or already expired, which is a benign double-answer
+    /// (a second click, a decision that raced the deadline), not an error.
+    ///
+    /// THE only way a page ever reaches a camera or a microphone in yggterm. It
+    /// takes an explicit `allow`, and every caller of this reaches it from a
+    /// human's click.
+    pub fn resolve_media_permission(&self, request_id: u64, allow: bool) -> bool {
+        use webkit2gtk::PermissionRequestExt as _;
+        let Some(parked) = self.parked_media_permissions.borrow_mut().remove(&request_id) else {
+            return false;
+        };
+        tracing::info!(
+            request_id,
+            surface_id = parked.surface_id,
+            allow,
+            "web surface: answered a capture permission request"
+        );
+        if allow {
+            parked.request.allow();
+        } else {
+            parked.request.deny();
+        }
+        true
+    }
+
+    /// Sweep the deadlines, then hand back every ask that was settled WITHOUT a
+    /// human's answer — timed out here, or denied when its surface closed.
+    ///
+    /// One drain for both because they are one fact for the shell: "the dialog
+    /// you are showing for this id is moot, take it down." Deliberately not two
+    /// queues — a dialog that outlived its request is the same bug whichever way
+    /// the request died, and two drains is two places to forget one.
+    ///
+    /// Both paths DENY. A prompt nobody answers is not a prompt that stays open:
+    /// the page's promise has to settle, and the only safe settlement is a
+    /// rejection. Called once per reconcile tick.
+    pub fn take_retired_media_permissions(&self) -> Vec<u64> {
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = self
+            .parked_media_permissions
+            .borrow()
+            .iter()
+            .filter(|(_, parked)| parked.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for request_id in &expired {
+            tracing::info!(
+                request_id,
+                "web surface: capture permission request timed out — denied"
+            );
+            self.resolve_media_permission(*request_id, false);
+        }
+        let mut retired = std::mem::take(&mut *self.retired_media_permissions.borrow_mut());
+        retired.extend(expired);
+        retired
+    }
+
+    /// Every parked ask belonging to `surface_id`, DENIED and queued as retired.
+    ///
+    /// A surface that is going away takes its questions with it. Leaving them
+    /// parked would keep a "may this page use your camera?" dialog on screen
+    /// naming a page that no longer exists — and would hold an engine object
+    /// belonging to a destroyed web process until the timeout.
+    fn retire_media_permissions_for_surface(&self, surface_id: u64) {
+        let owned: Vec<u64> = self
+            .parked_media_permissions
+            .borrow()
+            .iter()
+            .filter(|(_, parked)| parked.surface_id == surface_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for request_id in owned {
+            self.resolve_media_permission(request_id, false);
+            self.retired_media_permissions.borrow_mut().push(request_id);
+        }
     }
 
 
@@ -3784,7 +4143,24 @@ impl WebSurfaceHost {
             use wry::WebViewExtUnix as _;
             if let Some(settings) = webkit2gtk::WebViewExt::settings(&webview.webview()) {
                 settings.set_enable_smooth_scrolling(true);
+                // Camera and microphone, per surface and behind the gate
+                // connected below. See `apply_media_capture_settings`.
+                apply_media_capture_settings(&settings);
             }
+        }
+        // The gate that answers what the capability above lets a page ask for.
+        // ⛔ These two go together or not at all: the setting without the gate is
+        // a page whose `getUserMedia()` hangs on an unanswered signal, and the
+        // gate without the setting is dead code.
+        {
+            use wry::WebViewExtUnix as _;
+            connect_media_permission_gate(
+                &webview.webview(),
+                id,
+                &self.media_permission_requests,
+                &self.parked_media_permissions,
+                &self.next_media_permission_id,
+            );
         }
         // Downloads, wired to the ENGINE this surface runs on. Once per context
         // — `download-started` is a context signal and the tabs of one session
@@ -4127,6 +4503,11 @@ impl WebSurfaceHost {
         self.fullscreen
             .set(fullscreen_owner_after(self.fullscreen.get(), id, false));
         self.theme_colors.borrow_mut().remove(&id);
+        // And the questions this surface had outstanding. A destroyed webview
+        // will never be answered, and an unanswered ask is a held engine object
+        // plus a dialog on screen for a page that is gone. Deny, and tell the
+        // shell so the dialog goes with it.
+        self.retire_media_permissions_for_surface(id);
     }
 
     /// Stash surface `id`: detach its container from the overlay WITHOUT
@@ -6093,6 +6474,247 @@ mod scroll_nav_shim_locks {
              `elementFromPoint` again — the GTK press was already swallowed \
              (`Propagation::Stop`), so a throwing dispatch eats the only copy \
              and mouse back/forward go dead with no error anywhere",
+        );
+    }
+}
+
+/// LOCKS for HARDWARE CAPTURE — the camera and the microphone.
+///
+/// The engine half cannot be exercised on this host: `permission-request` needs
+/// a live WebKitGTK view, a display, and a page that actually calls
+/// `getUserMedia()`. So the file's standing split applies (see
+/// `engine_visibility_locks`): the SHAPE of the answer is a pure function that
+/// is driven directly, and the WIRING that reaches it is scanned out of the
+/// product source.
+///
+/// The one rule these locks exist to defend: **no page reaches a capture device
+/// without a human's explicit approval.** Each assertion below names the exact
+/// way that could stop being true.
+#[cfg(test)]
+mod media_capture_locks {
+    use super::engine_visibility_locks::{body_of, product_lines};
+    use super::*;
+
+    /// The capability, per surface, on BOTH builders. `enable-webrtc` is the
+    /// measured one: `window.RTCPeerConnection` read `undefined` on the live
+    /// host before these lines existed, so a page could hold a capture stream
+    /// and have nowhere to send it.
+    #[test]
+    fn every_surface_builder_turns_the_capture_capability_on() {
+        let product = product_lines();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod media_capture_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        for builder in ["pub fn open(", "fn build_popup_webview("] {
+            let body = body_of(&product, builder);
+            assert!(
+                body.contains("apply_media_capture_settings(&settings);"),
+                "`{builder}` no longer turns the capture capability on for its \
+                 surface — `RTCPeerConnection` goes back to undefined on every \
+                 page it creates, which is the state this work found the product \
+                 in",
+            );
+        }
+        // The three settings that ARE that capability, in the one place that
+        // owns them.
+        let body = body_of(&product, "fn apply_media_capture_settings(");
+        for setter in [
+            "settings.set_enable_media_stream(true);",
+            "settings.set_enable_webrtc(true);",
+            "settings.set_enable_media_capabilities(true);",
+        ] {
+            assert!(
+                body.contains(setter),
+                "`apply_media_capture_settings` lost `{setter}`",
+            );
+        }
+    }
+
+    /// ⛔ The capability must NOT be flipped in the vendored wry's global
+    /// settings path. That path also builds the TERMINAL SHELL's webview — the
+    /// one that renders yggterm's own chrome and holds no `permission-request`
+    /// gate — so capture enabled there is capture enabled on a view nothing is
+    /// answering for.
+    #[test]
+    fn the_shells_own_webview_never_gets_the_capture_capability() {
+        let wry_gtk = include_str!("../../wry/src/webkitgtk/mod.rs");
+        for setter in [
+            "set_enable_media_stream",
+            "set_enable_webrtc",
+            "set_enable_media_capabilities",
+        ] {
+            assert!(
+                !wry_gtk.contains(setter),
+                "the vendored wry calls `{setter}` for EVERY webview it builds — \
+                 the terminal shell's included, which has no permission gate on \
+                 it — instead of the web-surface builders enabling capture per \
+                 surface behind `connect_media_permission_gate`",
+            );
+        }
+    }
+
+    /// The GATE, on both builders, beside the capability.
+    ///
+    /// Setting without gate = every `getUserMedia()` hangs on an unanswered
+    /// signal. Gate without setting = dead code. They ship together or the
+    /// feature is broken in one of two different ways.
+    #[test]
+    fn every_surface_builder_connects_the_permission_gate() {
+        let product = product_lines();
+        for builder in ["pub fn open(", "fn build_popup_webview("] {
+            let body = body_of(&product, builder);
+            assert!(
+                body.contains("connect_media_permission_gate("),
+                "`{builder}` no longer connects the capture permission gate — the \
+                 capability it enables would leave every `getUserMedia()` hanging \
+                 on a signal nobody answers",
+            );
+        }
+    }
+
+    /// ⛔ THE security lock: the gate NEVER allows anything by itself.
+    ///
+    /// `webkit_permission_request_allow` has exactly ONE call site in this file
+    /// — inside `resolve_media_permission`, behind an explicit `allow` argument
+    /// that only a human's click sets. An `.allow()` appearing anywhere else,
+    /// and above all inside the signal handler, is a page taking a camera with
+    /// no one asked.
+    #[test]
+    fn nothing_but_an_explicit_answer_can_allow_a_capture_request() {
+        let product = product_lines();
+        let gate = body_of(&product, "fn connect_media_permission_gate(");
+        assert!(
+            !gate.contains(".allow()"),
+            "the permission gate ALLOWS a request inside the signal handler — a \
+             page can now open the camera with no human in the loop, on a surface \
+             that also holds ssh sessions and a password vault",
+        );
+        assert!(
+            gate.contains("None => return false,"),
+            "the gate no longer returns `false` for permission types it does not \
+             handle — returning `true` for geolocation/notifications/pointer-lock \
+             either hangs them forever or, with an `allow()` behind it, grants \
+             the web every permission WebKit has",
+        );
+        // The whole file, not just the gate: one allow, one deny-by-branch.
+        let allows = product
+            .iter()
+            .filter(|line| line.contains(".allow();"))
+            .count();
+        assert_eq!(
+            allows, 1,
+            "`.allow()` is called from {allows} places in this file; there must be \
+             exactly one, in `resolve_media_permission`, behind the caller's \
+             explicit approval",
+        );
+        let resolve = body_of(&product, "pub fn resolve_media_permission(");
+        assert!(
+            resolve.contains("if allow {")
+                && resolve.contains("parked.request.allow();")
+                && resolve.contains("parked.request.deny();"),
+            "`resolve_media_permission` no longer branches an approval against a \
+             refusal — the one place a capture device is handed out must read as \
+             a two-sided decision",
+        );
+    }
+
+    /// Every way a parked ask can end WITHOUT an answer ends in a denial: the
+    /// deadline sweep, and a surface that closes under it.
+    #[test]
+    fn an_unanswered_capture_request_is_denied_not_left_hanging() {
+        let product = product_lines();
+        let retire = body_of(&product, "pub fn take_retired_media_permissions(");
+        assert!(
+            retire.contains("parked.deadline <= now") && retire.contains("(*request_id, false)"),
+            "the deadline sweep no longer DENIES what it expires — a page's \
+             `getUserMedia()` promise would hang forever and a camera offer would \
+             sit on screen indefinitely",
+        );
+        let per_surface = body_of(&product, "fn retire_media_permissions_for_surface(");
+        assert!(
+            per_surface.contains("self.resolve_media_permission(request_id, false);"),
+            "a closing surface no longer denies the asks it had outstanding — the \
+             engine object outlives its web process and the dialog names a page \
+             that is gone",
+        );
+        let close = body_of(&product, "pub fn close(&self, id: u64) {");
+        assert!(
+            close.contains("self.retire_media_permissions_for_surface(id);"),
+            "`close` no longer retires the surface's parked capture asks",
+        );
+    }
+
+    /// The request the shell is handed carries the two facts a human needs — WHO
+    /// is asking and for WHAT — and no engine handle. The handle staying here is
+    /// what keeps the GTK object on the GTK thread and makes "who may answer
+    /// this" one function rather than a pointer the shell could hold past its
+    /// life.
+    #[test]
+    fn the_shell_is_told_who_asked_and_for_what_but_holds_no_engine_handle() {
+        let product = product_lines();
+        let gate = body_of(&product, "fn connect_media_permission_gate(");
+        for needle in [
+            "media.is_for_audio_device()",
+            "media.is_for_video_device()",
+            "let uri = view.uri().map(|uri| uri.to_string()).unwrap_or_default();",
+        ] {
+            assert!(
+                gate.contains(needle),
+                "the gate lost `{needle}` — the prompt cannot name the site or the \
+                 device it would hand over",
+            );
+        }
+        // The engine handle lives on the HOST-side parked entry...
+        let parked = body_of(&product, "struct ParkedMediaPermission {");
+        assert!(
+            parked.contains("request: webkit2gtk::PermissionRequest,"),
+            "`ParkedMediaPermission` no longer holds the engine request — nothing \
+             keeps the ask alive between the signal and the human's answer, so a \
+             prompt could be shown for a request that can never be granted",
+        );
+        // ...and NOT on the struct that crosses to the shell.
+        let request = body_of(&product, "pub struct SurfaceMediaPermissionRequest {");
+        assert!(
+            !request.contains("webkit2gtk::"),
+            "`SurfaceMediaPermissionRequest` now carries an engine handle across \
+             the host boundary; the parked request must stay in the host and be \
+             answered by id",
+        );
+    }
+
+    /// `enumerateDevices()` is a SEPARATE request type and must stay separate:
+    /// device LABELS are the privacy leak, and the rule every browser follows is
+    /// that they appear only where capture is already allowed. A gate that
+    /// collapsed the two would prompt for a bare device list (noise) or, worse,
+    /// hand labels out under a capture grant's shape.
+    #[test]
+    fn a_device_list_ask_is_distinguished_from_a_capture_ask() {
+        let product = product_lines();
+        let gate = body_of(&product, "fn connect_media_permission_gate(");
+        assert!(
+            gate.contains("request.is::<DeviceInfoPermissionRequest>()"),
+            "the gate no longer recognises `enumerateDevices()`'s own permission \
+             type, so it falls through to `false` and device labels are decided \
+             by the engine default rather than by the site's capture grant",
+        );
+        assert_eq!(
+            SurfaceMediaPermissionKind::Capture.as_str(),
+            "capture",
+            "the trace/wire name of a capture ask changed",
+        );
+        assert_eq!(
+            SurfaceMediaPermissionKind::DeviceInfo.as_str(),
+            "device-info",
+            "the trace/wire name of a device-list ask changed",
+        );
+        assert_ne!(
+            SurfaceMediaPermissionKind::Capture,
+            SurfaceMediaPermissionKind::DeviceInfo,
+            "the two ask kinds must stay distinguishable",
         );
     }
 }
