@@ -223,7 +223,7 @@ use yggterm_server::{
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
-    RailHeader, RailScrollBody, RailSectionTitle,
+    RailHeader, RailScrollBody, RailSectionTitle, RowTreeDrop, RowTreeRow,
     SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
     ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
@@ -233,7 +233,7 @@ use yggui::{
     gradient_background_repeat_css,
     gradient_background_size_css, gradient_css, join_tree_child_path, live_blur_gradient_css,
     material_blur_radius_px, preview_surface_css,
-    reorder_flat_list, resolve_drag_drop_target as resolve_tree_drag_drop_target,
+    reorder_row_tree, resolve_drag_drop_target as resolve_tree_drag_drop_target,
     resolve_tree_drop_placement,
     search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
@@ -1410,6 +1410,12 @@ struct WebSurfaceTab {
     /// for a root tab. Filed = saved organization; root = the browsing session.
     /// The app tab (id 0) is always root: it belongs to the app, not the tree.
     folder: Option<String>,
+    /// A name the USER gave this row, which outranks `title` wherever the tab
+    /// is drawn. It has to be its own field: `title` is written from the engine
+    /// on every reconcile poll, so a rename stored there would last about a
+    /// second. `None` = the tab is named by its page, which is the default and
+    /// what every tab was before rows could be renamed.
+    custom_title: Option<String>,
     /// A script opened this tab (`window.open`, `target="_blank"`), so a script
     /// may close it — the rule every browser applies to `window.close()`. A tab
     /// the USER opened is theirs, and a page asking to close it is ignored.
@@ -2940,8 +2946,37 @@ enum AppPaneWidget {
         /// the app's own list, so the app remains the single source of truth
         /// for order. The rows re-arrange when the app says they did — which is
         /// also why a no-op drop POSTs nothing.
+        ///
+        /// A drop also POSTs `values["parent"]` — the id of the group the row
+        /// landed in, or `""` for the pane's root band. A pane with no groups
+        /// always gets `""`, which is what every pane got before groups existed.
         #[serde(default)]
         reorder_action: String,
+        /// How deep this row sits. `0` (the default, and what every pane
+        /// written before this field said) is the pane's root band.
+        ///
+        /// Structure is carried by DEPTH IN DRAW ORDER, not by a nested
+        /// `children` array: a row's parent is the nearest preceding row with a
+        /// smaller depth. The schema is already a flat `Vec<AppPaneWidget>` in
+        /// draw order — nesting rows would mean every renderer flattened them
+        /// again before drawing, which is a second encoding of one shape.
+        /// A depth that skips a level is clamped to one below its predecessor,
+        /// so the pane cannot be made incoherent by arithmetic.
+        #[serde(default)]
+        depth: u32,
+        /// Present ⇒ this row is a GROUP (a folder), and the value is whether
+        /// it is open. Absent ⇒ a leaf, and the row behaves exactly as
+        /// `list-row` always has. A group draws the tree's disclosure triangle
+        /// in its status slot and ACCEPTS A DROP INSIDE — the one thing
+        /// a flat list could never express, which is why contributed
+        /// panes were flat by construction.
+        #[serde(default)]
+        expanded: Option<bool>,
+        /// Fired by the disclosure triangle with this row's id as its value.
+        /// Empty ⇒ the triangle is drawn but inert, and the app is expected to
+        /// toggle from `row_action` instead. Only a group has one.
+        #[serde(default)]
+        expand_action: String,
     },
     /// A compact horizontal row of icon buttons — the quick-actions strip
     /// (MS-Office quick access shape) at the top of an app's sidebar.
@@ -3251,6 +3286,12 @@ mod app_pane_reorder_tests {
         ))
     }
 
+    /// A FLAT pane's rows — what every pane written before `depth`/`expanded`
+    /// declares, and the shape the drag tests below exercise.
+    fn flat_rows(ids: &[&str]) -> Vec<RowTreeRow> {
+        ids.iter().map(|id| RowTreeRow::leaf(*id)).collect()
+    }
+
     /// The real gesture: press, then travel past the threshold. Every drag the
     /// user can perform goes through both steps, so every test does too.
     fn drag_row(shell: &mut ShellState, pane_id: &str, row_id: &str) {
@@ -3264,7 +3305,7 @@ mod app_pane_reorder_tests {
     // The gesture, end to end, on the state machine the render drives.
     #[test]
     fn a_rail_row_drag_reports_the_panes_new_order_on_drop() {
-        let rows = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows = flat_rows(&["a", "b", "c"]);
         let mut shell = shell();
         drag_row(&mut shell, "notes", "c");
         shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::Before);
@@ -3279,6 +3320,9 @@ mod app_pane_reorder_tests {
             Some((
                 "notes".to_string(),
                 "c".to_string(),
+                // A flat pane has no groups, so the parent is always the root
+                // band — the value every pane got before groups existed.
+                None,
                 vec!["c".to_string(), "a".to_string(), "b".to_string()]
             ))
         );
@@ -3290,7 +3334,7 @@ mod app_pane_reorder_tests {
     // mouse-up rewrites the app's store.
     #[test]
     fn a_drop_that_changes_nothing_reports_no_reorder() {
-        let rows = vec!["a".to_string(), "b".to_string()];
+        let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
         drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("notes", "b", DragDropPlacement::Before);
@@ -3305,7 +3349,7 @@ mod app_pane_reorder_tests {
     // guess at where the row should go.
     #[test]
     fn a_drag_released_over_nothing_is_abandoned() {
-        let rows = vec!["a".to_string(), "b".to_string()];
+        let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
         drag_row(&mut shell, "notes", "a");
         assert_eq!(shell.take_app_pane_row_drop(&rows), None);
@@ -3316,7 +3360,7 @@ mod app_pane_reorder_tests {
     // that would POST an order full of ids the receiving app never issued.
     #[test]
     fn a_hover_over_another_pane_is_not_a_drop_target() {
-        let rows = vec!["a".to_string(), "b".to_string()];
+        let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
         drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("tabs", "b", DragDropPlacement::After);
@@ -3328,7 +3372,7 @@ mod app_pane_reorder_tests {
     // click-without-moving stay a click.
     #[test]
     fn hovering_the_dragged_row_itself_is_not_a_target() {
-        let rows = vec!["a".to_string(), "b".to_string()];
+        let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
         drag_row(&mut shell, "notes", "a");
         shell.hover_app_pane_row_drop("notes", "a", DragDropPlacement::After);
@@ -3386,7 +3430,7 @@ mod app_pane_reorder_tests {
     // travelled is still a click, and accepts no target.
     #[test]
     fn a_press_that_never_travels_is_a_click_not_a_drag() {
-        let rows = vec!["a".to_string(), "b".to_string()];
+        let rows = flat_rows(&["a", "b"]);
         let mut shell = shell();
         shell.arm_app_pane_row_drag("notes".into(), "a".into(), (100.0, 100.0));
 
@@ -3513,11 +3557,80 @@ mod app_pane_reorder_tests {
         let after = app_pane_row_drop_line_style(DragDropPlacement::After, "#0af");
         assert!(before.contains("inset 0 2px 0 0 #0af"), "{before}");
         assert!(after.contains("inset 0 -2px 0 0 #0af"), "{after}");
+        // INSIDE is a real placement now that a row list can nest, and it is a
+        // RING, never an edge line: a line under a folder header would promise
+        // "beside the folder" while the drop lands in it.
+        let into = app_pane_row_drop_line_style(DragDropPlacement::Into, "#0af");
+        assert!(into.contains("inset 0 0 0 2px #0af"), "{into}");
+        assert_ne!(into, after);
+        assert_ne!(into, before);
+    }
+
+    /// The pointer band → placement rule, once for every row list.
+    #[test]
+    fn a_leaf_row_has_two_bands_and_a_group_row_has_three() {
+        // A leaf has no inside: every offset is one of the two edges.
+        for y in [0.0, 5.0, 13.9, 14.1, 27.0] {
+            assert_ne!(row_drop_placement_for_offset(y, false), DragDropPlacement::Into);
+        }
+        assert_eq!(row_drop_placement_for_offset(2.0, false), DragDropPlacement::Before);
+        assert_eq!(row_drop_placement_for_offset(20.0, false), DragDropPlacement::After);
+        // A group keeps a narrow edge band at each end and files everything in
+        // between — DESIGN.md's before / inside / after snap zones.
+        assert_eq!(row_drop_placement_for_offset(2.0, true), DragDropPlacement::Before);
+        assert_eq!(row_drop_placement_for_offset(14.0, true), DragDropPlacement::Into);
+        assert_eq!(row_drop_placement_for_offset(26.0, true), DragDropPlacement::After);
+    }
+
+    /// `depth` in draw order IS the tree — the one structural encoding a
+    /// contributed pane has. A flat pane (no depth, no `expanded`) must project
+    /// to exactly the list it always was, or every app that predates this field
+    /// changes behaviour on upgrade.
+    #[test]
+    fn a_pane_that_declares_no_depth_projects_to_the_flat_list_it_always_was() {
+        let flat: Vec<AppPaneWidget> = serde_json::from_value(serde_json::json!([
+            {"kind": "list-row", "id": "a", "title": "A"},
+            {"kind": "list-row", "id": "b", "title": "B"},
+            {"kind": "button", "id": "n", "label": "New", "action": "new"},
+            {"kind": "list-row", "id": "c", "title": "C"},
+        ]))
+        .expect("schema");
         assert_eq!(
-            app_pane_row_drop_line_style(DragDropPlacement::Into, "#0af"),
-            after,
-            "a flat list has no inside — Into draws as After, matching reorder_flat_list"
+            app_pane_row_tree(&flat),
+            vec![
+                RowTreeRow::leaf("a"),
+                RowTreeRow::leaf("b"),
+                RowTreeRow::leaf("c"),
+            ],
+            "no depth and no `expanded` ⇒ root leaves, which is what every pane \
+             written before this field declares"
         );
+    }
+
+    #[test]
+    fn depth_in_draw_order_becomes_the_parent_link() {
+        let nested: Vec<AppPaneWidget> = serde_json::from_value(serde_json::json!([
+            {"kind": "list-row", "id": "f1", "title": "Work", "expanded": true},
+            {"kind": "list-row", "id": "t1", "title": "one", "depth": 1},
+            {"kind": "list-row", "id": "t2", "title": "two", "depth": 1},
+            {"kind": "list-row", "id": "t3", "title": "loose"},
+        ]))
+        .expect("schema");
+        let rows = app_pane_row_tree(&nested);
+        assert!(rows[0].group, "a row that declared `expanded` is a group");
+        assert_eq!(rows[1].parent.as_deref(), Some("f1"));
+        assert_eq!(rows[2].parent.as_deref(), Some("f1"));
+        assert_eq!(rows[3].parent, None);
+        assert!(!rows[3].group);
+        // …and a depth that skips a level cannot orphan a row.
+        let skipped: Vec<AppPaneWidget> = serde_json::from_value(serde_json::json!([
+            {"kind": "list-row", "id": "a", "title": "A", "depth": 3},
+            {"kind": "list-row", "id": "b", "title": "B", "depth": 9},
+        ]))
+        .expect("schema");
+        let rows = app_pane_row_tree(&skipped);
+        assert_eq!(rows[0].parent, None);
+        assert_eq!(rows[1].parent.as_deref(), Some("a"));
     }
 }
 
@@ -3538,10 +3651,50 @@ struct AppPaneRowDrag {
     begun: bool,
 }
 
+/// The WebTabs rail's reorder gesture. The SAME two-phase shape
+/// [`AppPaneRowDrag`] has — armed on press, begun once the pointer clears
+/// [`yggui::DRAG_BEGIN_THRESHOLD_PX`] — because one window must not have two
+/// drag grammars. The rail's own gesture used to begin on contact and could
+/// only ever re-parent; it never re-indexed anything.
+#[derive(Debug, Clone, PartialEq)]
+struct WebTabRowDrag {
+    /// [`web_tab_row_id`] of the row under the press.
+    row_id: String,
+    origin: (f64, f64),
+    begun: bool,
+}
+
 /// Half a rail row's height: above it a drop lands BEFORE the row, below it
 /// AFTER. The cwd tree uses 12px bands around a 36px row; a rail row is the
 /// compact `SessionRowDensity::Rail`, so its midpoint is lower.
 const APP_PANE_ROW_DROP_MIDPOINT_PX: f64 = 14.0;
+
+/// The band at each END of a GROUP row: above it a drop lands BEFORE the group,
+/// below it AFTER, and everything between is INSIDE. DESIGN.md "Drag and drop":
+/// explicit before / inside / after snap zones. A leaf row has no inside and
+/// keeps the two bands [`APP_PANE_ROW_DROP_MIDPOINT_PX`] splits.
+const APP_PANE_GROUP_ROW_EDGE_BAND_PX: f64 = 8.0;
+
+/// Which band of a row the pointer is in — the ONE place a pointer offset
+/// becomes a placement, so the rail, the app panes and every future row list
+/// snap the same way.
+fn row_drop_placement_for_offset(offset_y: f64, is_group: bool) -> DragDropPlacement {
+    let y = offset_y.max(0.0);
+    if !is_group {
+        return if y <= APP_PANE_ROW_DROP_MIDPOINT_PX {
+            DragDropPlacement::Before
+        } else {
+            DragDropPlacement::After
+        };
+    }
+    if y <= APP_PANE_GROUP_ROW_EDGE_BAND_PX {
+        DragDropPlacement::Before
+    } else if y >= APP_PANE_ROW_DROP_MIDPOINT_PX * 2.0 - APP_PANE_GROUP_ROW_EDGE_BAND_PX {
+        DragDropPlacement::After
+    } else {
+        DragDropPlacement::Into
+    }
+}
 
 /// The reorderable rows of a pane, in draw order. A row opts in by declaring
 /// `reorder_action`; a row that does not is not a drag source AND not a drop
@@ -3559,18 +3712,49 @@ fn app_pane_reorderable_row_ids(widgets: &[AppPaneWidget]) -> Vec<String> {
         .collect()
 }
 
-/// The insertion line drawn on the edge a drop would land on. Same 2px accent
-/// rule the cwd tree's reorder uses, so one gesture reads the same everywhere.
+/// A pane's `list-row`s as the SHARED tree engine sees them: `depth` in draw
+/// order becomes a parent link, and a row that declared `expanded` is a group.
+///
+/// EVERY list row is here, reorderable or not, because a fixed group row still
+/// has to be a parent for the rows filed under it — the model is the pane's
+/// shape, and reorderability is a separate permission the renderer applies.
+fn app_pane_row_tree(widgets: &[AppPaneWidget]) -> Vec<RowTreeRow> {
+    // The innermost open group at each depth, so `depth - 1` resolves without
+    // a second pass over the list.
+    let mut ancestors: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    for widget in widgets {
+        let AppPaneWidget::ListRow {
+            id, depth, expanded, ..
+        } = widget
+        else {
+            continue;
+        };
+        let depth = (*depth as usize).min(ancestors.len());
+        ancestors.truncate(depth);
+        rows.push(RowTreeRow {
+            id: id.clone(),
+            parent: ancestors.last().cloned(),
+            group: expanded.is_some(),
+        });
+        ancestors.push(id.clone());
+    }
+    rows
+}
+
+/// The mark drawn where a drop would land. Same 2px accent rule the cwd tree's
+/// reorder uses, so one gesture reads the same everywhere: an insertion LINE on
+/// the edge for before/after, and for INSIDE the whole group ringed — DESIGN.md
+/// "Drag and drop": the final placement must match the visible snap indicator
+/// exactly, and a line under a folder header would promise the wrong landing.
 fn app_pane_row_drop_line_style(placement: DragDropPlacement, accent: &str) -> String {
-    let edge = match placement {
-        DragDropPlacement::Before => "top",
-        // A flat list has no inside; `Into` is `After` (see `reorder_flat_list`).
-        DragDropPlacement::Into | DragDropPlacement::After => "bottom",
-    };
-    format!("box-shadow: inset 0 {} 0 0 {accent};", match edge {
-        "top" => "2px",
-        _ => "-2px",
-    })
+    match placement {
+        DragDropPlacement::Before => format!("box-shadow: inset 0 2px 0 0 {accent};"),
+        DragDropPlacement::After => format!("box-shadow: inset 0 -2px 0 0 {accent};"),
+        DragDropPlacement::Into => {
+            format!("border-radius:8px; box-shadow: inset 0 0 0 2px {accent};")
+        }
+    }
 }
 
 fn app_pane_action_url(control_url: &str) -> String {
@@ -3772,6 +3956,137 @@ struct WebSurfaceOverlayTabView {
     /// homes (the rail rows and the classic strip's chips).
     loading: bool,
 }
+/// The name a tab ROW shows, in one place. Precedence: the name the USER gave
+/// it, then the page's own title, then the app tab's app name / the URL host.
+///
+/// One owner because the rail row, the classic strip chip, the rename field's
+/// prefill and the overflow menu must never disagree about what a tab is
+/// called. `index` is the tab's position, and `0` is the app tab.
+fn web_surface_tab_label(tab: &WebSurfaceTab, index: usize) -> String {
+    tab.custom_title
+        .clone()
+        .or_else(|| tab.title.clone())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if index == 0 {
+                "ychrome".to_string()
+            } else {
+                web_surface_tab_host_label(&tab.url)
+            }
+        })
+}
+
+/// The name a folder is BORN with. It is a placeholder, which is why the rename
+/// field opens with it SELECTED — the first keystroke replaces it.
+const WEB_TAB_NEW_FOLDER_NAME: &str = "New folder";
+
+/// A rail row's id in the SHARED row-tree vocabulary — `folder:<id>` for a
+/// folder, `tab:<id>` for a tab. ONE id space because the rail is ONE ordered
+/// list: a folder and a tab sit side by side in it, and
+/// [`yggui::reorder_row_tree`] orders ids, not two parallel collections.
+///
+/// [`WebTabMenuTarget`] is the decoded form. It was already the "which rail row"
+/// vocabulary (a right-click names a row); naming rows for the reorder engine
+/// too keeps that one answer instead of minting a second row enum beside it.
+fn web_tab_row_id(target: &WebTabMenuTarget) -> String {
+    match target {
+        WebTabMenuTarget::Folder(id) => format!("folder:{id}"),
+        WebTabMenuTarget::Tab(id) => format!("tab:{id}"),
+    }
+}
+
+fn web_tab_row_target(row_id: &str) -> Option<WebTabMenuTarget> {
+    if let Some(folder) = row_id.strip_prefix("folder:") {
+        return (!folder.is_empty()).then(|| WebTabMenuTarget::Folder(folder.to_string()));
+    }
+    row_id
+        .strip_prefix("tab:")
+        .and_then(|tab| tab.parse::<u64>().ok())
+        .map(WebTabMenuTarget::Tab)
+}
+
+/// One row of the tab tree, in DRAW ORDER — the rail's whole model.
+///
+/// Folders come FIRST, each followed by the tabs filed in it, and the loose
+/// tabs follow them all (user-reported 2026-07-30: "folders above tabs"). A
+/// row inside a COLLAPSED folder is in here with `visible: false`: it must not
+/// be drawn, but it must still be in the model, or a reorder elsewhere in the
+/// rail would silently drop every tab the user had folded away.
+#[derive(Debug, Clone, PartialEq)]
+struct WebTabRailRow {
+    row: WebTabMenuTarget,
+    depth: u32,
+    visible: bool,
+}
+
+impl WebTabRailRow {
+    fn id(&self) -> String {
+        web_tab_row_id(&self.row)
+    }
+    fn is_folder(&self) -> bool {
+        matches!(self.row, WebTabMenuTarget::Folder(_))
+    }
+}
+
+/// The tab tree as one ordered row list. Pure over the overlay view, so the
+/// ordering rule is unit-tested without a webview.
+fn web_tab_rail_rows(
+    folders: &[WebTabFolder],
+    tabs: &[WebSurfaceOverlayTabView],
+) -> Vec<WebTabRailRow> {
+    let mut rows = Vec::with_capacity(folders.len() + tabs.len());
+    for folder in folders {
+        rows.push(WebTabRailRow {
+            row: WebTabMenuTarget::Folder(folder.id.clone()),
+            depth: 0,
+            visible: true,
+        });
+        for tab in tabs
+            .iter()
+            .filter(|tab| tab.folder.as_deref() == Some(folder.id.as_str()))
+        {
+            rows.push(WebTabRailRow {
+                row: WebTabMenuTarget::Tab(tab.id),
+                depth: 1,
+                visible: !folder.collapsed,
+            });
+        }
+    }
+    for tab in tabs.iter().filter(|tab| tab.folder.is_none()) {
+        rows.push(WebTabRailRow {
+            row: WebTabMenuTarget::Tab(tab.id),
+            depth: 0,
+            visible: true,
+        });
+    }
+    rows
+}
+
+/// The rail's rows as the SHARED reorder engine sees them. A folder is a GROUP
+/// (a tab can be dropped inside it); a tab is a leaf.
+fn web_tab_rail_row_tree(rows: &[WebTabRailRow]) -> Vec<RowTreeRow> {
+    let mut parent: Option<String> = None;
+    rows.iter()
+        .map(|row| {
+            if row.depth == 0 {
+                parent = row.is_folder().then(|| row.id());
+                RowTreeRow {
+                    id: row.id(),
+                    parent: None,
+                    group: row.is_folder(),
+                }
+            } else {
+                RowTreeRow {
+                    id: row.id(),
+                    parent: parent.clone(),
+                    group: false,
+                }
+            }
+        })
+        .collect()
+}
+
 /// Resolve and commit a user-driven tab navigation (address bar, back,
 /// forward). The blocking egress resolution (possible `ssh -L` setup) runs
 /// off the UI event loop; the result lands via
@@ -7285,6 +7600,11 @@ struct SavedWebTab {
     url: String,
     #[serde(default)]
     title: String,
+    /// The name the user gave the row, if any — see
+    /// [`WebSurfaceTab::custom_title`]. Empty (and absent, in a store written
+    /// before rows could be renamed) = named by its page.
+    #[serde(default)]
+    name: String,
     /// The folder this tab is filed in; `None` = a root tab.
     ///
     /// This is the whole persistence rule: a FILED tab is organization and
@@ -12848,13 +13168,19 @@ struct ShellState {
     /// bar cannot draw a folder, so the modal says what will happen before the
     /// organization disappears behind an overflow menu.
     pending_classic_tabs_switch: bool,
-    /// `(folder id, draft name)` while a tab-tree folder is being renamed.
-    web_tab_folder_rename: Option<(String, String)>,
-    /// The tab being dragged in the tab tree, and the row it is over:
-    /// `Some(Some(folder))` = file it there, `Some(None)` = the root, `None` =
-    /// over nothing, which is a no-op on release.
-    web_tab_drag: Option<u64>,
-    web_tab_drop_target: Option<Option<String>>,
+    /// `(rail row id, draft name)` while a tab-tree row is being renamed —
+    /// [`web_tab_row_id`], so a FOLDER and a TAB rename through one field. A
+    /// second `Option<u64>` beside it for tabs would be a second answer to
+    /// "what is being renamed right now", and the rail can only rename one row.
+    web_tab_rename: Option<(String, String)>,
+    /// The rail row being dragged. Same two-phase shape as [`AppPaneRowDrag`]
+    /// (armed on press, begun once the pointer clears the shared threshold),
+    /// because a press that has not travelled is still a click — the rail used
+    /// to start a drag on contact.
+    web_tab_drag: Option<WebTabRowDrag>,
+    /// `(rail row id, placement)` the drag is currently over. `None` = over
+    /// nothing, which makes the release a no-op rather than a silent move.
+    web_tab_drop_target: Option<(String, DragDropPlacement)>,
     /// A contributed rail row's reorder gesture. Only rows whose app declared
     /// `reorder_action` ever land here. See [`AppPaneRowDrag`].
     app_pane_row_drag: Option<AppPaneRowDrag>,
@@ -13372,9 +13698,9 @@ struct RenderSnapshot {
     pending_fido2: Option<PendingFido2Dialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
     pending_classic_tabs_switch: bool,
-    web_tab_folder_rename: Option<(String, String)>,
-    web_tab_drag: Option<u64>,
-    web_tab_drop_target: Option<Option<String>>,
+    web_tab_rename: Option<(String, String)>,
+    web_tab_drag: Option<WebTabRowDrag>,
+    web_tab_drop_target: Option<(String, DragDropPlacement)>,
     app_pane_row_drag: Option<AppPaneRowDrag>,
     app_pane_row_drop_target: Option<(String, String, DragDropPlacement)>,
     web_tab_overflow_open: bool,
@@ -14762,7 +15088,7 @@ impl ShellState {
             pending_fido2: None,
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -15697,8 +16023,8 @@ impl ShellState {
             pending_fido2: self.pending_fido2.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             pending_classic_tabs_switch: self.pending_classic_tabs_switch,
-            web_tab_folder_rename: self.web_tab_folder_rename.clone(),
-            web_tab_drag: self.web_tab_drag,
+            web_tab_rename: self.web_tab_rename.clone(),
+            web_tab_drag: self.web_tab_drag.clone(),
             web_tab_drop_target: self.web_tab_drop_target.clone(),
             app_pane_row_drag: self.app_pane_row_drag.clone(),
             app_pane_row_drop_target: self.app_pane_row_drop_target.clone(),
@@ -15891,6 +16217,7 @@ impl ShellState {
             reload_nonce: 0,
             profile: profile.clone(),
             folder: None,
+            custom_title: None,
             loading: true,
             theme_color: None,
             lease_until_ms: None,
@@ -15953,6 +16280,9 @@ impl ShellState {
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: saved.folder,
+                // The name the user gave the row, restored with it. Empty in a
+                // store written before rows could be renamed.
+                custom_title: Some(saved.name).filter(|name| !name.is_empty()),
                 // A restored tab has no webview until it is selected, so nothing
                 // is loading in it.
                 loading: false,
@@ -16072,6 +16402,7 @@ impl ShellState {
             reload_nonce: 0,
             profile: "default".to_string(),
             folder: None,
+            custom_title: None,
             loading: false,
             theme_color: None,
             lease_until_ms: None,
@@ -17221,6 +17552,7 @@ impl ShellState {
                 reload_nonce: 0,
                 profile,
                 folder: placement.folder.clone(),
+                custom_title: None,
                 loading: false,
                 theme_color: None,
                 lease_until_ms: None,
@@ -17317,6 +17649,7 @@ impl ShellState {
                 reload_nonce: 0,
                 profile: profile.clone(),
                 folder: placement.folder.clone(),
+                custom_title: None,
                 // WebKit began the load the moment it made the view.
                 loading: true,
                 theme_color: None,
@@ -17910,17 +18243,7 @@ impl ShellState {
             .enumerate()
             .map(|(index, tab)| WebSurfaceOverlayTabView {
                 id: tab.id,
-                label: tab
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        if index == 0 {
-                            "ychrome".to_string()
-                        } else {
-                            web_surface_tab_host_label(&tab.url)
-                        }
-                    }),
+                label: web_surface_tab_label(tab, index),
                 is_app_tab: index == 0,
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
@@ -18235,6 +18558,7 @@ impl ShellState {
                 .map(|tab| SavedWebTab {
                     url: tab.url.clone(),
                     title: tab.title.clone().unwrap_or_default(),
+                    name: tab.custom_title.clone().unwrap_or_default(),
                     folder: tab.folder.clone(),
                     // Where the user was standing, not just what was open.
                     active: tab.id == active_tab,
@@ -18257,53 +18581,84 @@ impl ShellState {
             }
             surface.folders.push(WebTabFolder {
                 id: id.clone(),
-                name: "New folder".to_string(),
+                name: WEB_TAB_NEW_FOLDER_NAME.to_string(),
                 collapsed: false,
             });
         } else {
             return;
         }
-        self.web_tab_folder_rename = Some((id, "New folder".to_string()));
+        self.web_tab_rename = Some((
+            web_tab_row_id(&WebTabMenuTarget::Folder(id)),
+            WEB_TAB_NEW_FOLDER_NAME.to_string(),
+        ));
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
-    fn web_tab_begin_rename(&mut self, folder_id: &str) {
+    /// Open a rail ROW's in-place rename — a folder or a tab, keyed by
+    /// [`web_tab_row_id`]. A tab's current name is what the row currently
+    /// SHOWS (its own name if it has one, else the page title, else the host):
+    /// a rename field that opened empty over a titled row would read as "this
+    /// row has no name".
+    fn web_tab_begin_rename(&mut self, row_id: &str) {
+        let Some(target) = web_tab_row_target(row_id) else {
+            return;
+        };
         let name = self
             .active_web_surface()
-            .and_then(|surface| {
-                surface
+            .and_then(|surface| match &target {
+                WebTabMenuTarget::Folder(folder_id) => surface
                     .folders
                     .iter()
-                    .find(|folder| folder.id == folder_id)
-                    .map(|folder| folder.name.clone())
+                    .find(|folder| &folder.id == folder_id)
+                    .map(|folder| folder.name.clone()),
+                WebTabMenuTarget::Tab(tab_id) => surface
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == *tab_id)
+                    .map(|index| web_surface_tab_label(&surface.tabs[index], index)),
             })
             .unwrap_or_default();
-        self.web_tab_folder_rename = Some((folder_id.to_string(), name));
+        self.web_tab_rename = Some((row_id.to_string(), name));
     }
     fn web_tab_set_rename_draft(&mut self, draft: String) {
-        if let Some((_, name)) = self.web_tab_folder_rename.as_mut() {
+        if let Some((_, name)) = self.web_tab_rename.as_mut() {
             *name = draft;
         }
     }
     fn web_tab_commit_rename(&mut self, session_path: &str) {
-        let Some((folder_id, name)) = self.web_tab_folder_rename.take() else {
+        let Some((row_id, name)) = self.web_tab_rename.take() else {
+            return;
+        };
+        let Some(target) = web_tab_row_target(&row_id) else {
             return;
         };
         let name = name.trim().to_string();
         if name.is_empty() {
             return;
         }
-        if let Some(surface) = self.web_surfaces.get_mut(session_path)
-            && let Some(folder) = surface
-                .folders
-                .iter_mut()
-                .find(|folder| folder.id == folder_id)
-        {
-            folder.name = name;
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            match target {
+                WebTabMenuTarget::Folder(folder_id) => {
+                    if let Some(folder) =
+                        surface.folders.iter_mut().find(|f| f.id == folder_id)
+                    {
+                        folder.name = name;
+                    }
+                }
+                WebTabMenuTarget::Tab(tab_id) => {
+                    if let Some(tab) = surface.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        // A user-given name OUTRANKS the page title and is not
+                        // erased by the next load — the reconciler writes
+                        // `title` from the engine every poll, so storing the
+                        // rename there would survive about a second.
+                        tab.custom_title = Some(name);
+                    }
+                }
+            }
         }
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn web_tab_cancel_rename(&mut self) {
-        self.web_tab_folder_rename = None;
+        self.web_tab_rename = None;
     }
     /// Delete a folder. Its tabs are NOT closed — they return to the root, the
     /// same as removing a cwd-tree group. Deleting organization must never
@@ -18317,12 +18672,13 @@ impl ShellState {
                 }
             }
         }
+        let renaming_this_folder = web_tab_row_id(&WebTabMenuTarget::Folder(folder_id.to_string()));
         if self
-            .web_tab_folder_rename
+            .web_tab_rename
             .as_ref()
-            .is_some_and(|(id, _)| id == folder_id)
+            .is_some_and(|(id, _)| id == &renaming_this_folder)
         {
-            self.web_tab_folder_rename = None;
+            self.web_tab_rename = None;
         }
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
@@ -18362,31 +18718,166 @@ impl ShellState {
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     /// Drag state for the tab tree. Mouse-driven, like the cwd tree's (HTML5 DnD
-    /// is not what that tree uses, and one drag grammar beats two).
-    fn web_tab_start_drag(&mut self, tab_id: u64) {
-        if tab_id != WEB_TAB_APP_TAB_ID {
-            self.web_tab_drag = Some(tab_id);
+    /// is not what that tree uses, and one drag grammar beats two), and
+    /// two-phase like the contributed rail's: a press is a click until it
+    /// travels [`yggui::DRAG_BEGIN_THRESHOLD_PX`].
+    ///
+    /// The APP TAB is never a drag source. It is the app's own row, `tabs[0]`,
+    /// and it stays there.
+    fn arm_web_tab_row_drag(&mut self, row_id: String, pointer: (f64, f64)) {
+        if web_tab_row_target(&row_id) == Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID)) {
+            return;
+        }
+        self.web_tab_drag = Some(WebTabRowDrag {
+            row_id,
+            origin: pointer,
+            begun: false,
+        });
+        self.web_tab_drop_target = None;
+    }
+
+    fn maybe_begin_web_tab_row_drag(&mut self, pointer: (f64, f64)) -> bool {
+        let Some(drag) = self.web_tab_drag.as_mut() else {
+            return false;
+        };
+        if drag.begun {
+            return true;
+        }
+        if !drag_threshold_reached(drag.origin, pointer) {
+            return false;
+        }
+        drag.begun = true;
+        true
+    }
+
+    /// Hover `row_id` at `placement` while a drag is live.
+    ///
+    /// Two coercions, both because the rail's TREE IS TWO LEVELS DEEP by
+    /// construction — a folder holds tabs, and `WebSurfaceTab::folder` is one
+    /// optional id, not a path:
+    ///
+    /// - a FOLDER dragged over a folder can only land beside it, never inside;
+    /// - nothing lands above the app tab, which owns `tabs[0]`.
+    fn hover_web_tab_row_drop(&mut self, row_id: &str, placement: DragDropPlacement) {
+        let Some(drag) = self.web_tab_drag.as_ref().filter(|drag| drag.begun) else {
+            return;
+        };
+        if drag.row_id == row_id {
+            self.web_tab_drop_target = None;
+            return;
+        }
+        let dragging_folder = matches!(
+            web_tab_row_target(&drag.row_id),
+            Some(WebTabMenuTarget::Folder(_))
+        );
+        let placement = match (dragging_folder, web_tab_row_target(row_id)) {
+            // A FOLDER moves among FOLDERS. The rail is two bands — folders
+            // above, loose tabs below — so "between two tabs" is not a place a
+            // folder can be, and a folder has nowhere to go inside another one
+            // (`WebSurfaceTab::folder` is one optional id, not a path).
+            (true, Some(WebTabMenuTarget::Folder(_))) => match placement {
+                DragDropPlacement::Into => DragDropPlacement::After,
+                other => other,
+            },
+            (true, _) => {
+                self.web_tab_drop_target = None;
+                return;
+            }
+            // A TAB dropped anywhere on a FOLDER row goes INSIDE it. The bands
+            // mean a tab cannot come to rest between two folders, and a drop
+            // line promising otherwise would land the row somewhere else —
+            // DESIGN.md: the final placement must match the visible indicator.
+            (false, Some(WebTabMenuTarget::Folder(_))) => DragDropPlacement::Into,
+            // Nothing lands above the app tab, which owns `tabs[0]`.
+            (false, Some(WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID))) => DragDropPlacement::After,
+            (false, _) => placement,
+        };
+        let next = Some((row_id.to_string(), placement));
+        if self.web_tab_drop_target != next {
+            self.web_tab_drop_target = next;
         }
     }
-    fn web_tab_hover_folder(&mut self, target: Option<Option<String>>) {
-        if self.web_tab_drag.is_some() {
-            self.web_tab_drop_target = target;
-        }
-    }
+
     /// Commit the drag onto whatever row it is hovering. A drag that ends over
     /// nothing is a no-op, not a move to the root: dropping in the void must not
     /// silently unfile a tab.
-    fn web_tab_end_drag(&mut self) {
-        let (Some(tab_id), Some(target)) =
-            (self.web_tab_drag.take(), self.web_tab_drop_target.take())
-        else {
-            self.web_tab_drop_target = None;
+    ///
+    /// `rows` is the rail's WHOLE row tree, collapsed folders' tabs included —
+    /// see [`web_tab_rail_rows`].
+    fn end_web_tab_row_drag(&mut self, rows: &[RowTreeRow]) {
+        let drag = self.web_tab_drag.take();
+        let target = self.web_tab_drop_target.take();
+        let Some(drag) = drag.filter(|drag| drag.begun) else {
+            return;
+        };
+        let Some((target_row, placement)) = target else {
+            return;
+        };
+        let Some(drop) = reorder_row_tree(rows, &drag.row_id, &target_row, placement) else {
             return;
         };
         let Some(session) = self.active_web_surface_session() else {
             return;
         };
-        self.web_tab_move_to_folder(&session, tab_id, target);
+        self.apply_web_tab_row_drop(&session, &drag.row_id, drop);
+    }
+
+    fn clear_web_tab_row_drag(&mut self) {
+        self.web_tab_drag = None;
+        self.web_tab_drop_target = None;
+    }
+
+    fn web_tab_row_is_dragging(&self, row_id: &str) -> bool {
+        self.web_tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.begun && drag.row_id == row_id)
+    }
+
+    fn web_tab_row_drop_edge(&self, row_id: &str) -> Option<DragDropPlacement> {
+        self.web_tab_drop_target
+            .as_ref()
+            .filter(|(row, _)| row == row_id)
+            .map(|(_, placement)| *placement)
+    }
+
+    /// Adopt a resolved drop: the moved row's new parent, and the whole rail's
+    /// new order.
+    ///
+    /// Only the MOVED row can have changed parent — a folder carries its tabs
+    /// with it and their `folder` id is untouched — so filing is one write, and
+    /// the rest is a permutation of `surface.folders` and `surface.tabs` into
+    /// the order the engine returned. The app tab is pinned at `tabs[0]`
+    /// whatever the order says, which is the same invariant
+    /// [`web_tab_placement`] enforces for a NEW tab; ordering and placement
+    /// therefore agree instead of competing.
+    fn apply_web_tab_row_drop(&mut self, session_path: &str, moved: &str, drop: RowTreeDrop) {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return;
+        };
+        if let Some(WebTabMenuTarget::Tab(tab_id)) = web_tab_row_target(moved)
+            && tab_id != WEB_TAB_APP_TAB_ID
+        {
+            let folder = match drop.parent.as_deref().and_then(web_tab_row_target) {
+                Some(WebTabMenuTarget::Folder(folder_id)) => Some(folder_id),
+                _ => None,
+            };
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.folder = folder;
+            }
+        }
+        let rank = |row_id: &str| drop.order.iter().position(|id| id == row_id);
+        surface.folders.sort_by_key(|folder| {
+            rank(&web_tab_row_id(&WebTabMenuTarget::Folder(folder.id.clone()))).unwrap_or(usize::MAX)
+        });
+        surface.tabs.sort_by_key(|tab| {
+            if tab.id == WEB_TAB_APP_TAB_ID {
+                return 0;
+            }
+            rank(&web_tab_row_id(&WebTabMenuTarget::Tab(tab.id)))
+                .map(|index| index + 1)
+                .unwrap_or(usize::MAX)
+        });
+        self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -19504,7 +19995,7 @@ impl ShellState {
                     self.web_tab_move_to_folder(session_path, *tab_id, Some(folder));
                 }
             }
-            WebTabMenuAction::RenameFolder(folder_id) => self.web_tab_begin_rename(folder_id),
+            WebTabMenuAction::RenameRow(row) => self.web_tab_begin_rename(&web_tab_row_id(row)),
             WebTabMenuAction::ToggleFolder(folder_id) => {
                 self.web_tab_toggle_folder(session_path, folder_id)
             }
@@ -19646,13 +20137,22 @@ impl ShellState {
         }
     }
 
-    /// End the gesture and report what it meant: `(pane, moved row, new order)`,
-    /// or `None` for a drag that never found a target or that changed nothing.
-    /// `rows` is the pane's reorderable row ids in their CURRENT displayed order.
+    /// End the gesture and report what it meant: `(pane, moved row, new parent,
+    /// new order)`, or `None` for a drag that never found a target or that
+    /// changed nothing. `rows` is the pane's WHOLE row tree in its current
+    /// displayed order (see [`app_pane_row_tree`]) — groups included, whether or
+    /// not they are themselves draggable, because they are what a drop lands in.
+    ///
+    /// The new parent is `None` for the pane's root band. The order returned is
+    /// the tree's whole flatten; the caller narrows it to the reorderable rows
+    /// before POSTing, which is what `values["order"]` has always meant.
     ///
     /// ALWAYS clears, whatever it returns. That is the contract every release
     /// path relies on: the gesture cannot outlive the mouse button.
-    fn take_app_pane_row_drop(&mut self, rows: &[String]) -> Option<(String, String, Vec<String>)> {
+    fn take_app_pane_row_drop(
+        &mut self,
+        rows: &[RowTreeRow],
+    ) -> Option<(String, String, Option<String>, Vec<String>)> {
         let drag = self.app_pane_row_drag.take();
         let target = self.app_pane_row_drop_target.take();
         let drag = drag.filter(|drag| drag.begun)?;
@@ -19660,8 +20160,8 @@ impl ShellState {
         if target_pane != drag.pane_id {
             return None;
         }
-        let order = reorder_flat_list(rows, &drag.row_id, &target_row, placement)?;
-        Some((drag.pane_id, drag.row_id, order))
+        let drop = reorder_row_tree(rows, &drag.row_id, &target_row, placement)?;
+        Some((drag.pane_id, drag.row_id, drop.parent, drop.order))
     }
 
     fn clear_app_pane_row_drag(&mut self) {
@@ -56910,9 +57410,18 @@ async fn app_pane_run_reorder(
     pane_id: String,
     action: String,
     moved: String,
+    parent: Option<String>,
     order: Vec<String>,
 ) {
-    app_pane_run_action_with_order(state, desktop, pane_id, action, Some(moved), Some(order)).await;
+    app_pane_run_action_with_order(
+        state,
+        desktop,
+        pane_id,
+        action,
+        Some(moved),
+        Some((parent, order)),
+    )
+    .await;
 }
 
 async fn app_pane_run_action(
@@ -56931,7 +57440,7 @@ async fn app_pane_run_action_with_order(
     pane_id: String,
     action: String,
     value: Option<String>,
-    order: Option<Vec<String>>,
+    order: Option<(Option<String>, Vec<String>)>,
 ) {
     let (control_url, control_token, mut values, value_keys, host, live_zoom, secure, prefs) = {
         let shell = state.read();
@@ -57017,9 +57526,17 @@ async fn app_pane_run_action_with_order(
         map.insert("vertical_tabs".to_string(), serde_json::json!(prefs.0));
         map.insert("restore_tabs".to_string(), serde_json::json!(prefs.1));
     }
-    // A reorder's payload: the pane's full new row order.
-    if let (Some(order), Some(map)) = (order, values.as_object_mut()) {
+    // A reorder's payload: the pane's full new row order, and WHICH GROUP the
+    // moved row landed in (`""` = the pane's root band, which is every drop a
+    // pane without groups can produce). Two fields because a drop can change
+    // either without the other, and an app that had to infer the parent from
+    // the order would be re-deriving what the GUI already resolved.
+    if let (Some((parent, order)), Some(map)) = (order, values.as_object_mut()) {
         map.insert("order".to_string(), serde_json::json!(order));
+        map.insert(
+            "parent".to_string(),
+            serde_json::Value::String(parent.unwrap_or_default()),
+        );
     }
     // A widget that carries its own value (a tab id, a row's item id) passes it
     // alongside the pane's draft inputs rather than mutating them.
@@ -75239,6 +75756,12 @@ fn app() -> Element {
                 if state.read().app_pane_row_drag.is_some() {
                     state.with_mut(|shell| shell.clear_app_pane_row_drag());
                 }
+                // …and so does the WebTabs rail's, for the same reason and by
+                // the same route: the rail's own container takes a real drop
+                // first, so this only catches a release that landed outside it.
+                if state.read().web_tab_drag.is_some() {
+                    state.with_mut(|shell| shell.clear_web_tab_row_drag());
+                }
                 state.with_mut(|shell| shell.finish_sidebar_resize());
                 state.with_mut(|shell| shell.finish_rail_resize());
             },
@@ -76595,9 +77118,17 @@ fn app() -> Element {
                             // no other action does.
                             on_app_pane_reorder: {
                                 let desktop = desktop.clone();
-                                move |(pane_id, action, moved, order): (String, String, String, Vec<String>)| {
+                                move |(pane_id, action, moved, parent, order): (
+                                    String,
+                                    String,
+                                    String,
+                                    Option<String>,
+                                    Vec<String>,
+                                )| {
                                     let desktop = desktop.clone();
-                                    spawn(app_pane_run_reorder(state, desktop, pane_id, action, moved, order));
+                                    spawn(app_pane_run_reorder(
+                                        state, desktop, pane_id, action, moved, parent, order,
+                                    ));
                                 }
                             },
                             on_app_pane_value: move |(widget_id, value): (String, String)| {
@@ -79661,6 +80192,9 @@ fn SessionStyleRow(
     #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
     #[props(default)] onmousedown: Option<EventHandler<MouseEvent>>,
     #[props(default)] onmouseenter: Option<EventHandler<MouseEvent>>,
+    /// Double-click — the tree's own "rename this row" gesture, and declared
+    /// here for the same reason `oncontextmenu` is.
+    #[props(default)] ondoubleclick: Option<EventHandler<MouseEvent>>,
     /// Right-click. Declared like the other listeners rather than left to the
     /// attribute spread, because the spread carries ATTRIBUTES and a listener
     /// passed through it would silently never fire.
@@ -79699,6 +80233,11 @@ fn SessionStyleRow(
             },
             onmouseenter: move |evt| {
                 if let Some(handler) = &onmouseenter {
+                    handler.call(evt);
+                }
+            },
+            ondoubleclick: move |evt| {
+                if let Some(handler) = &ondoubleclick {
                     handler.call(evt);
                 }
             },
@@ -79765,6 +80304,57 @@ fn SessionStyleRow(
             }
         }
     }
+}
+
+/// The tree's DISCLOSURE CHEVRON — the one glyph in the product that says "this
+/// row has an inside". Down = open, right = closed. Drawn once here so the
+/// cwdtree's folders, a contributed pane's groups and the WebTabs rail's
+/// folders cannot drift into three different triangles; tweak it and every
+/// surface inherits.
+#[component]
+fn RowDisclosureChevron(expanded: bool) -> Element {
+    rsx! {
+        svg {
+            width: "10",
+            height: "10",
+            view_box: "0 0 12 12",
+            fill: "none",
+            xmlns: "http://www.w3.org/2000/svg",
+            path {
+                d: if expanded { "M3 4.75L6 7.75L9 4.75" } else { "M4.75 3L7.75 6L4.75 9" },
+                stroke: "currentColor",
+                stroke_width: "1.35",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+            }
+        }
+    }
+}
+
+/// Focus an in-place rename field AND SELECT what is already in it.
+///
+/// A row born with a placeholder name — a folder's "New folder", a note's
+/// "Untitled" — must take the user's first keystroke as a REPLACEMENT. Focus
+/// alone leaves the caret at the end, so the user types into the placeholder
+/// and then has to delete it, which is the "New folder text should be
+/// selected" report. `set_focus` cannot express a selection, so this is the one
+/// place the shell reaches for the DOM, and every rename field in the app goes
+/// through it rather than each growing its own snippet.
+fn select_rename_field(selector: &str) {
+    let _ = document::eval(&format!(
+        "const el = document.querySelector({selector}); \
+         if (el) {{ el.focus(); el.select(); }}",
+        selector = serde_json::Value::String(selector.to_string()),
+    ));
+}
+
+/// The hit target a disclosure chevron sits in, inside a row's leading slot.
+/// Transparent and borderless: the chevron IS the affordance.
+fn row_disclosure_button_style(color: &str) -> String {
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; width:100%; height:100%; \
+         border:none; background:transparent; padding:0; color:{color}; cursor:pointer;"
+    )
 }
 
 /// A file-type badge for `list-row` icons of the form `file:<ext>` — a small
@@ -80512,30 +81102,7 @@ fn SidebarRow(
                             evt.stop_propagation();
                             on_set_expanded.call(row_toggle_target_expanded);
                         },
-                        svg {
-                            width: "10",
-                            height: "10",
-                            view_box: "0 0 12 12",
-                            fill: "none",
-                            xmlns: "http://www.w3.org/2000/svg",
-                            if row.expanded {
-                                path {
-                                    d: "M3 4.75L6 7.75L9 4.75",
-                                    stroke: "currentColor",
-                                    stroke_width: "1.35",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                }
-                            } else {
-                                path {
-                                    d: "M4.75 3L7.75 6L4.75 9",
-                                    stroke: "currentColor",
-                                    stroke_width: "1.35",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                }
-                            }
-                        }
+                        RowDisclosureChevron { expanded: row.expanded }
                         span {
                             style: "min-width:8px; text-align:right;",
                             "{row.descendant_sessions}"
@@ -111965,7 +112532,7 @@ fn RightRail(
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     /// `(pane id, action, moved row id, the pane's new row order)` — fired
     /// when a reorderable rail row is dropped somewhere that changes the order.
-    on_app_pane_reorder: EventHandler<(String, String, String, Vec<String>)>,
+    on_app_pane_reorder: EventHandler<(String, String, String, Option<String>, Vec<String>)>,
     /// (widget_id, value) — a draft input changed; stays in the GUI until an
     /// action carries it to the app.
     on_app_pane_value: EventHandler<(String, String)>,
@@ -112835,9 +113402,17 @@ fn WebFindBar(
     }
 }
 /// The TAB TREE: the active web surface's tabs and the user's virtual folders.
-/// yggterm's own chrome (it owns the tabs), rendered with the cwd tree's
-/// grammar — disclosure triangles, an inline rename, drag a row into a folder,
-/// and a delete that removes the ORGANIZATION and never the content.
+/// yggterm's own chrome (it owns the tabs) — and it IS the cwd tree's row
+/// grammar, not a fourth tree beside it (user-reported 2026-07-30, twice).
+///
+/// Everything structural here is SHARED: rows are [`SessionStyleRow`]s indented
+/// by `depth`, the disclosure glyph is [`RowDisclosureChevron`], the drop bands
+/// come from [`row_drop_placement_for_offset`], and a drop is resolved by
+/// [`yggui::reorder_row_tree`] — the same engine a contributed pane's
+/// `list-row`s use. The rail's own hand-rolled folder tree used to live here,
+/// and its drag could only ever RE-PARENT: it never re-indexed anything.
+///
+/// Folders come FIRST, then the loose tabs ([`web_tab_rail_rows`]).
 ///
 /// Vertical-tabs mode IS this rail: the viewport's tab strip collapses and the
 /// tabs live here. Turning the mode off retires the rail (see
@@ -112863,113 +113438,348 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
     let omni_session_path = session_path.clone();
     let omni_panel_bg = palette.panel.to_string();
     let omni_text = palette.text.to_string();
-    let rename = snapshot.web_tab_folder_rename.clone();
-    let dragging = snapshot.web_tab_drag;
-    let drop_target = snapshot.web_tab_drop_target.clone();
+    let rename = snapshot.web_tab_rename.clone();
     // The surface's identity, from the ONE owner of it (the app tab). The rail
     // renders the active session, so this is that session's profile.
     let overlay_profile = snapshot.active_web_surface_profile.clone();
-    let root_tabs: Vec<WebSurfaceOverlayTabView> = overlay
+
+    // THE MODEL — one ordered list, folders above tabs, a collapsed folder's
+    // tabs present but not visible. `row_tree` is that same list as the shared
+    // reorder engine sees it and is what a drop resolves against, which is why
+    // a folded-away tab survives a reorder elsewhere in the rail.
+    let rail_rows = web_tab_rail_rows(&overlay.folders, &overlay.tabs);
+    let row_tree = web_tab_rail_row_tree(&rail_rows);
+    let folders: HashMap<String, WebTabFolder> = overlay
+        .folders
+        .iter()
+        .map(|folder| (folder.id.clone(), folder.clone()))
+        .collect();
+    let mut folder_counts: HashMap<String, usize> = HashMap::new();
+    for tab in &overlay.tabs {
+        if let Some(folder) = tab.folder.clone() {
+            *folder_counts.entry(folder).or_default() += 1;
+        }
+    }
+    let tabs: HashMap<u64, WebSurfaceOverlayTabView> = overlay
         .tabs
         .iter()
-        .filter(|tab| tab.folder.is_none())
-        .cloned()
+        .map(|tab| (tab.id, tab.clone()))
         .collect();
-    // One row renderer for a tab wherever it sits — root or filed. A tab is the
-    // same thing in both places; only its indent differs. Rendered by the
-    // SHARED row engine (Phase 1): the anatomy and metrics are the same
-    // vocabulary the cwdtree rows draw with.
-    let tab_row = {
+
+    // ONE row renderer for every rail row — a folder and a tab are the same
+    // kind of thing here, differing only in their leading slot, their trailing
+    // verbs and what a click means. TWO renderers is how the two drifted apart
+    // in the first place: the folder header was a bespoke `div` sharing nothing
+    // with the rows under it.
+    let row_view = {
         let session_path = session_path.clone();
-        move |tab: WebSurfaceOverlayTabView, indent: u32| {
-            let tab_id = tab.id;
-            let is_app_tab = tab.is_app_tab;
-            let label = tab.label.clone();
-            let active = tab.active;
-            let loading = tab.loading;
-            let being_dragged = dragging == Some(tab_id);
-            let hover_folder = tab.folder.clone();
-            let (select_path, close_path) = (session_path.clone(), session_path.clone());
-            let menu_path = session_path.clone();
-            rsx! {
-                SessionStyleRow {
-                    key: "webtab-{tab_id}",
-                    "data-web-tab-row": "{tab_id}",
-                    "data-web-tab-active": if active { "true" } else { "false" },
-                    density: SessionRowDensity::Rail,
-                    depth: indent,
-                    selected: active,
-                    dimmed: being_dragged,
-                    text_color: palette.text.to_string(),
-                    selected_bg: palette.accent_soft.to_string(),
-                    label: label.clone(),
-                    dot: rsx! {
-                        span {
-                            "data-web-tab-loading": if loading { "true" } else { "false" },
-                            style: web_tab_loading_dot_style(loading),
+        let rename = rename.clone();
+        move |row: &WebTabRailRow| -> Element {
+            let row_id = row.id();
+            let depth = row.depth;
+            let is_folder = row.is_folder();
+            let is_app_tab = row.row == WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID);
+            let (drop_edge, row_is_dragging) = state.with(|shell| {
+                (
+                    shell.web_tab_row_drop_edge(&row_id),
+                    shell.web_tab_row_is_dragging(&row_id),
+                )
+            });
+            let renaming = rename
+                .as_ref()
+                .filter(|(id, _)| id == &row_id)
+                .map(|(_, draft)| draft.clone());
+
+            // RENAMING replaces the row body in place — the cwd tree's own
+            // rename shape, for a FOLDER and a TAB alike.
+            if let Some(draft) = renaming {
+                let (commit_path, blur_path) = (session_path.clone(), session_path.clone());
+                let field_row = row_id.clone();
+                return rsx! {
+                    div {
+                        key: "webrow-{row_id}",
+                        "data-web-tab-row-id": "{row_id}",
+                        style: format!(
+                            "display:flex; align-items:center; gap:6px; padding:2px 0 2px {}px;",
+                            8 + depth * 12,
+                        ),
+                        input {
+                            "data-web-tab-row-rename": "{row_id}",
+                            style: format!(
+                                "flex:1 1 auto; min-width:0; padding:3px 6px; border-radius:6px; \
+                                 border:1px solid {}; background:rgba(127,127,127,0.12); color:{}; \
+                                 font-size:12px; font-weight:600; outline:none;",
+                                palette.accent, palette.text,
+                            ),
+                            initial_value: "{draft}",
+                            // Focus AND SELECT. A row born with a placeholder
+                            // name ("New folder") must take the user's first
+                            // keystroke as a REPLACEMENT, not append to it.
+                            onmounted: move |evt| {
+                                let field_row = field_row.clone();
+                                async move {
+                                    let _ = evt.set_focus(true).await;
+                                    select_rename_field(&format!(
+                                        "[data-web-tab-row-rename=\"{field_row}\"]"
+                                    ));
+                                }
+                            },
+                            onclick: move |evt: MouseEvent| evt.stop_propagation(),
+                            onmousedown: move |evt: MouseEvent| evt.stop_propagation(),
+                            oninput: move |evt: FormEvent| {
+                                let value = evt.value();
+                                state.with_mut(|shell| shell.web_tab_set_rename_draft(value));
+                            },
+                            onkeydown: move |evt: KeyboardEvent| {
+                                let commit_path = commit_path.clone();
+                                match evt.key() {
+                                    Key::Enter => state.with_mut(|shell| shell.web_tab_commit_rename(&commit_path)),
+                                    Key::Escape => state.with_mut(|shell| shell.web_tab_cancel_rename()),
+                                    _ => {}
+                                }
+                            },
+                            onblur: move |_| {
+                                let blur_path = blur_path.clone();
+                                state.with_mut(|shell| shell.web_tab_commit_rename(&blur_path));
+                            },
                         }
-                    },
-                    onmousedown: move |_| {
-                        state.with_mut(|shell| shell.web_tab_start_drag(tab_id));
-                    },
-                    onmouseenter: {
-                        let hover_folder = hover_folder.clone();
-                        move |_| {
-                            // Hovering a tab means "put it where THIS tab lives",
-                            // so a drop onto a folder's contents files it there.
-                            let hover_folder = hover_folder.clone();
-                            state.with_mut(|shell| shell.web_tab_hover_folder(Some(hover_folder)));
-                        }
-                    },
-                    onclick: move |_| {
-                        select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
-                    },
-                    // The rail's rows join every other row surface in the app:
-                    // right-click raises the SHARED `ContextMenuOverlay`. The
-                    // verbs it carries (close others, duplicate, file, split)
-                    // existed already and had no entry point here.
-                    oncontextmenu: move |evt: MouseEvent| {
-                        open_web_tab_menu_from_event(
-                            state,
-                            &menu_path,
-                            WebTabMenuTarget::Tab(tab_id),
-                            WebSurfaceChromeAnchor::Rail,
-                            evt,
-                        );
-                    },
-                    actions: rsx! {
-                        // The app tab gets NO ✕. Its ✕ used to QUIT ychrome (a
-                        // Ctrl+C to the app) while this same row's context menu
-                        // refused to close it and said why — two affordances on
-                        // one row disagreeing, and since the app tab wears a real
-                        // page's title it is visually identical to a content row.
-                        // The user's report was exactly this: closing the first
-                        // tab took the whole browser away. Quitting the app lives
-                        // where quitting an app lives — the session row's ✕ and
-                        // the surface's own power control.
-                        if !is_app_tab {
+                    }
+                };
+            }
+
+            // The row's own vocabulary, resolved once so the rsx below has one
+            // shape for both kinds.
+            let (label, selected, badge, expanded, dot, actions, on_activate) = match &row.row {
+                WebTabMenuTarget::Folder(folder_id) => {
+                    let name = folders
+                        .get(folder_id)
+                        .map(|folder| folder.name.clone())
+                        .unwrap_or_default();
+                    let expanded = folders
+                        .get(folder_id)
+                        .is_none_or(|folder| !folder.collapsed);
+                    let count = folder_counts.get(folder_id).copied().unwrap_or(0);
+                    let (toggle_path, toggle_id) = (session_path.clone(), folder_id.clone());
+                    let (add_path, add_id) = (session_path.clone(), folder_id.clone());
+                    let (delete_path, delete_id) = (session_path.clone(), folder_id.clone());
+                    let (chevron_path, chevron_id) = (session_path.clone(), folder_id.clone());
+                    (
+                        name,
+                        false,
+                        Some(count.to_string()),
+                        Some(expanded),
+                        rsx! {
                             button {
-                                "data-web-tab-close": "{tab_id}",
-                                style: session_row_action_button_style(palette.text),
-                                title: "Close tab",
+                                "data-web-tab-folder-expand": "{folder_id}",
+                                style: row_disclosure_button_style(palette.muted),
+                                title: if expanded { "Collapse folder" } else { "Expand folder" },
+                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
-                                    let close_path = close_path.clone();
-                                    state.with_mut(|shell| {
-                                        shell.web_surface_close_tab(&close_path, tab_id);
-                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                                    });
+                                    let (path, id) = (chevron_path.clone(), chevron_id.clone());
+                                    state.with_mut(|shell| shell.web_tab_toggle_folder(&path, &id));
                                 },
-                                "✕"
+                                RowDisclosureChevron { expanded }
                             }
-                        }
+                        },
+                        rsx! {
+                            button {
+                                "data-web-tab-folder-add": "{folder_id}",
+                                style: session_row_action_button_style(palette.text),
+                                title: "New tab in this folder",
+                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                // Same opener as every other "+", so a tab born
+                                // in a folder is typing-ready too.
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    let (path, id) = (add_path.clone(), add_id.clone());
+                                    open_web_surface_tab(
+                                        state,
+                                        &path,
+                                        WebTabOpenRequest::blank_in_folder(id),
+                                    );
+                                },
+                                "+"
+                            }
+                            button {
+                                "data-web-tab-folder-delete": "{folder_id}",
+                                style: session_row_action_button_style(palette.text),
+                                // Says what it does: the folder goes, the tabs
+                                // come back to the root. Deleting organization
+                                // must never delete content.
+                                title: "Delete folder (its tabs return to the root)",
+                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    let (path, id) = (delete_path.clone(), delete_id.clone());
+                                    state.with_mut(|shell| shell.web_tab_delete_folder(&path, &id));
+                                },
+                                "🗑"
+                            }
+                        },
+                        EventHandler::new(move |_| {
+                            let (path, id) = (toggle_path.clone(), toggle_id.clone());
+                            state.with_mut(|shell| shell.web_tab_toggle_folder(&path, &id));
+                        }),
+                    )
+                }
+                WebTabMenuTarget::Tab(tab_id) => {
+                    let tab_id = *tab_id;
+                    let tab = tabs.get(&tab_id).cloned();
+                    let loading = tab.as_ref().is_some_and(|tab| tab.loading);
+                    let (select_path, close_path) = (session_path.clone(), session_path.clone());
+                    (
+                        tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default(),
+                        tab.as_ref().is_some_and(|tab| tab.active),
+                        None,
+                        None,
+                        rsx! {
+                            span {
+                                "data-web-tab-loading": if loading { "true" } else { "false" },
+                                style: web_tab_loading_dot_style(loading),
+                            }
+                        },
+                        rsx! {
+                            // The app tab gets NO ✕. Its ✕ used to QUIT ychrome
+                            // (a Ctrl+C to the app) while this same row's menu
+                            // refused to close it and said why — two affordances
+                            // on one row disagreeing. Quitting the app lives
+                            // where quitting an app lives.
+                            if !is_app_tab {
+                                button {
+                                    "data-web-tab-close": "{tab_id}",
+                                    style: session_row_action_button_style(palette.text),
+                                    title: "Close tab",
+                                    onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                    onclick: move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        let close_path = close_path.clone();
+                                        state.with_mut(|shell| {
+                                            shell.web_surface_close_tab(&close_path, tab_id);
+                                            shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                                        });
+                                    },
+                                    "✕"
+                                }
+                            }
+                        },
+                        EventHandler::new(move |_| {
+                            select_web_surface_tab(
+                                state,
+                                select_path.clone(),
+                                tab_id,
+                                WebTabSelect::User,
+                            );
+                        }),
+                    )
+                }
+            };
+
+            let menu_path = session_path.clone();
+            let menu_target = row.row.clone();
+            let rename_target = row_id.clone();
+            let (down_row, move_row) = (row_id.clone(), row_id.clone());
+            rsx! {
+                div {
+                    key: "webrow-{row_id}",
+                    // The row's identity and state, in ONE vocabulary for both
+                    // kinds — a probe asks the same questions of a folder and a
+                    // tab. Drag state is read on this OUTER box so the drop line
+                    // is not clipped by the row's own border radius, the same
+                    // reason the contributed rail draws it here.
+                    "data-web-tab-row-id": "{row_id}",
+                    "data-web-tab-row-kind": if is_folder { "folder" } else { "tab" },
+                    "data-web-tab-row-depth": "{depth}",
+                    "data-web-tab-row-active": if selected { "true" } else { "false" },
+                    "data-web-tab-row-expanded": match expanded {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "",
                     },
+                    "data-web-tab-row-dragging": if row_is_dragging { "1" } else { "0" },
+                    "data-web-tab-row-drop-edge": match drop_edge {
+                        Some(DragDropPlacement::Before) => "before",
+                        Some(DragDropPlacement::Into) => "into",
+                        Some(DragDropPlacement::After) => "after",
+                        None => "",
+                    },
+                    style: drop_edge
+                        .map(|placement| app_pane_row_drop_line_style(placement, palette.accent))
+                        .unwrap_or_default(),
+                    onmousedown: move |evt: MouseEvent| {
+                        if evt.trigger_button() != Some(MouseButton::Primary) {
+                            return;
+                        }
+                        // ARM only: a press that has not travelled is a click.
+                        let pointer = evt.client_coordinates();
+                        let down_row = down_row.clone();
+                        state.with_mut(|shell| {
+                            shell.arm_web_tab_row_drag(down_row, (pointer.x, pointer.y));
+                        });
+                    },
+                    onmousemove: move |evt: MouseEvent| {
+                        // No button held ⇒ a hover, not a drag.
+                        if !evt.held_buttons().contains(MouseButton::Primary) {
+                            return;
+                        }
+                        let pointer = evt.client_coordinates();
+                        // Before / inside / after, from the ONE band rule: a
+                        // FOLDER has an inside, a tab does not.
+                        let placement = row_drop_placement_for_offset(
+                            evt.element_coordinates().y,
+                            is_folder,
+                        );
+                        let move_row = move_row.clone();
+                        state.with_mut(|shell| {
+                            if !shell.maybe_begin_web_tab_row_drag((pointer.x, pointer.y)) {
+                                return;
+                            }
+                            shell.hover_web_tab_row_drop(&move_row, placement);
+                        });
+                    },
+                    SessionStyleRow {
+                        density: SessionRowDensity::Rail,
+                        depth,
+                        selected,
+                        dimmed: row_is_dragging,
+                        text_color: palette.text.to_string(),
+                        selected_bg: palette.accent_soft.to_string(),
+                        label,
+                        badge,
+                        badge_color: Some(palette.muted.to_string()),
+                        dot,
+                        actions,
+                        onclick: on_activate,
+                        // Double-click renames, exactly as the cwd tree's rows
+                        // do. The app tab is the app's, not the tree's.
+                        ondoubleclick: (!is_app_tab).then(|| {
+                            let rename_target = rename_target.clone();
+                            EventHandler::new(move |_| {
+                                let rename_target = rename_target.clone();
+                                state.with_mut(|shell| shell.web_tab_begin_rename(&rename_target));
+                            })
+                        }),
+                        // Right-click raises the SHARED `ContextMenuOverlay`,
+                        // through the ONE opener both row kinds have always
+                        // gone through.
+                        oncontextmenu: EventHandler::new(move |evt: MouseEvent| {
+                            open_web_tab_menu_from_event(
+                                state,
+                                &menu_path,
+                                menu_target.clone(),
+                                WebSurfaceChromeAnchor::Rail,
+                                evt,
+                            );
+                        }),
+                    }
                 }
             }
         }
     };
+
     let new_tab_path = session_path.clone();
     let new_folder_path = session_path.clone();
+    let end_drag_tree = row_tree.clone();
     rsx! {
         // The tab loading dot blinks with the same keyframes the live-session
         // status dot does. Declared here too so the rail carries its own signal
@@ -112983,7 +113793,17 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // it was last over; ending over nothing is a no-op, never a silent
             // move to the root.
             onmouseup: move |_| {
-                state.with_mut(|shell| shell.web_tab_end_drag());
+                let end_drag_tree = end_drag_tree.clone();
+                state.with_mut(|shell| shell.end_web_tab_row_drag(&end_drag_tree));
+            },
+            // A drag that wanders out of the rail forgets its TARGET, so a
+            // release outside lands nothing — but the gesture itself is ended
+            // by the shell root's release, never here. Ending it on leave is
+            // not the same question: row-to-row movement inside the rail
+            // produces leave events too, and abandoning on those made the drag
+            // impossible to complete.
+            onmouseleave: move |_| {
+                state.with_mut(|shell| shell.web_tab_drop_target = None);
             },
             // Zen-style omnibox: in vertical-tabs mode the address bar leaves the
             // viewport and lives here, at the top of the tab tree. Same component
@@ -113105,214 +113925,13 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                 // LIST's job now that rows come from the shared engine.
                 style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px; \
                         display:flex; flex-direction:column; gap:2px;",
-                // The root path: the live, unfiled tabs. In classic mode these
-                // are exactly the tabs the strip draws, which is why the modal
-                // can promise the strip keeps them.
-                div {
-                    "data-web-tab-root-drop": "1",
-                    style: format!(
-                        "font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; \
-                         color:{}; padding:6px 8px 4px; border-radius:8px; background:{};",
-                        palette.muted,
-                        if dragging.is_some() && drop_target == Some(None) { palette.accent_soft } else { "transparent" },
-                    ),
-                    onmouseenter: move |_| {
-                        state.with_mut(|shell| shell.web_tab_hover_folder(Some(None)));
-                    },
-                    "Root"
-                }
-                for tab in root_tabs.iter().cloned() {
-                    {tab_row(tab, 0)}
-                }
-                for folder in overlay.folders.iter().cloned() {
-                    {
-                        let folder_id = folder.id.clone();
-                        let folder_tabs: Vec<WebSurfaceOverlayTabView> = overlay
-                            .tabs
-                            .iter()
-                            .filter(|tab| tab.folder.as_deref() == Some(folder_id.as_str()))
-                            .cloned()
-                            .collect();
-                        let renaming = rename
-                            .as_ref()
-                            .filter(|(id, _)| id == &folder_id)
-                            .map(|(_, draft)| draft.clone());
-                        let is_drop_target =
-                            dragging.is_some() && drop_target == Some(Some(folder_id.clone()));
-                        let collapsed = folder.collapsed;
-                        let name = folder.name.clone();
-                        let count = folder_tabs.len();
-                        let (toggle_path, rename_path, delete_path, add_path, hover_id) = (
-                            session_path.clone(),
-                            session_path.clone(),
-                            session_path.clone(),
-                            session_path.clone(),
-                            folder_id.clone(),
-                        );
-                        let (toggle_id, delete_id, add_id, rename_id) = (
-                            folder_id.clone(),
-                            folder_id.clone(),
-                            folder_id.clone(),
-                            folder_id.clone(),
-                        );
-                        let (menu_path, menu_id) = (session_path.clone(), folder_id.clone());
-                        rsx! {
-                            div {
-                                key: "webfolder-{folder_id}",
-                                div {
-                                    "data-web-tab-folder": "{folder_id}",
-                                    "data-web-tab-folder-collapsed": if collapsed { "true" } else { "false" },
-                                    style: format!(
-                                        "display:flex; align-items:center; gap:6px; margin-top:6px; padding:6px 8px; \
-                                         border-radius:8px; cursor:pointer; font-size:11px; font-weight:700; color:{}; background:{};",
-                                        palette.text,
-                                        if is_drop_target { palette.accent_soft } else { "transparent" },
-                                    ),
-                                    onmouseenter: {
-                                        let hover_id = hover_id.clone();
-                                        move |_| {
-                                            let hover_id = hover_id.clone();
-                                            state.with_mut(|shell| shell.web_tab_hover_folder(Some(Some(hover_id))));
-                                        }
-                                    },
-                                    onclick: {
-                                        let toggle_path = toggle_path.clone();
-                                        let toggle_id = toggle_id.clone();
-                                        move |_| {
-                                            let (toggle_path, toggle_id) = (toggle_path.clone(), toggle_id.clone());
-                                            state.with_mut(|shell| shell.web_tab_toggle_folder(&toggle_path, &toggle_id));
-                                        }
-                                    },
-                                    ondoubleclick: {
-                                        let rename_id = rename_id.clone();
-                                        move |_| {
-                                            let rename_id = rename_id.clone();
-                                            state.with_mut(|shell| shell.web_tab_begin_rename(&rename_id));
-                                        }
-                                    },
-                                    // Folder rows get the same shared menu the
-                                    // tab rows do — Rename / Collapse / Close
-                                    // its tabs, the last one NAMING its count.
-                                    oncontextmenu: {
-                                        let (menu_path, menu_id) = (menu_path.clone(), menu_id.clone());
-                                        move |evt: MouseEvent| {
-                                            open_web_tab_menu_from_event(
-                                                state,
-                                                &menu_path,
-                                                WebTabMenuTarget::Folder(menu_id.clone()),
-                                                WebSurfaceChromeAnchor::Rail,
-                                                evt,
-                                            );
-                                        }
-                                    },
-                                    span {
-                                        style: "flex:0 0 auto; opacity:0.7; font-size:9px;",
-                                        if collapsed { "▸" } else { "▾" }
-                                    }
-                                    if let Some(draft) = renaming {
-                                        input {
-                                            "data-web-tab-folder-rename": "{folder_id}",
-                                            style: format!(
-                                                "flex:1 1 auto; min-width:0; padding:3px 6px; border-radius:6px; \
-                                                 border:1px solid {}; background:rgba(127,127,127,0.12); color:{}; \
-                                                 font-size:11px; font-weight:600; outline:none;",
-                                                palette.accent, palette.text,
-                                            ),
-                                            autofocus: true,
-                                            initial_value: "{draft}",
-                                            onclick: move |evt: MouseEvent| evt.stop_propagation(),
-                                            oninput: move |evt: FormEvent| {
-                                                let value = evt.value();
-                                                state.with_mut(|shell| shell.web_tab_set_rename_draft(value));
-                                            },
-                                            onkeydown: {
-                                                let rename_path = rename_path.clone();
-                                                move |evt: KeyboardEvent| {
-                                                    let rename_path = rename_path.clone();
-                                                    match evt.key() {
-                                                        Key::Enter => state.with_mut(|shell| shell.web_tab_commit_rename(&rename_path)),
-                                                        Key::Escape => state.with_mut(|shell| shell.web_tab_cancel_rename()),
-                                                        _ => {}
-                                                    }
-                                                }
-                                            },
-                                            onblur: {
-                                                let rename_path = rename_path.clone();
-                                                move |_| {
-                                                    let rename_path = rename_path.clone();
-                                                    state.with_mut(|shell| shell.web_tab_commit_rename(&rename_path));
-                                                }
-                                            },
-                                        }
-                                    } else {
-                                        span {
-                                            style: "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                            "{name}"
-                                        }
-                                        span {
-                                            style: format!("flex:0 0 auto; font-size:10px; font-weight:600; color:{};", palette.muted),
-                                            "{count}"
-                                        }
-                                    }
-                                    button {
-                                        "data-web-tab-folder-add": "{folder_id}",
-                                        style: format!(
-                                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; \
-                                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
-                                            palette.text,
-                                        ),
-                                        title: "New tab in this folder",
-                                        onclick: {
-                                            let add_path = add_path.clone();
-                                            let add_id = add_id.clone();
-                                            // Same opener as every other "+", so
-                                            // a tab born in a folder is
-                                            // typing-ready too. It never was:
-                                            // this button had no focus snippet
-                                            // of its own to copy.
-                                            move |evt: MouseEvent| {
-                                                evt.stop_propagation();
-                                                let (add_path, add_id) = (add_path.clone(), add_id.clone());
-                                                open_web_surface_tab(
-                                                    state,
-                                                    &add_path,
-                                                    WebTabOpenRequest::blank_in_folder(add_id),
-                                                );
-                                            }
-                                        },
-                                        "+"
-                                    }
-                                    button {
-                                        "data-web-tab-folder-delete": "{folder_id}",
-                                        style: format!(
-                                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; \
-                                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.6;",
-                                            palette.text,
-                                        ),
-                                        // Says what it does: the folder goes, the
-                                        // tabs come back to the root. Deleting
-                                        // organization must never delete content.
-                                        title: "Delete folder (its tabs return to the root)",
-                                        onclick: {
-                                            let delete_path = delete_path.clone();
-                                            let delete_id = delete_id.clone();
-                                            move |evt: MouseEvent| {
-                                                evt.stop_propagation();
-                                                let (delete_path, delete_id) = (delete_path.clone(), delete_id.clone());
-                                                state.with_mut(|shell| shell.web_tab_delete_folder(&delete_path, &delete_id));
-                                            }
-                                        },
-                                        "🗑"
-                                    }
-                                }
-                                if !collapsed {
-                                    for tab in folder_tabs.iter().cloned() {
-                                        {tab_row(tab, 1)}
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // ONE list, in the model's order: folders (with their tabs)
+                // above the loose tabs. There is no separate "Root" drop band
+                // any more — it was a second drop path beside the reorder
+                // engine. Un-filing is what dropping beside a ROOT row means,
+                // and the app tab is always one, so the gesture is always there.
+                for row in rail_rows.iter().filter(|row| row.visible) {
+                    {row_view(row)}
                 }
             }
         }
@@ -114282,7 +114901,7 @@ fn AppPaneRailBody(
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     /// `(pane id, action, moved row id, the pane's new row order)` — fired
     /// when a reorderable rail row is dropped somewhere that changes the order.
-    on_app_pane_reorder: EventHandler<(String, String, String, Vec<String>)>,
+    on_app_pane_reorder: EventHandler<(String, String, String, Option<String>, Vec<String>)>,
     on_app_pane_value: EventHandler<(String, String)>,
     /// A row's right-click opens its context menu on the shell state directly —
     /// a GUI-owned floating overlay, not an app schema.
@@ -114336,6 +114955,14 @@ fn AppPaneRailBody(
     let reorderable_row_ids: Vec<String> = schema
         .as_ref()
         .map(|schema| app_pane_reorderable_row_ids(&schema.widgets))
+        .unwrap_or_default();
+    // The pane's SHAPE, for the shared reorder engine. Every list row is in it,
+    // groups included, because a drop lands relative to rows the app may not
+    // have made draggable; `reorderable_row_ids` stays the PERMISSION list and
+    // narrows what actually reaches the app.
+    let row_tree: Vec<RowTreeRow> = schema
+        .as_ref()
+        .map(|schema| app_pane_row_tree(&schema.widgets))
         .unwrap_or_default();
 
     rsx! {
@@ -114602,7 +115229,7 @@ fn AppPaneRailBody(
                                     "{label}"
                                 }
                             },
-                            AppPaneWidget::ListRow { id, title, subtitle, icon, status, selected, row_action, actions, menu, rename, reorder_action } => {
+                            AppPaneWidget::ListRow { id, title, subtitle, icon, status, selected, row_action, actions, menu, rename, reorder_action, depth, expanded, expand_action } => {
                                 // The SHARED row engine (Phase 1): same anatomy
                                 // and metrics as the cwdtree rows and WebTabs
                                 // rail — whole-row clickable, selected tinted,
@@ -114745,6 +115372,11 @@ fn AppPaneRailBody(
                                     };
                                 }
                                 let reorderable = !reorder_action.is_empty();
+                                // A row that declared `expanded` is a GROUP: it
+                                // draws the disclosure triangle and it has an
+                                // inside a drop can land in.
+                                let row_is_group = expanded.is_some();
+                                let row_expanded = expanded.unwrap_or(true);
                                 let (drop_edge, row_is_dragging) = if reorderable {
                                     let shell = state.read();
                                     (
@@ -114753,6 +115385,36 @@ fn AppPaneRailBody(
                                     )
                                 } else {
                                     (None, false)
+                                };
+                                // A GROUP's leading slot is its disclosure chevron;
+                                // a leaf's is its status dot.
+                                let leading_slot: Option<Element> = if row_is_group {
+                                    let (expand_pane, expand_action, expand_row) =
+                                        (pane_id.clone(), expand_action.clone(), id.clone());
+                                    let on_expand = on_app_pane_action.clone();
+                                    Some(rsx! {
+                                        button {
+                                            "data-app-pane-row-expand": "{expand_row}",
+                                            style: row_disclosure_button_style(palette.muted),
+                                            title: if row_expanded { "Collapse" } else { "Expand" },
+                                            onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                            onclick: move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                if expand_action.is_empty() {
+                                                    return;
+                                                }
+                                                on_expand.call((
+                                                    expand_pane.clone(),
+                                                    expand_action.clone(),
+                                                    Some(expand_row.clone()),
+                                                ));
+                                            },
+                                            RowDisclosureChevron { expanded: row_expanded }
+                                        }
+                                    })
+                                } else {
+                                    app_pane_row_status_dot_style(palette, &status)
+                                        .map(|dot| rsx! { span { style: "{dot}" } })
                                 };
                                 rsx! {
                                     div {
@@ -114765,7 +115427,8 @@ fn AppPaneRailBody(
                                         "data-app-pane-row-reorderable": if reorderable { "1" } else { "0" },
                                         "data-app-pane-row-drop-edge": match drop_edge {
                                             Some(DragDropPlacement::Before) => "before",
-                                            Some(_) => "after",
+                                            Some(DragDropPlacement::Into) => "into",
+                                            Some(DragDropPlacement::After) => "after",
                                             None => "",
                                         },
                                         "data-app-pane-row-dragging": if row_is_dragging { "1" } else { "0" },
@@ -114824,14 +115487,13 @@ fn AppPaneRailBody(
                                                     return;
                                                 }
                                                 let pointer = evt.client_coordinates();
-                                                // Above/below the row's midpoint —
-                                                // a flat list has only two bands.
-                                                let y = evt.element_coordinates().y.max(0.0);
-                                                let placement = if y <= APP_PANE_ROW_DROP_MIDPOINT_PX {
-                                                    DragDropPlacement::Before
-                                                } else {
-                                                    DragDropPlacement::After
-                                                };
+                                                // Before / inside / after, from the
+                                                // ONE band rule. A GROUP row has an
+                                                // inside; a leaf keeps two bands.
+                                                let placement = row_drop_placement_for_offset(
+                                                    evt.element_coordinates().y,
+                                                    row_is_group,
+                                                );
                                                 state.with_mut(|shell| {
                                                     if !shell.maybe_begin_app_pane_row_drag((
                                                         pointer.x, pointer.y,
@@ -114847,9 +115509,10 @@ fn AppPaneRailBody(
                                             }
                                         },
                                         onmouseup: {
-                                            let (pane_id, action, rows) = (
+                                            let (pane_id, action, rows, reorderable_ids) = (
                                                 pane_id.clone(),
                                                 reorder_action.clone(),
+                                                row_tree.clone(),
                                                 reorderable_row_ids.clone(),
                                             );
                                             let on_app_pane_reorder = on_app_pane_reorder.clone();
@@ -114857,16 +115520,26 @@ fn AppPaneRailBody(
                                             move |_: MouseEvent| {
                                                 let dropped = state
                                                     .with_mut(|shell| shell.take_app_pane_row_drop(&rows));
-                                                let Some((drop_pane, moved, order)) = dropped else {
+                                                let Some((drop_pane, moved, parent, order)) = dropped
+                                                else {
                                                     return;
                                                 };
                                                 if action.is_empty() || drop_pane != pane_id {
                                                     return;
                                                 }
+                                                // `values["order"]` has always been the
+                                                // REORDERABLE rows; a fixed row the app
+                                                // pinned must not appear in a list the
+                                                // app is about to adopt as its own.
+                                                let order: Vec<String> = order
+                                                    .into_iter()
+                                                    .filter(|id| reorderable_ids.iter().any(|row| row == id))
+                                                    .collect();
                                                 on_app_pane_reorder.call((
                                                     pane_id.clone(),
                                                     action.clone(),
                                                     moved,
+                                                    parent,
                                                     order,
                                                 ));
                                             }
@@ -114907,7 +115580,14 @@ fn AppPaneRailBody(
                                         },
                                     SessionStyleRow {
                                         "data-app-pane-row": "{id}",
+                                        "data-app-pane-row-group": if row_is_group { "1" } else { "0" },
+                                        "data-app-pane-row-expanded": if row_is_group && row_expanded { "1" } else { "0" },
+                                        "data-app-pane-row-depth": "{depth}",
                                         density: SessionRowDensity::Rail,
+                                        // The pane's tree, drawn by the SHARED row
+                                        // engine's indent — the reason `depth` is a
+                                        // schema field and not a component change.
+                                        depth,
                                         selected,
                                         // ONE dim for a dragged row. The rail
                                         // used to fade its own outer box by a
@@ -114923,8 +115603,11 @@ fn AppPaneRailBody(
                                         // always had. The app names the class,
                                         // yggterm paints it from the shared
                                         // traffic-signal vocabulary.
-                                        dot: app_pane_row_status_dot_style(palette, &status)
-                                            .map(|dot| rsx! { span { style: "{dot}" } }),
+                                        // A GROUP's leading slot is its disclosure
+                                        // chevron; a leaf's is its status dot. Same
+                                        // slot either way, so a folder and the rows
+                                        // under it start their titles at one x.
+                                        dot: leading_slot,
                                         icon: (!icon.is_empty()).then(|| app_pane_row_icon(&icon)),
                                         // The cwdtree's icon rule: muted at
                                         // rest, text color on the selected row.
@@ -116359,6 +117042,18 @@ fn web_tab_menu_items(
             });
             items.push(RowMenuItem::divider());
             // ---- arrange ----------------------------------------------------
+            // Naming a row is ARRANGE, not page: it changes the tree, not the
+            // page. Discoverable here as well as by double-click — the folder
+            // rows have had exactly this verb all along, and a tab row that
+            // could only be renamed by a gesture nobody announces is a
+            // half-shipped affordance.
+            let rename = RowMenuItem::new("webtab-rename", "Rename tab", 'n')
+                .icon(MenuIcon::Rename);
+            items.push(if tab.is_app_tab {
+                rename.disabled("the app's tab is named by the app")
+            } else {
+                rename
+            });
             let move_to = RowMenuItem::new("webtab-move", "Move to folder ▸", 'm')
                 .icon(MenuIcon::Folder);
             items.push(if tab.is_app_tab {
@@ -116559,7 +117254,10 @@ enum WebTabMenuAction {
     MoveToNewFolder(u64),
     SplitWithActiveTab(u64),
     NewTabInFolder(String),
-    RenameFolder(String),
+    /// Rename THIS ROW — a folder or a tab. One verb, because the rail has one
+    /// rename ([`ShellState::web_tab_begin_rename`]) and a second action for
+    /// the second row kind would be a second answer to "what is being renamed".
+    RenameRow(WebTabMenuTarget),
     ToggleFolder(String),
     CloseFolderTabs(String),
     DeleteFolder(String),
@@ -116579,6 +117277,7 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
                 "webtab-close-others" => Some(WebTabMenuAction::CloseOtherTabs(tab)),
                 "webtab-close-below" => Some(WebTabMenuAction::CloseTabsBelow(tab)),
                 "webtab-duplicate" => Some(WebTabMenuAction::DuplicateTab(tab)),
+                "webtab-rename" => Some(WebTabMenuAction::RenameRow(WebTabMenuTarget::Tab(tab))),
                 "webtab-split" => Some(WebTabMenuAction::SplitWithActiveTab(tab)),
                 "webtab-move-root" => Some(WebTabMenuAction::MoveToFolder(tab, None)),
                 "webtab-move-new-folder" => Some(WebTabMenuAction::MoveToNewFolder(tab)),
@@ -116592,7 +117291,9 @@ fn web_tab_menu_action(target: &WebTabMenuTarget, id: &str) -> Option<WebTabMenu
         }
         WebTabMenuTarget::Folder(folder) => match id {
             "webfolder-new-tab" => Some(WebTabMenuAction::NewTabInFolder(folder.clone())),
-            "webfolder-rename" => Some(WebTabMenuAction::RenameFolder(folder.clone())),
+            "webfolder-rename" => Some(WebTabMenuAction::RenameRow(WebTabMenuTarget::Folder(
+                folder.clone(),
+            ))),
             "webfolder-toggle" => Some(WebTabMenuAction::ToggleFolder(folder.clone())),
             "webfolder-close-tabs" => Some(WebTabMenuAction::CloseFolderTabs(folder.clone())),
             "webfolder-delete" => Some(WebTabMenuAction::DeleteFolder(folder.clone())),
@@ -116639,7 +117340,7 @@ fn web_tab_menu_close_plan(tabs: &[WebTabScopeRow], action: &WebTabMenuAction) -
         | WebTabMenuAction::MoveToNewFolder(_)
         | WebTabMenuAction::SplitWithActiveTab(_)
         | WebTabMenuAction::NewTabInFolder(_)
-        | WebTabMenuAction::RenameFolder(_)
+        | WebTabMenuAction::RenameRow(_)
         | WebTabMenuAction::ToggleFolder(_)
         | WebTabMenuAction::DeleteFolder(_) => Vec::new(),
     }
@@ -123296,6 +123997,7 @@ mod tests {
         SavedWebTab {
             url: url.to_string(),
             title: String::new(),
+            name: String::new(),
             folder: folder.map(str::to_string),
             active: false,
             app_tab: false,
@@ -123851,6 +124553,7 @@ mod tests {
                     reload_nonce: 0,
                     profile: "default".to_string(),
                     folder: None,
+                    custom_title: None,
                     loading: false,
                     theme_color: None,
                     lease_until_ms: None,
@@ -135411,6 +136114,9 @@ mod tests {
             menu: Vec::new(),
             rename: None,
             reorder_action: String::new(),
+            depth: 0,
+            expanded: None,
+            expand_action: String::new(),
         };
         assert_eq!(row("a").key(0, &epochs), row("a").key(7, &epochs));
         assert_ne!(row("a").key(0, &epochs), row("b").key(0, &epochs));
@@ -135435,6 +136141,9 @@ mod tests {
                 placeholder: String::new(),
             }),
             reorder_action: String::new(),
+            depth: 0,
+            expanded: None,
+            expand_action: String::new(),
         };
         // Only a row that DECLARED `reorder_action` is a drag source or a drop
         // target. A rail mixing fixed rows with reorderable ones must not let a
@@ -135451,6 +136160,9 @@ mod tests {
             menu: Vec::new(),
             rename: None,
             reorder_action: "reorder".into(),
+            depth: 0,
+            expanded: None,
+            expand_action: String::new(),
         };
         let widgets = vec![
             AppPaneWidget::Button {
@@ -157650,7 +158362,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -158307,7 +159019,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -158499,7 +159211,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -158691,7 +159403,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -158886,7 +159598,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -159085,7 +159797,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -159276,7 +159988,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -159467,7 +160179,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -159692,7 +160404,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -159886,7 +160598,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -160112,7 +160824,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -160515,7 +161227,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             web_profile_switcher: None,
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
-            web_tab_folder_rename: None,
+            web_tab_rename: None,
             web_tab_drag: None,
             web_tab_drop_target: None,
             app_pane_row_drag: None,
@@ -166411,6 +167123,7 @@ Updated at   Branch  Conversation\n\
 #[cfg(test)]
 mod webtabs_menu_switcher_locks {
     use super::*;
+    use yggui::DRAG_BEGIN_THRESHOLD_PX;
 
     /// PRODUCT lines of `shell.rs` at `CARGO_MANIFEST_DIR` — the source reads
     /// below judge the FILE, not the binary under test. They are evidence that a
@@ -166735,29 +167448,40 @@ mod webtabs_menu_switcher_locks {
     ///
     /// A count of `open_web_tab_context_menu(` inside `WebTabsRailBody` is
     /// satisfied by a handler wrapped in `if false { … }`: the spelling is
-    /// there, the count is two, and right-click does nothing. So each row's
+    /// there, the count is right, and right-click does nothing. So the row's
     /// `oncontextmenu` is pinned WHOLE, and it is one call to the ONE shared
     /// handler — which is itself covered by the behavioural locks on
     /// `open_web_tab_context_menu`.
+    ///
+    /// It used to take TWO assertions because the rail drew a folder header
+    /// that shared nothing with the rows under it. There is ONE row renderer
+    /// now, so the folder and the tab reach the menu through the same handler
+    /// with the row's own `WebTabMenuTarget` — and this lock says so: if a
+    /// second `oncontextmenu` ever appears in the rail, the count below fails.
     #[test]
     fn both_rail_row_kinds_open_the_menu() {
         let product = product_source();
         assert_eq!(
-            handler_body(&product, "\"data-web-tab-row\"", "oncontextmenu:"),
-            "oncontextmenu:move|evt:MouseEvent|{open_web_tab_menu_from_event(state,\
-             &menu_path,WebTabMenuTarget::Tab(tab_id),WebSurfaceChromeAnchor::Rail,evt,);},",
-            "a rail TAB row's right-click must BE the opener call — nothing around \
-             it, nothing instead of it"
+            handler_body(&product, "\"data-web-tab-row-id\"", "oncontextmenu:"),
+            "oncontextmenu:EventHandler::new(move|evt:MouseEvent|{\
+             open_web_tab_menu_from_event(state,&menu_path,menu_target.clone(),\
+             WebSurfaceChromeAnchor::Rail,evt,);}),",
+            "a rail row's right-click must BE the opener call, carrying the ROW's \
+             own target — nothing around it, nothing instead of it"
         );
+        let rail = function_body(&product, "fn WebTabsRailBody(");
         assert_eq!(
-            handler_body(&product, "\"data-web-tab-folder-collapsed\"", "oncontextmenu:"),
-            "oncontextmenu:{let(menu_path,menu_id)=(menu_path.clone(),menu_id.clone());\
-             move|evt:MouseEvent|{open_web_tab_menu_from_event(state,&menu_path,\
-             WebTabMenuTarget::Folder(menu_id.clone()),WebSurfaceChromeAnchor::Rail,evt,);}},",
-            "a rail FOLDER row's right-click must BE the opener call"
+            rail.matches("oncontextmenu:").count(),
+            1,
+            "ONE row renderer means ONE right-click wiring for folders and tabs \
+             alike; a second one is the two-renderer drift coming back"
         );
-        // …and there is exactly ONE place the two of them go through, so the
-        // behaviour above is proven once for both rows.
+        assert!(
+            rail.contains("let menu_target = row.row.clone();"),
+            "the target must come from the ROW, not be re-derived per kind:\n{rail}"
+        );
+        // …and there is exactly ONE place every row goes through, so the
+        // behaviour above is proven once for both kinds.
         assert_eq!(
             product
                 .iter()
@@ -166778,6 +167502,411 @@ mod webtabs_menu_switcher_locks {
                 "shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y), anchor)"
             ),
             "the shared handler must raise the menu at the pointer:\n{shared}"
+        );
+    }
+
+    // ======================================================================
+    // LOCK 1b — THE RAIL IS THE CWDTREE.
+    //
+    // The user asked for this twice. The rail hand-rolled its own folder tree
+    // — a FOURTH tree in the product — and its drag could only ever re-parent:
+    // it never re-indexed anything. These locks pin the shape of the fix, not
+    // its wording: ONE model (folders above tabs, collapsed rows still in it),
+    // ONE reorder engine (`yggui::reorder_row_tree`), ONE row component.
+    // ======================================================================
+
+    /// The rail's rows in draw order. Folders FIRST, each with its tabs, then
+    /// the loose tabs. Every other assertion in this section reads this.
+    fn rail_rows_of(shell: &ShellState) -> Vec<(String, u32, bool)> {
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("the surface is live");
+        web_tab_rail_rows(&overlay.folders, &overlay.tabs)
+            .into_iter()
+            .map(|row| (row.id(), row.depth, row.visible))
+            .collect()
+    }
+
+    fn rail_tree_of(shell: &ShellState) -> Vec<RowTreeRow> {
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("the surface is live");
+        web_tab_rail_row_tree(&web_tab_rail_rows(&overlay.folders, &overlay.tabs))
+    }
+
+    /// A surface with one folder holding two tabs, plus two loose tabs. The app
+    /// tab is `tab:0` and is always root, so the rail reads:
+    /// `folder:f1, tab:1, tab:2, tab:0, tab:3, tab:4`.
+    fn shell_with_folder() -> ShellState {
+        let mut shell = shell_with_surface(&[
+            ("https://filed-a/", Some("f1")),
+            ("https://filed-b/", Some("f1")),
+            ("https://loose-a/", None),
+            ("https://loose-b/", None),
+        ]);
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            });
+        shell
+    }
+
+    #[test]
+    fn the_rail_puts_folders_above_tabs_and_indents_what_is_filed() {
+        let shell = shell_with_folder();
+        assert_eq!(
+            rail_rows_of(&shell),
+            vec![
+                ("folder:f1".to_string(), 0, true),
+                ("tab:1".to_string(), 1, true),
+                ("tab:2".to_string(), 1, true),
+                ("tab:0".to_string(), 0, true),
+                ("tab:3".to_string(), 0, true),
+                ("tab:4".to_string(), 0, true),
+            ],
+            "organization above the working set, and a filed tab is INDENTED — \
+             the depth the shared row engine draws, not a hand-written padding"
+        );
+    }
+
+    /// A folded-away tab leaves the VIEW and stays in the MODEL. Feeding the
+    /// reorder engine only the visible rows would delete it on the next drop.
+    #[test]
+    fn a_collapsed_folders_tabs_leave_the_view_but_not_the_model() {
+        let mut shell = shell_with_folder();
+        shell.web_tab_toggle_folder("local://ws", "f1");
+        let rows = rail_rows_of(&shell);
+        assert_eq!(
+            rows.iter().find(|(id, _, _)| id == "tab:1"),
+            Some(&("tab:1".to_string(), 1, false)),
+            "present, not drawn"
+        );
+        assert_eq!(rows.len(), 6, "nothing left the model");
+        assert_eq!(
+            rows.iter().filter(|(_, _, visible)| *visible).count(),
+            4,
+            "…and the folded rows are the two that left the view"
+        );
+    }
+
+    /// The whole gesture, on the state machine the render drives.
+    fn drag_rail_row(shell: &mut ShellState, row: &str, onto: &str, placement: DragDropPlacement) {
+        let tree = rail_tree_of(shell);
+        shell.arm_web_tab_row_drag(row.to_string(), (0.0, 0.0));
+        assert!(
+            shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)),
+            "the pointer travelled past the shared threshold"
+        );
+        shell.hover_web_tab_row_drop(onto, placement);
+        shell.end_web_tab_row_drag(&tree);
+    }
+
+    fn rail_order(shell: &ShellState) -> Vec<String> {
+        rail_rows_of(shell)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+
+    /// THE defect. The old rail could file a tab into a folder and nothing
+    /// else; dropping a tab beside another tab did nothing at all.
+    #[test]
+    fn a_rail_drag_reorders_as_well_as_re_parents() {
+        // REORDER among the loose tabs — no parent changes, and the old rail
+        // had no way to express this at all.
+        let mut shell = shell_with_folder();
+        drag_rail_row(&mut shell, "tab:4", "tab:3", DragDropPlacement::Before);
+        assert_eq!(
+            rail_order(&shell),
+            vec!["folder:f1", "tab:1", "tab:2", "tab:0", "tab:4", "tab:3"],
+            "the row MOVED"
+        );
+
+        // REORDER INSIDE a folder — same gesture, and the tab stays filed.
+        let mut shell = shell_with_folder();
+        drag_rail_row(&mut shell, "tab:1", "tab:2", DragDropPlacement::After);
+        assert_eq!(
+            rail_order(&shell),
+            vec!["folder:f1", "tab:2", "tab:1", "tab:0", "tab:3", "tab:4"],
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .find(|tab| tab.id == 1)
+                .and_then(|tab| tab.folder.clone()),
+            Some("f1".to_string()),
+            "reordering inside a folder must not unfile the row"
+        );
+
+        // RE-PARENT — a loose tab dropped on the folder is filed at its TOP,
+        // which is where the ring was drawn.
+        let mut shell = shell_with_folder();
+        drag_rail_row(&mut shell, "tab:3", "folder:f1", DragDropPlacement::Into);
+        assert_eq!(
+            rail_rows_of(&shell)
+                .into_iter()
+                .map(|(id, depth, _)| (id, depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("folder:f1".to_string(), 0),
+                ("tab:3".to_string(), 1),
+                ("tab:1".to_string(), 1),
+                ("tab:2".to_string(), 1),
+                ("tab:0".to_string(), 0),
+                ("tab:4".to_string(), 0),
+            ],
+        );
+
+        // UN-FILE — dropped beside a root row it comes back out, and the app
+        // tab is always a root row, so the gesture is always available.
+        let mut shell = shell_with_folder();
+        drag_rail_row(&mut shell, "tab:1", "tab:3", DragDropPlacement::After);
+        assert_eq!(
+            rail_order(&shell),
+            vec!["folder:f1", "tab:2", "tab:0", "tab:3", "tab:1", "tab:4"],
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .find(|tab| tab.id == 1)
+                .and_then(|tab| tab.folder.clone()),
+            None,
+            "dropping beside a loose tab un-files the row"
+        );
+    }
+
+    /// The rail is TWO BANDS — folders above, loose tabs below — so a drop that
+    /// crosses them has exactly one honest meaning, and the mark drawn is the
+    /// landing (DESIGN.md: the final placement must match the visible
+    /// indicator). A tab "before a folder" would have landed after every folder
+    /// anyway, which is the lie this coercion removes.
+    #[test]
+    fn a_cross_band_drop_means_the_one_thing_it_can_mean() {
+        let mut shell = shell_with_folder();
+
+        // A TAB anywhere on a folder row: INSIDE.
+        shell.arm_web_tab_row_drag("tab:3".to_string(), (0.0, 0.0));
+        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
+        for band in [
+            DragDropPlacement::Before,
+            DragDropPlacement::Into,
+            DragDropPlacement::After,
+        ] {
+            shell.hover_web_tab_row_drop("folder:f1", band);
+            assert_eq!(
+                shell.web_tab_row_drop_edge("folder:f1"),
+                Some(DragDropPlacement::Into),
+                "a tab cannot come to rest between two folders"
+            );
+        }
+        shell.clear_web_tab_row_drag();
+
+        // A FOLDER over a TAB row: no target at all, rather than a landing the
+        // model cannot hold.
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(WebTabFolder {
+                id: "f2".to_string(),
+                name: "Later".to_string(),
+                collapsed: false,
+            });
+        shell.arm_web_tab_row_drag("folder:f2".to_string(), (0.0, 0.0));
+        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
+        shell.hover_web_tab_row_drop("tab:3", DragDropPlacement::After);
+        assert_eq!(shell.web_tab_row_drop_edge("tab:3"), None);
+        let before = rail_order(&shell);
+        let tree = rail_tree_of(&shell);
+        shell.end_web_tab_row_drag(&tree);
+        assert_eq!(rail_order(&shell), before, "and the release moves nothing");
+    }
+
+    /// A drag is a click until it travels, and the app tab is nobody's to move.
+    #[test]
+    fn the_rail_shares_the_windows_one_drag_grammar() {
+        let mut shell = shell_with_folder();
+        let tree = rail_tree_of(&shell);
+
+        shell.arm_web_tab_row_drag("tab:3".to_string(), (100.0, 100.0));
+        assert!(!shell.maybe_begin_web_tab_row_drag((101.0, 100.0)), "jitter is a click");
+        assert!(!shell.web_tab_row_is_dragging("tab:3"), "an armed press does not dim");
+        shell.hover_web_tab_row_drop("folder:f1", DragDropPlacement::Into);
+        assert_eq!(
+            shell.web_tab_row_drop_edge("folder:f1"),
+            None,
+            "an armed press accepts no drop target"
+        );
+        let before = rail_rows_of(&shell);
+        shell.end_web_tab_row_drag(&tree);
+        assert_eq!(rail_rows_of(&shell), before, "releasing a click moves nothing");
+
+        // The app tab is `tabs[0]` and stays there.
+        shell.arm_web_tab_row_drag("tab:0".to_string(), (0.0, 0.0));
+        assert!(shell.web_tab_drag.is_none(), "the app tab is not a drag source");
+    }
+
+    /// The tab tree is TWO levels by construction (`WebSurfaceTab::folder` is
+    /// one optional id, not a path), so the two coercions that keep it that way
+    /// are part of the contract, not defensive noise.
+    #[test]
+    fn the_tab_tree_stays_two_levels_and_the_app_tab_stays_first() {
+        let mut shell = shell_with_folder();
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .folders
+            .push(WebTabFolder {
+                id: "f2".to_string(),
+                name: "Later".to_string(),
+                collapsed: false,
+            });
+
+        // A folder dropped INSIDE a folder lands BESIDE it instead.
+        shell.arm_web_tab_row_drag("folder:f2".to_string(), (0.0, 0.0));
+        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
+        shell.hover_web_tab_row_drop("folder:f1", DragDropPlacement::Into);
+        assert_eq!(
+            shell.web_tab_row_drop_edge("folder:f1"),
+            Some(DragDropPlacement::After),
+            "a folder cannot be filed in a folder — the model has nowhere to put it"
+        );
+        shell.clear_web_tab_row_drag();
+
+        // And nothing lands above the app tab.
+        shell.arm_web_tab_row_drag("tab:3".to_string(), (0.0, 0.0));
+        assert!(shell.maybe_begin_web_tab_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)));
+        shell.hover_web_tab_row_drop("tab:0", DragDropPlacement::Before);
+        assert_eq!(
+            shell.web_tab_row_drop_edge("tab:0"),
+            Some(DragDropPlacement::After),
+            "the app tab owns tabs[0]"
+        );
+        let tree = rail_tree_of(&shell);
+        shell.end_web_tab_row_drag(&tree);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].tabs[0].id,
+            WEB_TAB_APP_TAB_ID,
+            "…and it still does after the drop"
+        );
+    }
+
+    /// Renamable tab rows — the second half of the report. A user-given name
+    /// must OUTRANK the page title, or the next reconcile poll erases it.
+    #[test]
+    fn a_renamed_tab_keeps_its_name_when_the_page_retitles_itself() {
+        let mut shell = shell_with_surface(&[("https://example.com/", None)]);
+        shell.web_tab_begin_rename("tab:1");
+        shell.web_tab_set_rename_draft("  Reading list  ".to_string());
+        shell.web_tab_commit_rename("local://ws");
+
+        // The engine reports a new page title, as it does on every poll.
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface")
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == 1)
+            .expect("the tab")
+            .title = Some("Example Domain".to_string());
+
+        let overlay = shell.snapshot().active_web_surface_overlay.expect("overlay");
+        assert_eq!(
+            overlay
+                .tabs
+                .iter()
+                .find(|tab| tab.id == 1)
+                .map(|tab| tab.label.as_str()),
+            Some("Reading list"),
+            "the user's name wins, trimmed, and the page title does not overwrite it"
+        );
+
+        // The app tab is the app's — it has no rename gesture, so its label is
+        // still the app's.
+        shell.web_tab_begin_rename("tab:0");
+        shell.web_tab_set_rename_draft("mine".to_string());
+        shell.web_tab_commit_rename("local://ws");
+        // (the state layer permits it; the RENDER withholds the gesture — see
+        // `the_rail_draws_every_row_with_the_shared_engine` for that half.)
+        assert!(shell.web_tab_rename.is_none(), "a commit always clears the field");
+    }
+
+    /// "New folder" is born INTO a rename whose text is SELECTED — the first
+    /// keystroke replaces the placeholder instead of appending to it.
+    #[test]
+    fn a_new_folder_opens_its_rename_on_a_selected_placeholder() {
+        let mut shell = shell_with_surface(&[]);
+        shell.web_tab_new_folder("local://ws");
+        let (row_id, draft) = shell.web_tab_rename.clone().expect("born into a rename");
+        assert!(row_id.starts_with("folder:"), "{row_id}");
+        assert_eq!(draft, WEB_TAB_NEW_FOLDER_NAME);
+
+        // …and the field that draws it selects, not merely focuses.
+        let product = product_source();
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert!(
+            rail.contains("select_rename_field(&format!("),
+            "the rename field must SELECT its placeholder:\n{rail}"
+        );
+        let selector = function_body(&product, "fn select_rename_field(");
+        assert!(
+            selector.contains("el.select();"),
+            "…and selecting is what it does:\n{selector}"
+        );
+    }
+
+    /// The reuse doctrine, as a lock. The rail draws NO row of its own: every
+    /// row is the shared component, indented by the shared engine's `depth`,
+    /// and the drop is resolved by the shared reorder engine. A hand-written
+    /// row `div`, a private triangle or a private ordering rule is the fourth
+    /// tree coming back.
+    #[test]
+    fn the_rail_draws_every_row_with_the_shared_engine() {
+        let product = product_source();
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert_eq!(
+            rail.matches("SessionStyleRow {").count(),
+            1,
+            "ONE row renderer for folders and tabs alike:\n{rail}"
+        );
+        assert!(
+            rail.contains("RowDisclosureChevron { expanded }"),
+            "the folder's triangle is the SHARED chevron, not a private glyph"
+        );
+        for private in ["▸", "▾", "padding:6px 8px", "margin-top:6px"] {
+            assert!(
+                !rail.contains(private),
+                "the rail is drawing its own row chrome again ({private}):\n{rail}"
+            );
+        }
+        assert!(
+            rail.contains("row_drop_placement_for_offset("),
+            "the drop bands come from the ONE band rule"
+        );
+        // The rail resolves a drop through the shared engine — via the state
+        // method, which is where the engine is called.
+        let end = function_body(&product, "fn end_web_tab_row_drag(");
+        assert!(
+            end.contains("reorder_row_tree(rows, &drag.row_id, &target_row, placement)"),
+            "the rail must not order rows by an arithmetic of its own:\n{end}"
+        );
+        // The app tab keeps no rename gesture: it is the app's row.
+        assert!(
+            rail.contains("ondoubleclick: (!is_app_tab).then(|| {"),
+            "double-click renames every row EXCEPT the app tab:\n{rail}"
         );
     }
 
@@ -167864,6 +168993,9 @@ mod webtabs_menu_switcher_locks {
                 "webtab-duplicate",
                 "webtab-split",
                 "--",
+                // Naming a row changes the TREE, so it arranges — beside
+                // "Move to folder", the folder rows' own Rename's neighbour.
+                "webtab-rename",
                 "webtab-move",
                 "--",
                 "webtab-close",
