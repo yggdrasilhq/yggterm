@@ -3545,6 +3545,97 @@ mod app_pane_reorder_tests {
         );
     }
 
+    /// THE LEADING ANATOMY, per density (DESIGN.md "Session-style rows").
+    ///
+    /// The cwdtree shows two leading marks at once — a live session's
+    /// keep-alive dot BESIDE its kind icon — so it pays for two columns. A
+    /// right-rail row never shows two, so it pays for one. Paying for the
+    /// second there put a 20px icon box and its gap on every web-tab row in the
+    /// rail with nothing in it, which is what the user reported on 2026-07-31.
+    #[test]
+    fn the_rail_pays_for_one_leading_mark_column_and_the_tree_for_two() {
+        let tree = session_row_metrics(SessionRowDensity::Sidebar);
+        let rail = session_row_metrics(SessionRowDensity::Rail);
+        assert_eq!(
+            tree.status_column_px,
+            Some(9),
+            "the cwdtree keeps its separate status column — a live row shows \
+             its keep-alive dot AND its kind icon at the same time"
+        );
+        assert_eq!(
+            rail.status_column_px, None,
+            "a rail row has ONE leading mark column; the status dot rides the \
+             icon slot rather than buying a column that no drawn row fills"
+        );
+        // The gutter that costs, spelled out: indent + the mark column(s) +
+        // one gap per column. 8 + 20 + 6 = 34 for the rail (was 51 with the
+        // second column and its gap), 12 + 9 + 8 + 20 + 8 = 57 for a live tree
+        // row, unchanged.
+        let rail_gutter = rail.indent_base_px + rail.icon_box_px + rail.gap_px;
+        assert_eq!(
+            rail_gutter, 34,
+            "a rail row's title starts 34px in; every px above that is a box \
+             the row does not draw into"
+        );
+        let tree_gutter = tree.indent_base_px
+            + tree.status_column_px.expect("the tree has a status column")
+            + tree.gap_px
+            + tree.icon_box_px
+            + tree.gap_px;
+        assert_eq!(
+            tree_gutter, 57,
+            "the cwdtree's own gutter is NOT part of this change — the user \
+             reported the rail, and the tree draws into both its columns"
+        );
+    }
+
+    /// The 2026-07-17 rule, which the leading-anatomy split above does NOT
+    /// touch: a rail title and a tree title are the same type at the same size
+    /// in the same box. An 11px rail title next to the 12px tree read as a
+    /// different font, and the user caught it.
+    #[test]
+    fn the_two_densities_still_share_one_typography_and_one_icon_box() {
+        let tree = session_row_metrics(SessionRowDensity::Sidebar);
+        let rail = session_row_metrics(SessionRowDensity::Rail);
+        assert_eq!(tree.font_px, rail.font_px, "one type size across densities");
+        assert_eq!(
+            tree.icon_box_px, rail.icon_box_px,
+            "one icon box across densities — a glyph that changed size between \
+             the tree and the rail would read as two vocabularies"
+        );
+    }
+
+    /// A rail level indents TWO SPACES further than a tree level (user,
+    /// 2026-07-31: "2 spaces worth of more indentation in the folder"). The
+    /// row's own 12px Inter measures 3.375px per space, so two of them is
+    /// 6.75px and 12 + 6.75 rounds to 19.
+    #[test]
+    fn a_rail_level_indents_two_spaces_further_than_a_tree_level() {
+        let tree = session_row_metrics(SessionRowDensity::Sidebar);
+        let rail = session_row_metrics(SessionRowDensity::Rail);
+        assert_eq!(tree.indent_step_px, 12, "the cwdtree's step is unchanged");
+        assert_eq!(
+            rail.indent_step_px, 19,
+            "12px + two space-advances of the row's own 12px Inter (2 × 3.375 \
+             = 6.75) rounds to 19"
+        );
+        // …and the step is what the container actually pays out, so a depth-2
+        // rail row is indented 8 + 2 × 19 = 46px.
+        let deep = session_row_container_style(
+            SessionRowDensity::Rail,
+            2,
+            false,
+            false,
+            true,
+            "#eef",
+            "#123",
+        );
+        assert!(
+            deep.contains("padding:5px 8px 5px 46px"),
+            "depth must reach the row as indent, not as a hand-written pad:\n{deep}"
+        );
+    }
+
     // The rail gesture must be OBSERVABLE. It was absent from `server app
     // state` entirely, so "the row stays dimmed forever" could only be argued
     // from a screenshot — and `dragging` is precisely the flag that paints the
@@ -80503,7 +80594,18 @@ struct SessionRowMetrics {
     gap_px: u32,
     font_px: f32,
     icon_box_px: u32,
-    dot_rail_px: u32,
+    /// A SEPARATE status column, ahead of the icon box — or `None` when this
+    /// density carries status ON the icon slot, as ONE leading mark column.
+    ///
+    /// The cwdtree has two leading marks at once (a live session's keep-alive
+    /// dot BESIDE its kind icon), so it pays for two columns. A right-rail row
+    /// never does: a folder has a glyph and no dot, a web tab has a loading dot
+    /// and no glyph, and a contributed leaf that has both wants the dot to read
+    /// as a badge ON its icon, not as a column of its own. Paying for the
+    /// second column there spent 15px of a ~220px rail on a box that is empty
+    /// in every row that draws (user report 2026-07-31: "significant waste of
+    /// horizontal space on each row").
+    status_column_px: Option<u32>,
 }
 
 const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
@@ -80520,23 +80622,33 @@ const fn session_row_metrics(density: SessionRowDensity) -> SessionRowMetrics {
             gap_px: 8,
             font_px: 12.0,
             icon_box_px: 20,
-            dot_rail_px: 9,
+            status_column_px: Some(9),
         },
-        // Density differs in SPACING only (padding/radius/indent). The
-        // typography and the icon/dot slot geometry are IDENTICAL to the
-        // sidebar's — a human eye reads the left cwdtree and a right-rail
-        // file list as the same vocabulary, and an 11px rail title next to
-        // the 12px tree was visibly "off" (user-caught 2026-07-17).
+        // TYPOGRAPHY and the icon box are IDENTICAL to the sidebar's — a human
+        // eye reads the left cwdtree and a right-rail file list as the same
+        // vocabulary, and an 11px rail title next to the 12px tree was visibly
+        // "off" (user-caught 2026-07-17). What the rail may differ in is
+        // SPACING and the LEADING ANATOMY:
+        //
+        //   * `status_column_px: None` — one mark column, not two (see the
+        //     field's own note). 15px back on every row.
+        //   * `indent_step_px: 19` — two space-advances MORE than the tree's
+        //     12 (the row's own 12px Inter measures 3.375px per space, so two
+        //     of them is 6.75px → 19). The rail asked for it and the tree did
+        //     not, because the tree spends a DIFFERENT icon on every level
+        //     (machine → folder → session kind) while every rail row wears the
+        //     same mark: with that redundancy gone, indent is the only thing
+        //     left carrying depth, so it has to carry more.
         SessionRowDensity::Rail => SessionRowMetrics {
-            indent_base_px: 10,
-            indent_step_px: 12,
+            indent_base_px: 8,
+            indent_step_px: 19,
             pad_v_px: 5,
             pad_h_px: 8,
             radius_px: 8,
             gap_px: 6,
             font_px: 12.0,
             icon_box_px: 20,
-            dot_rail_px: 9,
+            status_column_px: None,
         },
     }
 }
@@ -80570,15 +80682,51 @@ fn session_row_container_style(
     )
 }
 
-/// The fixed-width slot the status dot sits in (laid out even when empty, so
-/// an appearing dot never shoves the title sideways).
+/// The fixed-width SEPARATE status column, for a density that has one (the
+/// cwdtree). Laid out even when empty, so an appearing dot never shoves the
+/// title sideways. A density with `status_column_px: None` draws no such column
+/// — its status dot rides [`session_row_mark_column_style`] instead.
 fn session_row_dot_rail_style(density: SessionRowDensity) -> String {
     let m = session_row_metrics(density);
     format!(
         "display:inline-flex; align-items:center; justify-content:center; \
          width:{w}px; min-width:{w}px; height:{h}px; flex:0 0 auto;",
-        w = m.dot_rail_px,
+        w = m.status_column_px.unwrap_or(0),
         h = m.icon_box_px,
+    )
+}
+
+/// The ONE leading mark column, for a density with no separate status column.
+/// Always laid out, icon or no icon, so every row of a list starts its title at
+/// one x — the rule the two-column anatomy kept with an always-drawn dot rail.
+/// `position:relative` because the status dot is positioned INSIDE it.
+fn session_row_mark_column_style(density: SessionRowDensity, color: &str) -> String {
+    let m = session_row_metrics(density);
+    format!(
+        "position:relative; display:inline-flex; align-items:center; justify-content:center; \
+         width:{s}px; min-width:{s}px; height:{s}px; color:{color}; flex:0 0 auto;",
+        s = m.icon_box_px,
+    )
+}
+
+/// Where the status dot sits inside the mark column: CENTERED when the mark is
+/// the dot itself (a web tab has no glyph), a corner BADGE when it shares the
+/// column with an icon (a contributed leaf that is both dirty and a `.md`).
+/// Absolute either way, so an appearing dot moves nothing at all — the promise
+/// the always-laid-out dot rail was making, kept more strictly.
+///
+/// ⚠ ONE key set across both branches, values only. Dioxus applies `style`
+/// property-by-property and never clears a key a later render drops.
+fn session_row_status_badge_style(over_icon: bool) -> String {
+    let (inset, margin) = if over_icon {
+        ("auto 0px 0px auto", "0")
+    } else {
+        ("0px", "auto")
+    };
+    format!(
+        "position:absolute; inset:{inset}; margin:{margin}; \
+         display:inline-flex; align-items:center; justify-content:center; \
+         width:auto; height:auto; pointer-events:none;"
     )
 }
 
@@ -80664,6 +80812,7 @@ fn SessionStyleRow(
     #[props(default)] oncontextmenu: Option<EventHandler<MouseEvent>>,
 ) -> Element {
     let clickable = onclick.is_some();
+    let metrics = session_row_metrics(density);
     let container = session_row_container_style(
         density,
         depth,
@@ -80710,21 +80859,40 @@ fn SessionStyleRow(
                 }
             },
             ..attributes,
-            // The status slot is ALWAYS laid out, dot or no dot (DESIGN.md
-            // "Session-style rows"): a row whose status appears later —
-            // a yedit note going dirty — must not shove its own title
-            // sideways, and two rows of the same list must not start their
-            // titles at different x.
-            span {
-                style: session_row_dot_rail_style(density),
-                if let Some(dot) = dot {
-                    {dot}
-                }
-            }
-            if let Some(icon) = icon {
+            // THE LEADING SLOT is ALWAYS laid out, mark or no mark (DESIGN.md
+            // "Session-style rows"): a row whose status appears later — a yedit
+            // note going dirty — must not shove its own title sideways, and two
+            // rows of the same list must not start their titles at different x.
+            //
+            // How WIDE that slot is, is the density's answer. The cwdtree pays
+            // for two columns because it shows two marks at once; a rail row
+            // never does, so it pays for one and the dot rides the icon.
+            if metrics.status_column_px.is_some() {
                 span {
-                    style: session_row_icon_box_style(density, &icon_slot_color),
-                    {icon}
+                    style: session_row_dot_rail_style(density),
+                    if let Some(dot) = dot.clone() {
+                        {dot}
+                    }
+                }
+                if let Some(icon) = icon.clone() {
+                    span {
+                        style: session_row_icon_box_style(density, &icon_slot_color),
+                        {icon}
+                    }
+                }
+            } else {
+                span {
+                    "data-session-row-mark": "1",
+                    style: session_row_mark_column_style(density, &icon_slot_color),
+                    if let Some(icon) = icon.clone() {
+                        {icon}
+                    }
+                    if let Some(dot) = dot.clone() {
+                        span {
+                            style: session_row_status_badge_style(icon.is_some()),
+                            {dot}
+                        }
+                    }
                 }
             }
             if let Some(subtitle_text) = subtitle_text {
@@ -114073,15 +114241,17 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         false,
                         Some(count.to_string()),
                         Some(expanded),
-                        // No dot on a folder — but the slot is still laid out
-                        // by the shared row, so a folder and the rows under it
-                        // start their titles at one x.
-                        rsx! {},
+                        // No dot on a folder. `None`, not an empty element: the
+                        // mark COLUMN is laid out by the shared row either way
+                        // (so a folder and the rows under it start their titles
+                        // at one x), but a slot handed `rsx!{}` reserves a box
+                        // for nothing.
+                        None,
                         // THE folder glyph, from its one owner: filled when the
                         // folder is open, outline when it is shut, exactly as
                         // the cwd tree three pixels away draws it.
-                        rsx! { RowFolderIcon { expanded } },
-                        rsx! {
+                        Some(rsx! { RowFolderIcon { expanded } }),
+                        Some(rsx! {
                             button {
                                 "data-web-tab-folder-expand": "{folder_id}",
                                 style: row_disclosure_button_style(palette.muted),
@@ -114094,8 +114264,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 },
                                 RowDisclosureChevron { expanded }
                             }
-                        },
-                        rsx! {
+                        }),
+                        Some(rsx! {
                             button {
                                 "data-web-tab-folder-new-folder": "{folder_id}",
                                 style: session_row_action_button_style(palette.text),
@@ -114157,7 +114327,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 },
                                 "🗑"
                             }
-                        },
+                        }),
                         EventHandler::new(move |_| {
                             let (path, id) = (toggle_path.clone(), toggle_id.clone());
                             state.with_mut(|shell| {
@@ -114182,38 +114352,44 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         tab.as_ref().is_some_and(|tab| tab.active),
                         None,
                         None,
-                        rsx! {
+                        // A tab's ONE leading mark is its loading dot; it rides
+                        // the mark column the folder's glyph sits in, so both
+                        // row kinds start their titles at one x on ONE column.
+                        Some(rsx! {
                             span {
                                 "data-web-tab-loading": if loading { "true" } else { "false" },
                                 style: web_tab_loading_dot_style(loading),
                             }
-                        },
-                        rsx! {},
-                        rsx! {},
-                        rsx! {
-                            // The app tab gets NO ✕. Its ✕ used to QUIT ychrome
-                            // (a Ctrl+C to the app) while this same row's menu
-                            // refused to close it and said why — two affordances
-                            // on one row disagreeing. Quitting the app lives
-                            // where quitting an app lives.
-                            if !is_app_tab {
-                                button {
-                                    "data-web-tab-close": "{tab_id}",
-                                    style: session_row_action_button_style(palette.text),
-                                    title: "Close tab",
-                                    onmousedown: |evt: MouseEvent| evt.stop_propagation(),
-                                    onclick: move |evt: MouseEvent| {
-                                        evt.stop_propagation();
-                                        let close_path = close_path.clone();
-                                        state.with_mut(|shell| {
-                                            shell.web_surface_close_tab(&close_path, tab_id);
-                                            shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                                        });
-                                    },
-                                    "✕"
-                                }
+                        }),
+                        // No glyph, no chevron — and `None`, not `rsx!{}`. An
+                        // EMPTY element is not an absent slot: it reserved a
+                        // 20px icon box plus its gap on every tab row in the
+                        // rail, and a 6px gap for a chevron that was never
+                        // drawn (user report 2026-07-31).
+                        None,
+                        None,
+                        // The app tab gets NO ✕. Its ✕ used to QUIT ychrome
+                        // (a Ctrl+C to the app) while this same row's menu
+                        // refused to close it and said why — two affordances
+                        // on one row disagreeing. Quitting the app lives
+                        // where quitting an app lives.
+                        (!is_app_tab).then(|| rsx! {
+                            button {
+                                "data-web-tab-close": "{tab_id}",
+                                style: session_row_action_button_style(palette.text),
+                                title: "Close tab",
+                                onmousedown: |evt: MouseEvent| evt.stop_propagation(),
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    let close_path = close_path.clone();
+                                    state.with_mut(|shell| {
+                                        shell.web_surface_close_tab(&close_path, tab_id);
+                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                                    });
+                                },
+                                "✕"
                             }
-                        },
+                        }),
                         EventHandler::new(move |_| {
                             // A drag's own release is also a click: moving a
                             // tab must not also switch to it.
@@ -168651,6 +168827,68 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
+    /// AN EMPTY ELEMENT IS NOT AN ABSENT SLOT. `rsx! {}` hands the shared row
+    /// something that draws nothing, and the row dutifully reserves its box —
+    /// which is exactly how every web-tab row came to carry a 20px icon box it
+    /// never filled and a 6px gap for a chevron it never drew (user report
+    /// 2026-07-31, "significant waste of horizontal space on each row"). A
+    /// surface with nothing for a slot says `None`.
+    #[test]
+    fn the_rail_passes_an_absent_slot_as_none_never_as_an_empty_element() {
+        let product = product_source();
+        let rail = function_body(&product, "fn WebTabsRailBody(");
+        assert!(
+            !rail.contains("rsx! {}"),
+            "an empty element in a row slot reserves a box for nothing; pass \
+             None:\n{rail}"
+        );
+        // …and the slots that DO draw are named here, so this cannot pass by
+        // the rail simply having stopped drawing folders.
+        assert!(
+            rail.contains("Some(rsx! { RowFolderIcon { expanded } })"),
+            "the folder row still fills the mark column with the shared glyph:\n{rail}"
+        );
+        assert!(
+            rail.contains("(!is_app_tab).then(|| rsx! {"),
+            "and the app tab's absent ✕ is an absent slot too, not an empty one"
+        );
+    }
+
+    /// The shared row draws the DENSITY's leading anatomy, and both of them: a
+    /// surface cannot get a mark column by writing one, and the always-laid-out
+    /// leading slot survives in each.
+    #[test]
+    fn the_shared_row_draws_both_leading_anatomies_and_nobody_else_does() {
+        let product = product_source();
+        let row = function_body(&product, "fn SessionStyleRow(");
+        assert!(
+            row.contains("if metrics.status_column_px.is_some() {"),
+            "the anatomy is chosen by the DENSITY, not by the caller:\n{row}"
+        );
+        assert!(
+            row.contains("style: session_row_dot_rail_style(density),"),
+            "the two-column anatomy still draws its status rail:\n{row}"
+        );
+        assert!(
+            row.contains("style: session_row_mark_column_style(density, &icon_slot_color),"),
+            "the one-column anatomy draws the shared mark column:\n{row}"
+        );
+        assert!(
+            row.contains("style: session_row_status_badge_style(icon.is_some()),"),
+            "…with the dot centred or badged by whether it shares the column:\n{row}"
+        );
+        // The mark column has exactly one call site: a second one is a surface
+        // growing a leading slot of its own.
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("session_row_mark_column_style(density, &"))
+                .count(),
+            1,
+            "one owner draws the mark column; a second call site is a fork"
+        );
+    }
+
     /// The reuse doctrine, as a lock. The rail draws NO row of its own: every
     /// row is the shared component, indented by the shared engine's `depth`,
     /// and the drop is resolved by the shared reorder engine. A hand-written
@@ -171588,8 +171826,15 @@ mod webtabs_menu_switcher_locks {
     fn the_app_tabs_row_offers_no_close_at_all_on_either_surface() {
         let product = product_source();
         // BOTH surfaces: the rail row and the classic strip chip. Each ✕ must be
-        // behind an `if !is_app_tab` — a title change alone would leave the
-        // gesture live.
+        // behind the `!is_app_tab` predicate — a title change alone would leave
+        // the gesture live.
+        //
+        // TWO gate spellings, because the two surfaces hang the ✕ differently
+        // and both are the same predicate: the strip draws it as a conditional
+        // CHILD (`if !is_app_tab {`), while the rail hands the shared row an
+        // absent `actions` SLOT (`(!is_app_tab).then(|| …)`) — an EMPTY element
+        // there would still have reserved its gap (DESIGN.md, 2026-07-31). A
+        // gate written any OTHER way, or none at all, still fails here.
         for (guard, what) in [
             ("\"data-web-tab-close\": \"{tab_id}\",", "the rail row's ✕"),
             ("title: \"Close tab\",", "the strip chip's ✕"),
@@ -171600,7 +171845,8 @@ mod webtabs_menu_switcher_locks {
                 .unwrap_or_else(|| panic!("{what} moved — move this lock with it"));
             let before = product[at.saturating_sub(8)..at].join("\n");
             assert!(
-                before.contains("if !is_app_tab {"),
+                before.contains("if !is_app_tab {")
+                    || before.contains("(!is_app_tab).then(|| rsx! {"),
                 "{what} must be drawn only for a tab that is not the app:\n{before}"
             );
         }
