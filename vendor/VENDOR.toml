@@ -1,0 +1,54 @@
+# WHERE EACH VENDORED CRATE CAME FROM.
+#
+# Without this record our own patch set is uncomputable and every upgrade is
+# archaeology — which is exactly the state the fork was in until 2026-08-01.
+# `docs/vendor-upgrade-path.md` is the procedure; this is the data it needs.
+#
+# `version` is the PRISTINE upstream release we forked FROM, not the version we
+# claim to be. Fetch it with:
+#   curl -sL https://static.crates.io/crates/<n>/<n>-<version>.crate | tar xz
+#
+# `inline_files`  = upstream files we EDIT. Every one is a future merge conflict.
+# `additive_files` = files that exist only in our tree. Zero upgrade cost.
+# ⭐ Moving work from the first list to the second is the whole strategy.
+
+[wry]
+upstream = "https://github.com/tauri-apps/wry"
+version = "0.55.0"
+inline_files = [
+  "src/inject_initialization_scripts.rs",
+  "src/lib.rs",
+  "src/web_context.rs",
+  "src/webkitgtk/mod.rs",
+  "src/webkitgtk/synthetic_mouse_events.rs",
+  "src/webkitgtk/web_context.rs",
+  "src/webview2/mod.rs",
+  "src/wkwebview/class/wry_web_view_ui_delegate.rs",
+]
+additive_files = []
+
+[dioxus-desktop]
+upstream = "https://github.com/DioxusLabs/dioxus"
+version = "0.7.9"
+inline_files = [
+  "src/app.rs",
+  "src/desktop_context.rs",
+  "src/edits.rs",
+  "src/ipc.rs",
+  "src/js/native_eval.js",
+  "src/launch.rs",
+  "src/lib.rs",
+  "src/mobile.rs",
+  "src/protocol.rs",
+  "src/webview.rs",
+]
+additive_files = [
+  "src/web_surface.rs",
+  "src/web_surface_clipboard_image_paste.rs",
+]
+
+[dioxus-interpreter-js]
+upstream = "https://github.com/DioxusLabs/dioxus"
+version = "0.7.9"
+inline_files = []
+additive_files = []
