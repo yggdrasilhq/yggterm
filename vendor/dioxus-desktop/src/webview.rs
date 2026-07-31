@@ -704,6 +704,47 @@ impl WebviewInstance {
                     );
                 });
             }
+            // The shell's CHORDS (Ctrl+F, F11), claimed on the TOPLEVEL WINDOW
+            // so they work whatever holds the keyboard — a page, a popup, a
+            // terminal, a child kind that does not exist yet. Whoever had the
+            // key never saw it; the claimer consumed it above them, so this is
+            // delivery, not interception.
+            //
+            // `focus_shell` is per-chord and it matters: Ctrl+F targets a field
+            // in the SHELL's DOM, which cannot take a keystroke while WebKit's
+            // child holds the toplevel focus, so the keyboard must come home
+            // FIRST. F11 only runs a command — taking the keyboard off the page
+            // the user is reading would be a second, unasked-for effect.
+            {
+                use gtk::prelude::WidgetExt as _;
+                use tao::platform::unix::WindowExtUnix as _;
+                use webkit2gtk::WebViewExt as _;
+                use wry::WebViewExtUnix as _;
+                let shell_webkit = desktop_context.webview.webview();
+                host.set_chord_notifier(move |chord| {
+                    let cancellable: Option<&gtk::gio::Cancellable> = None;
+                    if chord.focus_shell {
+                        shell_webkit.grab_focus();
+                    }
+                    #[allow(deprecated)]
+                    shell_webkit.run_javascript(
+                        &format!(
+                            "window.__yggtermChordFromHost && window.__yggtermChordFromHost('{}');",
+                            chord.id.replace('\\', "\\\\").replace('\'', "\\'")
+                        ),
+                        cancellable,
+                        |_| {},
+                    );
+                });
+                // ONE attachment point, on the one toplevel — see
+                // `connect_window_chord_claimer`. A per-surface claimer would
+                // have to be remembered at every door a focusable child is
+                // built through, and a forgotten door re-traps the user in
+                // fullscreen with no way out.
+                host.install_window_chord_claimer(
+                    gtk::prelude::Cast::upcast_ref(desktop_context.window.gtk_window()),
+                );
+            }
             desktop_context.install_web_surface_host(host);
         }
 
