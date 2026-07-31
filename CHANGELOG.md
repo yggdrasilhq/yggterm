@@ -4,6 +4,31 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Fixed: a Claude Code viewport no longer stays broken at the bottom until you
+  type a slash.** The reveal screen-reconcile is what repairs a wrong frame, and
+  it was gated on 1.2 s of output silence with a rearm that had no ceiling — so
+  on a working agent, which never stops streaming, it could be deferred for the
+  whole turn. Its only escape required the viewport to have already gone
+  near-blank, which caught the catastrophic case and did nothing for the far more
+  common partially-broken bottom. Measured on the live host: 198 deferrals
+  against 32 completed reconciles in 83 minutes, in chains ~40 rearms deep
+  spanning ~2 minutes. The quiet window is still preferred; after 12 s the repaint
+  is forced regardless of output.
+- **Fixed: dragging a selection over a streaming session no longer stalls the
+  terminal.** The previous fix made per-event work O(1) but coalesced the
+  expensive half to `requestAnimationFrame`, so the O(selected-cells) selection
+  serialization still ran ~60x/second on the thread that also runs the xterm write
+  pump. A live drag now schedules nothing — drag-end performs the single
+  serialization anyone can observe, which every reader already flushed for.
+- **Three viewport bug classes became measurable instead of arguable.** Reconcile
+  deferrals report `defer_chain_depth`/`defer_chain_ms` (the trace rate-limiter was
+  hiding 2.8x of them, so a line count was never a deferral count) and a forced
+  repaint emits `screen_reconcile_forced_deadline`; a finished drag emits
+  `drag_selection_complete` with its event count, duration and flush cost; and the
+  cold-mount veil now reports every disposition including the host-torn-down path
+  that previously ended silently, with `cold_mount_veil_count` and
+  `cold_mount_veil_oldest_age_ms` exposed on `server app state` so a veil stuck
+  over a terminal can be seen from outside the webview.
 - **ALT+ KeyTips now reach every visible control — the §12.2 inversion, at the
   overlay boundary.** Opening the ALT layer derives a hotkey badge for every
   visible interactable that has no declared letter and no per-element excuse:

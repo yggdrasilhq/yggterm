@@ -553,6 +553,42 @@ const SCREEN_RECONCILE_OUTPUT_QUIET_MS: u64 = 1_200;
 // frame on a working session would otherwise stay wrong for the whole turn;
 // the corrective write lands once the surface is quiet AND idle.
 const SCREEN_RECONCILE_DEFER_REARM_MS: u64 = 3_000;
+/// THE DEFER MUST HAVE A DEADLINE (user-reported 2026-07-31, telemetry-proven).
+///
+/// `SCREEN_RECONCILE_OUTPUT_QUIET_MS` above asks for 1.2 s of output silence
+/// before a corrective repaint. That is the right *preference* — it is what
+/// stops a reconcile tearing a good frame mid-burst. It was also, until this
+/// constant existed, the only way out: a miss re-armed `+3 s` forever, with no
+/// cap and no deadline.
+///
+/// **An agent CLI is never output-silent.** A working codex/CC turn drives a
+/// spinner continuously, so the quiet window simply does not arrive, and the
+/// reconcile that the code above calls "the broken-bottom fix" never runs. The
+/// only escape was `reveal_incomplete`, which requires the viewport to have
+/// already rotted below 3 non-blank rows — it catches the blank-frame
+/// catastrophe and does nothing for the far more common PArecordsALLY broken
+/// bottom, which is what users actually report and "fix" by typing `/` (that
+/// makes the CLI repaint its own footer, because we never did).
+///
+/// Measured on the live host before this bound existed: 198 real deferrals
+/// against 32 completed reconciles in 83 minutes, in chains ~40 rearms deep
+/// spanning ~2 minutes, escaping only via the near-blank bypass.
+///
+/// So: keep the quiet test as the preferred path, and force the reconcile once
+/// the correction has been owed this long. This is the same principle the
+/// constitution states for the daemon drain — *the drain must not require a
+/// quiet window*, because a machine that is always active never provides one.
+/// 12 s is chosen to be far longer than any legitimate output burst (the quiet
+/// test only needs 1.2 s) while staying well inside the window in which a user
+/// notices a broken bottom and reaches for the keyboard.
+const SCREEN_RECONCILE_DEFER_DEADLINE_MS: u64 = 12_000;
+/// Ceiling on the cold-mount veil, the opaque rectangle a cold terminal mount
+/// puts over its host so the user never watches wrong-frame churn. The settle
+/// release (stable buffer + daemon-sourced content) and the keystroke release
+/// both normally fire long before this — measured live at p50 1.7 s, max 4.5 s
+/// across 11 releases — but the cap is the promise that a veil can never trap
+/// the user, so it must exist and must be reachable from one place.
+const COLD_MOUNT_VEIL_HARD_CAP_MS: u64 = 20_000;
 /// Outcome for a due visible-screen reconcile once the daemon frame is in
 /// hand. `DeferWorking` means re-arm (never write over a working surface,
 /// never drop the correction); `SkipUnwritable` keeps the bounded
@@ -578,6 +614,28 @@ fn screen_reconcile_decision(screen_text: &str) -> ScreenReconcileDecision {
 /// reconcile must defer, not write.
 fn screen_reconcile_output_quiet(now_ms: u64, last_forwarded_output_at_ms: u64) -> bool {
     now_ms.saturating_sub(last_forwarded_output_at_ms) >= SCREEN_RECONCILE_OUTPUT_QUIET_MS
+}
+/// How long a due reconcile has been owed, measured from the FIRST defer of the
+/// current chain (0 when no chain is open).
+///
+/// The distinction matters: the rearm cadence is 3 s, so "time since the last
+/// defer" is never more than 3 s no matter how long the user has been staring
+/// at a broken frame. Only the chain start measures the thing the user feels.
+fn screen_reconcile_defer_chain_age_ms(now_ms: u64, chain_began_ms: u64) -> u64 {
+    if chain_began_ms == 0 {
+        return 0;
+    }
+    now_ms.saturating_sub(chain_began_ms)
+}
+/// `true` once a deferred reconcile has been owed past
+/// [`SCREEN_RECONCILE_DEFER_DEADLINE_MS`] and must be forced through even though
+/// output is still flowing.
+///
+/// This is the escape the quiet gate lacked. See the constant for why an
+/// unbounded defer was a live user-visible bug rather than a theoretical one.
+fn screen_reconcile_defer_deadline_expired(now_ms: u64, chain_began_ms: u64) -> bool {
+    screen_reconcile_defer_chain_age_ms(now_ms, chain_began_ms)
+        >= SCREEN_RECONCILE_DEFER_DEADLINE_MS
 }
 
 /// FORWARD-RATE PROBE (latency campaign 2026-06-19): the GUI main thread runs at
@@ -50218,6 +50276,32 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     canvas_count: canvasLayers.length,
                     visible_canvas_layer_count: visibleCanvasLayerCount,
                     hidden_canvas_layer_count: hiddenCanvasLayerCount,
+                    // COLD-MOUNT VEIL, VISIBLE TO A PROBE (2026-07-31). The veil
+                    // is an opaque rectangle over the user's terminal, and until
+                    // now nothing outside the webview could tell whether one was
+                    // up: a stuck veil looks exactly like a hung session from
+                    // the outside, and `server app state` reported neither.
+                    // Document-wide on purpose — a veil stuck on ANY host is the
+                    // symptom, and this needs no local binding so both
+                    // describe_state builders can carry the same answer.
+                    cold_mount_veil_count:
+                        document.querySelectorAll('.yggterm-cold-mount-veil').length,
+                    cold_mount_veil_oldest_age_ms: (() => {
+                        try {
+                            const veils = window.__yggtermColdMountVeils || {};
+                            const now = Date.now();
+                            let oldest = 0;
+                            for (const key of Object.keys(veils)) {
+                                const record = veils[key];
+                                if (record && record.attachedAtMs) {
+                                    oldest = Math.max(oldest, now - record.attachedAtMs);
+                                }
+                            }
+                            return Math.max(0, oldest);
+                        } catch (_veilAgeError) {
+                            return 0;
+                        }
+                    })(),
                     software_canvas_layer_optimization_active: mountedHost
                         ? Boolean(mountedHost.softwareCanvasLayerOptimizationActive)
                         : false,
@@ -53483,6 +53567,32 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     canvas_count: canvasLayers.length,
                     visible_canvas_layer_count: visibleCanvasLayerCount,
                     hidden_canvas_layer_count: hiddenCanvasLayerCount,
+                    // COLD-MOUNT VEIL, VISIBLE TO A PROBE (2026-07-31). The veil
+                    // is an opaque rectangle over the user's terminal, and until
+                    // now nothing outside the webview could tell whether one was
+                    // up: a stuck veil looks exactly like a hung session from
+                    // the outside, and `server app state` reported neither.
+                    // Document-wide on purpose — a veil stuck on ANY host is the
+                    // symptom, and this needs no local binding so both
+                    // describe_state builders can carry the same answer.
+                    cold_mount_veil_count:
+                        document.querySelectorAll('.yggterm-cold-mount-veil').length,
+                    cold_mount_veil_oldest_age_ms: (() => {{
+                        try {{
+                            const veils = window.__yggtermColdMountVeils || {{}};
+                            const now = Date.now();
+                            let oldest = 0;
+                            for (const key of Object.keys(veils)) {{
+                                const record = veils[key];
+                                if (record && record.attachedAtMs) {{
+                                    oldest = Math.max(oldest, now - record.attachedAtMs);
+                                }}
+                            }}
+                            return Math.max(0, oldest);
+                        }} catch (_veilAgeError) {{
+                            return 0;
+                        }}
+                    }})(),
                     software_canvas_layer_optimization_active: mountedHost ? Boolean(mountedHost.softwareCanvasLayerOptimizationActive) : false,
                     software_canvas_hidden_layer_count: mountedHost ? Number(mountedHost.softwareCanvasHiddenLayerCount || 0) : hiddenCanvasLayerCount,
                     software_canvas_visible_layer_count: mountedHost ? Number(mountedHost.softwareCanvasVisibleLayerCount || 0) : visibleCanvasLayerCount,
@@ -85368,6 +85478,16 @@ fn TerminalCanvas(
             let mut last_forwarded_output_at_ms = 0_u64;
             let mut last_screen_reconcile_defer_trace_ms = 0_u64;
             let mut suppressed_screen_reconcile_defer_count = 0_u64;
+            // DEFER CHAIN ACCOUNTING (2026-07-31). The trace line below is rate
+            // limited to one per 10 s, and `suppressed_since_last` was the only
+            // hint that more had happened — so a raw line count understated the
+            // real deferral total 2.8x and a chain looked like scattered
+            // singletons. These two carry the CHAIN itself: how deep it is and
+            // when it started, reset only when a reconcile actually runs. They
+            // are what makes "the corrector is starved right now" readable from
+            // telemetry instead of inferable from it.
+            let mut screen_reconcile_defer_chain_depth = 0_u64;
+            let mut screen_reconcile_defer_chain_began_ms = 0_u64;
             let mut last_window_focused_for_read =
                 state.with(|shell| shell.effective_window_focused());
             let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
@@ -85488,8 +85608,43 @@ fn TerminalCanvas(
                     // write is the same content).
                     let reveal_incomplete = screen_reconcile_reason == "reveal_screen_reconcile"
                         && last_host_health_visible_nonblank_rows < 3;
+                    // THE DEADLINE. `reveal_incomplete` only rescues a viewport
+                    // that has already gone near-blank; a partially broken
+                    // bottom takes no escape from the quiet gate at all,
+                    // because the session that broke it never stops streaming.
+                    // Once the correction has been owed for
+                    // SCREEN_RECONCILE_DEFER_DEADLINE_MS, stop waiting for a
+                    // silence that is not coming and repaint. Chain start is
+                    // stamped on the FIRST defer of a chain, so the deadline
+                    // measures how long the user has been looking at a wrong
+                    // frame — not how long since the last rearm.
+                    let defer_chain_age_ms = screen_reconcile_defer_chain_age_ms(
+                        reconcile_now_ms,
+                        screen_reconcile_defer_chain_began_ms,
+                    );
+                    let defer_deadline_expired = screen_reconcile_defer_deadline_expired(
+                        reconcile_now_ms,
+                        screen_reconcile_defer_chain_began_ms,
+                    );
+                    if defer_deadline_expired {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "screen_reconcile_forced_deadline",
+                            json!({
+                                "session_path": session_path.clone(),
+                                "reason": screen_reconcile_reason,
+                                "defer_chain_depth": screen_reconcile_defer_chain_depth,
+                                "defer_chain_ms": defer_chain_age_ms,
+                                "deadline_ms": SCREEN_RECONCILE_DEFER_DEADLINE_MS,
+                                "visible_nonblank_rows": last_host_health_visible_nonblank_rows,
+                            }),
+                        );
+                    }
                     if !screen_reconcile_output_quiet(reconcile_now_ms, last_forwarded_output_at_ms)
                         && !reveal_incomplete
+                        && !defer_deadline_expired
                     {
                         // Mid-turn output is still flowing — defer (keep the
                         // reason) without even fetching the daemon frame. The
@@ -85497,6 +85652,11 @@ fn TerminalCanvas(
                         // transient clears; the quiet gate does not.
                         screen_reconcile_due_at_ms =
                             reconcile_now_ms.saturating_add(SCREEN_RECONCILE_DEFER_REARM_MS);
+                        if screen_reconcile_defer_chain_began_ms == 0 {
+                            screen_reconcile_defer_chain_began_ms = reconcile_now_ms;
+                        }
+                        screen_reconcile_defer_chain_depth =
+                            screen_reconcile_defer_chain_depth.saturating_add(1);
                         if last_screen_reconcile_defer_trace_ms == 0
                             || reconcile_now_ms
                                 .saturating_sub(last_screen_reconcile_defer_trace_ms)
@@ -85511,6 +85671,12 @@ fn TerminalCanvas(
                                     "session_path": session_path.clone(),
                                     "reason": screen_reconcile_reason,
                                     "suppressed_since_last": suppressed_screen_reconcile_defer_count,
+                                    // The chain, not the sample: a rate-limited
+                                    // line count is not a deferral count.
+                                    "defer_chain_depth": screen_reconcile_defer_chain_depth,
+                                    "defer_chain_ms": reconcile_now_ms
+                                        .saturating_sub(screen_reconcile_defer_chain_began_ms),
+                                    "deadline_ms": SCREEN_RECONCILE_DEFER_DEADLINE_MS,
                                 }),
                             );
                             last_screen_reconcile_defer_trace_ms = reconcile_now_ms;
@@ -85521,6 +85687,11 @@ fn TerminalCanvas(
                         }
                     } else {
                     screen_reconcile_due_at_ms = 0;
+                    // The chain ends when the reconcile actually runs — not when
+                    // a single rearm elapses. Reset here so the next chain's
+                    // depth/age measure that chain alone.
+                    screen_reconcile_defer_chain_depth = 0;
+                    screen_reconcile_defer_chain_began_ms = 0;
                     let reconcile_reason = screen_reconcile_reason;
                     screen_reconcile_reason = "post_resize_screen_reconcile";
                     if let Ok((screen_text, _running, _out, _post, _seq, _spawn)) = terminal_snapshot_async(
@@ -97559,8 +97730,14 @@ fn terminal_eval_script_with_canvas_renderer(
             // a solid background-colored veil and release it only when the
             // buffer has SETTLED (nonblank content + stable baseY/cursor for
             // two consecutive polls), on the user's first keystroke (their
-            // echo must never be hidden), or at an 8s hard cap (never trap
+            // echo must never be hidden), or at the hard cap below (never trap
             // the user behind a veil).
+            //
+            // ⚠ This comment used to say "an 8s hard cap" while the code used
+            // 20000. Nobody was misled into a bug by it, but a comment that
+            // disagrees with its constant is how the next person gets misled,
+            // so the number now lives in ONE place —
+            // COLD_MOUNT_VEIL_HARD_CAP_MS — and this prose does not restate it.
             try {{
                 if (window.getComputedStyle(host).position === 'static') {{
                     host.style.position = 'relative';
@@ -97578,21 +97755,56 @@ fn terminal_eval_script_with_canvas_renderer(
                 let veilLastBaseY = -1;
                 let veilLastCursorY = -1;
                 let veilStablePolls = 0;
+                // VEIL ACCOUNTING (2026-07-31). Live telemetry showed 17
+                // `cold_mount_veil_attached` against 11 `..._released` — six
+                // veils with no disposition at all. That gap is not cosmetic:
+                // a veil is an opaque rectangle over the user's terminal, and
+                // "released silently when its host was torn down" and "still
+                // covering the viewport right now" were indistinguishable from
+                // outside. Every veil now leaves a record, and the live count
+                // is readable from `server app state` so a stuck one can be
+                // SEEN instead of inferred.
+                try {{
+                    window.__yggtermColdMountVeils = window.__yggtermColdMountVeils || {{}};
+                    window.__yggtermColdMountVeils[hostId] = {{
+                        attachedAtMs: veilAttachedAtMs,
+                        hostId,
+                        sessionPath: host.getAttribute("data-terminal-session-path") || "",
+                    }};
+                }} catch (_error) {{}}
                 const releaseColdMountVeil = (reason) => {{
                     try {{
-                        if (veil.isConnected) {{
+                        // `isConnected` false means the host was destroyed under
+                        // the veil — a real disposition, previously unlogged,
+                        // and the whole of the 6-of-17 gap.
+                        const wasConnected = veil.isConnected;
+                        if (wasConnected) {{
                             veil.remove();
-                            sendTerminalEvent({{
-                                kind: "debug",
-                                message: `cold_mount_veil_released host=${{hostId}} reason=${{reason}} held_ms=${{Date.now() - veilAttachedAtMs}}`
-                            }});
                         }}
+                        try {{
+                            if (window.__yggtermColdMountVeils) {{
+                                delete window.__yggtermColdMountVeils[hostId];
+                            }}
+                        }} catch (_bookkeepingError) {{}}
+                        sendTerminalEvent({{
+                            kind: "debug",
+                            message: `cold_mount_veil_released host=${{hostId}}`
+                                + ` reason=${{wasConnected ? reason : 'host_torn_down'}}`
+                                + ` held_ms=${{Date.now() - veilAttachedAtMs}}`
+                        }});
                     }} catch (_error) {{}}
                 }};
                 const veilSettlePoll = () => {{
                     try {{
-                        if (!veil.isConnected) {{ return; }}
-                        if (Date.now() - veilAttachedAtMs >= 20000) {{
+                        if (!veil.isConnected) {{
+                            // Was: a silent `return`. That single line WAS the
+                            // 6-of-17 accounting gap — a host torn down under
+                            // its veil ended the poll chain with no record, so
+                            // the veil's fate became unknowable. Report it.
+                            releaseColdMountVeil('host_torn_down');
+                            return;
+                        }}
+                        if (Date.now() - veilAttachedAtMs >= {COLD_MOUNT_VEIL_HARD_CAP_MS}) {{
                             releaseColdMountVeil('hard_cap');
                             return;
                         }}
@@ -104400,8 +104612,39 @@ fn terminal_eval_script_with_canvas_renderer(
             primarySelectionSyncPending = false;
             runPrimarySelectionSync(reason);
         }};
+        // CC-DRAG-STALL RESIDUAL (user-reported 2026-07-31, still freezing on
+        // 2.12.19 after the O(1) handler landed). Making per-EVENT work O(1)
+        // was necessary and not sufficient: the deferred half still coalesced
+        // to requestAnimationFrame, so during a live drag over a streaming
+        // session `runPrimarySelectionSync` — and with it the
+        // O(selected-cells) `term.getSelection()` serialization — ran once per
+        // ANIMATION FRAME (~60/s), on the same webview thread as the xterm
+        // write pump. The commit title said a drag's cost must not grow with
+        // the selection it drags; per-frame, it still did.
+        //
+        // Nothing can observe __yggtermPrimarySelection mid-drag: every reader
+        // flushes synchronously first (pointerdown, pointerup, and
+        // primarySelectionTextForPaste flushes EVERY host before it reads). So
+        // while the pointer is down the rAF flush is pure redundancy — skip it
+        // and let drag-end do the one serialization that is actually observed.
+        // Cost during a drag is now O(1) per event AND O(1) per frame, with a
+        // single O(selected-cells) pass at mouseup.
+        let primarySelectionPointerDragActive = false;
+        let dragSelectionChangeCount = 0;
+        let dragBeganAtMs = 0;
         const schedulePrimarySelectionSync = () => {{
             primarySelectionSyncPending = true;
+            if (primarySelectionPointerDragActive) {{
+                // Drag in flight: count it for the lifecycle report, stay
+                // pending, and schedule NOTHING — pointerup (or a cross-host
+                // paste flush) performs the one serialization anyone observes.
+                // One block, one exit: the counter lives inside the guard so
+                // there is exactly one `primarySelectionPointerDragActive`
+                // test in this function. Two of them let a lock anchor on the
+                // wrong one and stay green while the guard was deleted.
+                dragSelectionChangeCount += 1;
+                return;
+            }}
             if (primarySelectionSyncScheduleHandle !== null) {{
                 return;
             }}
@@ -104427,12 +104670,46 @@ fn terminal_eval_script_with_canvas_renderer(
         // selection, exactly as the per-event path did.
         const handlePrimarySelectionSyncPointerDown = (_event) => {{
             flushPrimarySelectionSync('selection_flush_pointer_down');
+            // Open the drag window AFTER the flush: the flush must still record
+            // the COMPLETED previous selection before xterm clears it.
+            primarySelectionPointerDragActive = true;
+            dragSelectionChangeCount = 0;
+            dragBeganAtMs = Date.now();
         }};
         // Drag end: make the FINAL selection durable NOW, not at the next
         // animation frame — a middle-click (possibly on another host) must
         // never read a stale or partial window.__yggtermPrimarySelection.
         const handlePrimarySelectionSyncPointerUp = (_event) => {{
+            // Close the drag window FIRST so the flush below is allowed to do
+            // the real work; then report the drag we just finished.
+            const wasDragging = primarySelectionPointerDragActive;
+            primarySelectionPointerDragActive = false;
+            const flushBeganAtMs = Date.now();
             flushPrimarySelectionSync('selection_flush_pointer_up');
+            if (wasDragging) {{
+                // DRAG LIFECYCLE INSTRUMENT (2026-07-31). The terminal
+                // selection path emitted ONE event per copy and nothing during
+                // a drag, so a user-reported drag freeze was invisible to
+                // telemetry — the render/forward probes are 60 s averages and
+                // cannot see a sub-second stall. These four numbers make the
+                // stall measurable: how many selection events the drag
+                // generated (streaming sessions multiply them), how long the
+                // one real serialization took, how big the selection was, and
+                // how long the whole drag lasted.
+                try {{
+                    const entryForDrag = window.__yggtermXtermHosts
+                        && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    sendTerminalEvent({{
+                        kind: "debug",
+                        message: `drag_selection_complete host=${{hostId}}`
+                            + ` selection_events=${{dragSelectionChangeCount}}`
+                            + ` drag_ms=${{flushBeganAtMs - dragBeganAtMs}}`
+                            + ` flush_ms=${{Date.now() - flushBeganAtMs}}`
+                            + ` selected_chars=${{entryForDrag ? (entryForDrag.primarySelectionLength || 0) : 0}}`
+                    }});
+                }} catch (_error) {{}}
+            }}
         }};
         // XTERM-BUG: clipboard-double-paste — telemetry to attribute the
         // bug class. Every entry into a paste path emits an
@@ -129371,6 +129648,158 @@ mod tests {
             ScreenReconcileDecision::SkipUnwritable
         );
     }
+    // A DRAG'S COST MUST NOT GROW WITH THE SELECTION — PER FRAME EITHER.
+    //
+    // 2.12.19 made the onSelectionChange handler O(1) by deferring the
+    // expensive half to a trailing edge. The user still reported the freeze,
+    // because that trailing edge was requestAnimationFrame: during a live drag
+    // over a streaming session the O(selected-cells) `term.getSelection()` ran
+    // ~60x/second on the webview thread that also runs the xterm write pump.
+    //
+    // The fix is that a drag schedules NOTHING; drag-end does the one
+    // serialization anyone can observe. These lock the three halves of that:
+    // the suppression exists, the pointer handlers open/close the window in the
+    // right order relative to their flushes, and the drag stays reportable.
+    #[test]
+    fn a_live_drag_schedules_no_per_frame_selection_work() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+
+        // The drag window exists and gates the scheduler.
+        assert!(script.contains("let primarySelectionPointerDragActive = false;"));
+        let scheduler = script
+            .split("const schedulePrimarySelectionSync = () => {")
+            .nth(1)
+            .expect("schedulePrimarySelectionSync must exist");
+        let scheduler_body = scheduler
+            .split("const handlePrimarySelectionSyncPointerDown")
+            .next()
+            .unwrap_or(scheduler);
+        // It must bail on the drag flag BEFORE it can reach either scheduling
+        // primitive — that early return is the entire fix.
+        //
+        // ⚠ ANCHOR CARE: an earlier cut of this lock searched for
+        // `if (primarySelectionPointerDragActive) {` while the function also
+        // held a second such test (the drag counter). Deleting the guard
+        // outright left the lock GREEN because it matched the counter instead.
+        // The scheduler now has exactly ONE such test, and this asserts that —
+        // so a re-split into two blocks fails here rather than silently
+        // un-anchoring the ordering assertion below.
+        assert_eq!(
+            scheduler_body
+                .matches("if (primarySelectionPointerDragActive) {")
+                .count(),
+            1,
+            "the scheduler must test the drag flag exactly once; a second test \
+             lets this lock anchor on the wrong block"
+        );
+        let drag_guard = scheduler_body
+            .find("if (primarySelectionPointerDragActive) {")
+            .expect("scheduler must check the drag flag");
+        // The guard must RETURN. A guard that merely counts and falls through
+        // schedules the rAF anyway — the exact bug, with the flag still read.
+        let guard_tail = &scheduler_body[drag_guard..];
+        let guard_end = guard_tail
+            .find("}")
+            .expect("the drag guard must be a closed block");
+        assert!(
+            guard_tail[..guard_end].contains("return;"),
+            "the drag guard must return — counting the event and falling through \
+             still pays getSelection() every animation frame"
+        );
+        let raf = scheduler_body
+            .find("window.requestAnimationFrame(flushScheduledPrimarySelectionSync)")
+            .expect("scheduler must still schedule a rAF when NOT dragging");
+        let timeout = scheduler_body
+            .find("window.setTimeout(flushScheduledPrimarySelectionSync, 16)")
+            .expect("scheduler must still have its non-rAF fallback");
+        assert!(
+            drag_guard < raf && drag_guard < timeout,
+            "the drag guard must precede both scheduling primitives, else a drag \
+             still pays getSelection() every frame"
+        );
+
+        // pointerdown: flush the COMPLETED selection first, THEN open the drag
+        // window. Reversed, the previous selection is lost to the suppression.
+        let down = script
+            .split("const handlePrimarySelectionSyncPointerDown = (_event) => {")
+            .nth(1)
+            .expect("pointer-down handler must exist");
+        let down_body = down.split("};").next().unwrap_or(down);
+        let down_flush = down_body
+            .find("flushPrimarySelectionSync('selection_flush_pointer_down')")
+            .expect("pointer-down must flush");
+        let down_open = down_body
+            .find("primarySelectionPointerDragActive = true;")
+            .expect("pointer-down must open the drag window");
+        assert!(
+            down_flush < down_open,
+            "pointer-down must flush the completed selection BEFORE suppressing"
+        );
+
+        // pointerup: close the drag window first, THEN flush — otherwise the
+        // flush is itself suppressed and the final selection never lands.
+        let up = script
+            .split("const handlePrimarySelectionSyncPointerUp = (_event) => {")
+            .nth(1)
+            .expect("pointer-up handler must exist");
+        let up_close = up
+            .find("primarySelectionPointerDragActive = false;")
+            .expect("pointer-up must close the drag window");
+        let up_flush = up
+            .find("flushPrimarySelectionSync('selection_flush_pointer_up')")
+            .expect("pointer-up must flush");
+        assert!(
+            up_close < up_flush,
+            "pointer-up must close the drag window BEFORE flushing, or the final \
+             selection is swallowed by the suppression"
+        );
+
+        // The drag must remain measurable from telemetry — that was the whole
+        // reason this bug survived a release: the selection path emitted almost
+        // nothing and the render probes are 60s averages.
+        assert!(script.contains("drag_selection_complete host="));
+        assert!(script.contains("selection_events=${dragSelectionChangeCount}"));
+        assert!(script.contains("flush_ms="));
+    }
+
+    // EVERY VEIL MUST LEAVE A RECORD.
+    //
+    // Live telemetry showed 17 `cold_mount_veil_attached` against 11
+    // `..._released`. The missing six were hosts torn down under their veil,
+    // where the settle poll hit a bare `return` — so "released quietly" and
+    // "still covering the user's terminal" were indistinguishable from outside.
+    #[test]
+    fn a_cold_mount_veil_reports_every_disposition() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("cold_mount_veil_attached"));
+        assert!(script.contains("cold_mount_veil_released"));
+        // The teardown path is named rather than silent.
+        assert!(script.contains("releaseColdMountVeil('host_torn_down');"));
+        assert!(script.contains("reason=${wasConnected ? reason : 'host_torn_down'}"));
+        // The release event is emitted OUTSIDE the isConnected branch, so a
+        // disconnected veil still reports. (Was: emit nested inside it.)
+        let release = script
+            .split("const releaseColdMountVeil = (reason) => {")
+            .nth(1)
+            .expect("releaseColdMountVeil must exist");
+        let release_body = release
+            .split("const veilSettlePoll")
+            .next()
+            .unwrap_or(release);
+        assert!(
+            !release_body.contains("if (veil.isConnected) {\n                            veil.remove();\n                            sendTerminalEvent("),
+            "the release event must not be nested inside the isConnected branch"
+        );
+        // A live veil is visible to `server app state` probes.
+        assert!(script.contains("window.__yggtermColdMountVeils"));
+        // The hard cap has exactly one source of truth.
+        assert!(script.contains(&format!(
+            "Date.now() - veilAttachedAtMs >= {COLD_MOUNT_VEIL_HARD_CAP_MS}"
+        )));
+    }
+
     #[test]
     fn screen_reconcile_quiet_gate_blocks_recent_output() {
         // Output 200ms ago — mid-turn, must defer even if the working footer
@@ -129383,6 +129812,73 @@ mod tests {
         ));
         // Never-seen-output (fresh mount, tracker still 0) must not block.
         assert!(screen_reconcile_output_quiet(5_000, 0));
+    }
+
+    // THE DEFER MUST CONVERGE (user-reported broken bottom, 2026-07-31).
+    //
+    // The quiet gate above is correct as a PREFERENCE and was wrong as the only
+    // exit: a working agent CLI streams continuously, so `output_quiet` can stay
+    // false for the entire turn and the reconcile that fixes a broken bottom
+    // never ran. Live trace before the deadline existed: 198 deferrals vs 32
+    // completed reconciles, chains ~40 deep over ~2 minutes.
+    //
+    // These lock the property that actually matters — the wait is BOUNDED — and
+    // are written against the pure predicates so a mutation to either one is
+    // caught. Mutating the `>=` to `>` in
+    // `screen_reconcile_defer_deadline_expired`, or the chain-age function's
+    // `chain_began_ms` to `now_ms`, fails these.
+    #[test]
+    fn a_deferred_reconcile_converges_even_while_output_never_stops() {
+        let chain_began = 100_000_u64;
+        // The instant the chain opens, nothing is owed yet.
+        assert!(!screen_reconcile_defer_deadline_expired(
+            chain_began,
+            chain_began
+        ));
+        // One rearm short of the deadline: still deferring, still preferring quiet.
+        assert!(!screen_reconcile_defer_deadline_expired(
+            chain_began + SCREEN_RECONCILE_DEFER_DEADLINE_MS - 1,
+            chain_began
+        ));
+        // At the deadline the correction is forced — REGARDLESS of output, which
+        // is the whole point: this path is reached only when output is NOT quiet.
+        assert!(screen_reconcile_defer_deadline_expired(
+            chain_began + SCREEN_RECONCILE_DEFER_DEADLINE_MS,
+            chain_began
+        ));
+        // And it stays forced; a long chain must never fall back to waiting.
+        assert!(screen_reconcile_defer_deadline_expired(
+            chain_began + SCREEN_RECONCILE_DEFER_DEADLINE_MS * 10,
+            chain_began
+        ));
+        // The deadline must be reachable within a live turn, not a theoretical
+        // ceiling: it has to be longer than the quiet window it backstops and
+        // short enough that a user has not already reached for the keyboard.
+        assert!(SCREEN_RECONCILE_DEFER_DEADLINE_MS > SCREEN_RECONCILE_OUTPUT_QUIET_MS);
+        assert!(SCREEN_RECONCILE_DEFER_DEADLINE_MS >= SCREEN_RECONCILE_DEFER_REARM_MS * 2);
+        assert!(SCREEN_RECONCILE_DEFER_DEADLINE_MS <= 30_000);
+    }
+
+    #[test]
+    fn the_defer_clock_measures_the_chain_not_the_last_rearm() {
+        // No chain open: nothing is owed. A stray `now` must not read as an
+        // age of `now` and force a reconcile on the very first check.
+        assert_eq!(screen_reconcile_defer_chain_age_ms(500_000, 0), 0);
+        assert!(!screen_reconcile_defer_deadline_expired(500_000, 0));
+        // With a chain open, age is measured from its START. The rearm cadence
+        // is 3s, so "time since last defer" could never exceed it — only the
+        // chain start measures what the user actually experiences.
+        assert_eq!(
+            screen_reconcile_defer_chain_age_ms(
+                100_000 + SCREEN_RECONCILE_DEFER_REARM_MS * 7,
+                100_000
+            ),
+            SCREEN_RECONCILE_DEFER_REARM_MS * 7
+        );
+        // Clock going backwards (suspend/resume) must saturate to 0, never wrap
+        // into a huge age that forces a spurious repaint.
+        assert_eq!(screen_reconcile_defer_chain_age_ms(90_000, 100_000), 0);
+        assert!(!screen_reconcile_defer_deadline_expired(90_000, 100_000));
     }
 
     // App-control `force-foreground` (monitoring override): with the flag on,
