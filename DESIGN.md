@@ -526,15 +526,29 @@ functions and the `SessionStyleRow` component in shell.rs.
   when the interactivity is bespoke, as the cwdtree row does). Do not write a
   fourth row style.
 - **A row list is a TREE, and there is one of them.** Nesting is `depth` on the
-  row (indent comes from `session_row_metrics`, never a hand-written padding),
-  and the GROUP marker is the shared `RowDisclosureChevron` in the row's LEADING
-  slot — the same slot a leaf's status dot sits in, so a folder and the rows
-  under it start their titles at one x. The cwdtree sidebar, the WebTabs rail
-  and contributed `list-row` panes all draw this way; a surface that grows its
-  own triangle or its own indent arithmetic is the bug this rule exists to
-  prevent (the rail hand-rolled both until 2026-07-31).
-- **Folders sit ABOVE loose rows** in any list that has both (user, 2026-07-30).
-  Organization first, then the working set.
+  row (indent comes from `session_row_metrics`, never a hand-written padding).
+  The cwdtree sidebar, the WebTabs rail and contributed `list-row` panes all
+  draw this way; a surface that grows its own indent arithmetic is the bug this
+  rule exists to prevent (the rail hand-rolled it until 2026-07-31).
+- **A GROUP ROW WEARS TWO MARKS, and the cwdtree owns both.** The LEADING icon
+  slot carries `RowFolderIcon` — **FILLED when the group is open, OUTLINE when
+  it is shut** — and the TRAILING `expander` slot carries
+  `RowDisclosureChevron` (down = open, right = shut) beside the group's count.
+  The fill is the state at rest; the chevron is the control. Both slots are
+  shared components with exactly one owner each: a surface that inlines a
+  folder path or a triangle of its own is the drift this rule ends (the rail
+  drew a chevron and no folder at all until 2026-07-31, and the user reported
+  it as "folders should have a folder icon … just like yggterm cwdtree").
+  The `expander` slot is ALWAYS visible, unlike `actions`, which are
+  hover-revealed verbs: expand/collapse is not something you should have to
+  hover to discover.
+- **Folders sit ABOVE loose rows AT EVERY LEVEL** in any list that has both
+  (user, 2026-07-30). Organization first, then the working set — a folder's own
+  sub-folders precede its leaf rows exactly as root folders precede root rows.
+- **A folder holds folders, arbitrarily deep** (user, 2026-07-31). Depth is not
+  capped anywhere: not in the model, not in the draw walk, not in the drop
+  rules. The single move that is refused is a group into its OWN descendant,
+  which would erase the subtree.
 - **Renaming happens IN PLACE**, in the row, with the existing text SELECTED —
   a row born with a placeholder name ("New folder") must take the first
   keystroke as a replacement. Double-click is the gesture; the row's context
@@ -553,10 +567,42 @@ If a project has drag-and-drop tree or list reordering:
 - **before/after draw as a 2px accent LINE on the edge that will receive the
   row; inside draws as a 2px accent RING around the whole group.** A line under
   a folder header would promise "beside the folder" while the drop lands in it.
-- **One drag grammar per window.** A press is a click until the pointer travels
-  `yggui::DRAG_BEGIN_THRESHOLD_PX`; a drop is resolved by
-  `yggui::reorder_row_tree` (a flat list is its degenerate case). A surface with
-  its own ordering arithmetic is a second source of truth for order.
+- **One drag grammar per window, and it is ONE OBJECT.** Every row list drives
+  `yggui::RowDragGesture` — the WebTabs rail, every contributed app pane, and
+  anything added later. There is one gesture in the shell because there is one
+  pointer. A surface supplies its scope, its rows and its own meaning for
+  "expand"; it supplies nothing else. The full experience the gesture owns:
+  - **press-travel threshold** — a press is a click until the pointer travels
+    `yggui::DRAG_BEGIN_THRESHOLD_PX` (6px, measured as distance, not per axis);
+  - **the dragged row DIMS** to the shared row engine's `opacity:0.58`, never a
+    hand-written fade;
+  - **a floating GHOST CARD** follows the pointer from the window ROOT — not
+    from the list — so it does not freeze at the list's edge, and it names the
+    landing ("Drop inside Work") from one owner, `row_drop_target_hint`;
+  - **the drop indicator** is the line/ring rule above, drawn on the row's OUTER
+    box so a border radius cannot clip it;
+  - **SPRING-LOADED AUTO-EXPAND** — rest a drag inside a SHUT group for
+    `yggui::ROW_DRAG_SPRING_MS` and it opens under the pointer, once per group
+    per gesture. Without it a collapsed folder is a wall and filing something
+    two levels down costs one drop-open-drag-again per level. yggterm decides
+    WHEN; the surface performs the expansion, because "expand" means a
+    different write in each one;
+  - **ESCAPE abandons** a live drag, everywhere, at once;
+  - **release over nothing is abandoned** — never a guess, never a silent move
+    to the root — and leaving the list forgets the TARGET while keeping the
+    gesture (row-to-row movement inside a list produces leave events too);
+  - **the drag's own release does not also CLICK the row.** A committed drop
+    suppresses the click for `yggui::ROW_DRAG_CLICK_SUPPRESS_MS`, so moving a
+    row never also opens it.
+  A drop is resolved by `yggui::reorder_row_tree` (a flat list is its degenerate
+  case), reached THROUGH the gesture, never around it. A surface with its own
+  ordering arithmetic — or its own copy of any affordance above — is a second
+  source of truth.
+- **The contributed-pane wire schema is how an app inherits all of it.** A pane
+  declares `list-row` with `depth` / `expanded` / `expand_action` /
+  `reorder_action` and gets the whole experience with no app-side code. Absent
+  `depth`/`expanded` means a flat list, which is what every pane written before
+  nesting declares.
 
 ### Web View Surfaces
 
