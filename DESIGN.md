@@ -509,17 +509,36 @@ Every session-style list row — cwdtree sidebar rows, the WebTabs rail, app-pan
 `SessionRowDensity` + `session_row_metrics` + the `session_row_*_style`
 functions and the `SessionStyleRow` component in shell.rs.
 
-- Two densities of the same anatomy: `Sidebar` (the cwdtree main row's numbers
-  — 20px icon box, 9px dot rail, font 12, radius 12, 12px indent step) and
-  `Rail` (right-rail lists). Density differs in SPACING ONLY (padding 6/8,
-  radius 8): typography and the icon/dot slot geometry are IDENTICAL across
-  densities — an 11px rail title next to the 12px tree read as a different
-  font (user-caught 2026-07-17). Selection is the tint, never a weight change.
+- Two densities of the same vocabulary: `Sidebar` (the cwdtree main row's
+  numbers — 20px icon box, 9px status column, font 12, radius 12, 12px indent
+  base and step) and `Rail` (right-rail lists — padding 5/8, radius 8, 8px
+  indent base, 19px indent step, NO separate status column).
+  **TYPOGRAPHY AND THE ICON BOX ARE IDENTICAL ACROSS DENSITIES** — an 11px rail
+  title next to the 12px tree read as a different font (user-caught
+  2026-07-17), and that rule does not bend. Selection is the tint, never a
+  weight change.
+- **A density may differ in its LEADING ANATOMY, and one does.** The cwdtree
+  shows TWO leading marks at once — a live session's keep-alive dot BESIDE its
+  kind icon — so it pays for two columns: a 9px status rail, then the 20px icon
+  box. A right-rail row never shows two: a folder has a glyph and no dot, a web
+  tab has a loading dot and no glyph. Paying there for a column that is empty in
+  every row that draws cost 15px of a ~220px rail, which is what the user
+  reported on 2026-07-31 ("significant waste of horizontal space on each row").
+  So `Rail` has ONE mark column, 20px wide: the icon sits in it, and the status
+  dot rides it — centred when it is the only mark, a bottom-right BADGE when it
+  shares the column with an icon.
+- **The leading slot is laid out even when the row has no mark at all**, in both
+  anatomies, so an appearing dot never shoves the title sideways and two rows of
+  one list never start their titles at different x. Dot paint comes from the
+  status-indicator vocabulary (`live_session_status_dot_style` /
+  `web_tab_loading_dot_style`).
+- **An EMPTY ELEMENT IS NOT AN ABSENT SLOT.** A surface that has nothing for a
+  slot passes `None`; `rsx!{}` passes something that happens to draw nothing,
+  and the row dutifully reserves its box. That is precisely how every web-tab
+  row in the rail came to carry a 20px icon box and a chevron gap it never
+  drew.
 - Selection tint is the palette's `accent_soft` everywhere. Never a
   per-consumer mix.
-- The status-dot SLOT is laid out even when empty, so an appearing dot never
-  shoves the title sideways. Dot paint comes from the status-indicator
-  vocabulary (`live_session_status_dot_style` / `web_tab_loading_dot_style`).
 - Trailing actions use `session_row_action_button_style`; a trailing pill uses
   `session_row_badge_style` (ychrome profile badges live here).
 - New list surfaces MUST consume the engine (component, or the style functions
@@ -530,6 +549,15 @@ functions and the `SessionStyleRow` component in shell.rs.
   The cwdtree sidebar, the WebTabs rail and contributed `list-row` panes all
   draw this way; a surface that grows its own indent arithmetic is the bug this
   rule exists to prevent (the rail hand-rolled it until 2026-07-31).
+- **How MUCH a level indents is the density's answer, and the rail's is bigger
+  than the tree's** (19px vs 12px, user-asked 2026-07-31: "2 spaces worth of
+  more indentation in the folder" — the row's own 12px Inter measures 3.375px
+  per space, so two of them is 6.75px, and 12 + 6.75 rounds to 19). The tree
+  spends a DIFFERENT icon on every level — machine, then folder, then session
+  kind — so indent is only part of what carries depth there. Every rail row
+  wears the same mark, so indent is the whole of it and has to carry more.
+  This is a per-density number, not a per-surface one: a second surface at
+  `Rail` density inherits it rather than choosing again.
 - **A GROUP ROW WEARS TWO MARKS, and the cwdtree owns both.** The LEADING icon
   slot carries `RowFolderIcon` — **FILLED when the group is open, OUTLINE when
   it is shut** — and the TRAILING `expander` slot carries
