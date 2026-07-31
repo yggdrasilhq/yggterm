@@ -111,6 +111,107 @@ symbol rather than trusting a line number:**
   and delete both floating pills. Toasts need an anchor owned by the active
   viewport kind (top-center over a terminal, bottom-right over a document).
 
+## ⭐ USER-REPORTED, ychrome round 2 (2026-07-31) — IN FLIGHT
+
+Six items. **Each is already root-caused — read the mechanism before opening a
+file, and grep the named symbol rather than trusting a line number.** All six
+are being worked in isolated lane worktrees; remove an entry in the same commit
+as its live-verified fix.
+
+- **Screen tearing during scroll or animation.** `lane/dev/web-tearing`.
+  Investigation-first, no speculative fix. Established: guihost is a **KDE Wayland**
+  session (`kwin_wayland`), AMD `amdgpu`, `kwinrc` carries no tearing/VRR/latency
+  keys, and the GUI is **Wayland-native** (proven: `xwininfo -root -children` on
+  `:1` lists 15 children, none of them yggterm). KWin will not present a tearing
+  frame without opt-in, so the symptom is almost certainly **intra-window content
+  tearing** — one composited frame holding a half-updated page. Two leads:
+  (a) ⭐ `WebKitSettings::set_hardware_acceleration_policy` is **never called in
+  production** (only in the `docs/spikes/phase-f-under-glass` throwaway), so the
+  policy is WebKit's default `ON_DEMAND` — and a scroll or animation starting is
+  precisely what flips the accelerated-compositing mode; (b) under-glass is
+  ARMED on the live host (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`, armed 2026-07-30),
+  which is a recent change and therefore a prime suspect — `=0` reverts.
+  Also true and unexamined: **zero frame-clock integration anywhere**
+  (`gtk_widget_add_tick_callback`/`GdkFrameClock` have 0 occurrences), redraw is
+  manual `queue_draw()`. Instrument: `scripts/underglass-sandbox.sh`.
+  ⚠ Sway is not KWin — a null sandbox result narrows the cause, it does not
+  close the bug.
+
+- **No Ctrl+F while a page holds focus.** `lane/dev/find-chord-claimer`.
+  ⚠ **Find is ALREADY FULLY BUILT** — do not rebuild it. `WebSurfaceHost::find`
+  (`vendor/dioxus-desktop/src/web_surface.rs`), the engine-free policy owner
+  `crates/yggterm-shell/src/web_find.rs` (1202 lines, unit-tested), and the
+  `WebFindBar` component all exist and work. The ONLY gap is that Ctrl+F is
+  claimed in the shell's DOM keydown, which is deaf whenever the native GTK child
+  page webview has focus. Fix is the chord-claimer promotion of
+  `connect_seat_input_observer` (a pure observer today — every handler returns
+  `Propagation::Proceed`), relayed to the shell exactly like the existing
+  **ALT-tap relay** (`connect_alt_tap_observer` → `set_alt_tap_notifier` →
+  `webview.rs` `grab_focus()` + `run_javascript` → a `window.__yggterm…FromHost`
+  terminus). Ctrl+F must never be stolen from a terminal that owns the viewport.
+
+- **Tab spawn placement and new-tab focus.** `lane/dev/ychrome-tab-ux`.
+  **Every creation path appends to the end; there is no insertion-index owner.**
+  `web_surface_new_tab` pushes at one site, `web_surface_adopt_popup_tab`
+  (window.open / target=_blank) pushes at a SECOND independent site, restore-on-open
+  at a third — and a test encodes append order via `index + 1` id arithmetic.
+  Wanted: spawn-below-opener with cascade for context-menu new tab, middle-click,
+  duplicate and popups; rail-header `+` with no opener still appends. Duplicate
+  currently lands at the bottom. Rail drag re-parents but never re-indexes.
+  Focus: only the two `+` buttons focus the omnibox, via a 60 ms focus+select
+  `document::eval` snippet **hand-duplicated three times** with no shared helper
+  and no Ctrl+L. A tab opened from a link has a destination and must NOT steal
+  focus to the address bar.
+
+- **Context-menu UX polish.** Same lane. `ContextMenuOverlay` is a hand-rolled
+  Dioxus component shared by FIVE mounts, so improvements there are inherited by
+  all of them — do not fork a rail-only menu. `RowMenuItem` has **no icon field
+  and no submenu support** ("Move to folder" is deliberately flattened to N
+  sibling items, which does not scale). The rail menu has **no "New tab" item at
+  all**.
+
+- **Adblock/SponsorBlock not exhaustive; YouTube ads played at 2x.**
+  `lane/dev/adblock-exhaustive`. ✅ **The 2x symptom is root-caused and cured on
+  guihost (2026-07-31).** The deployed `youtube-adblock.js` was the pre-`d05a871`
+  copy lacking its `// ==UserScript==` block, so `@world main` defaulted to
+  `Isolated`, where its `window.fetch`/XHR/`ytInitialPlayerResponse` patches are
+  invisible to the page — leaving only the fallback that sets
+  `playbackRate = 16` (WebKit clamps it, hence "2x"). `idcac.js` and
+  `sponsorblock.js` were stale the same way; all three redeployed. ⚠ Injection
+  is per-webview at creation, so an existing tab keeps the script it was born
+  with — a NEW tab is required, not a reload.
+  **Still owed (the durable half):** a freshness check with ONE owner so a
+  bundled asset newer than the installed copy cannot sit dead; a LOUD refusal on
+  an unparseable/absent metadata block instead of the silent `Isolated` default
+  that caused this; and a real filter-list pipeline — today's ruleset is
+  `assets/web-adblock/rules.json`, **10 KB / 59 hand-written domain regexes plus
+  exactly ONE `css-display-none` rule with 8 selectors, referenced by no code
+  path at all** (a human must `cp` it into `~/.yggterm/web-adblock/`; done on
+  guihost, never on dev). No ABP/uBO syntax parser exists anywhere — no `##`, no
+  `##+js()`, no `$redirect=`. WebKit content blockers offer no redirect action,
+  so surrogates are impossible and untranslatable rules must be COUNTED and
+  reported, never silently dropped. SponsorBlock EXISTS and is real; idcac is a
+  hand-written ~140-line approximation, not the upstream ruleset.
+
+- **The WPE agent engine.** `lane/dev/wpe-engine-phase-a`.
+  ⛔ **The spec's core premise is factually wrong and §3 has been corrected:
+  Debian's WPE WebKit 2.52.5 ships NO WPEPlatform at all** — not "gaps in it".
+  Independently verified: `wpe-platform-1.0`/`-2.0` `.pc` absent, zero headers
+  declaring `wpe_display_headless_new`, **zero** `wpe_display` symbols exported
+  from `libWPEWebKit-2.0.so.1`, and `/usr/include/wpe-webkit-2.0/` holds only
+  `jsc` and `wpe`. WPEPlatform is an upstream build flag Debian leaves off, so
+  the version number in the spec was doing all the persuading and none of the
+  deciding. §9's sanctioned fallback fired: the substrate is **WebKitGTK + an
+  engine-owned Xvfb** behind the same verbs, and it delivered the two things the
+  risk register feared it would not — trusted input and faithful snapshots.
+  Phase A gate PASSES on dev (`ychrome engine gate`, five journaled proofs,
+  re-runnable). Bindings decision recorded in a new §9.1: **the gir crates**, no
+  bindgen, no `build.rs`. Phase B started: `/engine/*` router, 10 pages opened
+  concurrently in 1340 ms. Owed: `/nav` `/wait` `/dom` and the input events
+  (refused BY NAME today, never silently dropped), the socket plumbing is
+  unit-tested but never run against a deployed daemon, the gate has not been
+  re-run on guihost, and phases C/D/E remain. **Phase F stays out of scope.**
+
 ## Standing traps / other open bugs
 
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
