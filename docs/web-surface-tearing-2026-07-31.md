@@ -4,9 +4,10 @@
 > Both technical meanings of "tearing" are now ruled out for this window, on the
 > user's own GPU. What the user is seeing is therefore something else, and the
 > §"What would settle it" section names the one cheap observation that separates
-> the two remaining candidates. **No production code was changed** — the Iron Law
-> is no fixes without root cause, and a speculative render change on the daily
-> driver would be worse than the symptom.
+> the two remaining candidates. **No product behaviour was changed** — the Iron
+> Law is no fixes without root cause, and a speculative render change on the
+> daily driver would be worse than the symptom. The single Rust edit is one name
+> added to a test-module exemption list (§8); it cannot run in a shipped binary.
 
 ## 1. The symptom
 
