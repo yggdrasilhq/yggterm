@@ -562,7 +562,17 @@ functions and the `SessionStyleRow` component in shell.rs.
     palette colour reads as a bright rectangle sliding down the list. The blur
     takes its colour from whatever is actually behind — gradient, selection
     tint, dark theme — and the wash is the graceful degradation where
-    `backdrop-filter` is unavailable.
+    `backdrop-filter` is unavailable. Both are declared in the REVEALED rule
+    only: `backdrop-filter` forces a compositing layer wherever it appears, and
+    a sidebar of twenty rows should not each carry one for a chip nobody is
+    looking at.
+  - **The chip BLEEDS over the row's own padding, so it wears the row's rounded
+    edge** — a chip that stopped at the content box read as a white sticker
+    floating inside the row, with a strip of the selection tint past it. The
+    row's `overflow:hidden` clips it back to the radius, so the feathered left
+    edge is the only edge meant to be seen. **It does not bleed when an expander
+    follows it**: the chevron sits one gap to the right and the bleed put the
+    chip 2px on top of it, which inverts the rule above.
   - **THREE reveal triggers, and all three are required**: row `:hover`, the row
     being active/selected, and `:focus-within` on the ROW. Mouse-only would
     strand the ALT/KeyTip keyboard layer — a row reached by keyboard would offer
