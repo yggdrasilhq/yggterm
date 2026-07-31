@@ -83,9 +83,13 @@ symbol rather than trusting a line number:**
   `PrintOperation::run_dialog` (its "Print to File" is the PDF destination users
   actually want). Do NOT build a Chrome-style preview: nothing in the tree can
   display a PDF, and every settings change would mean re-rendering the document.
-- ⚠ **Cross-cutting for both of the above:** a browser accelerator claimed in the
-  shell's DOM keydown CANNOT fire while a page holds GTK focus. Promote the seat
-  observer into a chord CLAIMER (Ctrl+F, Ctrl+P) in `connect_key_press_event`.
+- ⚠ **Cross-cutting, now SOLVED for the mechanism, still open for print:** a
+  browser accelerator claimed in the shell's DOM keydown cannot fire while a page
+  holds GTK focus. The claimer exists — `connect_window_chord_claimer` on the
+  TOPLEVEL window (`web_surface.rs`), matching a table the shell pushes
+  (`claimed_chords_for` in `shell.rs`). Adding `Ctrl+P` is ONE row in that table
+  plus one arm at the terminus; it is left out only because there is no print
+  path to route it to yet.
 - **Fullscreen video takes the WINDOW fullscreen** (KDE then hides its panels
   until the video is un-fullscreened, even from another session). User-settled
   design: fullscreen fills the VIEWPORT by default, with an ychrome setting for
@@ -219,18 +223,16 @@ as its live-verified fix.
   ⚠ Sway is not KWin — a null sandbox result narrows the cause, it does not
   close the bug.
 
-- **No Ctrl+F while a page holds focus.** `lane/dev/find-chord-claimer`.
-  ⚠ **Find is ALREADY FULLY BUILT** — do not rebuild it. `WebSurfaceHost::find`
-  (`vendor/dioxus-desktop/src/web_surface.rs`), the engine-free policy owner
-  `crates/yggterm-shell/src/web_find.rs` (1202 lines, unit-tested), and the
-  `WebFindBar` component all exist and work. The ONLY gap is that Ctrl+F is
-  claimed in the shell's DOM keydown, which is deaf whenever the native GTK child
-  page webview has focus. Fix is the chord-claimer promotion of
-  `connect_seat_input_observer` (a pure observer today — every handler returns
-  `Propagation::Proceed`), relayed to the shell exactly like the existing
-  **ALT-tap relay** (`connect_alt_tap_observer` → `set_alt_tap_notifier` →
-  `webview.rs` `grab_focus()` + `run_javascript` → a `window.__yggterm…FromHost`
-  terminus). Ctrl+F must never be stolen from a terminal that owns the viewport.
+- **⚠ NOT LIVE-PROVEN: the fullscreen mouse route.** Shipped with the chord
+  claimer below, but only the keyboard half has been exercised end to end. The
+  floating window-controls strip (`if fullscreen {` in `shell.rs`) now declares
+  `data-covers-web-surface: "fullscreen-window-controls"`, which is *correct in
+  every case and a no-op where the page hole never reached it* — but it has NOT
+  been shown to be the reason the user's click did nothing. Settle it on guihost:
+  enter distraction-free mode over a web surface with under-glass armed, run
+  `server app state`, and read the input holes against the strip's rect. If the
+  hole does not cover `top:12px right:14px`, the cover is belt-and-braces and the
+  real mouse cause is still open.
 
 - **Tab spawn placement and new-tab focus.** `lane/dev/ychrome-tab-ux`.
   **Every creation path appends to the end; there is no insertion-index owner.**

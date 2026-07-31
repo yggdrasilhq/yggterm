@@ -39824,6 +39824,22 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     if (modalOpen()) { return; }
     if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ tap: true }); }
   };
+  // The HOST's CHORD relay — the SECOND door §13.1 opens, and the one that
+  // makes a shell key survive a focused child. A chord the shell owns (Ctrl+F,
+  // F11) pressed while ANY child holds the keyboard: this window's listeners
+  // are as deaf to it as they are to the ALT tap, so the vendored host CLAIMS
+  // it on the TOPLEVEL WINDOW, consumes it (nothing below may also run its own
+  // handler for a key the chrome just took) and calls in here with the chord's
+  // shell-owned id. Same sender as every other bridge message, so this lands on
+  // the one Rust terminus (keytip_apply_bridge_message).
+  //
+  // ⚠ NO MODAL GUARD, unlike the tap relay, and that is the point: F11 is the
+  // way OUT of a mode with no chrome, so a door that stood down whenever
+  // something was on screen would be a door that fails exactly when the user
+  // needs it. The terminus decides what each id means; the relay only carries.
+  window.__yggtermChordFromHost = function(chord){
+    if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ chord: chord }); }
+  };
   // --- KeyTip floating-badge painter (§9): central assignment in Rust (each
   // interactable carries data-keytip-tip = its assigned letter while the overlay
   // is up), local painting here. Badges are their own little blocks in a
@@ -39985,6 +40001,119 @@ fn push_accels_to_bridge(config: &KeymapConfig) {
         "window.__yggtermAltAccels = {};",
         keytip_accel_js_array(config)
     ));
+    // …and the OTHER key door, on the same edge and from the same config, so a
+    // rebind cannot land on one and not the other. The JS set only fires while
+    // the SHELL webview holds the keyboard; this one fires above every focused
+    // child. Two doors, one keymap.
+    window().set_web_surface_claimed_chords(claimed_chords_for(config));
+}
+
+/// The id the FIND chord relays under.
+///
+/// The find bar is not on the ALT ladder, so it has no keytip command id to
+/// borrow; this is spelled once and read at the terminus, which is what keeps
+/// the wire name from growing a second spelling.
+const WEB_FIND_CHORD_ID: &str = "web.find";
+
+/// Ctrl+F, the one claimed chord that is NOT a registered accelerator.
+///
+/// It cannot be one: `keytip::DEFAULT_ACCELERATORS` is asserted PTY-safe
+/// (`assert_accels_pty_safe`) and a bare `Ctrl+<letter>` belongs to the
+/// terminal forever. Ctrl+F is a BROWSER key, legal only while a browser owns
+/// the viewport — which is exactly what `page_only` says and what the window
+/// claimer checks before claiming.
+const WEB_FIND_CHORD: &str = "Ctrl+F";
+
+/// Which registered accelerators are claimed ABOVE a focused child.
+///
+/// **Not all of them, and that is deliberate.** Every accelerator in
+/// `keytip::DEFAULT_ACCELERATORS` has the same deafness — the JS bridge that
+/// serves them lives in the shell webview and never sees a key a focused page
+/// took — but only one of them is a TRAP: `window.fullscreen` is the way OUT of
+/// a mode that hides the chrome, and a user who cannot leave it has no recourse
+/// but to kill the app (reported 2026-07-31, exactly that). The rest degrade to
+/// "the shortcut did nothing", which is a bug to fix on its own evidence, not a
+/// reason to reroute five more keys through a new path in one change.
+///
+/// Adding one is this list plus nothing else.
+const WINDOW_CLAIMED_ACCEL_COMMANDS: &[&str] = &["window.fullscreen"];
+
+/// The GDK key name a `keytip::Chord` key means, or `None` when this door
+/// cannot express it.
+///
+/// `None` is a REFUSAL, not a gap to paper over: a chord whose key we cannot
+/// name is simply not claimed, so it keeps working exactly as it does today
+/// through the JS bridge. Silently claiming the wrong key would be worse than
+/// not claiming at all.
+fn gdk_key_name_for_chord_key(key: &str) -> Option<String> {
+    let key = key.trim().to_ascii_lowercase();
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        // A single alphanumeric: GDK answers a character keyval, and
+        // `press_key` folds it to lowercase.
+        (Some(single), None) if single.is_ascii_alphanumeric() => Some(single.to_string()),
+        // F1..F35: GDK's key NAME, which is upper-case `F` plus the number.
+        (Some('f'), Some(digit)) if digit.is_ascii_digit() => {
+            let number: u32 = key[1..].parse().ok()?;
+            (1..=35).contains(&number).then(|| format!("F{number}"))
+        }
+        _ => None,
+    }
+}
+
+/// THE claim table, built from the live keymap.
+///
+/// Data, not code: the vendored host matches it and relays the id back, and
+/// knows nothing about what any of it means. Rebuilt on every keymap edge
+/// (`push_accels_to_bridge`), so a rebound accelerator is claimed at its NEW
+/// chord without a restart.
+fn claimed_chords_for(config: &KeymapConfig) -> Vec<dioxus::desktop::ClaimedChord> {
+    let mut out = Vec::new();
+    if let Some(chord) = Chord::parse(WEB_FIND_CHORD)
+        && let Some(key) = gdk_key_name_for_chord_key(&chord.key)
+    {
+        out.push(dioxus::desktop::ClaimedChord {
+            ctrl: chord.ctrl,
+            shift: chord.shift,
+            alt: chord.alt,
+            key,
+            id: WEB_FIND_CHORD_ID.to_string(),
+            // A BROWSER key only. Claimed app-wide it would eat readline's
+            // forward-char in every terminal in the app.
+            page_only: true,
+            // The find field is in the SHELL's DOM and cannot take a keystroke
+            // while WebKit's child holds the toplevel focus.
+            focus_shell: true,
+        });
+    }
+    for (id, chord) in keytip::effective_accelerators(config) {
+        if !WINDOW_CLAIMED_ACCEL_COMMANDS.contains(&id.as_str()) {
+            continue;
+        }
+        // SUPER belongs to the compositor on this path; the claimer does not
+        // read it, so a chord rebound onto it must not be claimed here either.
+        if chord.meta {
+            continue;
+        }
+        let Some(key) = gdk_key_name_for_chord_key(&chord.key) else {
+            continue;
+        };
+        out.push(dioxus::desktop::ClaimedChord {
+            ctrl: chord.ctrl,
+            shift: chord.shift,
+            alt: chord.alt,
+            key,
+            id,
+            // PTY-safe by the keymap's own rule, so it needs no browser.
+            // ⚠ THIS IS THE ESCAPE HATCH: an F11 that only worked over a
+            // focused page would still leave a user trapped everywhere else.
+            page_only: false,
+            // Leaving fullscreen must not ALSO take the keyboard off the page
+            // the user was reading — that would be a second, unasked-for effect.
+            focus_shell: false,
+        });
+    }
+    out
 }
 /// Keep the below-the-webview ALT key bridge installed for the GUI's lifetime
 /// and act on each message it reports. The eval is held open so its `recv()`
@@ -39995,6 +40124,13 @@ fn push_accels_to_bridge(config: &KeymapConfig) {
 async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
     let bridge_js = keytip_bridge_js(&state.peek().keytip_config);
     loop {
+        // The OTHER key door, re-armed on every (re)install. `push_accels_to_bridge`
+        // keeps the two in step on every keymap edge; this is what arms the window
+        // claimer in the first place — and it is inside the loop, not before it,
+        // so the ESCAPE HATCH cannot be lost to a startup ordering race with the
+        // surface host's installation. Replacing the table with an identical one
+        // is free.
+        window().set_web_surface_claimed_chords(claimed_chords_for(&state.peek().keytip_config));
         let mut eval = document::eval(&bridge_js);
         loop {
             match eval.recv::<serde_json::Value>().await {
@@ -40040,6 +40176,24 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             state.with_mut(|shell| shell.clear_alt_overlay());
             dispatch_keytip_node(state, &command);
         }
+        return;
+    }
+    // A shell CHORD claimed on a focused PAGE webview (§13.1's second door).
+    // The GTK claimer already consumed the key, so this is DELIVERY, not
+    // interception — and it lands on the same opener the shell's own Ctrl+F
+    // keydown uses, which is what keeps the two doors from growing different
+    // refusals. Its own message, like `modal_key`, so a chord name can never be
+    // mistaken for a chord CHARACTER.
+    if let Some(chord) = msg.get("chord").and_then(|value| value.as_str()) {
+        if chord == WEB_FIND_CHORD_ID {
+            open_web_find_for_viewport(state);
+            return;
+        }
+        // Every other claimed chord IS a keytip command id, and it lands on the
+        // same dispatch the accelerator bridge above uses — so `window.fullscreen`
+        // has ONE toggle whichever door the key came through.
+        state.with_mut(|shell| shell.clear_alt_overlay());
+        dispatch_keytip_node(state, chord);
         return;
     }
     // §12.3: a dialog key for an open modal, sent while the ALT overlay is
@@ -63573,7 +63727,7 @@ async fn close_web_find_everywhere(
     let lender = state.with_mut(|shell| shell.close_web_find(session_path));
     let tore_down_a_bar = lender.is_some();
     if let Some(origin) = lender {
-        restore_focus_after_web_find(origin);
+        restore_focus_after_web_find(state, &desktop, session_path, origin);
     }
     let engine =
         run_web_find_step(state, desktop, Some(session_path), web_find::FindStep::Close).await;
@@ -74205,36 +74359,19 @@ fn app() -> Element {
                 // Ctrl+<letter> belongs to the PTY (`assert_accels_pty_safe`),
                 // so a global Ctrl+F would eat readline's forward-char in every
                 // terminal in the app. It is only a browser key when a browser
-                // owns the viewport, which is exactly the condition below.
+                // owns the viewport, which is exactly what
+                // `open_web_find_for_viewport` refuses on — and this handler is
+                // only ONE of its two doors: the other is the GTK chord claimer
+                // on a focused page webview, which cannot reach this listener at
+                // all. Both call the same opener; neither owns the decision.
                 if is_accel
                     && !evt.modifiers().contains(Modifiers::SHIFT)
                     && !evt.modifiers().contains(Modifiers::ALT)
                     && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("f"))
+                    && open_web_find_for_viewport(state).is_some()
                 {
-                    // The lender: whoever holds the keyboard right now. A
-                    // terminal that is typing-ready is the one that gets it back
-                    // on Escape; a page or chrome lender is given back by
-                    // blurring and nothing more.
-                    let opened = state.with_mut(|shell| {
-                        let session = shell.server.active_session_path()?.to_string();
-                        // A picker-phase surface has no page to search.
-                        let overlay =
-                            shell.web_surface_overlay_for_session(&session, current_millis())?;
-                        if overlay.picker_control_url.is_some() {
-                            return None;
-                        }
-                        let origin = if shell.terminal_input_override_active {
-                            web_find::FindFocusOrigin::Terminal(session.clone())
-                        } else {
-                            web_find::FindFocusOrigin::Page
-                        };
-                        shell.open_web_find(&session, origin).then_some(session)
-                    });
-                    if opened.is_some() {
-                        evt.prevent_default();
-                        focus_web_find_input();
-                        return;
-                    }
+                    evt.prevent_default();
+                    return;
                 }
                 // The bare "/" search hotkey is GONE (user call 2026-07-23): a
                 // plain printable key stole real typing whenever the
@@ -75143,6 +75280,20 @@ fn app() -> Element {
                 }
                 if fullscreen {
                     div {
+                        // ⚠ THE ONLY MOUSE ROUTE OUT OF DISTRACTION-FREE MODE.
+                        // In this mode the titlebar and sidebar are not
+                        // rendered at all, so this floating strip carries the
+                        // exit-fullscreen control and nothing else does.
+                        //
+                        // It therefore MUST declare itself a cover. Under glass
+                        // (the standard presentation path) the input region is
+                        // the window MINUS the page holes PLUS the declared
+                        // covers, so chrome that floats over a page and does not
+                        // declare gets no input at all: the button is visible,
+                        // the click goes through it to the page, and — with the
+                        // keyboard route deaf too — the user's only way out is
+                        // to kill the app. That is what happened (2026-07-31).
+                        "data-covers-web-surface": "fullscreen-window-controls",
                         style: "position:absolute; top:12px; right:14px; z-index:180;",
                         onmousedown: |evt| evt.stop_propagation(),
                         onclick: |evt| evt.stop_propagation(),
@@ -111287,16 +111438,31 @@ fn focus_web_find_input() {
 ///
 /// The bar never DECIDES where focus belongs — `origin` was recorded at open
 /// time and this only replays it. A terminal lender gets its input re-enabled
-/// and refocused; a page or chrome lender gets the field blurred and nothing
-/// else, because the shell has no business reaching into a native webview's
-/// focus and the click that follows will do it correctly.
+/// and refocused; a PAGE lender gets the toplevel's keyboard back through the
+/// host focus verb; a chrome lender (the origin an agent-opened bar records)
+/// gets the field blurred and nothing else, because nobody in particular lent
+/// anything.
+///
+/// ⚠ **The page arm is not decoration.** Ctrl+F pressed on a focused page is
+/// claimed at the GTK level and the relay grabs the keyboard for the shell so
+/// the field — which lives in the shell's DOM — can take a keystroke at all.
+/// Without the give-back, Escape would leave the user's page with no keyboard
+/// until they clicked it: no PageUp, no PageDown, no typing into the form they
+/// were filling. `web_find::give_back_moves_the_keyboard` is where that is
+/// stated; this is where it is obeyed. The host verb refuses a surface that is
+/// not being shown, so a bar closed over a backgrounded page costs nothing.
 ///
 /// The target comes from `web_find::return_focus_to_lender`, which is also what
 /// writes the give-back into the published ledger: the move this function makes
 /// and the move the trace reports are produced by the same call, so a close
 /// that skipped the give-back would show up as a MISSING entry rather than be
 /// papered over by bookkeeping.
-fn restore_focus_after_web_find(origin: web_find::FindFocusOrigin) {
+fn restore_focus_after_web_find(
+    state: Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: &str,
+    origin: web_find::FindFocusOrigin,
+) {
     let target = web_find::return_focus_to_lender(&origin);
     let _ = document::eval(&format!(
         r#"
@@ -111309,9 +111475,69 @@ fn restore_focus_after_web_find(origin: web_find::FindFocusOrigin) {
         }})();
         "#
     ));
-    if let web_find::FindFocusTarget::Terminal(session_path) = target {
-        refocus_terminal_session_input(&session_path);
+    if !web_find::give_back_moves_the_keyboard(&target) {
+        return;
     }
+    match target {
+        web_find::FindFocusTarget::Terminal(session_path) => {
+            refocus_terminal_session_input(&session_path);
+        }
+        web_find::FindFocusTarget::Page => {
+            if let Ok((_, native_id)) = resolve_live_web_surface(&state, Some(session_path)) {
+                desktop.web_surface_focus(native_id);
+            }
+        }
+        // The borrow direction never reaches a give-back, and chrome is
+        // filtered out above; both arms are here so a new target cannot be
+        // added without deciding what closing means for it.
+        web_find::FindFocusTarget::FindInput | web_find::FindFocusTarget::Chrome => {}
+    }
+}
+/// THE one door to "open the find bar over whatever page owns the viewport".
+///
+/// **Two keyboards ask for this and they must reach the SAME decisions.** The
+/// shell's own root `onkeydown` sees Ctrl+F only while the shell webview holds
+/// focus; while a page holds it — the normal case while browsing, and the
+/// reported bug ("no ctrl+F") — the key is claimed at the GTK level on the
+/// TOPLEVEL WINDOW and relayed in through `keytip_apply_bridge_message`. Before this
+/// function existed the refusals lived inline in the DOM handler's closure, so
+/// the second door could only have got them by copying them, and a copied
+/// refusal is a refusal that drifts.
+///
+/// Refuses, in order: no active session; no live overlay for it (no web surface
+/// at all, or a stale one); a PICKER-phase surface, which has no page to
+/// search. Records the LENDER — a typing-ready terminal underneath gets the
+/// keyboard back on Escape, a page lender gets it back through the host focus
+/// verb — and then borrows the keyboard into the field.
+///
+/// Idempotent, which is also what a browser does: Ctrl+F on an already-open bar
+/// re-focuses and selects the field rather than forgetting who lent the
+/// keyboard (`ShellState::open_web_find`). That is the ONLY way back into a bar
+/// the user left by clicking into the page, because an unfocused bar claims no
+/// keys at all — see `web_find::find_bar_blocks_terminal_input`.
+///
+/// Returns the session whose bar is now open and focused, or `None` if it
+/// refused.
+fn open_web_find_for_viewport(mut state: Signal<ShellState>) -> Option<String> {
+    // The lender: whoever holds the keyboard right now. A terminal that is
+    // typing-ready is the one that gets it back on Escape; a page lender is
+    // given it back through the host focus verb when the bar closes.
+    let session = state.with_mut(|shell| {
+        let session = shell.server.active_session_path()?.to_string();
+        // A picker-phase surface has no page to search.
+        let overlay = shell.web_surface_overlay_for_session(&session, current_millis())?;
+        if overlay.picker_control_url.is_some() {
+            return None;
+        }
+        let origin = if shell.terminal_input_override_active {
+            web_find::FindFocusOrigin::Terminal(session.clone())
+        } else {
+            web_find::FindFocusOrigin::Page
+        };
+        shell.open_web_find(&session, origin).then_some(session)
+    })?;
+    focus_web_find_input();
+    Some(session)
 }
 /// The bar's own close (Escape, ✕). Both halves live in
 /// `close_web_find_everywhere`, which the agent verb's `--close` also calls —
@@ -123021,6 +123247,310 @@ mod tests {
         }
     }
 
+    /// **THE REPORTED BUGS, engine half.** Two reports, one root cause:
+    /// *"no ctrl+F (find system in website)"* and *"on F11 (fullscreen) there is
+    /// no way to un-fullscreen as F11 … do not work. Hence the restart."*
+    ///
+    /// Both keys were already wired — in the SHELL webview, which is deaf the
+    /// whole time a native GTK child holds the keyboard. That is the normal
+    /// state while browsing, so Ctrl+F did nothing and F11 trapped the user in a
+    /// mode that renders no chrome. The fix is one claimer on the TOPLEVEL
+    /// WINDOW, above every focused child.
+    ///
+    /// Scanned from HERE and not only from the vendored crate's own test module
+    /// because `dioxus-desktop` is a `[patch.crates-io]` path dependency, not a
+    /// workspace member: nothing in that file runs under `cargo test
+    /// --workspace`. The pure claim RULE is private there and locked there
+    /// (`chord_claim_locks`, `cargo test -p dioxus-desktop`); the WIRING is
+    /// locked here, where the suite that gates this repo can see it.
+    #[test]
+    fn the_chord_claimer_is_installed_on_the_toplevel_and_consumes_only_a_claim() {
+        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        const GLUE: &str = include_str!("../../../vendor/dioxus-desktop/src/webview.rs");
+        let host = web_surface_host_product_source();
+
+        // ONE attachment point, and it is the toplevel. A per-surface claimer
+        // has to be remembered at every door a focusable child is built through
+        // — there were already two — and a forgotten door re-traps the user.
+        assert!(
+            host.contains("fn connect_window_chord_claimer(")
+                && host.contains("window.connect_key_press_event(move |window, event| {"),
+            "the claimer must hang off the toplevel window's key-press-event"
+        );
+        assert_eq!(
+            host.matches("connect_window_chord_claimer(").count(),
+            2,
+            "exactly one definition and one call: a second attachment point is \
+             the per-surface trap coming back"
+        );
+        assert!(
+            !host.contains("connect_chord_claimer(&webview.webview()"),
+            "no per-surface claimer may survive beside the window one — two \
+             layers claiming the same key is two answers to who consumed it"
+        );
+
+        let claimer = HOST
+            .split("fn connect_window_chord_claimer(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn rect_logical(").next())
+            .expect("the surface host must define `connect_window_chord_claimer`");
+        assert_eq!(
+            claimer.matches("gtk::glib::Propagation::Stop").count(),
+            1,
+            "exactly ONE Stop, and it is on the claimed path: a window-level \
+             handler that swallowed anything else would take keys off every \
+             widget in the app"
+        );
+        let claimed_at = claimer
+            .find("let Some(claimed) = claimed else {")
+            .expect("the claim decision must go through the pure rule");
+        let stop_at = claimer
+            .find("gtk::glib::Propagation::Stop")
+            .expect("a claimed chord must be consumed");
+        assert!(
+            claimed_at < stop_at,
+            "the key may only be consumed AFTER the rule says it is ours"
+        );
+        assert!(
+            claimer.contains("window.focused_widget()")
+                && claimer.contains("page_focused"),
+            "the `page_only` rows are answered from the toplevel's OWN focus \
+             widget — that is the only honest reading of who holds the keyboard"
+        );
+
+        let registration = GLUE
+            .split("host.set_chord_notifier(move |chord| {")
+            .nth(1)
+            .expect("the webview glue must register the chord notifier")
+            .split("\n                });")
+            .next()
+            .expect("the registration closes");
+        let focus_at = registration
+            .find("if chord.focus_shell {")
+            .expect("the keyboard hand-over must be per-chord, not unconditional");
+        let relay_at = registration
+            .find("window.__yggtermChordFromHost")
+            .expect("the notifier must relay the chord into the shell webview");
+        assert!(
+            focus_at < relay_at,
+            "a focus_shell chord must be granted the keyboard BEFORE the relay: \
+             the find field is in the SHELL's DOM and cannot take a keystroke \
+             while a child holds the toplevel focus"
+        );
+        assert!(
+            GLUE.contains("host.install_window_chord_claimer("),
+            "the glue that owns the toplevel must be the one that attaches the \
+             claimer to it"
+        );
+    }
+
+    /// The table the window claimer matches, as a VALUE — the behavioural half
+    /// of the escape lock below.
+    ///
+    /// Two rows, two opposite policies, and the difference is the whole design:
+    /// `Ctrl+F` is a browser key (`page_only`) that also needs the keyboard
+    /// brought home (`focus_shell`); the fullscreen accelerator is neither.
+    #[test]
+    fn the_claim_table_is_two_rows_with_opposite_policies() {
+        let table = claimed_chords_for(&KeymapConfig::default());
+
+        let find = table
+            .iter()
+            .find(|entry| entry.id == WEB_FIND_CHORD_ID)
+            .expect("Ctrl+F must be in the claim table or find-in-page is deaf again");
+        assert_eq!(
+            (find.ctrl, find.shift, find.alt, find.key.as_str()),
+            (true, false, false, "f")
+        );
+        assert!(
+            find.page_only,
+            "a bare Ctrl+<letter> belongs to the PTY — claimed app-wide this \
+             would eat readline's forward-char in every terminal in the app"
+        );
+        assert!(
+            find.focus_shell,
+            "the find field is in the shell's DOM and cannot take a keystroke \
+             while a child holds the toplevel focus"
+        );
+
+        let fullscreen = table
+            .iter()
+            .find(|entry| entry.id == "window.fullscreen")
+            .expect("the fullscreen escape must be in the claim table");
+        assert_eq!(
+            (
+                fullscreen.ctrl,
+                fullscreen.shift,
+                fullscreen.alt,
+                fullscreen.key.as_str()
+            ),
+            (false, false, false, "F11"),
+            "the shipping chord, canonicalised to the GDK key NAME the claimer \
+             compares against"
+        );
+        assert!(
+            !fullscreen.page_only,
+            "an escape that only works while a browser owns the viewport is not \
+             an escape"
+        );
+        assert!(
+            !fullscreen.focus_shell,
+            "leaving fullscreen must not also take the keyboard off the page"
+        );
+
+        assert_eq!(
+            table.len(),
+            2,
+            "the table is the WHOLE claimed set — Ctrl+P (print) is deliberately \
+             absent because there is no print path to route it to: {table:?}"
+        );
+    }
+
+    /// A REBIND is honoured, and an inexpressible chord is refused rather than
+    /// guessed.
+    #[test]
+    fn the_claim_table_follows_the_keymap_and_refuses_what_it_cannot_name() {
+        let mut config = KeymapConfig::default();
+        config.set_accel(
+            "window.fullscreen".to_string(),
+            Chord::parse("Ctrl+Shift+F10").expect("a parseable chord"),
+        );
+        let rebound = claimed_chords_for(&config)
+            .into_iter()
+            .find(|entry| entry.id == "window.fullscreen")
+            .expect("a rebound escape is still an escape");
+        assert_eq!(
+            (
+                rebound.ctrl,
+                rebound.shift,
+                rebound.alt,
+                rebound.key.as_str()
+            ),
+            (true, true, false, "F10"),
+            "the claim table is rebuilt from the live keymap, so a user who \
+             rebinds fullscreen is claimed at THEIR chord"
+        );
+
+        // A key this door cannot name is not claimed — it keeps working exactly
+        // as it does today through the shell's JS bridge. Guessing would be
+        // worse than refusing.
+        assert_eq!(gdk_key_name_for_chord_key("f11"), Some("F11".to_string()));
+        assert_eq!(gdk_key_name_for_chord_key("F11"), Some("F11".to_string()));
+        assert_eq!(gdk_key_name_for_chord_key("t"), Some("t".to_string()));
+        assert_eq!(gdk_key_name_for_chord_key("7"), Some("7".to_string()));
+        assert_eq!(gdk_key_name_for_chord_key("pagedown"), None);
+        assert_eq!(gdk_key_name_for_chord_key("f99"), None);
+        assert_eq!(gdk_key_name_for_chord_key(""), None);
+
+        let mut unnameable = KeymapConfig::default();
+        unnameable.set_accel(
+            "window.fullscreen".to_string(),
+            Chord::parse("Ctrl+Alt+PageDown").expect("a parseable chord"),
+        );
+        assert!(
+            !claimed_chords_for(&unnameable)
+                .iter()
+                .any(|entry| entry.id == "window.fullscreen"),
+            "a chord the door cannot express is REFUSED, not approximated"
+        );
+    }
+
+    /// ⭐ **THE USER CANNOT BE LOCKED IN.** This is the class of bug where the
+    /// only way out is to kill the app, and it happened: F11 entered a mode that
+    /// renders no titlebar and no sidebar, and then neither the key nor the
+    /// floating control could leave it.
+    ///
+    /// Two independent escapes, both locked here, because either one alone is a
+    /// single point of failure:
+    ///
+    /// 1. **The keyboard.** `window.fullscreen` is in the window claimer's
+    ///    table, and its row is NOT `page_only` — an escape that only works
+    ///    while a browser owns the viewport is not an escape.
+    /// 2. **The mouse.** The floating window-controls strip is the only chrome
+    ///    rendered in that mode, so it must declare itself a cover; under glass
+    ///    the input region is the window minus the page holes plus the declared
+    ///    covers, and undeclared chrome over a page gets no clicks at all.
+    #[test]
+    fn distraction_free_mode_always_has_a_way_out() {
+        let source = include_str!("shell.rs");
+        let table = source
+            .split("fn claimed_chords_for(config: &KeymapConfig)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("shell.rs must define the claim table");
+        assert!(
+            table.contains("WINDOW_CLAIMED_ACCEL_COMMANDS.contains(&id.as_str())"),
+            "the accelerator half of the table must come from the LIVE keymap, \
+             so a user who rebinds fullscreen is claimed at their chord:\n{table}"
+        );
+        assert!(
+            table.contains("page_only: false,"),
+            "the escape row must be claimed whatever holds the keyboard:\n{table}"
+        );
+        assert!(
+            table.contains("focus_shell: false,"),
+            "…and leaving fullscreen must not also take the keyboard off the \
+             page the user was reading:\n{table}"
+        );
+        assert!(
+            WINDOW_CLAIMED_ACCEL_COMMANDS.contains(&"window.fullscreen"),
+            "`window.fullscreen` is THE trap key — it is the way out of a mode \
+             that renders no chrome. Removing it from the claim table locks the \
+             user in with no recourse but to kill the app"
+        );
+        // …and the table is ARMED, inside the bridge (re)install loop rather
+        // than once before it, so a startup ordering race with the surface
+        // host's installation cannot silently cost the escape.
+        let install_loop = source
+            .split("async fn keytip_alt_tap_install_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("shell.rs must define the bridge install loop");
+        let loop_at = install_loop
+            .find("loop {")
+            .expect("the install loop must loop");
+        let arm_at = install_loop
+            .find("window().set_web_surface_claimed_chords(")
+            .expect("the install loop must arm the window claimer's table");
+        assert!(
+            loop_at < arm_at,
+            "the claim table must be (re)armed INSIDE the loop — armed once \
+             before it, a host installed later than the first tick would leave \
+             the user with no escape at all:\n{install_loop}"
+        );
+
+        assert!(
+            keytip::effective_accelerators(&KeymapConfig::default())
+                .iter()
+                .any(|(id, chord)| id == "window.fullscreen"
+                    && gdk_key_name_for_chord_key(&chord.key).is_some()),
+            "…and the shipping chord for it must be one this door can express, \
+             or the claim table silently ships without the escape in it"
+        );
+
+        // The mouse route: the ONE chrome node rendered in that mode declares
+        // itself a cover.
+        let product = shell_product_source();
+        let at = product
+            .find("\"data-covers-web-surface\": \"fullscreen-window-controls\",")
+            .expect(
+                "the floating window-controls strip must declare itself a cover — \
+                 undeclared chrome over a page is visible and unclickable",
+            );
+        let before = &product[at.saturating_sub(1400)..at];
+        assert!(
+            before.contains("if fullscreen {"),
+            "…and that declaration belongs to the FULLSCREEN strip, which is the \
+             only chrome that mode renders:\n{before}"
+        );
+        let after = &product[at..at + 1600];
+        assert!(
+            after.contains("WindowControlsStrip {") && after.contains("on_toggle_fullscreen:"),
+            "…and the covered node must be the strip that carries the \
+             exit-fullscreen control:\n{after}"
+        );
+    }
+
     /// This crate hands the engine the policy `web_find` owns, and nothing of
     /// its own: the option mask by function, the cap by constant.
     ///
@@ -123386,7 +123916,7 @@ mod tests {
             "the close must tear the bar down"
         );
         assert!(
-            close.contains("restore_focus_after_web_find(origin)"),
+            close.contains("restore_focus_after_web_find(state, &desktop, session_path, origin)"),
             "the close must REPLAY the recorded lender — a close that finishes \
              the engine search and never hands the keyboard back leaves the \
              user typing into nothing, and the agent's `--close` is the path \
@@ -123431,9 +123961,9 @@ mod tests {
              the borrow through `web_find`, which is what records it"
         );
         let restore = source
-            .split("fn restore_focus_after_web_find(origin: web_find::FindFocusOrigin) {")
+            .split("fn restore_focus_after_web_find(\n")
             .nth(1)
-            .and_then(|rest| rest.split("\n/// The bar's own close").next())
+            .and_then(|rest| rest.split("\n/// THE one door to").next())
             .expect("shell.rs must define `restore_focus_after_web_find`");
         assert!(
             restore.contains("web_find::return_focus_to_lender(&origin)"),
@@ -167450,6 +167980,124 @@ mod menu_dismissal_locks {
                 .any(|line| line.contains("desktop.web_surface_focus(native_id);")),
             "closing the layer over a revealed page must hand the keyboard \
              back to that page through the host focus verb"
+        );
+    }
+
+    /// **THE REPORTED BUG: "no ctrl+F (find system in website)".**
+    ///
+    /// The find feature was whole; the KEY was not reachable. Ctrl+F was
+    /// claimed only in the shell's root `onkeydown`, which is deaf whenever the
+    /// native GTK child page webview holds focus — the normal case while
+    /// browsing. The second door is the GTK chord claimer (locked in the
+    /// vendored host), relaying through this bridge.
+    ///
+    /// What this lock defends is the SHAPE of that fix: two doors, ONE opener.
+    /// A second door that carried its own copy of "which session, is it a
+    /// picker, who lent the keyboard" is a copy that drifts, and the DOM
+    /// handler's inline closure is exactly where those refusals used to live.
+    #[test]
+    fn the_host_chord_relay_lands_on_the_one_find_opener() {
+        let relay = ALT_TAP_LISTENER_JS_TEMPLATE
+            .split("window.__yggtermChordFromHost = function(chord){")
+            .nth(1)
+            .expect("the bridge must define the host chord relay")
+            .split("};")
+            .next()
+            .expect("the relay closes");
+        assert!(
+            !relay.contains("modalOpen()"),
+            "⭐ the chord relay must NOT take the tap relay's modal guard. F11 is \
+             the way OUT of a mode that renders no chrome, and a door that \
+             stands down whenever something is on screen is a door that fails \
+             exactly when the user needs it. What each id MEANS is the \
+             terminus's decision; the relay only carries"
+        );
+        assert!(
+            relay.contains("window.__yggtermAltTapSend({ chord: chord });"),
+            "the relay posts on the SAME sender as every other bridge message, \
+             so it lands on the one Rust terminus"
+        );
+
+        let product = product_source();
+        let bridge = function_body(&product, "fn keytip_apply_bridge_message(");
+        assert!(
+            bridge.contains("if let Some(chord) = msg.get(\"chord\").and_then(|value| value.as_str())"),
+            "the dispatcher must handle the chord message it is sent:\n{bridge}"
+        );
+        assert!(
+            bridge.contains("open_web_find_for_viewport(state);"),
+            "…on the SAME opener the shell's own Ctrl+F keydown uses — a second \
+             opener is a second set of refusals:\n{bridge}"
+        );
+        assert!(
+            bridge.contains("if chord == WEB_FIND_CHORD_ID {"),
+            "the wire name comes from the ONE shell-owned constant, so the claim \
+             table and this terminus cannot grow two spellings of it:\n{bridge}"
+        );
+        assert!(
+            bridge.contains("dispatch_keytip_node(state, chord);"),
+            "⭐ every OTHER claimed chord is a keytip command id and must land on \
+             the SAME dispatch the accelerator bridge uses — `window.fullscreen` \
+             gets one toggle whichever door the key came through, not a second \
+             one grown here:\n{bridge}"
+        );
+
+        // ONE opener, and it is the one that carries the refusals.
+        let opener = function_body(&product, "fn open_web_find_for_viewport(");
+        for refusal in [
+            "shell.server.active_session_path()",
+            "shell.web_surface_overlay_for_session(",
+            "overlay.picker_control_url.is_some()",
+            "shell.terminal_input_override_active",
+        ] {
+            assert!(
+                opener.contains(refusal),
+                "the one opener must carry `{refusal}` — this is the decision \
+                 the second door would otherwise have had to copy:\n{opener}"
+            );
+        }
+        assert!(
+            opener.contains("focus_web_find_input();"),
+            "opening the bar INCLUDES borrowing the keyboard into it: the chord \
+             door's whole point is that the page holds the keyboard and the \
+             field is in the shell's DOM:\n{opener}"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| {
+                    line.contains(".open_web_find(") && !line.contains("fn open_web_find")
+                })
+                .count(),
+            2,
+            "exactly two callers of `open_web_find`: the one keyboard opener \
+             (`open_web_find_for_viewport`) and `begin_agent_web_find` (which \
+             must never move focus). A third is a door that has grown its own \
+             refusals"
+        );
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("open_web_find_for_viewport(state)"))
+                .count(),
+            2,
+            "exactly two doors call the opener: the shell's root onkeydown and \
+             the host chord relay's terminus"
+        );
+
+        // The give-back half. A page that lent the keyboard through the chord
+        // door must get it back on close, or Escape leaves the page the user is
+        // reading with no keyboard at all.
+        let restore = function_body(&product, "fn restore_focus_after_web_find(");
+        assert!(
+            restore.contains("web_find::give_back_moves_the_keyboard(&target)"),
+            "the give-back must consult the policy that says a Page lender is a \
+             real move, not a blur:\n{restore}"
+        );
+        assert!(
+            restore.contains("desktop.web_surface_focus(native_id);"),
+            "…and a Page target must actually be handed the keyboard, through \
+             the host focus verb the ALT layer's give-back uses:\n{restore}"
         );
     }
 
