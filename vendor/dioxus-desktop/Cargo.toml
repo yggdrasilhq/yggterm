@@ -71,26 +71,30 @@ transparent = ["wry/transparent"]
 [lib]
 name = "dioxus_desktop"
 path = "src/lib.rs"
+# Same reason as the removed `headless_tests` targets below: upstream's doc
+# examples are written against the `dioxus` UMBRELLA crate (`use
+# dioxus::prelude::*`, `VirtualDom`, `rsx!`), which this vendored crate does
+# not depend on. They cannot compile here and never have. As a
+# `[patch.crates-io]` path dependency that was invisible; as a workspace
+# member it fails the whole `cargo test --workspace` build and takes the 68
+# real lib tests down with it.
+doctest = false
 
-[[test]]
-name = "check_eval"
-path = "headless_tests/eval.rs"
-harness = false
-
-[[test]]
-name = "check_events"
-path = "headless_tests/events.rs"
-harness = false
-
-[[test]]
-name = "check_forms"
-path = "headless_tests/forms.rs"
-harness = false
-
-[[test]]
-name = "check_rendering"
-path = "headless_tests/rendering.rs"
-harness = false
+# ⛔ `headless_tests/` IS NOT DECLARED, DELIBERATELY. Those four targets
+# (check_eval, check_events, check_forms, check_rendering) are upstream
+# Dioxus's own browser-driven integration tests. They `use dioxus::...`, and
+# this vendored crate has no `[dev-dependencies]` at all — so they have never
+# compiled here and cannot. While the crate was only a `[patch.crates-io]`
+# path dependency that was invisible. The moment it became a workspace member
+# (root Cargo.toml, "a lock that never runs is not a lock") `cargo test
+# --workspace` started failing to BUILD, which hides the 68 lib tests that
+# change was made to run. Declaring them is strictly worse than not: a target
+# that cannot compile is not coverage, it is a red suite everyone learns to
+# ignore. The files stay on disk for upstream diffs.
+#
+# If they are ever wanted, they need `dioxus` as a dev-dependency plus the
+# headless browser harness upstream drives them with — a real piece of work,
+# not a missing line.
 
 [dependencies.anyhow]
 version = "1.0.98"

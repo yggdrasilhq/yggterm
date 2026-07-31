@@ -6652,15 +6652,28 @@ mod tests {
                                                     plan.webkit_disable_dmabuf_renderer
                                                         == GlEnvAction::Remove
                                                 );
-                                                // ...but arming does NOT follow it. A
-                                                // working GPU is not consent to turn on
-                                                // under-glass compositing; that pairing
-                                                // is what put an agent's page over the
-                                                // user's whole window.
-                                                assert!(
-                                                    !armed,
-                                                    "under-glass must stay unarmed without an \
-                                             explicit request ({context})"
+                                                // ...and since 5b0280a arming FOLLOWS it.
+                                                // This assertion used to read `!armed`
+                                                // ("a working GPU is not consent"), which
+                                                // was the contract before the user settled
+                                                // the opposite: under-glass is the correct
+                                                // presentation path, not an experiment, and
+                                                // *"our software needs an extra flag to be
+                                                // correct"* is the bug. The lock is rewritten
+                                                // to the new model rather than deleted, and
+                                                // it is STRICTER than what it replaces —
+                                                // it pins both directions, so neither the
+                                                // hardware default nor the software demotion
+                                                // can regress silently. Software GL still
+                                                // refuses: DMABuf cannot composite over SHM
+                                                // and SIGSEGVs on a host with no working
+                                                // hardware GL.
+                                                assert_eq!(
+                                                    armed,
+                                                    policy.hardware_gl,
+                                                    "with no user opinion, under-glass arms on \
+                                             a hardware-GL host and demotes on software GL \
+                                             ({context})"
                                                 );
                                             }
                                             cells += 1;
