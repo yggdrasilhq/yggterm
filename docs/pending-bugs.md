@@ -2457,12 +2457,82 @@ newest is 3 weeks old and much has shipped since. Re-check before working one;
 some are certainly fixed already. Full narrative for each is in
 `~/.claude/memory-archive/-home-user-gh-yggterm/<slug>.md`.
 
-- **Broken-bottom during a working turn** (`finding-broken-bottom-reconcile-starved-during-work`)
-  — content-scoop on resize + daemon-screen reconcile double-gated off for the
-  whole turn, so redraw/Esc only repaint an already-wrong client buffer.
-  ROOT-CAUSED 2026-06-17, explicitly NOT fixed. Related and also open:
-  `sidebugs-webgl-artifacts-stale-frame-on-switch` calls stale-frames-after-switch
-  "the biggest remaining UX bug".
+- ⭐ **Broken-bottom during a working turn — NO LONGER A LEAD. USER-CONFIRMED LIVE
+  ON 2.12.19 (2026-07-31) AND ROOT-CAUSED TO ONE THRESHOLD.** User's words: "the
+  bottom region of CC opens up always TUI frame broken and I fix with slash usage
+  and scroll." That workaround is the tell — typing `/` makes Claude Code repaint
+  its own footer, i.e. **the CLI fixes it because yggterm's corrector never runs.**
+
+  The corrector is the reveal screen-reconcile in `shell.rs:~84866`, and its own
+  comment already says it "IS the broken-bottom fix". It is gated on
+  `screen_reconcile_output_quiet` = **1,200 ms with no forwarded output**
+  (`SCREEN_RECONCILE_OUTPUT_QUIET_MS`, shell.rs:550). On a miss it rearms
+  **+3,000 ms** (`SCREEN_RECONCILE_DEFER_REARM_MS`, shell.rs:555) — **with no
+  maximum defer count and no deadline.** A working agent CLI drives a spinner
+  continuously, so the quiet window never arrives.
+
+  There IS a bypass, and its threshold is the bug:
+  ```rust
+  let reveal_incomplete = screen_reconcile_reason == "reveal_screen_reconcile"
+      && last_host_health_visible_nonblank_rows < 3;
+  ```
+  It only rescues a viewport that has degraded to **fewer than 3 non-blank rows** —
+  the catastrophic blank-frame case. **A partially broken bottom, which is what the
+  user actually sees, has 40+ non-blank rows, so it takes no escape at all** and
+  waits for a silence that never comes.
+
+  **Measured in `~/.yggterm/event-trace.jsonl`, 83 minutes, 2026-07-31:**
+  - **198 true deferrals** (71 traced + 127 hidden by the 10 s trace rate-limiter —
+    read `suppressed_since_last`, the raw line count understates it 2.8×) against
+    only **32 completed reconciles**: deferred 6:1.
+  - Chains are long, not isolated: session `…828dc5021f0d` deferred ~36 consecutive
+    times over 106 s (10:18:19→10:20:05); `…1369e395ee57` ~40 times over 110 s
+    (10:29:38→10:31:28). Both escaped only via the blank bypass.
+  - `reveal_forced_incomplete` fired **9 times** — nine occasions where the viewport
+    had to rot to near-blank before anything corrected it.
+
+  **Fix shape: bound the defer.** After N consecutive defers or T seconds, force the
+  reconcile regardless of output — the same principle the constitution already
+  states for the daemon drain ("the drain must not require a quiet window"). Keep
+  the 1,200 ms quiet test as the *preferred* path so brief bursts still avoid a
+  tear; add the deadline so convergence is guaranteed. Do NOT simply widen
+  `last_host_health_visible_nonblank_rows`; that trades one arbitrary threshold for
+  another.
+
+  Related and also open: `sidebugs-webgl-artifacts-stale-frame-on-switch` calls
+  stale-frames-after-switch "the biggest remaining UX bug".
+
+- ⚠ **THE PATTERN BEHIND THREE SEPARATE BUGS: we gate corrective work on
+  output-silence, and an agent CLI is never output-silent.** Same false assumption
+  in three places, all live:
+  1. the hot-restart idle gate — 300 s idle threshold on a clock that OUTPUT bumps
+     (`daemon.rs:501`, `session_idle_for_ms`); measured 0-of-40 samples open;
+  2. the screen reconcile above — 1,200 ms quiet, unbounded rearm;
+  3. the 2.12.19 drag-stall fix's own root cause, quoted from a81c7366: selection
+     events fire "per streamed write that shifts the buffer under a live selection
+     — an agent CLI that streams constantly multiplies the events."
+
+  Terminals for humans are mostly quiet; this product's primary workload never is.
+  **Any new gate must have a deadline, or hang off a positive liveness signal
+  rather than an absence-of-output signal** (see
+  `finding-agent-session-liveness-is-invisible-to-os-signals`).
+
+- **Drag-selection still freezes the TUI on 2.12.19** (user-reported 2026-07-31),
+  despite a81c7366 making the per-event handler O(1) with a trailing-edge flush.
+  So the residual stall is NOT the `getSelection()` serialization that fix removed.
+  ⚠ **Currently un-diagnosable from telemetry: the terminal selection path is
+  effectively uninstrumented** — one `selection_copy_*` triple in 83 minutes — and
+  `app_render_rate`/`terminal_forward_rate` are 60-second averages (1.1–5.7
+  renders/s, 0.8–5.7 forwards/s, no storm) which cannot see a sub-second freeze.
+  First step is an instrument, not a fix: emit a drag-lifecycle trace (mousedown →
+  selectionchange count → rAF flush latency → mouseup) so the stall can be located.
+
+- **`screen_snapshot_clipped_to_pty_width` fires constantly and nobody has looked**
+  — 108 times in 17 minutes on `local://43c47548…`, every one reporting
+  `pty_cols: 171` against `screen_max_column: 260`. The daemon's vt100 screen is
+  holding content 89 columns wider than the PTY it belongs to and discarding the
+  overhang on every snapshot (`terminal.rs:2113`). Unexplained; may be benign
+  post-resize residue, may be a second content-loss path.
 - **LIVE-path frame corruption** (`finding-client-buffer-garble-attach-seed-and-live-path`)
   — the attach-seed half was fixed in 2.10.4; the live-path half was left open
   with probes already shipped to convict it.
