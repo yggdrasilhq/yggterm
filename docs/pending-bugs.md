@@ -226,6 +226,102 @@ detector found nothing precisely because on Wayland there is nothing to find.
   (`no_hittable_match`, `detached_node`, `target_moved`, `zero_size_element`) —
   two planes with different words for the same refusal is the divergence
   AGENTS.md forbids, and avoiding it is why the engine borrowed these names.
+- **Adblock/SponsorBlock not exhaustive; YouTube ads played at 2x.**
+  `lane/dev/adblock-exhaustive`. ✅ **The 2x symptom is root-caused and cured on
+  guihost (2026-07-31).** The deployed `youtube-adblock.js` was the pre-`d05a871`
+  copy lacking its `// ==UserScript==` block, so `@world main` defaulted to
+  `Isolated`, where its `window.fetch`/XHR/`ytInitialPlayerResponse` patches are
+  invisible to the page — leaving only the fallback that sets
+  `playbackRate = 16` (WebKit clamps it, hence "2x"). `idcac.js` and
+  `sponsorblock.js` were stale the same way; all three redeployed. ⚠ Injection
+  is per-webview at creation, so an existing tab keeps the script it was born
+  with — a NEW tab is required, not a reload.
+  **Still owed (the durable half):** a freshness check with ONE owner so a
+  bundled asset newer than the installed copy cannot sit dead; a LOUD refusal on
+  an unparseable/absent metadata block instead of the silent `Isolated` default
+  that caused this; and a real filter-list pipeline — today's ruleset is
+  `assets/web-adblock/rules.json`, **10 KB / 59 hand-written domain regexes plus
+  exactly ONE `css-display-none` rule with 8 selectors, referenced by no code
+  path at all** (a human must `cp` it into `~/.yggterm/web-adblock/`; done on
+  guihost, never on dev). No ABP/uBO syntax parser exists anywhere — no `##`, no
+  `##+js()`, no `$redirect=`. WebKit content blockers offer no redirect action,
+  so surrogates are impossible and untranslatable rules must be COUNTED and
+  reported, never silently dropped. SponsorBlock EXISTS and is real; idcac is a
+  hand-written ~140-line approximation, not the upstream ruleset.
+
+  ✅ **The RE-REPORT (ads still playing after the ychrome-side cure) was a
+  SECOND, yggterm-side bug, root-caused and fixed on `lane/dev/userscript-injection`
+  (2026-07-31).** Nothing was wrong with the wire, the engine, or the scripts:
+  `/policy` served all five with the right `@world`/`@match`, and staging them on
+  a webview through the vendored wry injects all four placement quadrants
+  (verified against the byte-identical live wire on a standalone WebKitGTK
+  harness). The break was upstream of all of it — the session had **no sidebar
+  contribution at all**, so `web_surface_policy_gate()` answered `Absent` and
+  every webview it ever built got `userscripts: []`, no ruleset, no UA and no
+  signer bridge. `app_surface_restore_targets` asked the daemon ONCE per
+  (session, PTY pid) whether an app had declared; a row exists ~3 s before
+  `ychrome` declares, so the one ask legitimately missed and was never repeated.
+  It is per SESSION, which is why closing and reopening the TAB never helped.
+  Fixed by a backoff re-ask (2.5 s doubling to a 60 s ceiling) and by splitting
+  the candidate filter's AND over the rail and web halves — a session that had
+  its web surface but not its contribution was excluded from the sweep forever.
+  ⚠ **Two instrument traps this cost a day to:** `window.__ytAdDefense` and
+  `window.__ysb` do not exist in any script (the real globals are `__yga_*` and
+  `__ysb_*`), and an isolated-world global is invisible to `web eval`, which runs
+  in the page's world — so probe main-world scripts by their global and
+  isolated-world ones by a DOM effect.
+
+- **The WPE agent engine.** `lane/dev/wpe-engine-phase-a`.
+  ⛔ **The spec's core premise is factually wrong and §3 has been corrected:
+  Debian's WPE WebKit 2.52.5 ships NO WPEPlatform at all** — not "gaps in it".
+  Independently verified: `wpe-platform-1.0`/`-2.0` `.pc` absent, zero headers
+  declaring `wpe_display_headless_new`, **zero** `wpe_display` symbols exported
+  from `libWPEWebKit-2.0.so.1`, and `/usr/include/wpe-webkit-2.0/` holds only
+  `jsc` and `wpe`. WPEPlatform is an upstream build flag Debian leaves off, so
+  the version number in the spec was doing all the persuading and none of the
+  deciding. §9's sanctioned fallback fired: the substrate is **WebKitGTK + an
+  engine-owned Xvfb** behind the same verbs, and it delivered the two things the
+  risk register feared it would not — trusted input and faithful snapshots.
+  Phase A gate PASSES on dev (`ychrome engine gate`, five journaled proofs,
+  re-runnable). Bindings decision recorded in a new §9.1: **the gir crates**, no
+  bindgen, no `build.rs`. Phase B started: `/engine/*` router, 10 pages opened
+  concurrently in 1340 ms. Owed: `/nav` `/wait` `/dom` and the input events
+  (refused BY NAME today, never silently dropped), the socket plumbing is
+  unit-tested but never run against a deployed daemon, the gate has not been
+  re-run on guihost, and phases C/D/E remain. **Phase F stays out of scope.**
+
+- **⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` BREAKS THE WEB SURFACE OUTRIGHT** (found
+  2026-07-31 by the tearing lane, reproduced twice: the page never appeared).
+  This is the **top-precedence GL escape hatch** per `docs/optimization-pass.md:222`
+  (`WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
+  `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the EGL child probe), so the documented
+  way to force software presentation currently costs the user every web surface.
+  Either fix it or stop documenting it as the escape hatch — a hatch that
+  destroys the thing it is meant to rescue is worse than none.
+
+- **⚠ THE GL PROBE NEVER RUNS ON THE LIVE HOST.** guihost reports
+  `webkit_gl_policy: hardware_gl_forced`, not `probed`, because
+  `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` sits in the launcher env and outranks
+  the probe. Any reasoning that assumes the live host measured its own GL is
+  wrong. Noted while investigating tearing; not itself known to be a defect,
+  but it silently invalidates a premise agents keep reusing.
+
+- **⚠ FLAKY UNDER LOAD: `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
+  (seen 2026-07-31 at load average **37.5**, with seven lanes building in
+  parallel). It spawns `sleep 30` and asserts the child reads as running;
+  the failing assertion is `render_probe.rs:1905`, the FIRST one. Re-run in
+  isolation: **5/5 green**, and the full suite was green 20 minutes earlier, so
+  it is load-induced, not a regression — no lane touched this file.
+  **Not diagnosed, and worth diagnosing rather than retrying.**
+  `process_still_running` (`render_probe.rs:741-749`) is narrow: it fails only if
+  `/proc/<pid>/stat` is unreadable, `stat.pid != pid`, `stat.comm != comm`, or the
+  state is `Z`/`X`. The test reads `comm` from `/proc` itself at :1901 and then
+  passes it straight back, so a comm mismatch implies the value CHANGED between
+  two adjacent reads — i.e. the first read caught the child mid-`spawn`, before
+  `exec` replaced its `comm`. If that is it, the product code is fine and the
+  TEST is racy; but this is a **liveness probe** in a project whose central
+  lesson is that instruments lie, so "probably just flaky" is not an acceptable
+  resting place. Prove which side is wrong before trusting either.
 
 ## Standing traps / other open bugs
 
