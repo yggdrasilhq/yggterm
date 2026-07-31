@@ -928,14 +928,20 @@ For a dev/agent deploy (new version on disk), the SIMPLE and correct path is:
 `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`/`XAUTHORITY` from `/proc/<gui>/environ`,
 detached via `setsid nohup … </dev/null &`).
 
-> ⛔ **COPY THE WHOLE ENV, NOT THE FIVE VARIABLES NAMED ABOVE.** guihost's GUI runs
-> with **`YGGTERM_WEB_SURFACE_UNDER_GLASS=0`**, and that flag is load-bearing:
-> arming under-glass is what put a background agent's page over the user's entire
-> window (`incident-f0-transparency-chain-app-wide-break`; `docs/pending-bugs.md`
-> records guihost as "hardware GL with Phase F under-glass OFF"). An agent that
-> relaunches using only the five desktop variables silently drops it and re-arms
-> the incident. Caught 2026-07-31 — my manual relaunch omitted it and only the
-> host's own supervisor put it back.
+> ⛔ **COPY THE WHOLE ENV, NOT THE FIVE VARIABLES NAMED ABOVE.** The `YGGTERM_`
+> prefix carries this host's policy flags, and hand-listing variables silently
+> drops whichever one you did not think of.
+>
+> ⚠ **The under-glass example here has INVERTED — read this before acting on
+> older notes.** This warning used to say guihost runs with
+> `YGGTERM_WEB_SURFACE_UNDER_GLASS=0` and that dropping it re-arms the F.0
+> incident. **As of 2026-07-31 under-glass is armed BY DEFAULT** (user directive:
+> a web surface that needs an extra flag to sit flush is wrong by default — see
+> `under_glass_default_armed` in `apps/yggterm/src/main.rs`). So an unset variable
+> now means ARMED, which is the correct path, and the drop-the-variable trap
+> points the other way: a host deliberately running `=0` loses its opt-out if you
+> hand-list. The rule is unchanged and now matters in both directions — **copy
+> the whole `YGGTERM_` set and do not reason about which flags matter.**
 >
 > Do this instead of hand-listing variables:
 > ```bash

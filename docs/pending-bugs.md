@@ -6,9 +6,20 @@ fix) once the fix is verified live on guihost.
 
 ## ⚠ READ FIRST — the state of the machine, 2026-07-26
 
-- **guihost runs hardware GL with Phase F under-glass OFF.** That pairing is new
-  and deliberate: arming under-glass put a background agent's page over the
-  user's entire window. `YGGTERM_FORCE_SOFTWARE_GL=1` reverts everything.
+- ⭐ **SUPERSEDED 2026-07-31: under-glass is now armed BY DEFAULT on a
+  hardware-GL host** (`under_glass_default_armed`, `apps/yggterm/src/main.rs`;
+  commit "under-glass is the standard, not a flag you have to know"). The user
+  quit the GUI, relaunched it the ordinary way, found the web surface no longer
+  sat flush, and settled it: *"I could not understand why our software needs an
+  extra flag to be correct."* The earlier pairing recorded here — "guihost runs
+  hardware GL with Phase F under-glass OFF", adopted because arming put a
+  background agent's page over the user's entire window — is **no longer the
+  configuration**. What changed is that the incident's real cause was degraded
+  paint, not stacking, and unrevealed surfaces are now structurally unmapped
+  (pixel-proven). Escape hatches unchanged: `YGGTERM_WEB_SURFACE_UNDER_GLASS=0`,
+  or `YGGTERM_WEB_SURFACE_LEGACY_STACK=1` which beats everything; the software-GL
+  demotion still refuses to arm where DMABuf would SIGSEGV.
+  `YGGTERM_FORCE_SOFTWARE_GL=1` still reverts the GL side of everything.
 - **The GPU CPU win is NOT established.** Every large figure previously recorded
   here was an artefact of comparing windows with different paint exposure. See
   `docs/optimization-pass.md` and field guide §7.3 before quoting any number.
@@ -113,10 +124,61 @@ symbol rather than trusting a line number:**
 
 ## ⭐ USER-REPORTED, ychrome round 2 (2026-07-31) — IN FLIGHT
 
-Six items. **Each is already root-caused — read the mechanism before opening a
-file, and grep the named symbol rather than trusting a line number.** All six
-are being worked in isolated lane worktrees; remove an entry in the same commit
+Eight items. **Each is already root-caused — read the mechanism before opening a
+file, and grep the named symbol rather than trusting a line number.** All are
+being worked in isolated lane worktrees; remove an entry in the same commit
 as its live-verified fix.
+
+- **★★★ F11 FULLSCREEN HAS NO ESCAPE — the user had to SIGTERM the GUI to get
+  out.** `lane/dev/find-chord-claimer`. **This is the same root cause as the
+  missing Ctrl+F, and it is the worst instance of it.** `F11` IS registered
+  (`keytip.rs:732`, `("window.fullscreen", "F11")` → `ShellCommand::ToggleFullscreen`,
+  dispatched `shell.rs:40699`) and IS PTY-safe (`keytip.rs:1302` asserts it), so
+  unlike Ctrl+F it may be claimed globally. But KeyTips chord walking lives in
+  the below-the-webview JS bridge (`keytip_apply_bridge_message`), which the
+  `onkeydown` comment at `shell.rs:74184-74187` says works "from a focused
+  terminal too" — and **both that bridge and the DOM keydown live in the SHELL
+  webview, so a focused native child PAGE webview consumes F11 before either
+  door sees it.** Entering fullscreen works; the only key that leaves is deaf.
+  Second, independent cause: **the titlebar controls are also unresponsive in
+  fullscreen** ("the title buttons bubble on the top left do not work"), so the
+  mouse route is broken too and there is no escape at all. Hypothesis to falsify:
+  under-glass carves a cairo input region into the glass (`glass_input_region`
+  ~`web_surface.rs:2138`, `restack_glass` `:2229-2266`) and in fullscreen the
+  titlebar band falls outside it, so clicks pass through to the page.
+  `crates/yggui/src/chrome.rs` already models `ChromeControlIcon::Fullscreen`/
+  `ExitFullscreen` and swaps on state, so the control exists and knows its state.
+  ⚠ A fullscreen escape needs a STRUCTURAL lock — the per-surface seat observer
+  is attached at only two call sites (`web_surface.rs:2663`, `:3389`), so a third
+  surface kind added later silently re-traps the user. Claiming at the toplevel
+  `GtkWindow` `key-press-event` is likely the more robust layer; verify which
+  layer actually receives the event first rather than reasoning from GTK docs.
+  ⚠ Note `enter-fullscreen`/`leave-fullscreen` ARE bound (`web_surface.rs:1514`,
+  `:1521`) — the older "not bound at all yet" note below is stale.
+
+- **Image paste from the clipboard into a webapp does not work** (reported
+  against openwebui). `lane/dev/clipboard-image-paste`. Investigation-first.
+  ⚠ **This exact symptom was reported and 'fixed' once before**: the lock
+  `every_page_surface_is_built_able_to_paste` (`web_surface.rs:6291-6330`) exists
+  precisely because wry defaults `clipboard` to false and "the async clipboard
+  API (and an IMAGE paste in particular) failed silently on every page". The
+  grant is present today (`with_clipboard(true)` at `web_surface.rs:2625`,
+  `:3177` → `set_javascript_can_access_clipboard(true)` at
+  `vendor/wry/src/webkitgtk/mod.rs:459-462`) and the lock passes — **so a lock
+  that greps source text for a call proved the call is written, not that it took
+  effect.** Prime suspect for interference: the SEPARATE terminal image-paste
+  path (`terminal_image_paste_in_flight` `shell.rs:12286`,
+  `claim_terminal_image_paste` `:41901`, `TERMINAL_IMAGE_PASTE_DEDUPE_MS`,
+  `stage_remote_clipboard_png` `yggterm-server/src/lib.rs:13678`,
+  `clipboard_sweep.rs`) plus the Ctrl+V-keyed JS at `shell.rs:34558` — the shell
+  may claim or race the clipboard read that the page needs. Clipboard ownership
+  here is already known-delicate (`shell.rs:41831-41839` documents an arboard
+  synchronous `get()` on the GTK main thread deadlocking the X11 selection);
+  note the host is now **Wayland-native**, so `wl_data_device` applies and some
+  of that X11-selection lore may no longer hold. Test all three shapes a web app
+  may use — the `paste` event's `clipboardData.items`/`.files`,
+  `navigator.clipboard.read()`, and a drop — since the failure may be specific
+  to one.
 
 - **Screen tearing during scroll or animation.** `lane/dev/web-tearing`.
   Investigation-first, no speculative fix. Established: guihost is a **KDE Wayland**
