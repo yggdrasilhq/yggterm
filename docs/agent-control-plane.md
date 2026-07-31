@@ -1412,7 +1412,9 @@ seen this run is consistent with hold-expiry, not a missing feature. Lesson for
 the file: never conclude "not deployed" from a usage string.
 
 **Closed 2026-07-25.** The usage string is no longer hand-maintained: it renders
-from `WEB_ACTIONS` in `apps/yggterm/src/main.rs`, and
+from `WEB_ACTIONS` in `crates/yggterm-server/src/app_control_web_cli.rs` (it
+lived in `apps/yggterm/src/main.rs` until 2026-07-31 — see "both binaries, one
+owner" below), and
 `every_web_action_appears_in_the_usage_string` FAILS when the dispatcher's own
 match arms disagree with it (in either direction — an undocumented verb and a
 documented-but-unimplemented one are both errors, the second being worse because
@@ -1420,6 +1422,21 @@ it sends a caller after something that will never answer). The scanner that read
 those arms carries a coverage floor, so a scanner that goes blind fails rather
 than passing green. The full verb plane is documented in
 `docs/web-surfaces.md#the-server-app-web-verb-plane-2026-07-25`.
+
+**Both binaries, one owner (2026-07-31).** The plane's dispatcher lived inside
+`apps/yggterm/src/main.rs`, so it existed on the GUI binary only:
+`yggterm-headless server app web <anything>` answered `unsupported app control
+command: web` — on the binary agents are told to drive — and its `server app
+--help` did not list the plane either, so the refusal read as "this build lacks
+the feature" rather than "wrong binary". It is now
+`yggterm_server::run_app_control_web_cli`, in
+`crates/yggterm-server/src/app_control_web_cli.rs`, with both binaries' `"web"`
+arm a single delegating line and both `--help` texts rendering
+`web_usage_block(<own binary name>)`. The copy-the-arm fix was refused
+deliberately: two dispatchers diverge on the first new verb, which is exactly
+how the plane came to exist on one binary. `both_binaries_route_the_web_plane_to_its_one_owner`
+(in `apps/yggterm/src/main.rs`) derives the verb list from the owner and fails
+the build if either binary carries a `web` dispatch of its own.
 
 ## Field findings — invisible co-browse maiden run (2026-07-23)
 

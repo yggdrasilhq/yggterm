@@ -1,4 +1,11 @@
 mod app_control;
+// THE `server app web …` CLI, owned once for BOTH binaries. It lived in
+// apps/yggterm/src/main.rs, which made the whole verb plane answer
+// "unsupported app control command: web" on yggterm-headless — the binary
+// agents are told to drive. Copying the arm into the second binary would have
+// been a second encoding of one concept; there is now one owner and both
+// binaries route to it.
+mod app_control_web_cli;
 pub mod app_declare;
 mod attach;
 mod clipboard_sweep;
@@ -53,6 +60,9 @@ pub use app_control::{
     default_screenshot_output_path, enqueue_app_control_request, enqueue_screen_recording_request,
     enqueue_screenshot_request, resolve_agent_identity, set_agent_identity,
     take_next_app_control_request, verify_session_removal, wait_for_app_control_response,
+};
+pub use app_control_web_cli::{
+    WEB_ACTIONS, run_app_control_web_cli, web_action_names, web_usage_block,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{
