@@ -14892,6 +14892,19 @@ struct ContextMenuPlacement {
     top: Option<f64>,
     right: Option<f64>,
     bottom: Option<f64>,
+    /// How tall the menu may actually be AT THIS ANCHOR, in CSS px.
+    ///
+    /// The surface used to cap itself with `max-height:calc(100vh - 24px)`,
+    /// which silently assumes the menu starts at the top of the window. A menu
+    /// anchored partway down is then allowed to be a full viewport tall and
+    /// runs off the bottom edge — taking its own scrollbar with it, so the
+    /// overflow is real but UNREACHABLE (user report: the profile dropdown,
+    /// ~30 entries, anchored at y≈108 in a 1200px window, was cut off with no
+    /// way to scroll). The placement already knows the window, the margin and
+    /// the anchor, so it is the only thing that CAN answer this — and the box
+    /// disagreeing with the placement math is precisely the bug class
+    /// `context_menu_surface_style` says it exists to prevent.
+    max_height: f64,
 }
 #[derive(Clone)]
 struct CopyGenerationTarget {
@@ -48602,11 +48615,24 @@ fn context_menu_placement(
         (window_size.1 - position.1)
             .clamp(margin, (window_size.1 - menu_size.1 - margin).max(margin))
     });
+    // The space actually left at the chosen anchor. Top-anchored the menu grows
+    // DOWN from `top` and must stop `margin` short of the bottom edge;
+    // bottom-anchored it grows UP from `window - bottom` and must stop at
+    // `min_top`, which is the same floor the top branch clamps to.
+    let max_height = match (top, bottom) {
+        (Some(top), _) => window_size.1 - top - margin,
+        (None, Some(bottom)) => window_size.1 - bottom - min_top,
+        // Neither anchor resolved: fall back to the whole usable column rather
+        // than to zero, so a degenerate window can never draw an invisible menu.
+        (None, None) => window_size.1 - min_top - margin,
+    }
+    .max(0.0);
     ContextMenuPlacement {
         left,
         top,
         right,
         bottom,
+        max_height,
     }
 }
 fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
@@ -48636,6 +48662,10 @@ fn context_menu_surface_style(
     placement_style: &str,
     backdrop_filter: &str,
     width: f64,
+    // The height the PLACEMENT reserved at this anchor. Passed in for the same
+    // reason `width` is: a box that caps itself independently of the placement
+    // is how the profile dropdown came to hang off the bottom of the window.
+    max_height: f64,
 ) -> String {
     let dark = palette_is_dark(palette);
     let background = if dark {
@@ -48651,9 +48681,9 @@ fn context_menu_surface_style(
     let max_width = width.round().max(0.0);
     let min_width = CONTEXT_MENU_MIN_BOX_PX.min(max_width);
     format!(
-        "position:absolute; {}; box-sizing:border-box; min-width:{}px; max-width:{}px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
+        "position:absolute; {}; box-sizing:border-box; min-width:{}px; max-width:{}px; max-height:{}px; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; padding:6px; border-radius:10px; \
          background:{}; box-shadow:{}; color:{}; backdrop-filter:{}; -webkit-backdrop-filter:{};",
-        placement_style, min_width, max_width, background, shadow, palette.text, backdrop_filter, backdrop_filter
+        placement_style, min_width, max_width, max_height.round().max(0.0), background, shadow, palette.text, backdrop_filter, backdrop_filter
     )
 }
 /// Does this virtual path end in a leaf the tree GENERATED rather than a real
@@ -119583,7 +119613,7 @@ fn ContextMenuOverlay(
                 "data-context-menu": "1",
                 "data-yggterm-menu-surface": "1",
                 "data-yggterm-modal-root": modal_root.clone().unwrap_or_default(),
-                style: format!("{} pointer-events:auto;", context_menu_surface_style(palette, &placement_style, menu_blur, menu_width)),
+                style: format!("{} pointer-events:auto;", context_menu_surface_style(palette, &placement_style, menu_blur, menu_width, placement.max_height)),
                 onmousedown: |evt| evt.stop_propagation(),
                 onmouseup: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
@@ -140521,6 +140551,59 @@ mod tests {
             assert!(style.contains(light.gradient));
         }
     }
+    /// A MENU MUST FIT WHERE IT IS PUT.
+    ///
+    /// The box used to cap itself with `max-height:calc(100vh - 24px)`, which
+    /// assumes the menu starts at the top of the window. The profile dropdown
+    /// has ~30 entries and is anchored at y≈108 in a 1200px window, so it was
+    /// allowed to be 1176px tall — a box ending at 1284px, hanging off the
+    /// bottom edge and carrying its own scrollbar with it. The overflow was
+    /// real and UNREACHABLE (user report 2026-08-01, screenshot).
+    #[test]
+    fn a_menu_anchored_low_may_not_be_taller_than_the_room_beneath_it() {
+        let window = (1920.0, 1200.0);
+        let margin = CONTEXT_MENU_MARGIN_PX;
+        // Anchored well down the window, as the rail's profile badge is.
+        let low = context_menu_placement((1800.0, 108.0), window, (224.0, 420.0), None);
+        let top = low.top.expect("a menu with room below anchors by its top");
+        assert!(
+            top + low.max_height <= window.1 - margin,
+            "the box must end inside the window: top {top} + max_height {} > {}",
+            low.max_height,
+            window.1 - margin
+        );
+        // And it must still be given the room that IS there, not clipped to nothing.
+        assert!(low.max_height > 900.0, "max_height {} is uselessly small", low.max_height);
+
+        // Flipped to a bottom anchor, the menu grows UP and must clear the
+        // titlebar floor the top branch clamps to.
+        let high = context_menu_placement((1800.0, 1150.0), window, (224.0, 420.0), None);
+        let bottom = high.bottom.expect("a menu with no room below anchors by its bottom");
+        assert!(
+            window.1 - bottom - high.max_height >= 44.0,
+            "an upward menu must not run under the titlebar"
+        );
+
+        // The DRAWN box must carry the placement's number, not a constant: the
+        // two disagreeing is the whole defect.
+        let style = context_menu_surface_style(
+            palette(UiTheme::ZedDark),
+            &context_menu_position_style(low),
+            "none",
+            224.0,
+            low.max_height,
+        );
+        assert!(
+            style.contains(&format!("max-height:{}px;", low.max_height.round())),
+            "the box must use the placement's height:\n{style}"
+        );
+        assert!(
+            !style.contains("100vh"),
+            "a viewport-relative cap cannot know where the menu was anchored:\n{style}"
+        );
+        assert!(style.contains("overflow-y:auto"), "the overflow must scroll:\n{style}");
+    }
+
     #[test]
     fn context_menu_surface_and_live_close_button_are_dark_theme_aware() {
         let dark = palette(UiTheme::ZedDark);
@@ -140529,6 +140612,7 @@ mod tests {
             "left:10px; top:10px;",
             "none",
             context_menu_width(None),
+            420.0,
         );
         assert!(menu_style.contains("rgba(22,28,34,0.98)"));
         assert!(!menu_style.contains("rgba(248,249,252,0.98)"));
@@ -171815,6 +171899,7 @@ mod webtabs_menu_switcher_locks {
             "right:12px; top:100px;",
             "none",
             width,
+            420.0,
         );
         assert!(
             style.contains("box-sizing:border-box;"),
@@ -172772,6 +172857,7 @@ mod webtabs_menu_switcher_locks {
                 "right:12px; top:100px;",
                 "none",
                 narrow_width,
+                420.0,
             )
             .contains(&format!("max-width:{narrow_width}px;")),
             "the drawn box follows the squeeze too, or the band bounds nothing"
