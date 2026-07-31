@@ -400,6 +400,19 @@ by `window_focused` and by `daemon_request/terminal_read` rate. `gpu_ms` zero in
 - **Zero GPU engine time in a window means IDLE, not software.** Read the
   DRM-fd count first: llvmpipe never opens a DRM node, so that is the
   structural answer; engine time is a workload answer.
+- **The DAEMON is a lying witness for the GUI on anything OSC 7717.** One
+  declare is parsed TWICE: the daemon reads the raw PTY bytes in Rust and
+  stores the payload verbatim, while the GUI parses it in xterm.js and
+  **hand-builds** the event object field by field. A field present in
+  `server terminal app-declares` therefore proves NOTHING about what the GUI
+  holds. `control_token` was added to the Rust wire type and missed in the JS
+  for three days; ychrome's panes 403'd while every daemon-side probe said the
+  token was fine, and four wrong attributions (stale token, pre-gate client,
+  old daemon binary, lossy replay) were burned on that asymmetry. Locked by
+  `the_js_forwarder_copies_every_sidebar_declare_field`. **Symptom shape: the
+  rail draws correctly but its GUI-only routes refuse.** The one-step
+  falsification is to replay the daemon's own token by hand — a 200 means the
+  app is fine and the GUI is not sending it.
 - **`grep -c` on a binary counts LINES.** Use `strings | grep -c`, and pick a
   string the fix definitely contains — a format string, not a code identifier
   that may be inlined away.
