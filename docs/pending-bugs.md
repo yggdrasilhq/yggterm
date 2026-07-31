@@ -86,6 +86,19 @@ symbol rather than trusting a line number:**
   folder does not spring. Real pointers jitter; an automated pointer that
   issues exactly one move does not. If this ever bites a user, the fix is a
   render-loop tick that re-evaluates the dwell, not a second hover path.
+  **The user's DENSITY follow-up is also FIXED**, on `lane/dev/rail-density`
+  ("significant waste of horizontal space on each row … 2 spaces worth of more
+  indentation in the folder"). Measured on the live rail: 51px of leading
+  gutter, of which 26px was an icon box every TAB row reserved and never
+  filled, plus a 6px gap for an expander it never drew — because the rail
+  handed those slots `rsx!{}` (an empty element) where `None` means an absent
+  slot. `SessionRowDensity::Rail` now declares `status_column_px: None` (ONE
+  20px mark column: the folder glyph or the loading dot, with the dot riding
+  the icon as a corner badge when a contributed row has both) and
+  `indent_step_px: 19` (12 + two space-advances of the row's own 12px Inter).
+  Gutter 51px → 34px; every rail row gains label width at every depth
+  (+23px at depth 0, +16 at depth 1, +9 at depth 2). The cwdtree is
+  byte-identical — it draws into both its columns, so it keeps them.
 - **Downloads have no destination choice, no progress, and lie about history.**
   `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
   every terminal in the app (staged destination + async picker is the shape).
