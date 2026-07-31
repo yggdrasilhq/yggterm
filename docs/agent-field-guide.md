@@ -443,6 +443,26 @@ that is "deployed" is not running until the process that serves it restarts.
 Check `/proc/<pid>/exe` for ` (deleted)` and compare process start time against
 the fix's commit time.
 
+⚠ **But neither `(deleted)` nor the start-time comparison PROVES the process is
+stale, and on 2026-07-31 believing them nearly cost a live browsing session.** A
+running `ychrome` client showed `(deleted)` and a start time 37 minutes BEFORE
+the merge commit, which read as a textbook pre-deploy client, missing the round-29
+control token and due to be cycled. Both signals were misleading: the binary had
+simply been re-copied over its own inode by a later sync (new inode, same
+lineage), and the process had been started from a pre-merge TEST build of the
+same lane that already carried the fix. Reading the deleted image directly
+settled it — `strings /proc/<pid>/exe` found the feature markers
+(`X-Ychrome-Control`, `gui_not_routing_capable`) present, and the journal showed
+ONE refusal, on a page-originated read, which is the gate working as designed.
+
+**The rule: `/proc/<pid>/exe` is still READABLE after the file is unlinked, so
+interrogate the image instead of inferring from its metadata.** `sha256sum
+/proc/<pid>/exe` against the installed file tells you whether it differs at all,
+and `strings` on the same path tells you whether the specific fix is present. A
+hash difference alone only means "some other build" — it does NOT license
+restarting a process that is serving a user, and a build that differs while
+still carrying the fix is not a reason to destroy their page.
+
 ### 7.9 Source of truth for a tool's own source
 
 The deployed `yedit` binary's features existed **only** as untracked files on

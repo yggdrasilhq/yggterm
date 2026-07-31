@@ -14,8 +14,16 @@ fix) once the fix is verified live on jojo.
   `docs/optimization-pass.md` and field guide §7.3 before quoting any number.
 - **Two supernumerary daemons persist** holding unmigratable `local://` shells.
   That is the durable half of the chaining bug, still open.
-- **The vault agents on dev and jojo still need ONE `ychrome-vault unlock` each**
-  — the 401-on-write fix is installed but the running agents predate it.
+- ✅ **The vault agents on dev and jojo are current and unlocked (2026-07-31).**
+  Neither needed an unlock in the end. jojo was already satisfied; dev's binary
+  predated the `socket` field that the card-fill path's socket lookup reads, so
+  it was rebuilt, installed, and moved across with `ychrome-vault handover` —
+  the unlocked session hands to the new binary instead of re-locking, so the
+  refresh cost ZERO unlocks. Both now report `agent_stale:false`,
+  `state:unlocked`, `undecryptable:0`, `socket:…/vault/agent.sock`, and both
+  agree at 1116 items (dev resynced from 1115 on the handover).
+  ⚠ The handover verb is the way to refresh a vault binary. Do NOT
+  `stop-agent` for a version bump — that re-locks and costs the user an unlock.
 - ✅ **The five could-only-pass locks are all closed.** The last one — the
   web-surface reclaim family, where reverting all four production call sites
   left the suite green — is replaced by `shell::web_surface_reclaim_locks`,
@@ -2642,8 +2650,14 @@ some are certainly fixed already. Full narrative for each is in
 - **Rows lost across a daemon swap** (`project-resume-after-2100-daemon-swap`) — 3
   live rows lost, 2 of them keep-alive, with a rescue file. Same family as
   `finding-daemon-handoff-drops-live-rows` (still in memory/, code-cited).
-- **ychrome queued slices** (`campaign-zoom-system-rework`) — per-site zoom,
-  settings pane, session buddy, vertical tabs.
+- **ychrome queued slices** (`campaign-zoom-system-rework`) — **per-site zoom and
+  the settings pane BOTH SHIPPED** (verified on ychrome main 2026-07-31:
+  `src/webzoom.rs` is 238 lines of per-site overrides behind a `/zoom` endpoint
+  with a change-hash so the GUI refetches only when an override moved;
+  `src/sidebar.rs` serves "Tabs", "Browser identity" and "Userscripts"
+  sections). What is left of this slice is **session buddy**; **vertical tabs**
+  is NOT a separate item, it is the rail-as-cwdtree entry in the
+  ychrome-as-main-browser list above, and should be tracked there only.
 - **Non-code todos** (`project-blackboard-clearing-2026-07-16`) —
   awesome_steer_prompts repo, app-infra forecast.
 
