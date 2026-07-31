@@ -926,7 +926,38 @@ For a dev/agent deploy (new version on disk), the SIMPLE and correct path is:
 **deploy the binaries, then restart the GUI** (SIGTERM the GUI pid, relaunch
 `~/.local/bin/yggterm` with the desktop env — `DISPLAY`/`WAYLAND_DISPLAY`/
 `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`/`XAUTHORITY` from `/proc/<gui>/environ`,
-detached via `setsid nohup … </dev/null &`). A newer GUI whose own-version socket
+detached via `setsid nohup … </dev/null &`).
+
+> ⛔ **COPY THE WHOLE ENV, NOT THE FIVE VARIABLES NAMED ABOVE.** jojo's GUI runs
+> with **`YGGTERM_WEB_SURFACE_UNDER_GLASS=0`**, and that flag is load-bearing:
+> arming under-glass is what put a background agent's page over the user's entire
+> window (`incident-f0-transparency-chain-app-wide-break`; `docs/pending-bugs.md`
+> records jojo as "hardware GL with Phase F under-glass OFF"). An agent that
+> relaunches using only the five desktop variables silently drops it and re-arms
+> the incident. Caught 2026-07-31 — my manual relaunch omitted it and only the
+> host's own supervisor put it back.
+>
+> Do this instead of hand-listing variables:
+> ```bash
+> GUI=$(pgrep -x yggterm | head -1)
+> tr '\0' '\n' < /proc/$GUI/environ | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|XAUTHORITY|XDG_SESSION_TYPE|HOME|PATH|YGGTERM_)' > /tmp/gui-env
+> # …SIGTERM, swap the binary, then:
+> ( set -a; while IFS= read -r l; do export "$l"; done < /tmp/gui-env; set +a
+>   setsid nohup ~/.local/bin/yggterm >/tmp/yggterm-gui.log 2>&1 </dev/null & )
+> ```
+> The `YGGTERM_` prefix match is the point — it carries whatever policy flags this
+> host needs without you having to know their names.
+
+> ⚠ **ANOTHER AGENT CAN DEPLOY OVER YOU, AND IT LOOKS LIKE YOUR FIX NEVER LANDED.**
+> On 2026-07-31 a GUI deploy was verified live (a new `app state` field went from
+> `null` to a value), and ~6 minutes later both binaries were replaced by a second
+> agent's paired deploy — reverting it, with no error anywhere. **`app state`
+> agreeing once is not durable proof.** Before reporting a fix as live, confirm the
+> RUNNING binary is yours:
+> `strings ~/.local/bin/yggterm | grep -c <a string only your change introduces>`
+> (plain `grep -c` on a binary returns 0 — it prints "Binary file matches" instead
+> of counting, so it will lie to you). Then `git fetch` and rebase before
+> redeploying, or you revert their work exactly as they reverted yours. A newer GUI whose own-version socket
 is absent falls back to the running older daemon via `resolve_client_daemon_endpoint`
 (logs `gui/startup/daemon_version_mismatch`), serves every session the older daemon
 owns with **no re-resume**, and drives that daemon's cooperative hot-update *when the
