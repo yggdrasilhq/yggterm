@@ -948,3 +948,64 @@ filter is in hand, never before.
 cold launch it sits next to. It is a GUI-START cost, not a per-webapp cost, so
 it does not appear in the per-launch table — but for "why does this feel slow"
 it dominates everything else in this section combined.
+
+### 9e. The real-site check, and why the fixture is the result
+
+The same benchmark against `khanacademy.org` (one of the user's own profiles),
+median of 3, same host and display:
+
+| arm | exec→nav | TTFB | FCP | interactive | load | **LAUNCH** | net bytes |
+|---|---|---|---|---|---|---|---|
+| webkit cold | 2167 | 362 | 2093 | 663 | 3300 | **6841** | 100,399 |
+| webkit warm | 1959 | 358 | – | 504 | 1638 | **3597** | **0** |
+| chromium cold | 1303 | 786 | 2120 | 1040 | 3996 | **5771** | 100,582 |
+| chromium warm | 498 | 573 | 1356 | 709 | 3769 | **4227** | 10,968 |
+
+**On a real site we come out AHEAD end to end (3597 vs 4227 ms), and the
+startup gap still reproduces (1959 vs 498 exec→nav, ~4x).** Both of those are
+worth saying plainly, and the first is why this section leads with the fixture:
+
+- A real site does not serve the two engines the same bytes. Khan Academy
+  user-agent-sniffs; our page half (1638 ms) beating Chromium's (3769 ms) most
+  likely measures a lighter page, not a faster engine. There is no way to hold
+  content constant on someone else's server, which is the entire reason
+  `webapp_launch_fixture.py` exists.
+- Chromium's warm arm still pulled 10,968 bytes, so it was only partly warm —
+  the script says so rather than quietly averaging it in.
+
+So: **the fixture is the measurement and the real site is the sanity check.**
+The one term that survives both, unchanged in sign and roughly in magnitude, is
+engine startup. That is the finding.
+
+### 9f. What was deliberately NOT changed
+
+- **PSON / `WebProcessCache`.** Turning on
+  `process-swap-on-cross-site-navigation-enabled` at `WebContext` construction
+  is the only route to reusing a WebProcess, and it is worth ~650 ms per launch.
+  It is not a perf tweak: it changes the process/isolation model for every
+  surface, and there is a source-level report that with sandbox + PSON both on
+  `tryTakePrewarmedProcess` orphans a process per navigation (unverified at
+  runtime here; we set neither today). It also needs `web_context_key` in
+  `web_surface.rs` to be re-reasoned, which four lanes were editing. **Plan:
+  land it alone, behind an env arm, with this section's bench as the gate.**
+- **The GUI's own boot assets.** The Dioxus shell serves its HTML/JS over a
+  custom URI scheme, and custom-scheme responses do not go through
+  `NetworkCache` — they write zero cache records, so the shell re-fetches and
+  JSC re-compiles them at every start. That is a GUI-start cost like §9d, not a
+  webapp-launch cost, and the fix is to shrink/split what runs at startup rather
+  than to reach for a WebKit setting. Not measured here.
+- **`WEBKIT_DISABLE_DMABUF_RENDERER=1` on the live host** while
+  `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_forced` (read from guihost's WebKit child
+  environs, 2026-07-31). §1a says those three settings are ONE decision and that
+  hardware GL + SHM measured no better than software. This is the render lane's
+  question, not this one's, but it is recorded here because it was found here.
+
+> ⚠ **Correction to a premise this lane was handed.** "The cache model is
+> env-optional and currently UNSET, so we inherit WebKit's default" is FALSE.
+> `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs:5091`) sets
+> `YGGTERM_WEBKIT_CACHE_MODEL=web-browser` with `set_var` before any
+> `WebContext` exists. It does not appear in `/proc/<gui>/environ` because that
+> only ever holds the EXEC-time environment — the standing trap in §1a — but it
+> is plainly there in the environ of the WebKit children the GUI forked
+> afterwards, which is where it was verified on guihost. The cache model is already
+> explicit and already correct.
