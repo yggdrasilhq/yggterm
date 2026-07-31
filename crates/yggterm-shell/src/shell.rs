@@ -2146,7 +2146,35 @@ fn control_request_with_timeout(
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
     if !(200..300).contains(&status) {
-        return Err(format!("control endpoint returned {status}"));
+        // THE APP ALREADY WROTE THE ANSWER — surface it instead of the number.
+        //
+        // ychrome's refusal body carries a full sentence (what failed AND what
+        // to do about it) plus a machine-readable `cause`, written precisely so
+        // a human does not have to read our source to act. Dropping it is what
+        // put "control endpoint returned 403" in front of the user for three
+        // days while the body said which of three distinct failures it was.
+        //
+        // Bounded, because this string lands in a pane's error slot: a
+        // misconfigured endpoint answering with a page must not paste it there.
+        let detail = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|detail| !detail.is_empty())
+            .map(|mut detail| {
+                if detail.chars().count() > 400 {
+                    detail = detail.chars().take(400).collect::<String>() + "…";
+                }
+                detail
+            });
+        return Err(match detail {
+            Some(detail) => format!("control endpoint returned {status}: {detail}"),
+            None => format!("control endpoint returned {status}"),
+        });
     }
     if body.trim().is_empty() {
         return Ok(serde_json::Value::Null);
@@ -100856,6 +100884,20 @@ fn terminal_eval_script_with_canvas_renderer(
                                 env_id: typeof payload.env_id === 'string'
                                     ? payload.env_id
                                     : null,
+                                // THE ONE SECRET A DECLARE CARRIES, and the one
+                                // field this forwarder forgot for three days: the
+                                // Rust wire type grew `control_token` on
+                                // 2026-07-28 and this object was not updated, so
+                                // every LIVE declare arrived tokenless and every
+                                // GUI-only route answered 403 — while the daemon,
+                                // which parses the same OSC in Rust, held the
+                                // token perfectly. It must be forwarded and NEVER
+                                // traced; `the_js_forwarder_copies_every_sidebar
+                                // _declare_field` now fails if a wire field is
+                                // added without a line here.
+                                control_token: typeof payload.control_token === 'string'
+                                    ? payload.control_token
+                                    : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
                                     .map((pane) => ({{
@@ -137525,6 +137567,78 @@ mod tests {
         (handle.join().expect("the fake app answered"), replied)
     }
 
+    /// A refusal the app took care to WRITE must reach the user.
+    ///
+    /// ychrome answers a gated route with a sentence naming the failure and the
+    /// remedy, plus a `cause` handle. The GUI used to keep only the status
+    /// code, so the user saw "control endpoint returned 403" for three days
+    /// while the body said exactly which of three distinct failures it was and
+    /// what to do about each.
+    #[test]
+    fn a_refusal_body_reaches_the_caller_instead_of_a_bare_status_code() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake app");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the GUI connects");
+            let mut raw = vec![0u8; 4096];
+            let _ = stream.read(&mut raw);
+            let payload = serde_json::json!({
+                "error": "forbidden: /pane/settings is GUI-only and the ychrome CLI \
+                          serving this session predates the control-token gate. \
+                          Press Ctrl+C in that terminal and run ychrome again.",
+                "cause": "courier_absent",
+            })
+            .to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let url = format!("http://127.0.0.1:{port}/pane/settings");
+        let error = control_request(&url, None, Some("tok")).expect_err("a 403 is an error");
+        handle.join().expect("the fake app answered");
+        assert!(error.contains("403"), "the status still names itself: {error}");
+        assert!(
+            error.contains("predates the control-token gate"),
+            "the app's own remedy must survive to the caller: {error}"
+        );
+    }
+
+    /// The refusal detail lands in a pane's error slot, so an endpoint that
+    /// answers with something enormous must not paste all of it there.
+    #[test]
+    fn a_refusal_body_is_bounded_before_it_reaches_a_pane() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake app");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the GUI connects");
+            let mut raw = vec![0u8; 4096];
+            let _ = stream.read(&mut raw);
+            let payload = serde_json::json!({ "error": "x".repeat(5_000) }).to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 500 Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let url = format!("http://127.0.0.1:{port}/pane/settings");
+        let error = control_request(&url, None, None).expect_err("a 500 is an error");
+        handle.join().expect("the fake app answered");
+        assert!(
+            error.chars().count() < 500,
+            "an unbounded body must not reach a pane: {} chars",
+            error.chars().count()
+        );
+        assert!(error.ends_with('\u{2026}'), "truncation must be visible: {error}");
+    }
+
     #[test]
     fn the_gui_presents_its_control_token_on_an_app_endpoint_request() {
         let (wire, replied) = capture_control_request(
@@ -137620,6 +137734,59 @@ mod tests {
             !payload.contains("control_token"),
             "the declare's trace payload must never carry the token:\n{payload}"
         );
+    }
+
+    /// THE FIELD-BY-FIELD FORWARDER, LOCKED.
+    ///
+    /// The webview parses OSC 7717 in JS and hands Rust a HAND-BUILT object, so
+    /// a field added to the Rust wire type arrives `null` until someone copies
+    /// it across. The forwarder says so in a comment, and the comment was not
+    /// enough: `control_token` was added to the wire type on 2026-07-28 and
+    /// missed there, so for three days every LIVE declare built a tokenless
+    /// contribution and settings/vault answered 403 — while the daemon, parsing
+    /// the same OSC bytes in Rust, held the token perfectly. That asymmetry is
+    /// what made it so hard to see: every instrument that read the DAEMON said
+    /// the token was fine.
+    ///
+    /// So the rule is held here now: every field of the wire variant must
+    /// appear in the JS object.
+    #[test]
+    fn the_js_forwarder_copies_every_sidebar_declare_field() {
+        let protocol = include_str!("terminal_protocol.rs");
+        let wire = protocol
+            .split("    SidebarContribution {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    },").next())
+            .expect("the sidebar wire variant is present");
+        let fields: Vec<&str> = wire
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('/') && !line.starts_with('#'))
+            .filter_map(|line| line.strip_suffix(','))
+            .filter_map(|line| line.split_once(": "))
+            .map(|(name, _)| name)
+            .collect();
+        // If the variant's shape moves, this lock must fail LOUDLY rather than
+        // quietly scraping zero fields and passing forever.
+        assert!(
+            fields.len() >= 10,
+            "the field scrape found only {fields:?} — the wire variant moved and this lock went blind"
+        );
+        let source = include_str!("shell.rs");
+        let forwarder = source
+            .split("kind: 'sidebar_contribution',")
+            .nth(1)
+            .and_then(|rest| rest.split("return true;").next())
+            .expect("the JS sidebar forwarder is present");
+        for field in fields {
+            // `action` rides as an ES shorthand, so accept either form.
+            assert!(
+                forwarder.contains(&format!("{field}:")) || forwarder.contains(&format!("{field},")),
+                "the JS OSC forwarder drops `{field}`: a field added to the Rust wire type must be \
+                 copied across here too, or every live declare arrives with it null — which is \
+                 exactly how the control token was lost"
+            );
+        }
     }
 
 
