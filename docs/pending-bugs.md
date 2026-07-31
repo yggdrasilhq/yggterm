@@ -126,210 +126,80 @@ symbol rather than trusting a line number:**
   and delete both floating pills. Toasts need an anchor owned by the active
   viewport kind (top-center over a terminal, bottom-right over a document).
 
-## ⭐ USER-REPORTED, ychrome round 2 (2026-07-31) — IN FLIGHT
+## ⭐ USER-REPORTED, ychrome round 2 (2026-07-31)
 
-Eight items. **Each is already root-caused — read the mechanism before opening a
-file, and grep the named symbol rather than trusting a line number.** All are
-being worked in isolated lane worktrees; remove an entry in the same commit
-as its live-verified fix.
+**Five of these are CLOSED by the user's own eyes** and removed per this file's
+rule. What they were, so a reader of the git log can find the fixes: the F11
+fullscreen trap with no escape (same deaf-chord root cause as the missing
+Ctrl+F — claimed at the toplevel window, not per-surface); Ctrl+F itself;
+"the viewport recomputes / ychrome does not sit flush" (under-glass is now the
+DEFAULT, `5b0280a` — no flag); clipboard image paste (WebKitGTK never puts the
+image in the paste event's DataTransfer, proven in a vanilla webkit2gtk process,
+so a shim re-delivers it); and screen tearing, which was **XWayland** — see
+[[finding-yggterm-must-run-wayland-native]], and note the 21-arm/1,190-frame
+detector found nothing precisely because on Wayland there is nothing to find.
 
-- **★★★ F11 FULLSCREEN HAS NO ESCAPE — the user had to SIGTERM the GUI to get
-  out.** `lane/dev/find-chord-claimer`. **This is the same root cause as the
-  missing Ctrl+F, and it is the worst instance of it.** `F11` IS registered
-  (`keytip.rs:732`, `("window.fullscreen", "F11")` → `ShellCommand::ToggleFullscreen`,
-  dispatched `shell.rs:40699`) and IS PTY-safe (`keytip.rs:1302` asserts it), so
-  unlike Ctrl+F it may be claimed globally. But KeyTips chord walking lives in
-  the below-the-webview JS bridge (`keytip_apply_bridge_message`), which the
-  `onkeydown` comment at `shell.rs:74184-74187` says works "from a focused
-  terminal too" — and **both that bridge and the DOM keydown live in the SHELL
-  webview, so a focused native child PAGE webview consumes F11 before either
-  door sees it.** Entering fullscreen works; the only key that leaves is deaf.
-  Second, independent cause: **the titlebar controls are also unresponsive in
-  fullscreen** ("the title buttons bubble on the top left do not work"), so the
-  mouse route is broken too and there is no escape at all. Hypothesis to falsify:
-  under-glass carves a cairo input region into the glass (`glass_input_region`
-  ~`web_surface.rs:2138`, `restack_glass` `:2229-2266`) and in fullscreen the
-  titlebar band falls outside it, so clicks pass through to the page.
-  `crates/yggui/src/chrome.rs` already models `ChromeControlIcon::Fullscreen`/
-  `ExitFullscreen` and swaps on state, so the control exists and knows its state.
-  ⚠ A fullscreen escape needs a STRUCTURAL lock — the per-surface seat observer
-  is attached at only two call sites (`web_surface.rs:2663`, `:3389`), so a third
-  surface kind added later silently re-traps the user. Claiming at the toplevel
-  `GtkWindow` `key-press-event` is likely the more robust layer; verify which
-  layer actually receives the event first rather than reasoning from GTK docs.
-  ⚠ Note `enter-fullscreen`/`leave-fullscreen` ARE bound (`web_surface.rs:1514`,
-  `:1521`) — the older "not bound at all yet" note below is stale.
+**Shipped but NOT yet confirmed by the user:**
 
-- **Image paste from the clipboard into a webapp does not work** (reported
-  against openwebui). `lane/dev/clipboard-image-paste`. Investigation-first.
-  ⚠ **This exact symptom was reported and 'fixed' once before**: the lock
-  `every_page_surface_is_built_able_to_paste` (`web_surface.rs:6291-6330`) exists
-  precisely because wry defaults `clipboard` to false and "the async clipboard
-  API (and an IMAGE paste in particular) failed silently on every page". The
-  grant is present today (`with_clipboard(true)` at `web_surface.rs:2625`,
-  `:3177` → `set_javascript_can_access_clipboard(true)` at
-  `vendor/wry/src/webkitgtk/mod.rs:459-462`) and the lock passes — **so a lock
-  that greps source text for a call proved the call is written, not that it took
-  effect.** Prime suspect for interference: the SEPARATE terminal image-paste
-  path (`terminal_image_paste_in_flight` `shell.rs:12286`,
-  `claim_terminal_image_paste` `:41901`, `TERMINAL_IMAGE_PASTE_DEDUPE_MS`,
-  `stage_remote_clipboard_png` `yggterm-server/src/lib.rs:13678`,
-  `clipboard_sweep.rs`) plus the Ctrl+V-keyed JS at `shell.rs:34558` — the shell
-  may claim or race the clipboard read that the page needs. Clipboard ownership
-  here is already known-delicate (`shell.rs:41831-41839` documents an arboard
-  synchronous `get()` on the GTK main thread deadlocking the X11 selection);
-  note the host is now **Wayland-native**, so `wl_data_device` applies and some
-  of that X11-selection lore may no longer hold. Test all three shapes a web app
-  may use — the `paste` event's `clipboardData.items`/`.files`,
-  `navigator.clipboard.read()`, and a drop — since the failure may be specific
-  to one.
+- **Fullscreen video drew the chrome over the picture.** Fixed and pixel-proven
+  (172,645 chrome pixels over a flat test page → **123**, all inside the 10 px
+  corner radius; restore after a distraction-free → fullscreen → exit cycle is
+  zero differing pixels). ⚠ **This was a regression from making under-glass the
+  default**, and the shape is worth remembering: `web_surface_place_page_rect`
+  had promised for months that "a page on the whole screen owns every pixel of
+  the window" and delivered only the GEOMETRIC half — it suppressed chrome
+  *claims* and never stopped the shell *painting*, because an opaque page above
+  the DOM used to occlude chrome for free.
+- **Tab placement + context menu.** One owner (`web_tab_placement`) replaces
+  three independent `push` sites; spawn-below-opener with cascade; omnibox focus
+  on `foreground && Blank` only, so a middle-clicked link never steals the caret.
+  ⚠ **My screenshot diagnosis was WRONG and the lane corrected it**: the menu was
+  not clipping off-screen (it sat 12 px clear of the edge, flipping correctly) —
+  `RowMenuItem::disabled` was appending its *reason* to the *label*, so
+  `Close tab` became a 60-character sentence in a 216 px box. Six existing locks
+  had been asserting the reason belongs in the label, pinning the bug in place.
 
-- ✅ **CLOSED 2026-07-31 — "screen tearing" was an XWAYLAND artifact, and there
-  is no issue on Wayland.** User's own words, after being asked to distinguish a
-  true tear from judder: *"few frames of stickiness or artifacting … but that was
-  recorded in xWayland as we find out"* and, on the current Wayland-native GUI,
-  *"NO on wayland no issue."* They also confirmed it happened **only in yggterm**,
-  never in another app — consistent with our own launch path having been the
-  thing that landed in XWayland, not with a compositor or panel fault.
-  **This is why [[finding-yggterm-must-run-wayland-native]] is load-bearing and
-  not a preference: XWayland produced user-visible artifacts.** The measurement
-  that could not find the bug was right to report nothing — the lane ran 21 arms
-  and 1,190 frames on Wayland with a 4 px detector and found zero torn frames,
-  because on Wayland there is nothing to find. Instrument and doc are kept
-  (`tools/tear-probe/`, `scripts/web-tear-probe.sh`,
-  `docs/web-surface-tearing-2026-07-31.md`); they are the right tool if a real
-  tear is ever reported.
-  ⚠ Do NOT reopen this from a report that does not first establish which backend
-  the GUI actually resolved — measure with `xwininfo -root -children`, never
-  `/proc/<pid>/environ` (`set_var` never appears there).
+**STILL OPEN:**
 
-- **~~Screen tearing during scroll or animation.~~** (superseded by the entry
-  above; kept for the mechanism notes) `lane/dev/web-tearing`.
-  Investigation-first, no speculative fix. Established: guihost is a **KDE Wayland**
-  session (`kwin_wayland`), AMD `amdgpu`, `kwinrc` carries no tearing/VRR/latency
-  keys, and the GUI is **Wayland-native** (proven: `xwininfo -root -children` on
-  `:1` lists 15 children, none of them yggterm). KWin will not present a tearing
-  frame without opt-in, so the symptom is almost certainly **intra-window content
-  tearing** — one composited frame holding a half-updated page. Two leads:
-  (a) ⭐ `WebKitSettings::set_hardware_acceleration_policy` is **never called in
-  production** (only in the `docs/spikes/phase-f-under-glass` throwaway), so the
-  policy is WebKit's default `ON_DEMAND` — and a scroll or animation starting is
-  precisely what flips the accelerated-compositing mode; (b) under-glass is
-  ARMED on the live host (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`, armed 2026-07-30),
-  which is a recent change and therefore a prime suspect — `=0` reverts.
-  Also true and unexamined: **zero frame-clock integration anywhere**
-  (`gtk_widget_add_tick_callback`/`GdkFrameClock` have 0 occurrences), redraw is
-  manual `queue_draw()`. Instrument: `scripts/underglass-sandbox.sh`.
-  ⚠ Sway is not KWin — a null sandbox result narrows the cause, it does not
-  close the bug.
+- **★★★ ychrome's userscripts never inject, so YouTube plays ads and
+  SponsorBlock is silent.** Lane `lane/dev/userscript-injection`.
+  **Proven live**: yggterm's own shims (`__yggtermClipboardImagePasteShim`,
+  `__yggtermCloseShim`, `__yggtermScrollNavShim`, `__yggtermThemeColorShim`) are
+  ALL present in the page while `window.__ytAdDefense` and `window.__ysb` are
+  `undefined` and `window.fetch` is still native. The policy endpoint serves all
+  five scripts correctly (right worlds, right matches, `document-start`) and the
+  **adblock half of the same policy works** — the 146,748-rule set compiled and
+  attached (95 MB). So the loss is specific to the userscript path.
+  ⚠ **Two of my theories were falsified**: "born before policy, so recreate it"
+  (the user reopened the tab and ads returned) and "re-arm exhausted
+  `policy_attempts` when the app respawns" (deployed, no effect — kept as an
+  unmerged candidate patch, not discarded, since it may be a real latent bug).
+  ⭐ Strongest untested suspicion: **a NAME is what makes a world isolated** —
+  the plain userscript constructor IS the main world, and a NULL world name
+  fails `assertion 'worldName' failed` and refuses the script. The ychrome
+  engine lane hit exactly that. Check the attach path first.
+  Note YouTube pre-rolls come from **googlevideo.com, the same host as the
+  video**, so no network rule can touch them; the main-world `adPlacements`
+  strip is the only defence, which is why this presents as "adblock is broken".
 
-- **⚠ NOT LIVE-PROVEN: the fullscreen mouse route.** Shipped with the chord
-  claimer below, but only the keyboard half has been exercised end to end. The
-  floating window-controls strip (`if distraction_free_exit_visible {` in
-  `shell.rs` — it was `if fullscreen {` until element fullscreen learned to
-  suppress it) now declares
-  `data-covers-web-surface: "fullscreen-window-controls"`, which is *correct in
-  every case and a no-op where the page hole never reached it* — but it has NOT
-  been shown to be the reason the user's click did nothing. Settle it on guihost:
-  enter distraction-free mode over a web surface with under-glass armed, run
-  `server app state`, and read the input holes against the strip's rect. If the
-  hole does not cover `top:12px right:14px`, the cover is belt-and-braces and the
-  real mouse cause is still open.
+- **open-webui is slow when switching chats from its sidebar.** Untouched, and
+  deliberately NOT folded into the launch-speed work: that is SPA navigation, no
+  new process and no page load, so the ~650 ms WebProcess startup finding does
+  not explain it. Needs its own diagnosis.
 
-- **Tab spawn placement and new-tab focus.** `lane/dev/ychrome-tab-ux`.
-  **Every creation path appends to the end; there is no insertion-index owner.**
-  `web_surface_new_tab` pushes at one site, `web_surface_adopt_popup_tab`
-  (window.open / target=_blank) pushes at a SECOND independent site, restore-on-open
-  at a third — and a test encodes append order via `index + 1` id arithmetic.
-  Wanted: spawn-below-opener with cascade for context-menu new tab, middle-click,
-  duplicate and popups; rail-header `+` with no opener still appends. Duplicate
-  currently lands at the bottom. Rail drag re-parents but never re-indexes.
-  Focus: only the two `+` buttons focus the omnibox, via a 60 ms focus+select
-  `document::eval` snippet **hand-duplicated three times** with no shared helper
-  and no Ctrl+L. A tab opened from a link has a destination and must NOT steal
-  focus to the address bar.
+- **Webapp launch speed.** Root-caused, partly fixed. **Caching was the wrong
+  hypothesis** — the HTTP disk cache already works and contributes 0 ms (0 bytes
+  off the network on a warm arm). ~650 ms is WebKit **WebProcess startup**, per
+  surface, and a second surface in a live process does NOT skip it, so
+  prewarming one spare would not help. Second term is JS parse/compile with no
+  code cache (~174 ms) — **JavaScriptCore has no persistent bytecode cache in
+  the GTK port at all**, so that gap versus Chromium's V8 code cache is
+  structural, not a setting. The adblock compile (17,180 ms → 3.7 ms via
+  load-first keyed on a content hash) IS fixed. PSON / `WebProcessCache` is the
+  only route to the 650 ms and is deliberately untouched: `process-swap-on-
+  cross-site-navigation-enabled` is construct-only and the GTK constructor
+  shadows it, and `prewarmGlobally()` is Cocoa-only.
 
-- **Context-menu UX polish.** Same lane. `ContextMenuOverlay` is a hand-rolled
-  Dioxus component shared by FIVE mounts, so improvements there are inherited by
-  all of them — do not fork a rail-only menu. `RowMenuItem` has **no icon field
-  and no submenu support** ("Move to folder" is deliberately flattened to N
-  sibling items, which does not scale). The rail menu has **no "New tab" item at
-  all**.
-
-- **Adblock/SponsorBlock not exhaustive; YouTube ads played at 2x.**
-  `lane/dev/adblock-exhaustive`. ✅ **The 2x symptom is root-caused and cured on
-  guihost (2026-07-31).** The deployed `youtube-adblock.js` was the pre-`d05a871`
-  copy lacking its `// ==UserScript==` block, so `@world main` defaulted to
-  `Isolated`, where its `window.fetch`/XHR/`ytInitialPlayerResponse` patches are
-  invisible to the page — leaving only the fallback that sets
-  `playbackRate = 16` (WebKit clamps it, hence "2x"). `idcac.js` and
-  `sponsorblock.js` were stale the same way; all three redeployed. ⚠ Injection
-  is per-webview at creation, so an existing tab keeps the script it was born
-  with — a NEW tab is required, not a reload.
-  **Still owed (the durable half):** a freshness check with ONE owner so a
-  bundled asset newer than the installed copy cannot sit dead; a LOUD refusal on
-  an unparseable/absent metadata block instead of the silent `Isolated` default
-  that caused this; and a real filter-list pipeline — today's ruleset is
-  `assets/web-adblock/rules.json`, **10 KB / 59 hand-written domain regexes plus
-  exactly ONE `css-display-none` rule with 8 selectors, referenced by no code
-  path at all** (a human must `cp` it into `~/.yggterm/web-adblock/`; done on
-  guihost, never on dev). No ABP/uBO syntax parser exists anywhere — no `##`, no
-  `##+js()`, no `$redirect=`. WebKit content blockers offer no redirect action,
-  so surrogates are impossible and untranslatable rules must be COUNTED and
-  reported, never silently dropped. SponsorBlock EXISTS and is real; idcac is a
-  hand-written ~140-line approximation, not the upstream ruleset.
-
-- **The WPE agent engine.** `lane/dev/wpe-engine-phase-a`.
-  ⛔ **The spec's core premise is factually wrong and §3 has been corrected:
-  Debian's WPE WebKit 2.52.5 ships NO WPEPlatform at all** — not "gaps in it".
-  Independently verified: `wpe-platform-1.0`/`-2.0` `.pc` absent, zero headers
-  declaring `wpe_display_headless_new`, **zero** `wpe_display` symbols exported
-  from `libWPEWebKit-2.0.so.1`, and `/usr/include/wpe-webkit-2.0/` holds only
-  `jsc` and `wpe`. WPEPlatform is an upstream build flag Debian leaves off, so
-  the version number in the spec was doing all the persuading and none of the
-  deciding. §9's sanctioned fallback fired: the substrate is **WebKitGTK + an
-  engine-owned Xvfb** behind the same verbs, and it delivered the two things the
-  risk register feared it would not — trusted input and faithful snapshots.
-  Phase A gate PASSES on dev (`ychrome engine gate`, five journaled proofs,
-  re-runnable). Bindings decision recorded in a new §9.1: **the gir crates**, no
-  bindgen, no `build.rs`. Phase B started: `/engine/*` router, 10 pages opened
-  concurrently in 1340 ms. Owed: `/nav` `/wait` `/dom` and the input events
-  (refused BY NAME today, never silently dropped), the socket plumbing is
-  unit-tested but never run against a deployed daemon, the gate has not been
-  re-run on guihost, and phases C/D/E remain. **Phase F stays out of scope.**
-
-- **⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` BREAKS THE WEB SURFACE OUTRIGHT** (found
-  2026-07-31 by the tearing lane, reproduced twice: the page never appeared).
-  This is the **top-precedence GL escape hatch** per `docs/optimization-pass.md:222`
-  (`WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
-  `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the EGL child probe), so the documented
-  way to force software presentation currently costs the user every web surface.
-  Either fix it or stop documenting it as the escape hatch — a hatch that
-  destroys the thing it is meant to rescue is worse than none.
-
-- **⚠ THE GL PROBE NEVER RUNS ON THE LIVE HOST.** guihost reports
-  `webkit_gl_policy: hardware_gl_forced`, not `probed`, because
-  `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` sits in the launcher env and outranks
-  the probe. Any reasoning that assumes the live host measured its own GL is
-  wrong. Noted while investigating tearing; not itself known to be a defect,
-  but it silently invalidates a premise agents keep reusing.
-
-- **⚠ FLAKY UNDER LOAD: `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
-  (seen 2026-07-31 at load average **37.5**, with seven lanes building in
-  parallel). It spawns `sleep 30` and asserts the child reads as running;
-  the failing assertion is `render_probe.rs:1905`, the FIRST one. Re-run in
-  isolation: **5/5 green**, and the full suite was green 20 minutes earlier, so
-  it is load-induced, not a regression — no lane touched this file.
-  **Not diagnosed, and worth diagnosing rather than retrying.**
-  `process_still_running` (`render_probe.rs:741-749`) is narrow: it fails only if
-  `/proc/<pid>/stat` is unreadable, `stat.pid != pid`, `stat.comm != comm`, or the
-  state is `Z`/`X`. The test reads `comm` from `/proc` itself at :1901 and then
-  passes it straight back, so a comm mismatch implies the value CHANGED between
-  two adjacent reads — i.e. the first read caught the child mid-`spawn`, before
-  `exec` replaced its `comm`. If that is it, the product code is fine and the
-  TEST is racy; but this is a **liveness probe** in a project whose central
-  lesson is that instruments lie, so "probably just flaky" is not an acceptable
-  resting place. Prove which side is wrong before trusting either.
 
 ## Standing traps / other open bugs
 
