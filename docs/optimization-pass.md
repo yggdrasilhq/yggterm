@@ -791,3 +791,160 @@ ticks, and the same `daemon_request/terminal_read` rate on each side.
 ⚠ Do not start that experiment while agents are working: the one arm that did
 paint was contaminated by five concurrent agents on the host, and the arm after
 it measured a GUI displaying a different session entirely.
+
+## 9. Webapp launch latency: it is not the cache (2026-07-31)
+
+**The report:** *"I see helium (chromium fork or any chrome based browsers) they
+launch webapps so fast. We need a stellar caching solution like chrome."*
+
+The observation is right and the named cause is wrong. Measured against Helium
+0.14.7.1 (Chromium 150) on the same host, the same page and the same protocol,
+**our HTTP disk cache already works and contributes almost nothing to the gap.**
+Roughly 100% of the warm-launch difference is engine STARTUP, paid before the
+page's navigation clock even begins.
+
+### 9a. The instrument
+
+- `crates/yggterm-webprobe` — a binary whose whole lifetime is ONE launch. It
+  reports the Rust-side phases (`gtk_init`, `WebContext::new`,
+  `WebViewBuilder::build_gtk`), the WebKit auxiliary-process spawns observed
+  from `/proc` (not inferred), wry's `PageLoadEvent`s, and the page's own
+  `PerformanceTiming` / `PerformanceResourceTiming` / paint entries over IPC.
+  `--second-url` launches a second surface in the same process, which is the
+  only way to tell a per-process cost from a per-surface one.
+  `--adblock` times WebKit's content-filter store.
+- `scripts/webapp_launch_fixture.py` — a deterministic heavy webapp: N distinct
+  copies of this repo's real minified bundles, `immutable` on the assets and
+  `no-cache` on the shell (the convention Chromium's code cache is built for),
+  every script tag bracketed in `performance.mark`s.
+- `scripts/webapp_launch_bench.py` — runs both engines, cold and warm, and
+  computes `launch_ms = (timeOrigin - spawn_epoch) + loadEventEnd` identically
+  on each side so neither gets to define "loaded" its own way.
+
+> ⚠ **Two instrument traps, both of which produced a confident wrong answer here
+> before being fixed.** (1) The probe originally exited the instant `load` fired;
+> WebKit's network process writes cache records asynchronously **after** that, so
+> the cache held nothing but its 8-byte salt and the next run refetched
+> everything. That artifact read exactly like "WebKitGTK never caches". Hence
+> `--settle-ms`, default 2000. (2) **WebKitGTK reports `transferSize` AND
+> `decodedBodySize` as 0 for a cache hit**, where Chromium reports
+> `transferSize == 0, decodedBodySize > 0`. A cache-hit detector written against
+> Chromium's semantics scores every WebKit hit as a miss. `network_bytes == 0`
+> is the portable test.
+
+### 9b. The numbers
+
+Fixture (8 bundles, 2.95 MB of real minified JS), localhost, Xvfb on `dev`,
+median of 5. ⚠ The host carried `loadavg ~30` from other lanes' builds, so the
+absolute figures are inflated; the RATIOS and the phase shares are the result.
+
+| arm | exec→nav | TTFB | FCP | interactive | JS exec | load | **LAUNCH** | net bytes |
+|---|---|---|---|---|---|---|---|---|
+| webkit cold | 2147 | 2 | – | 510 | 491 | 536 | **2701** | 2,947,452 |
+| webkit warm | 1118 | 0 | – | 335 | 325 | 346 | **1396** | **0** |
+| chromium cold | 619 | 102 | 492 | – | 585 | – | **1902** | 0 |
+| chromium warm | 473 | 92 | 252 | 285 | **151** | 285 | **758** | 755 |
+
+Warm against warm, which is the user's actual case:
+
+- **Total gap 638 ms.** Startup accounts for **645 ms** of it (1118 vs 473); the
+  whole page half accounts for **61 ms** (346 vs 285). The gap is startup.
+- **Our cache works.** `net bytes` is 0 on the webkit warm arm: the entire
+  2.95 MB came off disk. Cold→warm buys us 1305 ms. Caching is not the deficit.
+- The one place Chromium's *code* cache shows up is `JS exec`: Chromium
+  585 → 151 cold→warm (3.9x), ours 491 → 325 (1.5x). On identical warm bytes
+  we spend **325 ms to Chromium's 151 ms**. Real, and second order: ~27% of the
+  gap, against startup's ~100%.
+
+Phase decomposition on a QUIET host (5 runs, `about:blank` — no content at all,
+so every millisecond below is fixed cost):
+
+| phase | ms |
+|---|---|
+| `gtk_init` | 70–87 |
+| window realize (cumulative) | ~110 |
+| `WebContext::new` | 46–47 |
+| `WebViewBuilder::build_gtk` | 56 |
+| NetworkProcess spawn observed | ~125 |
+| WebProcess spawn observed | ~175 |
+| navigation requested | ~207 |
+| **`load-changed: Started`** | **~860** |
+
+**~650 ms passes between our asking for the navigation and WebKit beginning it,
+on a blank page.** Repeatable to ±15 ms across 5 runs.
+
+### 9c. The root cause, and the falsification that survived
+
+> **Every web surface spawns its own WebKit WebProcess and waits ~650 ms for it
+> to initialize before the page's navigation can start. WebKitGTK 2.52.5 has no
+> working way to have that process ready in advance.**
+
+The falsification attempt that mattered: *if this were a once-per-process
+startup cost, a SECOND surface in an already-running process would skip it.*
+`--second-url` says it does not. A second surface spawns its own WebProcess
+(seen in the spawn timeline) and still waits ~710–790 ms before `load` starts,
+whether it shares the first `WebContext` or gets its own. Sharing a context
+shares only the **NetworkProcess** (1 vs 2 in the two arms). So the cost is
+per-SURFACE, and prewarming one spare process would not have covered it either.
+
+Why WebKitGTK cannot currently avoid it, verified against our installed 2.52.5:
+
+1. **`WebProcessCache` — the mechanism that would reuse a departing surface's
+   process — has capacity 0.** `ENABLE(WEBPROCESS_CACHE)` is on and our cache
+   model already qualifies, but the capacity calculation bails out; the string
+   `WebProcessCache::updateCapacity: Cache is disabled because process swap on
+   navigation is disabled` is present in our linked `libwebkit2gtk-4.1.so.0`.
+   PSON is reachable only through the **construct-only** GObject property
+   `process-swap-on-cross-site-navigation-enabled` (default `FALSE`); the GTK
+   constructor engages a `std::optional<bool>` with `false`, which permanently
+   shadows the WebPreference, so no runtime toggle can reach it. Were it on,
+   capacity would be `min(RAM/256MB, 30)`.
+2. **Prewarming does nothing on GTK.** `WebProcess::prewarmGlobally()` — the
+   function that would build the JSC VM, heap and normal world in advance — is
+   `#if PLATFORM(COCOA)`. `ProcessType::PrewarmedWebContent` is assigned only in
+   `WebProcessCocoa.mm`. A "prewarmed" process on our port is a pre-forked,
+   pre-IPC-connected, otherwise stone-cold process. (The symbol is in our `.so`
+   because the body compiles unconditionally — a standing reason not to reason
+   from `strings` alone.)
+3. **JavaScriptCore has no persistent bytecode cache in the WebKitGTK port.**
+   This is the honest bound on how close to Chromium we can get on `JS exec`:
+   it is not a setting we have failed to turn on, it is a feature that does not
+   exist. It caps the achievable win at roughly the 174 ms measured above and
+   no configuration change will move it.
+
+Ranked by measured contribution to the 638 ms warm gap:
+
+| # | term | measured | reachable? |
+|---|---|---|---|
+| 1 | WebProcess startup per surface | ~650 ms | only via PSON + `WebProcessCache`, a security/architecture change |
+| 2 | JS parse+compile with no code cache | ~174 ms | **no** — JSC has no equivalent |
+| 3 | HTTP disk cache | **0 ms** | already working |
+
+### 9d. What WAS fixed, because it is far larger than any of the above
+
+The adblock content filter was **compiled from source at every GUI start**.
+`webkit_user_content_filter_store_save` COMPILES; it is not "write if absent",
+and `vendor/dioxus-desktop/src/web_surface.rs` called it unconditionally.
+Measured with `yggterm-webprobe --adblock` on 146,748 rules (13.9 MB):
+
+| path | wall |
+|---|---|
+| `save` (compile) | **17,180 ms** |
+| `load` of the same, already compiled | **3.7–4.3 ms** |
+
+**~4,300x**, at every launch, during which nothing was filtered. The old code
+carried a comment that page loads are slower than the compile; that was true
+against the 60-rule file it was written for and is now wrong by three orders of
+magnitude.
+
+Fixed by loading first and compiling only on a miss, keyed on a content stamp:
+the store identifier IS `yggterm-adblock-<sha256(rules)[..32]>`, so a hit proves
+byte-identical source and there is no separate stamp file that could disagree
+with the bytecode it describes. Changed rules simply miss and compile once
+(verified: an appended rule re-compiles). Stale generations are pruned after the
+filter is in hand, never before.
+
+⚠ **Scale this against §9b before ranking it.** 17 s is ~12x the entire
+cold launch it sits next to. It is a GUI-START cost, not a per-webapp cost, so
+it does not appear in the per-launch table — but for "why does this feel slow"
+it dominates everything else in this section combined.

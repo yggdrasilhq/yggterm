@@ -7019,6 +7019,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yggterm-webprobe"
+version = "2.12.19"
+dependencies = [
+ "gtk",
+ "serde_json",
+ "webkit2gtk",
+ "webkit2gtk-sys",
+ "wry",
+]
+
+[[package]]
 name = "yggui"
 version = "2.12.19"
 dependencies = [

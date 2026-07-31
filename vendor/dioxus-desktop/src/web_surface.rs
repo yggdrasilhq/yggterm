@@ -678,27 +678,102 @@ fn web_context_key(
 /// via WebKit's declarative content filters — the mechanism GNOME Web uses.
 /// The webkit2gtk 2.0.2 SAFE binding does not bind UserContentFilterStore /
 /// add_filter (only the error enum), so this goes through `webkit2gtk::ffi`
-/// directly. One ruleset per GUI process, compiled once (async, on the GTK
-/// main loop) into a bytecode store dir and attached to every surface opened
-/// with adblock on; surfaces that open while compilation is in flight get the
-/// filter attached from the completion callback (page loads are slower than
-/// the compile, so the first navigation is still covered in practice).
+/// directly. One ruleset per GUI process, made available once (async, on the
+/// GTK main loop) from a bytecode store dir and attached to every surface
+/// opened with adblock on; surfaces that open while it is in flight get the
+/// filter attached from the completion callback.
+///
+/// # LOAD FIRST. Never compile what is already compiled. (2026-07-31)
+///
+/// This module used to call `webkit_user_content_filter_store_save`
+/// unconditionally at every GUI start, and `save` COMPILES — it is not a
+/// "write if absent". Measured on WebKitGTK 2.52.5 against the real 146,748-rule
+/// ruleset:
+///
+/// | path | wall time |
+/// |---|---|
+/// | `save` (compile) | **15.7 s**, ~476 MB peak |
+/// | `load` of the same, already-compiled | **0.011 s** |
+///
+/// ~1,400x, on a path that ran at every single launch. The old code carried a
+/// comment saying "page loads are slower than the compile, so the first
+/// navigation is still covered in practice" — that was true when it was written
+/// against a 60-rule hand-written file and is now false by three orders of
+/// magnitude. Every GUI start spent ~16 s with NO filtering at all, and burned
+/// half a gigabyte doing it.
+///
+/// The fix is `load` first and `save` only on a miss. The correctness question
+/// that makes it safe is "how do we know the stored bytecode was compiled from
+/// the ruleset we hold?", and the answer is that the STORE IDENTIFIER CARRIES A
+/// CONTENT STAMP: the identifier is `yggterm-adblock-<sha256(ruleset)[..32]>`.
+/// A hit therefore proves byte-identical source; changed rules simply miss and
+/// compile once, under a new identifier. There is no separate stamp file that
+/// could disagree with the bytecode it describes — the name IS the stamp, which
+/// is the single-source-of-truth shape this repo requires.
+///
+/// Stale generations are pruned after the filter is in hand (each compiled
+/// ruleset is ~91 MB on disk, so keeping every historical version is not an
+/// option), never before: a prune that ran first could delete the entry we are
+/// about to load.
 mod adblock {
     use gtk::glib::translate::ToGlibPtr as _;
     use std::cell::RefCell;
+    use std::time::Instant;
     use webkit2gtk::ffi as wk;
 
+    /// Every identifier this module has ever written begins with this, so the
+    /// pruner can tell our generations from anything else sharing the store.
+    pub(super) const IDENTIFIER_PREFIX: &str = "yggterm-adblock-";
+
     thread_local! {
-        // (compiled filter, compile started). GTK-main-thread only, like every
+        // (compiled filter, work started). GTK-main-thread only, like every
         // other surface path in this module.
         static STATE: RefCell<(Option<*mut wk::WebKitUserContentFilter>, bool)> =
             const { RefCell::new((None, false)) };
-        // Webviews that opened with adblock on before compilation finished;
-        // drained by the compile-completion callback. Holding the engine
-        // WebView (a GObject clone) keeps this independent of surface
-        // lifetime bookkeeping — attaching to an already-destroyed webview is
-        // a harmless no-op on a still-live GObject.
+        // Webviews that opened with adblock on before the filter was ready;
+        // drained by the completion callback. Holding the engine WebView (a
+        // GObject clone) keeps this independent of surface lifetime
+        // bookkeeping — attaching to an already-destroyed webview is a
+        // harmless no-op on a still-live GObject.
         static PENDING: RefCell<Vec<webkit2gtk::WebView>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Everything the async load → (miss) → save chain needs to carry. Boxed
+    /// into the callback `user_data`, so the identifier and the source bytes
+    /// are guaranteed to outlive an operation that reads them.
+    struct Compile {
+        store: *mut wk::WebKitUserContentFilterStore,
+        identifier: std::ffi::CString,
+        source: gtk::glib::Bytes,
+        started: Instant,
+    }
+
+    /// The store identifier for a ruleset — and therefore the ONLY thing that
+    /// decides whether a launch loads compiled bytecode or spends ~16 s
+    /// rebuilding it. Pure, so the decision is testable without an engine.
+    ///
+    /// A hit on this identifier proves the stored bytecode was compiled from
+    /// byte-identical source. That is the whole safety argument for skipping
+    /// the compile, so it must not be weakened into anything cheaper than a
+    /// content hash — an mtime or a length would let changed rules load stale
+    /// bytecode, which is a silent correctness bug (the user's ad blocking
+    /// would quietly be a previous version's).
+    ///
+    /// If SHA-256 were somehow unavailable we cannot PROVE a match, so we must
+    /// not load. The fallback is process-unique, which makes the load miss and
+    /// the save run — i.e. it degrades to exactly the old always-compile
+    /// behaviour, on a branch unreachable with a stock glib.
+    pub(super) fn filter_identifier(json: &[u8]) -> String {
+        match gtk::glib::compute_checksum_for_data(gtk::glib::ChecksumType::Sha256, json) {
+            Some(stamp) => {
+                let hex = stamp.as_str();
+                format!("{IDENTIFIER_PREFIX}{}", &hex[..32.min(hex.len())])
+            }
+            None => {
+                eprintln!("yggterm adblock: no SHA-256 available; compiling without a stamp");
+                format!("{IDENTIFIER_PREFIX}unstamped-{}", std::process::id())
+            }
+        }
     }
 
     fn attach_to(webkit: &webkit2gtk::WebView, filter: *mut wk::WebKitUserContentFilter) {
@@ -710,8 +785,27 @@ mod adblock {
         }
     }
 
+    /// Adopt a ready filter: cache it and drain everything that opened while we
+    /// were still fetching it.
+    fn adopt(filter: *mut wk::WebKitUserContentFilter) {
+        STATE.with(|s| s.borrow_mut().0 = Some(filter));
+        let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        for webkit in pending {
+            attach_to(&webkit, filter);
+        }
+    }
+
+    /// Take a `GError` out by value so it is freed, and render it.
+    unsafe fn take_error(error: *mut gtk::glib::ffi::GError) -> String {
+        if error.is_null() {
+            return "unknown error".to_string();
+        }
+        let err: gtk::glib::Error = unsafe { gtk::glib::translate::from_glib_full(error) };
+        err.to_string()
+    }
+
     /// Attach the compiled filter to a surface webview now, or queue it for
-    /// attachment when compilation finishes. Returns whether it attached now.
+    /// attachment when it is ready. Returns whether it attached now.
     pub(super) fn attach(webview: &wry::WebView) -> bool {
         use wry::WebViewExtUnix as _;
         let webkit = webview.webview();
@@ -728,9 +822,130 @@ mod adblock {
         }
     }
 
-    /// Kick off (once per process) async compilation of the content-blocker
-    /// JSON at `ruleset` into `store_dir`. Completion caches the filter and
-    /// drains the pending-webview queue. No-op if compilation already started.
+    /// Drop every `yggterm-adblock-*` generation in the store except `keep`.
+    ///
+    /// Called only AFTER the current filter is in hand. A compiled ruleset is
+    /// ~91 MB, so without this the store grows by that much every time the
+    /// rules change.
+    fn prune_stale(store: *mut wk::WebKitUserContentFilterStore, keep: std::ffi::CString) {
+        unsafe extern "C" fn fetched(
+            source: *mut gtk::glib::gobject_ffi::GObject,
+            result: *mut gtk::gio::ffi::GAsyncResult,
+            user_data: gtk::glib::ffi::gpointer,
+        ) {
+            let keep = unsafe { Box::from_raw(user_data as *mut std::ffi::CString) };
+            let store = source as *mut wk::WebKitUserContentFilterStore;
+            let identifiers = unsafe {
+                wk::webkit_user_content_filter_store_fetch_identifiers_finish(store, result)
+            };
+            if identifiers.is_null() {
+                return;
+            }
+            let mut cursor = identifiers;
+            unsafe {
+                while !(*cursor).is_null() {
+                    let found = std::ffi::CStr::from_ptr(*cursor);
+                    let text = found.to_string_lossy();
+                    if text.starts_with(IDENTIFIER_PREFIX) && found != keep.as_c_str() {
+                        eprintln!("yggterm adblock: dropping stale generation {text}");
+                        wk::webkit_user_content_filter_store_remove(
+                            store,
+                            found.as_ptr(),
+                            std::ptr::null_mut(),
+                            None,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    cursor = cursor.add(1);
+                }
+                gtk::glib::ffi::g_strfreev(identifiers);
+            }
+        }
+
+        unsafe {
+            wk::webkit_user_content_filter_store_fetch_identifiers(
+                store,
+                std::ptr::null_mut(),
+                Some(fetched),
+                Box::into_raw(Box::new(keep)) as gtk::glib::ffi::gpointer,
+            );
+        }
+    }
+
+    unsafe extern "C" fn load_done(
+        source: *mut gtk::glib::gobject_ffi::GObject,
+        result: *mut gtk::gio::ffi::GAsyncResult,
+        user_data: gtk::glib::ffi::gpointer,
+    ) {
+        let compile = unsafe { Box::from_raw(user_data as *mut Compile) };
+        let mut error: *mut gtk::glib::ffi::GError = std::ptr::null_mut();
+        let filter = unsafe {
+            wk::webkit_user_content_filter_store_load_finish(
+                source as *mut wk::WebKitUserContentFilterStore,
+                result,
+                &mut error,
+            )
+        };
+        if !filter.is_null() {
+            eprintln!(
+                "yggterm adblock: filter loaded from store in {:.3}s (no compile)",
+                compile.started.elapsed().as_secs_f64()
+            );
+            adopt(filter);
+            prune_stale(compile.store, compile.identifier.clone());
+            return;
+        }
+        // A miss is the NORMAL first-run path and the normal path after the
+        // rules change, so it is not an error to report loudly — but the
+        // GError still has to be consumed or it leaks.
+        let _ = unsafe { take_error(error) };
+        eprintln!("yggterm adblock: no compiled ruleset for this content, compiling once");
+        let raw = Box::into_raw(compile);
+        unsafe {
+            let compile = &*raw;
+            wk::webkit_user_content_filter_store_save(
+                compile.store,
+                compile.identifier.as_ptr(),
+                compile.source.to_glib_none().0,
+                std::ptr::null_mut(),
+                Some(save_done),
+                raw as gtk::glib::ffi::gpointer,
+            );
+        }
+    }
+
+    unsafe extern "C" fn save_done(
+        source: *mut gtk::glib::gobject_ffi::GObject,
+        result: *mut gtk::gio::ffi::GAsyncResult,
+        user_data: gtk::glib::ffi::gpointer,
+    ) {
+        let compile = unsafe { Box::from_raw(user_data as *mut Compile) };
+        let mut error: *mut gtk::glib::ffi::GError = std::ptr::null_mut();
+        let filter = unsafe {
+            wk::webkit_user_content_filter_store_save_finish(
+                source as *mut wk::WebKitUserContentFilterStore,
+                result,
+                &mut error,
+            )
+        };
+        if filter.is_null() {
+            let message = unsafe { take_error(error) };
+            eprintln!("yggterm adblock: ruleset compile failed: {message}");
+            PENDING.with(|p| p.borrow_mut().clear());
+            return;
+        }
+        eprintln!(
+            "yggterm adblock: ruleset compiled in {:.3}s (cached for next launch)",
+            compile.started.elapsed().as_secs_f64()
+        );
+        adopt(filter);
+        prune_stale(compile.store, compile.identifier.clone());
+    }
+
+    /// Make the compiled content-blocker available (once per process), loading
+    /// it from `store_dir` when the ruleset has not changed and compiling only
+    /// on a miss. Completion caches the filter and drains the pending-webview
+    /// queue. No-op if this already ran.
     pub(super) fn ensure_compiled(ruleset: &std::path::Path, store_dir: &std::path::Path) {
         let started = STATE.with(|s| std::mem::replace(&mut s.borrow_mut().1, true));
         if started {
@@ -744,56 +959,79 @@ mod adblock {
             }
         };
         let _ = std::fs::create_dir_all(store_dir);
+        let identifier =
+            std::ffi::CString::new(filter_identifier(&json)).expect("stamp has no NUL");
         let bytes = gtk::glib::Bytes::from_owned(json);
         let store_path = std::ffi::CString::new(store_dir.to_string_lossy().as_bytes())
             .expect("store path has no NUL");
-        let identifier = std::ffi::CString::new("yggterm-adblock").unwrap();
-
-        unsafe extern "C" fn save_done(
-            source: *mut gtk::glib::gobject_ffi::GObject,
-            result: *mut gtk::gio::ffi::GAsyncResult,
-            _user_data: gtk::glib::ffi::gpointer,
-        ) {
-            let mut error: *mut gtk::glib::ffi::GError = std::ptr::null_mut();
-            let filter = unsafe {
-                wk::webkit_user_content_filter_store_save_finish(
-                    source as *mut wk::WebKitUserContentFilterStore,
-                    result,
-                    &mut error,
-                )
-            };
-            if filter.is_null() {
-                let message = if error.is_null() {
-                    "unknown error".to_string()
-                } else {
-                    let err: gtk::glib::Error =
-                        unsafe { gtk::glib::translate::from_glib_full(error) };
-                    err.to_string()
-                };
-                eprintln!("yggterm adblock: ruleset compile failed: {message}");
-                PENDING.with(|p| p.borrow_mut().clear());
-                return;
-            }
-            STATE.with(|s| s.borrow_mut().0 = Some(filter));
-            let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
-            for webkit in pending {
-                attach_to(&webkit, filter);
-            }
-        }
 
         unsafe {
-            let store = wk::webkit_user_content_filter_store_new(store_path.as_ptr());
-            wk::webkit_user_content_filter_store_save(
-                store,
-                identifier.as_ptr(),
-                bytes.to_glib_none().0,
-                std::ptr::null_mut(),
-                Some(save_done),
-                std::ptr::null_mut(),
-            );
-            // The store object stays alive for the async op via its own ref;
+            // The store object stays alive for the async ops via its own ref;
             // we deliberately leak our ref (one store per process, tiny).
+            let store = wk::webkit_user_content_filter_store_new(store_path.as_ptr());
+            let compile = Box::into_raw(Box::new(Compile {
+                store,
+                identifier,
+                source: bytes,
+                started: Instant::now(),
+            }));
+            let identifier_ptr = (*compile).identifier.as_ptr();
+            wk::webkit_user_content_filter_store_load(
+                store,
+                identifier_ptr,
+                std::ptr::null_mut(),
+                Some(load_done),
+                compile as gtk::glib::ffi::gpointer,
+            );
         }
+    }
+}
+
+/// Locks on the adblock store identifier — the decision that turns a ~16 s
+/// compile at every GUI start into an ~11 ms load.
+///
+/// Measured on WebKitGTK 2.52.5 with the real 146,748-rule ruleset: `save`
+/// (compile) 15.7 s / ~476 MB peak, `load` of the same 0.011 s. Reproduce with
+/// `yggterm-webprobe --adblock <rules.json> --adblock-store <dir>`.
+#[cfg(test)]
+mod adblock_identifier_locks {
+    use super::adblock::filter_identifier;
+
+    #[test]
+    fn the_identifier_is_a_content_stamp_so_a_hit_proves_identical_rules() {
+        let rules = br#"[{"trigger":{"url-filter":"ads"},"action":{"type":"block"}}]"#;
+        let same = br#"[{"trigger":{"url-filter":"ads"},"action":{"type":"block"}}]"#;
+        assert_eq!(
+            filter_identifier(rules),
+            filter_identifier(same),
+            "identical rules must reuse the compiled bytecode — otherwise every \
+             launch recompiles and the fix is inert"
+        );
+    }
+
+    #[test]
+    fn changed_rules_get_a_different_identifier_so_stale_bytecode_can_never_load() {
+        let before = br#"[{"trigger":{"url-filter":"ads"},"action":{"type":"block"}}]"#;
+        let after = br#"[{"trigger":{"url-filter":"track"},"action":{"type":"block"}}]"#;
+        assert_ne!(
+            filter_identifier(before),
+            filter_identifier(after),
+            "a changed ruleset MUST miss: loading the previous generation would \
+             silently run the user's ad blocking a version behind"
+        );
+        // A one-byte edit is the case a length or mtime stamp would miss.
+        let one_byte = br#"[{"trigger":{"url-filter":"adz"},"action":{"type":"block"}}]"#;
+        assert_ne!(filter_identifier(before), filter_identifier(one_byte));
+        assert_eq!(before.len(), one_byte.len(), "same length, different content");
+    }
+
+    #[test]
+    fn every_identifier_carries_the_prefix_the_pruner_matches_on() {
+        // prune_stale only removes identifiers with this prefix. If the writer
+        // and the pruner disagree, either nothing is reclaimed (~91 MB per
+        // generation leaks) or something else in the store gets deleted.
+        assert!(filter_identifier(b"[]").starts_with(super::adblock::IDENTIFIER_PREFIX));
+        assert!(filter_identifier(b"[]").is_ascii(), "store identifiers become filenames");
     }
 }
 
