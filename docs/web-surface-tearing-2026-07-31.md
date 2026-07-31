@@ -94,6 +94,8 @@ That matches the live GUI, whose trace reads
 probe page never appeared at all, twice. That is a separate finding, not a tear
 measurement, and it means the documented top-precedence GL escape hatch
 (`docs/optimization-pass.md:222`) currently costs the user every web surface.
+Not filed in `docs/pending-bugs.md` from this lane to keep the merge clean; it
+is a real bug and wants an entry.
 
 ### guihost (AMD `radeonsi`, the user's own GPU, isolated headless sway) — 250 frames
 
@@ -254,7 +256,34 @@ In priority order. The first item is worth more than everything else here.
 - The two `nocomposite-*` arms are REFUSALS, not zeros. They measured nothing
   because the surface never appeared.
 
-## 8. Reproducing the numbers
+## 8. The one production line this lane touched
+
+`crates/yggterm-core/src/install.rs:1641-1663` — `web-tear-probe.sh` added to the
+named exemption list in `no_shipped_script_decides_the_webkit_gl_path`. That lock
+scans `scripts/` for anything that SETS `WEBKIT_DISABLE_COMPOSITING_MODE`, because
+the §1a lesson was that launchers must stop deciding the GL path; it already
+exempts the `gl_ab_*` harnesses on the stated ground that "an A/B whose arms
+cannot force their own arm is not an A/B", and this probe is the same category —
+a measurement tool, never installed, never on a launch path.
+
+**The exemption was falsified before it was accepted.** Appending
+`export WEBKIT_DISABLE_COMPOSITING_MODE=1` to the non-exempt
+`scripts/underglass-sandbox.sh` turns the lock RED, naming that file:
+
+```
+these scripts still decide the GL path the binary now probes for:
+  [".../scripts/underglass-sandbox.sh"]
+test result: FAILED. 0 passed; 1 failed
+```
+
+and restoring the file turns it GREEN again. So the carve-out is narrow and the
+scanner still bites. (Note while doing this: the matcher watches
+`WEBKIT_DISABLE_COMPOSITING_MODE` and *nothing else* —
+`YGGTERM_FORCE_SOFTWARE_GL` in a script sails straight through. A first mutation
+with that variable stayed green and would have been read as "the lock is a hole"
+if it had not been chased down.)
+
+## 9. Reproducing the numbers
 
 ```bash
 # one arm, end to end, prints its number

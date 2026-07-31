@@ -1637,12 +1637,16 @@ mod tests {
             };
             files_scanned += 1;
             lines_scanned += text.lines().count();
-            // The GL A/B harness is the one legitimate GL-path setter in
+            // The A/B harnesses are the one legitimate GL-path setter in
             // scripts/: an A/B whose arms cannot force their own arm is not an
-            // A/B. It is a MEASUREMENT tool, never installed and never on a
+            // A/B. They are MEASUREMENT tools, never installed and never on a
             // launch path — which is the distinction this lock is really about.
             // Named exactly, not pattern-matched, so a launcher cannot smuggle
             // itself in by picking a similar filename.
+            //
+            // `web-tear-probe.sh` joined the list for the same reason: its
+            // matrix has to run a software-GL arm and an SHM arm to say whether
+            // either one tears (docs/web-surface-tearing-2026-07-31.md).
             let is_the_gl_experiment_harness = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1654,6 +1658,7 @@ mod tests {
                             | "gl_ab_selftest.sh"
                             | "gl_ab_verify_env.py"
                             | "gl_ab_analyze.py"
+                            | "web-tear-probe.sh"
                     )
                 });
             if is_the_gl_experiment_harness {
