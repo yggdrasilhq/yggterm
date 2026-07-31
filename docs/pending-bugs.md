@@ -225,7 +225,9 @@ as its live-verified fix.
 
 - **⚠ NOT LIVE-PROVEN: the fullscreen mouse route.** Shipped with the chord
   claimer below, but only the keyboard half has been exercised end to end. The
-  floating window-controls strip (`if fullscreen {` in `shell.rs`) now declares
+  floating window-controls strip (`if distraction_free_exit_visible {` in
+  `shell.rs` — it was `if fullscreen {` until element fullscreen learned to
+  suppress it) now declares
   `data-covers-web-surface: "fullscreen-window-controls"`, which is *correct in
   every case and a no-op where the page hole never reached it* — but it has NOT
   been shown to be the reason the user's click did nothing. Settle it on jojo:
