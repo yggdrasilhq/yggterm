@@ -53011,6 +53011,38 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         canvas_count: canvasCount,
                         visible_canvas_layer_count: canvasCount,
                         hidden_canvas_layer_count: 0,
+                        // COLD-MOUNT VEIL, VISIBLE TO A PROBE (2026-07-31).
+                        // THIS is the builder that feeds `active_terminal_hosts`
+                        // in `server app state` — the one an agent actually
+                        // reads. (Two sibling describe-state scripts carry the
+                        // same pair; they are separate pre-existing surfaces,
+                        // and this file's rule is that all of them agree.)
+                        // NOTE the brace style: this script is a PLAIN raw
+                        // string, so braces are literal here and must be
+                        // doubled in the format! sibling. Getting that
+                        // backwards emits invalid JS that fails silently
+                        // inside a try/catch.
+                        // (And never write a raw-string delimiter inside one of
+                        // these comments -- it closes the string and the rest
+                        // of the JS is parsed as Rust.)
+                        cold_mount_veil_count:
+                            document.querySelectorAll('.yggterm-cold-mount-veil').length,
+                        cold_mount_veil_oldest_age_ms: (() => {
+                            try {
+                                const veils = window.__yggtermColdMountVeils || {};
+                                const now = Date.now();
+                                let oldest = 0;
+                                for (const key of Object.keys(veils)) {
+                                    const record = veils[key];
+                                    if (record && record.attachedAtMs) {
+                                        oldest = Math.max(oldest, now - record.attachedAtMs);
+                                    }
+                                }
+                                return Math.max(0, oldest);
+                            } catch (_veilAgeError) {
+                                return 0;
+                            }
+                        })(),
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         xterm_canvas_renderer_requested: Boolean(window.__yggtermXtermCanvasRendererEnabled),
                     xterm_renderer_policy_reason: String(window.__yggtermXtermRendererPolicyReason || ''),
@@ -129794,6 +129826,34 @@ mod tests {
         );
         // A live veil is visible to `server app state` probes.
         assert!(script.contains("window.__yggtermColdMountVeils"));
+
+        // ⚠ THE PROBE MUST LIVE IN THE BUILDER THAT ACTUALLY FEEDS
+        // `active_terminal_hosts`. Live-caught: the first cut of this added the
+        // pair to two sibling describe-state scripts and NOT the one an agent
+        // reads, so `server app state` returned null for both fields on the
+        // deployed build while every test was green. There are three such
+        // scripts in this file; this pins the probe to the one whose object is
+        // assigned to `active_terminal_hosts`.
+        let source = include_str!("shell.rs");
+        let feeding_builder = source
+            .split("active_terminal_hosts: activeTerminalHosts")
+            .next()
+            .expect("some script assigns active_terminal_hosts");
+        let probe_at = feeding_builder
+            .rfind("cold_mount_veil_count:")
+            .expect(
+                "the builder that feeds active_terminal_hosts must carry the veil probe — \
+                 adding it to a sibling describe-state script leaves `app state` blind",
+            );
+        // …and it must be the SAME object, i.e. after the last host-object start
+        // preceding the assignment, not an earlier script entirely.
+        let host_object_at = feeding_builder
+            .rfind("canvas_count: canvasCount")
+            .expect("the feeding builder's host object is identifiable by canvas_count");
+        assert!(
+            probe_at > host_object_at.saturating_sub(4_000),
+            "the veil probe must sit inside the host object that reaches active_terminal_hosts"
+        );
         // The hard cap has exactly one source of truth.
         assert!(script.contains(&format!(
             "Date.now() - veilAttachedAtMs >= {COLD_MOUNT_VEIL_HARD_CAP_MS}"
