@@ -12520,13 +12520,13 @@ struct ShellState {
     /// whose host is mounted, and a two-tier app like yedit declares exactly
     /// ONCE and exits, so there is no heartbeat to catch at all.
     ///
-    /// This is the ledger that makes the repair one-shot rather than a poll:
-    /// a session is asked about once, and asked AGAIN only when its runtime
-    /// token moves — i.e. after a daemon handover re-resumed the PTY, which is
-    /// exactly "first mount after a handover". A session whose app genuinely
-    /// isn't there records the attempt too, so a plain shell costs one daemon
-    /// request per GUI lifetime and never becomes a per-tick poll.
-    app_surface_restore_attempts: HashMap<String, Option<String>>,
+    /// This is the ledger that keeps the repair off the hot path: it holds the
+    /// runtime a session was last asked about, how many asks that runtime has
+    /// had, and when the last one went out, so
+    /// [`app_surface_restore_targets`] can space the next one out
+    /// ([`app_surface_restore_retry_ms`]) instead of either polling every tick
+    /// or giving up forever.
+    app_surface_restore_attempts: HashMap<String, AppSurfaceRestoreAttempt>,
     /// The schema currently rendered in `RightPanelMode::AppPane`, plus the
     /// pane it belongs to. Fetched from the app's control endpoint on open and
     /// replaced by whatever an action returns. `None` while a fetch is in
@@ -28891,12 +28891,75 @@ struct AppSurfaceRestoreRow {
     active: bool,
 }
 
-/// A session this tick will ask the daemon about.
+/// One session's place in the surface-restore retry schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppSurfaceRestoreAttempt {
+    /// The runtime this session was bound to when it was last asked
+    /// (`ManagedSessionView::terminal_process_id`). A daemon handover that
+    /// re-resumes the PTY moves it, which restarts the schedule.
+    runtime_token: Option<String>,
+    /// How many times THIS runtime has been asked. Drives the backoff only.
+    asks: u32,
+    /// When the last ask went out.
+    last_at_ms: u64,
+}
+
+/// The tick interval, and therefore the shortest gap between two asks about one
+/// session.
+const APP_SURFACE_RESTORE_RETRY_BASE_MS: u64 = 2_500;
+
+/// The longest gap. A row that will never host an app settles here.
+const APP_SURFACE_RESTORE_RETRY_CEILING_MS: u64 = 60_000;
+
+/// How long to wait before asking the daemon AGAIN about a session whose app has
+/// not declared yet.
+///
+/// ⛔ **"The daemon holds no declare for this session" is not a durable answer,
+/// and treating it as one was the bug.** A row exists before its app does: a
+/// `terminal new` followed by `ychrome` declares about FIVE seconds after the
+/// row is born, and the restore tick asks about THREE. Live-caught on guihost
+/// 2026-07-31 — the GUI asked at 17:40:47 and traced `daemon_declare_absent`,
+/// ychrome's declare reached the daemon at 17:40:50, and because the ledger had
+/// already recorded the ask against a runtime token that never moves again, the
+/// session never got a [`SidebarContributionState`]. [`ShellState::web_surface_policy_gate`]
+/// then answered [`SurfacePolicyGate::Absent`] for the session's whole life, so
+/// every webview built for it carried `userscripts: []`, no adblock ruleset, no
+/// UA and no `yggterm-appctl://` signer bridge. On the user's daily driver that
+/// is YouTube playing its pre-rolls and SponsorBlock never running — and because
+/// the gate is per SESSION, closing and reopening the TAB cannot clear it, which
+/// is exactly what the user reported three times.
+///
+/// Proven by A/B on ONE session at one instant, both clients on the same daemon:
+/// the user's GUI (gate `absent`) evaluated `__yga_loaded:false`, `window.fetch`
+/// still native, `ytInitialPlayerResponse.adPlacements` PRESENT; a fresh shadow
+/// client (gate `ready`) evaluated `__yga_loaded:true`, `fetch` patched,
+/// `adPlacements` GONE.
+///
+/// Doubling from the tick interval to a one-minute ceiling is what makes the
+/// answer converge without becoming the per-tick poll the ledger exists to
+/// prevent: an app that is seconds late is picked up almost at once, an app the
+/// user starts an hour later is picked up within a minute, and a plain shell
+/// that will never host one costs a single cheap daemon round trip per minute.
+fn app_surface_restore_retry_ms(asks: u32) -> u64 {
+    let shift = asks.saturating_sub(1).min(5);
+    APP_SURFACE_RESTORE_RETRY_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(APP_SURFACE_RESTORE_RETRY_CEILING_MS)
+}
+
+/// A session this tick will ask the daemon about, and WHICH halves of its app
+/// surface are missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppSurfaceRestoreTarget {
     session_path: String,
     ssh_target: Option<String>,
     runtime_token: Option<String>,
+    /// This client holds no contribution: ask for the rail/document half.
+    /// FALSE means "already up", and the rail rebuild must NOT run — it tears
+    /// down and re-resolves the contribution's `ssh -L` forward.
+    want_rail: bool,
+    /// This client holds no web surface with tabs: ask for the web half.
+    want_web: bool,
 }
 
 /// PURE. Which rows this tick should ask the daemon for a retained declare, in
@@ -28904,27 +28967,42 @@ struct AppSurfaceRestoreTarget {
 ///
 /// Three rules, each of which has a way of being got wrong:
 ///
-///   1. **A session that already shows its app surface is not a candidate.**
-///      Re-fetching a declare for a session whose rail is already up would
-///      tear down and re-resolve its `ssh -L` forward on every tick.
-///   2. **One attempt per (session, runtime token).** Without the ledger this
-///      becomes a per-tick daemon poll over every row; with the token in the
-///      key it still re-arms after a handover re-resumes the PTY.
+///   1. **The two halves are asked for INDEPENDENTLY.** ychrome declares a
+///      `web-surface` and a sidebar; yedit declares a sidebar and no web
+///      surface. A row is a candidate when EITHER half is missing, and the
+///      target names which — a rail that is already up is never re-fetched
+///      (that would re-resolve its `ssh -L` every tick), and a web surface that
+///      is already up never suppresses the rail's ask. It used to be an AND
+///      over both halves, which meant a session that had picked up its web
+///      surface but not its contribution was excluded from the sweep FOREVER —
+///      a second, independent way to end up with `SurfacePolicyGate::Absent`
+///      for life, and the state the live repro session was left in.
+///   2. **One ask per (session, runtime token) per backoff window.** Without a
+///      ledger this is a per-tick daemon poll over every row; without the
+///      backoff it is one ask ever, which treats "the app has not declared YET"
+///      as "this session will never have an app" — see
+///      [`app_surface_restore_retry_ms`] for what that cost the user. The token
+///      in the key still re-arms immediately after a handover re-resumes the
+///      PTY.
 ///   3. **The active row goes first.** The user is looking at exactly one
 ///      session, and it must not wait behind six background rows for its
 ///      surface to come back.
 fn app_surface_restore_targets(
     rows: &[AppSurfaceRestoreRow],
-    attempted: &HashMap<String, Option<String>>,
+    attempted: &HashMap<String, AppSurfaceRestoreAttempt>,
+    now_ms: u64,
     budget: usize,
 ) -> Vec<AppSurfaceRestoreTarget> {
     let mut candidates: Vec<&AppSurfaceRestoreRow> = rows
         .iter()
-        .filter(|row| !row.has_contribution && !row.has_web_surface)
-        .filter(|row| {
-            attempted
-                .get(&row.session_path)
-                .is_none_or(|token| token != &row.runtime_token)
+        .filter(|row| !row.has_contribution || !row.has_web_surface)
+        .filter(|row| match attempted.get(&row.session_path) {
+            None => true,
+            Some(attempt) => {
+                attempt.runtime_token != row.runtime_token
+                    || now_ms.saturating_sub(attempt.last_at_ms)
+                        >= app_surface_restore_retry_ms(attempt.asks)
+            }
         })
         .collect();
     // Stable: the active row first, everything else in the caller's order (the
@@ -28938,6 +29016,8 @@ fn app_surface_restore_targets(
             session_path: row.session_path.clone(),
             ssh_target: row.ssh_target.clone(),
             runtime_token: row.runtime_token.clone(),
+            want_rail: !row.has_contribution,
+            want_web: !row.has_web_surface,
         })
         .collect()
 }
@@ -28968,14 +29048,35 @@ impl ShellState {
     }
 
     /// Record that a session was asked about, so it is not asked again until
-    /// its runtime moves.
+    /// its backoff window elapses or its runtime moves.
+    ///
+    /// A NEW runtime restarts the schedule rather than inheriting the previous
+    /// one's backoff: a handover that re-resumed the PTY is a fresh app that
+    /// deserves the fast asks, not the tail of a minute-long window the dead one
+    /// earned.
     fn mark_app_surface_restore_attempted(
         &mut self,
         session_path: &str,
         runtime_token: Option<String>,
+        now_ms: u64,
     ) {
-        self.app_surface_restore_attempts
-            .insert(session_path.to_string(), runtime_token);
+        let entry = self
+            .app_surface_restore_attempts
+            .entry(session_path.to_string())
+            .or_insert_with(|| AppSurfaceRestoreAttempt {
+                runtime_token: runtime_token.clone(),
+                asks: 0,
+                last_at_ms: now_ms,
+            });
+        if entry.runtime_token != runtime_token {
+            *entry = AppSurfaceRestoreAttempt {
+                runtime_token,
+                asks: 0,
+                last_at_ms: now_ms,
+            };
+        }
+        entry.asks = entry.asks.saturating_add(1);
+        entry.last_at_ms = now_ms;
     }
 }
 
@@ -28999,10 +29100,12 @@ impl ShellState {
 /// `document_surface_visible_for` and the web reconciler then render when the
 /// user visits that session.
 async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: std::path::PathBuf) {
+    let now_ms = current_millis() as u64;
     let targets = state.with(|shell| {
         app_surface_restore_targets(
             &shell.app_surface_restore_rows(),
             &shell.app_surface_restore_attempts,
+            now_ms,
             APP_SURFACE_RESTORE_BUDGET_PER_TICK,
         )
     });
@@ -29018,6 +29121,7 @@ async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: st
             shell.mark_app_surface_restore_attempted(
                 &target.session_path,
                 target.runtime_token.clone(),
+                now_ms,
             );
         }
     });
@@ -29026,25 +29130,39 @@ async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: st
         // declare whose control endpoint does not answer traces
         // `daemon_declare_endpoint_dead` and restores nothing, which leaves the
         // session on the terminal surface — today's behaviour, with a reason.
-        let rail = rebuild_sidebar_contribution_from_daemon_declare(
-            state,
-            trace_home.clone(),
-            &target.session_path,
-            target.ssh_target.clone(),
-        )
-        .await;
+        //
+        // Only when this client has no contribution: a rebuild tears the stored
+        // one down and re-resolves its `ssh -L`, so running it against a rail
+        // that is already up would spawn one ssh per window.
+        let rail = if target.want_rail {
+            rebuild_sidebar_contribution_from_daemon_declare(
+                state,
+                trace_home.clone(),
+                &target.session_path,
+                target.ssh_target.clone(),
+            )
+            .await
+        } else {
+            false
+        };
         // The web half. Independent of the rail: ychrome declares a
         // `web-surface` and no sidebar pane, yedit the reverse. Its own
         // staleness ceiling is the right liveness test HERE (unlike the rail's,
         // where it was wrong) because a browser surface heartbeats every ~4s —
         // an old web-surface record means the app really did exit.
-        let web = rebuild_web_surface_from_daemon_declare(
-            state,
-            trace_home.clone(),
-            &target.session_path,
-        )
-        .await;
-        if rail || web.rebuilt() {
+        let web = if target.want_web {
+            Some(
+                rebuild_web_surface_from_daemon_declare(
+                    state,
+                    trace_home.clone(),
+                    &target.session_path,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if rail || web.as_ref().is_some_and(DeclareRebuild::rebuilt) {
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -29053,7 +29171,11 @@ async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: st
                 json!({
                     "session_path": target.session_path,
                     "rail": rail,
-                    "web": web.reason(),
+                    // A half that was NOT asked for reads as `already_up`, never
+                    // as one of the rebuild's own reasons — "no_declare" for a
+                    // surface this client is already showing would be a lie the
+                    // next investigation has to unlearn.
+                    "web": web.as_ref().map_or("already_up", DeclareRebuild::reason),
                 }),
             );
         }
@@ -125747,9 +125869,19 @@ mod tests {
     /// production decision — never hand-built rows, which is exactly how a
     /// lock ends up unable to fail (field guide §7.1).
     fn restore_targets(shell: &ShellState, budget: usize) -> Vec<AppSurfaceRestoreTarget> {
+        restore_targets_at(shell, 0, budget)
+    }
+
+    /// [`restore_targets`] at a stated wall clock, for the backoff schedule.
+    fn restore_targets_at(
+        shell: &ShellState,
+        now_ms: u64,
+        budget: usize,
+    ) -> Vec<AppSurfaceRestoreTarget> {
         app_surface_restore_targets(
             &shell.app_surface_restore_rows(),
             &shell.app_surface_restore_attempts,
+            now_ms,
             budget,
         )
     }
@@ -125775,14 +125907,11 @@ mod tests {
         );
     }
 
-    // A session whose rail this client ALREADY holds must never be re-asked:
-    // a rebuild tears down and re-resolves the contribution's `ssh -L`, so
-    // asking on every tick would spawn one ssh per tick forever.
-    #[test]
-    fn a_session_already_showing_its_app_surface_is_never_re_asked() {
-        let mut shell = shell_with_live_rows(&["local://alpha", "local://beta"], "local://alpha");
+    /// Give `session` a contribution, the way a declare would — so the rail
+    /// half reads as ALREADY UP through the production reader.
+    fn give_contribution(shell: &mut ShellState, session: &str) {
         shell.upsert_sidebar_contribution(
-            "local://alpha",
+            session,
             Vec::new(),
             None,
             Some("yedit".to_string()),
@@ -125798,20 +125927,90 @@ mod tests {
                 None,
             )),
         );
+    }
+
+    /// Give `session` a web surface with one tab, the way ychrome's
+    /// `web-surface open` declare would — so the WEB half reads as already up
+    /// through the production reader.
+    fn give_web_surface(shell: &mut ShellState, session: &str) {
+        shell.upsert_web_surface(
+            session,
+            "https://www.youtube.com/watch?v=x".to_string(),
+            None,
+            "https://www.youtube.com/watch?v=x".to_string(),
+            None,
+            None,
+            "ytprobe".to_string(),
+            false,
+            WebSurfaceOpenKind::Launch,
+            1_000,
+        );
+    }
+
+    // A session whose rail this client ALREADY holds must never have its rail
+    // re-asked: a rebuild tears down and re-resolves the contribution's
+    // `ssh -L`, so asking on every tick would spawn one ssh per tick forever.
+    #[test]
+    fn a_session_already_showing_its_app_surface_is_never_re_asked() {
+        let mut shell = shell_with_live_rows(&["local://alpha", "local://beta"], "local://alpha");
+        give_contribution(&mut shell, "local://alpha");
         let targets = restore_targets(&shell, 8);
         assert_eq!(
             targets
                 .iter()
-                .map(|target| target.session_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["local://beta"],
-            "the session whose contribution is already up is not a candidate"
+                .find(|target| target.session_path == "local://alpha")
+                .map(|target| target.want_rail),
+            Some(false),
+            "the session whose contribution is already up never asks for the rail again"
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.want_web),
+            "…and neither row holds a web surface, so both still ask for that half"
         );
     }
 
-    // One ask per (session, runtime). Without the ledger this becomes a daemon
-    // poll over every row, every 2.5s, forever — including for plain shells
-    // that will never have a declare.
+    // ⛔ THE TWO HALVES ARE INDEPENDENT. A session that picked up its WEB
+    // surface but never its contribution used to be filtered out of the sweep
+    // by an AND over both halves — and a session with no contribution has
+    // `SurfacePolicyGate::Absent`, which builds every webview it ever owns with
+    // `userscripts: []` and no adblock ruleset. That is the YouTube-plays-ads /
+    // SponsorBlock-never-runs report, and it is why closing and reopening the
+    // TAB never helped: the gate is per SESSION.
+    #[test]
+    fn a_session_holding_a_web_surface_but_no_contribution_still_asks_for_its_rail() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        give_web_surface(&mut shell, "local://alpha");
+        let targets = restore_targets(&shell, 8);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (
+                    target.session_path.as_str(),
+                    target.want_rail,
+                    target.want_web
+                ))
+                .collect::<Vec<_>>(),
+            vec![("local://alpha", true, false)],
+            "a web surface must not suppress the ask for the missing contribution"
+        );
+    }
+
+    // A row with BOTH halves up is not a candidate at all.
+    #[test]
+    fn a_session_with_both_halves_up_is_not_a_candidate() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        give_contribution(&mut shell, "local://alpha");
+        give_web_surface(&mut shell, "local://alpha");
+        assert!(
+            restore_targets(&shell, 8).is_empty(),
+            "nothing is missing, so nothing is asked"
+        );
+    }
+
+    // One ask per (session, runtime) PER BACKOFF WINDOW. Without the ledger
+    // this becomes a daemon poll over every row, every 2.5s, forever.
     #[test]
     fn a_session_is_asked_once_and_a_handover_re_arms_it() {
         let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
@@ -125819,7 +126018,7 @@ mod tests {
         assert_eq!(first.len(), 1, "the first tick asks");
         let token = first[0].runtime_token.clone();
         assert_eq!(token.as_deref(), Some("42"), "the PTY's pid IS the token");
-        shell.mark_app_surface_restore_attempted("local://alpha", token);
+        shell.mark_app_surface_restore_attempted("local://alpha", token, 0);
         assert!(
             restore_targets(&shell, 8).is_empty(),
             "an answered session is not asked again on the next tick"
@@ -125846,6 +126045,86 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("4242".to_string())],
             "a re-resumed PTY is a new runtime, so the surface is asked about again"
+        );
+    }
+
+    // ⛔ THE BUG THE USER REPORTED THREE TIMES, AS A DECISION.
+    //
+    // A row exists before its app does. `terminal new` then `ychrome` puts the
+    // declare in the daemon about five seconds after the row is born, and the
+    // restore tick asks about three — so the FIRST ask legitimately answers
+    // "no declare". Treating that as durable left the session with no
+    // contribution for the life of its PTY, `SurfacePolicyGate::Absent`, and
+    // therefore every webview built with `userscripts: []` and no adblock —
+    // YouTube ads playing, SponsorBlock never running, and closing the tab no
+    // help because the gate is per SESSION, not per tab.
+    //
+    // Measured on guihost 2026-07-31: GUI asked 17:40:47, ychrome declared
+    // 17:40:50, gate stayed `absent` through six later `web ensure` calls while
+    // a fresh shadow client on the same daemon answered `ready`.
+    #[test]
+    fn an_app_that_declares_after_the_first_ask_is_asked_again() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let token = restore_targets_at(&shell, 1_000, 8)[0].runtime_token.clone();
+        shell.mark_app_surface_restore_attempted("local://alpha", token, 1_000);
+        assert!(
+            restore_targets_at(&shell, 1_000 + 2_499, 8).is_empty(),
+            "inside the window the session is not re-asked"
+        );
+        assert_eq!(
+            restore_targets_at(&shell, 1_000 + 2_500, 8)
+                .iter()
+                .map(|target| target.session_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local://alpha"],
+            "the app declared three seconds late: the tick MUST ask again"
+        );
+    }
+
+    // …and the re-ask backs off, so a plain shell that will never host an app
+    // settles to one cheap daemon round trip per minute rather than one per
+    // tick — the cost the ledger exists to avoid.
+    #[test]
+    fn the_re_ask_backs_off_to_a_one_minute_ceiling() {
+        assert_eq!(
+            (1..=8).map(app_surface_restore_retry_ms).collect::<Vec<_>>(),
+            vec![2_500, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000],
+            "doubling from the tick interval, capped at a minute"
+        );
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let token = restore_targets_at(&shell, 0, 8)[0].runtime_token.clone();
+        for ask in 0..4 {
+            shell.mark_app_surface_restore_attempted("local://alpha", token.clone(), ask * 100);
+        }
+        // Four asks recorded ⇒ the next window is 20s from the last ask (300ms).
+        assert!(
+            restore_targets_at(&shell, 300 + 19_999, 8).is_empty(),
+            "the fourth window has not elapsed"
+        );
+        assert_eq!(
+            restore_targets_at(&shell, 300 + 20_000, 8).len(),
+            1,
+            "…and it re-arms when it does"
+        );
+    }
+
+    // A handover restarts the SCHEDULE, not just the token: the re-resumed app
+    // is a fresh app and deserves the fast asks, not the tail of the minute-long
+    // window the dead one earned.
+    #[test]
+    fn a_handover_restarts_the_backoff_schedule() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        for ask in 0..6 {
+            shell.mark_app_surface_restore_attempted(
+                "local://alpha",
+                Some("42".to_string()),
+                ask * 10,
+            );
+        }
+        shell.mark_app_surface_restore_attempted("local://alpha", Some("4242".to_string()), 1_000);
+        assert_eq!(
+            shell.app_surface_restore_attempts["local://alpha"].asks, 1,
+            "a new runtime starts the schedule over"
         );
     }
 
@@ -125903,6 +126182,44 @@ mod tests {
             body.contains("spawn(restore_app_surfaces_tick("),
             "the working-flags poll tick no longer spawns the surface restore, so \
              yedit/ychrome go back to coming up as bare terminals after a restart"
+        );
+    }
+
+    // The other half of the same wiring, and the half the decision cannot
+    // reach: `restore_app_surfaces_tick` must DRIVE each missing half and only
+    // that half. Running the rail rebuild unconditionally re-resolves a live
+    // contribution's `ssh -L` once per window; skipping it when the WEB surface
+    // happens to be up is the bug this lane fixes.
+    #[test]
+    fn the_restore_tick_drives_each_missing_half_on_its_own() {
+        let source = include_str!("shell.rs");
+        let anchor = "async fn restore_app_surfaces_tick(";
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("the scan lost its anchor {anchor:?}"));
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor:?} has no column-0 close"));
+        let body = &body[..end];
+        assert!(
+            body.len() > 1_000 && body.len() < 20_000,
+            "the restore-tick slice is {} bytes — the scan lost its bounds",
+            body.len()
+        );
+        assert!(
+            body.contains("if target.want_rail {"),
+            "the rail rebuild is no longer gated on the rail being MISSING, so it \
+             re-resolves a live contribution's ssh -L every backoff window"
+        );
+        assert!(
+            body.contains("if target.want_web {"),
+            "the web rebuild is no longer gated on the web surface being MISSING"
+        );
+        assert!(
+            body.contains("app_surface_restore_targets(")
+                && body.contains("mark_app_surface_restore_attempted("),
+            "the tick no longer routes through the decision + the ledger"
         );
     }
 
