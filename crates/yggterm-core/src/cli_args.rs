@@ -30,6 +30,37 @@ pub fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     None
 }
 
+/// The positional (non-flag) arguments from `start` onward.
+///
+/// The companion rule to [`cli_flag_value`], and the same reason it lives here:
+/// a positional reader that skips `--flag value` pairs differently on one entry
+/// point than another makes `server app web capture-element --selector x out.png`
+/// mean two things. Both binaries and the shared `server app web` dispatcher
+/// call this one implementation.
+///
+/// A `--flag` consumes the next token as its value ONLY when that token is not
+/// itself a flag — the same "a flag with no value is absent" rule
+/// [`cli_flag_value`] applies, so the two cannot disagree about where a value
+/// ends and a positional begins.
+pub fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
+    let mut positional = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        let value = args[index].as_str();
+        if value.starts_with("--") {
+            if index + 1 < args.len() && !args[index + 1].starts_with("--") {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        positional.push(value);
+        index += 1;
+    }
+    positional
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
