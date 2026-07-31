@@ -2491,13 +2491,18 @@ some are certainly fixed already. Full narrative for each is in
   - `reveal_forced_incomplete` fired **9 times** — nine occasions where the viewport
     had to rot to near-blank before anything corrected it.
 
-  **Fix shape: bound the defer.** After N consecutive defers or T seconds, force the
-  reconcile regardless of output — the same principle the constitution already
-  states for the daemon drain ("the drain must not require a quiet window"). Keep
-  the 1,200 ms quiet test as the *preferred* path so brief bursts still avoid a
-  tear; add the deadline so convergence is guaranteed. Do NOT simply widen
-  `last_host_health_visible_nonblank_rows`; that trades one arbitrary threshold for
-  another.
+  ✅ **FIXED IN CODE 2026-07-31 — `SCREEN_RECONCILE_DEFER_DEADLINE_MS = 12_000`.**
+  The 1,200 ms quiet test stays as the *preferred* path so brief bursts still avoid
+  a tear; once the correction has been owed for 12 s the reconcile is forced
+  regardless of output. Chain age is measured from the FIRST defer of a chain, not
+  the last rearm — the rearm cadence is 3 s, so "time since last defer" could never
+  exceed it no matter how long the user stared at a broken frame. Locks:
+  `a_deferred_reconcile_converges_even_while_output_never_stops` and
+  `the_defer_clock_measures_the_chain_not_the_last_rearm`, both red-proven
+  (`>=`→`>` on the boundary, and removing the no-chain guard, each fail).
+  ⚠ **NOT YET LIVE-VERIFIED on jojo** — the running GUI is 2.12.19, which predates
+  this. Confirm after the next deploy by watching for
+  `terminal_mount/screen_reconcile_forced_deadline` in the trace.
 
   Related and also open: `sidebugs-webgl-artifacts-stale-frame-on-switch` calls
   stale-frames-after-switch "the biggest remaining UX bug".
@@ -2519,13 +2524,71 @@ some are certainly fixed already. Full narrative for each is in
 
 - **Drag-selection still freezes the TUI on 2.12.19** (user-reported 2026-07-31),
   despite a81c7366 making the per-event handler O(1) with a trailing-edge flush.
-  So the residual stall is NOT the `getSelection()` serialization that fix removed.
-  ⚠ **Currently un-diagnosable from telemetry: the terminal selection path is
-  effectively uninstrumented** — one `selection_copy_*` triple in 83 minutes — and
-  `app_render_rate`/`terminal_forward_rate` are 60-second averages (1.1–5.7
-  renders/s, 0.8–5.7 forwards/s, no storm) which cannot see a sub-second freeze.
-  First step is an instrument, not a fix: emit a drag-lifecycle trace (mousedown →
-  selectionchange count → rAF flush latency → mouseup) so the stall can be located.
+
+  ✅ **RESIDUAL FOUND AND FIXED IN CODE 2026-07-31.** Making per-EVENT work O(1) was
+  necessary and not sufficient: the deferred half coalesced to
+  `requestAnimationFrame`, so during a live drag over a streaming session
+  `term.getSelection()` — the O(selected-cells) serialization — still ran **once per
+  animation frame (~60/s)** on the same webview thread as the xterm write pump. The
+  commit title said a drag's cost must not grow with the selection it drags; per
+  *frame*, it still did.
+
+  Nothing can observe `__yggtermPrimarySelection` mid-drag — every reader flushes
+  synchronously first (pointerdown, pointerup, and `primarySelectionTextForPaste`
+  flushes every host before it reads) — so while the pointer is down the rAF flush
+  is pure redundancy. It is now skipped, and drag-end does the single serialization.
+  Cost during a drag is O(1) per event AND O(1) per frame.
+  Lock: `a_live_drag_schedules_no_per_frame_selection_work`, red-proven by deleting
+  the guard. ⚠ **NOT YET LIVE-VERIFIED** — needs a real drag on the deployed build.
+
+  ⚠ It remains possible that a second mechanism also contributes; the instrument
+  below exists to answer that rather than guess.
+
+- ✅ **THESE THREE BUG CLASSES ARE NOW PROVABLE FROM TELEMETRY (2026-07-31).** Each
+  of them survived because the instrument could not see it. What was added:
+
+  1. **Defer chains, not defer samples.** `screen_reconcile_deferred_recent_output`
+     is rate-limited to one line per 10 s, so a raw line count understated the real
+     deferral total **2.8×** (71 lines for 198 deferrals) and a continuous chain
+     read as scattered singletons. Every line now carries `defer_chain_depth` and
+     `defer_chain_ms`, reset only when a reconcile actually runs — so "the corrector
+     is starved right now, and has been for 106 s" is readable instead of
+     inferable. A forced repaint emits `screen_reconcile_forced_deadline` with the
+     chain depth/age that triggered it. **When reading these, use
+     `suppressed_since_last` — never the line count.**
+  2. **Drag lifecycle.** The terminal selection path emitted one event per copy and
+     nothing during a drag, which is why a user-reported freeze was invisible for a
+     release. Drag-end now emits `drag_selection_complete` with `selection_events`
+     (streaming sessions multiply these), `drag_ms`, `flush_ms` (the one real
+     serialization) and `selected_chars`. A freeze is now a number.
+  3. **Veil disposition and live veil state.** Telemetry showed 17
+     `cold_mount_veil_attached` against 11 `..._released` — six veils with no
+     disposition, because a host torn down under its veil hit a bare `return` in the
+     settle poll. That path now reports `reason=host_torn_down`, so every veil
+     leaves a record. And `server app state` gained `cold_mount_veil_count` +
+     `cold_mount_veil_oldest_age_ms` on each terminal host, because from outside the
+     webview a stuck veil looked exactly like a hung session and nothing reported
+     either. Lock: `a_cold_mount_veil_reports_every_disposition`.
+
+  **The general rule this pays for:** an absence-gate needs a deadline, and any
+  mechanism that can degrade the viewport needs to report its own state — otherwise
+  the next report of "it never opened" is another argument instead of a measurement.
+
+- ⚠ **`main` ships with 6 RED tests in `yggterm-shell` (found 2026-07-31).** All in
+  the retention/bridge/snapshot family:
+  `inactive_retained_ready_session_keeps_bridge_mounted_but_pauses_reads`,
+  `retained_background_session_trickles_reads_instead_of_pausing`,
+  `prune_terminal_attach_in_flight_drops_background_retained_attach`,
+  `shell_snapshot_retains_live_local_stored_codex_sessions`,
+  `shell_snapshot_trims_inactive_live_payloads_for_sidebar_and_retention`,
+  `sync_live_terminal_retention_keeps_active_not_fresh_inactive_live_sessions`.
+  Verified pre-existing by stashing all local work and re-running on clean `main`
+  — 1606 pass, these 6 fail. Unknown whether the tests encode a superseded model
+  or the retention behaviour genuinely regressed; per
+  `feedback-locks-survive-contract-changes`, **rewrite a test that encodes the old
+  model, never weaken it** — but decide that deliberately, with the retention
+  contract in hand. Likely cause of it going unnoticed: `cargo test | tail` eats
+  the exit code under `pipefail`, which that same memory already records as a trap.
 
 - **`screen_snapshot_clipped_to_pty_width` fires constantly and nobody has looked**
   — 108 times in 17 minutes on `local://43c47548…`, every one reporting
