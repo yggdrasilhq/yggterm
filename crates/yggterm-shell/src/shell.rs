@@ -2146,7 +2146,35 @@ fn control_request_with_timeout(
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
     if !(200..300).contains(&status) {
-        return Err(format!("control endpoint returned {status}"));
+        // THE APP ALREADY WROTE THE ANSWER — surface it instead of the number.
+        //
+        // ychrome's refusal body carries a full sentence (what failed AND what
+        // to do about it) plus a machine-readable `cause`, written precisely so
+        // a human does not have to read our source to act. Dropping it is what
+        // put "control endpoint returned 403" in front of the user for three
+        // days while the body said which of three distinct failures it was.
+        //
+        // Bounded, because this string lands in a pane's error slot: a
+        // misconfigured endpoint answering with a page must not paste it there.
+        let detail = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|detail| !detail.is_empty())
+            .map(|mut detail| {
+                if detail.chars().count() > 400 {
+                    detail = detail.chars().take(400).collect::<String>() + "…";
+                }
+                detail
+            });
+        return Err(match detail {
+            Some(detail) => format!("control endpoint returned {status}: {detail}"),
+            None => format!("control endpoint returned {status}"),
+        });
     }
     if body.trim().is_empty() {
         return Ok(serde_json::Value::Null);
@@ -137361,6 +137389,78 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/action");
         let replied = control_request(&url, body.as_ref(), token);
         (handle.join().expect("the fake app answered"), replied)
+    }
+
+    /// A refusal the app took care to WRITE must reach the user.
+    ///
+    /// ychrome answers a gated route with a sentence naming the failure and the
+    /// remedy, plus a `cause` handle. The GUI used to keep only the status
+    /// code, so the user saw "control endpoint returned 403" for three days
+    /// while the body said exactly which of three distinct failures it was and
+    /// what to do about each.
+    #[test]
+    fn a_refusal_body_reaches_the_caller_instead_of_a_bare_status_code() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake app");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the GUI connects");
+            let mut raw = vec![0u8; 4096];
+            let _ = stream.read(&mut raw);
+            let payload = serde_json::json!({
+                "error": "forbidden: /pane/settings is GUI-only and the ychrome CLI \
+                          serving this session predates the control-token gate. \
+                          Press Ctrl+C in that terminal and run ychrome again.",
+                "cause": "courier_absent",
+            })
+            .to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let url = format!("http://127.0.0.1:{port}/pane/settings");
+        let error = control_request(&url, None, Some("tok")).expect_err("a 403 is an error");
+        handle.join().expect("the fake app answered");
+        assert!(error.contains("403"), "the status still names itself: {error}");
+        assert!(
+            error.contains("predates the control-token gate"),
+            "the app's own remedy must survive to the caller: {error}"
+        );
+    }
+
+    /// The refusal detail lands in a pane's error slot, so an endpoint that
+    /// answers with something enormous must not paste all of it there.
+    #[test]
+    fn a_refusal_body_is_bounded_before_it_reaches_a_pane() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake app");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the GUI connects");
+            let mut raw = vec![0u8; 4096];
+            let _ = stream.read(&mut raw);
+            let payload = serde_json::json!({ "error": "x".repeat(5_000) }).to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 500 Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let url = format!("http://127.0.0.1:{port}/pane/settings");
+        let error = control_request(&url, None, None).expect_err("a 500 is an error");
+        handle.join().expect("the fake app answered");
+        assert!(
+            error.chars().count() < 500,
+            "an unbounded body must not reach a pane: {} chars",
+            error.chars().count()
+        );
+        assert!(error.ends_with('\u{2026}'), "truncation must be visible: {error}");
     }
 
     #[test]
