@@ -3896,12 +3896,17 @@ mod app_pane_reorder_tests {
             "the verbs are positioned against the anchor, so it must be the \
              containing block: {anchor}"
         );
-        let actions = session_row_actions_style();
+        let actions = session_row_actions_style(5, 9);
         assert!(
             actions.contains("position:absolute;"),
             "the verbs must not be a flex item: {actions}"
         );
-        assert!(actions.contains("right:0px;"), "{actions}");
+        // Bled over the row's own padding so the chip reaches the row's real
+        // edges — the row's `overflow:hidden` clips it back to the radius. A
+        // chip that stopped at the CONTENT box read as a floating sticker.
+        assert!(actions.contains("right:-9px;"), "{actions}");
+        assert!(actions.contains("top:-5px;"), "{actions}");
+        assert!(actions.contains("bottom:-5px;"), "{actions}");
         assert!(actions.contains("mask-image:linear-gradient(to right"), "{actions}");
         // …and the fade that lets them sit OVER a long title, which lives in the
         // REVEALED rule so a row at rest pays for no compositing layer. Both
@@ -81163,11 +81168,21 @@ fn session_row_actions_anchor_style(row_gap_px: u32) -> String {
 /// The mask is here rather than in the CSS because it is the SHAPE of the chip,
 /// and it must match the `padding-left` that keeps the first glyph clear of the
 /// feather — one number, one place.
-fn session_row_actions_style() -> String {
+///
+/// `bleed_v_px`/`bleed_h_px` are the row's OWN padding, and the chip is pulled
+/// out over them so it reaches the row's real edges. Without that it stops at
+/// the content box and reads as a white sticker floating inside the row, with a
+/// strip of the selection tint showing past its right edge (caught on the live
+/// pixel, 2026-08-01). The row clips it back to its own rounded corners — every
+/// row family sets `overflow:hidden` — so bleeding costs nothing and buys the
+/// chip the row's own shape. The feathered left edge is the only edge that
+/// should be visible at all.
+fn session_row_actions_style(bleed_v_px: u32, bleed_h_px: u32) -> String {
     let fade = SESSION_ROW_ACTIONS_FADE_PX;
     format!(
-        "position:absolute; right:0px; top:0px; bottom:0px; display:inline-flex; align-items:center; \
-         gap:2px; padding-left:{fade}px; \
+        "position:absolute; right:-{bleed_h_px}px; top:-{bleed_v_px}px; bottom:-{bleed_v_px}px; \
+         display:inline-flex; align-items:center; justify-content:flex-end; \
+         gap:2px; padding-left:{fade}px; padding-right:{bleed_h_px}px; \
          -webkit-mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px); \
          mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px);"
     )
@@ -81360,7 +81375,9 @@ fn SessionStyleRow(
                     style: session_row_actions_anchor_style(metrics.gap_px),
                     span {
                         "data-session-row-actions": "1",
-                        style: session_row_actions_style(),
+                        // Bled over the row's OWN padding, so the chip wears the
+                        // row's rounded edges instead of floating inside it.
+                        style: session_row_actions_style(metrics.pad_v_px, metrics.pad_h_px),
                         {actions}
                     }
                 }
@@ -82123,7 +82140,9 @@ fn SidebarRow(
                     style: session_row_actions_anchor_style(6),
                     span {
                     "data-session-row-actions": "1",
-                    style: session_row_actions_style(),
+                    // 5/9, the cwdtree row's own `padding:5px 9px` — the chip
+                    // bleeds over it and the row clips it back to its radius.
+                    style: session_row_actions_style(5, 9),
                     button {
                         "data-sidebar-live-session-close": "1",
                         // Per-element (§12.1), reason "list-item": a per-row
