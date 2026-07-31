@@ -210,7 +210,8 @@ fn print_server_app_help() {
   yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
-
+  yggterm-headless server app keytips <audit [--json]|show|hide>
+{web_usage}
 row tenancy (server app terminal new): every create from this CLI is stamped
   with the creating pid, this host, and --purpose if given; read it back with
   `server terminal tenants`. --ephemeral additionally OPTS IN to reaping, and it
@@ -232,7 +233,11 @@ row tenancy (server app terminal new): every create from this CLI is stamped
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
-  with one GUI and no target it routes there automatically."
+  with one GUI and no target it routes there automatically.",
+        // Rendered by the web plane's OWNER, the same call the GUI binary's
+        // help makes: an agent reading THIS binary's --help sees exactly the
+        // verbs it can run, because the same code answers both questions.
+        web_usage = yggterm_server::web_usage_block("yggterm-headless")
     );
 }
 
@@ -335,23 +340,12 @@ fn normalize_monitor_args(args: &[String]) -> Option<Vec<String>> {
     }
 }
 
+/// THE positional-argument rule, shared with the `yggterm` binary and with the
+/// `server app web` dispatcher that reads the same argv — one implementation,
+/// so a `--flag value` pair cannot be skipped on one entry point and read as a
+/// positional on another. See [`yggterm_core::cli_args`].
 fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
-    let mut positional = Vec::new();
-    let mut index = start;
-    while index < args.len() {
-        let value = args[index].as_str();
-        if value.starts_with("--") {
-            if index + 1 < args.len() && !args[index + 1].starts_with("--") {
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        positional.push(value);
-        index += 1;
-    }
-    positional
+    yggterm_core::cli_positional_args(args, start)
 }
 
 /// THE argv flag rule, shared with the `yggterm` binary and with the
@@ -2717,6 +2711,14 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app keytips action: {other}"),
                 }
             }
+            // THE web verb plane, on the binary agents actually drive. It used
+            // to exist on the GUI binary only, so every verb in it —
+            // eval/read/await/do/fill/wait/ensure/frames/… — answered
+            // "unsupported app control command: web" here, which reads to an
+            // agent as "not built". One owner
+            // (crates/yggterm-server/src/app_control_web_cli.rs), both
+            // binaries; do not inline a verb here.
+            "web" => yggterm_server::run_app_control_web_cli(&args, timeout_ms),
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
     }

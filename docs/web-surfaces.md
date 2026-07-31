@@ -916,12 +916,25 @@ rects"). No app involvement: tabs are GUI chrome by doctrine.
 
 ## The `server app web` verb plane (2026-07-25)
 
-The agent-facing surface of a web surface. `yggterm server app web --help`
-renders from `WEB_ACTIONS` in `apps/yggterm/src/main.rs`, and a test
+The agent-facing surface of a web surface. It runs identically on **both**
+binaries — `yggterm server app web …` and `yggterm-headless server app web …`
+are the same code — because the plane has ONE owner,
+`yggterm_server::run_app_control_web_cli` in
+`crates/yggterm-server/src/app_control_web_cli.rs`, which each binary's `"web"`
+arm delegates to in a single line. It lived in `apps/yggterm/src/main.rs` until
+2026-07-31, which is why the headless binary refused every verb of it with
+`unsupported app control command: web`.
+
+`server app web --help` renders from `WEB_ACTIONS` in that same file (under the
+calling binary's own name), and a test
 (`every_web_action_appears_in_the_usage_string`) fails when the dispatcher's own
 match arms disagree with it — because a stale usage block already caused one
 "not deployed" misdiagnosis in the field (docs/agent-control-plane.md:1275). If
 you add a verb and skip the usage entry, the build fails. That is deliberate.
+A second test (`both_binaries_route_the_web_plane_to_its_one_owner`, in
+`apps/yggterm/src/main.rs`) derives the verb list from the owner and fails if
+either binary grows a `web` dispatch of its own — a verb on one binary only is
+the split-dispatch trap, and this plane has already fallen into it once.
 
 ### App-control is a FILESYSTEM DROPBOX, not RPC
 

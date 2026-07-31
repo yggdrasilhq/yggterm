@@ -51,7 +51,7 @@ pub use app_registry::{
     APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
     write_app_manifest,
 };
-pub use cli_args::cli_flag_value;
+pub use cli_args::{cli_flag_value, cli_positional_args};
 pub use browser::{
     BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
     unique_session_short_ids_for_pairs,

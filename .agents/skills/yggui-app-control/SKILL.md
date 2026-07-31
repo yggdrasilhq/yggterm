@@ -161,7 +161,19 @@ never resurrect a surface the app or the user closed.
 
 ### The rest of the `web` plane (2026-07-25)
 
-`yggterm server app web --help` is now generated from the dispatcher's own verb
+⚠ **Either binary runs it, and they cannot diverge (fixed 2026-07-31).** The
+whole `web` plane used to live in the GUI binary's `main.rs` only, so
+`yggterm-headless server app web <anything>` — the binary CLAUDE.md and these
+skills point agents at — answered `unsupported app control command: web`, which
+reads as "this build does not have the feature". The plane now has ONE owner,
+`crates/yggterm-server/src/app_control_web_cli.rs`; both binaries route their
+`"web"` arm straight to it and render the same generated usage block under
+their own name. Every example below works verbatim with `yggterm-headless` in
+place of `yggterm`. A test (`both_binaries_route_the_web_plane_to_its_one_owner`
+in `apps/yggterm/src/main.rs`) fails the build if either binary grows a verb
+dispatch of its own again.
+
+`yggterm server app web --help` is generated from the dispatcher's own verb
 list, so it cannot go stale — **never conclude "not deployed" from a usage
 string**, but do trust this one. Full reference:
 `docs/web-surfaces.md#the-server-app-web-verb-plane-2026-07-25`. The parts that
