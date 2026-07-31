@@ -757,6 +757,61 @@ impl DesktopService {
             .unwrap_or_default()
     }
 
+    /// Drain the capture (camera / microphone) permission asks raised since the
+    /// last tick. Each names a page whose `getUserMedia()` is BLOCKED until it
+    /// is answered — see `WebSurfaceHost::take_media_permission_requests`.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_media_permission_requests(
+        &self,
+    ) -> Vec<crate::web_surface::SurfaceMediaPermissionRequest> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_media_permission_requests())
+            .unwrap_or_default()
+    }
+
+    /// Answer a parked capture ask. `true` ⇒ the page gets the device; this is
+    /// the ONLY path to a camera or a microphone in yggterm, and every caller
+    /// reaches it from a human's click. Returns whether the id was still parked.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn resolve_web_surface_media_permission(&self, request_id: u64, allow: bool) -> bool {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.resolve_media_permission(request_id, allow))
+            // No host ⇒ nothing was parked ⇒ nothing was granted. The default
+            // that matters here is that this can never read as an approval.
+            .unwrap_or(false)
+    }
+
+    /// Sweep capture-ask deadlines and drain the ids that were settled without a
+    /// human — timed out, or denied because their surface closed. The shell
+    /// takes down any dialog it was showing for them.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_retired_media_permissions(&self) -> Vec<u64> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_retired_media_permissions())
+            .unwrap_or_default()
+    }
+
     /// How many downloads are running right now, across every surface. A
     /// transfer outlives the tab that started it, so this can be non-zero with
     /// no surface open.
