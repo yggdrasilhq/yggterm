@@ -279,6 +279,28 @@ as its live-verified fix.
   reported, never silently dropped. SponsorBlock EXISTS and is real; idcac is a
   hand-written ~140-line approximation, not the upstream ruleset.
 
+  ✅ **The RE-REPORT (ads still playing after the ychrome-side cure) was a
+  SECOND, yggterm-side bug, root-caused and fixed on `lane/dev/userscript-injection`
+  (2026-07-31).** Nothing was wrong with the wire, the engine, or the scripts:
+  `/policy` served all five with the right `@world`/`@match`, and staging them on
+  a webview through the vendored wry injects all four placement quadrants
+  (verified against the byte-identical live wire on a standalone WebKitGTK
+  harness). The break was upstream of all of it — the session had **no sidebar
+  contribution at all**, so `web_surface_policy_gate()` answered `Absent` and
+  every webview it ever built got `userscripts: []`, no ruleset, no UA and no
+  signer bridge. `app_surface_restore_targets` asked the daemon ONCE per
+  (session, PTY pid) whether an app had declared; a row exists ~3 s before
+  `ychrome` declares, so the one ask legitimately missed and was never repeated.
+  It is per SESSION, which is why closing and reopening the TAB never helped.
+  Fixed by a backoff re-ask (2.5 s doubling to a 60 s ceiling) and by splitting
+  the candidate filter's AND over the rail and web halves — a session that had
+  its web surface but not its contribution was excluded from the sweep forever.
+  ⚠ **Two instrument traps this cost a day to:** `window.__ytAdDefense` and
+  `window.__ysb` do not exist in any script (the real globals are `__yga_*` and
+  `__ysb_*`), and an isolated-world global is invisible to `web eval`, which runs
+  in the page's world — so probe main-world scripts by their global and
+  isolated-world ones by a DOM effect.
+
 - **The WPE agent engine.** `lane/dev/wpe-engine-phase-a`.
   ⛔ **The spec's core premise is factually wrong and §3 has been corrected:
   Debian's WPE WebKit 2.52.5 ships NO WPEPlatform at all** — not "gaps in it".
