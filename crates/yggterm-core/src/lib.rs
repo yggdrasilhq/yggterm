@@ -22,6 +22,11 @@ mod perf;
 // unreadable as a whole (three functions in a binary's main.rs, Linux-only),
 // and the user paid for that in repeated XWayland and software-GL incidents.
 pub mod presentation_policy;
+// A history COLLECTION is a Markdown file with frontmatter — folders are
+// headings, items are list links, notes are prose — so an agent can shape it
+// with ordinary text tools and the user can read it in yedit. See
+// ychrome/docs/collections.md. The one rule: a collection may never lose a link.
+pub mod web_collection;
 pub mod render_probe;
 mod retention;
 /// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of
