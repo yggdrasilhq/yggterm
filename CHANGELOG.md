@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Fixed: a web surface you switched away from comes back at the size the
+  window is NOW.** Show the cwd tree again over a backgrounded page — a remote
+  desktop, a browser tab — and the page kept the width it had while the tree was
+  hidden: it sat shifted to the right with its far edge cut off, and switching
+  sessions or hiding the tree again never healed it. A page is resized by giving
+  its native view a new size, and a hidden view cannot take one: the reveal was
+  placing the surface before showing it, so the new size was dropped and the old
+  one stuck. The reveal now shows first and places after.
+
 ## 2.12.23
 
 - **Fixed: the "Daemon updating" message that would not go away.** It could sit
