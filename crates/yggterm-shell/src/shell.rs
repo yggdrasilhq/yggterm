@@ -10594,6 +10594,10 @@ async fn web_surface_native_reconcile_loop(
     // opened READ-ONLY because another live client held the lock is NOT recorded
     // here (we hold nothing to release), so a later surface re-attempts acquire.
     let mut held_profile_write_locks: std::collections::HashSet<String> = HashSet::new();
+    // Profiles this client has ALREADY told the user it opened without a jar.
+    // Per profile, not per surface: a ten-tab surface degrades ten times and
+    // owes exactly one sentence about it.
+    let mut announced_jarless_profiles: std::collections::HashSet<String> = HashSet::new();
     // The daemon endpoint + this process's pid, for the write-lock round-trips.
     // Stable for the process lifetime, so read once. pid ties the lock to this
     // process so a GUI crash cannot wedge the profile (daemon reclaims a dead
@@ -11399,13 +11403,21 @@ async fn web_surface_native_reconcile_loop(
                     // this profile's jar BEFORE opening a WebContext on it. Two
                     // WebContexts writing one jar corrupt it, so when another live
                     // client (a shadow view, a second GUI) already holds the lock
-                    // this surface opens READ-ONLY (ephemeral, no jar: profile_dir
-                    // None) instead of a second writer. The user's Active GUI
-                    // preempts a Shadow holder (4.1a PreemptedShadow => writable),
-                    // so this read-only path only bites Active-vs-Active — a rare
-                    // second GUI on the same profile — and every shadow that tries
-                    // to write a profile the user holds. Ephemeral profiles keep
-                    // their own in-memory context and need no lock.
+                    // this surface opens with NO JAR instead of as a second
+                    // writer. The user's Active GUI preempts a Shadow holder
+                    // (4.1a PreemptedShadow => writable), so this path only bites
+                    // Active-vs-Active — a rare second GUI on the same profile —
+                    // and every shadow that tries to write a profile the user
+                    // holds. Ephemeral profiles keep their own in-memory context
+                    // and need no lock.
+                    //
+                    // ⛔ This comment used to say "READ-ONLY". It never was:
+                    // `profile_dir: None` is an EPHEMERAL context, which reads
+                    // nothing from the jar as well as writing nothing back. The
+                    // word is now [`WebSurfaceJarMode`]'s, which also says the
+                    // degradation out loud instead of leaving the user to
+                    // discover it as "the login will not stick".
+                    let mut surface_jar_mode = WebSurfaceJarMode::EphemeralByRequest;
                     let surface_profile_dir: Option<std::path::PathBuf> = match &profile_dir {
                         None => None,
                         Some(jar) => {
@@ -11448,15 +11460,39 @@ async fn web_surface_native_reconcile_loop(
                                     json!({
                                         "profile": lock_key,
                                         "writable": writable,
+                                        "jar_mode": WebSurfaceJarMode::decide(true, writable)
+                                            .as_str(),
                                         "session_path": session_path,
                                         "tab_id": tab_id,
                                     }),
                                 );
                                 writable
                             };
+                            surface_jar_mode = WebSurfaceJarMode::decide(true, writable);
+                            // Say it, once per profile. A degradation nobody is
+                            // told about is indistinguishable from a site that
+                            // simply refuses to log you in, which is how this
+                            // one survived as "the login will not stick".
+                            if let Some((title, body)) = surface_jar_mode.notice(&lock_key)
+                                && announced_jarless_profiles.insert(lock_key.clone())
+                            {
+                                let mut writable_state = state;
+                                writable_state.with_mut(|shell| {
+                                    shell.push_notification(
+                                        NotificationTone::Warning,
+                                        title,
+                                        body,
+                                    );
+                                });
+                            }
                             if writable { Some(jar.clone()) } else { None }
                         }
                     };
+                    debug_assert_eq!(
+                        surface_jar_mode.keeps_cookies(),
+                        surface_profile_dir.is_some(),
+                        "the mode and the jar it describes must never disagree"
+                    );
                     // Adblock + userscripts belong to the APP, which serves the
                     // effective policy from its own host. No contribution ⇒ no
                     // policy, and that is right: adblock is browsing config, and
@@ -12080,6 +12116,93 @@ fn web_surface_url_scheme_allowed(url: &str) -> bool {
 fn normalize_web_surface_profile(profile: Option<&str>) -> String {
     yggterm_core::web_profile::normalize_web_profile(profile)
 }
+/// Which jar a web surface actually opened on, once the one-writer-per-profile
+/// rule has had its say.
+///
+/// ⛔ **The bug this names.** The degradation used to be invisible: a surface
+/// whose profile write-lock was held elsewhere was handed `profile_dir: None`,
+/// which is an EPHEMERAL context — it reads nothing from the jar and writes
+/// nothing back — while the code beside it said it opened "READ-ONLY". Those are
+/// not the same thing, and the difference is exactly what a user meets: the
+/// surface starts logged OUT and cannot keep a cookie, including a bot-check
+/// clearance cookie, so a challenged login loops forever with **nothing on
+/// screen explaining it**. Reported against ychrome as "the login will not
+/// stick".
+///
+/// This enum does not fix the jar. It fixes the SILENCE, which is the half that
+/// can be fixed without a design call: the mode is named, traced, and said out
+/// loud once per profile.
+///
+/// ⚠ **Why the other half is not done here, so it is not attempted casually.**
+/// Making the degradation genuinely read-only means giving the surface a
+/// private COPY of the profile's cookies and local storage — WebKitGTK has no
+/// read-only jar mode, and cookies are a Netscape text file, so a copy is
+/// mechanically easy. It is not editorially easy: every shadow surface an agent
+/// opens on a profile the user holds would then duplicate that profile's live
+/// session cookies to a second place on disk. In a browser that carries the
+/// operator's brokerage sessions, spreading cookie jars is a security decision
+/// and belongs to him, not to a bug fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceJarMode {
+    /// The profile's own jar, read and written. What the user expects.
+    Persistent,
+    /// No jar because none was asked for: the reserved ephemeral profile, whose
+    /// whole point is to leave no trace. Not a degradation, and never announced.
+    EphemeralByRequest,
+    /// No jar because another live client holds this profile's write lock. Two
+    /// WebContexts writing one jar corrupt it, so refusing to be the second
+    /// writer is right; opening with NO jar is the part that surprises.
+    NoJarLockHeldElsewhere,
+}
+
+impl WebSurfaceJarMode {
+    /// The ONE decision. Pure, so the rule is testable without a webview.
+    fn decide(has_profile_jar: bool, writable: bool) -> Self {
+        match (has_profile_jar, writable) {
+            (false, _) => Self::EphemeralByRequest,
+            (true, true) => Self::Persistent,
+            (true, false) => Self::NoJarLockHeldElsewhere,
+        }
+    }
+
+    /// The wire/trace name. One spelling, so a trace line and a notice can never
+    /// disagree about which mode a surface opened in.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::EphemeralByRequest => "ephemeral_by_request",
+            Self::NoJarLockHeldElsewhere => "no_jar_lock_held_elsewhere",
+        }
+    }
+
+    /// Does the surface keep the profile's cookies? The field the degradation
+    /// is actually ABOUT, kept separate from the mode name so a future fourth
+    /// mode has to answer it rather than inherit an answer.
+    fn keeps_cookies(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+
+    /// What the user is owed, in their own terms: not "the write lock is held"
+    /// but "you will be logged out and it will not stick". `None` when nothing
+    /// surprising happened.
+    fn notice(self, profile: &str) -> Option<(String, String)> {
+        match self {
+            Self::Persistent | Self::EphemeralByRequest => None,
+            Self::NoJarLockHeldElsewhere => Some((
+                format!("\"{profile}\" opened without its cookies"),
+                format!(
+                    "Another window or client already holds the \"{profile}\" profile, and two \
+                     of them writing one cookie jar corrupts it. This surface therefore opened \
+                     with NO jar: it starts logged out, and anything you sign in to here will \
+                     not be remembered — including the clearance cookie a bot check sets, which \
+                     is why such a login can loop. Close the other holder and reopen the page to \
+                     get the profile back."
+                ),
+            )),
+        }
+    }
+}
+
 /// Reserved profile name for an ephemeral (private-browsing) surface: no jar
 /// on disk, all website data in memory, gone when the surface closes. Owned
 /// here and mirrored by ychrome's picker/standalone handling — a
@@ -59764,16 +59887,38 @@ const WEB_DO_SCROLL_PIN_JS: &str = "(function(){var el=__YGG_REF__;\
 /// contract token: [`web_do_resolved_from_info`] REFUSES a payload that does
 /// not carry it, so collapsing the two phases back into one cannot pass
 /// silently.
+///
+/// ⛔ **`hit.contains(el)` IS NOT HITTABILITY, AND BELIEVING IT WAS IS THE BUG.**
+/// This test used to read `hit===el || el.contains(hit) || hit.contains(el)`.
+/// `elementFromPoint` over a `visibility:hidden` element returns whatever paints
+/// there — on a plain page, `<body>` — and **`<body>` contains every element on
+/// the page**, so the third clause accepted ANY candidate on ANY normal page.
+/// The occlusion check was therefore a no-op wherever it mattered, and the click
+/// went to a point where nothing listens while the response said `onTarget`.
+/// A click reaches an element only when the point lands ON it or on a
+/// DESCENDANT of it, because only then does the event path run through it; an
+/// ancestor hit means the ancestor was clicked, not this node. Found in the
+/// engine plane first (`ychrome` `c547aa6`), fixed here 2026-08-01.
+///
+/// The viewport guard is the second half: `elementFromPoint` outside the
+/// viewport is specified to answer `null`, but reading a rect that is off-screen
+/// and then asking anyway invites a browser-specific accident. A point nobody
+/// can reach is refused by construction, and the payload says WHICH node
+/// intercepted so `target_moved` is actionable instead of merely true.
 const WEB_DO_RESOLVE_PINNED_JS: &str = "(function(){__YGG_PATH_FN__\
     var el=(window.__YGG_PIN_KEY__||[])[0];\
     if(!el)return{found:false,phase:'post_scroll',handle:'lost'};\
     var connected=(el.isConnected!==undefined)?!!el.isConnected\
     :!!(document.contains&&document.contains(el));\
     var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
-    var hit=document.elementFromPoint(cx,cy);\
-    var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
+    var inView=cx>=0&&cy>=0&&cx<=(window.innerWidth||0)&&cy<=(window.innerHeight||0);\
+    var hit=inView?document.elementFromPoint(cx,cy):null;\
+    var onTarget=!!(hit&&(hit===el||(el.contains&&el.contains(hit))));\
+    var name=function(n){return n?(String(n.tagName||'').toLowerCase()\
+    +(n.id?'#'+n.id:'')):null;};\
     return{found:true,phase:'post_scroll',x:cx,y:cy,w:r.width,h:r.height,\
-    onTarget:!!onTarget,visible:r.width>0&&r.height>0,isConnected:connected,\
+    onTarget:onTarget,inViewport:inView,hit:name(hit),\
+    visible:r.width>0&&r.height>0,isConnected:connected,\
     cssPath:__yggPath(el),tag:el.tagName};})()";
 
 /// Focus the PINNED element (index 0 unless composed otherwise).
@@ -59835,21 +59980,48 @@ const WEB_DO_LIVE_FN_JS: &str = "\
     if(t&&__yggLive(t))found=t;}\
     return found;};";
 
-/// The ONE css resolution rule: `querySelectorAll(sel)[nth]`, with the match
-/// COUNT reported.
+/// The ONE css resolution rule: classify every match with `__yggLive`, keep the
+/// hittable ones, and answer `live[nth]` — with the counts reported.
 ///
-/// `querySelector` was the old rule and it is the duplicate-id defect: a page
+/// `querySelector` was the FIRST rule and it is the duplicate-id defect: a page
 /// that renders two form blocks with the same ids answers with the first, every
-/// time, and says nothing about the other eight. Counting is not optional here —
-/// an ambiguous resolution that reports nothing is the same class of lie as a
-/// stale rect.
+/// time, and says nothing about the other eight. Counting fixed the silence.
+///
+/// ⛔ **Counting was not enough, and the gap was measured.** Until 2026-08-01
+/// this arm took `querySelectorAll(sel)[nth]` off the RAW pool and hard-coded
+/// `hidden:0` — the liveness predicate ran only in the `Role` arm. On a page
+/// that carries a `visibility:hidden` duplicate AHEAD of the real control
+/// (IBKR's login page has six-plus `button[type=submit]`, five of them dead)
+/// the decoy measures a real rect, so nothing geometric refuses it, and the
+/// click was dispatched into the void and reported as a success. A hidden
+/// duplicate is NOISE, not ambiguity: it never reaches the pool, so `nth`
+/// counts hittable matches and `matches` reports how many survived. This is the
+/// same predicate and the same vocabulary the engine plane uses
+/// (`ychrome` `src/engine/js.rs::CLICK_POOL`) — one word per refusal across
+/// both planes is the invariant, not a coincidence.
+///
+/// ⚠ **This changes `fill`/`type`/`key` too, deliberately, and here is the
+/// reasoning so it is not undone by surprise.** One [`WebElementRef`] has ONE
+/// matcher, so a node the click plane will not touch is not addressable by the
+/// typing plane either. That is the right default: a `display:none`,
+/// `visibility:hidden` or `0x0` field is one a human cannot focus or type into,
+/// so a fill that "succeeded" into it was already a lie-of-success — and the
+/// resolver refused `zero_size_element` on the click path for that exact reason
+/// long before this change. The pattern people worry about, a real `<input>`
+/// hidden behind styled OTP boxes, is normally `opacity: 0` with a real rect,
+/// and `__yggLive` deliberately does NOT filter opacity, so it still resolves.
+/// Anything genuinely undisplayable now refuses BY NAME (`no_hittable_match`),
+/// which is recoverable — `web eval` writes a value the DOM will not accept
+/// from a keyboard — rather than silently doing nothing.
 fn web_css_matcher_js(selector: &str, nth: usize) -> String {
     format!(
-        "(function(){{var els=document.querySelectorAll({sel});\
-         window.{key}={{n:els.length,nth:{nth},hidden:0}};\
-         return els[{nth}]||null;}})()",
+        "(function(){{var all=document.querySelectorAll({sel});\
+         __YGG_LIVE_FN__\
+         var live=[],dead=0;\
+         for(var i=0;i<all.length;i++){{if(__yggLive(all[i]))live.push(all[i]);else dead++;}}\
+         window.__YGG_MATCH_KEY__={{n:live.length,nth:{nth},hidden:dead}};\
+         return live[{nth}]||null;}})()",
         sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
-        key = WEB_DO_MATCH_KEY,
     )
 }
 
@@ -59880,11 +60052,15 @@ fn web_element_ref_js_raw(target: &WebElementRef) -> String {
             tag,
             nth,
         } => {
-            // Candidate pool, match, then drop any candidate that CONTAINS
-            // another candidate: on a substring match the whole ancestor chain
-            // up to <body> matches, and clicking <body> is never what was
-            // meant. Document order + innermost-wins + `nth` is fully
+            // Candidate pool, match, DROP THE DEAD, then drop any survivor that
+            // CONTAINS another survivor: on a substring match the whole ancestor
+            // chain up to <body> matches, and clicking <body> is never what was
+            // meant. Document order + liveness + innermost-wins + `nth` is fully
             // deterministic — the same page always yields the same node.
+            //
+            // Liveness runs BEFORE innermost-wins on purpose: a hidden inner
+            // span must not suppress the visible ancestor that is the only thing
+            // a human can actually click.
             let pool = tag.clone().unwrap_or_else(|| {
                 "a,button,input,select,textarea,label,summary,\
                  [role],[onclick],[tabindex],div,span,td,th,li,p,h1,h2,h3,h4"
@@ -59901,12 +60077,15 @@ fn web_element_ref_js_raw(target: &WebElementRef) -> String {
                  if(!t)t=norm(e.innerText||e.textContent);\
                  if(!t)continue;\
                  if(exact?(t===want):(t.indexOf(want)!==-1))out.push(e);}}\
+                 __YGG_LIVE_FN__\
+                 var alive=[],dead=0;\
+                 for(var j=0;j<out.length;j++){{if(__yggLive(out[j]))alive.push(out[j]);else dead++;}}\
                  var inner=[];\
-                 for(var j=0;j<out.length;j++){{var keep=true;\
-                 for(var k=0;k<out.length;k++){{if(k!==j&&out[j].contains&&out[j].contains(out[k]))\
+                 for(var j=0;j<alive.length;j++){{var keep=true;\
+                 for(var k=0;k<alive.length;k++){{if(k!==j&&alive[j].contains&&alive[j].contains(alive[k]))\
                  {{keep=false;break;}}}}\
-                 if(keep)inner.push(out[j]);}}\
-                 window.__YGG_MATCH_KEY__={{n:inner.length,nth:nth,hidden:0}};\
+                 if(keep)inner.push(alive[j]);}}\
+                 window.__YGG_MATCH_KEY__={{n:inner.length,nth:nth,hidden:dead}};\
                  return inner[nth]||null;}})()",
                 pool = quote(&pool),
                 want = quote(text),
@@ -60072,7 +60251,8 @@ impl MatchDiag {
 
     /// Everything the matcher found was hidden or stale. A pick that lands here
     /// must refuse — clicking a dead MUI option is exactly the silent no-op the
-    /// filing agent hit.
+    /// filing agent hit, and clicking a `visibility:hidden` submit duplicate is
+    /// the same no-op on a login page.
     fn only_stale(&self) -> bool {
         self.matches == 0 && self.hidden > 0
     }
@@ -60080,15 +60260,33 @@ impl MatchDiag {
 
 /// The ONE refusal message for a matcher that produced no usable element.
 ///
-/// `stale_listbox_only` and `no element matches` are different diagnoses and the
-/// caller acts differently on them (dismiss the dead popper vs. fix the
-/// selector), so they are different messages — from one owner, so a click and a
-/// fill can never phrase the same failure two ways.
+/// Three diagnoses, because the caller acts differently on each: dismiss the
+/// dead popper (`stale_listbox_only`), stop believing the page has a clickable
+/// copy of this thing (`no_hittable_match`), or fix the selector
+/// (`no element matches`). One owner, so a click and a fill can never phrase the
+/// same failure two ways.
+///
+/// `no_hittable_match` is the engine plane's word for exactly this state
+/// (`ychrome` `src/engine/api.rs`), and it is spelled the same here on purpose.
+/// It only became reachable on this plane once the CSS and text matchers started
+/// filtering for liveness — before that an all-hidden pool was answered WITH one
+/// of the hidden nodes, which is the bug, not a refusal.
 fn web_do_match_refusal(target: &WebElementRef, diag: Option<MatchDiag>) -> String {
+    let picking_from_a_popper = matches!(
+        target,
+        WebElementRef::Role { role, .. }
+            if role.eq_ignore_ascii_case("option") || role.eq_ignore_ascii_case("menuitem")
+    );
     match diag {
-        Some(diag) if diag.only_stale() => format!(
+        Some(diag) if diag.only_stale() && picking_from_a_popper => format!(
             "stale_listbox_only ({} matched {} hidden/stale node(s) and nothing live — \
              dismiss the open popper and retry)",
+            target.describe(),
+            diag.hidden
+        ),
+        Some(diag) if diag.only_stale() => format!(
+            "no_hittable_match ({} matched {} element(s) and NONE could receive a click \
+             (hidden, zero-size or aria-hidden) — refusing rather than dispatching into the void)",
             target.describe(),
             diag.hidden
         ),
@@ -60263,15 +60461,29 @@ fn web_do_resolved_from_info(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Err(format!("{} matched a zero-size element", target.describe()));
+        return Err(format!(
+            "zero_size_element ({} matched a zero-size element)",
+            target.describe()
+        ));
     }
     if !info
         .get("onTarget")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
+        // Name what intercepted, because "it moved" and "an overlay is over it"
+        // are different problems with different remedies and the caller cannot
+        // tell them apart from the refusal alone.
+        let landed = match (
+            info.get("inViewport").and_then(Value::as_bool),
+            info.get("hit").and_then(Value::as_str),
+        ) {
+            (Some(false), _) => " — its centre is outside the viewport".to_string(),
+            (_, Some(hit)) => format!(" — the point lands on {hit}"),
+            _ => String::new(),
+        };
         return Err(format!(
-            "target_moved (the resolved point no longer hits {})",
+            "target_moved (the resolved point no longer hits {}{landed})",
             target.describe()
         ));
     }
@@ -64277,7 +64489,9 @@ mod web_do_verb_tests {
             css.contains("document.querySelectorAll(\"#login\")"),
             "{css}"
         );
-        assert!(css.contains("els[0]"), "{css}");
+        // Indexed out of the LIVE pool, not the raw node list — see
+        // `every_matcher_filters_for_liveness_not_only_the_role_arm`.
+        assert!(css.contains("live[0]"), "{css}");
 
         let by_text = web_element_ref_js(&WebElementRef::Text {
             text: "Proceed to Pay".into(),
@@ -64293,8 +64507,10 @@ mod web_do_verb_tests {
             "{by_text}"
         );
         assert!(by_text.contains("exact=true"), "{by_text}");
-        // Innermost-wins is what stops a substring match selecting <body>.
-        assert!(by_text.contains("contains(out[k])"), "{by_text}");
+        // Innermost-wins is what stops a substring match selecting <body>, and
+        // it runs over the LIVE survivors so a hidden inner span cannot suppress
+        // the visible ancestor a human would actually click.
+        assert!(by_text.contains("contains(alive[k])"), "{by_text}");
 
         let by_role = web_element_ref_js(&WebElementRef::Role {
             role: "BUTTON".into(),
@@ -64686,9 +64902,25 @@ mod web_do_verb_tests {
             scroll.contains(&format!("window.{WEB_DO_PIN_KEY}=[el]")),
             "phase A must PIN what it scrolled to: {scroll}"
         );
+        // Phase A DOES read a rect now — the liveness predicate has to, or a
+        // `display:none` decoy is indistinguishable from a real control — so
+        // the invariant is not "no measurement", it is **no measurement the
+        // injector can act on**. Two locks hold that: phase A's payload carries
+        // no geometry at all, and every rect it reads belongs to the shared
+        // liveness predicate, which spends it on a boolean and nothing else.
         assert!(
-            !scroll.contains("getBoundingClientRect"),
-            "phase A must not measure — any rect it took would be pre-scroll: {scroll}"
+            scroll.contains("return{found:true,isConnected:connected,scrollTopBefore:top,match:m};"),
+            "phase A's payload must stay geometry-free — any rect in it would be \
+             pre-scroll: {scroll}"
+        );
+        assert!(
+            !scroll.contains("elementFromPoint"),
+            "hit-testing a pre-scroll point is the same lie as reporting one: {scroll}"
+        );
+        assert_eq!(
+            scroll.matches("getBoundingClientRect").count(),
+            WEB_DO_LIVE_FN_JS.matches("getBoundingClientRect").count(),
+            "the only rect phase A may read is the liveness predicate's: {scroll}"
         );
 
         let measure = web_do_script_common(WEB_DO_RESOLVE_PINNED_JS);
@@ -64718,19 +64950,21 @@ mod web_do_verb_tests {
             first.contains("querySelectorAll(\"#Name\")"),
             "counting requires querySelectorAll: {first}"
         );
-        assert!(first.contains("els[0]"), "{first}");
+        assert!(first.contains("live[0]"), "{first}");
         assert!(
             first.contains(&format!("window.{WEB_DO_MATCH_KEY}")),
             "{first}"
         );
 
         // `--nth 1` reaches the second block. `Css(s)` IS `CssNth{s,0}`: same
-        // matcher, same description.
+        // matcher, same description. The index counts HITTABLE matches, because
+        // a `visibility:hidden` duplicate is noise rather than a block anyone
+        // meant to address.
         let second = web_element_ref_js(&WebElementRef::CssNth {
             css: "#Name".into(),
             nth: 1,
         });
-        assert!(second.contains("els[1]"), "{second}");
+        assert!(second.contains("live[1]"), "{second}");
         assert_eq!(
             web_element_ref_js(&WebElementRef::CssNth {
                 css: "#Name".into(),
@@ -64849,6 +65083,265 @@ mod web_do_verb_tests {
             !role.contains("return pool[nth]||null"),
             "answering straight out of the unfiltered pool is the defect: {role}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // THE HIDDEN-DUPLICATE FAMILY (found on the engine plane 2026-07-31,
+    // fixed there in `ychrome` c547aa6, fixed HERE 2026-08-01).
+    //
+    // One page shape produced both halves: a `visibility:hidden` duplicate
+    // ahead of the real control. It measures a real rect, so the CSS matcher
+    // handed it over; its centre hits `<body>`, and `<body>` contains every
+    // element, so the occlusion check waved it through. Success, reported,
+    // into the void.
+    // ------------------------------------------------------------------
+
+    // Half one: every matcher classifies for liveness, not just the role arm.
+    // A hidden duplicate must never enter the pool, so `nth` counts things a
+    // human could click and `matches` reports how many survived.
+    #[test]
+    fn every_matcher_filters_for_liveness_not_only_the_role_arm() {
+        for target in [
+            WebElementRef::Css("button[type=submit]".into()),
+            WebElementRef::CssNth {
+                css: "button[type=submit]".into(),
+                nth: 2,
+            },
+            WebElementRef::Text {
+                text: "Login".into(),
+                exact: false,
+                tag: None,
+                nth: None,
+            },
+            WebElementRef::Role {
+                role: "button".into(),
+                label: "Login".into(),
+                nth: None,
+            },
+            WebElementRef::Role {
+                role: "option".into(),
+                label: "PASSPORT".into(),
+                nth: None,
+            },
+        ] {
+            // Read the arm BEFORE substitution: there, `__YGG_LIVE_FN__` is
+            // still a placeholder, so every `__yggLive(` left in the text is a
+            // CALL the arm makes rather than one inside the shared definition.
+            // Asserting on the substituted script would pass for an arm that
+            // merely pastes the predicate in and never applies it — which is
+            // exactly the mutation this lock exists to catch.
+            let raw = web_element_ref_js_raw(&target);
+            assert!(
+                raw.contains("__YGG_LIVE_FN__"),
+                "{} must pull in the ONE liveness predicate: {raw}",
+                target.describe()
+            );
+            assert!(
+                raw.contains("if(__yggLive("),
+                "{} must APPLY the predicate to each candidate, not merely \
+                 define it: {raw}",
+                target.describe()
+            );
+            assert!(
+                raw.contains("else dead++;"),
+                "{} must COUNT what the predicate rejected, or an all-hidden pool \
+                 is indistinguishable from an empty page: {raw}",
+                target.describe()
+            );
+
+            let js = web_element_ref_js(&target);
+            assert!(
+                js.contains("hidden:dead"),
+                "{} must report how many candidates it dropped, or `no_hittable_match` \
+                 can never be reached: {js}",
+                target.describe()
+            );
+            assert!(
+                !js.contains("hidden:0"),
+                "a hard-coded drop count is the defect — it made every pool look clean: {js}"
+            );
+        }
+
+        // And the CSS arm specifically must not index the RAW node list. That
+        // expression IS the reported bug: `querySelectorAll(sel)[nth]` answers
+        // with the decoy on any page that carries one.
+        let css = web_element_ref_js(&WebElementRef::Css("button[type=submit]".into()));
+        assert!(
+            !css.contains("return els[0]||null") && !css.contains("return all[0]||null"),
+            "the css arm must answer out of the LIVE pool, never the raw one: {css}"
+        );
+        assert!(
+            css.contains("return live[0]||null"),
+            "the css arm must answer `live[nth]`: {css}"
+        );
+    }
+
+    // Half two: an ancestor hit is not a hit. `<body>` contains everything, so
+    // accepting `hit.contains(el)` accepted every candidate on every normal
+    // page and made the whole occlusion check a no-op.
+    #[test]
+    fn an_ancestor_hit_is_not_a_hit() {
+        let js = WEB_DO_RESOLVE_PINNED_JS;
+        assert!(
+            !js.contains("hit.contains(el)"),
+            "an ancestor hit means the ANCESTOR was clicked, not this node: {js}"
+        );
+        assert!(
+            js.contains("hit===el||(el.contains&&el.contains(hit))"),
+            "the point must land ON the node or on a DESCENDANT of it: {js}"
+        );
+        assert!(
+            js.contains("inView?document.elementFromPoint"),
+            "a centre outside the viewport must refuse by construction, not by \
+             trusting elementFromPoint to answer null: {js}"
+        );
+
+        // …and the refusal has to say WHICH node intercepted, or the caller
+        // cannot tell an overlay from a node that moved.
+        let target = WebElementRef::Css("#login".into());
+        let err = web_do_resolved_from_info(
+            &target,
+            &resolved_info(json!({"onTarget": false, "hit": "div#cookie-wall"})),
+            None,
+        )
+        .expect_err("an occluded target must refuse");
+        assert!(err.starts_with("target_moved"), "{err}");
+        assert!(err.contains("div#cookie-wall"), "{err}");
+
+        let err = web_do_resolved_from_info(
+            &target,
+            &resolved_info(json!({"onTarget": false, "inViewport": false})),
+            None,
+        )
+        .expect_err("an off-screen centre must refuse");
+        assert!(err.contains("outside the viewport"), "{err}");
+    }
+
+    // Half three: one word per refusal across both planes. An all-hidden CSS
+    // pool is `no_hittable_match` — the engine's spelling — while the popper
+    // diagnosis stays reserved for the pick that actually has a popper.
+    #[test]
+    fn an_all_hidden_pool_refuses_with_the_engines_word_for_it() {
+        let only_hidden = Some(MatchDiag {
+            matches: 0,
+            nth: 0,
+            hidden: 6,
+        });
+
+        let css = web_do_match_refusal(&WebElementRef::Css("button[type=submit]".into()), only_hidden);
+        assert!(css.starts_with("no_hittable_match"), "{css}");
+        assert!(css.contains('6'), "the drop count is the evidence: {css}");
+
+        let text = web_do_match_refusal(
+            &WebElementRef::Text {
+                text: "Login".into(),
+                exact: false,
+                tag: None,
+                nth: None,
+            },
+            only_hidden,
+        );
+        assert!(text.starts_with("no_hittable_match"), "{text}");
+
+        // A non-popper role is not a popper either.
+        let button = web_do_match_refusal(
+            &WebElementRef::Role {
+                role: "button".into(),
+                label: "Login".into(),
+                nth: None,
+            },
+            only_hidden,
+        );
+        assert!(button.starts_with("no_hittable_match"), "{button}");
+
+        // The popper diagnosis survives where it belongs, and only there.
+        for role in ["option", "menuitem", "MenuItem"] {
+            let popper = web_do_match_refusal(
+                &WebElementRef::Role {
+                    role: role.into(),
+                    label: "PASSPORT".into(),
+                    nth: None,
+                },
+                only_hidden,
+            );
+            assert!(popper.starts_with("stale_listbox_only"), "{popper}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // THE JAR A SURFACE ACTUALLY OPENED ON (ychrome: "the login will not
+    // stick", 2026-07-31).
+    //
+    // The one-writer-per-profile rule is right. Handing the loser an
+    // EPHEMERAL context while calling it "read-only" in the comment beside
+    // it was not, and neither was doing it in silence.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_surface_that_lost_the_profile_lock_says_so_once_and_in_the_users_terms() {
+        use WebSurfaceJarMode as Mode;
+
+        // The rule.
+        assert_eq!(Mode::decide(true, true), Mode::Persistent);
+        assert_eq!(Mode::decide(true, false), Mode::NoJarLockHeldElsewhere);
+        assert_eq!(Mode::decide(false, true), Mode::EphemeralByRequest);
+        assert_eq!(
+            Mode::decide(false, false),
+            Mode::EphemeralByRequest,
+            "a profile with no jar was never asking for one — the lock cannot \
+             degrade what does not exist"
+        );
+
+        // The field the degradation is actually about.
+        assert!(Mode::Persistent.keeps_cookies());
+        assert!(
+            !Mode::NoJarLockHeldElsewhere.keeps_cookies(),
+            "this is the whole bug: no jar means no cookies, which is NOT \
+             read-only"
+        );
+        assert!(!Mode::EphemeralByRequest.keeps_cookies());
+
+        // Only the surprising mode speaks, and it speaks about cookies and
+        // logins rather than about write locks.
+        assert!(Mode::Persistent.notice("work").is_none());
+        assert!(
+            Mode::EphemeralByRequest.notice("temp").is_none(),
+            "private browsing leaving no trace is the FEATURE — announcing it \
+             would train the user to dismiss the notice that matters"
+        );
+        let (title, body) = Mode::NoJarLockHeldElsewhere
+            .notice("finance")
+            .expect("the degradation the user meets must be announced");
+        assert!(title.contains("finance"), "{title}");
+        for owed in ["logged out", "not be remembered", "bot check"] {
+            assert!(
+                body.contains(owed),
+                "the notice must name the symptom the user will actually hit \
+                 ({owed}): {body}"
+            );
+        }
+        assert!(
+            body.contains("Close the other holder"),
+            "a notice with no remedy is just an apology: {body}"
+        );
+
+        // One spelling per mode, shared by the trace line and the notice.
+        assert_eq!(Mode::NoJarLockHeldElsewhere.as_str(), "no_jar_lock_held_elsewhere");
+        assert_eq!(Mode::Persistent.as_str(), "persistent");
+        assert_eq!(Mode::EphemeralByRequest.as_str(), "ephemeral_by_request");
+    }
+
+    // A zero-size match is `zero_size_element` on both planes. It used to be a
+    // bare English sentence here, which is how one refusal came to have two
+    // names.
+    #[test]
+    fn a_zero_size_match_refuses_by_the_shared_name() {
+        let err = web_do_resolved_from_info(
+            &WebElementRef::Css("#file".into()),
+            &resolved_info(json!({"visible": false})),
+            None,
+        )
+        .expect_err("a zero-size element must refuse");
+        assert!(err.starts_with("zero_size_element"), "{err}");
     }
 
     // DEFECT 1's other half: WHICH mechanism runs. Per-key GTK injection is
