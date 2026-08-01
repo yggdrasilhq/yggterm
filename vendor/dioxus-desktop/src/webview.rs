@@ -736,6 +736,31 @@ impl WebviewInstance {
                         |_| {},
                     );
                 });
+                // The PAGE MENU's entries, relayed the same way and for the
+                // same reason: the shell owns what an id means, this layer only
+                // carries. The click point rides along because a page verb that
+                // acts on "what you right-clicked" cannot ask afterwards —
+                // WebKit's menu is gone by then and the pointer has moved.
+                let shell_webkit = desktop_context.webview.webview();
+                host.set_page_menu_notifier(move |invocation| {
+                    let cancellable: Option<&gtk::gio::Cancellable> = None;
+                    #[allow(deprecated)]
+                    shell_webkit.run_javascript(
+                        &format!(
+                            "window.__yggtermPageMenuFromHost && \
+                             window.__yggtermPageMenuFromHost('{}',{},{},{});",
+                            invocation
+                                .item_id
+                                .replace('\\', "\\\\")
+                                .replace('\'', "\\'"),
+                            invocation.surface_id,
+                            invocation.x,
+                            invocation.y,
+                        ),
+                        cancellable,
+                        |_| {},
+                    );
+                });
                 // ONE attachment point, on the one toplevel — see
                 // `connect_window_chord_claimer`. A per-surface claimer would
                 // have to be remembered at every door a focusable child is
