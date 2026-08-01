@@ -273,6 +273,22 @@ row; `on_chrome` uses luminance-aware text against the variable titlebar chrome
 This is distinct from a binary on/off SWITCH (track + sliding thumb,
 `inline_toggle_*`), used for Auto-hide Titlebar, Sound, etc. — leave those alone.
 
+#### The surface switch has ONE home
+
+"What is this session's viewport showing" is answered by exactly one control:
+the titlebar slot (`.yggterm-titlebar-view-toggle`, driven by
+`TitlebarSurfaceSwitch`). It shows an agent CLI's **Web View | Terminal**, or a
+libyggterm app's **Document | Terminal**, or nothing — and when it shows
+nothing it keeps its footprint, hidden and inert, so the titlebar does not
+shuffle.
+
+⛔ **Never float a second copy over a viewport.** A terminal and a document
+surface both fill their rect edge to edge and reserve no space for chrome, so an
+`position:absolute` pill lands on top of the content — which is exactly what
+happened to yedit: the Document|Terminal pill drew over the first line of the
+document it controlled. Chrome that needs space takes it in FLOW, in the
+titlebar, or it does not exist.
+
 #### Primary buttons
 
 Primary actions should look unmistakably clickable.
@@ -509,6 +525,13 @@ Notifications are reusable shell components, not one-off project afterthoughts.
 - Notification history panels are acceptable when the product benefits from persistent event history.
 - Clear-one and clear-all actions should be supported when a notification panel exists.
 - In-app toasts should usually sit horizontally centered near the top of the app, not pinned to a screen edge.
+- **The anchor belongs to the viewport, not to the toast.** Top-centre is the
+  default and is right over a terminal, whose newest output and prompt live at
+  the BOTTOM. Over a document the top of the viewport is the title and the first
+  line being read, so the stack moves to the bottom corner **on the rail's
+  edge** — directional chrome follows the mirror. `ToastAnchor` owns all three
+  placements and every arm emits an identical style-key set; a bottom anchor
+  reverses the stack so the newest toast stays nearest its edge.
 - Long-running work such as generation, caching, indexing, sync, or remote bootstrap should use reusable job notifications with a visible progress bar.
 - Background jobs should not be silent; if the work may take more than a moment, the shell should make that work legible.
 - Job notifications should coalesce by task identity instead of stacking duplicate progress cards.
