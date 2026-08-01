@@ -4,6 +4,88 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.12.21
+
+- **New: you can put the sidebars on the other side.** Settings → Window Chrome
+  → **Mirror Chrome** flips the app's chrome about its vertical centre line: the
+  cwd tree, the titlebar's two-phase toggle and the **+** button move right, and
+  the right-hand rail and its trigger buttons move left. The search box does not
+  move — it is the axis. Everything that has a direction flips with it: the
+  panels' slide-in, their drop shadows, the resize grips (always on a panel's
+  inner edge), the titlebar popovers' growth direction, the attached panel's
+  square corner, and the page-edge reveal that lets you reach a panel over a
+  full-bleed web page. The window's minimise/maximise/close buttons deliberately
+  stay put — those belong to your desktop, not to yggterm. Some people read
+  left-to-right chrome and some the other way; this is a preference, not a
+  locale, so row indentation, disclosure chevrons and text alignment are
+  unchanged.
+
+- **Fixed: the close button no longer sits on an ugly white smudge.** The ✕ and
+  the folder-row verbs used to float on a frosted chip so the title would never
+  reflow, which meant the title ran *underneath* them and they read as a smear
+  rather than as buttons — on the sidebar cwd tree, on ychrome's folder rows and
+  in yedit, all from one rule. They are back in the row now: invisible and
+  costing no width at all until you hover, select, or reach the row by keyboard,
+  and then the title simply truncates to make room, the way every file tree
+  does.
+
+- **Fixed: your background browser tabs stop being thrown away while the machine
+  has plenty of memory.** A backgrounded web surface was destroyed on a
+  ten-minute clock that consulted no memory reading whatsoever. On the live host
+  that clock accounted for **134 of 182 page teardowns, and you reopened 109 of
+  them** — 49 within half an hour — each one paying a full rebuild plus its lost
+  scroll position, form state and SPA route. Across 403 memory samples the
+  machine was comfortable every single time. A page is now kept indefinitely
+  while memory is comfortable, still parked on the old clock when memory is
+  tight, and still dropped fast under real pressure. Backgrounded tabs stay
+  throttled and paused as before, so this costs idle CPU nothing.
+
+- **New: the browser keys a browser is expected to have.** `F5` and `Ctrl+R`
+  reload, `Ctrl+Shift+R` reloads past the cache, `Ctrl+T` opens a tab with the
+  cursor already in the address box, `Ctrl+L` selects the address, `Ctrl+W`
+  closes the tab, and `F12` / `Ctrl+Shift+I` toggle developer tools. They exist
+  only while a browser owns the keyboard, and by construction they cannot
+  collide with the ALT/KeyTip layer — that layer is forbidden from claiming bare
+  `Ctrl+<letter>` and bare function keys, which is exactly the shape these take.
+
+- **New: screenshots of a web page are a first-class thing, from the menu and
+  from the command line.** Right-click a page for **visible area**, **full
+  page**, **this element** and **selected area**. The same four are scriptable
+  for agents (`ychrome ctl shot … region=full|element|rect`), and full-page is a
+  real single-shot render of the whole document rather than a stitched scroll,
+  so there are no seams and no repeated sticky header. `prescroll=true` walks
+  the page first for sites that only load content as it comes into view.
+
+- **New: automations — run an agent session on a schedule and have it cleaned
+  up.** Describe the job once (which CLI, which machine, which folder, what to
+  say to it, and when), and yggterm writes both its own record and a real
+  systemd timer, so `systemctl --user list-timers` shows it beside everything
+  else on the machine. A run opens the session detached, delivers the prompt,
+  and the session closes itself once it has been quiet for its idle budget. A
+  run that is still going long past its budget is never killed — it raises a
+  notice that survives restarts and reboots and clears only when you say so. A
+  job missed because the machine was asleep runs late only if it can still start
+  inside its grace window, so a 3 a.m. boot picks up the midnight job and a
+  Wednesday afternoon boot does not ambush you with it. "Every two weeks on
+  Sunday" is expressible and does not drift.
+
+- **Fixed: `ychrome-vault totp` refuses instead of guessing when the clock is
+  wrong.** A host 72 seconds out produced six well-formed digits that were
+  always wrong, with no warning — and waiting never helped, because a constant
+  skew never drifts into the right window. It now asks the kernel whether the
+  clock is actually disciplined and says the clock is the problem. `ychrome-vault
+  clock` reports what it sees; `--ignore-clock` overrides deliberately.
+
+- **Fixed: ychrome kept two separate HTTP caches.** The agent engine wrote its
+  cache one directory below the browser's, so the two never shared a byte and
+  each profile paid every download twice.
+
+- **Fixed: clicking an element by CSS could hit an invisible duplicate.** The
+  matcher counted hidden elements as candidates, and its "is this really on top"
+  check accepted `<body>` as the answer — which is true of every element on
+  every page, so the check never refused anything.
+
+
 - **New: the camera and the microphone work in the browser — and a page only
   gets them when you say so.** Until now a page that called `getUserMedia()` on
   a yggterm web surface simply **hung**: WebKitGTK raised its
