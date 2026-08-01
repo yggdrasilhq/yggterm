@@ -27,6 +27,41 @@ use std::path::{Path, PathBuf};
 /// `web-profiles/temp/` directory on disk is ignored by design.
 pub const WEB_PROFILE_TEMP: &str = "temp";
 
+/// The directory under `~/.yggterm` that holds every profile jar.
+pub const WEB_PROFILES_DIRNAME: &str = "web-profiles";
+
+/// The jar ROOT on this host: `~/.yggterm/web-profiles`.
+///
+/// Here rather than at each caller for the reason the rest of this module
+/// exists: the GUI, the daemon and the `collection` verbs all address the same
+/// directory, and a second spelling of the path is a second answer to "where
+/// does this profile live". `None` when this host has no resolvable home.
+pub fn web_profiles_root() -> Option<PathBuf> {
+    crate::resolve_yggterm_home().ok().map(web_profiles_root_in)
+}
+
+/// The jar root inside an arbitrary yggterm home — the testable half of
+/// [`web_profiles_root`], and what a scratch-home lock drives.
+pub fn web_profiles_root_in(yggterm_home: impl AsRef<Path>) -> PathBuf {
+    yggterm_home.as_ref().join(WEB_PROFILES_DIRNAME)
+}
+
+/// One profile's jar directory under `root`. `None` for the ephemeral profile,
+/// which keeps nothing on disk — that is the same answer everywhere, so a
+/// caller cannot accidentally give `temp` a directory.
+pub fn web_profile_dir_in(root: impl AsRef<Path>, profile: &str) -> Option<PathBuf> {
+    let name = normalize_web_profile(Some(profile));
+    if web_profile_is_ephemeral(&name) {
+        return None;
+    }
+    Some(root.as_ref().join(name))
+}
+
+/// One profile's jar directory on this host.
+pub fn web_profile_dir(profile: &str) -> Option<PathBuf> {
+    web_profile_dir_in(web_profiles_root()?, profile)
+}
+
 /// Fallback profile when none is named (or the name is unsafe).
 pub const WEB_PROFILE_DEFAULT: &str = "default";
 

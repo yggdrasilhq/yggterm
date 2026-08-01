@@ -1361,6 +1361,19 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "automation" {
         return yggterm_server::run_automation_cli(&args[1..], AUTOMATION_APP_CONTROL_TIMEOUT_MS);
     }
+    // Collections — history organised into things worth keeping. Same shape as
+    // automations above and ONE owner
+    // (crates/yggterm-server/src/web_collection_cli.rs). Matched before the
+    // daemon handshake because none of these verbs needs a daemon: a collection
+    // is a Markdown file in the profile's own jar.
+    // `snapshot` is matched at the TOP level only — `server snapshot` is the
+    // daemon's own verb and must keep meaning that.
+    if args.first().is_some_and(|arg| arg == "collection" || arg == "snapshot") {
+        return yggterm_server::run_web_collection_cli(&args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "collection" {
+        return yggterm_server::run_web_collection_cli(&args[1..]);
+    }
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();

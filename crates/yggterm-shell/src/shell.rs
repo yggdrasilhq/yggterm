@@ -2018,9 +2018,7 @@ fn web_surface_profile_meta(profile: &str) -> yggterm_core::web_profile::Profile
 /// exercised against a scratch root without an env var the rest of the test
 /// binary would race on.
 fn web_surface_profiles_root() -> Option<std::path::PathBuf> {
-    yggterm_core::resolve_yggterm_home()
-        .ok()
-        .map(|home| home.join("web-profiles"))
+    yggterm_core::web_profile::web_profiles_root()
 }
 fn web_surface_profile_meta_in(
     root: &std::path::Path,
@@ -8986,10 +8984,7 @@ fn web_tab_is_saved(tab_id: u64, url: &str, app_url: &str) -> bool {
 /// reserved ephemeral profile — temp browsing must leave no disk trace,
 /// matching its ephemeral WebContext.
 fn web_surface_history_path(profile: &str) -> Option<std::path::PathBuf> {
-    if profile == WEB_SURFACE_TEMP_PROFILE {
-        return None;
-    }
-    Some(web_surface_profile_dir(profile)?.join("history.jsonl"))
+    yggterm_core::web_history::web_history_path(profile)
 }
 fn append_web_surface_history(profile: &str, url: &str, title: &str) {
     if !web_surface_url_is_page(url) {
@@ -9095,13 +9090,11 @@ fn web_surface_history_suggestions(
     out
 }
 
-/// A visited page, as the internal history viewer needs it.
-#[derive(Debug, Clone, PartialEq)]
-struct WebHistoryEntry {
-    ts_ms: u64,
-    url: String,
-    title: String,
-}
+/// A visited page, as the internal history viewer needs it. The type is
+/// `yggterm_core::web_history`'s, because the viewer is not the only reader any
+/// more — `collection add-from-history` asks the same file the same question
+/// from the CLI, and two shapes would become two answers.
+type WebHistoryEntry = yggterm_core::web_history::WebHistoryEntry;
 
 /// How many history entries the internal viewer renders. A cap bounds the
 /// `data:` URL the page is carried in (it rides the tab model), and a browser
@@ -9111,35 +9104,11 @@ const WEB_HISTORY_PAGE_LIMIT: usize = 1000;
 /// Read a profile's history newest-first, deduped by URL (keeping the most
 /// recent visit), capped. The same file the omnibox reads, so the viewer and the
 /// suggestions never disagree about what was visited.
+///
+/// The read itself lives in `yggterm_core::web_history` — one reader for the
+/// GUI viewer and for the `collection` verbs.
 fn web_surface_history_entries(profile: &str, limit: usize) -> Vec<WebHistoryEntry> {
-    let Some(path) = web_surface_history_path(profile) else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out = Vec::new();
-    for line in raw.lines().rev() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(url) = value.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        if !seen.insert(url.to_string()) {
-            continue;
-        }
-        out.push(WebHistoryEntry {
-            ts_ms: value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0),
-            url: url.to_string(),
-            title: value.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-        });
-        if out.len() >= limit {
-            break;
-        }
-    }
-    out
+    yggterm_core::web_history::web_history_entries(profile, limit)
 }
 
 /// Civil date (year, month, day) from days since the Unix epoch — Howard
@@ -12229,10 +12198,7 @@ const WEB_SURFACE_TEMP_PROFILE: &str = yggterm_core::web_profile::WEB_PROFILE_TE
 /// context: the reserved "temp" profile maps here, so nothing it browses
 /// touches disk.
 fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
-    if profile == WEB_SURFACE_TEMP_PROFILE {
-        return None;
-    }
-    web_surface_profiles_root().map(|root| root.join(profile))
+    yggterm_core::web_profile::web_profile_dir(profile)
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
