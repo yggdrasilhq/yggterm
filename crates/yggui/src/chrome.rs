@@ -1,6 +1,7 @@
 use dioxus::desktop::window;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
+use yggui_contract::SidebarEdge;
 
 use crate::motion::standard_transition;
 
@@ -35,18 +36,92 @@ pub struct ChromePalette {
     pub is_dark: bool,
 }
 
+/// The absolutely-positioned box one titlebar cluster lives in.
+///
+/// Every key is emitted in both orientations — `left` AND `right`, always — so
+/// flipping the mirror cannot leave the previous anchor behind. Dioxus applies
+/// `style` property-by-property and never clears a key the next render drops;
+/// a cluster that anchored by omitting the other side would end up pinned to
+/// both edges and stretch across the titlebar.
+fn titlebar_cluster_outer_style(edge: SidebarEdge, inset_px: i32) -> String {
+    format!(
+        "position:absolute; z-index:1; {}:8px; {}:auto; top:0; bottom:0; min-width:0; \
+         max-width:calc(100% - 16px); height:100%; display:flex; align-items:center; \
+         justify-content:{}; padding-left:{}px; padding-right:0px; box-sizing:border-box; \
+         pointer-events:none;",
+        edge.css_near(),
+        edge.css_far(),
+        edge.css_justify(),
+        if edge == SidebarEdge::Left { inset_px } else { 0 },
+    )
+}
+
+/// The inner strip that actually holds a cluster's controls.
+///
+/// `row-reverse` is what makes the mirror a REFLECTION rather than a
+/// translation: the control nearest the search box stays nearest the search
+/// box, and the one nearest the window edge stays nearest the window edge — so
+/// the `☰` that opens the tree still sits against the tree's own edge after the
+/// flip. `flex-direction` is emitted in both branches for the same style-key
+/// reason as above.
+fn titlebar_cluster_inner_style(mirrored: bool, justify: &str) -> String {
+    format!(
+        "display:inline-flex; flex-direction:{}; align-items:center; justify-content:{}; \
+         min-width:0; max-width:100%; height:100%; pointer-events:auto;",
+        if mirrored { "row-reverse" } else { "row" },
+        justify,
+    )
+}
+
 #[component]
 pub fn TitlebarChrome(
     background: String,
     zoom_percent: f32,
-    left: Element,
+    /// Which physical window edge the `leading` cluster sits against — the
+    /// answer `ChromeOrientation::edge(ChromeSlot::Tree)` gave. `trailing` takes
+    /// the other edge; `center` is the mirror's AXIS and never moves.
+    ///
+    /// This component does not consult a setting and does not decide a side. It
+    /// is told one edge and derives everything from it, which is why there is
+    /// only ever one place that knows what "mirrored" means.
+    leading_edge: SidebarEdge,
+    /// Reserved space at the PHYSICALLY LEFT cluster for window buttons the OS
+    /// draws itself (macOS traffic lights). It follows the left edge, not a
+    /// cluster, because the OS does not mirror when we do.
+    leading_inset_px: i32,
+    /// The tree's half of the titlebar: sidebar toggle, view toggle, `+`, chip.
+    leading: Element,
+    /// The search field. Stays put in both orientations.
     center: Element,
-    right: Element,
+    /// The rail's half: connect, tabs, app panes, notifications, settings,
+    /// metadata, overflow.
+    trailing: Element,
+    /// Window-manager chrome (minimise / maximise / close). NOT mirrored — the
+    /// window buttons belong to the platform, sit where the platform puts them,
+    /// and stay physically outermost on their own edge whichever app cluster
+    /// shares it.
+    window_controls: Element,
     on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
 ) -> Element {
     const TITLEBAR_DRAG_THRESHOLD_PX: f64 = 5.0;
     let mut pending_drag_origin = use_signal(|| None::<(f64, f64)>);
+    let mirrored = leading_edge == SidebarEdge::Right;
+    let trailing_edge = leading_edge.opposite();
+    // The two clusters keep their OWN packing in both orientations: the leading
+    // cluster always packs toward its own edge and so does the trailing one.
+    // Under `row-reverse` the main axis start is the right, which is exactly why
+    // these two constants do not flip with the mirror.
+    let leading_inner = titlebar_cluster_inner_style(mirrored, "flex-start");
+    let trailing_inner = titlebar_cluster_inner_style(mirrored, "flex-end");
+    // The window buttons ride whichever cluster shares the PHYSICAL right edge,
+    // always outermost on it. Resolved once, into two slots, so each Element is
+    // consumed exactly once.
+    let (leading_controls, trailing_controls) = if mirrored {
+        (window_controls, rsx! {})
+    } else {
+        (rsx! {}, window_controls)
+    };
     rsx! {
         div {
             style: format!(
@@ -109,10 +184,15 @@ pub fn TitlebarChrome(
                 on_toggle_maximized.call(());
             },
             div {
-                style: "position:absolute; z-index:1; left:8px; top:0; bottom:0; min-width:0; max-width:calc(100% - 16px); height:100%; display:flex; align-items:center; justify-content:flex-start; box-sizing:border-box; pointer-events:none;",
+                "data-yggui-titlebar-cluster": "leading",
+                style: titlebar_cluster_outer_style(leading_edge, leading_inset_px),
                 div {
-                    style: "display:inline-flex; align-items:center; justify-content:flex-start; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
-                    {left}
+                    style: leading_inner,
+                    // Under `row-reverse` the physically-outermost child is the
+                    // FIRST in source order, which is why the controls lead here
+                    // and trail in the other cluster.
+                    {leading_controls}
+                    {leading}
                 }
             }
             div {
@@ -123,10 +203,12 @@ pub fn TitlebarChrome(
                 }
             }
             div {
-                style: "position:absolute; z-index:1; right:8px; top:0; bottom:0; min-width:0; max-width:calc(100% - 16px); height:100%; display:flex; align-items:center; justify-content:flex-end; box-sizing:border-box; pointer-events:none;",
+                "data-yggui-titlebar-cluster": "trailing",
+                style: titlebar_cluster_outer_style(trailing_edge, leading_inset_px),
                 div {
-                    style: "display:inline-flex; align-items:center; justify-content:flex-end; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
-                    {right}
+                    style: trailing_inner,
+                    {trailing}
+                    {trailing_controls}
                 }
             }
         }

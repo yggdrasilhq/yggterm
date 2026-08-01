@@ -69,9 +69,15 @@ pub fn SideRailShell(
     content_style: String,
     /// Present only for an auto-hidden rail. Ignored when docked.
     reveal: Option<SideRailReveal>,
-    /// A resize grip on the rail's inner (left) edge — the host authors it so the
-    /// drag machinery stays in the shell. `None` for a non-resizable rail.
+    /// A resize grip on the rail's INNER edge — whichever side that is; the
+    /// host authors it (and its side) so the drag machinery stays in the shell.
+    /// `None` for a non-resizable rail.
     resize_handle: Option<Element>,
+    /// The label this rail declares itself with when it covers a native web
+    /// surface. Side-free by construction: the host names the PANEL, because a
+    /// mirrored window puts this rail on the left and `"sidebar-right"` would
+    /// then be a lie in the shell's own DOM.
+    cover_label: &'static str,
     body: Element,
 ) -> Element {
     rsx! {
@@ -81,7 +87,7 @@ pub fn SideRailShell(
             "data-yggui-side-rail-auto-hide": if auto_hide { "1" } else { "0" },
             "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
             "data-yggui-side-rail-autohide-pin": if pinned { "1" } else { "0" },
-            "data-covers-web-surface": if revealed { "sidebar-right" },
+            "data-covers-web-surface": if revealed { cover_label },
             style: outer_style,
             onmousedown: |evt| evt.stop_propagation(),
             onclick: |evt| evt.stop_propagation(),
@@ -116,7 +122,7 @@ pub fn SideRailShell(
                 {body}
                 // The grip rides the CARD's inner edge (inside it), so it moves
                 // with the card in every mode — docked and revealed-overlay alike
-                // — exactly as the left tree's grip lives inside its content card.
+                // — exactly as the tree's grip lives inside its content card.
                 if let Some(resize_handle) = resize_handle {
                     {resize_handle}
                 }
