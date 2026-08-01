@@ -49,6 +49,36 @@ Full mission rationale: see `~/.claude/projects/-home-user-gh-yggterm/memory/pro
   `github.com/avikalpa`, remain Apache-2.0 licensed, and expose clean
   integration boundaries that Yggterm can embed without absorbing the whole app.
 
+## ⛔ THE PRESENTATION POLICY — you may not flip these flags
+
+**Read `docs/presentation-policy.md` before touching anything that decides how
+this product draws.** The sanctioned per-platform defaults live in
+`crates/yggterm-core/src/presentation_policy.rs` and are the SSOT for display
+backend, GL, frame delivery and video decode.
+
+Four rules, all of them paid for in the user's time:
+
+1. **Never set a `PRESENTATION_VARS` variable against the user's running GUI.**
+   Not `GDK_BACKEND`, not `LIBGL_ALWAYS_SOFTWARE`, not
+   `WEBKIT_DISABLE_DMABUF_RENDERER`, not any of the rest. To test an arm, use
+   `scripts/underglass-sandbox.sh` or `scripts/web-tear-probe.sh`, which build a
+   throwaway GUI with its own env and its own daemon. **The user's GUI is not a
+   test rig.**
+2. **A Wayland session runs Wayland-native.** Forcing X11 gives XWayland and
+   silently changes compositing, input latency and the terminal renderer at
+   once. Every measurement taken afterwards describes a machine the user does
+   not run.
+3. **What you learned under Xvfb does not travel.** Headless sway and Xvfb ARE
+   X11, so `GDK_BACKEND=x11` is right *there* and wrong on the user's desktop.
+   This exact carry-over has cost hours more than once.
+4. **`/proc/<pid>/environ` cannot tell you what is in force** — these are
+   applied with `set_var` after exec. Read the
+   `gui/startup/linux_desktop_backend_policy` trace event instead.
+
+If a default is wrong, **change the table and say why in the row**, with a
+measurement. Do not work around it with an env var, and do not "just try" one on
+the live host.
+
 ## Engineering constraints
 
 - Primary implementation language: **Rust**.

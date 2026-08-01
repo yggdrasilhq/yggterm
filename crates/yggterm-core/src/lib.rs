@@ -15,6 +15,13 @@ pub mod memory_profile;
 /// native CLI player, so two players can never drift into two chimes.
 pub mod notification_audio;
 mod perf;
+// THE SANCTIONED PRESENTATION DEFAULTS, per platform — the one table that says
+// what this product runs as on each display stack, and the law that agents may
+// not flip those variables against the user's GUI. See
+// docs/presentation-policy.md. It exists because the decision was previously
+// unreadable as a whole (three functions in a binary's main.rs, Linux-only),
+// and the user paid for that in repeated XWayland and software-GL incidents.
+pub mod presentation_policy;
 pub mod render_probe;
 mod retention;
 /// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of

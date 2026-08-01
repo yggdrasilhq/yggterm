@@ -4242,6 +4242,28 @@ fn configure_linux_webkit_compositing() {
             .is_some(),
         },
     );
+    // HARDWARE VIDEO DECODE, from the sanctioned table so the value exists once.
+    //
+    // WebKitGTK decodes through GStreamer, which loads BOTH the VA (hardware)
+    // and libav (software) decoders and chooses by rank. Measured on the live
+    // host with a YouTube video playing: `libgstva.so` and `libgstlibav.so`
+    // were both mapped into the video WebProcess while it burned 58-61% of one
+    // core — software winning a pipeline that had hardware sitting right there,
+    // which the user sees as judder rather than as heat.
+    //
+    // Set only when nobody has answered: an explicit rank is a deliberate act
+    // (a bisect, a broken driver) and this is not the layer that overrules it.
+    if std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none()
+        && let Some(rank) =
+            yggterm_core::presentation_policy::sanctioned(
+                yggterm_core::presentation_policy::PresentationTarget::LinuxWayland,
+            )
+            .iter()
+            .find(|var| var.name == "GST_PLUGIN_FEATURE_RANK")
+            .and_then(|var| var.value)
+    {
+        unsafe { std::env::set_var("GST_PLUGIN_FEATURE_RANK", rank) };
+    }
     for (key, action) in linux_webkit_gl_env_plan_entries(&plan) {
         match action {
             GlEnvAction::Set(value) => unsafe { std::env::set_var(key, value) },
