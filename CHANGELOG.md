@@ -4,6 +4,87 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.12.23
+
+- **Fixed: the "Daemon updating" message that would not go away.** It could sit
+  over a session while the pane beside it plainly showed the same version on
+  both sides and a daemon that had been up for half an hour. It armed on
+  "sessions are parked on an older daemon", which is a *state* — true for days
+  at a time — rather than an *event*, so it was armed permanently; and it
+  re-armed on every session switch, which is why it felt constant. It now waits
+  for the daemon actually serving you to change.
+
+- **Fixed: Claude Code no longer opens with a broken bottom, and switching into
+  a session no longer garbles characters.** Both were the same message above.
+  While it was showing, the terminal painted nothing at all, and when it
+  finished it repainted only the rows that had changed since — so everything
+  written meanwhile stayed invisible, and the character atlas was never healed.
+  It now redraws the whole screen on the way out, which is what you were doing
+  by hand with a refresh.
+
+- **Fixed: selecting and copying no longer freezes the view.** Selecting text
+  pins the terminal so streaming output cannot yank it away mid-drag — correct,
+  but its only way back was "scroll to the bottom", and if you selected while
+  already *at* the bottom there was nothing to scroll and the pin never lifted.
+  You would see "N new messages" pile up until you switched sessions.
+
+- **Fixed: the first tab in a browser session has a close button again**, and
+  Duplicate works on it. That tab is the app's own, so it cannot be destroyed —
+  its ✕ once quit the whole app, which is why it was taken away. Now, whenever
+  it is showing a real page, its ✕ closes the *page* and returns the tab home.
+
+- **New: middle-click back, forward, reload or history to do it in a new tab.**
+  The same gesture you already use on a link, now on the buttons beside the
+  address bar. Each new tab lands directly below the one you clicked from.
+
+- **New: collections — browsing history you meant to keep**, and **import from
+  the browsers you already use**. A collection is a Markdown file in the
+  profile's own jar: frontmatter, your notes as prose, folders as headings,
+  links as a list — readable, editable in yedit, and the same file is the
+  export. `web-import` reads Chrome, Brave, Vivaldi, Chromium, Helium, Edge,
+  Firefox, LibreWolf, Zen and Waterfox, history and bookmarks, from a copy of
+  the profile so a running browser is never disturbed. Running it twice adds
+  nothing twice. Snapshots that repeat themselves are not written, and a
+  collection is never pruned by anything.
+
+- **Fixed: yedit's line numbers drifted further down the file the longer it
+  got.** The gutter measured a row height the browser reported but never used
+  (20.92px against a real 20px), and spent that error on every line — 42 rows of
+  drift on a 400-line wrapped document. It now measures each line as laid out,
+  checks its own arithmetic, and if the check ever fails it stops drawing
+  numbers rather than drawing wrong ones. The floating "Document | Terminal"
+  pill that covered the text is gone; it lives in the titlebar now, and toasts
+  no longer land on top of what you are reading.
+
+- **Fixed: three ways a browser process was created for nothing.** Preparing a
+  session built one process per tab even for tabs never shown — 13 tabs meant 13
+  processes, now 1. Removing a session left a second viewer's processes running
+  forever for a session that no longer existed. And every reload leaked a
+  network process, five reloads costing five, because a destroy-and-recreate
+  briefly looked like an abandonment. This is memory and fan noise you were
+  paying for and could not see.
+
+- **Fixed: removing a remote agent session said it worked when it did not.** The
+  shutdown only ever spoke Codex's dialect, so for a Claude Code session on
+  another machine the request never crossed the ssh hop at all — the local side
+  tidied up, reported success, and the agent kept running. It now speaks both,
+  checks the far side afterwards, and refuses by name rather than claiming
+  success it cannot verify.
+
+- **Fixed: re-pinning a remote session's terminal size reached the wrong
+  daemon.** It asked whichever daemon matched the tool's own version instead of
+  the one that actually owns the session, so on a machine where an older daemon
+  still holds them the request failed five times and gave up.
+
+- **Fixed: the shadow client would not start from inside an agent's session** —
+  which mattered because that is the whole point of it. While it was broken,
+  testing anything meant using your GUI.
+
+- **New: `server app web profile`** — the profile picker's own actions (avatar,
+  protect) are reachable from the command line, sharing one write path with the
+  card so neither can drop a setting the other wrote.
+
+
 - **New: middle-click back, forward, reload or history to do it in a new tab.**
   The same gesture you already use on a link, now on the buttons beside the
   address bar. Middle-click **back** and the previous page opens in its own tab
