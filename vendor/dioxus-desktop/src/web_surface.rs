@@ -4191,15 +4191,22 @@ impl WebSurfaceHost {
     /// engine default. Bounds are logical pixels relative to the window's
     /// top-left.
     ///
-    /// `visible` is "is this surface being REVEALED to someone right now", and
-    /// it decides two things at birth: whether the view may take the toplevel's
-    /// keyboard focus, and whether the ENGINE is told the page is on screen. A
-    /// surface created for a session nobody is looking at is born hidden — same
-    /// rule, same shape as `build_popup_webview` — so its
-    /// `document.visibilityState` reads `hidden` from the first frame and its
-    /// `requestAnimationFrame` never starts. Creating it visible and hiding it a
-    /// tick later would be a lie the page has already acted on: a spinner on a
-    /// never-revealed surface measured 0.85 cores that way.
+    /// `visible` is "is this surface being REVEALED to someone right now", and it
+    /// decides whether the ENGINE is told the page is on screen. A surface
+    /// created for a session nobody is looking at is born hidden — same rule,
+    /// same shape as `build_popup_webview` — so its `document.visibilityState`
+    /// reads `hidden` from the first frame and its `requestAnimationFrame` never
+    /// starts. Creating it visible and hiding it a tick later would be a lie the
+    /// page has already acted on: a spinner on a never-revealed surface measured
+    /// 0.85 cores that way.
+    ///
+    /// `focused` is the SECOND question — "does this page take the toplevel's
+    /// keyboard at birth" — and it is separate because the two answers genuinely
+    /// differ: a new tab opened with Ctrl+T is shown AND typing-ready in the
+    /// shell's omnibox, so its webview must appear without taking the keyboard
+    /// the omnibox is holding. Visibility still bounds it (`visible && focused`),
+    /// so no caller can hand the user's keyboard to a surface nobody can see —
+    /// the 2026-07-26 headless-surface theft stays structurally impossible.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -4216,6 +4223,7 @@ impl WebSurfaceHost {
         w: i32,
         h: i32,
         visible: bool,
+        focused: bool,
     ) -> Result<(), String> {
         // Replace any existing surface with this id.
         self.close(id);
@@ -4275,8 +4283,11 @@ impl WebSurfaceHost {
             // focus off the user's terminal at birth and kept it: the user's
             // "the shadow session spawn took focus away from my viewport",
             // 2026-07-26. A surface only gets the focus when it is being shown
-            // TO SOMEONE.
-            .with_focused(visible)
+            // TO SOMEONE — `visible` — and only when the CALLER says this page
+            // is who the keyboard belongs to — `focused`. The `&&` is what keeps
+            // the 2026-07-26 rule structural: no argument combination can focus
+            // a surface nobody can see.
+            .with_focused(visible && focused)
         // A page in a browser can paste. WebKitGTK has no permission UI for
         // this, so it is granted for the surface as a whole — the same trust
         // boundary the profile jar already draws. Without it an IMAGE paste
@@ -7946,7 +7957,7 @@ mod download_locks {
         let product = product_lines();
         let focused = product
             .iter()
-            .filter(|line| line.contains(".with_focused(visible)"))
+            .filter(|line| line.contains(".with_focused("))
             .count();
         assert!(
             focused >= 2,
@@ -7963,9 +7974,9 @@ mod download_locks {
              that cannot paste is the same bug in a smaller window"
         );
         // …and the grant sits ON the builders, not somewhere a refactor could
-        // strand it: each one immediately follows a `.with_focused(visible)`.
+        // strand it: each one immediately follows a `.with_focused(..)`.
         for (index, line) in product.iter().enumerate() {
-            if line.contains(".with_focused(visible)") {
+            if line.contains(".with_focused(") {
                 assert!(
                     product
                         .get(index + 1..index + 9)
