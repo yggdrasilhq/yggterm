@@ -5278,13 +5278,20 @@ impl AppliedWebSurface {
 fn web_surface_reap_due(
     now_ms: u64,
     stashed_at_ms: Option<u64>,
-    hold_ms: u64,
+    hold_ms: Option<u64>,
     lease_until_ms: Option<u64>,
     media_active: bool,
 ) -> bool {
     if media_active {
         return false;
     }
+    // `None` = no clock at all. On a machine with memory to spare there is
+    // nothing to reclaim FOR, and a destroy costs the user a full page rebuild
+    // on the next look (see `ReclaimPosture`). The surface is still stashed and
+    // still throttled; only the destroy is off.
+    let Some(hold_ms) = hold_ms else {
+        return false;
+    };
     let hold_due = match stashed_at_ms {
         Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
         // Not yet marked stashed this tick: only a zero hold reaps immediately.
@@ -5494,15 +5501,51 @@ fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> O
         .min()
 }
 
+/// THE destroy clock for one backgrounded surface, or `None` for "no clock".
+///
+/// `configured_hold_ms` is the user's EXPLICIT knob out of
+/// `~/.yggterm/web-surface.json`, or `None` when they set nothing. The
+/// distinction is load-bearing in both directions: an explicit `0` means
+/// "destroy the moment it leaves the screen" and must survive a comfortable
+/// machine, and an ABSENT knob is what lets a comfortable machine keep the page
+/// instead of running a default clock against memory nobody wants.
 fn web_surface_background_hold_ms_for(
-    configured_hold_ms: u64,
-    reclaim_pressured: bool,
+    configured_hold_ms: Option<u64>,
+    posture: crate::terminal_observe::ReclaimPosture,
     recent_reaps: u32,
-) -> u64 {
-    if reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
-        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+) -> Option<u64> {
+    // Pressure first and unchanged: when the machine is genuinely short, the
+    // hold collapses whatever was configured — unless this surface is on the
+    // treadmill, in which case reaping it again reclaims nothing and costs a
+    // fresh web process.
+    if posture.is_pressured() && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
+        return Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS);
     }
-    configured_hold_ms
+    // ⭐ THE DESTROY IS A RECLAIM, SO IT NEEDS SOMETHING TO RECLAIM FOR.
+    //
+    // A comfortable machine with no explicit knob keeps the page. Everything
+    // that made backgrounding cheap has ALREADY happened by the time this is
+    // asked — the surface is stashed, demoted and throttled, so its page is
+    // `document.hidden`, its rAF is paused and its timers are throttled (§5
+    // constraint 1 of docs/optimization-pass.md: the axis is PAINT, not
+    // existence). Destroying it on top of that buys exactly one thing, memory,
+    // and by construction this branch is the case where nothing is asking for
+    // any. What it costs is the whole §9 launch bill on the next look.
+    //
+    // The ceiling this removes is re-imposed by the posture itself, with
+    // hysteresis for free: as live surfaces accumulate, headroom falls, the
+    // posture goes Tight and the configured hold resumes; below the floor it
+    // goes Pressured and the hold collapses to seconds. Memory, not a clock, is
+    // what decides — which is the mechanism Chromium's tab discarding uses and
+    // the reason its background tabs come back instantly.
+    if matches!(
+        posture,
+        crate::terminal_observe::ReclaimPosture::Comfortable
+    ) && configured_hold_ms.is_none()
+    {
+        return None;
+    }
+    Some(configured_hold_ms.unwrap_or(WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS.saturating_mul(1000)))
 }
 
 /// The default for BOTH holds below. One number, because a backgrounded SESSION
@@ -5531,33 +5574,34 @@ fn web_surface_config_raw() -> Option<String> {
 /// PURE — the file read is [`web_surface_config_raw`]'s job — so which KEY a
 /// hold reads and what it falls back to are answerable by a test instead of by
 /// the test machine's `$HOME`.
-fn web_surface_config_hold_ms(raw: Option<&str>, key: &str, default_secs: u64) -> u64 {
-    let default_ms = default_secs.saturating_mul(1000);
+/// Read one `*_secs` hold out of an already-read `web-surface.json` body, in ms.
+///
+/// `None` = the user set nothing, and that is now a DECISION rather than a
+/// missing value: [`web_surface_background_hold_ms_for`] keeps a page alive on a
+/// comfortable machine only when nobody asked for a clock. Returning the default
+/// here would erase the difference between "they chose ten minutes" and "they
+/// chose nothing", which is exactly the difference the fix turns on.
+fn web_surface_config_hold_ms(raw: Option<&str>, key: &str) -> Option<u64> {
     raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|config| config.get(key).and_then(Value::as_u64))
         .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or(default_ms)
 }
 
-/// The SESSION hold's whole policy — pressure override, key, default — over an
-/// already-read config body. [`web_surface_background_hold_ms`] is the adapter
-/// that supplies the body.
-fn web_surface_background_hold_ms_from(raw: Option<&str>, reclaim_pressured: bool) -> u64 {
-    // Under memory pressure, reclaim aggressively regardless of the configured
-    // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
-    // back to the system before it thrashes swap.
-    if reclaim_pressured {
-        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
-    }
-    web_surface_config_hold_ms(
-        raw,
-        "background_hold_secs",
-        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
-    )
+/// The SESSION hold's configured value over an already-read config body.
+/// [`web_surface_background_hold_ms`] is the adapter that supplies the body.
+///
+/// No pressure logic here any more. The pressure override used to live in BOTH
+/// this function and [`web_surface_background_hold_ms_for`], and the live call
+/// site passed a hardcoded `false` to switch this copy off — two encodings of
+/// one rule, with the caller compensating for one of them. The pass owns it now,
+/// which is what the pass's own doc comment already claimed ("the reconcile loop
+/// keeps NO policy").
+fn web_surface_background_hold_ms_from(raw: Option<&str>) -> Option<u64> {
+    web_surface_config_hold_ms(raw, "background_hold_secs")
 }
 
-fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
-    web_surface_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)
+fn web_surface_background_hold_ms() -> Option<u64> {
+    web_surface_background_hold_ms_from(web_surface_config_raw().as_deref())
 }
 
 /// The TAB hold's whole policy over an already-read config body: its OWN key,
@@ -5566,15 +5610,8 @@ fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
 /// while every behavioural test still passed — which is exactly why the policy
 /// lives in a function a test can hand a config body to
 /// (`the_tab_hold_reads_its_own_config_key_and_defaults_to_ten_minutes`).
-fn web_surface_tab_background_hold_ms_from(raw: Option<&str>, reclaim_pressured: bool) -> u64 {
-    if reclaim_pressured {
-        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
-    }
-    web_surface_config_hold_ms(
-        raw,
-        "tab_background_hold_secs",
-        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
-    )
+fn web_surface_tab_background_hold_ms_from(raw: Option<&str>) -> Option<u64> {
+    web_surface_config_hold_ms(raw, "tab_background_hold_secs")
 }
 
 /// How long a BACKGROUND TAB of a session the user IS looking at stays alive
@@ -5589,8 +5626,8 @@ fn web_surface_tab_background_hold_ms_from(raw: Option<&str>, reclaim_pressured:
 /// lazy-create path a never-visited one does (its URL and title live in the tab
 /// model and on disk — see [`SavedWebTab`] — so what returns is the page, not a
 /// blank).
-fn web_surface_tab_background_hold_ms(reclaim_pressured: bool) -> u64 {
-    web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)
+fn web_surface_tab_background_hold_ms() -> Option<u64> {
+    web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref())
 }
 
 /// The engine's live "is this page playing audio" answer, as the reclaim plan
@@ -5777,7 +5814,10 @@ struct WebSurfaceBackgroundDecision {
     key: (String, u64),
     native_id: u64,
     action: WebSurfaceBackgroundAction,
-    hold_ms: u64,
+    /// The destroy clock this surface is on, or `None` for "no clock" — a
+    /// comfortable machine with no configured hold. Traced as `null`, which is
+    /// the honest reading: not "zero milliseconds", but "no deadline".
+    hold_ms: Option<u64>,
     media_active: bool,
     /// Which domain claimed it (and therefore which configured hold produced
     /// `hold_ms`). Carried into the trace so per-tab reclaim is answerable from
@@ -5791,6 +5831,10 @@ struct WebSurfaceBackgroundDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSurfaceBackgroundPlan {
     reclaim_pressured: bool,
+    /// The three-state read `reclaim_pressured` is the top band of. Traced so a
+    /// pass that reaped nothing SAYS why, instead of leaving a reader to
+    /// re-derive the thresholds from `/proc`.
+    posture: crate::terminal_observe::ReclaimPosture,
     decisions: Vec<WebSurfaceBackgroundDecision>,
 }
 
@@ -5814,15 +5858,20 @@ fn web_surface_background_plan(
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
-    configured_hold_ms: u64,
-    configured_tab_hold_ms: u64,
+    configured_hold_ms: Option<u64>,
+    configured_tab_hold_ms: Option<u64>,
     surfaces: &[WebSurfaceBackgroundInput],
     media: &dyn WebSurfaceMediaProbe,
 ) -> WebSurfaceBackgroundPlan {
     // CURRENT headroom plus the kernel's own thrash accounting — never
     // `swap_pressured`, which latches TRUE after one bad afternoon and never
-    // clears. See `MemoryPressureSnapshot::reclaim_pressured`.
-    let reclaim_pressured = pressure.reclaim_pressured() || forced_pressure;
+    // clears. See `MemoryPressureSnapshot::reclaim_posture`.
+    let posture = if forced_pressure {
+        crate::terminal_observe::ReclaimPosture::Pressured
+    } else {
+        pressure.reclaim_posture()
+    };
+    let reclaim_pressured = posture.is_pressured();
     let detach = web_surface_background_detach(under_glass, reclaim_pressured);
     let decisions = surfaces
         .iter()
@@ -5834,11 +5883,8 @@ fn web_surface_background_plan(
                 WebSurfaceBackgroundReason::Session => configured_hold_ms,
                 WebSurfaceBackgroundReason::Tab => configured_tab_hold_ms,
             };
-            let hold_ms = web_surface_background_hold_ms_for(
-                configured,
-                reclaim_pressured,
-                surface.recent_reaps,
-            );
+            let hold_ms =
+                web_surface_background_hold_ms_for(configured, posture, surface.recent_reaps);
             // Engine truth, read at the moment of the decision and for THIS
             // surface — a stale flag, or one read for a different surface, would
             // be worse than none.
@@ -5882,6 +5928,7 @@ fn web_surface_background_plan(
         .collect();
     WebSurfaceBackgroundPlan {
         reclaim_pressured,
+        posture,
         decisions,
     }
 }
@@ -5929,8 +5976,8 @@ fn web_surface_reclaim_background_pass(
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
-    configured_hold_ms: u64,
-    configured_tab_hold_ms: u64,
+    configured_hold_ms: Option<u64>,
+    configured_tab_hold_ms: Option<u64>,
     backgrounded: &[((String, u64), WebSurfaceBackgroundReason)],
     applied: &mut HashMap<(String, u64), AppliedWebSurface>,
     lease_until_ms: &dyn Fn(&(String, u64)) -> Option<u64>,
@@ -5965,6 +6012,7 @@ fn web_surface_reclaim_background_pass(
         &*host,
     );
     let reclaim_pressured = plan.reclaim_pressured;
+    let posture = plan.posture.label();
     for decision in &plan.decisions {
         let key = &decision.key;
         let hold_ms = decision.hold_ms;
@@ -5997,6 +6045,11 @@ fn web_surface_reclaim_background_pass(
                             // something keeps re-creating.
                             "reaps_in_window": reap_count,
                             "reclaim_pressured": reclaim_pressured,
+                            // WHY the machine wanted the memory back. A destroy
+                            // recorded as `comfortable` is the 2026-08-01 bug
+                            // (a ten-minute clock reaping a page on a host with
+                            // 61% of its RAM free) and must not reappear.
+                            "memory_posture": posture,
                             "hold_ms": hold_ms,
                         }),
                     );
@@ -6046,6 +6099,7 @@ fn web_surface_reclaim_background_pass(
                         "detached": detach,
                         "domain": decision.reason.label(),
                         "reclaim_pressured": reclaim_pressured,
+                        "memory_posture": posture,
                         "media_active": decision.media_active,
                     }),
                 );
@@ -6272,8 +6326,8 @@ mod web_surface_reclaim_locks {
             under_glass,
             pressure,
             false,
-            configured_hold_ms,
-            TAB_HOLD_SENTINEL_MS,
+            Some(configured_hold_ms),
+            Some(TAB_HOLD_SENTINEL_MS),
             &backgrounded,
             applied,
             &|key| leases.get(key).copied(),
@@ -6342,7 +6396,8 @@ mod web_surface_reclaim_locks {
             host.stashed
         );
         assert_eq!(
-            plan.decisions[0].hold_ms, 777_000,
+            plan.decisions[0].hold_ms,
+            Some(777_000),
             "the CONFIGURED hold must survive the pass, not a hardcoded default"
         );
 
@@ -6364,7 +6419,8 @@ mod web_surface_reclaim_locks {
         assert_eq!(host.stashed, vec![9], "genuine shortage detaches");
         assert!(host.demoted.is_empty());
         assert_eq!(
-            plan.decisions[0].hold_ms, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            plan.decisions[0].hold_ms,
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "genuine shortage collapses the hold — that is the feature"
         );
     }
@@ -6476,9 +6532,9 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             holds,
             vec![
-                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
-                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
-                600_000
+                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+                Some(600_000)
             ],
             "the first {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps under pressure are fast \
              (the feature); after that the surface has demonstrated it is wanted and \
@@ -6700,8 +6756,8 @@ mod web_surface_reclaim_locks {
             true,
             &comfortable,
             true,
-            600_000,
-            TAB_HOLD_SENTINEL_MS,
+            Some(600_000),
+            Some(TAB_HOLD_SENTINEL_MS),
             &backgrounded,
             &mut applied,
             &|_key| None,
@@ -6714,8 +6770,153 @@ mod web_surface_reclaim_locks {
         assert_eq!(host.stashed, vec![61], "forced pressure hard-detaches");
         assert_eq!(
             plan.decisions[0].hold_ms,
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
         );
+    }
+
+    /// ⭐⭐ THE 2026-08-01 BUG, AT THE CALL SITE: A COMFORTABLE MACHINE MUST NOT
+    /// DESTROY THE USER'S PAGE ON A WALL CLOCK.
+    ///
+    /// What the user reported: *"Same pages on reload look like they are
+    /// reloading afresh."* What the live host's own trace said, read across
+    /// every retained `event-trace.*.jsonl` on guihost: **134 of 182
+    /// `native_close` events were `background_hold_expired`, every one of them
+    /// `reclaim_pressured: false` and `hold_ms: 600000`** — pages destroyed by a
+    /// ten-minute timer on a laptop with 9.2 GB of 15.1 GB available. And they
+    /// were not abandoned pages: of the 132 surfaces killed that way, **the user
+    /// reopened 109**, 49 of them within half an hour. Every one of those reopens
+    /// pays a fresh `WebKitWebProcess`, a fresh navigation, a fresh JS
+    /// parse+compile against a JSC with no bytecode cache, and loses scroll
+    /// position, form state and SPA state. The HTTP disk cache was never the
+    /// problem: it was populated (33 MB in one profile) and serving.
+    ///
+    /// So this is a BEHAVIOURAL lock at the pass, not a helper unit test. The
+    /// surface below is 24 hours past a ten-minute hold on a comfortable
+    /// machine, which is the exact shape that used to reap, and it must be
+    /// stashed and kept. Its sibling assertion is that genuine pressure still
+    /// reaps the identical surface — a fix that simply stopped reclaiming would
+    /// pass half of this test and reintroduce the 3.9 GB freeze.
+    #[test]
+    fn a_comfortable_machine_stashes_a_long_backgrounded_page_and_never_destroys_it() {
+        let key = ("live::cache-and-snappiness".to_string(), 0_u64);
+        let backgrounded = vec![(key.clone(), WebSurfaceBackgroundReason::Session)];
+        // Stashed a full day ago: past the ten-minute default by two orders of
+        // magnitude, so nothing here turns on the arithmetic.
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = 2_000_000 + day_ms;
+
+        let mut applied = HashMap::new();
+        // NOT yet stashed: the pass has to background it first, so this drives
+        // the whole lifecycle rather than asserting against a hand-set
+        // `stashed_at_ms`. The first cut of this test asserted demote+throttle
+        // on an ALREADY-stashed surface and failed, because such a surface is a
+        // `Wait` — a fair reminder that the stash happens once.
+        applied.insert(key.clone(), applied_surface(71, None));
+        let mut host = FakeHost::default();
+        let comfortable = comfortable();
+        assert_eq!(
+            comfortable.reclaim_posture(),
+            crate::terminal_observe::ReclaimPosture::Comfortable,
+            "the fixture must be comfortable, or this test proves nothing"
+        );
+        let first = web_surface_reclaim_background_pass(
+            2_000_000,
+            true,
+            &comfortable,
+            false,
+            None,
+            None,
+            &backgrounded,
+            &mut applied,
+            &|_key| None,
+            &mut host,
+        );
+        assert!(host.closed.is_empty(), "backgrounding must not destroy");
+        assert!(matches!(
+            first.decisions[0].action,
+            WebSurfaceBackgroundAction::Stash { .. }
+        ));
+        // It IS still backgrounded, and that half must not regress: demoted and
+        // throttled, so the page is `document.hidden` and stops painting. The
+        // axis is paint, not existence (docs/optimization-pass.md §5).
+        assert_eq!(host.demoted, vec![71], "it must still be demoted");
+        assert_eq!(
+            host.throttled,
+            vec![(71, true)],
+            "it must still be throttled — keeping the page must not keep it PAINTING"
+        );
+
+        // A DAY later, on the same comfortable machine. This is the shape that
+        // used to reap.
+        let mut host = FakeHost::default();
+        let plan = web_surface_reclaim_background_pass(
+            now,
+            true,
+            &comfortable,
+            false,
+            // NOTHING CONFIGURED. That is the case 100% of the live host's
+            // destroys came from — there is no `~/.yggterm/web-surface.json` on
+            // guihost — and it is the only case the posture is allowed to decide.
+            None,
+            None,
+            &backgrounded,
+            &mut applied,
+            &|_key| None,
+            &mut host,
+        );
+        assert!(
+            host.closed.is_empty(),
+            "a page nobody is short of memory for was destroyed anyway: {:?}",
+            host.closed
+        );
+        assert!(
+            applied.contains_key(&key),
+            "the surface must survive the pass — a reclaimed entry is a page the \
+             user has to watch rebuild"
+        );
+        assert_eq!(
+            plan.decisions[0].hold_ms, None,
+            "a comfortable machine with no configured hold must be on NO destroy \
+             clock; any number here is a deadline on the user's page"
+        );
+        assert!(matches!(
+            plan.decisions[0].action,
+            WebSurfaceBackgroundAction::Wait
+        ));
+
+        // ...and the same surface, on a machine that is genuinely short, still
+        // dies. Reclaim is not switched off; it is moved onto the signal that
+        // means something.
+        let mut applied = HashMap::new();
+        applied.insert(key.clone(), applied_surface(71, Some(2_000_000)));
+        let mut host = FakeHost::default();
+        let plan = web_surface_reclaim_background_pass(
+            now,
+            true,
+            &short(),
+            false,
+            None,
+            None,
+            &backgrounded,
+            &mut applied,
+            &|_key| None,
+            &mut host,
+        );
+        assert_eq!(
+            host.closed,
+            vec![71],
+            "genuine shortage must still reclaim — a fix that only ever keeps \
+             pages is the 3.9 GB freeze coming back"
+        );
+        assert_eq!(
+            plan.decisions[0].hold_ms,
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+        );
+        // The trace has to SAY which of the two it was, or the next reader is
+        // back to inferring pressure from a timestamp.
+        let closes = host.trace_named("native_close");
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0]["memory_posture"], "pressured");
     }
 
     /// THE RESIDUAL SEAM. Everything above drives
@@ -6804,14 +7005,16 @@ mod web_surface_reclaim_locks {
                 // reclaim on a healthy machine.
                 "web_surface_force_background_pressure(),",
                 // The user's configured SESSION hold, from
-                // ~/.yggterm/web-surface.json. `false` here is deliberate: the
-                // PASS decides pressure, so the caller must ask for the
-                // UNPRESSURED (configured) value.
-                "web_surface_background_hold_ms(false),",
+                // ~/.yggterm/web-surface.json — `None` when they configured
+                // nothing, which is the reading that lets a comfortable machine
+                // keep the page. It takes no pressure argument: the PASS owns
+                // that, and a caller that could pre-apply pressure here is a
+                // second encoding of the rule.
+                "web_surface_background_hold_ms(),",
                 // ...and the TAB hold, its own knob. Passing the session hold
                 // twice would silently give background tabs the session
                 // schedule, which is exactly the knob this lane added.
-                "web_surface_tab_background_hold_ms(false),",
+                "web_surface_tab_background_hold_ms(),",
                 // The reclaim DOMAIN: (session, tab) candidates with the reason
                 // that produced each one.
                 "&backgrounded,",
@@ -7234,8 +7437,8 @@ mod web_surface_reclaim_locks {
             true,
             pressure,
             false,
-            session_hold_ms,
-            tab_hold_ms,
+            Some(session_hold_ms),
+            Some(tab_hold_ms),
             domain,
             applied,
             &|key| leases.get(key).copied(),
@@ -7363,7 +7566,7 @@ mod web_surface_reclaim_locks {
                 .iter()
                 .map(|decision| decision.hold_ms)
                 .collect::<Vec<_>>(),
-            vec![300_000, 300_000],
+            vec![Some(300_000), Some(300_000)],
             "a background TAB must be charged the tab hold, not the session hold"
         );
         assert_eq!(
@@ -7666,10 +7869,10 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             holds,
             vec![
-                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
-                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
                 // Demonstrably wanted: back to the configured TAB hold.
-                300_000,
+                Some(300_000),
             ],
             "after {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps in the window the tab has \
              shown it is wanted and must keep its configured hold"
@@ -7696,75 +7899,90 @@ mod web_surface_reclaim_locks {
         let tab_only = r#"{"tab_background_hold_secs": 42}"#;
         let session_only = r#"{"background_hold_secs": 42}"#;
 
-        // No file, no key, or a body that is not JSON at all ⇒ the shared
-        // default. Ten minutes: a tab has to be off screen that long before a
-        // reclaim can cost the user their scroll position.
+        use crate::terminal_observe::ReclaimPosture;
+        // ⭐ ABSENT IS NOT THE DEFAULT ANY MORE — it is `None`, and the
+        // difference is the whole 2026-08-01 fix. The default still EXISTS and
+        // is still ten minutes; it is applied by the hold policy, and only on a
+        // machine that has something to reclaim for.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(None, false),
-            TEN_MINUTES_MS,
-            "the tab hold's default changed; the docs and the CHANGELOG say ten \
-             minutes, and a shorter one trades the user's page state"
+            web_surface_tab_background_hold_ms_from(None),
+            None,
+            "an unset knob must read as unset; folding the default in here \
+             erases the difference between 'they chose ten minutes' and 'they \
+             chose nothing', which is what decides whether a comfortable \
+             machine keeps the page"
+        );
+        assert_eq!(web_surface_background_hold_ms_from(None), None);
+        assert_eq!(
+            web_surface_tab_background_hold_ms_from(Some("not json at all")),
+            None
         );
         assert_eq!(
-            web_surface_background_hold_ms_from(None, false),
-            TEN_MINUTES_MS
-        );
-        assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some("not json at all"), false),
-            TEN_MINUTES_MS
-        );
-        assert_eq!(
-            web_surface_tab_background_hold_ms_from(
-                Some(r#"{"tab_background_hold_secs": "5"}"#),
-                false
-            ),
-            TEN_MINUTES_MS,
+            web_surface_tab_background_hold_ms_from(Some(r#"{"tab_background_hold_secs": "5"}"#)),
+            None,
             "a string is not a number of seconds; guessing at it would be a second \
              parse with a different unit"
         );
+        // ...and the ten minutes the CHANGELOG promises is still what an unset
+        // knob resolves to wherever a clock applies at all.
+        for posture in [ReclaimPosture::Tight, ReclaimPosture::Pressured] {
+            assert_eq!(
+                web_surface_background_hold_ms_for(
+                    None,
+                    posture,
+                    WEB_SURFACE_THRASH_REOPEN_LIMIT
+                ),
+                Some(TEN_MINUTES_MS),
+                "the hold's default changed; the docs and the CHANGELOG say ten \
+                 minutes, and a shorter one trades the user's page state"
+            );
+        }
 
         // The knob itself, in seconds, converted once.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(tab_only), false),
-            42_000,
+            web_surface_tab_background_hold_ms_from(Some(tab_only)),
+            Some(42_000),
             "`tab_background_hold_secs` is the key the user is told to set"
         );
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(
-                Some(r#"{"tab_background_hold_secs": 0}"#),
-                false
-            ),
-            0,
+            web_surface_tab_background_hold_ms_from(Some(r#"{"tab_background_hold_secs": 0}"#)),
+            Some(0),
             "0 is a real setting — reclaim the moment a tab leaves the screen — \
              not a missing value"
+        );
+        // ...and an explicit 0 must survive a COMFORTABLE machine. The user
+        // asked for immediate reclaim on their own box; keeping the page
+        // because memory looks fine would silently ignore them.
+        assert_eq!(
+            web_surface_background_hold_ms_for(Some(0), ReclaimPosture::Comfortable, 0),
+            Some(0),
+            "an explicit hold is the user's decision and outranks the posture"
         );
 
         // TWO knobs, not one wearing two names. Each hold must ignore the
         // other's key, in both directions.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(session_only), false),
-            TEN_MINUTES_MS,
+            web_surface_tab_background_hold_ms_from(Some(session_only)),
+            None,
             "the TAB hold followed the SESSION key: the new knob has collapsed \
              onto the old one and setting it does nothing"
         );
         assert_eq!(
-            web_surface_background_hold_ms_from(Some(session_only), false),
-            42_000
+            web_surface_background_hold_ms_from(Some(session_only)),
+            Some(42_000)
         );
         assert_eq!(
-            web_surface_background_hold_ms_from(Some(tab_only), false),
-            TEN_MINUTES_MS,
+            web_surface_background_hold_ms_from(Some(tab_only)),
+            None,
             "the SESSION hold followed the TAB key"
         );
 
-        // Pressure still overrides both, before any config is consulted.
+        // Pressure still overrides a configured hold — but it is the POLICY
+        // that applies it now, not the config reader. It used to live in both,
+        // with the live call site passing `false` to switch one copy off.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(tab_only), true),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
-        );
-        assert_eq!(
-            web_surface_background_hold_ms_from(Some(session_only), true),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+            web_surface_background_hold_ms_for(Some(42_000), ReclaimPosture::Pressured, 0),
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
         );
 
         // ...and the adapters the loop actually calls are wired to the ONE file
@@ -7798,8 +8016,8 @@ mod web_surface_reclaim_locks {
                 "fn web_surface_config_raw() -> Option<String> {",
                 // ...and its three readers: the hold parser's adapter pair, and
                 // the string-knob reader that used to open the file itself.
-                "web_surface_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)",
-                "web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)",
+                "web_surface_background_hold_ms_from(web_surface_config_raw().as_deref())",
+                "web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref())",
                 "let raw = web_surface_config_raw()?;",
             ],
             "the web-surface config readers changed. A hold that no longer reads \
@@ -10687,8 +10905,8 @@ async fn web_surface_native_reconcile_loop(
                 under_glass,
                 &read_memory_pressure_snapshot(),
                 web_surface_force_background_pressure(),
-                web_surface_background_hold_ms(false),
-                web_surface_tab_background_hold_ms(false),
+                web_surface_background_hold_ms(),
+                web_surface_tab_background_hold_ms(),
                 &backgrounded,
                 &mut applied,
                 &|key| web_surface_lease_until_ms(&state, &key.0, key.1),
@@ -64770,7 +64988,7 @@ mod web_do_verb_tests {
     // could reap a surface the user was about to switch back to.
     #[test]
     fn lease_extends_the_hold_and_never_shortens_it() {
-        let hold = 600_000;
+        let hold = Some(600_000);
         let stashed = Some(1_000_u64);
         // Hold not yet up, no lease: keep.
         assert!(!web_surface_reap_due(2_000, stashed, hold, None, false));
@@ -64801,8 +65019,12 @@ mod web_do_verb_tests {
             false
         ));
         // Zero hold still honors a live lease.
-        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000), false));
-        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+        assert!(!web_surface_reap_due(2_000, None, Some(0), Some(9_000), false));
+        assert!(web_surface_reap_due(2_000, None, Some(0), None, false));
+        // NO hold at all — a comfortable machine — never reaps, whatever the
+        // clocks say. This is the branch the destroy-on-a-wall-clock bug had no
+        // way to express.
+        assert!(!web_surface_reap_due(999_999_000, stashed, None, None, false));
     }
 
     /// ONE TUNNEL PER SESSION, NOT PER TAB. `ssh -N -D` is the session's egress:
@@ -64877,7 +65099,7 @@ mod web_do_verb_tests {
     /// to cut off what the user is listening to.
     #[test]
     fn an_audible_background_surface_is_never_reaped() {
-        let hold = 600_000;
+        let hold = Some(600_000);
         let stashed = Some(1_000_u64);
         // Hold long expired, no lease — the exact case that reaps today.
         assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
@@ -64886,20 +65108,20 @@ mod web_do_verb_tests {
         assert!(web_surface_reap_due(
             9_000,
             stashed,
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             None,
             false
         ));
         assert!(!web_surface_reap_due(
             9_000,
             stashed,
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             None,
             true
         ));
         // Nor does a zero hold, the destroy-immediately configuration.
-        assert!(web_surface_reap_due(2_000, None, 0, None, false));
-        assert!(!web_surface_reap_due(2_000, None, 0, None, true));
+        assert!(web_surface_reap_due(2_000, None, Some(0), None, false));
+        assert!(!web_surface_reap_due(2_000, None, Some(0), None, true));
         // And silence restores the ordinary clocks — the veto is a veto, not a
         // permanent pin. A page that finished playing reaps on the next tick.
         assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
@@ -134432,30 +134654,39 @@ mod tests {
     /// surface that has demonstrated it comes back must stop being a target.
     #[test]
     fn the_thrash_hold_helper_escalates_at_the_reopen_limit() {
-        let pressured_hold = web_surface_background_hold_ms_for(600_000, true, 0);
+        use crate::terminal_observe::ReclaimPosture::Pressured;
+        let pressured_hold = web_surface_background_hold_ms_for(Some(600_000), Pressured, 0);
         assert_eq!(
-            pressured_hold, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            pressured_hold,
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "first reap under pressure must still be fast — that is the feature"
         );
         assert_eq!(
-            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT - 1),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            web_surface_background_hold_ms_for(
+                Some(600_000),
+                Pressured,
+                WEB_SURFACE_THRASH_REOPEN_LIMIT - 1
+            ),
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "below the limit it is still an ordinary reclaim candidate"
         );
-        let thrashing =
-            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
+        let thrashing = web_surface_background_hold_ms_for(
+            Some(600_000),
+            Pressured,
+            WEB_SURFACE_THRASH_REOPEN_LIMIT,
+        );
         assert!(
-            thrashing > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            thrashing.is_some_and(|ms| ms > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "a surface reaped {} times in the window is demonstrably wanted; \
-             reaping it again is the treadmill — got {thrashing} ms",
+             reaping it again is the treadmill — got {thrashing:?} ms",
             WEB_SURFACE_THRASH_REOPEN_LIMIT,
         );
         // And the escalation must be per-surface, not global: a DIFFERENT
         // surface with no history is still reclaimed promptly, or one busy page
         // would switch reclaim off for everything.
         assert_eq!(
-            web_surface_background_hold_ms_for(600_000, true, 0),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            web_surface_background_hold_ms_for(Some(600_000), Pressured, 0),
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "one thrashing surface must not spare every other surface"
         );
     }
@@ -134506,12 +134737,19 @@ mod tests {
         // unaffected (always detaches).
         assert!(web_surface_background_detach(true, true));
         assert!(web_surface_background_detach(false, true));
-        // The pressured hold is the short reclaim window (deterministic — the
-        // pressured branch returns before reading any config file).
-        assert_eq!(
-            web_surface_background_hold_ms(true),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
-        );
+        // The pressured hold is the short reclaim window, whatever was
+        // configured — asked of the POLICY, which is where the override lives
+        // now (the config reader used to carry a second copy of it).
+        for configured in [None, Some(600_000), Some(0)] {
+            assert_eq!(
+                web_surface_background_hold_ms_for(
+                    configured,
+                    crate::terminal_observe::ReclaimPosture::Pressured,
+                    0
+                ),
+                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+            );
+        }
     }
 
     /// ⚠ NOT A CALL-SITE LOCK, despite what it used to claim. It computes
@@ -134532,10 +134770,6 @@ mod tests {
         assert!(live.swap_pressured(), "swap history is deep on this host");
         // The argument both policy functions are handed. This is the defect: it
         // was `swap_pressured()` (true here) and must be `reclaim_pressured()`.
-        // `web_surface_background_hold_ms(false)` reads
-        // `~/.yggterm/web-surface.json`, so asserting its RESULT would depend on
-        // the test machine's config — the deterministic statement is about the
-        // input, plus the pressured branch which returns before any file read.
         assert!(
             !live.reclaim_pressured(),
             "45% of RAM available and 0.06% stall time is not reclaim pressure"
@@ -134546,9 +134780,32 @@ mod tests {
             true,
             live.reclaim_pressured()
         ));
+        // ⭐ AND ON THIS SAME READING THE PAGE IS NOT DESTROYED EITHER.
+        //
+        // 45% headroom is COMFORTABLE, so a surface the user configured no hold
+        // for gets no destroy clock at all. This is the fixture that makes the
+        // 2026-08-01 finding a regression test rather than a story: the live
+        // host was reading almost exactly this while 134 of 182 recorded
+        // destroys fired anyway, `reclaim_pressured: false`, and the user
+        // reopened 109 of the 132 pages killed.
         assert_eq!(
-            web_surface_background_hold_ms(true),
-            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+            live.reclaim_posture(),
+            crate::terminal_observe::ReclaimPosture::Comfortable
+        );
+        assert_eq!(
+            web_surface_background_hold_ms_for(None, live.reclaim_posture(), 0),
+            None,
+            "a ten-minute clock on a host with 45% of its RAM free destroys \
+             pages to buy memory nobody is asking for"
+        );
+        // The five-second window is still what genuine pressure selects.
+        assert_eq!(
+            web_surface_background_hold_ms_for(
+                None,
+                crate::terminal_observe::ReclaimPosture::Pressured,
+                0
+            ),
+            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
             "the five-second window is what the wrong argument used to select"
         );
     }
