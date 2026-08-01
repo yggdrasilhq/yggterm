@@ -3,6 +3,12 @@ pub mod agent_cli;
 pub mod agent_scheme;
 pub mod app_registry;
 mod browser;
+// Bringing a decade of history OUT of the browsers that hold it: Chromium's
+// `History`/`Bookmarks` and Firefox's `places.sqlite`, in-process through
+// rusqlite. Three traps live here — the 1601 epoch, the locked live database,
+// and idempotence — each of which produces plausible garbage rather than an
+// error. See ychrome/docs/collections.md §Import.
+pub mod browser_import;
 pub mod cli_args;
 pub mod click_grid;
 pub mod gl_probe;
@@ -31,9 +37,11 @@ pub mod web_collection;
 // writes, id allocation, and the two rules that make snapshots safe — an
 // identical snapshot is never written, and a COLLECTION is never pruned.
 pub mod web_collection_store;
-// The per-profile `history.jsonl`, read in ONE place. The omnibox, the history
-// viewer and `collection add-from-history` all ask this file the same
-// questions; a second reader is how they would come to disagree.
+// The per-profile `history.jsonl`, read AND written in ONE place. The omnibox,
+// the history viewer and `collection add-from-history` all ask this file the
+// same questions; a second reader is how they would come to disagree. Its one
+// invariant is that lines are in VISIT ORDER — every reader walks the file
+// backwards — which is why the browser import merges rather than appends.
 pub mod web_history;
 pub mod render_probe;
 mod retention;

@@ -8956,8 +8956,13 @@ fn save_web_tab_store_in(
 /// that record where a surface has been — the history journal and the saved tab
 /// tree — so an internal `data:` page (the history view itself) can never be
 /// journalled as a visit or come back as a restored tab.
+///
+/// The rule belongs to the journal, so it is the journal's crate that owns it:
+/// the browser import asks the same question about a decade of rows out of
+/// Chrome's `urls` table, and a second spelling here would let the two answer
+/// differently about the same URL.
 fn web_surface_url_is_page(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    yggterm_core::web_history::web_history_url_is_page(url)
 }
 /// Does this tab belong in the profile's saved tree?
 ///
@@ -8983,28 +8988,24 @@ fn web_tab_is_saved(tab_id: u64, url: &str, app_url: &str) -> bool {
 /// written by the native-surface reconciler's page observer). None for the
 /// reserved ephemeral profile — temp browsing must leave no disk trace,
 /// matching its ephemeral WebContext.
+///
+/// The path, the record and the ephemeral refusal all belong to
+/// `yggterm_core::web_history`, because the browser import writes the SAME file
+/// from outside the GUI. This resolves the jar root and asks it.
 fn web_surface_history_path(profile: &str) -> Option<std::path::PathBuf> {
     yggterm_core::web_history::web_history_path(profile)
 }
 fn append_web_surface_history(profile: &str, url: &str, title: &str) {
-    if !web_surface_url_is_page(url) {
-        return;
-    }
     let Some(path) = web_surface_history_path(profile) else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let line = json!({"ts_ms": current_millis(), "url": url, "title": title}).to_string();
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(file, "{line}");
-    }
+    // One visit, through the journal's own writer: it owns the record shape and
+    // the non-page refusal, and it appends without reading — a page load must
+    // not pay for the size of the history behind it.
+    let _ = yggterm_core::web_history::append_web_visit(
+        &path,
+        &yggterm_core::web_history::WebHistoryEntry::new(current_millis(), url, title),
+    );
 }
 /// Omnibox history suggestions for `query`: most-recent-first substring match
 /// (case-insensitive, over url + title), deduped by URL. Deterministic given

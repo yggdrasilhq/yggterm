@@ -714,6 +714,61 @@ whole plane. Notes on two verbs:
   inventing a second placement path here is exactly what the spec forbids. The
   rail in I6 calls this same resolver; until then the answer carries
   `"placement": "unwired_until_i6"` rather than pretending.
+## Importing other browsers' history and bookmarks (2026-08-01)
+
+The point of collections (`ychrome/docs/collections.md`) is getting a decade of
+browsing out of the browsers holding it — five Chromium forks (Chrome, Brave,
+Vivaldi, Chromium, Helium; Edge too) and the Firefox family. In-process through
+`rusqlite`, never a shell-out to `sqlite3`:
+
+```
+yggterm-headless web-import browsers
+yggterm-headless web-import profiles --browser brave
+yggterm-headless web-import run --browser brave [--source-profile "Profile 1"]
+    [--path <user-data-dir>] [--profile <yggterm-profile>] [--dry-run] [--json]
+```
+
+The library is `yggterm_core::browser_import`; the verb is a thin shell over it,
+so the GUI, ychrome and I3's `collection import` arm all reach one behaviour. No
+daemon and no GUI are involved — it is local file work.
+
+**History is a timeline, bookmarks are folders.** Visits merge into the
+profile's `history.jsonl`; bookmarks become ONE collection whose folder tree is
+heading depth. A giant collection of 200k visits is not something anyone can
+read, and a flattened bookmark list loses the only organisation the user made.
+
+Three traps, each of which produces plausible garbage rather than an error, and
+each with a lock in `browser_import.rs`:
+
+- **The epoch.** Chromium's stamps are microseconds since **1601-01-01**;
+  Firefox's are microseconds since **1970-01-01**. Swap them and a decade of
+  history lands in 2390 or before 1601 — every row self-consistent, every date
+  wrong. Both converters refuse anything outside 1990..2100, which is exactly
+  what a swapped epoch produces in either direction.
+- **The database is locked while that browser runs.** Every read copies the file
+  *and its `-wal`/`-shm`/`-journal`* to a private temp directory and opens THE
+  COPY read-only. The newest browsing lives in the `-wal`, so a copy without it
+  silently drops the last session.
+- **Idempotence.** History dedupes on `(url, visit_time)`, bookmarks on
+  `(folder path, url)`. Re-running is the normal way to pick up what the browser
+  has done since, and a re-run leaves both files byte-identical.
+
+**The journal's invariant is visit ORDER**, and the import is what could break
+it: every reader walks `history.jsonl` backwards and treats the last line as the
+newest visit, capped at 1000. Appending imported visits would leave every date
+correct and still show the user nothing but pages from 2016. So
+`yggterm_core::web_history` owns two writers — `append_web_visit` (live, one
+line, no read) and `merge_web_visits` (import: dedupe, and merge into position
+when the batch is older). That module also owns the record shape, the path and
+the "is it a page" rule; `shell.rs` calls in rather than keeping a second copy.
+
+Also imported from the URL table, not only from `visits`: Chromium expires visit
+rows at ~90 days while `urls.last_visit_time` survives, so for an old profile
+that table is most of what is left. Two passes, one dedupe.
+
+Not covered yet: Session Buddy's JSON export (spec §Import lists it), favicons,
+and Chromium's `Bookmarks` `date_added` (folders and order are preserved; the
+per-item timestamp is not carried into the item line).
 
 ## Renderer and security
 
