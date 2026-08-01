@@ -1396,6 +1396,13 @@ per surface.
 both "destroyed" and "the user just revealed it". Disambiguate on the ROW's
 existence and on the GUI's pid, or a routine GUI restart reads exactly like a
 reap. It did once here.
+⚠⚠ **Compare `stashed_for_ms` NUMERICALLY, never with a shell glob.** A watcher
+written here matched `*stashed_for_ms=6[5-9]*` intending "650,000 ms or more"
+and fired on **65,846 ms** — 65 seconds — then printed `PASSED 600s STILL
+ALIVE`. It was a wrong answer to the exact question this section exists to
+settle, and it would have read as confirmation of the fix. `[ "$v" -gt 640000 ]`
+is the test. Three instrument ambiguities in one measurement is the standing
+warning: on this host, verify the verifier before quoting it.
 
 ### 11g. Still open after this section
 
