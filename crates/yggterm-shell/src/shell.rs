@@ -868,33 +868,41 @@ fn status_dot_blink_opacity_css(working: bool) -> String {
 /// which is exactly why the ychrome tab rail (whose body never injected it) wore
 /// a ✕ on every row at rest (user report + screenshot, 2026-08-01).
 ///
-/// …and the FROSTED CHIP is painted HERE, in the revealed state only, rather
-/// than in the row's inline style. `backdrop-filter` forces a compositing layer
-/// wherever it is declared, and a sidebar of 22 live rows plus a rail of tabs
-/// would each carry one at rest, forever, for a chip nobody is looking at. At
-/// rest the rule says `none`; the reveal turns it on.
+/// …and there is DELIBERATELY NO BACKGROUND behind the verbs.
 ///
-/// It is a FUNCTION of the palette because the wash is the surface's own
-/// colour, and one window has one palette — so this is the single owner of that
-/// answer rather than a prop each row family passes and could pass differently.
-fn session_row_hover_css(palette: Palette) -> String {
-    let fade = SESSION_ROW_ACTIONS_FADE_PX;
-    let wash = format!("color-mix(in srgb, {} 62%, transparent)", palette.panel);
-    format!(
-        "[data-session-row] [data-session-row-actions]{{opacity:0; pointer-events:none; \
-         background-image:none; backdrop-filter:none; -webkit-backdrop-filter:none; \
-         transition:opacity 120ms ease;}} \
-         [data-session-row] [data-session-row-actions] *{{pointer-events:none;}} \
-         [data-session-row]:hover [data-session-row-actions],\
-         [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions],\
-         [data-session-row]:focus-within [data-session-row-actions]\
-         {{opacity:1; \
-         background-image:linear-gradient(to right, transparent 0px, {wash} {fade}px); \
-         backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);}} \
-         [data-session-row]:hover [data-session-row-actions] *,\
-         [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions] *,\
-         [data-session-row]:focus-within [data-session-row-actions] *{{pointer-events:auto;}}"
-    )
+/// The first cut floated them on a frosted chip (blur + a wash of the surface
+/// colour, feathered by a mask) so the title could keep the whole row at all
+/// times. The user saw it and rejected it — the title ran UNDER the chip and
+/// read as a smudge rather than a button (2026-08-01, screenshot): "the white
+/// bg effect on the close buttons in both cwdtrees look so ugly. Let us not
+/// have a close button bg like it used to and truncate the row line to make
+/// room for the button."
+///
+/// So the verbs are IN FLOW. At rest they are `display:none`, which costs no
+/// width at all, so the title still gets the whole row — that half of the
+/// reclaim survives. Revealed, they take their space and the title ellipsizes
+/// to fit, which is what a truncating row is supposed to do and what every
+/// file tree does. The reflow-on-hover this trades for is the point, not a
+/// regression: it is what makes the ✕ legible against the row rather than
+/// against the text under it.
+///
+/// It stays a FUNCTION of the palette because the reveal is one owner for
+/// every row family — see [`the_row_reveal_rule_has_one_owner_and_reaches_every_surface`].
+fn session_row_hover_css(_palette: Palette) -> String {
+    // EVERY state names the SAME properties. Dioxus applies inline styles
+    // property-by-property, and while this particular rule is a stylesheet
+    // (not an inline style) the discipline is kept so a later move to inline
+    // cannot resurrect the dropped-key class of bug this file has hit twice.
+    "[data-session-row] [data-session-row-actions]{display:none; opacity:0; pointer-events:none;} \
+     [data-session-row] [data-session-row-actions] *{pointer-events:none;} \
+     [data-session-row]:hover [data-session-row-actions],\
+     [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions],\
+     [data-session-row]:focus-within [data-session-row-actions]\
+     {display:inline-flex; opacity:1; pointer-events:auto;} \
+     [data-session-row]:hover [data-session-row-actions] *,\
+     [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions] *,\
+     [data-session-row]:focus-within [data-session-row-actions] *{pointer-events:auto;}"
+        .to_string()
 }
 /// The vertical-tabs left pane slides in from the edge as the top chrome
 /// collapses (max-height transition on the tab bar + nav bar).
@@ -3885,73 +3893,68 @@ mod app_pane_reorder_tests {
     /// live-session row, so a truncated title stopped 24px short of the row it
     /// was in. Hiding it was never enough; it has to leave the flex line.
     #[test]
-    fn the_trailing_verbs_are_out_of_flow_so_the_title_keeps_the_whole_row() {
+    fn the_trailing_verbs_take_their_space_only_once_they_are_shown() {
+        // THE USER OVERRULED THE FIRST DESIGN, 2026-08-01. The verbs used to
+        // float out of flow on a frosted chip so the title could keep the whole
+        // row even while they showed. He saw it and rejected it: "the white bg
+        // effect on the close buttons in both cwdtrees look so ugly. Let us not
+        // have a close button bg like it used to and truncate the row line to
+        // make room for the button." The title was running UNDER the chip.
+        //
+        // So: in flow, no background, and the title truncates when they appear.
+        // This lock was REWRITTEN to the new contract rather than deleted —
+        // weakening it would let the chip come back by accident.
         let anchor = session_row_actions_anchor_style(6);
-        assert!(anchor.contains("width:0px;"), "{anchor}");
-        assert!(anchor.contains("flex:0 0 0px;"), "{anchor}");
-        // A zero-WIDTH item is not a zero-COST item: flex `gap` still charges
-        // the title one gap for it, which is the last 6px of "the entire width".
-        assert!(anchor.contains("margin-left:-6px;"), "{anchor}");
-        assert!(
-            anchor.contains("position:relative;"),
-            "the verbs are positioned against the anchor, so it must be the \
-             containing block: {anchor}"
-        );
+        assert!(anchor.contains("flex:0 0 auto;"), "an in-flow cell: {anchor}");
+        for banned in ["width:0px;", "position:relative;", "margin-left:-"] {
+            assert!(
+                !anchor.contains(banned),
+                "`{banned}` is the out-of-flow anchor coming back: {anchor}"
+            );
+        }
         let actions = session_row_actions_style(5, 9);
-        assert!(
-            actions.contains("position:absolute;"),
-            "the verbs must not be a flex item: {actions}"
+        for banned in [
+            "position:absolute;",
+            "mask-image",
+            "right:-",
+            "background",
+            "backdrop-filter",
+        ] {
+            assert!(
+                !actions.contains(banned),
+                "`{banned}` is the chip coming back: {actions}"
+            );
+        }
+
+        // THE REVEAL OWNS `display`, and that is what makes the row free at
+        // rest: `display:none` costs no width, so a row with nothing revealed
+        // still gives the title everything. Revealed, it becomes a flex item
+        // and the title ellipsizes around it.
+        let css = session_row_hover_css(palette(UiTheme::ZedLight));
+        assert!(css.contains("display:none;"), "at rest the verbs cost NO width: {css}");
+        assert!(css.contains("display:inline-flex;"), "revealed they take space: {css}");
+        for banned in ["backdrop-filter", "linear-gradient", "color-mix"] {
+            assert!(
+                !css.contains(banned),
+                "`{banned}` is the frosted chip coming back: {css}"
+            );
+        }
+        // …and the theme no longer changes the answer, because there is no
+        // wash to tint. Both palettes must produce the identical rule.
+        assert_eq!(
+            css,
+            session_row_hover_css(palette(UiTheme::ZedDark)),
+            "with no background, the reveal cannot depend on the palette"
         );
-        // Bled over the row's own padding so the chip reaches the row's real
-        // edges — the row's `overflow:hidden` clips it back to the radius. A
-        // chip that stopped at the CONTENT box read as a floating sticker.
-        assert!(actions.contains("right:-9px;"), "{actions}");
-        assert!(actions.contains("top:-5px;"), "{actions}");
-        assert!(actions.contains("bottom:-5px;"), "{actions}");
-        // …and a row that ALSO has an expander does not bleed sideways: the
-        // chevron sits 6px to the right and the bleed put the chip 2px on it
-        // (measured live on a rail folder row). The expander is permanent
-        // chrome; a hover may never cover it.
-        let beside_expander = session_row_actions_style(5, 0);
-        assert!(beside_expander.contains("right:-0px;"), "{beside_expander}");
-        assert!(beside_expander.contains("top:-5px;"), "{beside_expander}");
+        // The title must actually be allowed to shrink, or it would push the
+        // verbs off the row instead of truncating.
         let product_src = product_source();
         assert!(
-            product_src.contains("if expander_present { 0 } else { metrics.pad_h_px },"),
-            "the shared row must choose the bleed by whether an expander follows"
+            product_src.contains("min-width:0"),
+            "the label cluster needs min-width:0 or flex will not let it ellipsize"
         );
-        assert!(actions.contains("mask-image:linear-gradient(to right"), "{actions}");
-        // …and the fade that lets them sit OVER a long title, which lives in the
-        // REVEALED rule so a row at rest pays for no compositing layer. Both
-        // halves: the blur takes its colour from whatever is really behind (the
-        // window is transparent and the backdrop is a gradient, so a flat fade
-        // would read as a bright rectangle) and the wash is the fallback if a
-        // platform has no backdrop-filter.
-        let light = session_row_hover_css(palette(UiTheme::ZedLight));
-        assert!(light.contains("backdrop-filter:none;"), "{light}");
-        assert!(light.contains("backdrop-filter:blur("), "{light}");
-        assert!(
-            light.contains("color-mix(in srgb, #ffffff 62%, transparent)"),
-            "the wash is the WINDOW's own surface colour: {light}"
-        );
-        let dark = session_row_hover_css(palette(UiTheme::ZedDark));
-        assert!(
-            dark.contains("color-mix(in srgb, #161c22 62%, transparent)"),
-            "…and it follows the theme: {dark}"
-        );
-        // The row itself is the positioning context for consumers that hand the
-        // whole thing to the shared component.
-        let container = session_row_container_style(
-            SessionRowDensity::Rail,
-            0,
-            false,
-            false,
-            true,
-            "#eef",
-            "#123",
-        );
-        assert!(container.contains("position:relative;"), "{container}");
     }
+
 
     /// ★ ONE REVEAL RULE, THREE TRIGGERS, ONE INJECTION SITE.
     ///
@@ -3963,11 +3966,19 @@ mod app_pane_reorder_tests {
     #[test]
     fn the_row_reveal_rule_has_one_owner_and_reaches_every_surface() {
         let css = session_row_hover_css(palette(UiTheme::ZedLight));
-        // Hidden at rest.
-        assert!(
-            css.contains("[data-session-row] [data-session-row-actions]{opacity:0;"),
-            "{css}"
-        );
+        // Hidden at rest — and hidden by `display`, not merely faded, so the
+        // row costs the title no width while nothing is revealed. Asserted on
+        // the at-rest BLOCK rather than on a leading substring, because pinning
+        // property ORDER made this lock fail the moment the contract changed
+        // without the contract being wrong (2026-08-01).
+        let at_rest = css
+            .split("[data-session-row] [data-session-row-actions]{")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the at-rest rule is present");
+        assert!(at_rest.contains("display:none;"), "at rest: {at_rest}");
+        assert!(at_rest.contains("opacity:0;"), "at rest: {at_rest}");
+        assert!(at_rest.contains("pointer-events:none;"), "at rest: {at_rest}");
         // THREE triggers. Mouse-only would strand the ALT/KeyTip layer.
         for trigger in [
             "[data-session-row]:hover [data-session-row-actions]",
@@ -81756,11 +81767,12 @@ const SESSION_ROW_ACTIONS_FADE_PX: u32 = 22;
 /// the app tab's — the one row with no verbs at all — reached 2546). Cancelling
 /// it makes "the entire width" literally true, and it also keeps a group row's
 /// title-to-chevron distance at ONE gap instead of two.
-fn session_row_actions_anchor_style(row_gap_px: u32) -> String {
-    format!(
-        "position:relative; align-self:stretch; width:0px; min-width:0px; flex:0 0 0px; \
-         margin-left:-{row_gap_px}px;"
-    )
+fn session_row_actions_anchor_style(_row_gap_px: u32) -> String {
+    // A plain in-flow cell. It is zero-width while its child is `display:none`,
+    // so a row with no revealed verbs gives the title everything; when the
+    // child appears the cell grows and the title's `min-width:0` + ellipsis
+    // does the truncating.
+    "display:flex; align-items:center; flex:0 0 auto;".to_string()
 }
 
 /// The revealed verbs themselves: out of flow, pinned to the anchor's trailing
@@ -81790,15 +81802,11 @@ fn session_row_actions_anchor_style(row_gap_px: u32) -> String {
 /// row family sets `overflow:hidden` — so bleeding costs nothing and buys the
 /// chip the row's own shape. The feathered left edge is the only edge that
 /// should be visible at all.
-fn session_row_actions_style(bleed_v_px: u32, bleed_h_px: u32) -> String {
-    let fade = SESSION_ROW_ACTIONS_FADE_PX;
-    format!(
-        "position:absolute; right:-{bleed_h_px}px; top:-{bleed_v_px}px; bottom:-{bleed_v_px}px; \
-         display:inline-flex; align-items:center; justify-content:flex-end; \
-         gap:2px; padding-left:{fade}px; padding-right:{bleed_h_px}px; \
-         -webkit-mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px); \
-         mask-image:linear-gradient(to right, transparent 0px, #000 {fade}px);"
-    )
+fn session_row_actions_style(_bleed_v_px: u32, _bleed_h_px: u32) -> String {
+    // `display` is owned by the reveal rule (none -> inline-flex); everything
+    // here is the in-flow box it becomes. No background, no mask, no bleed —
+    // the row's own surface shows through, which is the whole point.
+    "align-items:center; justify-content:flex-end; gap:2px; margin-left:4px;".to_string()
 }
 
 /// The tiny trailing verbs (✕, rename, …) every row family shares.
