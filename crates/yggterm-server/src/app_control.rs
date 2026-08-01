@@ -176,7 +176,9 @@ pub enum AppControlKeyCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WebElementRef {
-    /// A CSS selector, resolved with `document.querySelector` (first match).
+    /// A CSS selector, resolved against the HITTABLE matches in document order
+    /// (`nth` 0). A `display:none` / `visibility:hidden` / `aria-hidden`
+    /// duplicate is noise, never a candidate — see `web_css_matcher_js`.
     Css(String),
     /// The element whose visible text (or `aria-label`, or an input's `value`)
     /// matches. Ties are broken deterministically: candidates in document order,

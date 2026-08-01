@@ -133,9 +133,18 @@ symbol rather than trusting a line number:**
   per-origin; the adblock filter may be eating `/cdn-cgi/challenge-platform/` or
   `challenges.cloudflare.com` (zero-build test: disable adblock for that profile;
   durable: an `ignore-previous-rules` allowlist entry); and **a profile whose
-  write-lock is held elsewhere silently opens EPHEMERAL**, so cookies never
-  persist and the challenge loops forever — make that refusal open the jar
-  READ-ONLY as its own comment claims, and stop degrading silently. Nothing is
+  write-lock is held elsewhere silently opened EPHEMERAL**, so cookies never
+  persist and the challenge loops forever. ✅ **The SILENCE is fixed**
+  (`WebSurfaceJarMode`): the mode is decided, spelled and traced in one place,
+  and a degraded profile now raises one notice per profile saying it starts
+  logged out and will not remember a bot-check cookie — the misleading
+  "READ-ONLY" comment is gone, since `profile_dir: None` never was read-only.
+  ⚠ **Making it a genuinely read-only jar is still open and is a DESIGN CALL,
+  not a mechanical fix** — WebKitGTK has no such mode, so it means giving the
+  loser a private copy of the profile's cookies, and every agent shadow surface
+  would then duplicate the user's live session cookies to a second place on
+  disk. Options are costed in `ychrome/docs/pending-bugs.md`. The UA half and
+  the engine's own jar were fixed in ychrome (`89d83b3`, `f8bef43`). Nothing is
   diagnosable today because no main-frame load status is traced.
 - **False/stale gates.** `runtime_status_handoff_active()` is
   `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
@@ -253,31 +262,6 @@ detector found nothing precisely because on Wayland there is nothing to find.
   shadows it, and `prewarmGlobally()` is Cocoa-only.
 
 
-- **★★ `web do click --css` MIS-CLICKS A HIDDEN DUPLICATE — the same ancestor-hit
-  bug the engine just fixed, still live in the surface plane** (found 2026-07-31
-  by `lane/dev/engine-click-hittable` while fixing ychrome's copy; **not fixed
-  here**, because three lanes were editing `shell.rs` at the time).
-  Two defects, both in `crates/yggterm-shell/src/shell.rs` — grep the symbols,
-  the numbers move:
-  1. `var onTarget = hit===el || (el.contains&&el.contains(hit)) || (hit&&hit.contains&&hit.contains(el));`
-     (was ~`:57306`). ⛔ **`<body>` contains every element on the page**, so the
-     third clause accepts *any* candidate on *any* normal page. A click that
-     lands on an ANCESTOR reaches the ancestor, not the node you named. Drop the
-     clause: `hit === el || el.contains(hit)`.
-  2. `web_css_matcher_js` (was ~`:57378`) does `querySelectorAll(sel)[nth]` with
-     `hidden:0` **hard-coded and no liveness filter at all**. Only the *Role*
-     matcher runs `__yggLive`.
-  Net effect: on a page with a `visibility:hidden` duplicate ahead of the real
-  control, the decoy passes `visible` (it has a real rect) AND passes `onTarget`
-  (body contains it) and gets the click — reported as success. The plane gets
-  the `0x0` case right and gets role/text targets right; **its CSS path is
-  wrong.** The engine's fixed resolver (`ychrome` `c547aa6`, `src/engine/hit.rs`)
-  is the reference: classify with the liveness predicate, pin, `scrollIntoView`,
-  let the scroll settle, re-measure, then require `hit === el || el.contains(hit)`.
-  ⚠ Keep the refusal vocabulary identical across both planes
-  (`no_hittable_match`, `detached_node`, `target_moved`, `zero_size_element`) —
-  two planes with different words for the same refusal is the divergence
-  AGENTS.md forbids, and avoiding it is why the engine borrowed these names.
 - **Adblock/SponsorBlock not exhaustive; YouTube ads played at 2x.**
   `lane/dev/adblock-exhaustive`. ✅ **The 2x symptom is root-caused and cured on
   jojo (2026-07-31).** The deployed `youtube-adblock.js` was the pre-`d05a871`
