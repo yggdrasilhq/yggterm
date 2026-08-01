@@ -27,7 +27,9 @@ pub use motion::{
     emphasized_exit_transition, standard_accelerate_transition, standard_decelerate_transition,
     standard_transition, transition,
 };
-pub use notifications::{TOAST_CSS, ToastCard, ToastItem, ToastPalette, ToastTone, ToastViewport};
+pub use notifications::{
+    TOAST_CSS, ToastAnchor, ToastCard, ToastItem, ToastPalette, ToastTone, ToastViewport,
+};
 pub use rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailReveal, SideRailShell};
 pub use theme::{
     MAX_THEME_STOPS, THEME_EDITOR_SWATCHES, append_theme_stop, chrome_material_tint,

@@ -515,6 +515,38 @@ bug. Check before investigating:
 - Trace: component `daemon_handover`, events `handover_paint_suspended` /
   `handover_paint_resumed` (one pair from `ShellState`, one per mounted bridge).
 
+### `document_wrap_gutters` — the yedit line-number gutter grades its own homework
+
+A wrapped document's gutter cannot be checked by reading it: it desyncs slowly,
+by fractions of a pixel per line, and the number beside line 40 still looks
+right. So the gutter measures every logical line, emits one block at that
+line's measured height, and then **compares the total against the textarea's own
+content height** before drawing anything.
+
+```json
+"document_wrap_gutters": [
+  { "widget_id": "body", "status": "ok", "entry_count": 412,
+    "detail": { "lines": 412, "sum": 8621.1, "scroll_height": 8675,
+                "client_height": 640, "padding": 54, "delta": 0.1,
+                "measured": true } }
+]
+```
+
+- `status: "ok"` — the sum agrees with the textarea, which was scrolling and
+  could therefore be asked. This is the only status that means *verified*.
+- `status: "unverified"` — the document fits its box, so `scrollHeight` is
+  clamped to the padding box and cannot confirm a total. Numbers ARE drawn;
+  nothing contradicts them. Expected on a short document.
+- `status: "drift"` — the totals disagree. **The gutter deliberately draws no
+  numbers**, because wrong numbers are worse than none. An empty gutter column
+  beside a wrapped document is this, and `detail.delta` is how far off it was.
+- `measured: false` — over 6000 lines, so each line was assumed to be one visual
+  row rather than measured. Combined with `status: "drift"` that means the
+  document wraps and the fallback cannot serve it.
+
+`entry_count` is one per LOGICAL line, not per visual row — a file of 412 lines
+reads 412 however many of them wrap.
+
 ### Drag gestures — TWO independent ones, and they read differently
 
 The cwd tree and the contributed app rail (yedit's file list, ychrome's tabs)

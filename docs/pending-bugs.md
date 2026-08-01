@@ -81,16 +81,6 @@ fix) once the fix is verified live on jojo.
   `server app state` REFRESHES the observation, so an external probe cannot
   measure staleness and can itself arm the gate.
 
-- **yedit: the wrap gutter drifts, and chrome draws over text.** The gutter takes
-  one fractional `getComputedStyle(...).lineHeight` and uses it for BOTH the
-  per-entry height and the row count, so error accumulates down the file — emit
-  one gutter block per LOGICAL line at the MIRROR child's measured
-  `offsetHeight`, and make the gutter self-verifying (sum === `scrollHeight -
-  padding`; on mismatch stop drawing numbers and stamp an observable field). The
-  "Document | Terminal" pill floats over an editor with no reserved space — move
-  it into the titlebar's existing surface-switch slot and delete both floating
-  pills.
-
 - **A degraded profile cannot be made genuinely READ-ONLY — DESIGN CALL, decided
   2026-08-01.** The silence half is done (`WebSurfaceJarMode` owns the decision,
   the spelling and the notice). WebKitGTK has no read-only jar, so "genuinely

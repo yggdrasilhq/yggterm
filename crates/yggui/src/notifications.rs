@@ -34,6 +34,65 @@ pub struct ToastItem {
     pub persistent: bool,
 }
 
+/// Where the toast stack sits over the app.
+///
+/// The anchor belongs to the VIEWPORT the toasts cover, not to the toasts: a
+/// terminal keeps its newest output and its prompt at the bottom, so toasts go
+/// top-centre; a document keeps its title and first line at the top, so toasts
+/// go to a bottom corner. The caller owns that decision (and, on a bottom
+/// corner, which side the chrome mirror puts it on) — this type only draws it.
+///
+/// The newest toast always sits NEAREST the anchored edge, which is why the
+/// bottom variants reverse the stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ToastAnchor {
+    /// Horizontally centred near the top — DESIGN.md's default placement.
+    #[default]
+    TopCenter,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ToastAnchor {
+    /// The stack root's box, with an IDENTICAL property-key set in every arm.
+    ///
+    /// ⚠ Dioxus applies a style string property-by-property and never clears a
+    /// key a later render stops emitting, so an arm that simply omitted `top`
+    /// would keep the previous arm's `top` forever. Every arm names every key.
+    fn stack_style(self) -> &'static str {
+        match self {
+            Self::TopCenter => {
+                "position:fixed; top:22px; bottom:auto; left:50%; right:auto; \
+                 transform:translateX(-50%); flex-direction:column; align-items:stretch; \
+                 z-index:80; display:flex; gap:10px; width:320px; \
+                 max-width:min(320px, calc(100vw - 32px)); pointer-events:none;"
+            }
+            Self::BottomLeft => {
+                "position:fixed; top:auto; bottom:22px; left:22px; right:auto; \
+                 transform:none; flex-direction:column-reverse; align-items:flex-start; \
+                 z-index:80; display:flex; gap:10px; width:320px; \
+                 max-width:min(320px, calc(100vw - 32px)); pointer-events:none;"
+            }
+            Self::BottomRight => {
+                "position:fixed; top:auto; bottom:22px; left:auto; right:22px; \
+                 transform:none; flex-direction:column-reverse; align-items:flex-end; \
+                 z-index:80; display:flex; gap:10px; width:320px; \
+                 max-width:min(320px, calc(100vw - 32px)); pointer-events:none;"
+            }
+        }
+    }
+
+    /// The stamp app-control reads back, so "where did the toast go?" is a
+    /// question the running app answers rather than one a screenshot has to.
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::TopCenter => "top_center",
+            Self::BottomLeft => "bottom_left",
+            Self::BottomRight => "bottom_right",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct ToastPalette {
     pub text: &'static str,
@@ -125,7 +184,7 @@ fn linux_x11_safe_mode() -> bool {
 pub fn ToastViewport(
     items: Vec<ToastItem>,
     palette: ToastPalette,
-    center_offset: i32,
+    anchor: ToastAnchor,
     max_age_ms: u64,
     max_visible: usize,
     now_ms: u64,
@@ -151,10 +210,8 @@ pub fn ToastViewport(
     rsx! {
         div {
             key: "{stack_key}",
-            style: format!(
-                "position:fixed; top:22px; left:50%; transform:translateX(calc(-50% + {}px)); z-index:80; display:flex; flex-direction:column; gap:10px; width:320px; max-width:min(320px, calc(100vw - 32px)); pointer-events:none;",
-                center_offset
-            ),
+            "data-yggui-toast-anchor": anchor.wire_name(),
+            style: anchor.stack_style(),
             for notification in visible {
                 div {
                     key: "{notification.id}",
@@ -320,5 +377,76 @@ pub fn toast_tone_colors(
         ToastTone::Success => ("#2f9e62", foreground),
         ToastTone::Warning => ("#d79b24", foreground),
         ToastTone::Error => ("#d95c5c", foreground),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn style_keys(style: &str) -> BTreeSet<String> {
+        style
+            .split(';')
+            .filter_map(|declaration| declaration.split_once(':'))
+            .map(|(key, _)| key.split_whitespace().collect::<String>())
+            .filter(|key| !key.is_empty())
+            .collect()
+    }
+
+    /// ⚠ THE DIOXUS STYLE-KEY TRAP. A style string is applied
+    /// property-by-property and a key a later render stops emitting is never
+    /// cleared — so an anchor that set only `bottom` would inherit the previous
+    /// anchor's `top` and float in the middle of the window. Every arm must
+    /// name every key, and this is the lock that says so.
+    #[test]
+    fn every_toast_anchor_emits_the_same_style_keys() {
+        let top = style_keys(ToastAnchor::TopCenter.stack_style());
+        for anchor in [ToastAnchor::BottomLeft, ToastAnchor::BottomRight] {
+            assert_eq!(
+                style_keys(anchor.stack_style()),
+                top,
+                "{anchor:?} drops or adds a style key relative to TopCenter"
+            );
+        }
+        for key in ["top", "bottom", "left", "right", "transform", "flex-direction"] {
+            assert!(
+                top.contains(key),
+                "the positioning key `{key}` must be named by every anchor, not left to inherit"
+            );
+        }
+    }
+
+    /// The newest toast belongs nearest the edge the stack is anchored to:
+    /// downward from the top, upward from a bottom corner. `visible` is already
+    /// newest-first, so a bottom anchor reverses the flex flow.
+    #[test]
+    fn a_bottom_anchor_stacks_away_from_its_edge() {
+        assert!(
+            ToastAnchor::TopCenter
+                .stack_style()
+                .contains("flex-direction:column;")
+        );
+        for anchor in [ToastAnchor::BottomLeft, ToastAnchor::BottomRight] {
+            assert!(
+                anchor.stack_style().contains("flex-direction:column-reverse;"),
+                "{anchor:?} must grow upward from its edge"
+            );
+        }
+    }
+
+    #[test]
+    fn each_anchor_has_its_own_probe_name() {
+        let names = [
+            ToastAnchor::TopCenter,
+            ToastAnchor::BottomLeft,
+            ToastAnchor::BottomRight,
+        ]
+        .map(ToastAnchor::wire_name);
+        assert_eq!(
+            names.iter().collect::<BTreeSet<_>>().len(),
+            names.len(),
+            "app-control cannot tell two anchors apart if they share a name"
+        );
     }
 }

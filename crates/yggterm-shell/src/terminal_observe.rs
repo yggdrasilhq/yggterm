@@ -519,6 +519,15 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .unwrap_or("")
         .trim()
         .to_string();
+    // The yedit wrap gutter's self-check, verbatim. It is the gutter that
+    // decides whether its own numbers are trustworthy (see
+    // `DOCUMENT_WRAP_GUTTER_SCRIPT`); app-control only carries the verdict, so
+    // a drifting gutter is observable instead of merely visible.
+    let document_wrap_gutters = dom
+        .get("document_wrap_gutters")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let terminal_hosts = dom
         .get("terminal_hosts")
         .and_then(Value::as_array)
@@ -876,6 +885,7 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         },
         "document_editor_count": document_editor_count,
         "document_body_sample": document_body_sample,
+        "document_wrap_gutters": document_wrap_gutters,
         "dom_error": dom_error,
         "dom_degraded_reason": dom_degraded_reason,
         "terminal_host_count": terminal_hosts.len(),
