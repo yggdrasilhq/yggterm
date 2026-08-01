@@ -622,9 +622,35 @@ pub(crate) fn normalized_live_row_identity(key: &str) -> String {
 /// caller re-spells it — a row must not slip past its own tombstone by being
 /// asked about under an equivalent runtime key.
 pub fn live_row_close_is_remembered(home_dir: &std::path::Path, session_path: &str) -> bool {
+    !live_row_closes_remembered_among(home_dir, [session_path]).is_empty()
+}
+
+/// The same question asked of MANY sessions at once, and the ONE place the
+/// plane is loaded, folded and consulted — the singular above is this function
+/// with one path in it.
+///
+/// It exists because the caller that needs it most is a per-tick sweep: a client
+/// holding web surfaces for N sessions has to ask "did the user close any of
+/// these rows elsewhere?", and asking N times is N reads of a file that every
+/// daemon on this machine shares. One load, N folds, and the answer is the
+/// subset that is blocked — in the order the caller asked, so the sweep it
+/// drives is deterministic.
+///
+/// Read-only, like the singular, and for the same reason: `record`/`clear`/
+/// `gc`/`save` are the primitives of a read-modify-write and a caller outside
+/// `live_row_tombstones` that reaches for them publishes a private snapshot over
+/// other daemons' closes.
+pub fn live_row_closes_remembered_among<'a>(
+    home_dir: &std::path::Path,
+    session_paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
     let now = crate::live_row_tombstones::now_secs();
-    crate::live_row_tombstones::LiveRowTombstones::load(home_dir, now)
-        .blocks(&normalized_live_row_identity(session_path), now)
+    let tombstones = crate::live_row_tombstones::LiveRowTombstones::load(home_dir, now);
+    session_paths
+        .into_iter()
+        .filter(|path| tombstones.blocks(&normalized_live_row_identity(path), now))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// **A genuinely closed row, for a test in ANOTHER crate.** Not compiled into
