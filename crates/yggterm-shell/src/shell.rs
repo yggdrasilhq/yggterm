@@ -1979,27 +1979,13 @@ fn kill_control_forward(contribution: &SidebarContributionState) {
 /// `~/.yggterm/web-profiles/`, always including "default", never the reserved
 /// ephemeral "temp" (it gets its own card).
 fn enumerate_web_surface_profiles() -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    if let Some(root) = web_surface_profiles_root()
-        && let Ok(entries) = std::fs::read_dir(root)
-    {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = entry.file_name().to_str()
-                && !name.is_empty()
-                && !name.starts_with('.')
-                && name != WEB_SURFACE_TEMP_PROFILE
-            {
-                names.push(name.to_string());
-            }
-        }
+    // CORE's enumeration, not a second walk of the same directory: the
+    // `server app web profile list` verb answers from the same function, so
+    // what an agent is told exists and what the picker draws cannot diverge.
+    match web_surface_profiles_root() {
+        Some(root) => yggterm_core::web_profile::list_web_profiles_in(&root),
+        None => vec![yggterm_core::web_profile::WEB_PROFILE_DEFAULT.to_string()],
     }
-    if !names.iter().any(|name| name == "default") {
-        names.push("default".to_string());
-    }
-    names.sort();
-    names.dedup();
-    names
 }
 /// A host-owned profile's `profile.json` metadata. Missing file ⇒ defaults —
 /// the overwhelmingly common case, and never an error.
@@ -2064,22 +2050,18 @@ fn update_web_surface_profile_meta(
     };
     update_web_surface_profile_meta_in(&root, profile, edit)
 }
+/// The picker card's write is CORE's write. There are two writers of this
+/// sidecar now — this card and the `server app web profile` verbs the agent
+/// control plane drives — and a second read-modify-write here would be a
+/// second chance to drop `agent_drive`, the key a different process owns.
 fn update_web_surface_profile_meta_in(
     root: &std::path::Path,
     profile: &str,
     edit: impl FnOnce(&mut yggterm_core::web_profile::ProfileMeta),
 ) -> Result<(), String> {
-    let normalized = normalize_web_surface_profile(Some(profile));
-    if normalized != profile.trim() {
-        return Err("that is not a profile name this host can edit".to_string());
-    }
-    if normalized == WEB_SURFACE_TEMP_PROFILE {
-        return Err("the temporary profile keeps nothing on disk".to_string());
-    }
-    let dir = root.join(&normalized);
-    let mut meta = yggterm_core::web_profile::ProfileMeta::read(&dir);
-    edit(&mut meta);
-    meta.write(&dir).map_err(|err| err.to_string())
+    yggterm_core::web_profile::update_profile_meta_in(root, profile, edit)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 /// Delete a host-owned web-profile jar (cookies, logins, storage) from the
 /// picker UI.
