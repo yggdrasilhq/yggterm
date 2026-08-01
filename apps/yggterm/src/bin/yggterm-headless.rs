@@ -156,7 +156,10 @@ common server commands:
   yggterm-headless server snapshot
   yggterm-headless server monitor --scenario panic-report
   yggterm-headless server monitor --scenario latency-check --all
-  yggterm-headless server app <subcommand>"
+  yggterm-headless server app <subcommand>
+  yggterm-headless collection <list|show|new|add|add-from-history|move|rename|tag|note|promote|open|export|prune>
+  yggterm-headless snapshot now [--profile <p>] (--url <u> [--title <t>])...
+    `collection --help` prints the whole plane"
     );
 }
 
@@ -1289,6 +1292,19 @@ fn main() -> Result<()> {
     }
     if args.len() >= 2 && args[0] == "server" && args[1] == "automation" {
         return yggterm_server::run_automation_cli(&args[1..], AUTOMATION_APP_CONTROL_TIMEOUT_MS);
+    }
+    // Collections — history organised into things worth keeping. ONE owner
+    // (crates/yggterm-server/src/web_collection_cli.rs), both binaries, exactly
+    // as `automation` above. No daemon handshake: a collection is a Markdown
+    // file in the profile's own jar, and `collection list` must answer on a
+    // machine with no GUI and no daemon at all.
+    // `snapshot` is matched at the TOP level only — `server snapshot` is the
+    // daemon screen dump and must keep meaning that.
+    if args.first().is_some_and(|arg| arg == "collection" || arg == "snapshot") {
+        return yggterm_server::run_web_collection_cli(&args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "collection" {
+        return yggterm_server::run_web_collection_cli(&args[1..]);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
         // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant
