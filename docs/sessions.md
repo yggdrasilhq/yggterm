@@ -118,6 +118,32 @@ second low-signal title classifier or passive-generation gate.
 - Viewport history is a stack of stable targets, not a second source of truth. It stores session paths or Startpage scopes only so close can choose a replacement; the daemon and metadata store remain authoritative for runtime and copy.
 - When a session is closed, every matching session path or normalized live-runtime alias is pruned from viewport history before fallback selection. This keeps the sequence `open A`, `open B`, `close A`, `close B` from falling back to the already closed A.
 
+### Closing a session that lives on another machine
+
+**Never report a removal as verified for work done on only one side of an ssh
+hop.** A remote agent row (`remote-cc://<machine>/<id>`,
+`remote-session://<machine>/<id>`) has its PTY held by the REMOTE host's own
+yggterm server, deliberately, so it survives ssh drops. Everything the closing
+client can see locally — its row order, its `/proc`, the ssh client it reaped —
+is therefore silent about whether the agent stopped.
+
+Two obligations, and they are separate:
+
+1. **Ask.** The close must cross the hop for BOTH agent kinds. Resolve the
+   target through `remote_agent_pty_target_for_path` (or its free-function twin
+   `remote_agent_row_target`) — the ROW SCHEME implies the kind — and call the
+   per-kind remote verb (`server remote terminate-codex` / `terminate-cc`).
+   `remote_shutdown_target_for_path` parses `remote-session://` only; anything
+   routed through it silently treats every Claude Code row as non-remote.
+2. **Verify, or refuse by name.** Ask the owning machine whether its runtime is
+   still alive (`server remote agent-runtime-alive <runtime-key>`, which sweeps
+   every coexisting daemon on that host) and feed the answer into
+   `verify_session_removal` as `remote_runtime_after`. A probe that fails or
+   cannot be read is `Unverifiable`, which is a refusal — never a pass. The
+   refusal names are `remote_runtime_survived` and
+   `remote_runtime_unverifiable`, and `server app session remove` **exits
+   non-zero** on any refusal.
+
 Remote cwd bookmarks created from a machine/folder context menu are saved as local metadata, but they render in the owning remote machine tree. The synthetic storage path is an implementation detail; the sidebar must not leak it as a local `/__remote_folder__/...` row. A saved remote bookmark should remain visible even if the remote scan currently has no session under that cwd.
 
 The remote bookmark projection uses the complete saved workspace model, not the
