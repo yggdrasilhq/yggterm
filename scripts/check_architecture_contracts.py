@@ -386,6 +386,65 @@ def check_terminal_retained_replay_policy_contract() -> None:
     )
 
 
+def check_gui_binary_resolution_contract() -> None:
+    """The GUI-launcher scripts must not read YGGTERM_BIN as a launch target.
+
+    YGGTERM_BIN is the DAEMON's own executable (it exports it into every PTY it
+    owns), so inside any daemon-owned row it names `yggterm-headless` — a build
+    with no GUI. `shadow-client.sh` defaulting through it made the agent-first
+    test surface unusable for every in-session agent, which pushed agents onto
+    the user's live GUI (docs/pending-bugs.md, J8a/J8b).
+
+    Locked here rather than in a unit test because the failure is in shell
+    scripts, and because the probe those scripts use is only sound while the two
+    Rust help printers keep disagreeing about `install`.
+    """
+    owner = "scripts/lib/gui-binary.sh"
+    require_contains(
+        owner,
+        "yggterm_resolve_gui_binary",
+        "the one owner of GUI-binary resolution must define the resolver",
+    )
+    for launcher in ["scripts/shadow-client.sh", "scripts/underglass-sandbox.sh"]:
+        text = read(launcher)
+        if "lib/gui-binary.sh" not in text:
+            fail(
+                f"{launcher}: must source {owner} rather than resolving a GUI "
+                "binary of its own"
+            )
+        for banned in ['"$YGGTERM_BIN"', "${YGGTERM_BIN:-$", "$YGGTERM_BIN "]:
+            if banned in text:
+                fail(
+                    f"{launcher}: reads YGGTERM_BIN as a launch target ({banned!r}). "
+                    "That variable is the daemon's own exe — headless in every "
+                    "daemon-owned row, and suffixed ' (deleted)' after a hot "
+                    "restart. Use yggterm_resolve_gui_binary."
+                )
+
+    # The probe is a text discriminator against the binaries' own `--help`, so
+    # it is only sound while `install` stays a GUI-only top-level command. If
+    # this ever fails, FIX THE PROBE — do not delete the check, because a probe
+    # that answers "GUI" for a headless build reopens the original bug.
+    require_regex(
+        "scripts/lib/gui-binary.sh",
+        r"grep -qE '\^\[\[:space:\]\]\+\[\^\[:space:\]\]\+ install\$'",
+        "the GUI probe must match the help line it was written against",
+    )
+    require_regex(
+        "apps/yggterm/src/main.rs",
+        r"^  yggterm install$",
+        "the GUI's main help must keep the line scripts/lib/gui-binary.sh probes for",
+    )
+    headless_help = read("apps/yggterm/src/bin/yggterm-headless.rs")
+    if re.search(r"^  yggterm-headless install$", headless_help, flags=re.MULTILINE):
+        fail(
+            "apps/yggterm/src/bin/yggterm-headless.rs: the headless help now "
+            "advertises `install`, which makes scripts/lib/gui-binary.sh unable "
+            "to tell the two builds apart — pick a new discriminator in the same "
+            "change"
+        )
+
+
 def main() -> int:
     check_doc_cross_links()
     check_agents_operating_law()
@@ -396,6 +455,7 @@ def main() -> int:
     check_ui_telemetry_contract()
     check_session_copy_policy_contract()
     check_terminal_retained_replay_policy_contract()
+    check_gui_binary_resolution_contract()
     if FAILURES:
         for failure in FAILURES:
             print(f"ARCHITECTURE CONTRACT FAILED: {failure}", file=sys.stderr)

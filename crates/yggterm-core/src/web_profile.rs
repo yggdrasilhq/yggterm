@@ -194,6 +194,16 @@ pub fn web_profile_is_protected_by_construction(profile: &str) -> bool {
     WEB_PROFILE_PERMANENT.contains(&name.as_str())
 }
 
+/// Why a permanent profile's protection cannot be toggled — the sentence the
+/// picker card's row menu shows on its DISABLED "Protect profile" entry, and
+/// the refusal the `server app web profile protect` verb answers with.
+///
+/// One string, both surfaces: the card and the verb are the same affordance
+/// reached two ways, and an agent that got a different answer from the CLI than
+/// the user gets from the menu would have no way to know which one is the
+/// product's actual rule.
+pub const WEB_PROFILE_PERMANENT_REASON: &str = "default is always protected";
+
 /// Whether a profile refuses deletion: permanent by construction, or marked
 /// protected by its owner.
 pub fn web_profile_is_protected(profile: &str, meta: &ProfileMeta) -> bool {
@@ -438,6 +448,124 @@ impl ProfileMeta {
         std::fs::create_dir_all(profile_dir)?;
         std::fs::write(Self::path_in(profile_dir), self.to_json())
     }
+}
+
+// NOTE: the jar root lives at the top of this module as the pair
+// `web_profiles_root()` / `web_profiles_root_in(home)`. Two lanes landed the
+// same move in parallel and briefly defined it twice — which is precisely the
+// divergence both of them were trying to prevent. The `_in` half is the
+// testable one a scratch-home lock drives; call that, never a second spelling.
+
+/// Existing host-owned profile jars under `root`, as the picker lists them:
+/// directory names, always including `default`, never the reserved ephemeral
+/// `temp` (which keeps nothing on disk and gets its own card), sorted and
+/// deduplicated.
+pub fn list_web_profiles_in(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+                && !name.is_empty()
+                && !name.starts_with('.')
+                && name != WEB_PROFILE_TEMP
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    if !names.iter().any(|name| name == WEB_PROFILE_DEFAULT) {
+        names.push(WEB_PROFILE_DEFAULT.to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Why a metadata WRITE was refused. Deletion has its own guard
+/// ([`WebProfileDeleteRefusal`]); this one governs the sidecar, which a
+/// permanent profile may still edit — `default` can choose an avatar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebProfileMetaRefusal {
+    /// The name could not name a jar under `~/.yggterm/web-profiles/`.
+    UnsafeName,
+    /// The reserved ephemeral profile keeps nothing on disk.
+    Ephemeral,
+}
+
+impl WebProfileMetaRefusal {
+    /// The NAMED reason, shown verbatim by the picker's notice line and by the
+    /// CLI's refusal.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnsafeName => "that is not a profile name this host can edit",
+            Self::Ephemeral => "the temporary profile keeps nothing on disk",
+        }
+    }
+}
+
+/// A metadata write that did not happen: the policy refused it, or the
+/// filesystem did.
+///
+/// The two are kept apart deliberately. A full disk reported as "that is not a
+/// profile name this host can edit" sends the caller after the wrong problem,
+/// and an agent driving the CLI has no screen to notice the difference on.
+#[derive(Debug)]
+pub enum WebProfileMetaError {
+    /// The policy said no. Nothing was written.
+    Refused(WebProfileMetaRefusal),
+    /// The policy allowed it and the write itself failed.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for WebProfileMetaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => f.write_str(refusal.reason()),
+            Self::Write(error) => write!(f, "could not write the profile's metadata: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WebProfileMetaError {}
+
+/// THE read-modify-write for a profile's `profile.json`, and the only one.
+///
+/// Read-modify-write is the contract, never a blind overwrite: `agent_drive`
+/// is specced into this same file and is written by a DIFFERENT process
+/// (`ychrome/docs/agent-engine.md` §7), so a rewrite that dropped it would
+/// silently re-grant a profile the owner had denied. [`ProfileMeta`] carries
+/// unknown keys through ([`ProfileMeta::unknown_keys`]); this function is what
+/// guarantees every writer goes through that path.
+///
+/// It lives here rather than in the GUI because there are now two writers: the
+/// picker card's row menu and the `server app web profile` verbs the agent
+/// control plane drives. Two implementations of "edit a profile's sidecar"
+/// would be two chances to drop the key.
+///
+/// Returns the metadata AS WRITTEN, so a caller can report what the file now
+/// says without re-reading it.
+pub fn update_profile_meta_in(
+    root: &Path,
+    profile: &str,
+    edit: impl FnOnce(&mut ProfileMeta),
+) -> Result<ProfileMeta, WebProfileMetaError> {
+    let normalized = normalize_web_profile(Some(profile));
+    if normalized != profile.trim() {
+        return Err(WebProfileMetaError::Refused(
+            WebProfileMetaRefusal::UnsafeName,
+        ));
+    }
+    if web_profile_is_ephemeral(&normalized) {
+        return Err(WebProfileMetaError::Refused(
+            WebProfileMetaRefusal::Ephemeral,
+        ));
+    }
+    let dir = root.join(&normalized);
+    let mut meta = ProfileMeta::read(&dir);
+    edit(&mut meta);
+    meta.write(&dir).map_err(WebProfileMetaError::Write)?;
+    Ok(meta)
 }
 
 #[cfg(test)]
@@ -963,5 +1091,176 @@ mod tests {
         assert_eq!(count_emoji_clusters("🇮🇳"), 1, "a regional pair is ONE cluster");
         assert_eq!(count_emoji_clusters("🇮🇳🇯🇵"), 2, "two flags are TWO clusters");
         assert_eq!(count_emoji_clusters("👍🏽"), 1, "a skin tone joins its base");
+    }
+
+    /// A scratch PROFILES ROOT (the directory that holds per-profile jars),
+    /// as opposed to [`ScratchProfileDir`], which is one jar.
+    struct ScratchProfilesRoot(PathBuf);
+
+    impl ScratchProfilesRoot {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "yggterm-profiles-root-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch profiles root");
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchProfilesRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// ⚠ THE TWO-WRITER LOCK, and the reason this function exists at all.
+    ///
+    /// There are now two ways to change a profile's avatar: the picker card's
+    /// row menu, and `server app web profile avatar` on the agent control
+    /// plane. The card's write was previously the only one, so the unknown-key
+    /// contract had exactly one implementation to get right. This asserts that
+    /// the SHARED entry point both of them call keeps `agent_drive` — a key
+    /// ychrome owns and this build has no field for — across an avatar change
+    /// AND a protection toggle.
+    ///
+    /// It also pins the return value: the caller is told what the file now
+    /// says without re-reading it, which is what the CLI reports.
+    #[test]
+    fn the_shared_write_path_preserves_a_key_neither_writer_understands() {
+        let root = ScratchProfilesRoot::new("two-writer");
+        let jar = root.path().join("work");
+        std::fs::create_dir_all(&jar).expect("jar");
+        std::fs::write(
+            ProfileMeta::path_in(&jar),
+            r#"{"agent_drive": "deny", "emoji": "🦊"}"#,
+        )
+        .expect("seed");
+
+        let written = update_profile_meta_in(root.path(), "work", |meta| {
+            meta.emoji = Some("🚀".to_string())
+        })
+        .expect("an avatar edit on an ordinary profile is allowed");
+        assert_eq!(written.emoji.as_deref(), Some("🚀"));
+        assert_eq!(
+            written.unknown_keys().get("agent_drive"),
+            Some(&Value::String("deny".to_string())),
+            "the returned meta must still carry the key it does not understand"
+        );
+
+        let toggled = update_profile_meta_in(root.path(), "work", |meta| meta.protected = true)
+            .expect("a protection toggle on an ordinary profile is allowed");
+        assert!(toggled.protected);
+
+        let body: Value = serde_json::from_str(
+            &std::fs::read_to_string(ProfileMeta::path_in(&jar)).expect("read back"),
+        )
+        .expect("json");
+        assert_eq!(
+            body.get("agent_drive").and_then(Value::as_str),
+            Some("deny"),
+            "TWO writes through the shared path and the agent-drive denial must still be there — \
+             a dropped key silently re-grants a profile the owner denied"
+        );
+        assert_eq!(body.get("emoji").and_then(Value::as_str), Some("🚀"));
+        assert_eq!(body.get("protected").and_then(Value::as_bool), Some(true));
+    }
+
+    /// A profile that has never been opened may still choose an avatar: the
+    /// write creates the jar. (The picker allows this; the CLI must too.)
+    #[test]
+    fn a_write_creates_the_jar_for_a_profile_that_was_never_opened() {
+        let root = ScratchProfilesRoot::new("create-jar");
+        update_profile_meta_in(root.path(), "fresh", |meta| meta.emoji = Some("🐧".to_string()))
+            .expect("write");
+        assert_eq!(
+            ProfileMeta::read(&root.path().join("fresh")).emoji.as_deref(),
+            Some("🐧")
+        );
+    }
+
+    /// The write REFUSES what the picker refuses, by name. An unsafe name must
+    /// not be normalized into a different profile's jar — silently editing
+    /// `default` because the caller typed `../default` is the worst outcome.
+    #[test]
+    fn the_shared_write_path_refuses_unsafe_and_ephemeral_names() {
+        let root = ScratchProfilesRoot::new("refusals");
+        for unsafe_name in ["", "   ", ".", "..", "a/b", "../default", "/etc/passwd"] {
+            let error = update_profile_meta_in(root.path(), unsafe_name, |meta| {
+                meta.emoji = Some("🚀".to_string())
+            })
+            .expect_err("an unsafe name must be refused, never normalized into another jar");
+            assert!(
+                matches!(
+                    error,
+                    WebProfileMetaError::Refused(WebProfileMetaRefusal::UnsafeName)
+                ),
+                "{unsafe_name:?} gave {error:?}"
+            );
+        }
+        let error = update_profile_meta_in(root.path(), WEB_PROFILE_TEMP, |meta| {
+            meta.emoji = Some("🚀".to_string())
+        })
+        .expect_err("the ephemeral profile keeps nothing on disk");
+        assert!(matches!(
+            error,
+            WebProfileMetaError::Refused(WebProfileMetaRefusal::Ephemeral)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "the temporary profile keeps nothing on disk",
+            "the refusal a user reads and the refusal an agent reads are one string"
+        );
+        // Nothing was created for any of them.
+        assert!(
+            !root.path().join(WEB_PROFILE_TEMP).exists(),
+            "a refused write must not create a jar"
+        );
+    }
+
+    /// The enumeration the picker draws and the enumeration the CLI reports
+    /// are one function: `default` always present, `temp` never, dotfiles and
+    /// plain files skipped, sorted.
+    #[test]
+    fn listing_profiles_matches_what_the_picker_draws() {
+        let root = ScratchProfilesRoot::new("list");
+        for dir in ["work", "default", WEB_PROFILE_TEMP, ".hidden", "agent-1"] {
+            std::fs::create_dir_all(root.path().join(dir)).expect("jar");
+        }
+        std::fs::write(root.path().join("not-a-jar.txt"), "x").expect("stray file");
+        assert_eq!(
+            list_web_profiles_in(root.path()),
+            vec![
+                "agent-1".to_string(),
+                "default".to_string(),
+                "work".to_string()
+            ]
+        );
+        // An empty (or missing) root still offers the default card.
+        let empty = ScratchProfilesRoot::new("list-empty");
+        assert_eq!(
+            list_web_profiles_in(empty.path()),
+            vec![WEB_PROFILE_DEFAULT.to_string()]
+        );
+        assert_eq!(
+            list_web_profiles_in(Path::new("/nonexistent/yggterm/web-profiles")),
+            vec![WEB_PROFILE_DEFAULT.to_string()]
+        );
+    }
+
+    /// The jar root has one spelling. If this drifts, the CLI and the picker
+    /// read different directories and every answer either gives is a lie about
+    /// the other.
+    #[test]
+    fn the_profiles_root_is_the_documented_path() {
+        assert_eq!(
+            web_profiles_root(Path::new("/home/user/.yggterm")),
+            PathBuf::from("/home/user/.yggterm/web-profiles")
+        );
     }
 }
