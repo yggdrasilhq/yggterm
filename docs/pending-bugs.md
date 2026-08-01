@@ -236,6 +236,19 @@ symptoms, and the last two are strongly suspected to share a root:
   yggterm's 185 historical GitHub releases were deleted (Apache-era binaries,
   user-ordered); the live release lane starts at v2.12.23.
 
+- **A HOVER-REVEALED CONTRIBUTED RAIL PANE DRAWS ITS HEADER AND NONE OF ITS ROWS**
+  (found 2026-08-01 while live-verifying the hover-reveal context-menu fix; NOT
+  caused by it — reproduced identically on the deployed 2.12.23 binary and on
+  the fixed build, on two separate shadows). Open a yedit session so the rail
+  shows its contributed `notes` pane: docked it has 27 `[data-app-pane-row]`
+  rows; hide the rail and hover-reveal it and the card reads `notes` with
+  **zero** rows and 7 nodes of content total. The reveal resolves the right MODE
+  (`right_panel_reveal_mode`) but the pane's schema is not there to render.
+  Consequence for verification as well as for the user: the one rail surface
+  with right-clickable rows cannot be exercised in the hidden+revealed state at
+  all, which is why `rail_autohide_pinned`'s new menu term is unit-proven but
+  not yet live-proven end-to-end.
+
 - **⚠ TOOLING: `app state`'s DOM debug snapshot times out on jojo, so every DOM
   probe field is unreadable there** (found 2026-08-01 while verifying the yedit
   gutter). `dom_debug_snapshot_timeout` comes back on BOTH a shadow client and
