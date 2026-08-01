@@ -4,6 +4,30 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.12.24
+
+- **Fixed: browser keyboard shortcuts work without clicking the page first.**
+  `Ctrl+T`, `Ctrl+R`, `F12` and the rest did nothing until you clicked into the
+  viewport once. Revealing a web surface has three different doors, and only one
+  of them handed the keyboard to the page — the one that almost never runs. The
+  common door is the one that brings a backgrounded surface back, and it never
+  gave the page the keys, so every shortcut was dead for the rest of that
+  surface's life. One rule now decides who holds the keyboard, and every door
+  spends it.
+
+- **Fixed: `Ctrl+T` no longer loses the address bar a split second after opening
+  the tab.** The new tab's page grabbed the keyboard as it was built, a moment
+  after the address bar had been given it. The address bar now holds the keys
+  until you press Enter or Escape, which is what every other browser does.
+
+- **Fixed: right-click works on a sidebar you opened by hovering.** The context
+  menu never appeared. The panel was not at fault: a hover-revealed panel floats
+  over the terminal by design, and the terminal claims secondary clicks by
+  screen position alone — so it swallowed the click before the row ever saw it.
+  Both hover-revealed panels are now excluded from that claim, and an open menu
+  holds either panel open while you use it.
+
+
 - **Fixed: a web surface you switched away from comes back at the size the
   window is NOW.** Show the cwd tree again over a backgrounded page — a remote
   desktop, a browser tab — and the page kept the width it had while the tree was
