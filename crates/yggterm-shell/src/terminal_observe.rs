@@ -62,6 +62,56 @@ const RECLAIM_PSI_FULL_AVG60_BP: u32 = 1_000;
 /// misses.
 const RECLAIM_PSI_HEADROOM_CEILING_PCT: u64 = 30;
 
+/// How badly this machine needs a backgrounded page's memory back.
+///
+/// ONE owner for that question. Before this existed the reclaim had TWO
+/// answers to it and they disagreed: [`MemoryPressureSnapshot::reclaim_pressured`]
+/// decided whether to *detach* and how short the hold should be, while the
+/// destroy itself ran off a ten-minute WALL CLOCK that consulted nothing at
+/// all. The clock therefore fired on a machine with 61% of its memory free —
+/// measured on the live host 2026-08-01, where 134 of 182 recorded surface
+/// destroys carried `reclaim_pressured: false`, and the user reopened 109 of
+/// the 132 pages they had killed. Each of those reopens is a full page rebuild:
+/// a fresh `WebKitWebProcess` (~650 ms, `docs/optimization-pass.md` §9c), a
+/// fresh navigation, JS reparsed and recompiled with no bytecode cache, scroll
+/// position and form state gone. That is what "same pages on reload look like
+/// they are reloading afresh" is.
+///
+/// The doc comment on [`RECLAIM_AVAILABLE_FLOOR_PCT`] already stated the rule
+/// the clock was breaking: *above the floor, reclaiming a user's pages costs
+/// them work to buy memory nobody is asking for.* This type makes the destroy
+/// obey it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimPosture {
+    /// Plenty of headroom. A backgrounded page costs memory nothing else wants,
+    /// and it is already throttled (demoted + `document.hidden`, so no rAF and
+    /// no compositor paint — see `web_surface_reclaim_background_pass`), so
+    /// destroying it buys nothing and costs a rebuild. Keep it.
+    Comfortable,
+    /// Headroom is getting uncomfortable but the machine is not yet short. The
+    /// configured hold applies: a page nobody has looked at for ten minutes is
+    /// a reasonable thing to trade for headroom that is starting to matter.
+    Tight,
+    /// Genuinely short of RAM, or measurably thrashing on reclaim. Collapse the
+    /// hold and give the memory back.
+    Pressured,
+}
+
+impl ReclaimPosture {
+    /// The label the trace carries, so a reader can see WHY a pass reaped
+    /// nothing without re-deriving the thresholds.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Comfortable => "comfortable",
+            Self::Tight => "tight",
+            Self::Pressured => "pressured",
+        }
+    }
+    pub(crate) fn is_pressured(self) -> bool {
+        matches!(self, Self::Pressured)
+    }
+}
+
 impl MemoryPressureSnapshot {
     pub(crate) fn swap_used_mb(&self) -> u64 {
         self.swap_used_kb / 1024
@@ -113,15 +163,45 @@ impl MemoryPressureSnapshot {
     /// independently, so a PSI-only snapshot is constructible — and it carries no
     /// headroom reading at all, which is precisely when this must refuse.
     pub(crate) fn reclaim_pressured(&self) -> bool {
+        self.reclaim_posture().is_pressured()
+    }
+    /// The three-state read, of which [`Self::reclaim_pressured`] is the top
+    /// band. One function so the destroy clock and the detach decision cannot
+    /// answer "how short is this machine" differently.
+    ///
+    /// An ABSENT snapshot reads [`ReclaimPosture::Tight`], and the asymmetry is
+    /// deliberate. It is not `Pressured`, because ignorance is not a licence to
+    /// destroy the user's pages (the rule the old `reclaim_pressured` stated by
+    /// returning FALSE first and unconditionally). It is not `Comfortable`
+    /// either, because that would silently switch the hold off on every host
+    /// without `/proc/meminfo` — a platform port, not a memory reading. `Tight`
+    /// is the pre-existing behaviour: the configured hold, unchanged.
+    pub(crate) fn reclaim_posture(&self) -> ReclaimPosture {
         if !self.is_present() {
-            return false;
+            return ReclaimPosture::Tight;
         }
         if self.available_below_pct(RECLAIM_AVAILABLE_FLOOR_PCT) {
-            return true;
+            return ReclaimPosture::Pressured;
         }
-        self.psi_full_avg60_bp
+        // The PSI route, vetoed by headroom exactly as before.
+        if self
+            .psi_full_avg60_bp
             .is_some_and(|bp| bp >= RECLAIM_PSI_FULL_AVG60_BP)
             && self.available_below_pct(RECLAIM_PSI_HEADROOM_CEILING_PCT)
+        {
+            return ReclaimPosture::Pressured;
+        }
+        // Comfortable starts where the PSI route's own headroom veto ends. That
+        // is not a new number: [`RECLAIM_PSI_HEADROOM_CEILING_PCT`] is already
+        // this codebase's line for "a memory stall here is not our problem", so
+        // it is also the line for "our backgrounded pages are not what this
+        // machine is short of". A fourth threshold would be a fourth thing to
+        // keep in step.
+        if self.available_below_pct(RECLAIM_PSI_HEADROOM_CEILING_PCT) {
+            ReclaimPosture::Tight
+        } else {
+            ReclaimPosture::Comfortable
+        }
     }
     /// `MemAvailable` strictly below `pct` percent of `MemTotal`. One owner for
     /// the headroom comparison so the two routes cannot drift apart in rounding.
@@ -142,6 +222,7 @@ impl MemoryPressureSnapshot {
             "mem_total_mb": self.mem_total_mb(),
             "swap_pressured": self.swap_pressured(),
             "reclaim_pressured": self.reclaim_pressured(),
+            "reclaim_posture": self.reclaim_posture().label(),
             "psi_some_avg60_pct": self
                 .psi_some_avg60_bp
                 .map(|bp| Value::from(f64::from(bp) / 100.0))
