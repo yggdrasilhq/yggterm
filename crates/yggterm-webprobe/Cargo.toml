@@ -3,6 +3,7 @@ name = "yggterm-webprobe"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 publish = false
 
 # Launch-decomposition instrument for web surfaces. Deliberately a SEPARATE

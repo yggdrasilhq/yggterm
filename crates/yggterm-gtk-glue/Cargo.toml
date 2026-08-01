@@ -3,6 +3,6 @@ name = "yggterm-gtk-glue"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "GPL-3.0-or-later"
+license.workspace = true
 
 [dependencies]
