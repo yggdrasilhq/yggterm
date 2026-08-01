@@ -4719,6 +4719,11 @@ struct WebSurfaceOverlayTabView {
     /// other. The menu needs that distinction and cannot compute it, because it
     /// never sees the surface's `osc_url`.
     holds_saved_page: bool,
+    /// The app's OWN url, on the app tab only. It is what "close the page"
+    /// returns this tab to — the app tab cannot be destroyed (its row is the
+    /// surface the app declared, and its ✕ once quit ychrome), so dismissing a
+    /// page here means going home, not going away.
+    app_home_url: Option<String>,
     effective_url: String,
     active: bool,
     /// The virtual folder it is filed in. The classic tab bar shows only the
@@ -19539,6 +19544,7 @@ impl ShellState {
                     &tab.effective_url,
                     &surface.osc_url,
                 ),
+                app_home_url: (index == 0).then(|| surface.osc_url.clone()),
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
                 folder: tab.folder.clone(),
@@ -117420,6 +117426,17 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     let tab = tabs.get(&tab_id).cloned();
                     let loading = tab.as_ref().is_some_and(|tab| tab.loading);
                     let (select_path, close_path) = (session_path.clone(), session_path.clone());
+                    // The app tab's ✕ is a "go home", and it exists only while
+                    // this tab is actually holding a page. `app_home` is Some
+                    // ONLY on the app tab, so it doubles as the branch: a user
+                    // tab closes, the app tab navigates.
+                    let app_tab_can_go_home =
+                        tab.as_ref().is_some_and(|tab| tab.holds_saved_page);
+                    let app_home = tab
+                        .as_ref()
+                        .filter(|_| app_tab_can_go_home)
+                        .and_then(|tab| tab.app_home_url.clone());
+
                     (
                         tab.as_ref().map(|tab| tab.label.clone()).unwrap_or_default(),
                         tab.as_ref().is_some_and(|tab| tab.active),
@@ -117441,24 +117458,52 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         // drawn (user report 2026-07-31).
                         None,
                         None,
-                        // The app tab gets NO ✕. Its ✕ used to QUIT ychrome
-                        // (a Ctrl+C to the app) while this same row's menu
-                        // refused to close it and said why — two affordances
-                        // on one row disagreeing. Quitting the app lives
-                        // where quitting an app lives.
-                        (!is_app_tab).then(|| rsx! {
+                        // The app tab's ✕ once QUIT ychrome (a Ctrl+C to the
+                        // app) while this same row's menu refused to close it
+                        // and said why — two affordances on one row
+                        // disagreeing. So it lost the ✕ entirely, and the user
+                        // then had a first tab with no close button at all
+                        // (report + screenshot, 2026-08-01).
+                        //
+                        // Both are avoidable, because the app tab has TWO
+                        // states and only one of them is "the app". While it
+                        // shows a real page it gets a ✕ that CLOSES THE PAGE —
+                        // it navigates the tab home rather than destroying the
+                        // row, which the surface could not survive anyway.
+                        // Quitting the app still lives where quitting an app
+                        // lives.
+                        (!is_app_tab || app_tab_can_go_home).then(|| rsx! {
                             button {
                                 "data-web-tab-close": "{tab_id}",
                                 style: session_row_action_button_style(palette.text),
-                                title: "Close tab",
+                                title: if is_app_tab { "Close page" } else { "Close tab" },
                                 onmousedown: |evt: MouseEvent| evt.stop_propagation(),
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     let close_path = close_path.clone();
-                                    state.with_mut(|shell| {
-                                        shell.web_surface_close_tab(&close_path, tab_id);
-                                        shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
-                                    });
+                                    if let Some(home) = app_home.clone() {
+                                        // Same ssh target the omnibox would
+                                        // use — read from the session rather
+                                        // than captured, so a surface that
+                                        // moved hosts cannot be navigated
+                                        // through a stale tunnel.
+                                        let ssh_target = state.with(|shell| {
+                                            shell.web_surface_session_ssh_target(&close_path)
+                                        });
+                                        navigate_web_surface_tab(
+                                            state,
+                                            close_path,
+                                            tab_id,
+                                            home,
+                                            ssh_target,
+                                            None,
+                                        );
+                                    } else {
+                                        state.with_mut(|shell| {
+                                            shell.web_surface_close_tab(&close_path, tab_id);
+                                            shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
+                                        });
+                                    }
                                 },
                                 "✕"
                             }
@@ -172245,6 +172290,8 @@ mod webtabs_menu_switcher_locks {
             // A user tab always holds a saved page; the app-tab cases that care
             // build the view themselves and say so.
             holds_saved_page: id != WEB_TAB_APP_TAB_ID,
+            app_home_url: (id == WEB_TAB_APP_TAB_ID)
+                .then(|| "http://127.0.0.1:7717/".to_string()),
             label: label.to_string(),
             is_app_tab: id == WEB_TAB_APP_TAB_ID,
             effective_url: format!("https://example.com/{id}"),
@@ -173089,9 +173136,14 @@ mod webtabs_menu_switcher_locks {
             rail.contains("Some(rsx! { RowFolderIcon { expanded } })"),
             "the folder row still fills the mark column with the shared glyph:\n{rail}"
         );
+        // The app tab's ✕ is CONDITIONAL (it appears once the tab holds a real
+        // page), and when it is absent it must be an absent SLOT — `.then(…)`
+        // yielding None — not an empty element, which would still reserve its
+        // gap on every row.
         assert!(
-            rail.contains("(!is_app_tab).then(|| rsx! {"),
-            "and the app tab's absent ✕ is an absent slot too, not an empty one"
+            rail.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {"),
+            "the app tab's conditional ✕ must be an absent slot when absent, \
+             never an empty one"
         );
     }
 
@@ -176058,15 +176110,25 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// THE FIRST TAB IS NOT A CLOSE BUTTON FOR THE APP.
+    /// THE FIRST TAB IS NOT A CLOSE BUTTON FOR THE APP — but it is not a tab
+    /// with no close button either.
     ///
-    /// The user's report: "closing the first tab in a multi-tab ychrome whoops me
-    /// out of the session". It did exactly that — the app tab's ✕ sent Ctrl+C to
-    /// the app and tore the surface down, while the SAME row's context menu
-    /// refused to close it and explained why. One row cannot hold two answers,
-    /// and since the app tab wears a real page's title it looks like any other.
+    /// The original report: "closing the first tab in a multi-tab ychrome whoops
+    /// me out of the session". It did exactly that — the app tab's ✕ sent Ctrl+C
+    /// to the app and tore the surface down, while the SAME row's menu refused
+    /// to close it. One row cannot hold two answers.
+    ///
+    /// ⚠ REWRITTEN 2026-08-01, second user report: "the first tab in ychrome
+    /// does not have a close button". Removing the ✕ outright over-corrected.
+    /// The app tab has TWO states and only one of them is "the app": while it
+    /// holds a real page it gets a ✕ that CLOSES THE PAGE, navigating the tab
+    /// home rather than destroying a row the surface could not survive losing.
+    ///
+    /// So what this lock protects is unchanged and sharper: **no tab ✕ may ever
+    /// quit the app.** The gate may now be `!is_app_tab || app_tab_can_go_home`;
+    /// what it may never be is absent, and what it may never do is Ctrl+C.
     #[test]
-    fn the_app_tabs_row_offers_no_close_at_all_on_either_surface() {
+    fn no_tab_close_button_can_ever_quit_the_app() {
         let product = product_source();
         // BOTH surfaces: the rail row and the classic strip chip. Each ✕ must be
         // behind the `!is_app_tab` predicate — a title change alone would leave
@@ -176089,8 +176151,10 @@ mod webtabs_menu_switcher_locks {
             let before = product[at.saturating_sub(8)..at].join("\n");
             assert!(
                 before.contains("if !is_app_tab {")
-                    || before.contains("(!is_app_tab).then(|| rsx! {"),
-                "{what} must be drawn only for a tab that is not the app:\n{before}"
+                    || before.contains("(!is_app_tab).then(|| rsx! {")
+                    || before.contains("(!is_app_tab || app_tab_can_go_home).then(|| rsx! {"),
+                "{what} must be gated on the app tab's STATE, never drawn \
+                 unconditionally:\n{before}"
             );
         }
         // The tab-row spelling is GONE outright.
