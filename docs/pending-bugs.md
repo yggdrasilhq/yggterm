@@ -103,7 +103,19 @@ file, and grep the named symbol rather than trusting a line number:**
   then duplicate the user's live session cookies to a second place on disk.
   Options are costed in `ychrome/docs/pending-bugs.md`.
 
-- **False/stale gates.** `runtime_status_handoff_active()` is
+- **False/stale gates.** ⭐ **PROVEN 2026-08-01, user screenshot** — the veil
+  ("Daemon updating. Sessions will settle in a moment.") was covering the
+  viewport while the metadata pane beside it read **Client 2.12.22 / Daemon
+  2.12.22 — the same version, uptime 35m, nothing updating at all.** The
+  giveaway is on the same pane: **"3 owned · 8 total · 5 preserved"**. The gate
+  is armed by `preserved_terminal_owner_count > 0`, and 5 preserved sessions is
+  a STEADY STATE, so the veil is permanently armed and every mount shows it.
+  The user's words: "Daemons are updating even when same daemon is present" and
+  "gating itself is so annoying". Both screenshots also show `Status:
+  bootstrapping` on a session that is simply attached.
+  **The fix is already specified below and is now unblocked by evidence.**
+
+  `runtime_status_handoff_active()` is
   `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
   two sessions are parked on an older daemon, so any mount arms the veil. Arm on
   a genuine daemon-IDENTITY transition instead (`pid:version` differs from last
