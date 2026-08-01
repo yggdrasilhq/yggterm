@@ -1,88 +1,158 @@
 # Third-party notices — yggterm
 
-yggterm is **Apache-2.0**. This file records what that obliges us to carry
-forward from upstream.
+yggterm is **GPL-3.0-or-later** (documentation: CC BY-SA 4.0). This file records
+what that obliges, and what upstream obliges us to carry forward.
+
+⚠ **This file was written for Apache-2.0 and was rewritten on 2026-08-01 when the
+licence changed.** The audit had to be re-run rather than re-labelled, because the
+licence flip inverted the question it answers. Under Apache the question was *"is
+there any copyleft in the tree?"* and any GPL dependency would have been a defect.
+Under GPL-3.0 the question is *"is anything GPL-INCOMPATIBLE?"* — a strictly
+easier bar, and copyleft dependencies are now permitted. The old file recorded a
+pass against a test we no longer run.
+
+## What GPL-3.0-or-later obliges us
+
+Nothing at all for **use**. The obligations attach to *conveying* — shipping a
+binary or a modified source tree to someone else. If you do that:
+
+- **Pass on the licence.** Recipients get the same GPL-3.0-or-later terms, and a
+  copy of `LICENSE` must go with the work.
+- **Offer Corresponding Source.** Whoever receives a binary must be able to get
+  the complete source it was built from, including build scripts, under the same
+  terms. For yggterm that includes everything under `vendor/` and `third_party/`,
+  because those are compiled into the product.
+- **Mark modified files as changed**, and keep the existing copyright, patent,
+  trademark and attribution notices intact.
+- **No further restrictions.** You cannot add terms narrowing what recipients may
+  do, and you cannot use patents or anti-tamper measures to make the effective
+  freedom smaller than the licence says.
+
+Using yggterm inside a company, including commercially and including on modified
+copies you keep to yourself, triggers none of this. Distribution does.
 
 ## Rust dependencies
 
 Full manifest: **`docs/DEPENDENCY-LICENCES.md`**, generated with
-`cargo license --avoid-dev-deps`. **Regenerate it whenever `Cargo.lock`
-changes** — a stale manifest is worse than none, because it reads as checked.
+`cargo license --avoid-dev-deps`. **Regenerate it whenever `Cargo.lock` changes**
+— a stale manifest is worse than none, because it reads as checked.
 
-### The audit, and its one finding
+### The audit — 2026-08-01, 680 crates
 
-Every crate was classified by its licence *field*, with dual licences resolved
-to their permissive arm (we take Apache-2.0 or MIT where offered).
+Every crate was classified by its licence *field*, with dual licences resolved to
+the arm we take (Apache-2.0 or MIT where offered).
 
-**No GPL, AGPL, SSPL, CDDL or EPL dependency exists in this repository** — which
-is the property an Apache-2.0 project has to keep true. The only copyleft in the
-tree is **MPL-2.0**, five crates:
+**Verdict: every licence in the dependency tree is GPL-3.0-compatible, and no
+GPL-incompatible licence appears anywhere.** Specifically absent: **CDDL, EPL,
+SSPL, BUSL, Commons Clause, AGPL, GPL-2.0-only, and anything proprietary.**
 
-| Crate | Reached via |
-|---|---|
-| `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors` | Servo's CSS stack, through the vendored webview layer |
-| `option-ext` | `dirs` → `dirs-sys` |
+The cases that needed a named judgement rather than a glance:
 
-**MPL-2.0 is file-level ("weak") copyleft and does not conflict with Apache-2.0
-distribution.** Its scope is the individual file: our own sources keep their own
-licence. Depending on these crates *unmodified* is fine.
+| Licence | Crates | Why it is fine under GPL-3.0 |
+|---|---|---|
+| Apache-2.0 | 14 direct, plus most dual arms | Compatible with GPL**v3** in one direction: Apache code may go into a GPLv3 work, not the reverse. It is *not* compatible with GPLv2 — one reason the target is v3-or-later. |
+| MPL-2.0 | `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`, `option-ext` | MPL-2.0 §3.3 explicitly permits combining with a "Secondary License", and names the GPL. This was the one caveat under Apache; under GPL it is simply allowed. |
+| Apache-2.0 OR LGPL-2.1-or-later OR MIT | `r-efi` (×2) | Permissive arms available anyway, and the "or later" on the LGPL arm reaches LGPL-3, which is GPLv3-compatible. |
+| Unicode-3.0 | 18 ICU crates | Permissive with a disclaimer; no copyleft, no advertising clause. |
+| BSL-1.0, Zlib, ISC, BSD-2-Clause, BSD-3-Clause, NCSA, 0BSD, CC0-1.0, Unlicense | 30-odd | Plain permissive licences, none with an advertising clause. |
+| CDLA-Permissive-2.0 | `webpki-root-certs` | A data licence with no downstream conditions beyond the disclaimer. |
+| Apache-2.0 WITH LLVM-exception | `target-lexicon` | The exception only widens permissions. |
 
-**What it obliges:** preserve those crates' licence notices, and make their
-source available. Normal crates.io distribution satisfies the second; this file
-and the manifest satisfy the first. ⚠ **If anyone vendors and MODIFIES one of
-these five, the modified files stay MPL-2.0 and their source must be
-published.** That matters more here than in most projects: this repository
-already vendors `wry` and `dioxus-desktop` under `vendor/`, so vendoring is a
-normal move rather than an exotic one. Vendoring an MPL crate to patch it is the
-case to watch.
+**One thing genuinely worth checking, and checked:** `openssl` and `openssl-sys`
+are in the tree, via `native-tls`. The crates themselves are Apache-2.0 and MIT —
+those are only the Rust bindings. The library they bind to is the system
+**OpenSSL 3.x, which is Apache-2.0** and therefore GPLv3-compatible. ⚠ This answer
+is version-dependent and was the classic trap: **OpenSSL 1.x used the old SSLeay
+licence with an advertising clause and was GPL-INCOMPATIBLE**, which is why so
+many projects carried a hand-written "OpenSSL exception". If yggterm is ever built
+against a pre-3.0 OpenSSL, that exception becomes necessary again.
 
-## Vendored source — T3 Code's timeline renderer
+### The one finding
 
-`third_party/t3code-timeline/` contains source **copied verbatim** from
-**T3 Code** (<https://github.com/pingdotgg/t3code>, © 2026 T3 Tools Inc.),
-**MIT**, at upstream commit `9e29c9d72895022322da52d8e961b38702bad9cc`
-(recorded in that directory's `UPSTREAM_COMMIT`). It landed in `5fb438e`.
+**`yggterm-webprobe` declared no licence at all** — it was the single `N/A` row in
+the audit. A first-party crate in a public repository with an empty licence field
+is unlicensed by default, meaning all rights reserved, which is the exact opposite
+of what was intended. Fixed in the same commit as this file.
 
-MIT permits the reuse and **requires the copyright and permission notice to
-travel with the copy** — `third_party/t3code-timeline/LICENSE.t3code` is that
-notice and must not be deleted. `NOTICE.md` beside it states the same rule.
+The licence is now declared **once**, in `[workspace.package]` at the root, and
+inherited by every first-party member with `license.workspace = true`. That is
+deliberate: twelve independent copies of a licence string are twelve chances for
+one to be missed, which is precisely how `yggterm-webprobe` went unnoticed.
+Manifests that state their own licence are only the vendored third-party crates
+and the crates deliberately detached from the workspace.
+
+## Vendored source
+
+⚠ **Vendored code keeps its own licence and its own headers.** MIT and Apache-2.0
+are GPL-3.0-compatible, so these trees combine lawfully into a GPL work — but the
+combination does not relicense them, and their notices must travel with any copy.
+
+### `vendor/dioxus-desktop`, `vendor/dioxus-interpreter-js` — MIT OR Apache-2.0
+
+From the Dioxus project. `vendor/dioxus-desktop` is a real workspace member and is
+compiled into the product. We take the **Apache-2.0** arm; `LICENSE-APACHE` at the
+repository root is that text.
+
+⚠ **`LICENSE-APACHE` is retained for this reason alone.** It is *not* a second
+licence for yggterm's own code and must not be read as one — yggterm has not been
+Apache-licensed since 2026-08-01.
+
+### `vendor/wry` — Apache-2.0 OR MIT
+
+From the wry project. Upstream ships both licence texts alongside the source, in
+`vendor/wry/LICENSE-APACHE` and `vendor/wry/LICENSE-MIT`. Those files must not be
+deleted.
+
+### `third_party/t3code-timeline/` — MIT
+
+Source **copied verbatim** from **T3 Code**
+(<https://github.com/pingdotgg/t3code>, © 2026 T3 Tools Inc.), **MIT**, at
+upstream commit `9e29c9d72895022322da52d8e961b38702bad9cc` (recorded in that
+directory's `UPSTREAM_COMMIT`). It landed in `5fb438e`.
+
+MIT permits the reuse and **requires the copyright and permission notice to travel
+with the copy** — `third_party/t3code-timeline/LICENSE.t3code` is that notice and
+must not be deleted. `NOTICE.md` beside it states the same rule.
 
 ⚠ **This entry was missing until 2026-08-01.** The directory carried its own
-correct notices, but this file — the one a redistributor reads — did not name
-it. A per-directory licence that the top-level notices never mention is the
-kind of gap an audit is supposed to catch, so: **any vendored tree under
-`third_party/` must be listed here in the same commit that adds it.**
+correct notices, but this file — the one a redistributor reads — did not name it.
+A per-directory licence that the top-level notices never mention is the kind of
+gap an audit is supposed to catch, so: **any vendored tree under `third_party/`
+must be listed here in the same commit that adds it.**
 
-⛔ **Distinguish this from work merely INSPIRED by t3code.** yggterm's own
-session timeline (the `Rendered` "Web View" surface) is native Rust + Dioxus,
-written from the *ideas* — a heterogeneous entry timeline, foldable tool rows,
-diff-stat labels. Ideas are not copyrightable and that work owes nothing. This
-section covers only the directory that holds an actual copy. The same
-distinction is drawn, at length, in ychrome's `THIRD-PARTY-NOTICES.md`
-(§"Scriptlets — reimplemented, not copied" and §SponsorBlock).
+⛔ **Distinguish this from work merely INSPIRED by t3code.** yggterm's own session
+timeline (the `Rendered` "Web View" surface) is native Rust + Dioxus, written from
+the *ideas* — a heterogeneous entry timeline, foldable tool rows, diff-stat labels.
+Ideas are not copyrightable and that work owes nothing. This section covers only
+the directory that holds an actual copy.
 
-⚠ **The vendored tree is currently DEAD CODE**: `transcript_view::spawn()` has
-no callers and the npm bundle is never built. Dead or not, while the files are
-in the repository the obligation above stands. If it is ever removed, remove
-this section in the same commit.
+⚠ **The vendored tree is currently DEAD CODE**: `transcript_view::spawn()` has no
+callers and the npm bundle is never built. Dead or not, while the files are in the
+repository the obligation above stands. If it is ever removed, remove this section
+in the same commit.
 
 ## No filter data lives here
 
-⚠ **Read this before adding any.** yggterm once shipped
-`assets/web-adblock/rules.json` — 10 KB of hand-written ad-blocking rules
-derived from upstream filter lists that are GPL-3.0 or CC BY-SA 3.0. An
-Apache-2.0 repository shipping a derivative of GPL data is a licence mismatch,
-and it was deleted for that reason (it was also a second owner of a concept
-ychrome owns).
+⚠ **The reason changed on 2026-08-01; the rule did not.** yggterm once shipped
+`assets/web-adblock/rules.json` — hand-written ad-blocking rules derived from
+upstream filter lists that are GPL-3.0 or CC BY-SA 3.0. Under Apache-2.0 that was
+a licence mismatch, and it is the reason usually given for the deletion.
 
-**Filter lists and anything compiled from them belong in ychrome, which is
-GPL-3.0-or-later precisely so it can carry them.** yggterm applies a ruleset the
-app hands it over the wire at runtime; it must never ship one.
+**That objection has now dissolved.** A GPL-3.0-or-later yggterm could carry
+GPL-derived filter data perfectly lawfully. Do not cite this section as a
+surviving licence prohibition — it is not one any more.
+
+**The architectural objection stands, and it was always the stronger one.** Filter
+lists belong to ychrome, which owns that concept; a ruleset here would be a second
+owner of it. yggterm applies a ruleset the app hands it over the wire at runtime,
+and must never ship one. If that ever changes, it changes as a design decision
+made with ychrome — not because someone noticed the licence no longer forbids it.
 
 ## ychrome is a separate work
 
 ychrome is **GPL-3.0-or-later** and lives in its own repository with its own
-notices. It does not affect this one: there is no dependency edge in either
-direction, and the two communicate over OSC 7717 and a loopback control
-endpoint. Process separation across a documented protocol is not linking, and
-yggterm's permissive licence is deliberate.
+notices. There is no dependency edge in either direction, and the two communicate
+over OSC 7717 and a loopback control endpoint. Process separation across a
+documented protocol is not linking, so neither project's licence reaches the other
+— a fact that mattered more when the two licences differed, and is still the
+reason each repository audits its own tree independently.

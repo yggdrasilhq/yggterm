@@ -3,6 +3,7 @@
 [package]
 name = "pty-fd-handoff-spike"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 edition = "2021"
 
 # Dependency-free, same convention as the WPE spikes: hand-written externs so

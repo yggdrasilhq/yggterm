@@ -3,7 +3,7 @@ name = "yggterm-shell"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "GPL-3.0-or-later"
+license.workspace = true
 
 [dependencies]
 pulldown-cmark = { version = "0.12", default-features = false }

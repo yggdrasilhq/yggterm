@@ -1,18 +1,52 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: yggterm
-Source: local
+Source: https://github.com/yggdrasilhq/yggterm
 
 Files: *.md
  AGENTS.md
-Copyright: 2026 Avikalpa Kundu
+Copyright: 2026 Avikalpa Kundu <avi@gour.top>
 License: CC-BY-SA-4.0
  Creative Commons Attribution-ShareAlike 4.0 International.
- On Debian systems, the full text of CC-BY-SA-4.0 is not bundled by default.
- See LICENSE-CC-BY-SA-4.0 in the source tree.
+ On Debian systems, the full text of CC-BY-SA-4.0 can be found in
+ /usr/share/common-licenses/CC-BY-SA-4.0
+ See also LICENSE-CC-BY-SA-4.0 in the source tree.
 
 Files: *
-Copyright: 2026 Avikalpa Kundu
-License: Apache-2.0
- Licensed under the Apache License, Version 2.0.
- On Debian systems, the full text of Apache-2.0 can be found in
+Copyright: 2026 Avikalpa Kundu <avi@gour.top>
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 3 of the License, or (at your option) any later
+ version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PArecordsCULAR PURPOSE. See the GNU General Public License for more details.
+ .
+ On Debian systems, the full text of the GNU General Public License version 3
+ can be found in /usr/share/common-licenses/GPL-3
+
+Files: vendor/dioxus-desktop/*
+ vendor/dioxus-interpreter-js/*
+Copyright: 2026 The Dioxus authors
+License: MIT or Apache-2.0
+ Vendored from the Dioxus project, offered under either licence at the
+ recipient's option. This package takes the Apache-2.0 arm; its text is in
+ LICENSE-APACHE in the source tree, and on Debian systems in
  /usr/share/common-licenses/Apache-2.0
+
+Files: vendor/wry/*
+Copyright: 2026 The Tauri Programme within The Commons Conservancy
+License: Apache-2.0 or MIT
+ Vendored from the wry project, offered under either licence at the recipient's
+ option. Upstream ships both texts alongside the source, in
+ vendor/wry/LICENSE-APACHE and vendor/wry/LICENSE-MIT, and those files must
+ travel with any copy.
+
+Files: third_party/t3code-timeline/*
+Copyright: 2026 T3 Tools Inc.
+License: MIT
+ Copied verbatim from T3 Code (https://github.com/pingdotgg/t3code). MIT
+ requires the copyright and permission notice to travel with the copy; that
+ notice is third_party/t3code-timeline/LICENSE.t3code and must not be deleted.
+ See THIRD-PARTY-NOTICES.md.

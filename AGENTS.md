@@ -46,7 +46,7 @@ Full mission rationale: see `~/.claude/projects/-home-user-gh-yggterm/memory/pro
 - This repo (`yggterm`) is the integration layer and product surface.
 - `~/gh/paper` and `~/gh/cellulose` are the intended local checkouts for
   standalone Paper and Cellulose apps. They should live under
-  `github.com/avikalpa`, remain Apache-2.0 licensed, and expose clean
+  `github.com/yggdrasilhq`, remain GPL-3.0-or-later licensed, and expose clean
   integration boundaries that Yggterm can embed without absorbing the whole app.
 
 ## ⛔ THE PRESENTATION POLICY — you may not flip these flags

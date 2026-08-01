@@ -3,6 +3,7 @@
 [package]
 name = "wpe-lane-a-spike"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 edition = "2021"
 
 # Deliberately dependency-free: the point of the spike is to MEASURE the

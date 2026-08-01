@@ -2,15 +2,24 @@
 
 Generated with `cargo license --avoid-dev-deps`. **Regenerate when `Cargo.lock` changes.**
 
+yggterm is **GPL-3.0-or-later**. The question this manifest answers is therefore
+*"is anything here GPL-INCOMPATIBLE?"* — not *"is there any copyleft?"*, which is
+what it answered while the project was Apache-2.0. Copyleft dependencies are
+permitted now; only incompatible licences are not.
+
+**Last audited 2026-08-01: no GPL-incompatible licence in the tree.** Nothing
+under CDDL, EPL, SSPL, BUSL, Commons Clause, AGPL, GPL-2.0-only, or proprietary
+terms. The judgement calls — Apache-2.0's one-way compatibility, MPL-2.0 §3.3,
+and the OpenSSL 3.x-versus-1.x question — are reasoned through in
+`THIRD-PARTY-NOTICES.md`, which is the document to read; this one is the evidence
+behind it.
+
 ## Summary
 
 | Licence | Crates |
 |---|---:|
-| (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) AND (Apache-2.0 OR ISC) AND Apache-2.0 AND BSD-3-Clause AND ISC AND MIT | 1 |
-| (Apache-2.0 OR ISC) AND ISC | 1 |
-| (Apache-2.0 OR MIT) AND NCSA | 1 |
-| (Apache-2.0 OR MIT) AND Unicode-3.0 | 1 |
-| Apache-2.0 | 14 |
+| 0BSD OR Apache-2.0 OR MIT | 1 |
+| Apache-2.0 | 4 |
 | Apache-2.0 AND ISC | 1 |
 | Apache-2.0 AND MIT | 1 |
 | Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT | 15 |
@@ -20,20 +29,24 @@ Generated with `cargo license --avoid-dev-deps`. **Regenerate when `Cargo.lock` 
 | Apache-2.0 OR BSD-3-Clause OR MIT | 2 |
 | Apache-2.0 OR CC0-1.0 | 1 |
 | Apache-2.0 OR CC0-1.0 OR MIT-0 | 1 |
+| (Apache-2.0 OR ISC) AND ISC | 1 |
 | Apache-2.0 OR ISC OR MIT | 3 |
+| (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) AND (Apache-2.0 OR ISC) AND Apache-2.0 AND BSD-3-Clause AND ISC AND MIT | 1 |
 | Apache-2.0 OR LGPL-2.1-or-later OR MIT | 2 |
 | Apache-2.0 OR MIT | 393 |
+| (Apache-2.0 OR MIT) AND NCSA | 1 |
+| (Apache-2.0 OR MIT) AND Unicode-3.0 | 1 |
 | Apache-2.0 OR MIT OR Zlib | 28 |
 | Apache-2.0 WITH LLVM-exception | 1 |
 | BSD-2-Clause | 3 |
 | BSD-3-Clause | 5 |
 | BSL-1.0 | 2 |
 | CDLA-Permissive-2.0 | 1 |
+| GPL-3.0-or-later | 11 |
 | ISC | 4 |
 | MIT | 155 |
 | MIT OR Unlicense | 7 |
 | MPL-2.0 | 5 |
-| N/A | 1 |
 | Unicode-3.0 | 18 |
 | Zlib | 7 |
 
@@ -173,7 +186,7 @@ dunce: 1.0.5, "Apache-2.0 OR CC0-1.0 OR MIT-0",
 ecdsa: 0.16.9, "Apache-2.0 OR MIT",
 either: 1.15.0, "Apache-2.0 OR MIT",
 elliptic-curve: 0.13.8, "Apache-2.0 OR MIT",
-emd-renderer: 0.1.0, "Apache-2.0",
+emd-renderer: 0.1.0, "GPL-3.0-or-later",
 enumset: 1.1.10, "Apache-2.0 OR MIT",
 enumset_derive: 0.14.0, "Apache-2.0 OR MIT",
 equator: 0.4.2, "MIT",
@@ -696,16 +709,16 @@ x11rb-protocol: 0.13.2, "Apache-2.0 OR MIT",
 xattr: 1.6.1, "Apache-2.0 OR MIT",
 xkeysym: 0.2.1, "Apache-2.0 OR MIT OR Zlib",
 y4m: 0.8.0, "MIT",
-yggterm: 2.12.19, "Apache-2.0",
-yggterm-core: 2.12.19, "Apache-2.0",
-yggterm-ghostty-bridge: 2.12.19, "Apache-2.0",
-yggterm-gtk-glue: 2.12.19, "Apache-2.0",
-yggterm-platform: 2.12.19, "Apache-2.0",
-yggterm-server: 2.12.19, "Apache-2.0",
-yggterm-shell: 2.12.19, "Apache-2.0",
-yggterm-webprobe: 2.12.19, "N/A",
-yggui: 2.12.19, "Apache-2.0",
-yggui-contract: 2.12.19, "Apache-2.0",
+yggterm: 2.12.23, "GPL-3.0-or-later",
+yggterm-core: 2.12.23, "GPL-3.0-or-later",
+yggterm-ghostty-bridge: 2.12.23, "GPL-3.0-or-later",
+yggterm-gtk-glue: 2.12.23, "GPL-3.0-or-later",
+yggterm-platform: 2.12.23, "GPL-3.0-or-later",
+yggterm-server: 2.12.23, "GPL-3.0-or-later",
+yggterm-shell: 2.12.23, "GPL-3.0-or-later",
+yggterm-webprobe: 2.12.23, "GPL-3.0-or-later",
+yggui: 2.12.23, "GPL-3.0-or-later",
+yggui-contract: 2.12.23, "GPL-3.0-or-later",
 yoke: 0.8.2, "Unicode-3.0",
 yoke-derive: 0.8.2, "Unicode-3.0",
 zerocopy: 0.8.48, "Apache-2.0 OR BSD-2-Clause OR MIT",

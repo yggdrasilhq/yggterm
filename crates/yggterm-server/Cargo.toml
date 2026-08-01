@@ -3,7 +3,7 @@ name = "yggterm-server"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "GPL-3.0-or-later"
+license.workspace = true
 
 [features]
 default = []
