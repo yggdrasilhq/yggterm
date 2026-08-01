@@ -1,4 +1,10 @@
 mod app_control;
+// Automations — scheduled agent-CLI sessions. PUBLIC because the CLI layer in
+// both binaries drives it and the daemon's deadline chore reads it; see
+// docs/automations.md. It owns no clock and no reaper: every decision function
+// takes `now_ms`, and the cleanup half is the EXISTING ephemeral reaper in
+// session_tenancy.rs rather than a second one here.
+pub mod automation;
 // THE `server app web …` CLI, owned once for BOTH binaries. It lived in
 // apps/yggterm/src/main.rs, which made the whole verb plane answer
 // "unsupported app control command: web" on yggterm-headless — the binary
