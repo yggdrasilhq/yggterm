@@ -264,6 +264,33 @@ symptoms, and the last two are strongly suspected to share a root:
 
 ## Standing traps / other open bugs
 
+- **⭐ GATE BUG #2 — "Restoring Remote Terminal" holds a BLANK viewport over a
+  session that is already running (user screenshot, 2026-08-01).** A DIFFERENT
+  gate from the handover veil fixed in 2.12.23; do not assume that fix covers
+  this. The toast says *"The viewport will switch in once the session is truly
+  interactive"* while the metadata pane beside it reads **`Status: running ·
+  working`**, PTY 174x65, a live PID — i.e. the session IS interactive and the
+  gate does not believe it.
+  **Where to look:** the toast and the blank viewport hang off
+  `timer_terminal_live_host_connected()` (`shell.rs`, the
+  `REMOTE_TERMINAL_RESUME_SLOW_MS` timer near the "Restoring Remote Terminal"
+  literal). That predicate — not the daemon's report of the session — decides
+  whether the user sees their terminal.
+  ⚠ **Suspect the instrument, not the session.** This codebase has been bitten
+  twice by a readiness field whose NAME did not mean what it appeared to
+  (`input_enabled` meant "this host holds stdin", renamed to
+  `host_stdin_enabled` / `foreground_input_ready`). Read what SETS
+  `terminal_live_host_connected` before theorising.
+  **Context that may matter:** the screenshot has **Client 2.12.23 / daemon
+  2.12.22 (older than this client)** and the session is `remote-cc://dev/…` with
+  2 preserved owners — so a readiness signal that a remote-CC session on an
+  OLDER owning daemon never emits is a live candidate, adjacent to the
+  owning-daemon resolution bug fixed in 2.12.23.
+  **The user's words: "GATE BUG".** Same family as the veil: a gate waiting on a
+  condition that is already true, or that can never become true, while showing
+  the user nothing.
+
+
 - **⛔⛔ PRE-REWRITE GIT LINEAGE — read before merging ANY old branch/worktree
   (2026-08-01, updated after the SECOND churn).** All public yggdrasilhq
   histories were rewritten in place so GPL-3.0-or-later holds from commit
