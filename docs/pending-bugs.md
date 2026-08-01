@@ -118,16 +118,122 @@ symptoms, and the last two are strongly suspected to share a root:
    the follow-prompt / user-scrollback guard treating a selection (or the scroll
    a selection causes) as sticky and never releasing after the copy completes.
    Screenshot also shows `sent 50 chars via OSC 52`.
-2. **Claude Code ALWAYS starts with a broken bottom**, plus glyph corruption
+2. ✅ **Claude Code ALWAYS starts with a broken bottom**, plus glyph corruption
    while switching into CC sessions. A TUI refresh fixes it every time — so the
    daemon's screen is right and the CLIENT is painting less than it holds.
-3. **YouTube frame judder with "overlaps"** while YouTube's own stats-for-nerds
+
+   **ROOT-CAUSED AND FIXED IN CODE 2026-08-01 (`lane/dev/render-pipeline`). It
+   is the GATE — the user's two complaints were one bug.** The handover veil
+   does not merely cover the viewport; while `handoverPaintSuspended` is true
+   the host does *no visible paint at all*. On release it used to run
+   `requestVisiblePaint(false)` — a damage-tracked partial paint. Every row the
+   read loop wrote during the veil is already in the buffer with its damage
+   consumed, so the resume presents **less than the client holds**. That is the
+   broken bottom, and it is DETERMINISTIC ("always") because the gate arms on
+   `preserved_terminal_owner_count > 0`, a steady state, so every mount goes
+   through it.
+
+   The glyph half is the same line. `clearTerminalTextureAtlas()` lives *inside*
+   the forced-refresh branch of the visible-paint funnel, and its own comment
+   already names the symptom: while a window is backgrounded the WebGL glyph
+   atlas goes stale, so a switch-in that does not force a refresh "paints cells
+   against a stale atlas -> wrong-glyph garble". A non-forced resume skips the
+   heal. **One dropped `forceFullRefresh` produces both halves.**
+
+   Compounding it, `requestVisiblePaint` checked `handoverPaintSuspended` and
+   returned *above* the `pendingVisiblePaintForceFullRefresh` latch — the one
+   thing that survives coalescing — so a full refresh demanded during the veil
+   was DESTROYED, not deferred. The drop site's comment claimed "the resume path
+   repaints from the daemon's own bytes"; the resume path deliberately does no
+   daemon replay (field guide §5) and passed `false`. Two sites owned "who
+   repaints after the veil" and they disagreed.
+
+   **Live evidence on jojo 2.12.22, the user's own GUI (pid 2094127):**
+   `daemon_handover/handover_paint_suspended` → `handover_paint_resumed` at
+   16:12:44→16:14:15, 16:28:37→16:30:09 and 18:03:10→18:04:41 — three windows of
+   **~91 s each in which terminals painted nothing**, every one released by
+   `resumed_timed_out` (the 90 s `suspend_ceiling_ms`), every one with
+   `fingerprint == resolved_fingerprint == pid=2050347:2.12.22`: **same daemon,
+   same version, no update in flight.** Reproduced on a shadow client
+   (`agent-render`, pid 2184903, 18:00:52) — screenshot shows the veil over the
+   viewport beside a rail reading Client 2.12.22 / Daemon 2.12.22 / uptime 2h23m
+   / "5 owned · 9 total · 4 preserved".
+
+   **The fix, two edits in the terminal host script:** latch the full-refresh
+   demand *before* the suspension can return (drop the FRAME, never the DEMAND),
+   and resume with `redrawTerminal('handover-paint-resume')` — the exact repaint
+   the user performs by hand, atlas clear + `term.refresh(0, rows-1)` over the
+   CLIENT's own buffer. It is **not** a daemon-screen replay, and it is
+   deliberately **not** gated on output silence: an agent CLI is never silent
+   (see §THE PATTERN BEHIND THREE SEPARATE BUGS below), and this is not
+   speculative correction — it is the settle of a window we ourselves blanked.
+   Locks: `a_suspended_host_defers_a_full_refresh_demand_instead_of_destroying_it`
+   and `a_handover_paint_resume_redraws_the_whole_client_buffer`, both red-proven
+   by restoring the two production statements.
+
+   ⚠ **Two things still owed.** (a) **Not live-verified** — jojo runs 2.12.22,
+   which predates both this and the false-gate arming fix (`c88324e`, on main,
+   undeployed). After the next deploy, confirm by opening a CC session and
+   grepping the trace for a manual-redraw with reason `handover-paint-resume`,
+   and confirm the veil no longer arms on a steady preserved-owner count.
+   (b) `c88324e` stops the *false* arming; this fix is still required, because a
+   REAL handover would leave exactly the same broken bottom without it.
+
+3. ⚠ **YouTube frame judder with "overlaps"** while YouTube's own stats-for-nerds
    reports almost no dropped frames. ⚠ That reading FALSIFIES the decode
    explanation: if frames are not being dropped, the decoder is keeping up and
    the fault is in PRESENTATION, not decode. "Overlaps" reads as stale frame
    content persisting, i.e. damage/compositing, not pipeline. The
    `GST_PLUGIN_FEATURE_RANK` default shipped in 2.12.22 is still correct on its
    own merits but is NOT the explanation for this.
+
+   **NOT ROOT-CAUSED. It does NOT share a root with symptom 2** — that was the
+   working hypothesis and it is dead: symptom 2 is deterministic and lives in
+   the handover veil, which is off most of the time. What the 2026-08-01 pass
+   found instead is a real, previously-unread presentation-layer suspect, and
+   what it eliminated:
+
+   **`app_render_storm` is live, large and unexplained.** On jojo 2026-08-01 the
+   Dioxus root rendered at **85–118 renders/s for a continuous 30 minutes**
+   (16:57:40→17:27:40) and in 202 one-minute windows across the trace, against a
+   calm baseline of 0.8–0.9/s. Measured cost while it ran at 33–47/s: the GUI's
+   **main thread at ~42% of one core** (`/proc/<pid>/task/<pid>/stat`, 2 s
+   deltas — not the `ps` lifetime average, which lies). That thread is the GTK
+   main loop, which is where the UI process composites every web surface's
+   DMABuf, so it is a plausible mechanism for frames that decode on time and
+   *present* late or twice. **Plausible is not proven — nothing here measured a
+   frame.**
+
+   **The autopsy has been shipped since run 4 and was never read (see §Residual
+   threads). It has now been read, and it answers its own discriminator:**
+   `forced_wakes: 0`, `unattributed: 506–510 of 512`, `shellstate_mut: 1–6`. Per
+   the arm site's own comment that means **NOT a caller of ours over-scheduling**
+   — do not go audit `schedule_update` call sites, that lane is closed.
+
+   Eliminated, each with the measurement that killed it:
+   - **Terminal output forwarding** — 2.0 forwards/s while the root rendered at
+     85/s. Decoupled.
+   - **`safe_shell_mut` / any ShellState field** — 1–6 mutations per 512 renders.
+   - **The handover veil** — 191 of 202 storm windows fall outside every paint
+     suspension (19% storm rate inside vs 5% outside: enriched, not causal).
+
+   Left standing: an app()-scope `use_signal` written outside `safe_shell_mut`,
+   or a Dioxus-internal wake (a task/eval/future resolving every frame).
+   ⚠ **The instrument cannot currently tell those apart, and its blind spot is
+   load-bearing:** `FORCED_WAKE_TOTAL` only wraps the `schedule_update()`
+   closure app() hands to its own 21 callers, so "forced_wakes: 0" means "none
+   of *our* 21 asked" — it can never see a Dioxus-internal wake. Next step is to
+   widen the autopsy (per-`use_signal` write attribution, or a Dioxus scope-wake
+   hook), not to guess. Strongest correlate to chase first:
+   `terminal_mount/forward_protocol_only_output` runs **75× higher** during
+   storms (15.1/min vs 0.2/min) while `terminal_io/dispatch` is flat.
+
+   Adjacent, found in the same trace and NOT the judder: **remote PTY resize
+   never reaches remote CC sessions.** `terminal_resize/remote_pty_resize_failed`
+   for `remote-cc://dev/<uuid>` with `terminal session not found:
+   cc-runtime://<uuid>`, five retries then `will_retry: false`, while
+   `remote-cc://oc/<uuid>` resizes `ok: true` on the same tick. SIGWINCH is
+   silently not delivered to those agents. Separate bug, own lane.
 
 ## Standing traps / other open bugs
 
