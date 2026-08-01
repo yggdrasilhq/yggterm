@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **New: middle-click back, forward, reload or history to do it in a new tab.**
+  The same gesture you already use on a link, now on the buttons beside the
+  address bar. Middle-click **back** and the previous page opens in its own tab
+  while the page you were reading stays exactly where it is — no more
+  duplicating a tab first so you can step the copy. **Forward** does the same
+  the other way, **reload** opens this page again alongside itself, and
+  **history** opens the history page without taking over the tab you were on.
+  Each new tab lands directly below the one you clicked from and joins its
+  group, so a second middle-click cascades after the first instead of pushing in
+  between; and like a middle-clicked link, it opens in the background rather than
+  yanking you to it.
+
 ## 2.12.22
 
 - **Fixed: video judder in the browser.** A YouTube video lurching and dropping

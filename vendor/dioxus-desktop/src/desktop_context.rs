@@ -407,6 +407,38 @@ impl DesktopService {
         }
     }
 
+    /// WHERE surface `id`'s back (or forward) step would land — the URL of that
+    /// entry in the ENGINE's own history list. `None` == nothing that way.
+    ///
+    /// For opening a nav target somewhere ELSE (a middle-click, which puts it in
+    /// a new tab). Stepping in place stays on
+    /// [`web_surface_go_back`](Self::web_surface_go_back).
+    pub fn web_surface_nav_target_url(&self, id: u64, forward: bool) -> Option<String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.nav_target_url(id, forward));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, forward);
+            None
+        }
+    }
+
     /// Step surface `id` back through the ENGINE's history.
     pub fn web_surface_go_back(&self, id: u64) {
         #[cfg(not(any(
