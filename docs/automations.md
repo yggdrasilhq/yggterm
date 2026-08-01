@@ -257,20 +257,51 @@ automation sync [--json]             # reconcile generated OS units against the 
 `--force` exists for exactly one reason: the user pressing "Run now" in the GUI,
 and an agent testing an automation without waiting a fortnight.
 
+## ⚠ THE GAP: an automation cannot open a session with no GUI running
+
+`CreateTerminal` is an **app-control** command, and app-control routes to a GUI
+worker. There is no daemon-side create — `server terminal new` does not exist,
+only `server app terminal new`. So an automation firing on a machine with no GUI
+records:
+
+```
+could not open a session: no live Yggterm GUI client is registered for app control
+```
+
+…as `spawn_failed`, with a notice. That is honest, and it is still a gap. On the
+live host the GUI is up essentially always, so the motivating midnight job
+works; a machine that reboots to a login screen and stays there does not.
+
+**The fix is a daemon-side create**, which is a real piece of work: the daemon
+already owns PTYs, so the capability is there, but the create path and its
+tenancy stamping currently live on the app-control side. Until it exists, the
+first cut's honest scope is "automations fire wherever a GUI is running", not
+"wherever the daemon is running" — and the first draft's claim to the latter was
+never true.
+
 ## Build plan
 
-- **I1 — record, store, guards.** `automation.rs`: record, run history, the
-  grace guard, the ISO-week parity guard, deterministic jitter. Pure, fully
-  unit-tested. Lifts the retired branch's `compute_next_run_at_ms` and its 6
-  tests.
-- **I2 — the verbs**, on both binaries through one parser.
-- **I3 — the executor.** `automation run <id>` driving the existing
-  `terminal new` / `terminal send` verbs, with E1 reuse.
-- **I4 — the systemd renderer** + `automation sync` + the hand-edit detector.
-- **I5 — notices**: deadline chore, the durable store, the three surfaces.
+- **I1 — record, store, guards.** ✅ `automation.rs`: record, run history, the
+  grace guard, the whole-weeks parity guard. Pure — every decision function
+  takes `now_ms` and `utc_offset_secs`. 35 tests.
+- **I2 — the verbs.** ✅ `automation_cli.rs`, one parser, both binaries.
+- **I3 — the executor.** ✅ `execute_run` driving
+  `create_terminal_with_tenancy` + `submit_terminal_prompt`, with E1 reuse and
+  the TTL-only tenancy that arms the existing reaper.
+- **I4 — the systemd renderer.** ✅ `automation_units.rs` + `automation sync`
+  with the fingerprint and the hand-edit refusal. Live-proven: systemd accepted
+  the generated unit and its own next-fire matched our calendar evaluator to
+  the second.
+- **I5 — notices.** ◐ The durable store, the raise-on-spawn-failure path,
+  idempotence-by-run and `dismiss` are done and live-proven. **Still owed: the
+  daemon chore that raises `RunOverdue` at `deadline_secs`, and the stamping of
+  `closed_at_ms` / `close_reason` when the reaper closes a run's row.** Without
+  that second half a completed run stays `is_open()` forever, which makes E1
+  re-prompt a dead session instead of spawning a fresh one.
 - **I6 — the GUI**: the Automated group (filtered by the derived predicate) and
-  the start-page Automations section with New Automation.
-- **I7 — launchd renderer.** Windows deferred to 3.0.0 with the platform build.
+  the start-page Automations section with New Automation. Not started.
+- **I7 — launchd renderer.** Not started. Windows deferred to 3.0.0 with the
+  platform build.
 
 ## Acceptance
 
