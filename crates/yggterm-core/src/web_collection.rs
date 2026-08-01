@@ -121,6 +121,21 @@ fn parse_item(line: &str) -> Option<(String, String, String)> {
 }
 
 impl Collection {
+    /// A collection built from scratch rather than parsed: frontmatter, and an
+    /// empty body for the caller to fill.
+    ///
+    /// It records that it HAS frontmatter, so an empty-bodied new collection
+    /// still writes its `---` block. The one thing this must not become is a
+    /// second way to spell a file — everything it produces goes back through
+    /// [`Collection::parse`] on the next read and must survive it unchanged.
+    pub fn with_frontmatter(fields: Vec<Field>) -> Self {
+        Self {
+            fields,
+            blocks: Vec::new(),
+            had_frontmatter: true,
+        }
+    }
+
     pub fn parse(source: &str) -> Self {
         let mut fields = Vec::new();
         let mut blocks = Vec::new();
@@ -309,6 +324,34 @@ impl Collection {
     pub fn contains_url(&self, url: &str) -> bool {
         self.items().any(|item| item.url == url)
     }
+
+    /// Move the item holding `url` into `folder`. `false` = no such item.
+    ///
+    /// The item is LIFTED, not rewritten: it keeps the source line it came in
+    /// with (its title, its spacing, its trailing note), so a move shows in a
+    /// diff as one line leaving one place and arriving in another rather than
+    /// as a re-serialisation of somebody's link.
+    pub fn move_item(&mut self, url: &str, folder: Option<&str>) -> bool {
+        let Some(at) = self.blocks.iter().position(
+            |block| matches!(block, Block::Item(item) if item.url == url),
+        ) else {
+            return false;
+        };
+        let Block::Item(item) = self.blocks.remove(at) else {
+            unreachable!("position matched an Item");
+        };
+        // A blank line orphaned by the lift would accumulate over repeated
+        // moves; drop it only when the removal left two blanks touching.
+        if at > 0
+            && at < self.blocks.len()
+            && matches!(&self.blocks[at - 1], Block::Raw(r) if r.trim().is_empty())
+            && matches!(&self.blocks[at], Block::Raw(r) if r.trim().is_empty())
+        {
+            self.blocks.remove(at);
+        }
+        self.add_item(folder, item);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +435,39 @@ mod tests {
         assert!(out.contains("## Reading"));
         assert!(out.trim_end().ends_with("- [R](https://example.org/r)"));
         assert_eq!(Collection::parse(&out).item_count(), 4);
+    }
+
+    #[test]
+    fn moving_an_item_lifts_its_source_line_rather_than_rewriting_it() {
+        let mut parsed = Collection::parse(SAMPLE);
+        assert!(parsed.move_item("https://example.org/sig", Some("Videos")));
+        let out = parsed.to_markdown();
+        // The line arrived VERBATIM — trailing note and all.
+        assert!(
+            out.contains("- [Signals](https://example.org/sig) <!-- added:2026-07-02 -->"),
+            "the user's own line must survive a move: {out}"
+        );
+        let videos = out.split("## Videos").nth(1).unwrap();
+        assert!(videos.contains("Signals"), "it must land under Videos: {out}");
+        let papers = out.split("## Videos").next().unwrap();
+        assert!(!papers.contains("Signals"), "and leave Papers: {out}");
+        // Nothing was lost, and the file still parses to the same item count.
+        assert_eq!(Collection::parse(&out).item_count(), 3);
+        // A url nobody holds moves nothing and says so.
+        assert!(!parsed.move_item("https://example.org/absent", Some("Papers")));
+    }
+
+    #[test]
+    fn a_collection_built_from_scratch_parses_back_to_itself() {
+        let built = Collection::with_frontmatter(vec![
+            Field { key: "id".to_string(), value: "x".to_string() },
+            Field { key: "kind".to_string(), value: "collection".to_string() },
+        ]);
+        assert_eq!(built.to_markdown(), "---\nid: x\nkind: collection\n---\n");
+        assert_eq!(
+            Collection::parse(&built.to_markdown()).to_markdown(),
+            built.to_markdown()
+        );
     }
 
     #[test]
