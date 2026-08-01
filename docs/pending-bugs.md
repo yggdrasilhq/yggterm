@@ -453,48 +453,36 @@ symptoms, and the last two are strongly suspected to share a root:
   fresh environment instead of copying its own? jojo and dev daemons are
   currently clean, so this is latent everywhere, live nowhere.
 
-- **★★ `web ensure` MINTS ONE WEB PROCESS PER TAB, revealed or not (measured on
-  jojo, 2.12.17, 2026-07-27 — J8a).** The docs promise "thirty rows, not thirty
-  webviews", and the RESTORE path honors it (a never-selected restored tab has
-  no webview) — but one `web ensure` on a declared surface builds a
-  `WebKitWebProcess` for EVERY tab, on a surface never revealed and never
-  visited. The law is exactly linear: processes = tabs + 2, ~108 MB RSS /
-  18.4 MB PSS per webview (PSS floor, trivial static fixture), so 100 tabs =
-  102 processes / ~11.4 GB RSS in one call. 2.12.18's per-tab reclaim drains
-  the pile after the hold (5 s under pressure), but the MINT-time spike is
-  unbounded. Fix: ensure mints the ACTIVE tab's webview only; the rest stay
-  tab-model-only until revealed/selected (the restore path's exact rule), plus
-  a live-webview LRU budget so no path can pile past a cap. Evidence:
-  `~/.local/share/ygg-j8-baseline/` on jojo.
-  **CONFIRMED STILL OPEN on 2.12.18 (jojo, 2026-07-27 — J8b):** 25 tabs seeded
-  and `ensure`d on a surface that was never revealed → **27 GUI web processes
-  before anything was shown**. The per-tab hold governs background tabs of a
-  session the user IS looking at, so it never fires here; the mint-time spike is
-  untouched by the reclaim lane. Lazy-ensure is the outstanding half.
-
-- **★★ A SECOND VIEWER DOUBLES EVERY WEBVIEW, AND `session remove` STRANDS THE
-  SHADOW'S SET FOREVER (jojo, 2.12.17, 2026-07-27 — J8a).** Webviews are
-  per-CLIENT: revealing a 10-tab surface on a shadow client built a second full
-  set (11 more processes). Then `session remove` answered `verified:true`,
-  reaped the ACTIVE client's webviews, and left the shadow's **21 webviews
-  (2.3 GB)** alive with no row anywhere — only `shadow-client.sh stop` freed
-  them. Same family as the remote-cc entry below: the teardown verifies one
-  side and claims the whole. Fix: the remove path must sweep every client's
-  applied set for the session, or refuse with the shadow named.
-  **REPRODUCES on 2.12.18 (jojo, 2026-07-27 — J8b).** Two fixture sessions
-  removed, both `verified:true` with reaped pids named: the GUI fell to **1**
-  webview while the shadow kept **3** (952 MB total) for rows that existed
-  nowhere; `shadow-client.sh stop` freed them (4 → 1, 952 → 495 MB). Smaller
-  only because per-tab reclaim had already collapsed most of the set — the
-  defect itself is unchanged.
+- **A SECOND VIEWER STILL BUILDS ITS OWN WEBVIEWS (residual of the J8a entry;
+  the STRANDING half is fixed, see below).** Webviews are per CLIENT, so a
+  shadow — or a second GUI — showing a 10-tab surface builds a second full set
+  (J8a: 11 more processes). That is what makes co-browsing work at all on the
+  current per-client surface model, and both sets are governed by the same
+  reclaim lane, so this is a cost rather than a defect. It is recorded only
+  because the memory arithmetic is easy to forget: a second viewer of a heavy
+  session roughly doubles the GUI-side web-process bill for as long as both are
+  shown. The half that WAS a defect — `session remove` answering `verified:true`
+  while the other client kept its set alive forever, with no row anywhere —
+  is fixed on 2026-08-01 (lane `lane/dev/webview-leaks`): every client now
+  sweeps the sessions it holds webviews for against the tombstone plane, in the
+  same conjunction `web ensure` refuses to revive on. Measured in the sandbox
+  before: GUI 2 → 1 webviews on a verified removal while the shadow stayed at 2;
+  after: the shadow drops with it. See `docs/web-surfaces.md` §Three ways a
+  process was minted for nothing.
 
 - **GUI process died mid-J8a with 51 webviews applied (jojo, 2.12.17 GUI 27779
   → fresh 325652 at 12:17:22, 2026-07-27). Cause UNDETERMINED** — no panic in
   the trace, no readable OOM record; the 50-webview ramp stage had completed
   one minute earlier, so the correlation is owned, not proven. The daemon
-  never blinked and every row survived (the constitution held). Watch item:
-  if a fresh GUI dies again near a large applied-webview count, this becomes
-  the top entry; the webview budget above is the mitigation either way.
+  never blinked and every row survived (the constitution held).
+  **2026-08-01: the PRECONDITION is gone, the cause is not.** The only path that
+  could apply ~50 webviews to one GUI in a single call was `web ensure`'s
+  per-tab mint, fixed on `lane/dev/webview-leaks` and measured at 1 → 15 web
+  processes before / 1 → 1 after on a 13-tab surface. So this state is no longer
+  reachable by an agent verb — but nothing here explains WHY that GUI died, and
+  a user with 50 revealed tabs can still reach a similar count one reveal at a
+  time. Still a watch item: if a fresh GUI dies again near a large applied
+  webview count, this becomes the top entry.
 
 - **`scripts/shadow-client.sh` is broken for every in-session agent (jojo,
   2026-07-27 — J8a).** The daemon exports `YGGTERM_BIN=<yggterm-headless>`
@@ -525,11 +513,22 @@ symptoms, and the last two are strongly suspected to share a root:
   give the picker an addressable entry point (a command-plane id, or a
   documented route), or expose the avatar/protect writes as `server app` verbs.
 
-- **`WebKitNetworkProcess` accumulates per profile churn (jojo, 2026-07-27 —
-  J8a: 3 → 10 across one baseline run).** One network process per WebContext
-  is the design; contexts for torn-down profiles are not always reaped with
-  their last webview. Small (network processes are lighter than web
-  processes), but it is a leak shape — audit `web_context_key` retirement.
+- **A `WebKitNetworkProcess` OUTLIVES the `WebContext` that started it, and
+  nothing we own can reap it (WebKitGTK behaviour, measured 2026-08-01).** The
+  residual of the "accumulates per profile churn" entry, which is otherwise
+  fixed. Our half was real and is gone: every destroy-and-recreate used to mint
+  a fresh `WebContext` (5 reloads = 5 network processes; J8a's 3 → 10 is 7
+  recreates), because the sweep ran inside `close` and took the engine in the
+  gap before the create. With the sweep moved to the tick, five reloads leak
+  zero. What remains is that dropping the LAST reference to a context leaves its
+  network process running: with `web_context_count()` at 0 and every surface
+  gone, the GUI still held 2. So the standing bill is **one network process per
+  distinct `web_context_key` the GUI has EVER opened**, not per live context.
+  Small (they are far lighter than web processes) and bounded by profile count
+  per GUI generation, but a long-lived GUI that cycles many profiles pays it.
+  Not obviously ours to fix — the next step, if it ever matters, is whether
+  `WebsiteDataManager`/`WebContext` disposal has an explicit terminate we are
+  not calling, or whether webkit2gtk simply keeps them for reuse.
 
 - **★★ REMOTE-CC `session remove` REPORTS `verified:true` WHILE THE REMOTE AGENT
   KEEPS RUNNING (found + reproduced end-to-end on jojo, 2.12.17, 2026-07-27).**
