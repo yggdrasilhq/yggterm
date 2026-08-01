@@ -5,9 +5,14 @@ mod app_control;
 // takes `now_ms`, and the cleanup half is the EXISTING ephemeral reaper in
 // session_tenancy.rs rather than a second one here.
 pub mod automation;
+// THE `automation …` verb plane, owned once for BOTH binaries — same rule as
+// app_control_web_cli, and for the same reason: a flag must mean one thing
+// whichever binary it was typed at.
+mod automation_cli;
 // The OS timer files an automation GENERATES. Separate from `automation` so the
 // record cannot grow a dependency on how any one platform spells a schedule.
 pub mod automation_units;
+pub use automation_cli::{automation_usage_block, run_automation_cli};
 // THE `server app web …` CLI, owned once for BOTH binaries. It lived in
 // apps/yggterm/src/main.rs, which made the whole verb plane answer
 // "unsupported app control command: web" on yggterm-headless — the binary
@@ -19620,6 +19625,37 @@ pub fn run_app_control_create_terminal_with_tenancy(
     tenancy: Option<CreateTerminalTenancy>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
+    let payload = create_terminal_with_tenancy(
+        machine_key,
+        cwd,
+        title_hint,
+        purpose,
+        kind,
+        activate,
+        tenancy,
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&payload)?)?;
+    Ok(())
+}
+
+/// The create, RETURNING its payload instead of printing it.
+///
+/// Split out so the automation executor can read the `session_path` it just
+/// made without scraping our own stdout. The printing wrapper above is the only
+/// other caller, so there is still exactly one implementation of "create a row
+/// with a tenancy declaration" — an automation and a human typing the verb take
+/// the same path and cannot drift.
+pub fn create_terminal_with_tenancy(
+    machine_key: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    purpose: Option<&str>,
+    kind: Option<&str>,
+    activate: bool,
+    tenancy: Option<CreateTerminalTenancy>,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
@@ -19643,8 +19679,7 @@ pub fn run_app_control_create_terminal_with_tenancy(
             object.insert("tenancy".to_string(), outcome);
         }
     }
-    write_stdout_payload(&serde_json::to_string_pretty(&payload)?)?;
-    Ok(())
+    Ok(payload)
 }
 
 /// Declare the tenancy of the row the create just produced, and report exactly
@@ -19849,12 +19884,31 @@ pub fn run_app_control_submit_terminal_prompt(
     ready_timeout_ms: u64,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
+    let response =
+        submit_terminal_prompt(session_path, data, ready_timeout_ms, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// The prompt submit, RETURNING its response instead of printing it.
+///
+/// This, and not `SendTerminalInput`, is what an automation injects with: it
+/// waits for the session to reach an idle prompt first. A freshly spawned agent
+/// CLI is not ready the instant its row exists, and raw input sent into that
+/// window is swallowed by the CLI's own startup — which would look exactly like
+/// "the automation fired and the agent ignored it".
+pub fn submit_terminal_prompt(
+    session_path: &str,
+    data: &str,
+    ready_timeout_ms: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<AppControlResponse> {
     let home = resolve_yggterm_home()?;
     // The app-control request waits up to `ready_timeout_ms` for the session to
     // reach an idle prompt before sending; give the IPC round-trip headroom beyond
     // that so the client doesn't time out while the GUI is still polling readiness.
     let request_timeout_ms = timeout_ms.max(ready_timeout_ms.saturating_add(10_000));
-    let response = request_app_control(
+    request_app_control(
         &home,
         AppControlCommand::SubmitTerminalPrompt {
             session_path: session_path.to_string(),
@@ -19862,9 +19916,7 @@ pub fn run_app_control_submit_terminal_prompt(
             timeout_ms: ready_timeout_ms,
         },
         request_timeout_ms,
-    )?;
-    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
-    Ok(())
+    )
 }
 
 pub fn run_app_control_reclaim_terminal_focus(
