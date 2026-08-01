@@ -5355,11 +5355,71 @@ fn web_profile_write_locks_to_release(
 /// (media queries, responsive breakpoints) while never shown.
 const WEB_SURFACE_HEADLESS_CREATE_RECT: (i32, i32, i32, i32) = (0, 0, 1280, 800);
 
-/// Whether an agent's EnsureWebSurface request is still standing. Pure so the
-/// TTL edge is testable; an expired request simply stops materializing — the
-/// already-created surface lives on under its own hold/lease clock.
-fn web_surface_headless_create_due(wanted_until_ms: Option<u64>, now_ms: u64) -> bool {
-    wanted_until_ms.is_some_and(|until| now_ms < until)
+/// Whether an agent's EnsureWebSurface request is still standing FOR THIS TAB.
+/// Pure so the TTL edge is testable; an expired request simply stops
+/// materializing — the already-created surface lives on under its own
+/// hold/lease clock.
+///
+/// # ONE TAB, NOT THE SESSION'S WHOLE SET (2026-08-01)
+///
+/// `web_surface_headless_wanted` is keyed by SESSION, and the reconciler asks
+/// this question once per TAB — so without the `tab_id == active_tab` clause a
+/// single `web ensure` built a `WebKitWebProcess` for every tab the session had,
+/// on a surface never revealed and never visited. Measured on guihost (J8a/J8b):
+/// processes = tabs + 2, exactly linear, ~108 MB RSS each, so 25 seeded tabs
+/// became 27 web processes before anything was shown and 100 tabs would have
+/// been ~11.4 GB in one call. The per-tab reclaim lane cannot help: it governs
+/// background tabs of a session the user IS looking at, and this surface is not
+/// one.
+///
+/// The ACTIVE tab is the right — and only — one to mint, because it is already
+/// what the rest of the agent plane means by "the surface": `web_surface_lease_for`
+/// leases `surface.active_tab` and nothing else, and the liveness probe, `web
+/// read`, `web do` and `web eval` all address the tab in front. Every other tab
+/// stays tab-model-only until it is revealed or selected, which is the restore
+/// path's rule verbatim ("thirty rows, not thirty webviews").
+fn web_surface_headless_create_due(
+    wanted_until_ms: Option<u64>,
+    now_ms: u64,
+    tab_id: u64,
+    active_tab: u64,
+) -> bool {
+    tab_id == active_tab && wanted_until_ms.is_some_and(|until| now_ms < until)
+}
+
+/// The `reason` a stranded-surface sweep tears a session's webviews down with —
+/// shared by the teardown and its trace line so an investigation greps ONE name.
+const WEB_SURFACE_ROW_CLOSED_ELSEWHERE: &str = "row_closed_elsewhere";
+
+/// How often a client asks whether a row it is holding webviews for was closed
+/// by SOMEBODY ELSE. One small read of a shared file, and only when this client
+/// actually holds surfaces — a stranded set costs ~500 MB a webview, so seconds
+/// is the right granularity and sub-second would be paying for nothing.
+const WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS: u64 = 2_000;
+
+/// Is the stranded-surface sweep due? Pure so the cadence is a decision a test
+/// can drive rather than a subtraction buried in the loop.
+fn web_surface_stranded_sweep_due(last_sweep_ms: Option<u64>, now_ms: u64) -> bool {
+    last_sweep_ms.is_none_or(|last| {
+        now_ms.saturating_sub(last) >= WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS
+    })
+}
+
+/// The sessions this client is holding at least one webview for, sorted and
+/// deduped.
+///
+/// Read from the reconciler's APPLIED mirror, never from desired state: the
+/// question the sweep asks is "what am I still paying WebKit processes for",
+/// and a session with a desired entry and no webview costs nothing. Sorted so
+/// the sweep's order — and therefore the trace it writes — does not depend on
+/// `HashMap` iteration.
+fn web_surface_sessions_holding_webviews(
+    applied: &HashMap<(String, u64), AppliedWebSurface>,
+) -> Vec<String> {
+    let mut sessions: Vec<String> = applied.keys().map(|(session, _)| session.clone()).collect();
+    sessions.sort();
+    sessions.dedup();
+    sessions
 }
 
 fn web_surface_lease_until_ms(
@@ -8076,6 +8136,11 @@ mod web_surface_reclaim_locks {
         pinned: &[u64],
         session_visible: bool,
         tab_hold_ms: u64,
+        // The agent's standing `EnsureWebSurface` deadline for THIS SESSION, as
+        // `ShellState::web_surface_headless_wanted` holds it — `None` when no
+        // agent has asked. Per session, exactly as the loop reads it, so the
+        // per-TAB narrowing is the rule's job and this fixture cannot hide it.
+        headless_wanted_until_ms: Option<u64>,
         applied: &mut HashMap<(String, u64), AppliedWebSurface>,
         next_native_id: &mut u64,
         host: &mut FakeHost,
@@ -8110,7 +8175,16 @@ mod web_surface_reclaim_locks {
             }
             // No webview: never visited, or reclaimed. Same door either way, and
             // that sameness IS the restore path.
-            let Some(rect) = web_surface_tab_create_rect(want_visible, place_rect, false) else {
+            let headless_wanted = !want_visible
+                && web_surface_headless_create_due(
+                    headless_wanted_until_ms,
+                    now_ms,
+                    *tab_id,
+                    active_tab,
+                );
+            let Some(rect) =
+                web_surface_tab_create_rect(want_visible, place_rect, headless_wanted)
+            else {
                 continue;
             };
             *next_native_id += 1;
@@ -8162,6 +8236,7 @@ mod web_surface_reclaim_locks {
                 &[],
                 true,
                 300_000,
+                None,
                 &mut applied,
                 &mut next_native_id,
                 &mut host,
@@ -8183,6 +8258,7 @@ mod web_surface_reclaim_locks {
             &[],
             true,
             300_000,
+            None,
             &mut applied,
             &mut next_native_id,
             &mut host,
@@ -8195,6 +8271,7 @@ mod web_surface_reclaim_locks {
             &[],
             true,
             300_000,
+            None,
             &mut applied,
             &mut next_native_id,
             &mut host,
@@ -8235,6 +8312,7 @@ mod web_surface_reclaim_locks {
             &[],
             true,
             300_000,
+            None,
             &mut applied,
             &mut next_native_id,
             &mut host,
@@ -8283,6 +8361,7 @@ mod web_surface_reclaim_locks {
                 &[],
                 true,
                 300_000,
+                None,
                 &mut applied,
                 &mut next_native_id,
                 &mut host,
@@ -8304,6 +8383,298 @@ mod web_surface_reclaim_locks {
             "nothing was ever created off screen, so nothing should have been \
              reclaimed: {:?}",
             host.closed
+        );
+    }
+
+    /// **`web ensure` IS ONE WEBVIEW.** The J8b measurement, as a lock: 25 tabs
+    /// seeded on a surface that is never revealed, one standing
+    /// `EnsureWebSurface`, and the reconciler realizes exactly ONE webview — the
+    /// active tab's, born headless at the canonical offscreen rect.
+    ///
+    /// Before the fix this tick realized 25, because the ask is keyed by SESSION
+    /// and the loop asks per TAB. On guihost that read as `tabs + 2` GUI web
+    /// processes (27 for this fixture, ~11.4 GB for a hundred) before anything
+    /// was shown, and no reclaim lane could reach it: the per-tab hold governs
+    /// background tabs of a session the user is LOOKING at, and this surface is
+    /// not one.
+    ///
+    /// The session is BACKGROUNDED here on purpose — that is the only state
+    /// `web ensure` materializes in, and it is the state in which every tab
+    /// looks identical to the create rule.
+    #[test]
+    fn one_ensure_on_a_twenty_five_tab_surface_realizes_exactly_one_webview() {
+        let session = "live::j8b-ensure";
+        let ids: Vec<u64> = (0..25).collect();
+        let tabs = tab_model(&ids);
+        let active = 3_u64;
+        let mut applied = HashMap::new();
+        let mut next_native_id = 800_u64;
+        let mut host = FakeHost::default();
+
+        // The agent's ask stands for another 15 minutes.
+        let standing = Some(1_000 + 900_000);
+        reconcile_tick(
+            1_000,
+            session,
+            &tabs,
+            active,
+            &[],
+            // Never revealed: no rect, no page hole, nobody is being shown it.
+            false,
+            300_000,
+            standing,
+            &mut applied,
+            &mut next_native_id,
+            &mut host,
+        );
+
+        assert_eq!(
+            applied.len(),
+            1,
+            "one `web ensure` built {} webviews for a 25-tab surface nobody has \
+             seen — that is one WebKitWebProcess per tab, ~108 MB each: {:?}",
+            applied.len(),
+            {
+                let mut keys: Vec<_> = applied.keys().cloned().collect();
+                keys.sort();
+                keys
+            }
+        );
+        let built = applied
+            .get(&(session.to_string(), active))
+            .expect("the tab the agent will drive is the one that must exist");
+        assert!(
+            !built.visible,
+            "a headless create is never shown; a visible one would paint over the \
+             session the user IS looking at"
+        );
+        assert_eq!(
+            built.bounds, WEB_SURFACE_HEADLESS_CREATE_RECT,
+            "the one surface must be born at the canonical offscreen rect"
+        );
+        assert!(
+            host.closed.is_empty(),
+            "nothing should have been reclaimed on the tick that created: {:?}",
+            host.closed
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // THE STRANDED SET. Webviews are per CLIENT: `session remove` reaps the
+    // surfaces of the client that ran it, answers `verified: true`, and leaves
+    // every OTHER client paying for its own full set — with no row anywhere
+    // (guihost J8a: a shadow held 21 webviews / 2.3 GB after a verified removal,
+    // and only `shadow-client.sh stop` freed them). These lock the sweep's two
+    // inputs; the DECISION it reaps on is `web_ensure_refuses_closed_session`,
+    // driven against a real tombstone plane in `web_ensure_closed_session_locks`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// THE LOOP STILL SWEEPS, and asks the right three owners in the right
+    /// order. Honest about what this is: a source read of `shell.rs` at
+    /// `CARGO_MANIFEST_DIR`, so it judges the FILE and not the binary — every
+    /// claim about what the sweep DECIDES is made by the tests beside it and by
+    /// `web_ensure_closed_session_locks`, which drives the rule against a real
+    /// tombstone plane. This one exists because the sweep is the only thing
+    /// standing between another client's close and a set of webviews nobody can
+    /// ever reach, and deleting it would break nothing else.
+    #[test]
+    fn the_reconcile_loop_still_sweeps_surfaces_whose_row_was_closed_elsewhere() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_surface_reclaim_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertions that name them",
+        );
+
+        let start = product
+            .iter()
+            .position(|line| {
+                line.trim() == "if web_surface_stranded_sweep_due(last_stranded_sweep_ms, now_sweep_ms) {"
+            })
+            .expect(
+                "the reconcile loop no longer sweeps stranded surfaces — a row closed on \
+                 another client leaves this client's webviews alive forever",
+            );
+        let end = product[start..]
+            .iter()
+            .position(|line| line.trim() == "let under_glass = desktop.web_surface_under_glass();")
+            .map(|offset| start + offset)
+            .expect("the sweep is no longer at the top of the tick");
+        let sweep = product[start..end].join("\n");
+        for needle in [
+            // WHAT it holds — the applied mirror, not desired state.
+            "let held = web_surface_sessions_holding_webviews(&applied);",
+            // The POSITIVE close signal, batched into one read of the shared
+            // plane. Absence from a daemon snapshot must never become the
+            // signal: it would reap a preserved owner's live session.
+            "yggterm_server::live_row_closes_remembered_among(",
+            // ...and the SAME conjunction `web ensure` revives on. An owner that
+            // cannot be reached is Unknown and keeps its surfaces.
+            "web_ensure_closed_session_check(endpoint, &trace_home, &session_path).await",
+            "if !web_ensure_refuses_closed_session(&check.runtime, check.row_close_remembered)",
+            // ONE teardown owner, the same one the local close path uses.
+            "shell.tear_down_web_surfaces_for_closed_session(",
+            "WEB_SURFACE_ROW_CLOSED_ELSEWHERE,",
+        ] {
+            assert!(
+                sweep.contains(needle),
+                "the stranded sweep no longer does `{needle}`:\n{sweep}",
+            );
+        }
+    }
+
+    /// **EVERY EXIT FROM THE TICK SWEEPS THE ENGINES.** The engine layer's
+    /// `close` no longer prunes `WebContext`s — sweeping between a close and its
+    /// recreate leaked a `WebKitNetworkProcess` every time (see
+    /// `WebSurfaceHost::close`) — so the reconciler owns the sweep now, and it
+    /// owes it on ALL THREE ways out of a tick.
+    ///
+    /// The empty-surface idle branch is the one that matters and the one the
+    /// first cut of this fix missed: it is precisely the state in which the last
+    /// context becomes unwanted, so a sweep written only at the bottom of the
+    /// loop never ran there and the final engine (with its network process)
+    /// lived for the life of the GUI. Measured: `contexts` stuck at 1, and 2
+    /// network processes, after the last surface was closed AND its row removed.
+    ///
+    /// The rule is enforced structurally rather than by counting call sites:
+    /// `web_surface_tick_settled` is the ONE way this loop ends a tick, and it
+    /// sweeps before it publishes.
+    #[test]
+    fn every_exit_from_the_tick_sweeps_engines_before_it_publishes() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod web_surface_reclaim_locks")),
+            "the scan is reading this test module, so the needles below would be \
+             satisfied by the assertions that name them",
+        );
+
+        // The tick-end helper sweeps FIRST, then publishes — so the context
+        // count the state snapshot reports is what the tick settled on.
+        let settled = product
+            .iter()
+            .position(|line| line.trim() == "fn web_surface_tick_settled(")
+            .expect("the tick-end helper is gone — move this lock with it");
+        let body = code_lines(&product[settled..settled + 12]);
+        let sweep = body
+            .iter()
+            .position(|line| *line == "desktop.prune_web_surface_contexts();")
+            .expect(
+                "the tick no longer sweeps engines — a WebContext whose last surface is \
+                 gone now lives, with its network process, for the life of the GUI",
+            );
+        let publish = body
+            .iter()
+            .position(|line| line.starts_with("publish_web_surface_native_ids("))
+            .expect("the tick-end helper no longer publishes the surface set");
+        assert!(
+            sweep < publish,
+            "the sweep must run before the publish, or the reported context count \
+             is a mid-tick figure: {body:?}",
+        );
+
+        // ...and it is the ONLY way the reconcile loop ends a tick. A bare
+        // `publish_web_surface_native_ids` in that loop is an exit that forgot
+        // to sweep, which is exactly how the idle branch was missed.
+        let loop_start = product
+            .iter()
+            .position(|line| line.trim() == "async fn web_surface_native_reconcile_loop(")
+            .expect("the reconcile loop moved — move this lock with it");
+        let loop_end = product[loop_start..]
+            .iter()
+            .position(|line| line.trim() == "async fn rebuild_web_surface_from_daemon_declare(")
+            .map(|offset| loop_start + offset)
+            .expect("the reconcile loop's end marker moved");
+        let exits: Vec<&String> = product[loop_start..loop_end]
+            .iter()
+            .filter(|line| line.contains("web_surface_tick_settled(&desktop, &applied);"))
+            .collect();
+        assert_eq!(
+            exits.len(),
+            3,
+            "the reconcile loop has {} sweeping exits; it has three ways out (the \
+             empty-surface idle branch, the eval-blind retry, and the full tick) and \
+             every one of them owes the sweep",
+            exits.len(),
+        );
+        assert!(
+            !product[loop_start..loop_end]
+                .iter()
+                .any(|line| line.contains("publish_web_surface_native_ids(")),
+            "the reconcile loop publishes without sweeping somewhere — that exit \
+             leaks the engine whose last surface just went",
+        );
+    }
+
+    /// The cadence. It must fire on the FIRST tick (a client that restarts into
+    /// a stranded set must not wait), then no more often than the interval —
+    /// this is one read of a file every daemon on the machine shares.
+    #[test]
+    fn the_stranded_sweep_runs_once_and_then_on_its_interval() {
+        assert!(
+            web_surface_stranded_sweep_due(None, 0),
+            "a client that has never swept must ask immediately"
+        );
+        let last = 100_000_u64;
+        assert!(!web_surface_stranded_sweep_due(Some(last), last));
+        assert!(!web_surface_stranded_sweep_due(
+            Some(last),
+            last + WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS - 1
+        ));
+        assert!(web_surface_stranded_sweep_due(
+            Some(last),
+            last + WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS
+        ));
+        // A clock that went backwards (suspend/resume) must not wedge the sweep
+        // shut forever; it simply is not due yet.
+        assert!(!web_surface_stranded_sweep_due(Some(last), last - 5_000));
+    }
+
+    /// WHAT the sweep asks about: the sessions this client is actually paying
+    /// WebKit processes for, read from the APPLIED mirror. Sorted and deduped,
+    /// so a session with twelve tabs is one question and the order of the
+    /// questions does not depend on `HashMap` iteration.
+    #[test]
+    fn the_stranded_sweep_asks_about_the_sessions_it_holds_webviews_for() {
+        let mut applied: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
+        assert!(
+            web_surface_sessions_holding_webviews(&applied).is_empty(),
+            "a client holding nothing must not touch the tombstone plane at all"
+        );
+        for tab in 0..12_u64 {
+            applied.insert(("live::zulu".to_string(), tab), applied_surface(tab, None));
+        }
+        applied.insert(("live::alpha".to_string(), 0), applied_surface(99, None));
+        applied.insert(
+            ("live::mike".to_string(), 4),
+            applied_surface(100, Some(1_000)),
+        );
+        assert_eq!(
+            web_surface_sessions_holding_webviews(&applied),
+            vec![
+                "live::alpha".to_string(),
+                "live::mike".to_string(),
+                "live::zulu".to_string()
+            ],
+            "one question per session, sorted — a STASHED surface still counts, \
+             because a stash is a live web process"
         );
     }
 
@@ -9642,6 +10013,32 @@ fn lock_web_surface_globals_for_test() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+/// THE END OF A RECONCILE TICK, whichever way the tick ends: sweep the engines
+/// nobody holds any more, then publish the surface set and the post-sweep
+/// context count.
+///
+/// One function because the two are one moment. The engine sweep used to live
+/// in the engine layer's `close`, which leaked a `WebKitNetworkProcess` on every
+/// destroy-and-recreate (see `WebSurfaceHost::close`); moving it to the tick
+/// fixed that and immediately created the opposite hazard, which is why this
+/// exists rather than a bare call at the bottom of the loop. The loop has THREE
+/// exits — the empty-surface idle branch, the eval-blind retry, and the full
+/// tick — and the first of those is exactly the state in which the last context
+/// becomes unwanted. A sweep written only at the bottom is skipped there, and
+/// the final engine lives for the life of the GUI. Measured: after the last
+/// surface closed, `contexts` stuck at 1 with 2 network processes.
+///
+/// Publishing AFTER the sweep also keeps the sharing instrument honest: the
+/// count the state snapshot reports is what the tick settled on, never a
+/// mid-tick figure.
+fn web_surface_tick_settled(
+    desktop: &dioxus::desktop::DesktopContext,
+    applied: &HashMap<(String, u64), AppliedWebSurface>,
+) {
+    desktop.prune_web_surface_contexts();
+    publish_web_surface_native_ids(applied, desktop.web_surface_context_count());
+}
+
 fn publish_web_surface_native_ids(
     applied: &HashMap<(String, u64), AppliedWebSurface>,
     web_context_count: usize,
@@ -10634,7 +11031,77 @@ async fn web_surface_native_reconcile_loop(
     // The ALT overlay flag as of the previous tick — the give-back edge below
     // fires only on open→closed, never steady-state.
     let mut last_alt_overlay_active = false;
+    // When this client last asked whether a row it holds webviews for was closed
+    // somewhere else (see the stranded sweep at the top of the tick).
+    let mut last_stranded_sweep_ms: Option<u64> = None;
     loop {
+        // ─── STRANDED SURFACES: a row somebody ELSE closed ───────────────────
+        //
+        // Webviews are per CLIENT. `session remove` tears down the surfaces of
+        // the client that ran it and answers `verified: true` — and every OTHER
+        // client holding that session goes on paying for its webviews forever,
+        // for a row that now exists nowhere. Measured on guihost (J8a): a shadow
+        // client kept 21 webviews (2.3 GB) after a verified removal, and only
+        // `shadow-client.sh stop` freed them.
+        //
+        // ⚠ ABSENCE FROM A SNAPSHOT IS NOT THE SIGNAL, and must never become
+        // one: a row owned by a preserved predecessor daemon drops out of the
+        // current daemon's snapshot while its session is perfectly alive, so
+        // reaping on absence would destroy another agent's page across a version
+        // bump. The signal is the POSITIVE record the close itself wrote — the
+        // tombstone plane, a shared read-modify-write every daemon on this
+        // machine appends to — and it is asked in exactly the conjunction
+        // `web ensure` already refuses on: a remembered close AND an owner that
+        // says the runtime is gone. An owner that cannot be reached is `Unknown`
+        // and keeps its surfaces, which is what makes this safe during a
+        // handover.
+        {
+            let now_sweep_ms = current_millis();
+            if web_surface_stranded_sweep_due(last_stranded_sweep_ms, now_sweep_ms) {
+                last_stranded_sweep_ms = Some(now_sweep_ms);
+                let held = web_surface_sessions_holding_webviews(&applied);
+                let closed_rows = if held.is_empty() {
+                    Vec::new()
+                } else {
+                    yggterm_server::live_row_closes_remembered_among(
+                        &trace_home,
+                        held.iter().map(String::as_str),
+                    )
+                };
+                for session_path in closed_rows {
+                    let endpoint = state.read().bootstrap.server_endpoint.clone();
+                    let check =
+                        web_ensure_closed_session_check(endpoint, &trace_home, &session_path).await;
+                    if !web_ensure_refuses_closed_session(&check.runtime, check.row_close_remembered)
+                    {
+                        continue;
+                    }
+                    // ONE owner of "this session's surfaces go away" — the same
+                    // teardown the local close path runs, so the lease, the
+                    // arbiter lanes and the headless-wanted claim all end with
+                    // the surfaces instead of re-materializing them next tick.
+                    let mut writable = state;
+                    let targets = writable.with_mut(|shell| {
+                        shell.tear_down_web_surfaces_for_closed_session(
+                            &session_path,
+                            WEB_SURFACE_ROW_CLOSED_ELSEWHERE,
+                        )
+                    });
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "web_surface",
+                        "stranded_surfaces_swept",
+                        json!({
+                            "session_path": session_path,
+                            "surfaces": targets,
+                            "runtime": format!("{:?}", check.runtime),
+                            "row_close_remembered": check.row_close_remembered,
+                        }),
+                    );
+                }
+            }
+        }
         let under_glass = desktop.web_surface_under_glass();
         if last_under_glass != Some(under_glass) {
             last_under_glass = Some(under_glass);
@@ -10987,7 +11454,7 @@ async fn web_surface_native_reconcile_loop(
                     "document.documentElement.style.removeProperty('--yggterm-under-glass-holes');",
                 );
             }
-            publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
+            web_surface_tick_settled(&desktop, &applied);
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
         }
@@ -11072,7 +11539,7 @@ async fn web_surface_native_reconcile_loop(
                 // session. The only thing a rect would tell us now is positioning
                 // and lazy-create for the ACTIVE surface — both safe to defer — so
                 // keep the active surface's applied state and retry next tick.
-                publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
+                web_surface_tick_settled(&desktop, &applied);
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
@@ -11369,11 +11836,14 @@ async fn web_surface_native_reconcile_loop(
                     }
                 } else {
                     // Headless materialization (agent control plane slice 2):
-                    // an agent asked for this BACKGROUNDED session's surfaces
+                    // an agent asked for this BACKGROUNDED session's surface
                     // to exist now (EnsureWebSurface) — create the webview at
                     // a canonical offscreen rect and stash it in the same
                     // tick: never revealed, no page hole, reaped on the
-                    // normal hold/lease clock.
+                    // normal hold/lease clock. THE ACTIVE TAB ONLY: the ask is
+                    // keyed by session and this loop runs per tab, so the
+                    // one-tab clause lives on the rule itself (see
+                    // `web_surface_headless_create_due`).
                     let headless_wanted = !want_visible
                         && web_surface_headless_create_due(
                             state
@@ -11382,6 +11852,8 @@ async fn web_surface_native_reconcile_loop(
                                 .get(session_path.as_str())
                                 .copied(),
                             current_millis(),
+                            tab_id,
+                            active_tab,
                         );
                     // Lazy creation, in one decision the negative lock can drive:
                     // a tab nobody is being shown and no agent asked for gets NO
@@ -12024,6 +12496,8 @@ async fn web_surface_native_reconcile_loop(
         // gone, freeing that jar for the next client (a shadow, a second GUI).
         // A stashed surface still holds its `applied` entry, so its jar stays
         // locked — the lock only drops when the surface is truly destroyed.
+        // The ENGINE sweep answers the same question one line below, at
+        // `web_surface_tick_settled`, and for the same reason.
         if !held_profile_write_locks.is_empty() {
             let in_use: std::collections::HashSet<String> = applied
                 .values()
@@ -12045,7 +12519,7 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
-        publish_web_surface_native_ids(&applied, desktop.web_surface_context_count());
+        web_surface_tick_settled(&desktop, &applied);
         // Tick pacing with a SWITCH KICK. Chrome mounts on the FIRST render
         // after a session/view switch (the overlay gate is render-time), but
         // the page hole + reveal ride THIS loop — a plain tick sleep leaves
@@ -13001,6 +13475,16 @@ const WEB_ENSURE_SESSION_CLOSED: &str = "session_closed";
 /// Absence from a snapshot is not one of the facts on purpose: a row owned by a
 /// preserved predecessor daemon drops out of the current daemon's snapshot while
 /// its session is perfectly alive.
+///
+/// # TWO CALLERS, ONE RULE (2026-08-01)
+///
+/// `web ensure` asks it before REVIVING a surface. The reconciler's stranded
+/// sweep asks the same question before DESTROYING one — a row closed on another
+/// client leaves this client's webviews alive with no row anywhere, and "may a
+/// surface exist under this session" is the same question in both directions.
+/// Both must stay one rule: a sweep that reaped on a softer test than the one
+/// `ensure` revives on would destroy pages `ensure` is contractually allowed to
+/// hand back.
 fn web_ensure_refuses_closed_session(
     runtime: &SessionRuntimeLiveness,
     row_close_remembered: bool,
@@ -139308,10 +139792,35 @@ mod tests {
     // clock, deliberately not this TTL.
     #[test]
     fn headless_create_fires_only_while_the_request_stands() {
-        assert!(web_surface_headless_create_due(Some(1_000), 999));
-        assert!(!web_surface_headless_create_due(Some(1_000), 1_000));
-        assert!(!web_surface_headless_create_due(Some(1_000), 2_000));
-        assert!(!web_surface_headless_create_due(None, 0));
+        assert!(web_surface_headless_create_due(Some(1_000), 999, 4, 4));
+        assert!(!web_surface_headless_create_due(Some(1_000), 1_000, 4, 4));
+        assert!(!web_surface_headless_create_due(Some(1_000), 2_000, 4, 4));
+        assert!(!web_surface_headless_create_due(None, 0, 4, 4));
+    }
+
+    /// THE MINT-TIME SPIKE, at the rule that decides it. One `web ensure` is
+    /// ONE webview — the active tab's — no matter how many tabs the session
+    /// carries. Measured before this clause on guihost (J8b): 25 seeded tabs on a
+    /// surface that was never revealed produced 27 GUI web processes.
+    ///
+    /// The negative half is the load-bearing one: drop `tab_id == active_tab`
+    /// and every row below turns true, which is exactly the bug.
+    #[test]
+    fn a_standing_ensure_materializes_the_active_tab_and_no_other() {
+        let standing = Some(1_000);
+        let now = 500;
+        let active = 7_u64;
+        assert!(
+            web_surface_headless_create_due(standing, now, active, active),
+            "the tab the agent is going to drive must be built"
+        );
+        for background in [0_u64, 1, 2, 6, 8, 24, 99] {
+            assert!(
+                !web_surface_headless_create_due(standing, now, background, active),
+                "tab {background} got a webview from an ensure aimed at tab {active} — \
+                 that is one WebKitWebProcess per tab, revealed or not"
+            );
+        }
     }
 
     #[test]
