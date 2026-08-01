@@ -47,84 +47,39 @@ fix) once the fix is verified live on jojo.
   **The habit stands regardless: before trusting ANY test in a report, mutate
   the production call site yourself.**
 
-## ⭐ USER-REPORTED, ychrome as the daily driver — WHAT IS LEFT
+## ⭐ ychrome as the daily driver — WHAT IS LEFT (user-confirmed 2026-08-01)
 
-> **Compressed 2026-08-01.** Two rounds of user reports (2026-07-30 and 07-31)
-> ran to ~310 lines, nearly all of it describing fixes that have since shipped.
-> Everything closed is in the CHANGELOG (2.12.18 → 2.12.22) and in
-> `campaign-yggterm-unified`; what follows is only what a user can still hit.
+> **The user closed these himself on 2026-08-01, so do not re-open them without
+> a fresh symptom:** downloads (done), **printing** (done — native handling, and
+> the Chrome-style preview was correctly NOT built: "not like chrome (desired)
+> but to native handling done"), webapp launch speed, the WPE lane, and
+> `ctl --help`. **Dropped by the user:** fullscreen-takes-the-window.
 >
-> **Closed since those rounds** (do not re-open without a fresh symptom): the
-> tab rail becoming the cwdtree, with folder icons, arbitrary nesting, the whole
-> drag gesture and the density pass; Cloudflare challenges; userscripts not
-> injecting (and the YouTube 2x-ads symptom behind it); adblock/SponsorBlock
+> Earlier rounds closed: the tab rail becoming the cwdtree with folder icons,
+> nesting, the drag gesture and the density pass; Cloudflare challenges;
+> userscripts not injecting and the YouTube 2x-ads symptom; adblock/SponsorBlock
 > exhaustiveness; open-webui sidebar switching; fullscreen chrome over the
-> picture; tab placement and the row context menu; the app tab's ✕ quitting the
-> app; close-selection; duplicate→about:blank; the row menu clipping; disabled
-> caching; ungranted clipboard; the 320 MB cap that distorted video audio; a
-> revealed page never taking the keyboard; dead back/forward; the mis-clicked
-> hidden duplicate; `ychrome-vault totp` on a skewed clock; the two HTTP caches;
-> the frosted close-button chip; and background tabs being destroyed on a clock.
+> picture; tab placement and the row menu; the mis-clicked hidden duplicate;
+> `ychrome-vault totp` on a skewed clock; the two HTTP caches; the frosted
+> close-button chip; and background tabs destroyed on a clock.
 
-**These remain, each already root-caused — read the mechanism before opening the
-file, and grep the named symbol rather than trusting a line number:**
+**TWO functional items remain, plus one design call and a live render batch.**
 
-- **Downloads have no destination choice, no progress, and lie about history.**
-  `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
-  every terminal in the app (staged destination + async picker is the shape).
-  Progress needs the retained `Download` handle polled (`connect_received_data`,
-  `estimated_progress`) rather than new events. The two toasts never coalesce
-  (`upsert_job_notification("download:<id>")` + `finish_job_notification`).
-  Dismissing a toast DELETES it from the panel — one `Vec<ToastNotification>` is
-  both queue and history; add `dismissed`, split the verbs, and move the
-  visibility predicate into yggui as ONE exported fn. **And a download that
-  outlives its last tab emits nothing at all** — the drain sits after two early
-  `continue`s in the reconcile loop; move it above them.
-
-- **No printing at all.** `WebSurfaceHost::print` modelled on `find` + GTK
-  `PrintOperation::run_dialog` (its "Print to File" is the PDF destination users
-  actually want). Do NOT build a Chrome-style preview: nothing in the tree can
-  display a PDF, and every settings change would mean re-rendering the document.
-  `Ctrl+P` is now ONE row in `WEB_PAGE_CHORDS` plus one arm at the terminus — it
-  is left out only because there is no print path to route it to yet.
-
-- **Fullscreen video takes the WINDOW fullscreen** (KDE then hides its panels
-  until it is un-fullscreened, even from another session). User-settled design:
-  fullscreen fills the VIEWPORT by default, with an ychrome setting for the
-  "real fullscreen" experience. WebKit's enter/leave-fullscreen signals are not
-  bound at all yet.
-
-- **A degraded profile still cannot be made genuinely READ-ONLY** — and this is
-  a DESIGN CALL, not a mechanical fix. The silence is fixed (`WebSurfaceJarMode`
-  decides, spells and traces the mode in one place, and raises one notice per
-  profile saying it starts logged out and will not remember a bot-check cookie).
-  But WebKitGTK has no read-only jar mode, so a real one means giving the loser a
-  private copy of the profile's cookies — and every agent shadow surface would
-  then duplicate the user's live session cookies to a second place on disk.
-  Options are costed in `ychrome/docs/pending-bugs.md`.
-
-- **False/stale gates.** ⭐ **PROVEN 2026-08-01, user screenshot** — the veil
-  ("Daemon updating. Sessions will settle in a moment.") was covering the
-  viewport while the metadata pane beside it read **Client 2.12.22 / Daemon
-  2.12.22 — the same version, uptime 35m, nothing updating at all.** The
-  giveaway is on the same pane: **"3 owned · 8 total · 5 preserved"**. The gate
-  is armed by `preserved_terminal_owner_count > 0`, and 5 preserved sessions is
-  a STEADY STATE, so the veil is permanently armed and every mount shows it.
-  The user's words: "Daemons are updating even when same daemon is present" and
-  "gating itself is so annoying". Both screenshots also show `Status:
-  bootstrapping` on a session that is simply attached.
-  **The fix is already specified below and is now unblocked by evidence.**
-
-  `runtime_status_handoff_active()` is
-  `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
-  two sessions are parked on an older daemon, so any mount arms the veil. Arm on
-  a genuine daemon-IDENTITY transition instead (`pid:version` differs from last
-  observed) and let the awaiting-key slice only SCOPE which surfaces are veiled.
-  The notice is also raised unconditionally — it never consults
+- **⭐ False/stale gates — PROVEN 2026-08-01 by user screenshot.** The veil
+  ("Daemon updating. Sessions will settle in a moment.") covered the viewport
+  while the pane beside it read **Client 2.12.22 / Daemon 2.12.22, uptime 35m** —
+  same version, nothing updating. The giveaway is on the same pane: **"3 owned ·
+  8 total · 5 preserved"**. `runtime_status_handoff_active()` is
+  `preserved_terminal_owner_count > 0`, and preserved sessions are a STEADY
+  STATE, so the veil is armed permanently and every mount shows it. User: *"Daemons
+  are updating even when same daemon is present"*, *"gating itself is so annoying"*.
+  **Fix:** arm on a genuine daemon IDENTITY transition (`pid:version` differs
+  from last observed), and let the awaiting-key slice only SCOPE which surfaces
+  are veiled. The notice is also raised unconditionally without consulting
   `active_view_mode`, which is why it covered a yedit document and claimed "the
-  terminal is paused". ⚠ **The self-check must run IN-PROCESS on the 2.5 s tick:
+  terminal is paused". ⚠ The self-check must run IN-PROCESS on the 2.5 s tick:
   `server app state` REFRESHES the observation, so an external probe cannot
-  measure staleness and can itself arm the gate.**
+  measure staleness and can itself arm the gate.
 
 - **yedit: the wrap gutter drifts, and chrome draws over text.** The gutter takes
   one fractional `getComputedStyle(...).lineHeight` and uses it for BOTH the
@@ -134,32 +89,45 @@ file, and grep the named symbol rather than trusting a line number:**
   padding`; on mismatch stop drawing numbers and stamp an observable field). The
   "Document | Terminal" pill floats over an editor with no reserved space — move
   it into the titlebar's existing surface-switch slot and delete both floating
-  pills. Toasts need an anchor owned by the active viewport kind.
+  pills.
 
-- **Webapp launch speed** — root-caused, partly fixed. ~650 ms of it is WebKit
-  **WebProcess startup**, which no cache can remove; process pre-warming is the
-  remaining lever. See `docs/optimization-pass.md` §9.
+- **A degraded profile cannot be made genuinely READ-ONLY — DESIGN CALL, decided
+  2026-08-01.** The silence half is done (`WebSurfaceJarMode` owns the decision,
+  the spelling and the notice). WebKitGTK has no read-only jar, so "genuinely
+  read-only" means giving the loser a COPY of the profile's cookies — and the
+  objection was that every agent shadow surface would then duplicate the user's
+  live session cookies to a second place on disk, in a browser carrying
+  brokerage sessions.
+  **Decision: option 2, narrowed — copy the `cookies` file ONLY, into a scratch
+  dir wiped at teardown, and ONLY for a surface the USER opened; an agent shadow
+  surface keeps today's jarless behaviour and its notice.** That fixes the
+  reported symptom (a second surface on a held profile stays logged in for its
+  life) while removing the objection outright, because the shadow path was the
+  whole exposure. A startup sweep clears crash leftovers.
 
-- **The WPE agent engine** — `lane/dev/wpe-engine-phase-a`. ⛔ Debian ships WPE
-  WebKit with WPEPlatform OFF, so the substrate is WebKitGTK + an engine-owned
-  Xvfb. Believe `ychrome engine probe`, never the spec prose.
+### ⭐ THE RENDER-PIPELINE BATCH (user, 2026-08-01) — untouched for a long time
 
-- **⚠ FLAKY UNDER LOAD:
-  `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
-  — fails on a busy host, passes in isolation. It is the test, not the code.
+The user's words: *"gating sessions have become ridiculously buggy. We have not
+touched the rendering pipeline for a long time and bugs have piled up."* Three
+symptoms, and the last two are strongly suspected to share a root:
 
-### Two entries CLOSED here by measurement, 2026-08-01
-
-- ~~**`WEBKIT_DISABLE_COMPOSITING_MODE=1` breaks the web surface outright.**~~
-  Still true, and no longer a loose trap: it is now a row in the sanctioned
-  table (`crates/yggterm-core/src/presentation_policy.rs`, value **absent**,
-  with the reason in the row) and agents are forbidden from setting it by
-  `AGENTS.md`. See `docs/presentation-policy.md`.
-- ~~**THE GL PROBE NEVER RUNS ON THE LIVE HOST.**~~ **FALSIFIED.** jojo's own
-  startup trace on 2026-08-01 reports `gl_probe_class=hardware`,
-  `gl_probe_driver=radeonsi`, `gl_probe_reason=egl_driver_name`,
-  `gl_probe_elapsed_ms=86`, with `libgl_always_software` and `gallium_driver`
-  both absent. The probe runs and it finds the real GPU.
+1. **The stuck viewport after a copy.** Selecting and copying in a session
+   leaves the viewport pinned: it shows **"2 new messages (ctrl+End) ↓"** while
+   output keeps arriving and never follows it. Switching sessions unsticks it —
+   which points at a remount clearing state that nothing else clears. Suspect
+   the follow-prompt / user-scrollback guard treating a selection (or the scroll
+   a selection causes) as sticky and never releasing after the copy completes.
+   Screenshot also shows `sent 50 chars via OSC 52`.
+2. **Claude Code ALWAYS starts with a broken bottom**, plus glyph corruption
+   while switching into CC sessions. A TUI refresh fixes it every time — so the
+   daemon's screen is right and the CLIENT is painting less than it holds.
+3. **YouTube frame judder with "overlaps"** while YouTube's own stats-for-nerds
+   reports almost no dropped frames. ⚠ That reading FALSIFIES the decode
+   explanation: if frames are not being dropped, the decoder is keeping up and
+   the fault is in PRESENTATION, not decode. "Overlaps" reads as stale frame
+   content persisting, i.e. damage/compositing, not pipeline. The
+   `GST_PLUGIN_FEATURE_RANK` default shipped in 2.12.22 is still correct on its
+   own merits but is NOT the explanation for this.
 
 ## Standing traps / other open bugs
 
