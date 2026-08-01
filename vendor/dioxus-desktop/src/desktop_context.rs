@@ -891,6 +891,10 @@ impl DesktopService {
     }
 
     /// Destroy an open web surface.
+    ///
+    /// This does NOT sweep the engine the surface was running on — see
+    /// [`Self::prune_web_surface_contexts`], which the caller owes once its tick
+    /// is done.
     pub fn close_web_surface(&self, id: u64) {
         #[cfg(not(any(
             target_os = "windows",
@@ -908,6 +912,27 @@ impl DesktopService {
             target_os = "android"
         ))]
         let _ = id;
+    }
+
+    /// Drop every shared `WebContext` no surface holds any more — and with it,
+    /// its `WebKitNetworkProcess`.
+    ///
+    /// **Call this once per reconcile tick, after every close AND every create
+    /// in that tick.** A destroy-and-recreate (reload, proxy change, profile
+    /// change) is two separate calls, and sweeping between them takes an engine
+    /// that is about to be wanted again: the create then mints a second
+    /// `WebContext` on the same jar, which is a second network process that
+    /// never exits. See `WebSurfaceHost::close`.
+    pub fn prune_web_surface_contexts(&self) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.prune_contexts();
+        }
     }
 
     /// Stash an open web surface: detach it from the overlay, keeping the

@@ -3407,26 +3407,34 @@ fn surface_new_window_handler(
             plumbing.next_id.set(next + 1);
             next
         };
-        let bounds = plumbing
+        // The opener's rect AND the engine it runs on, read in one borrow. The
+        // context is co-owned by the popup (see `build_popup_webview`): a
+        // related view shares its opener's WebContext, so the popup is a HOLDER
+        // of it and the sweep must see that.
+        let (bounds, opener_ctx) = plumbing
             .surfaces
             .borrow()
             .get(&opener_surface_id)
             .map(|surface| {
                 let (w, h) = surface.container.size_request();
                 (
-                    surface.container.margin_start(),
-                    surface.container.margin_top(),
-                    w,
-                    h,
+                    (
+                        surface.container.margin_start(),
+                        surface.container.margin_top(),
+                        w,
+                        h,
+                    ),
+                    surface._ctx.clone(),
                 )
             })
-            .unwrap_or((0, 0, 1, 1));
+            .unwrap_or(((0, 0, 1, 1), None));
         match build_popup_webview(
             &plumbing,
             popup_id,
             &features.opener.webview,
             bounds,
             !features.background,
+            opener_ctx,
         ) {
             Some(webview) => {
                 plumbing.popups.borrow_mut().push(SurfacePopup {
@@ -3489,12 +3497,31 @@ fn surface_link_gesture_handler(
 /// The page policy (userscripts, the passkey shim, the ad filter) is re-attached
 /// here, because a fresh view gets a fresh user-content manager. A popup with no
 /// passkey shim is precisely the window a passkey is needed in.
+///
+/// # A POPUP IS A HOLDER OF ITS OPENER'S ENGINE (fixed 2026-08-01)
+///
+/// `opener_ctx` is the opener's shared `WebContext`, co-owned here. The popup
+/// does not BUILD one — `with_related_view` puts it in the opener's process and
+/// context — but it does USE one, and `prune_contexts` sweeps on
+/// `Rc::strong_count == 1`. With `_ctx: None` the popup was invisible to that
+/// count, so closing the opener tab dropped the context out of the map while the
+/// popup was still running on it. The engine object survived (WebKit refcounts
+/// it), so the network process stayed — and the NEXT surface on that same
+/// jar+egress+control-endpoint key found no entry and built a SECOND
+/// `WebContext`: another `WebKitNetworkProcess`, and two `WebsiteDataManager`s
+/// writing one jar, which is the exact state `web_context_key` exists to
+/// prevent.
+///
+/// Co-owning it makes the popup count as the holder it already was, so the
+/// engine dies when its LAST user goes — the same rule a download in flight
+/// follows.
 fn build_popup_webview(
     plumbing: &SurfaceWindowPlumbing,
     popup_id: u64,
     opener: &webkit2gtk::WebView,
     opener_bounds: (i32, i32, i32, i32),
     visible: bool,
+    opener_ctx: Option<Rc<RefCell<WebContext>>>,
 ) -> Option<webkit2gtk::WebView> {
     use webkit2gtk::WebViewExt as _;
     use wry::WebViewBuilderExtUnix as _;
@@ -3644,7 +3671,11 @@ fn build_popup_webview(
         Surface {
             container,
             webview,
-            _ctx: None,
+            // The opener's engine, co-owned — see this function's doc. Every
+            // page surface holds one (shared or ephemeral), so `None` here means
+            // the opener was already gone when the create handler ran, and there
+            // was nothing to co-own.
+            _ctx: opener_ctx,
             // A popup opened by an unrevealed opener is hidden by hiding its
             // CONTAINER (see the branch above), which is the hard-stash shape,
             // not ours: page visibility is already correct for it (an unmapped
@@ -4555,7 +4586,12 @@ impl WebSurfaceHost {
     ///
     /// The rule itself is `retain_held_contexts`, which is where it can be
     /// driven; this method is the host's borrow around it and nothing more.
-    fn prune_contexts(&self) {
+    ///
+    /// **Called once per reconcile tick, by the shell** — never from `close`.
+    /// See [`WebSurfaceHost::close`] for the network-process leak that ordering
+    /// caused: a destroy-and-recreate is two calls, and a sweep between them
+    /// takes an engine that is about to be wanted again.
+    pub fn prune_contexts(&self) {
         retain_held_contexts(&mut self.contexts.borrow_mut());
     }
 
@@ -4770,6 +4806,32 @@ impl WebSurfaceHost {
             .is_some_and(|s| s.webview.webview().is_playing_audio())
     }
 
+    /// Destroy surface `id`.
+    ///
+    /// # THE ENGINE SWEEP IS NOT HERE (2026-08-01)
+    ///
+    /// This used to end with `self.prune_contexts()`, and that ordering leaked a
+    /// `WebKitNetworkProcess` on every DESTROY-AND-RECREATE. The recreate paths
+    /// (reload, proxy change, profile change, and `open`'s own replace-any-
+    /// existing) close the old surface and build the new one as two separate
+    /// calls: with the sweep here, the close dropped `strong_count` to 1 — only
+    /// the map — the context was taken, and the create a few statements later
+    /// found nothing under its `web_context_key` and built a fresh `WebContext`.
+    /// A fresh context is a fresh network process, and the old one does not
+    /// exit. Measured in the sandbox on 2.12.22: five `web reload`s took the GUI
+    /// from 3 to 8 network processes, +1 each, with `web_context_count()`
+    /// sitting at 1 the whole time (which is what makes it invisible to the
+    /// sharing instrument). It also silently defeated jar sharing for the
+    /// instant both contexts existed — the state `web_context_key` exists to
+    /// prevent.
+    ///
+    /// The sweep now runs ONCE PER RECONCILE TICK
+    /// ([`WebSurfaceHost::prune_contexts`], called by the shell after every
+    /// close and every create in the tick are done), which is the boundary at
+    /// which "nobody wants this engine any more" is actually answerable. The
+    /// lifetime it gives is unchanged for a genuine last-surface close — the
+    /// context still dies in that same tick — and a recreate now reuses the
+    /// engine it never really stopped needing.
     pub fn close(&self, id: u64) {
         if let Some(s) = self.surfaces.borrow_mut().remove(&id) {
             // A stashed surface's container is already detached.
@@ -4778,9 +4840,8 @@ impl WebSurfaceHost {
             }
             // Surface drops here: the webview is torn down, and its share of the
             // WebContext is released. The context itself survives while a
-            // sibling tab still holds it.
+            // sibling tab still holds it — or until the tick's own sweep.
         }
-        self.prune_contexts();
         // Do not leave a seat-input tally behind for a surface that is gone —
         // ids are reused, and a stale count would preempt the next agent batch
         // on the new surface for something the user did to the old one.
@@ -8106,7 +8167,7 @@ mod download_locks {
         let product = product_lines();
         assert!(
             product.join("\n").contains(
-                "fn prune_contexts(&self) {\n        \
+                "pub fn prune_contexts(&self) {\n        \
                  retain_held_contexts(&mut self.contexts.borrow_mut());\n    }"
             ),
             "the host's context sweep no longer goes through the rule under \
@@ -8134,6 +8195,126 @@ mod download_locks {
             !entry.contains("webkit2gtk::Download"),
             "the registry holds a `Download` handle again — dropping the last \
              reference to one inside its own signal handler is a use-after-free",
+        );
+    }
+
+    /// **A POPUP IS A HOLDER OF ITS OPENER'S ENGINE.** Same rule, same sweep,
+    /// same stand-in: a related view runs IN its opener's context, so closing
+    /// the opener tab must not sweep that context out of the map while the popup
+    /// is still on it.
+    ///
+    /// What the old `_ctx: None` cost is the second half here: with the map
+    /// entry gone but the engine alive (WebKit refcounts the object the popup
+    /// holds), the next surface on the SAME `web_context_key` finds nothing and
+    /// builds a fresh `WebContext` — one more `WebKitNetworkProcess`, and two
+    /// `WebsiteDataManager`s writing one jar. That is the accumulation shape
+    /// filed on jojo (J8a: 3 → 10 network processes across one run).
+    #[test]
+    fn a_popup_keeps_its_openers_engine_mapped_after_the_opener_tab_closes() {
+        let engine = Rc::new(RefCell::new(String::from("default-profile engine")));
+        let mut contexts: HashMap<String, Rc<RefCell<String>>> = HashMap::new();
+        contexts.insert("default".to_string(), engine.clone());
+        let opener_hold = engine.clone();
+        // The popup, co-owning what it runs on.
+        let popup_hold = engine.clone();
+        drop(engine);
+
+        retain_held_contexts(&mut contexts);
+        assert_eq!(contexts.len(), 1, "the sweep took a context still in use");
+
+        // THE OPENER TAB CLOSES while its popup is still up — a sign-in flow
+        // whose parent tab the user shut, the exact case popups exist for.
+        drop(opener_hold);
+        retain_held_contexts(&mut contexts);
+        assert_eq!(
+            contexts.len(),
+            1,
+            "the popup's engine was swept out of the map while the popup was \
+             running on it — the next surface on this jar mints a SECOND \
+             WebContext, i.e. a second network process over one cookie jar",
+        );
+        assert_eq!(
+            Rc::strong_count(contexts.get("default").expect("still mapped")),
+            2,
+            "the only holders left must be the map and the popup itself",
+        );
+
+        // The popup closes; the next sweep takes the engine, exactly as it would
+        // have when the last ordinary tab went.
+        drop(popup_hold);
+        retain_held_contexts(&mut contexts);
+        assert!(
+            contexts.is_empty(),
+            "an engine nobody holds must not outlive its last holder",
+        );
+
+        // ...and the popup builder really does co-own it. The builder cannot be
+        // driven (a related view needs a display, an engine and a live opener),
+        // so this is a source read of the one line that makes the popup a
+        // holder — the same honesty note as every scan in this file.
+        let source = product_lines().join("\n");
+        let start = source
+            .find("fn build_popup_webview(")
+            .expect("`build_popup_webview` is gone — move this lock with it");
+        let body = &source[start..];
+        assert!(
+            body.contains("opener_ctx: Option<Rc<RefCell<WebContext>>>,"),
+            "the popup builder is no longer handed its opener's engine",
+        );
+        assert!(
+            body.contains("_ctx: opener_ctx,"),
+            "the popup no longer co-owns its opener's engine, so `prune_contexts` \
+             cannot see it as a holder",
+        );
+        assert!(
+            !body.contains("_ctx: None,"),
+            "a popup registered with no engine hold again",
+        );
+    }
+
+    /// **THE SWEEP MUST NOT RUN INSIDE `close`.** A destroy-and-recreate is two
+    /// calls — `close(id)` then `open(id, …)`, whether that is the reconciler's
+    /// reload/proxy/profile branch or `open`'s own replace-any-existing — and a
+    /// sweep in the gap takes the engine that is about to be wanted again. The
+    /// create then finds nothing under its `web_context_key`, builds a second
+    /// `WebContext` on the same jar, and the old network process never exits.
+    ///
+    /// Measured in the sandbox on 2.12.22, before the move: five `web reload`s
+    /// on ONE surface took the GUI from 3 to 8 `WebKitNetworkProcess`es, exactly
+    /// +1 each, while `web_context_count()` read 1 the whole time — which is why
+    /// the sharing instrument never saw it.
+    ///
+    /// A source read, and honest about it: what the sweep DOES is proven by the
+    /// two driven tests above. This pins WHO calls it, which is the entire bug.
+    #[test]
+    fn the_engine_sweep_belongs_to_the_tick_and_not_to_close() {
+        let source = product_lines().join("\n");
+        let start = source
+            .find("pub fn close(&self, id: u64) {")
+            .expect("`close` is gone — move this lock with it");
+        let end = source[start..]
+            .find("\n    }\n")
+            .map(|offset| start + offset)
+            .expect("unterminated `close`");
+        let close_body = &source[start..end];
+        assert!(
+            !close_body.contains("prune_contexts"),
+            "`close` sweeps the engine again — every destroy-and-recreate now \
+             leaks a WebKitNetworkProcess:\n{close_body}",
+        );
+        assert!(
+            source.contains("pub fn prune_contexts(&self) {"),
+            "the sweep is no longer reachable by the tick that owes it",
+        );
+        // The one place inside the host that may still sweep immediately: a
+        // context built for a webview that FAILED to build has no owner but the
+        // map and no create is coming for it.
+        let open_start = source
+            .find("pub fn open(")
+            .expect("`open` is gone — move this lock with it");
+        assert!(
+            source[open_start..start].contains("self.prune_contexts();"),
+            "the failed-build path no longer sweeps the context it orphaned",
         );
     }
 }

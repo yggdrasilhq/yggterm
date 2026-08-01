@@ -240,6 +240,91 @@ Anything that can hold a decision belongs in the pass; the live host impl is fou
 one-line methods and is locked structurally by
 `the_reclaim_pass_call_site_is_wired_to_the_live_machine`. See field guide §7.1.
 
+#### Three ways a process was minted for nothing (fixed 2026-08-01)
+
+The reclaim lane above decides when a webview DIES. These are three places that
+created one — or refused to reap one — for no reader at all. All three were filed
+from the jojo J8a/J8b batteries; all three were re-measured in
+`scripts/underglass-sandbox.sh` against 2.12.22 before and after.
+
+**1. `web ensure` minted one web process per TAB.** The agent's materialization
+request (`ShellState::web_surface_headless_wanted`) is keyed by SESSION, and the
+reconciler asks "should this tab exist?" per TAB — so one `web ensure` on a
+backgrounded surface built a `WebKitWebProcess` for every tab it had, on a
+surface never revealed and never visited. Measured: a 13-tab surface went from
+**1 to 15 GUI web processes on one call** (~108 MB RSS each; 100 tabs would have
+been ~11.4 GB). No reclaim lane could reach it — the per-tab hold governs
+background tabs of a session the user IS looking at, and this surface is not one.
+
+`web_surface_headless_create_due` now carries the tab identity and answers for
+the ACTIVE tab only. That is not a compromise, it is the whole of what the ask
+means: `resolve_live_web_surface` — the door `eval`, `read`, `do`, `wait`,
+`screenshot` and `find` all go through — resolves `surface.active_tab` and
+nothing else, and `web_surface_lease_for` leases that tab alone. The other
+twenty-four webviews were unreachable to the entire agent plane. Every other tab
+now stays tab-model-only until it is revealed or selected, which is the restore
+path's rule verbatim. After: **1 → 1**.
+
+**2. A row closed on ANOTHER client stranded this client's webviews forever.**
+Webviews are per CLIENT. `session remove` tears down the surfaces of the client
+that ran it and answers `verified: true` — and every other client holding that
+session went on paying for its own full set, for a row that now exists nowhere.
+Measured with a shadow client attached to the same daemon: after a
+`verified: true` removal the GUI dropped to its own shell webview and **the
+shadow kept the surface's**, freed only by `shadow-client.sh stop` (J8a saw 21
+webviews / 2.3 GB left this way).
+
+The reconciler now sweeps, at the top of each tick and at most every
+`WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS`, the sessions it holds webviews for.
+⚠ **The signal is the tombstone plane, never absence from a snapshot** — a row
+owned by a preserved predecessor daemon drops out of the current daemon's
+snapshot while its session is perfectly alive, so reaping on absence would
+destroy another agent's page across a version bump. It asks in exactly the
+conjunction `web ensure` refuses to REVIVE on (`web_ensure_refuses_closed_session`:
+a remembered close AND an owner that says the runtime is gone), because "may a
+surface exist under this session" is the same question in both directions; an
+owner that cannot be reached is `Unknown` and keeps its surfaces. The teardown
+itself goes through the one owner the local close path uses, so the lease, the
+arbiter lanes and the headless-wanted claim end with the surfaces. After:
+**the shadow drops with the GUI**.
+
+*Residual, by design:* a second viewer still builds its OWN webviews for a
+session it is shown. That is what makes co-browsing work at all on the current
+per-client surface model; it is a cost, not a defect, and it is bounded by the
+same reclaim lane as the first viewer's.
+
+**3. Every destroy-and-recreate leaked a `WebKitNetworkProcess`.** `close` swept
+the shared `WebContext` map (`retain_held_contexts`, `strong_count == 1`)
+immediately. But a recreate — reload, proxy change, profile change, and `open`'s
+own replace-any-existing — is TWO calls, and the sweep in the gap took the engine
+that was about to be wanted again: the create then found nothing under its
+`web_context_key` and built a second `WebContext` on the same jar. One network
+process per recreate, and the old one does not exit. Measured: **five `web
+reload`s took the GUI from 3 to 8 network processes, +1 each, while
+`web_context_count()` read 1 the whole time** — which is why the sharing
+instrument never saw it. It also meant two `WebsiteDataManager`s over one cookie
+jar for the instant both existed, the exact state `web_context_key` exists to
+prevent.
+
+The sweep now belongs to the TICK (`web_surface_tick_settled`), which is the
+first moment "does anybody still hold this engine" is answerable. Two subtleties,
+both paid for:
+
+- The loop has **three** exits — the empty-surface idle branch, the eval-blind
+  retry, and the full tick — and the first is precisely the state in which the
+  LAST context becomes unwanted. A sweep written only at the bottom of the loop
+  left the final engine and its network process alive for the life of the GUI
+  (observed: `contexts` stuck at 1 after the last surface was closed and its row
+  removed). `web_surface_tick_settled` is therefore the one way the loop ends a
+  tick, and it sweeps before it publishes.
+- A **popup** now co-owns its opener's context. A related view runs IN the
+  opener's engine but registered with `_ctx: None`, so it was invisible to a
+  sweep that counts holders: closing the opener tab dropped the context out of
+  the map while the popup was still running on it, and the next surface on that
+  jar minted a second one.
+
+After: **five reloads, 0 leaked**.
+
 ## The egress rule
 
 **A surface's network egress is the invoking host's network — for ALL URLs.**
