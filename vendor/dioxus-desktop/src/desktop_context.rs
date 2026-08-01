@@ -142,11 +142,16 @@ impl DesktopService {
     ///
     /// `visible` says whether this surface is being created for someone to LOOK
     /// AT. It must be false for a headless create (`web ensure`, which demotes
-    /// the surface in the same tick), and it decides two things: a surface
-    /// nobody can see may not hold the window's keyboard focus (or the user's
-    /// typing goes into it instead of their terminal), and it is born HIDDEN to
-    /// the engine so its page reports `document.visibilityState: 'hidden'` and
+    /// the surface in the same tick): such a surface is born HIDDEN to the
+    /// engine, so its page reports `document.visibilityState: 'hidden'` and
     /// throttles its animation from the first frame.
+    ///
+    /// `focused` says whether this surface is who the KEYBOARD belongs to — a
+    /// separate question, because a page can be shown while a shell control (the
+    /// omnibox of a Ctrl+T tab, the find bar) holds the keys. A surface nobody
+    /// can see is never focused whatever this says: the host applies
+    /// `visible && focused`, which is what keeps an invisible agent surface from
+    /// swallowing the user's typing (2026-07-26).
     #[allow(clippy::too_many_arguments)]
     pub fn open_web_surface(
         &self,
@@ -163,6 +168,7 @@ impl DesktopService {
         w: i32,
         h: i32,
         visible: bool,
+        focused: bool,
     ) -> Result<(), String> {
         #[cfg(not(any(
             target_os = "windows",
@@ -186,6 +192,7 @@ impl DesktopService {
                     w,
                     h,
                     visible,
+                    focused,
                 ),
                 None => Err("web surface host not installed".to_string()),
             };
@@ -211,6 +218,7 @@ impl DesktopService {
                 w,
                 h,
                 visible,
+                focused,
             );
             Err("web surfaces require the GTK/WebKit backend".to_string())
         }
