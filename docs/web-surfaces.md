@@ -298,6 +298,102 @@ Because each tab is a real top-level webview (not an iframe), sites that
 refuse framing (X-Frame-Options / frame-ancestors: google.com, most login
 pages) render normally.
 
+## The legacy browser keys, and the page menu (2026-08-01)
+
+### Keys
+
+Every one of these was DEAD over a focused page before this, and every one of
+them is a verb the app already had with a mouse-only route:
+
+| Chord | Verb | Where it is served |
+|---|---|---|
+| `F5`, `Ctrl+R` | reload the active tab | `web_surface_reload_active_tab` — the ⟳ button's own owner |
+| `Ctrl+Shift+R` | hard reload (bypass cache) | the engine: `reload_bypass_cache` |
+| `Ctrl+T` | new tab, typing-ready in the address bar | `open_web_surface_tab` — THE UI opener |
+| `Ctrl+L` | focus + select the address bar | `focus_web_omnibox` |
+| `Ctrl+W` | close the active tab | the row menu's own close plan |
+| `F12`, `Ctrl+Shift+I` | toggle DevTools | `toggle_web_surface_devtools` |
+| `Ctrl+F` | find in page (predates this layer) | `open_web_find_for_viewport` |
+
+The table is `WEB_PAGE_CHORDS` in `shell.rs`; the terminus is
+`dispatch_web_page_chord`. Both are locked
+(`every_claimed_legacy_chord_has_an_arm_at_the_terminus`) because a chord with
+no arm is worse than no chord: the claimer consumes the key, so the page's own
+handler does not run either and the key silently eats itself.
+
+**⚠ Why this cannot collide with the ALT/KeyTips layer.** The ALT layer owns a
+clean ALT tap plus the registered accelerators, and `assert_accels_pty_safe`
+forbids every accelerator from being a bare `Ctrl+<letter>` or a bare function
+key — those belong to the terminal. This layer owns exactly the shapes that
+rule forbids, and **every row is `page_only`**, so none of these chords exists
+unless a browser genuinely owns the keyboard (the window claimer asks the
+toplevel which widget has focus). `Ctrl+R` is still readline's reverse-search
+everywhere else in the app. `no_legacy_browser_chord_is_also_an_accelerator`
+holds the two sets disjoint by name.
+
+### The page context menu
+
+A page had no yggterm menu, deliberately (see the `oncontextmenu` guard on the
+terminal host: WebKit's own menu already offers Copy/Cut/Paste/Select-All and a
+DOM reimplementation would be a second, worse copy). What was missing was a way
+to ADD one entry. There is now, and it is the same shape as the claimed-chord
+table: **the item list is DATA pushed from the shell**
+(`set_web_surface_page_menu_items`), the vendored host appends the labels it is
+given and relays the id that was clicked, and it knows what none of them mean.
+Adding an entry is a row in `WEB_PAGE_MENU_ITEMS` plus an arm at
+`dispatch_web_page_menu`; nothing in `web_surface.rs` changes.
+
+Four entries, which are the ychrome engine's four `/engine/shot` regions in the
+same words — a human clicking "full page" and an agent sending `region=full`
+must get the same picture:
+
+- **Screenshot visible area** — `SnapshotRegion::Visible`
+- **Screenshot full page** — `SnapshotRegion::FullDocument`
+- **Screenshot this element** — the element under the right-click, cropped out
+  of the full-document snapshot
+- **Screenshot an area…** — a drag overlay injected INTO THE PAGE (a native
+  child webview composites above all shell DOM, so an overlay drawn in the
+  shell would be invisible under the page it is selecting from). Escape and a
+  click with no drag both CANCEL, and a cancel toasts nothing.
+
+Both regions are native, so there is no scroll-and-stitch: a stitch seams at
+every step, repeats every `position: fixed` header once per tile, and leaves
+the page scrolled where the user did not put it. The element and area crops are
+cut from the pixels that one snapshot produced, never a second one.
+
+⚠ **The CSS→device scale is measured, not assumed** — the caller hands in the
+CSS width its rect was measured against and the scale is the snapshot's real
+width divided by it. A crop computed from the wrong ratio produces a plausible
+image of the wrong part of the page, which looking at the image cannot reveal.
+
+Captures land in `~/.yggterm/screenshots/`, the same directory the agent
+control plane writes `server app screenshot` to, and the toast names the size
+and the path.
+
+### What is PROVEN, and what is not (2026-08-01)
+
+- ✅ **The four entries appear on the real WebKit page menu**, beside WebKit's
+  own Back/Forward/Stop/Reload/Inspect Element. Live on jojo, in a shadow
+  client running this build, screenshotted.
+- ✅ **`snapshot_region` works on the GUI plane** — `server app web screenshot`
+  now routes through it and answered `capture_faithful: true` with a real
+  1076x965 PNG.
+- ✅ **All four capture regions, with faithful pixels read back**, on the
+  ychrome engine's identical implementation (`ychrome ctl shot region=…`).
+- ⚠ **NOT proven end-to-end: clicking one of the four entries in the GUI.**
+  A GTK popup menu is not reachable from any injection path we have — the `do`
+  verb delivers GDK events to the *webview widget*, and the shadow's headless
+  sway has no input devices at all (`swaymsg -t get_inputs` → `[]`), so neither
+  `sway seat cursor` nor `ydotool` can press a menu item. The relay itself is
+  the one the chord notifier uses (live today for Ctrl+F and F11) and the
+  terminus is source-locked, but the click is unexercised.
+- ⚠ **NOT proven: the keys.** Same gap, worse — a claimed chord is taken at the
+  GTK *toplevel window*, above the webview, so the injection path cannot reach
+  it either, and there is no key-injection tool that lands on a headless sway.
+  **If this layer is to be verifiable by an agent, the missing instrument is a
+  `server app key <chord>` verb that relays a synthetic press into the window
+  claimer** — that is the affordance to build next, not a workaround.
+
 ## Sidebars (decision, 2026-07-04; contribution shipped 2026-07-09)
 
 Web surfaces keep the generic yggterm sidebars: settings, notifications
