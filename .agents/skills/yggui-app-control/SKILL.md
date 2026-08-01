@@ -15,6 +15,32 @@ This skill is the agent's hands and eyes on the live yggterm desktop. Use it to:
 
 This was the explicit design intent: yggterm is agent-first controllable for everything from a remote console.
 
+## ⛔ BEFORE YOU RESTART THE GUI: the presentation policy binds you
+
+This skill hands you `app launch` and the kill-and-relaunch loop. That power is
+exactly how the user's GUI has repeatedly ended up running as something nobody
+chose. **Read `docs/presentation-policy.md`.**
+
+- **Never launch or relaunch the user's GUI with a `PRESENTATION_VARS` variable
+  set** — `GDK_BACKEND`, `LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`,
+  `WEBKIT_DISABLE_DMABUF_RENDERER`, `WEBKIT_DISABLE_COMPOSITING_MODE`,
+  `YGGTERM_WEB_SURFACE_UNDER_GLASS`, `GST_PLUGIN_FEATURE_RANK`,
+  `YGGTERM_ENABLE_XTERM_CANVAS`. `app launch` with a clean environment is the
+  only sanctioned way to bring their GUI back.
+- **What you learned under Xvfb does not travel.** Headless sway and Xvfb are
+  X11, so `GDK_BACKEND=x11` is correct there and WRONG on the user's Wayland
+  desktop. Restarting their GUI with it has cost hours, more than once. To test
+  an arm, use `scripts/underglass-sandbox.sh` — a throwaway GUI with its own env
+  and its own daemon.
+- **A relaunched GUI inherits the DAEMON's environment**, and the daemon can be
+  days old with a frozen env. After any relaunch, confirm the arming from the
+  `gui/startup/linux_desktop_backend_policy` trace event — NOT from
+  `/proc/<pid>/environ`, which cannot see `set_var` after exec.
+- **"Is it XWayland?"** is answered by counting X11 sockets in
+  `/proc/<gui-pid>/fd` (must be 0) and finding the GUI on `wayland-0` in
+  `ss -xp`. An empty `xwininfo` means the instrument failed, not that the answer
+  is no.
+
 ## Scope — Dioxus DESKTOP surface only (observability + automation, by agents for agents)
 
 This skill is an agent's "human eye + keyboard/mouse" for a **Dioxus desktop UX**: select an element (like a cwd-tree pick), navigate, screenshot the running app, measure animation/timing, iterate a feature — and when a flow repeats, write it as an **ad-hoc automation script, check it in, and rerun it** (a first-class record→replay "Macro" affordance is a future TODO, not built yet).

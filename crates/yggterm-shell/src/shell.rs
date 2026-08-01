@@ -43128,6 +43128,23 @@ const WEB_PAGE_CHORDS: &[WebPageChord] = &[
         id: "web.devtools",
         focus_shell: false,
     },
+    // Copy the PAGE's URL.
+    //
+    // ⚠ `Ctrl+Shift+C` is ALSO the terminal's copy, and that is not a conflict
+    // — it is the whole reason this layer is `page_only`. The terminal's copy
+    // lives inside the xterm host's own key handler, which only ever runs for a
+    // focused terminal widget; this row stands down unless a VISIBLE surface
+    // webview holds the toplevel's focus. One key, one meaning in each place a
+    // hand can be: copy the selection in a terminal, copy the address on a
+    // page. Locked by `the_terminal_copy_chord_is_never_stolen_from_a_terminal`.
+    //
+    // `focus_shell: false` on purpose: copying an address is not a reason to
+    // take the keyboard off the page the user is reading.
+    WebPageChord {
+        chord: "Ctrl+Shift+C",
+        id: "web.url.copy",
+        focus_shell: false,
+    },
 ];
 
 /// Which registered accelerators are claimed ABOVE a focused child.
@@ -102427,6 +102444,64 @@ async fn web_shot_area_rect(
 /// anyway. It is still this layer's key — handing it to `dispatch_keytip_node`
 /// would look up a command id that does not exist, which is a silent no-op with
 /// an extra step.
+///
+/// The URL a "copy this page's address" should hand over, for the active tab of
+/// `session`. `None` when there is nothing honest to copy.
+///
+/// **`tab.url`, and deliberately NOT `address_draft`.** They are different
+/// answers and the user asked for this one by name: the draft is what is sitting
+/// in the input box, which may be half-typed, may be an inline autocompletion
+/// nobody has accepted, and may be a search phrase that is not a URL at all.
+/// `tab.url` is what the ENGINE reports the document to be — written from
+/// `page_url` on the reconcile poll, so it has already followed every redirect.
+///
+/// A tab that has not navigated yet has an empty `url`, and an empty string is
+/// not an address. Copying it would silently clear whatever the user already had
+/// on their clipboard, which is worse than refusing.
+fn active_web_page_url(state: &Signal<ShellState>, session: &str) -> Option<String> {
+    let shell = state.peek();
+    let surface = shell.web_surfaces.get(session)?;
+    let tab = surface.tabs.iter().find(|tab| tab.id == surface.active_tab)?;
+    (!tab.url.trim().is_empty()).then(|| tab.url.clone())
+}
+
+/// Copy the active page's address, and SAY SO.
+///
+/// The notification is not decoration. A clipboard write is invisible by
+/// construction — nothing on screen changes — so a copy that stays silent is
+/// indistinguishable from a key that did nothing, and the user's next move is to
+/// press it again or to paste somewhere and find out. It names the URL because
+/// the question a user has right after this key is "which one did it take", and
+/// a tab whose address bar holds a half-typed draft is exactly when that matters.
+fn copy_active_web_page_url(mut state: Signal<ShellState>, session: &str) {
+    let Some(url) = active_web_page_url(&state, session) else {
+        state.with_mut(|shell| {
+            shell.push_notification(
+                NotificationTone::Warning,
+                "No Address To Copy",
+                "This tab has not opened a page yet.",
+            )
+        });
+        return;
+    };
+    match set_native_clipboard_contents(state, &YgguiClipboardContents::Text { text: url.clone() })
+    {
+        Ok(_) => state.with_mut(|shell| {
+            shell.push_notification(NotificationTone::Success, "Address Copied", url)
+        }),
+        // Named, never swallowed: a failed copy leaves the user's OLD clipboard
+        // in place, so reporting success would have them paste the wrong thing
+        // into something that matters.
+        Err(error) => state.with_mut(|shell| {
+            shell.push_notification(
+                NotificationTone::Error,
+                "Could Not Copy Address",
+                error.to_string(),
+            )
+        }),
+    }
+}
+
 fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
     let Some(session) = state
         .peek()
@@ -102484,6 +102559,7 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
                 let _ = window().toggle_web_surface_devtools(native_id);
             }
         }
+        "web.url.copy" => copy_active_web_page_url(state, &session),
         _ => return false,
     }
     true
@@ -129629,6 +129705,69 @@ mod tests {
                 legacy.chord
             );
         }
+    }
+
+    /// `Ctrl+Shift+C` is the TERMINAL's copy, and this layer borrowing it is
+    /// legal ONLY because every legacy row is `page_only`.
+    ///
+    /// The terminal's copy lives inside the xterm host's own key handler, which
+    /// runs for a focused terminal widget; the claimer stands a `page_only` row
+    /// down unless a VISIBLE surface webview holds the toplevel's focus. So one
+    /// key means copy-the-selection in a terminal and copy-the-address on a
+    /// page, and neither can reach the other.
+    ///
+    /// If a future edit ever makes a legacy row app-wide, THIS is the test that
+    /// should go red — losing terminal copy would be discovered by the user,
+    /// mid-work, with no clue why.
+    #[test]
+    fn the_terminal_copy_chord_is_never_stolen_from_a_terminal() {
+        let borrowed = WEB_PAGE_CHORDS
+            .iter()
+            .find(|chord| chord.chord == "Ctrl+Shift+C")
+            .expect("Ctrl+Shift+C is claimed for copying the page address");
+        assert_eq!(borrowed.id, "web.url.copy");
+        assert!(
+            !borrowed.focus_shell,
+            "copying an address must not take the keyboard off the page"
+        );
+        // The claim table is what the vendored host matches on. EVERY legacy
+        // row must be page_only, and this one most of all.
+        let config = KeymapConfig::default();
+        for claimed in claimed_chords_for(&config) {
+            if WEB_PAGE_CHORDS.iter().any(|row| row.id == claimed.id) {
+                assert!(
+                    claimed.page_only,
+                    "{} is a legacy browser chord but is claimed app-wide — on \
+                     Ctrl+Shift+C that silently costs the user terminal copy",
+                    claimed.id
+                );
+            }
+        }
+    }
+
+    /// The address a copy hands over comes from the PAGE, not the address bar.
+    ///
+    /// The user asked for this by name. `address_draft` is the text sitting in
+    /// the input — possibly half-typed, possibly an unaccepted autocompletion,
+    /// possibly a search phrase that is not a URL. Reading it would put the
+    /// wrong string on the clipboard in exactly the case the user cares about.
+    #[test]
+    fn copying_the_address_reads_the_page_url_and_never_the_typed_draft() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn active_web_page_url(state: &Signal<ShellState>, session: &str)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("shell.rs must define the page-url reader");
+        assert!(
+            body.contains("tab.url"),
+            "the copy must read the engine-observed page url"
+        );
+        assert!(
+            !body.contains("address_draft"),
+            "the copy must NOT read the address bar's draft — that is the bug \
+             the user named when asking for this key"
+        );
     }
 
     /// The page menu's entries and the terminus that serves them are ONE list.

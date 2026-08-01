@@ -127,6 +127,31 @@ When a spec changes (e.g. start page shows all sessions, or CC sessions appear i
 
 Do not introduce behavior that differs based on timing, environment, or ordering that the code does not control. Scan results must be deterministic. Row injection order must be stable. Modified-epoch fallbacks must be explicit. If a function can produce different output for the same input, that is a bug.
 
+### ⛔ Presentation flags are a LAW, not a knob (read before any render/compositing work)
+
+`docs/presentation-policy.md` + `crates/yggterm-core/src/presentation_policy.rs`
+are the SSOT for display backend, GL, frame delivery and video decode, per
+platform. **Never set `GDK_BACKEND`, `LIBGL_ALWAYS_SOFTWARE`,
+`WEBKIT_DISABLE_DMABUF_RENDERER`, `WEBKIT_DISABLE_COMPOSITING_MODE`,
+`YGGTERM_WEB_SURFACE_UNDER_GLASS` or any other `PRESENTATION_VARS` entry against
+the user's running GUI.** Test arms in the sandbox
+(`scripts/underglass-sandbox.sh`), never on their machine.
+
+Two traps that have each cost hours, more than once:
+
+- **A Wayland session runs Wayland-native.** What you learned testing under
+  Xvfb (where `GDK_BACKEND=x11` is correct) does NOT travel to the user's
+  desktop. Restarting their GUI into XWayland changes compositing, input
+  latency and the terminal renderer at once, and every measurement after that
+  describes a machine they do not run.
+- **`/proc/<pid>/environ` cannot answer "what is in force"** — these are applied
+  with `set_var` after exec. Read the `gui/startup/linux_desktop_backend_policy`
+  trace event, which is the decision reporting itself. For "is it XWayland",
+  count X11 sockets in `/proc/<pid>/fd` — an empty `xwininfo` is a blind
+  instrument, not a negative result.
+
+If a default is wrong, change the TABLE and put the measurement in the row.
+
 ### Verify live, not just in code
 
 For any UI change — button color, icon, layout, start page content, sidebar rows — take a live screenshot before and after using `/yggui` (see `.agents/skills/yggui-app-control/SKILL.md`). Do not mark a UI fix done until the live screenshot confirms it. App state and screenshot together are the proof; code review alone is not.
