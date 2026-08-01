@@ -4711,6 +4711,14 @@ struct WebSurfaceOverlayTabView {
     /// The app tab (tabs[0]) has no per-tab close button; closing the app is
     /// the overlay ✕ (real Ctrl+C).
     is_app_tab: bool,
+    /// Whether this tab holds a page the tree would SAVE — from
+    /// [`web_tab_is_saved`], the one owner of that rule.
+    ///
+    /// The app tab is the interesting case: it is the app while it shows the
+    /// app, but once the user navigates it to a real page it is a page like any
+    /// other. The menu needs that distinction and cannot compute it, because it
+    /// never sees the surface's `osc_url`.
+    holds_saved_page: bool,
     effective_url: String,
     active: bool,
     /// The virtual folder it is filed in. The classic tab bar shows only the
@@ -19526,6 +19534,11 @@ impl ShellState {
                 id: tab.id,
                 label: web_surface_tab_label(tab, index),
                 is_app_tab: index == 0,
+                holds_saved_page: web_tab_is_saved(
+                    tab.id,
+                    &tab.effective_url,
+                    &surface.osc_url,
+                ),
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
                 folder: tab.folder.clone(),
@@ -120893,17 +120906,27 @@ fn web_tab_menu_items(
             } else {
                 copy_url
             });
-            // The app tab is the APP, not a page to copy: a duplicate of it
-            // would be an ordinary user tab, and user tabs are persisted — the
-            // menu would mint the stale start-page row `persist_web_tabs`
-            // deliberately refuses to save. Greyed and saying so, like the
-            // other two app-tab verbs.
+            // ⭐ The refusal keys on the PAGE, not on the tab's identity.
+            //
+            // It used to refuse for the whole app tab, and the reason it gave
+            // itself was about persistence: a duplicate would be an ordinary
+            // user tab, and duplicating the app's start page would mint the
+            // stale row `persist_web_tabs` deliberately refuses to save. That
+            // reasoning is right and it is NARROWER than the rule it was
+            // spelled as. Once the user navigates the app tab to a real page —
+            // a YouTube video, say — a duplicate of it is an ordinary tab
+            // pointing at an ordinary URL, which is exactly what the tree
+            // saves. The user hit this and asked why (2026-08-01).
+            //
+            // So it asks `web_tab_is_saved`, the ONE owner of "would the tree
+            // keep this", which is the very rule the old comment was appealing
+            // to. Nothing new is encoded here.
             let duplicate = RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd')
                 .icon(MenuIcon::Duplicate);
-            items.push(if tab.is_app_tab {
-                duplicate.disabled("the app's own tab is the app, not a page to copy")
-            } else {
+            items.push(if tab.holds_saved_page {
                 duplicate
+            } else {
+                duplicate.disabled("this tab is showing the app itself, not a page to copy")
             });
             let split = RowMenuItem::new("webtab-split", "Split with active tab", 's')
                 .icon(MenuIcon::Split);
@@ -172167,9 +172190,61 @@ mod webtabs_menu_switcher_locks {
             .collect()
     }
 
+    /// The app tab is the APP while it is showing the app — and a PAGE once the
+    /// user navigates it somewhere. Duplicate must follow the page, not the id.
+    ///
+    /// The user hit this on a YouTube video open in an ychrome session's app
+    /// tab and asked why the entry was greyed (2026-08-01). The refusal was
+    /// spelled as "is this the app tab", but the reason it gave itself was
+    /// about PERSISTENCE — duplicating the app's start page would mint a row
+    /// `persist_web_tabs` refuses to save. That reason is narrower than the
+    /// rule was, and `web_tab_is_saved` already owns it.
+    #[test]
+    fn the_app_tab_can_be_duplicated_once_it_is_showing_a_real_page() {
+        let app_url = "http://127.0.0.1:7717/";
+        // Showing the app itself: not a page to copy.
+        assert!(!web_tab_is_saved(WEB_TAB_APP_TAB_ID, app_url, app_url));
+        // Navigated to a real page: an ordinary tab pointing at an ordinary
+        // URL, which is exactly what the tree saves.
+        assert!(web_tab_is_saved(
+            WEB_TAB_APP_TAB_ID,
+            "https://www.youtube.com/watch?v=Glc",
+            app_url
+        ));
+
+        let is_disabled = |holds_saved_page: bool| {
+            let mut view = tab(WEB_TAB_APP_TAB_ID, "What is Method Acting", None, true);
+            view.holds_saved_page = holds_saved_page;
+            let items = web_tab_menu_items(
+                &[view],
+                &[],
+                WEB_TAB_APP_TAB_ID,
+                &WebTabMenuTarget::Tab(WEB_TAB_APP_TAB_ID),
+                WebTabMenuPage::Root,
+                0,
+            );
+            items
+                .into_iter()
+                .find(|item| item.id == "webtab-duplicate")
+                .expect("the duplicate entry is always offered")
+                .disabled
+        };
+        assert!(
+            !is_disabled(true),
+            "an app tab showing a real page must be duplicable"
+        );
+        assert!(
+            is_disabled(false),
+            "an app tab showing the app itself must still refuse"
+        );
+    }
+
     fn tab(id: u64, label: &str, folder: Option<&str>, active: bool) -> WebSurfaceOverlayTabView {
         WebSurfaceOverlayTabView {
             id,
+            // A user tab always holds a saved page; the app-tab cases that care
+            // build the view themselves and say so.
+            holds_saved_page: id != WEB_TAB_APP_TAB_ID,
             label: label.to_string(),
             is_app_tab: id == WEB_TAB_APP_TAB_ID,
             effective_url: format!("https://example.com/{id}"),
