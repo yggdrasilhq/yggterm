@@ -10322,6 +10322,10 @@ async fn web_surface_native_reconcile_loop(
     // opened READ-ONLY because another live client held the lock is NOT recorded
     // here (we hold nothing to release), so a later surface re-attempts acquire.
     let mut held_profile_write_locks: std::collections::HashSet<String> = HashSet::new();
+    // Profiles this client has ALREADY told the user it opened without a jar.
+    // Per profile, not per surface: a ten-tab surface degrades ten times and
+    // owes exactly one sentence about it.
+    let mut announced_jarless_profiles: std::collections::HashSet<String> = HashSet::new();
     // The daemon endpoint + this process's pid, for the write-lock round-trips.
     // Stable for the process lifetime, so read once. pid ties the lock to this
     // process so a GUI crash cannot wedge the profile (daemon reclaims a dead
@@ -11127,13 +11131,21 @@ async fn web_surface_native_reconcile_loop(
                     // this profile's jar BEFORE opening a WebContext on it. Two
                     // WebContexts writing one jar corrupt it, so when another live
                     // client (a shadow view, a second GUI) already holds the lock
-                    // this surface opens READ-ONLY (ephemeral, no jar: profile_dir
-                    // None) instead of a second writer. The user's Active GUI
-                    // preempts a Shadow holder (4.1a PreemptedShadow => writable),
-                    // so this read-only path only bites Active-vs-Active — a rare
-                    // second GUI on the same profile — and every shadow that tries
-                    // to write a profile the user holds. Ephemeral profiles keep
-                    // their own in-memory context and need no lock.
+                    // this surface opens with NO JAR instead of as a second
+                    // writer. The user's Active GUI preempts a Shadow holder
+                    // (4.1a PreemptedShadow => writable), so this path only bites
+                    // Active-vs-Active — a rare second GUI on the same profile —
+                    // and every shadow that tries to write a profile the user
+                    // holds. Ephemeral profiles keep their own in-memory context
+                    // and need no lock.
+                    //
+                    // ⛔ This comment used to say "READ-ONLY". It never was:
+                    // `profile_dir: None` is an EPHEMERAL context, which reads
+                    // nothing from the jar as well as writing nothing back. The
+                    // word is now [`WebSurfaceJarMode`]'s, which also says the
+                    // degradation out loud instead of leaving the user to
+                    // discover it as "the login will not stick".
+                    let mut surface_jar_mode = WebSurfaceJarMode::EphemeralByRequest;
                     let surface_profile_dir: Option<std::path::PathBuf> = match &profile_dir {
                         None => None,
                         Some(jar) => {
@@ -11176,15 +11188,39 @@ async fn web_surface_native_reconcile_loop(
                                     json!({
                                         "profile": lock_key,
                                         "writable": writable,
+                                        "jar_mode": WebSurfaceJarMode::decide(true, writable)
+                                            .as_str(),
                                         "session_path": session_path,
                                         "tab_id": tab_id,
                                     }),
                                 );
                                 writable
                             };
+                            surface_jar_mode = WebSurfaceJarMode::decide(true, writable);
+                            // Say it, once per profile. A degradation nobody is
+                            // told about is indistinguishable from a site that
+                            // simply refuses to log you in, which is how this
+                            // one survived as "the login will not stick".
+                            if let Some((title, body)) = surface_jar_mode.notice(&lock_key)
+                                && announced_jarless_profiles.insert(lock_key.clone())
+                            {
+                                let mut writable_state = state;
+                                writable_state.with_mut(|shell| {
+                                    shell.push_notification(
+                                        NotificationTone::Warning,
+                                        title,
+                                        body,
+                                    );
+                                });
+                            }
                             if writable { Some(jar.clone()) } else { None }
                         }
                     };
+                    debug_assert_eq!(
+                        surface_jar_mode.keeps_cookies(),
+                        surface_profile_dir.is_some(),
+                        "the mode and the jar it describes must never disagree"
+                    );
                     // Adblock + userscripts belong to the APP, which serves the
                     // effective policy from its own host. No contribution ⇒ no
                     // policy, and that is right: adblock is browsing config, and
@@ -11808,6 +11844,93 @@ fn web_surface_url_scheme_allowed(url: &str) -> bool {
 fn normalize_web_surface_profile(profile: Option<&str>) -> String {
     yggterm_core::web_profile::normalize_web_profile(profile)
 }
+/// Which jar a web surface actually opened on, once the one-writer-per-profile
+/// rule has had its say.
+///
+/// ⛔ **The bug this names.** The degradation used to be invisible: a surface
+/// whose profile write-lock was held elsewhere was handed `profile_dir: None`,
+/// which is an EPHEMERAL context — it reads nothing from the jar and writes
+/// nothing back — while the code beside it said it opened "READ-ONLY". Those are
+/// not the same thing, and the difference is exactly what a user meets: the
+/// surface starts logged OUT and cannot keep a cookie, including a bot-check
+/// clearance cookie, so a challenged login loops forever with **nothing on
+/// screen explaining it**. Reported against ychrome as "the login will not
+/// stick".
+///
+/// This enum does not fix the jar. It fixes the SILENCE, which is the half that
+/// can be fixed without a design call: the mode is named, traced, and said out
+/// loud once per profile.
+///
+/// ⚠ **Why the other half is not done here, so it is not attempted casually.**
+/// Making the degradation genuinely read-only means giving the surface a
+/// private COPY of the profile's cookies and local storage — WebKitGTK has no
+/// read-only jar mode, and cookies are a Netscape text file, so a copy is
+/// mechanically easy. It is not editorially easy: every shadow surface an agent
+/// opens on a profile the user holds would then duplicate that profile's live
+/// session cookies to a second place on disk. In a browser that carries the
+/// operator's brokerage sessions, spreading cookie jars is a security decision
+/// and belongs to him, not to a bug fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurfaceJarMode {
+    /// The profile's own jar, read and written. What the user expects.
+    Persistent,
+    /// No jar because none was asked for: the reserved ephemeral profile, whose
+    /// whole point is to leave no trace. Not a degradation, and never announced.
+    EphemeralByRequest,
+    /// No jar because another live client holds this profile's write lock. Two
+    /// WebContexts writing one jar corrupt it, so refusing to be the second
+    /// writer is right; opening with NO jar is the part that surprises.
+    NoJarLockHeldElsewhere,
+}
+
+impl WebSurfaceJarMode {
+    /// The ONE decision. Pure, so the rule is testable without a webview.
+    fn decide(has_profile_jar: bool, writable: bool) -> Self {
+        match (has_profile_jar, writable) {
+            (false, _) => Self::EphemeralByRequest,
+            (true, true) => Self::Persistent,
+            (true, false) => Self::NoJarLockHeldElsewhere,
+        }
+    }
+
+    /// The wire/trace name. One spelling, so a trace line and a notice can never
+    /// disagree about which mode a surface opened in.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::EphemeralByRequest => "ephemeral_by_request",
+            Self::NoJarLockHeldElsewhere => "no_jar_lock_held_elsewhere",
+        }
+    }
+
+    /// Does the surface keep the profile's cookies? The field the degradation
+    /// is actually ABOUT, kept separate from the mode name so a future fourth
+    /// mode has to answer it rather than inherit an answer.
+    fn keeps_cookies(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+
+    /// What the user is owed, in their own terms: not "the write lock is held"
+    /// but "you will be logged out and it will not stick". `None` when nothing
+    /// surprising happened.
+    fn notice(self, profile: &str) -> Option<(String, String)> {
+        match self {
+            Self::Persistent | Self::EphemeralByRequest => None,
+            Self::NoJarLockHeldElsewhere => Some((
+                format!("\"{profile}\" opened without its cookies"),
+                format!(
+                    "Another window or client already holds the \"{profile}\" profile, and two \
+                     of them writing one cookie jar corrupts it. This surface therefore opened \
+                     with NO jar: it starts logged out, and anything you sign in to here will \
+                     not be remembered — including the clearance cookie a bot check sets, which \
+                     is why such a login can loop. Close the other holder and reopen the page to \
+                     get the profile back."
+                ),
+            )),
+        }
+    }
+}
+
 /// Reserved profile name for an ephemeral (private-browsing) surface: no jar
 /// on disk, all website data in memory, gone when the surface closes. Owned
 /// here and mirrored by ychrome's picker/standalone handling — a
@@ -59504,6 +59627,20 @@ const WEB_DO_LIVE_FN_JS: &str = "\
 /// same predicate and the same vocabulary the engine plane uses
 /// (`ychrome` `src/engine/js.rs::CLICK_POOL`) — one word per refusal across
 /// both planes is the invariant, not a coincidence.
+///
+/// ⚠ **This changes `fill`/`type`/`key` too, deliberately, and here is the
+/// reasoning so it is not undone by surprise.** One [`WebElementRef`] has ONE
+/// matcher, so a node the click plane will not touch is not addressable by the
+/// typing plane either. That is the right default: a `display:none`,
+/// `visibility:hidden` or `0x0` field is one a human cannot focus or type into,
+/// so a fill that "succeeded" into it was already a lie-of-success — and the
+/// resolver refused `zero_size_element` on the click path for that exact reason
+/// long before this change. The pattern people worry about, a real `<input>`
+/// hidden behind styled OTP boxes, is normally `opacity: 0` with a real rect,
+/// and `__yggLive` deliberately does NOT filter opacity, so it still resolves.
+/// Anything genuinely undisplayable now refuses BY NAME (`no_hittable_match`),
+/// which is recoverable — `web eval` writes a value the DOM will not accept
+/// from a keyboard — rather than silently doing nothing.
 fn web_css_matcher_js(selector: &str, nth: usize) -> String {
     format!(
         "(function(){{var all=document.querySelectorAll({sel});\
@@ -64757,6 +64894,68 @@ mod web_do_verb_tests {
             );
             assert!(popper.starts_with("stale_listbox_only"), "{popper}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // THE JAR A SURFACE ACTUALLY OPENED ON (ychrome: "the login will not
+    // stick", 2026-07-31).
+    //
+    // The one-writer-per-profile rule is right. Handing the loser an
+    // EPHEMERAL context while calling it "read-only" in the comment beside
+    // it was not, and neither was doing it in silence.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_surface_that_lost_the_profile_lock_says_so_once_and_in_the_users_terms() {
+        use WebSurfaceJarMode as Mode;
+
+        // The rule.
+        assert_eq!(Mode::decide(true, true), Mode::Persistent);
+        assert_eq!(Mode::decide(true, false), Mode::NoJarLockHeldElsewhere);
+        assert_eq!(Mode::decide(false, true), Mode::EphemeralByRequest);
+        assert_eq!(
+            Mode::decide(false, false),
+            Mode::EphemeralByRequest,
+            "a profile with no jar was never asking for one — the lock cannot \
+             degrade what does not exist"
+        );
+
+        // The field the degradation is actually about.
+        assert!(Mode::Persistent.keeps_cookies());
+        assert!(
+            !Mode::NoJarLockHeldElsewhere.keeps_cookies(),
+            "this is the whole bug: no jar means no cookies, which is NOT \
+             read-only"
+        );
+        assert!(!Mode::EphemeralByRequest.keeps_cookies());
+
+        // Only the surprising mode speaks, and it speaks about cookies and
+        // logins rather than about write locks.
+        assert!(Mode::Persistent.notice("work").is_none());
+        assert!(
+            Mode::EphemeralByRequest.notice("temp").is_none(),
+            "private browsing leaving no trace is the FEATURE — announcing it \
+             would train the user to dismiss the notice that matters"
+        );
+        let (title, body) = Mode::NoJarLockHeldElsewhere
+            .notice("finance")
+            .expect("the degradation the user meets must be announced");
+        assert!(title.contains("finance"), "{title}");
+        for owed in ["logged out", "not be remembered", "bot check"] {
+            assert!(
+                body.contains(owed),
+                "the notice must name the symptom the user will actually hit \
+                 ({owed}): {body}"
+            );
+        }
+        assert!(
+            body.contains("Close the other holder"),
+            "a notice with no remedy is just an apology: {body}"
+        );
+
+        // One spelling per mode, shared by the trace line and the notice.
+        assert_eq!(Mode::NoJarLockHeldElsewhere.as_str(), "no_jar_lock_held_elsewhere");
+        assert_eq!(Mode::Persistent.as_str(), "persistent");
+        assert_eq!(Mode::EphemeralByRequest.as_str(), "ephemeral_by_request");
     }
 
     // A zero-size match is `zero_size_element` on both planes. It used to be a
