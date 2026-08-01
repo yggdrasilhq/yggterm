@@ -2704,6 +2704,54 @@ fn run_ephemeral_session_reap_pass(
     crate::session_tenancy::ephemeral_session_reap_pass(&mut host)
 }
 
+/// Automation bookkeeping — stamp finished runs, raise overdue notices.
+///
+/// Rides the SAME chore tick as the ephemeral reap, immediately after it, and
+/// takes that pass's outcome as its input: the reaper is the only witness that
+/// can say whether a vanished row went on the idle rule or by a human's hand.
+///
+/// Costs nothing on a machine with no automations — the store is a missing file
+/// and the pass returns immediately.
+///
+/// ⚠ Mixed-daemon caveat, accepted deliberately. The store lives in
+/// `~/.yggterm/` and is shared by every daemon version running against that
+/// home, but `live_session_paths()` only knows THIS daemon's rows. So a run
+/// whose session is owned by an older, still-finessed daemon reads as absent
+/// here and gets stamped closed. The cost of that is bounded and
+/// self-correcting: E1 then declines to reuse it and the next run spawns a
+/// fresh session. The opposite error — never stamping, so a dead session looks
+/// open forever — silently stops the automation from ever spawning again, which
+/// is why the pass errs in this direction rather than the cautious-looking one.
+fn run_automation_bookkeeping_pass(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    home_dir: &Path,
+    reaped: &crate::session_tenancy::EphemeralReapOutcome,
+) -> crate::automation::BookkeepingOutcome {
+    let mut store = match crate::automation::load_store(home_dir) {
+        Ok(store) => store,
+        // A corrupt store is the CLI's problem to report, not a reason for the
+        // daemon to spam its journal every tick.
+        Err(_) => return crate::automation::BookkeepingOutcome::default(),
+    };
+    if store.automations.is_empty() {
+        return crate::automation::BookkeepingOutcome::default();
+    }
+    let live_sessions = {
+        let runtime = lock_daemon_runtime(runtime, "run_automation_bookkeeping_pass");
+        runtime.server.live_session_paths()
+    };
+    let outcome = crate::automation::bookkeeping_pass(
+        &mut store,
+        &live_sessions,
+        &reaped.reaped,
+        crate::current_millis_u64(),
+    );
+    if outcome.did_anything() {
+        let _ = crate::automation::save_store(home_dir, &store);
+    }
+    outcome
+}
+
 /// The journal payload emitted when a `Shadow` request is refused. Factored out
 /// so its shape is unit-testable without a live [`DaemonRuntime`].
 fn shadow_refused_trace_fields(request_name: &str, client_id: Option<&str>) -> serde_json::Value {
@@ -13021,6 +13069,31 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 let reaped = run_ephemeral_session_reap_pass(&runtime);
                 if reaped.did_anything() {
                     mark_daemon_activity(&last_activity_ms);
+                }
+                // Automations, immediately after the reap and on the same tick:
+                // the reaper is the only witness that can say WHY a row went
+                // away, and a run stamped with the wrong reason is worse than
+                // one stamped late.
+                let bookkeeping =
+                    run_automation_bookkeeping_pass(&runtime, &chore_home_dir, &reaped);
+                if bookkeeping.did_anything() {
+                    append_trace_event(
+                        &chore_home_dir,
+                        "daemon",
+                        "chore",
+                        "automation_bookkeeping",
+                        serde_json::json!({
+                            "closed": bookkeeping
+                                .closed
+                                .iter()
+                                .map(|(run_id, reason)| serde_json::json!({
+                                    "run_id": run_id,
+                                    "close_reason": reason,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "overdue_notices_raised": bookkeeping.raised,
+                        }),
+                    );
                 }
                 // Clipboard staging autoclean (docs/pending-bugs.md design):
                 // interval-gated inside, no runtime lock, per-host dir only.

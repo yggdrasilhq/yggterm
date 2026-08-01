@@ -292,12 +292,14 @@ never true.
   with the fingerprint and the hand-edit refusal. Live-proven: systemd accepted
   the generated unit and its own next-fire matched our calendar evaluator to
   the second.
-- **I5 — notices.** ◐ The durable store, the raise-on-spawn-failure path,
-  idempotence-by-run and `dismiss` are done and live-proven. **Still owed: the
-  daemon chore that raises `RunOverdue` at `deadline_secs`, and the stamping of
-  `closed_at_ms` / `close_reason` when the reaper closes a run's row.** Without
-  that second half a completed run stays `is_open()` forever, which makes E1
-  re-prompt a dead session instead of spawning a fresh one.
+- **I5 — notices.** ✅ The durable store, the raise-on-spawn-failure path,
+  idempotence-by-run and `dismiss` are live-proven. The daemon half landed too:
+  `bookkeeping_pass` rides the same chore tick as the ephemeral reap,
+  immediately after it, taking the reaper's outcome as its witness for WHY a row
+  went away. It stamps `closed_at_ms` / `close_reason` on finished runs — the
+  correctness half, without which a completed run stays `is_open()` forever and
+  E1 re-prompts a dead session instead of spawning a fresh one — and raises
+  `RunOverdue` at `deadline_secs` without ever closing anything.
 - **I6 — the GUI**: the Automated group (filtered by the derived predicate) and
   the start-page Automations section with New Automation. Not started.
 - **I7 — launchd renderer.** Not started. Windows deferred to 3.0.0 with the

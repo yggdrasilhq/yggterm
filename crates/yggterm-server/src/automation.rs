@@ -29,6 +29,8 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset, Week
 
 use yggterm_core::SessionKind;
 
+use crate::session_tenancy::EphemeralReapReason;
+
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Default idle-TTL before a run's session is closed by the existing reaper.
@@ -644,6 +646,99 @@ pub struct AutomationNotice {
 }
 
 // ---------------------------------------------------------------------------
+// Bookkeeping — what the daemon chore does between runs
+// ---------------------------------------------------------------------------
+
+/// What one bookkeeping pass changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookkeepingOutcome {
+    /// `(run_id, reason)` for runs whose session went away since last tick.
+    pub closed: Vec<(String, CloseReason)>,
+    /// Run ids that newly raised an overdue notice.
+    pub raised: Vec<String>,
+}
+
+impl BookkeepingOutcome {
+    pub fn did_anything(&self) -> bool {
+        !self.closed.is_empty() || !self.raised.is_empty()
+    }
+}
+
+/// Reconcile the store against the world, once.
+///
+/// Two jobs, and the FIRST one is a correctness fix rather than housekeeping.
+/// Nothing else ever stamps `closed_at_ms`, so without this a finished run stays
+/// `is_open()` forever — and E1 would then re-prompt a session that no longer
+/// exists instead of spawning a fresh one, every fortnight, silently.
+///
+/// `live_sessions` is every session path the daemon currently holds. `reaped`
+/// is what the ephemeral reaper closed on THIS tick, which is the only source
+/// that can distinguish "the TTL closed it" from "the user did" — a row that is
+/// simply absent gets [`CloseReason::User`], because that is the honest reading
+/// of "gone, and not by us".
+///
+/// Pure: `now_ms` is an argument, and the caller supplies the world.
+pub fn bookkeeping_pass(
+    store: &mut AutomationStore,
+    live_sessions: &[String],
+    reaped: &[(String, EphemeralReapReason)],
+    now_ms: u64,
+) -> BookkeepingOutcome {
+    let mut outcome = BookkeepingOutcome::default();
+    let mut overdue: Vec<AutomationNotice> = Vec::new();
+
+    for automation in &mut store.automations {
+        let deadline_secs = automation.deadline_secs;
+        let automation_id = automation.id.clone();
+        for run in &mut automation.runs {
+            if !run.is_open() {
+                continue;
+            }
+            let Some(session_path) = run.session_path.clone() else {
+                continue;
+            };
+            if !live_sessions.iter().any(|live| live == &session_path) {
+                let reason = reaped
+                    .iter()
+                    .find(|(path, _)| path == &session_path)
+                    .map(|(_, why)| match why {
+                        EphemeralReapReason::IdleTtl => CloseReason::EphemeralIdleTtl,
+                        EphemeralReapReason::OwnerGone => CloseReason::EphemeralOwnerGone,
+                    })
+                    .unwrap_or(CloseReason::User);
+                run.closed_at_ms = Some(now_ms);
+                run.close_reason = reason;
+                outcome.closed.push((run.run_id.clone(), reason));
+                continue;
+            }
+            // D2: the deadline NEVER closes. It only ever names the run.
+            if run_has_passed_deadline(run, deadline_secs, now_ms) {
+                overdue.push(AutomationNotice {
+                    run_id: run.run_id.clone(),
+                    automation_id: automation_id.clone(),
+                    kind: NoticeKind::RunOverdue,
+                    raised_at_ms: now_ms,
+                    message: format!(
+                        "still running {}s after it started, past a {deadline_secs}s budget — \
+                         left alone deliberately; close it yourself if it is stuck",
+                        now_ms.saturating_sub(run.started_at_ms) / 1000
+                    ),
+                    session_path: Some(session_path),
+                });
+            }
+        }
+    }
+
+    for notice in overdue {
+        let run_id = notice.run_id.clone();
+        if store.raise_notice(notice) {
+            outcome.raised.push(run_id);
+        }
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -1108,6 +1203,127 @@ mod tests {
         store.upsert(job);
         store.get_mut("infra-upgrade").unwrap().runs[0].closed_at_ms = Some(2_000);
         assert!(!store.session_is_automated("live/jojo/3"));
+    }
+
+    // ---- the bookkeeping pass ----
+
+    fn store_with_open_run(started_at_ms: u64) -> AutomationStore {
+        let mut store = AutomationStore::default();
+        let mut job = fortnightly_infra_job();
+        job.record_run(run_at(started_at_ms, Some("live/jojo/3")));
+        store.upsert(job);
+        store
+    }
+
+    #[test]
+    fn a_reaped_session_stamps_its_run_with_the_reapers_own_reason() {
+        let mut store = store_with_open_run(1_000);
+        let outcome = bookkeeping_pass(
+            &mut store,
+            &[],
+            &[(
+                "live/jojo/3".to_string(),
+                EphemeralReapReason::IdleTtl,
+            )],
+            5_000,
+        );
+        assert_eq!(
+            outcome.closed,
+            vec![("run-1000".to_string(), CloseReason::EphemeralIdleTtl)]
+        );
+        let run = &store.automations[0].runs[0];
+        assert_eq!(run.closed_at_ms, Some(5_000));
+        assert_eq!(run.close_reason, CloseReason::EphemeralIdleTtl);
+    }
+
+    #[test]
+    fn a_session_that_simply_vanished_is_recorded_as_closed_by_the_user() {
+        // "Gone, and not by us" is the honest reading. Claiming the TTL did it
+        // would put a reason in `automation runs` that never happened.
+        let mut store = store_with_open_run(1_000);
+        let outcome = bookkeeping_pass(&mut store, &[], &[], 5_000);
+        assert_eq!(
+            outcome.closed,
+            vec![("run-1000".to_string(), CloseReason::User)]
+        );
+    }
+
+    #[test]
+    fn closing_a_run_is_what_lets_the_next_fortnight_spawn_fresh() {
+        // THE correctness fix. Without this pass a finished run stays open()
+        // forever and E1 re-prompts a session that no longer exists.
+        let mut store = store_with_open_run(1_000);
+        assert!(store.automations[0].open_run().is_some());
+        bookkeeping_pass(&mut store, &[], &[], 5_000);
+        assert!(store.automations[0].open_run().is_none());
+    }
+
+    #[test]
+    fn a_live_session_is_left_entirely_alone() {
+        let mut store = store_with_open_run(1_000);
+        let outcome = bookkeeping_pass(&mut store, &["live/jojo/3".to_string()], &[], 5_000);
+        assert!(!outcome.did_anything());
+        assert!(store.automations[0].runs[0].is_open());
+    }
+
+    #[test]
+    fn an_overdue_run_raises_a_notice_and_is_still_not_closed() {
+        // D2's asymmetry, end to end.
+        let mut store = store_with_open_run(1_000);
+        let past_deadline = 1_000 + DEFAULT_DEADLINE_SECS * 1000 + 1;
+        let outcome = bookkeeping_pass(
+            &mut store,
+            &["live/jojo/3".to_string()],
+            &[],
+            past_deadline,
+        );
+        assert_eq!(outcome.raised, vec!["run-1000".to_string()]);
+        assert!(outcome.closed.is_empty(), "the deadline must never close");
+        assert!(
+            store.automations[0].runs[0].is_open(),
+            "the session is still the user's to deal with"
+        );
+        assert_eq!(store.notices.len(), 1);
+    }
+
+    #[test]
+    fn the_overdue_notice_is_raised_once_however_many_ticks_pass() {
+        let mut store = store_with_open_run(1_000);
+        let past = 1_000 + DEFAULT_DEADLINE_SECS * 1000 + 1;
+        let live = ["live/jojo/3".to_string()];
+        assert_eq!(bookkeeping_pass(&mut store, &live, &[], past).raised.len(), 1);
+        for tick in 1..5 {
+            assert!(
+                bookkeeping_pass(&mut store, &live, &[], past + tick * 60_000)
+                    .raised
+                    .is_empty(),
+                "a notice that re-raises every tick is a counter, not a notice"
+            );
+        }
+        assert_eq!(store.notices.len(), 1);
+    }
+
+    #[test]
+    fn a_run_inside_its_budget_raises_nothing() {
+        let mut store = store_with_open_run(1_000);
+        let outcome = bookkeeping_pass(
+            &mut store,
+            &["live/jojo/3".to_string()],
+            &[],
+            1_000 + DEFAULT_DEADLINE_SECS * 1000 - 1,
+        );
+        assert!(!outcome.did_anything());
+    }
+
+    #[test]
+    fn a_skipped_run_holds_no_session_so_the_pass_ignores_it_entirely() {
+        let mut store = AutomationStore::default();
+        let mut job = fortnightly_infra_job();
+        let mut skipped = run_at(1_000, None);
+        skipped.outcome = RunOutcome::SkippedOutOfGrace;
+        job.record_run(skipped);
+        store.upsert(job);
+        assert!(!bookkeeping_pass(&mut store, &[], &[], 9_999_999).did_anything());
     }
 
     // ---- history, notices, store ----

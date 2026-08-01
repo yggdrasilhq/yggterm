@@ -3992,6 +3992,26 @@ impl YggtermServer {
             .map(|(_resolved_key, session)| session.kind)
     }
 
+    /// EVERY promoted live session path, keep-alive or not.
+    ///
+    /// The twin below filters keep-alive out because it answers a different
+    /// question ("what does closing the GUI window take with it"). The
+    /// automation bookkeeping pass needs the unfiltered set: an automated
+    /// session is keep-alive by construction, so the filtered list would report
+    /// every one of them as gone and stamp every open run closed on the first
+    /// tick.
+    pub fn live_session_paths(&self) -> Vec<String> {
+        self.live_session_order
+            .iter()
+            .filter(|key| {
+                self.sessions
+                    .get(*key)
+                    .is_some_and(|session| managed_session_is_promoted_live_session(key, session))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn non_keep_alive_live_session_paths(&self) -> Vec<String> {
         self.live_session_order
             .iter()
