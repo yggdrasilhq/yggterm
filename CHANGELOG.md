@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **New: the camera and the microphone work in the browser — and a page only
+  gets them when you say so.** Until now a page that called `getUserMedia()` on
+  a yggterm web surface simply **hung**: WebKitGTK raised its
+  `permission-request` signal, nothing in yggterm was listening, and the page's
+  promise was left neither granted nor refused, forever. Video calls, voice
+  notes, camera-based sign-in and QR scanners could not work, and they failed by
+  freezing rather than by saying no.
+  A page now raises a **native prompt** naming the site and exactly which
+  devices it asked for. **Allow**, **Not now** (this once), or **Block this
+  site**. Escape, a click outside, a prompt nobody answers within two minutes,
+  and closing the page all mean *no* — nothing but the Allow button hands over a
+  device, and no keystroke can.
+  Your answer is remembered **per site, per device, by ychrome** — the same
+  place that holds ad blocking and per-site zoom — and every remembered decision
+  is listed in the browser's Settings pane under **Camera & microphone**, naming
+  the site and what it holds, with **Revoke** to take it back. A grant reaches
+  that one site and no other: a sub-domain never inherits it. Device names stay
+  hidden from a page that has not been allowed one, which is the standard
+  privacy rule.
+
 - **The session Web View shows the whole session now — including what the agent
   DID.** It used to show prose only, and for every Claude Code session it showed
   neither: the reader behind it called Codex's parser on whatever file it was

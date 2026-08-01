@@ -792,6 +792,69 @@ user's consent — the human is at the GUI. So a *fourth* thing crosses OSC 7717
   passkey prompt, and the surface returns when the dialog clears. Verify this with
   an `--backend os` capture, not `app screenshot` (which is blind to the surface).
 
+### Hardware capture surface (camera + microphone) — SHIPPED 2026-08-01 (yggterm 2.12.20)
+
+The passkey ceremony's mirror image, and the difference is the direction of first
+travel. A passkey ceremony starts in the APP and travels app→OSC→GUI. A capture
+request starts in the **ENGINE**, which lives in the GUI's own process, so it
+travels engine→GUI→app-over-HTTP→GUI. Same ownership split (**app owns policy,
+GUI owns presence**), so there is deliberately **no OSC verb** here — an app
+never initiates a capture prompt, it only answers "what is remembered for this
+origin".
+
+```text
+page --getUserMedia()--> WebKitGTK --permission-request--> yggterm (engine gate)
+yggterm --GET  <control>/media-permission?origin=&audio=&video=--> app
+                                       { "decision": "allow" | "deny" | "ask" }
+(ask) yggterm --native prompt--> the human
+yggterm --POST <control>/media-permission {origin, camera, microphone}--> app
+```
+
+- **The engine half** is `connect_media_permission_gate` +
+  `apply_media_capture_settings` in vendored `dioxus-desktop/web_surface.rs`
+  (§HARDWARE CAPTURE), per web surface, on BOTH builders (`open` and
+  `build_popup_webview`). ⛔ Never in the vendored wry's global settings path —
+  that also builds the terminal shell's webview, which has no gate on it.
+- **⛔ The gate never allows anything by itself.**
+  `webkit_permission_request_allow` has exactly ONE call site in the file,
+  behind an explicit `allow` argument only a human's click sets, and a lock
+  counts the call sites. Every other permission type (geolocation,
+  notifications, pointer lock, DRM, storage access) gets `false` from the
+  handler so the engine's own default still applies — do NOT widen it.
+- **An unanswered `permission-request` is NOT a deny.** Measured on jojo before
+  this shipped: `getUserMedia()` HUNG for 30 s+ with the promise unsettled, on a
+  build where the setting was untouched and nothing was connected. So every exit
+  must settle the page: Escape, the backdrop, "Not now", a 120 s deadline, and
+  the surface closing all call `deny()`.
+- **Every failure lands on ASK, never on a grant.** No control endpoint, a 404,
+  a timeout, a garbled body, a decision word this build does not know — all of
+  them raise the prompt. The GUI keeps NO memory of its own; a second store
+  would be a second thing that can disagree with the app's settings pane.
+- **`enumerateDevices()` is a SEPARATE engine request type**
+  (`DeviceInfoPermissionRequest`) and NEVER prompts: labels are revealed only to
+  an origin that already holds a capture grant. Blank labels before a grant are
+  the engine's own default — preserve it, do not widen it.
+- **Same stash rule as the passkey dialog.** `TopModal::MediaCapture` is in
+  `top_modal_of` AND in `chrome_transient_over_viewport`, so the prompt stashes
+  the surface in legacy stacking and gets the full-window cover under glass. A
+  new over-viewport modal that joins one list and not the other is invisible or
+  click-through.
+- **App side** (`ychrome/src/webmedia.rs`): allow/deny/ask per device, per
+  ORIGIN, `ask` stored as ABSENCE. ⛔ The match is EXACT — deliberately not
+  `sitehost`'s longest-suffix walk that zoom and identity use, because suffix
+  reach on a capture grant hands the camera to every sub-domain anyone can host.
+- **Rail rows are width-hostile.** The `list-row` gives its ACTIONS their width
+  first and the title takes what is left under `overflow:hidden`. A three-action
+  capture row measured a **0 px title** live — the origin painted nothing. Keep
+  a review-and-revoke row to ONE action and put state in the subtitle.
+- **Trace rows** (`server trace tail`, source `web_surface`):
+  `media_permission_request` (the ask, with `kind`/`audio`/`video`/`uri`),
+  `media_permission_policy` (the app's verdict + normalised origin),
+  `media_permission_retired` (timed out or its surface closed),
+  `media_permission_denied_busy` (a second prompt refused while one is up).
+  **DOM hooks** for a live probe: `[data-media-capture-overlay]`,
+  `-title`, `-origin`, `-allow`, `-decline`, `-block`.
+
 ### The `yggterm-appctl://` bridge — an in-page shim reaching its own app
 
 WebKitGTK blocks an https page from `fetch`-ing `http://127.0.0.1` (mixed
