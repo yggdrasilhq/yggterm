@@ -37,6 +37,12 @@ This file tracks user-visible changes in `yggterm`.
   placing the surface before showing it, so the new size was dropped and the old
   one stuck. The reveal now shows first and places after.
 
+- **Fixed: a search box an app puts in the viewport now appears there.** A
+  document surface rendered only some of the controls an app can declare — a
+  search box, a number field and a toolbar were dropped without a trace, so the
+  app looked like it had never asked for them. yRDP's machine chooser was the
+  one that showed: it had a working filter in the rail and none in the viewport.
+
 ## 2.12.23
 
 - **Fixed: the "Daemon updating" message that would not go away.** It could sit
