@@ -27,6 +27,14 @@ pub mod presentation_policy;
 // with ordinary text tools and the user can read it in yedit. See
 // ychrome/docs/collections.md. The one rule: a collection may never lose a link.
 pub mod web_collection;
+// WHERE those collection files live: `<profile>/collections/<id>.md`, atomic
+// writes, id allocation, and the two rules that make snapshots safe — an
+// identical snapshot is never written, and a COLLECTION is never pruned.
+pub mod web_collection_store;
+// The per-profile `history.jsonl`, read in ONE place. The omnibox, the history
+// viewer and `collection add-from-history` all ask this file the same
+// questions; a second reader is how they would come to disagree.
+pub mod web_history;
 pub mod render_probe;
 mod retention;
 /// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of

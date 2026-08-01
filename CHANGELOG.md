@@ -16,6 +16,28 @@ This file tracks user-visible changes in `yggterm`.
   between; and like a middle-clicked link, it opens in the background rather than
   yanking you to it.
 
+- **New: collections — browsing history you meant to keep.** A collection is a
+  Markdown file in the profile's own jar
+  (`~/.yggterm/web-profiles/<profile>/collections/<id>.md`): frontmatter, your
+  own notes as prose, folders as headings, links as a list. You can read it,
+  edit it in yedit, or hand it to an agent — and the same file is the export,
+  so there is nothing to convert. `yggterm collection --help` prints the whole
+  set: `list`, `show`, `new`, `add`, `add-from-history`, `move`, `rename`,
+  `tag`, `note`, `promote`, `open`, `export`, `prune`, plus `snapshot now`.
+  `add-from-history` reads the very same `history.jsonl` the address bar
+  suggests from, so what you file is what you actually visited, and running it
+  twice adds nothing twice.
+
+- **Snapshots cannot pile up, and a collection is never deleted.** A snapshot
+  identical to the previous one is not written, so a browser left open all day
+  leaves one snapshot rather than twenty-four — sameness is the set of pages,
+  not the file, because two snapshots of the same tabs always differ in their
+  timestamp. Snapshots age out (30 days, 200 per profile, both tunable); a
+  collection is never pruned by anything, at any setting, and `prune` prints
+  the collections it protected so you can see that rather than take it on
+  trust. Promoting a snapshot you want to keep is one verb and changes one
+  line in the file.
+
 ## 2.12.22
 
 - **Fixed: video judder in the browser.** A YouTube video lurching and dropping
