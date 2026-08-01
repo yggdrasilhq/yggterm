@@ -226,8 +226,9 @@ use yggui::{
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
     ROW_DRAG_CLICK_SUPPRESS_MS, RailHeader, RailScrollBody, RailSectionTitle, RowDragGesture,
     RowDropTarget, RowTreeDrop, RowTreeRow,
-    SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
-    ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
+    SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastAnchor,
+    ToastCard, ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone,
+    ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
     chrome_material_tint, clamp_theme_spec, default_theme_editor_spec, dominant_accent,
@@ -15672,6 +15673,77 @@ fn active_session_offers_view_toggle(snapshot: &RenderSnapshot) -> bool {
     snapshot
         .active_session_kind
         .is_some_and(SessionKind::offers_rendered_view)
+}
+/// What the titlebar's ONE surface-switch slot is showing.
+///
+/// The slot (`.yggterm-titlebar-view-toggle`) is the single home of "what is
+/// this session's viewport showing". It used to answer only for agent CLIs, so
+/// a libyggterm app's document surface grew its OWN Document|Terminal pill —
+/// two of them, in fact, both `position:absolute` over a viewport that had
+/// reserved no space for them, so the pill drew straight over the first line of
+/// the document it was meant to control. There is now one switch, in the slot
+/// that already existed for exactly this question.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TitlebarSurfaceSwitch {
+    /// Nothing to switch. The slot keeps its footprint so the rest of the
+    /// titlebar does not shuffle, but it is hidden and inert.
+    None,
+    /// An agent CLI's rendered view ↔ its terminal. No payload: which segment
+    /// is active is `active_view_mode`, and a copy here could only disagree
+    /// with it.
+    Rendered,
+    /// A libyggterm app's document surface ↔ the terminal the app runs in.
+    Document { document_visible: bool },
+}
+/// Decide which switch the titlebar slot shows for the active session.
+///
+/// A declared document surface WINS over the rendered-view toggle: the session
+/// is a shell hosting an app, and the app's surface is the thing in the
+/// viewport. `SessionKind` deliberately declines to answer this — see
+/// `SessionKind::offers_rendered_view`, whose test says in as many words that
+/// "an app that declares a viewport pane is the caller's question, not the
+/// kind's". This is that caller.
+fn titlebar_surface_switch(snapshot: &RenderSnapshot) -> TitlebarSurfaceSwitch {
+    if let Some(surface) = snapshot
+        .active_session_path
+        .as_deref()
+        .and_then(|path| snapshot.document_surfaces.get(path))
+    {
+        return TitlebarSurfaceSwitch::Document {
+            document_visible: surface.pane.visible,
+        };
+    }
+    if active_session_offers_view_toggle(snapshot) {
+        return TitlebarSurfaceSwitch::Rendered;
+    }
+    TitlebarSurfaceSwitch::None
+}
+/// Where toasts land — decided by the viewport they would cover.
+///
+/// DESIGN.md's default is "horizontally centered near the top", and that is
+/// right over a terminal, where the prompt and the newest output live at the
+/// BOTTOM. Over a document the top of the viewport is the title and the first
+/// line the user is reading, so the stack moves to the far bottom corner —
+/// the corner on the rail's edge, because the mirror moves everything
+/// directional with its edge.
+///
+/// Narrow on purpose: only a VISIBLE document surface moves the toasts. A web
+/// surface keeps the top-centre anchor (it already has the
+/// `data-covers-web-surface` input-hole machinery built around that position),
+/// and so does the start page.
+fn toast_anchor(snapshot: &RenderSnapshot) -> ToastAnchor {
+    let document_owns_viewport = snapshot
+        .active_session_path
+        .as_deref()
+        .and_then(|path| snapshot.document_surfaces.get(path))
+        .is_some_and(|surface| surface.pane.visible);
+    if !document_owns_viewport {
+        return ToastAnchor::TopCenter;
+    }
+    match snapshot.settings.chrome_orientation.edge(ChromeSlot::Rail) {
+        SidebarEdge::Left => ToastAnchor::BottomLeft,
+        SidebarEdge::Right => ToastAnchor::BottomRight,
+    }
 }
 fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
     if session.kind == SessionKind::Document {
@@ -52054,6 +52126,26 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
             const previewWindow = previewScroller?.querySelector('[data-preview-window-start]') || null;
             const documentEditors = Array.from(document.querySelectorAll('[data-document-editor="1"]'));
             const documentBodies = Array.from(document.querySelectorAll('[data-document-editor-body="1"]'));
+            // The wrap gutter's own verdict on itself. `status` is stamped by
+            // DOCUMENT_WRAP_GUTTER_SCRIPT after every rebuild: "ok" (the block
+            // heights sum to the textarea's content height), "unverified" (the
+            // document fits the box, so scrollHeight cannot confirm a total), or
+            // "drift" (they disagree — the numbers are deliberately NOT drawn).
+            // Anything but "ok"/"unverified" on a scrolling editor is a bug.
+            const documentWrapGutters = Array.from(document.querySelectorAll('[data-document-wrap-gutter]')).map((node) => {
+                let detail = null;
+                try {
+                    detail = JSON.parse(node.getAttribute('data-document-wrap-gutter-detail') || 'null');
+                } catch (_e) {
+                    detail = null;
+                }
+                return {
+                    widget_id: String(node.getAttribute('data-document-wrap-gutter') || ''),
+                    status: String(node.getAttribute('data-document-wrap-gutter-status') || ''),
+                    entry_count: node.firstElementChild ? node.firstElementChild.children.length : 0,
+                    detail: detail,
+                };
+            });
             const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
             const rootNode =
                 previewScroller?.closest('#yggterm-shell-root')
@@ -53984,6 +54076,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 window_inner_height: window.innerHeight,
                 document_editor_count: documentEditors.length,
                 document_body_sample: String(documentBodies[0]?.value || "").slice(0, 240),
+                document_wrap_gutters: documentWrapGutters,
                 shell_root_count: shellRoots.length,
                 shell_roots: shellRootDetails,
                 sidebar_count: sidebars.length,
@@ -79142,6 +79235,18 @@ fn app() -> Element {
                             },
                             on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                             on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
+                            on_set_document_surface_visible: move |(path, visible): (String, bool)| {
+                                state.with_mut(|shell| {
+                                    // `document_surface_hidden` is the SSOT for the
+                                    // user's toggle; the pane's own `visible` is a
+                                    // derivation of it (`document_surface_visible_for`).
+                                    if visible {
+                                        shell.document_surface_hidden.remove(&path);
+                                    } else {
+                                        shell.document_surface_hidden.insert(path);
+                                    }
+                                });
+                            },
                             on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
                             on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
                             on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
@@ -80040,7 +80145,7 @@ fn app() -> Element {
                                 accent: snapshot.palette.accent,
                                 is_dark: palette_is_dark(snapshot.palette),
                             },
-                        center_offset: toast_center_offset(&snapshot.right_panel_mode),
+                        anchor: toast_anchor(&snapshot),
                         max_age_ms: TOAST_VIEWPORT_MAX_AGE_MS,
                         max_visible: TOAST_VIEWPORT_MAX_VISIBLE,
                         now_ms: current_millis(),
@@ -80093,6 +80198,12 @@ fn Titlebar(
     on_next_search_content: EventHandler<()>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
+    /// Show (`true`) or hide (`false`) a session's document surface. The other
+    /// half of the surface-switch slot — see [`TitlebarSurfaceSwitch`]. The
+    /// SESSION rides along rather than being re-derived at the far end: the
+    /// slot was drawn for one particular path, and a second derivation is a
+    /// second chance to pick a different one.
+    on_set_document_surface_visible: EventHandler<(String, bool)>,
     on_toggle_session_menu: EventHandler<()>,
     on_toggle_new_menu: EventHandler<()>,
     on_toggle_overflow_menu: EventHandler<()>,
@@ -80278,6 +80389,14 @@ fn Titlebar(
     let orientation = snapshot.settings.chrome_orientation;
     let tree_edge = orientation.edge(ChromeSlot::Tree);
     let rail_edge = orientation.edge(ChromeSlot::Rail);
+    // The ONE surface switch. Asked once, here, so the slot and the probe stamp
+    // cannot disagree about what it is showing.
+    let surface_switch = titlebar_surface_switch(&snapshot);
+    let surface_switch_kind = match surface_switch {
+        TitlebarSurfaceSwitch::None => "none",
+        TitlebarSurfaceSwitch::Rendered => "rendered",
+        TitlebarSurfaceSwitch::Document { .. } => "document",
+    };
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
@@ -80314,51 +80433,119 @@ fn Titlebar(
                     }
                     div {
                         class: "yggterm-titlebar-view-toggle",
-                        // Keep the toggle's footprint even when it does not apply
-                        // (non-agent sessions) so the other titlebar elements hold
-                        // their usual position — hidden + non-interactive, not
-                        // removed. Only agent CLIs (Codex/Claude Code) act on it.
+                        // THE surface switch — one slot, for every kind of
+                        // second surface a session can have. Its footprint is
+                        // kept even when nothing applies so the rest of the
+                        // titlebar holds position: hidden + inert, not removed.
+                        //
+                        // ⚠ Both arms of the visibility branch emit BOTH keys.
+                        // Dioxus applies a style string property-by-property and
+                        // never clears a key a later render stops emitting, so
+                        // an empty arm would leave `visibility:hidden` latched
+                        // the first time a session stopped offering a switch.
+                        "data-titlebar-surface-switch": surface_switch_kind,
                         style: format!(
                             "{}{}",
                             segmented_control_track_style(snapshot.palette),
-                            if active_session_offers_view_toggle(&snapshot) {
-                                ""
-                            } else {
+                            if surface_switch == TitlebarSurfaceSwitch::None {
                                 " visibility:hidden; pointer-events:none;"
+                            } else {
+                                " visibility:visible; pointer-events:auto;"
                             },
                         ),
                         onmousedown: |evt| evt.stop_propagation(),
-                        button {
-                            style: segmented_control_segment_style(
-                                snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Rendered,
-                                false,
-                                true,
-                            ),
-                            ondoubleclick: |evt| evt.stop_propagation(),
-                            onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
-                            span {
-                                "data-keytip-node": keytip_node_id("view.web"),
-                                "data-keytip-tip": keytip_tip_attr(&snapshot, "view.web"),
-                                style: "display:none;",
+                        if let (TitlebarSurfaceSwitch::Document { document_visible }, Some(switch_path)) =
+                            (surface_switch, snapshot.active_session_path.clone())
+                        {
+                            // A libyggterm app's document surface. The app cannot
+                            // draw this switch itself — half of its job is to
+                            // bring back a surface the app is not rendering.
+                            button {
+                                class: "yggterm-titlebar-view-toggle-segment",
+                                "data-titlebar-surface-switch-segment": "document",
+                                style: segmented_control_segment_style(
+                                    snapshot.palette,
+                                    document_visible,
+                                    false,
+                                    true,
+                                ),
+                                title: if document_visible {
+                                    "The app's document view (you are here)"
+                                } else {
+                                    "Show the app's document view"
+                                },
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                onclick: {
+                                    let switch_path = switch_path.clone();
+                                    move |_| {
+                                        on_set_document_surface_visible
+                                            .call((switch_path.clone(), true))
+                                    }
+                                },
+                                "📄\u{fe0e} Document"
                             }
-                            "Web View"
-                        }
-                        button {
-                            style: segmented_control_segment_style(
-                                snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Terminal,
-                                false,
-                                true,
-                            ),
-                            ondoubleclick: |evt| evt.stop_propagation(),
-                            onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
-                            span {
-                                "data-keytip-node": keytip_node_id("view.terminal"),
-                                "data-keytip-tip": keytip_tip_attr(&snapshot, "view.terminal"),
-                                style: "display:none;",
+                            button {
+                                class: "yggterm-titlebar-view-toggle-segment",
+                                "data-titlebar-surface-switch-segment": "terminal",
+                                style: segmented_control_segment_style(
+                                    snapshot.palette,
+                                    !document_visible,
+                                    false,
+                                    true,
+                                ),
+                                title: if document_visible {
+                                    "Show the terminal (the app keeps running)"
+                                } else {
+                                    "Showing the terminal (the app keeps running)"
+                                },
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                onclick: {
+                                    let switch_path = switch_path.clone();
+                                    move |_| {
+                                        on_set_document_surface_visible
+                                            .call((switch_path.clone(), false))
+                                    }
+                                },
+                                "⌨\u{fe0e} Terminal"
                             }
-                            "Terminal"
+                        } else {
+                            // An agent CLI's rendered transcript ↔ its PTY.
+                            button {
+                                class: "yggterm-titlebar-view-toggle-segment",
+                                "data-titlebar-surface-switch-segment": "rendered",
+                                style: segmented_control_segment_style(
+                                    snapshot.palette,
+                                    snapshot.active_view_mode == WorkspaceViewMode::Rendered,
+                                    false,
+                                    true,
+                                ),
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
+                                span {
+                                    "data-keytip-node": keytip_node_id("view.web"),
+                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "view.web"),
+                                    style: "display:none;",
+                                }
+                                "Web View"
+                            }
+                            button {
+                                class: "yggterm-titlebar-view-toggle-segment",
+                                "data-titlebar-surface-switch-segment": "terminal",
+                                style: segmented_control_segment_style(
+                                    snapshot.palette,
+                                    snapshot.active_view_mode == WorkspaceViewMode::Terminal,
+                                    false,
+                                    true,
+                                ),
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
+                                span {
+                                    "data-keytip-node": keytip_node_id("view.terminal"),
+                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "view.terminal"),
+                                    style: "display:none;",
+                                }
+                                "Terminal"
+                            }
                         }
                     }
                     div {
@@ -85065,40 +85252,13 @@ fn MainSurface(
                             state,
                             session_path: session.session_path.clone(),
                         }
-                    } else if snapshot.document_surfaces.contains_key(&session.session_path) {
-                        // Hidden by the user's toggle. Mirror the document
-                        // surface's OWN segmented control (Terminal active,
-                        // Document the clickable way back) so the switch is the
-                        // SAME control in both states — never degrading to a lone
-                        // button. The app cannot draw this: its surface is
-                        // exactly what is hidden.
-                        div {
-                            style: format!(
-                                "position:absolute; top:10px; right:16px; z-index:30; opacity:0.9; {}",
-                                segmented_control_track_style(snapshot.palette)
-                            ),
-                            button {
-                                "data-document-show-toggle": "1",
-                                style: segmented_control_segment_style(snapshot.palette, false, false, false),
-                                title: "Show the app's document view",
-                                onclick: {
-                                    let mut state = state;
-                                    let session_path = session.session_path.clone();
-                                    move |_| {
-                                        state.with_mut(|shell| {
-                                            shell.document_surface_hidden.remove(&session_path);
-                                        });
-                                    }
-                                },
-                                "📄\u{fe0e} Document"
-                            }
-                            button {
-                                style: segmented_control_segment_style(snapshot.palette, true, false, false),
-                                title: "Showing the terminal (the app keeps running)",
-                                "⌨\u{fe0e} Terminal"
-                            }
-                        }
                     }
+                    // The way BACK from a hidden document surface is the
+                    // titlebar's surface-switch slot (`TitlebarSurfaceSwitch`),
+                    // not a pill floating over the terminal. There used to be
+                    // one here and a second over the document itself: two
+                    // copies of one control, each drawn over a viewport that
+                    // had reserved no space for it.
                 }
             }
         }
@@ -113728,45 +113888,96 @@ fn context_menu_policy_script() -> String {
 /// A textarea does not expose where its soft-wrap breaks each logical line, so a
 /// static `1\n2\n3` gutter desyncs the moment a line wraps — which is why the
 /// gutter used to be suppressed in wrap mode. This installs a JS maintainer that
-/// measures each logical line's visual-row count in a hidden mirror div (same
-/// content width, font, padding and wrap rules as the textarea, so it wraps
-/// identically), then renders the gutter one entry PER VISUAL ROW: the line
-/// number on a line's first row, a continuation arrow (↪) on each wrapped row —
-/// exactly like KDE Kate. The gutter's inner block is translated by the
-/// textarea's scrollTop so it tracks the text as it scrolls.
+/// measures each logical line in a hidden mirror div (same content width, font,
+/// padding and wrap rules as the textarea, so it wraps identically) and emits
+/// **one gutter block per LOGICAL line, at that line's measured height**: the
+/// line number on the block's first row, a continuation arrow (↪) on each
+/// wrapped row — exactly like KDE Kate. The gutter's inner block is translated
+/// by the textarea's scrollTop so it tracks the text as it scrolls.
+///
+/// ## Why one block per LOGICAL line, and not one per visual row
+///
+/// The first version took a single fractional `getComputedStyle(…).lineHeight`
+/// and used it for BOTH the height of every entry AND the row count
+/// (`round(offsetHeight / lineHeight)`). Every entry then carried the same
+/// rounding error, and because the entries stack, that error ACCUMULATED: at
+/// 13.5px/1.55 the line box is 20.925px, so a gutter drawn at a rounded 21px
+/// has slipped a whole row by line 300. Far enough down a file, the number
+/// beside a line was simply not that line's number.
+///
+/// The fix is to stop deriving geometry from a number and to carry the
+/// MEASUREMENT instead. Each block is exactly as tall as the mirror says its
+/// logical line is, so consecutive blocks cannot drift; the per-row division
+/// survives only INSIDE a block, where the worst case is one stray arrow on one
+/// line and nothing below it moves. Heights come from
+/// `getBoundingClientRect().height`, not `offsetHeight`, because `offsetHeight`
+/// is rounded to whole pixels — per-line rounding is this same bug in miniature.
+///
+/// ## The gutter checks itself
+///
+/// A silently-wrong gutter is worse than an absent one, so the sum of the block
+/// heights is compared against the textarea's own content height (`scrollHeight`
+/// minus its vertical padding). On a mismatch the numbers are NOT drawn and
+/// `data-document-wrap-gutter-status="drift"` is stamped on the gutter, with the
+/// arithmetic in `data-document-wrap-gutter-detail` — which `server app state`
+/// reports as `document_wrap_gutters`.
 ///
 /// Idempotent and self-reinstalling: the mount hook re-runs `syncAll()`, hooks
 /// each textarea once (input/scroll/resize), and rebuilds on every change.
 const DOCUMENT_WRAP_GUTTER_SCRIPT: &str = r#"
 (() => {
   const ARROW = "↪";
-  const MAX_LINES = 6000; // beyond this, fall back to plain numbers (no per-line measure)
-  function lineH(ta) {
-    const lh = parseFloat(getComputedStyle(ta).lineHeight);
-    return (isFinite(lh) && lh > 0) ? lh : 18;
+  // Beyond this the per-line measure is skipped (it is O(lines) of layout) and
+  // every logical line is ASSUMED to be one visual row. That assumption is not
+  // trusted: the self-check below compares the total against the textarea and
+  // drops the numbers the moment any line actually wrapped.
+  const MAX_MEASURED_LINES = 6000;
+  // `scrollHeight` is an integer rounded from a fractional layout, so exact
+  // equality with a fractional sum is not on offer. One pixel of slack sits two
+  // orders of magnitude below what is being guarded against — a whole line box.
+  const SUM_TOLERANCE_PX = 1.5;
+  function px(value) {
+    const parsed = parseFloat(value);
+    return isFinite(parsed) ? parsed : 0;
+  }
+  function lineHeightPx(cs) {
+    const lh = parseFloat(cs.lineHeight);
+    if (isFinite(lh) && lh > 0) return lh;
+    const fs = parseFloat(cs.fontSize);
+    return (isFinite(fs) && fs > 0) ? fs * 1.2 : 18;
+  }
+  function round2(value) {
+    return Math.round(value * 100) / 100;
   }
   function mirrorFor(ta) {
     let m = ta.__yggMirror;
     if (m && m.isConnected) return m;
     m = document.createElement("div");
     m.setAttribute("aria-hidden", "true");
-    m.style.cssText = "position:absolute; top:0; left:-99999px; visibility:hidden; pointer-events:none; margin:0; border:0;";
+    m.style.cssText = "position:absolute; top:0; left:-99999px; visibility:hidden; pointer-events:none; margin:0; border:0; padding:0; box-sizing:content-box;";
     document.body.appendChild(m);
     ta.__yggMirror = m;
     return m;
   }
-  function visualRows(ta) {
-    const cs = getComputedStyle(ta);
-    const contentWidth = ta.clientWidth - parseFloat(cs.paddingLeft || "0") - parseFloat(cs.paddingRight || "0");
+  // The height of EVERY logical line, measured where the line actually wraps.
+  function measureLineHeights(ta, cs) {
+    const contentWidth = ta.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight);
     if (!(contentWidth > 0)) return null;
     const lines = ta.value.split("\n");
-    if (lines.length > MAX_LINES) return lines.map(() => 1);
+    if (lines.length > MAX_MEASURED_LINES) {
+      const lh = lineHeightPx(cs);
+      return { heights: lines.map(() => lh), measured: false };
+    }
     const m = mirrorFor(ta);
     m.style.width = contentWidth + "px";
     m.style.fontFamily = cs.fontFamily;
     m.style.fontSize = cs.fontSize;
+    m.style.fontWeight = cs.fontWeight;
+    m.style.fontStyle = cs.fontStyle;
     m.style.lineHeight = cs.lineHeight;
     m.style.letterSpacing = cs.letterSpacing;
+    m.style.wordSpacing = cs.wordSpacing;
+    m.style.textIndent = cs.textIndent;
     m.style.tabSize = cs.tabSize;
     m.style.whiteSpace = "pre-wrap";
     m.style.overflowWrap = "anywhere";
@@ -113777,42 +113988,106 @@ const DOCUMENT_WRAP_GUTTER_SCRIPT: &str = r#"
       const d = document.createElement("div");
       d.style.whiteSpace = "pre-wrap";
       d.style.overflowWrap = "anywhere";
+      d.style.margin = "0";
+      d.style.padding = "0";
+      d.style.border = "0";
       // an empty logical line still occupies one visual row
-      d.textContent = line.length ? line : " ";
+      d.textContent = line.length ? line : " ";
       m.appendChild(d);
       kids.push(d);
     }
-    const lh = lineH(ta);
-    return kids.map((d) => Math.max(1, Math.round(d.offsetHeight / lh)));
+    // getBoundingClientRect, NOT offsetHeight: the latter rounds to whole pixels
+    // and a per-line rounding error is exactly the drift being fixed here.
+    return { heights: kids.map((d) => d.getBoundingClientRect().height), measured: true };
   }
   function gutterFor(ta) {
     const parent = ta.parentElement;
     if (!parent) return null;
     return parent.querySelector("[data-document-wrap-gutter]");
   }
+  function stamp(gutter, status, detail) {
+    gutter.setAttribute("data-document-wrap-gutter-status", status);
+    try {
+      gutter.setAttribute("data-document-wrap-gutter-detail", JSON.stringify(detail));
+    } catch (_e) {}
+  }
+  // Does the measured total agree with the textarea's own layout?
+  //   "ok"         - it does, and the textarea was scrolling, so it could say.
+  //   "unverified" - the content fits the box, so scrollHeight is clamped to the
+  //                  padding box and cannot confirm a total. Nothing contradicts
+  //                  the measurement, so numbers are drawn; the field says the
+  //                  check did not run rather than implying that it did.
+  //   "drift"      - they disagree. Numbers are withheld.
+  function verify(ta, cs, sum) {
+    const padTop = px(cs.paddingTop);
+    const padBottom = px(cs.paddingBottom);
+    const scrollHeight = ta.scrollHeight;
+    const clientHeight = ta.clientHeight;
+    const delta = (sum + padTop + padBottom) - scrollHeight;
+    let status;
+    if (scrollHeight > clientHeight) {
+      status = Math.abs(delta) <= SUM_TOLERANCE_PX ? "ok" : "drift";
+    } else if (delta > SUM_TOLERANCE_PX) {
+      // Claiming more content than a box that is NOT scrolling can hold.
+      status = "drift";
+    } else {
+      status = "unverified";
+    }
+    return {
+      status,
+      detail: {
+        sum: round2(sum),
+        scroll_height: scrollHeight,
+        client_height: clientHeight,
+        padding: round2(padTop + padBottom),
+        delta: round2(delta),
+      },
+    };
+  }
   function rebuild(ta) {
     const gutter = gutterFor(ta);
     if (!gutter) return;
     // An invisible editor has no layout to measure — its mirror reads 0 width.
     if (ta.offsetParent === null && ta.clientWidth === 0) return;
-    // Skip when nothing that affects wrapping changed (value or width). The
-    // body MutationObserver fires on unrelated churn — terminal streaming — so
-    // this guard is what keeps that from re-measuring a large doc every tick.
-    const sig = ta.value.length + ":" + ta.value + ":" + ta.clientWidth;
+    const cs = getComputedStyle(ta);
+    // Skip when nothing that affects wrapping changed (value, width or metrics).
+    // The body MutationObserver fires on unrelated churn — terminal streaming —
+    // so this guard is what keeps that from re-measuring a large doc every tick.
+    const sig = ta.value.length + ":" + ta.value + ":" + ta.clientWidth + ":" + cs.fontSize + ":" + cs.lineHeight;
     if (sig === ta.__yggGutterSig) return;
-    const rows = visualRows(ta);
-    if (!rows) return;
+    const measurement = measureLineHeights(ta, cs);
+    if (!measurement) return;
     ta.__yggGutterSig = sig;
-    const lh = lineH(ta);
-    let html = "";
-    for (let i = 0; i < rows.length; i++) {
-      html += '<div style="height:' + lh + 'px;line-height:' + lh + 'px;">' + (i + 1) + "</div>";
-      for (let k = 1; k < rows[i]; k++) {
-        html += '<div style="height:' + lh + 'px;line-height:' + lh + 'px;opacity:0.45;">' + ARROW + "</div>";
-      }
-    }
+    const heights = measurement.heights;
     let inner = gutter.firstElementChild;
     if (!inner) { inner = document.createElement("div"); gutter.appendChild(inner); }
+    let sum = 0;
+    for (let i = 0; i < heights.length; i++) sum += heights[i];
+    const checked = verify(ta, cs, sum);
+    checked.detail.lines = heights.length;
+    checked.detail.measured = measurement.measured;
+    stamp(gutter, checked.status, checked.detail);
+    if (checked.status === "drift") {
+      // A silently-wrong gutter is worse than an absent one.
+      inner.innerHTML = "";
+      inner.style.transform = "translateY(0px)";
+      return;
+    }
+    const lh = lineHeightPx(cs);
+    let html = "";
+    for (let i = 0; i < heights.length; i++) {
+      const height = heights[i];
+      // The BLOCK owns this logical line's exact height, so nothing below it can
+      // shift. The row count inside it is cosmetic — how many arrows the line
+      // gets — and a rounding error there cannot escape this block.
+      const rows = Math.max(1, Math.round(height / lh));
+      html += '<div style="height:' + height + 'px;overflow:hidden;">';
+      html += '<div style="line-height:' + lh + 'px;">' + (i + 1) + "</div>";
+      for (let k = 1; k < rows; k++) {
+        html += '<div style="line-height:' + lh + 'px;opacity:0.45;">' + ARROW + "</div>";
+      }
+      html += "</div>";
+    }
     inner.innerHTML = html;
     inner.style.transform = "translateY(" + (-ta.scrollTop) + "px)";
   }
@@ -113860,6 +114135,307 @@ const DOCUMENT_WRAP_GUTTER_SCRIPT: &str = r#"
   }
 })();
 "#;
+
+
+#[cfg(test)]
+mod yedit_gutter_and_surface_switch_tests {
+    use super::*;
+
+    /// The PRODUCT half of this file — test modules stripped, so a scan cannot
+    /// be satisfied by the needle its own assertion spells.
+    fn product_source() -> String {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !product.contains("mod yedit_gutter_and_surface_switch_tests"),
+            "the scan is reading this test module"
+        );
+        product
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // THE GUTTER
+    //
+    // The maintainer is JS running in the webview, so these lock the SHAPE of
+    // the arithmetic. What they cannot do is prove a pixel: the live proof is a
+    // long wrapped document in yedit, plus `document_wrap_gutters[].status`,
+    // which is exactly why the self-check exists.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// THE DEFECT: one fractional `lineHeight` sized every entry AND counted the
+    /// rows, so each entry carried the same rounding error and the errors
+    /// stacked — a whole row lost by line 300. Geometry must come from the
+    /// measurement, one block per LOGICAL line.
+    #[test]
+    fn the_wrap_gutter_sizes_each_block_from_the_measured_line_not_a_line_height() {
+        let script = DOCUMENT_WRAP_GUTTER_SCRIPT;
+        assert!(
+            script.contains("kids.map((d) => d.getBoundingClientRect().height)"),
+            "line heights must be MEASURED; offsetHeight rounds to whole pixels and \
+             per-line rounding is the drift being fixed"
+        );
+        assert!(
+            !script.contains(".offsetHeight"),
+            "offsetHeight is integer-rounded — it cannot carry a fractional line box"
+        );
+        assert!(
+            script.contains(r#"html += '<div style="height:' + height + 'px;overflow:hidden;">';"#),
+            "one block per logical line, at that line's measured height"
+        );
+        assert!(
+            !script.contains("'px;line-height:' + lh"),
+            "an entry sized by the computed line-height is the accumulating bug"
+        );
+        assert!(
+            !script.contains("Math.round(d.offsetHeight / lh)"),
+            "the row count must never decide an entry's HEIGHT"
+        );
+    }
+
+    /// The row count survives only INSIDE a block, where the worst case is a
+    /// stray arrow on one line and nothing below it moves.
+    #[test]
+    fn the_wrap_gutter_divides_only_inside_a_block() {
+        let script = DOCUMENT_WRAP_GUTTER_SCRIPT;
+        let block_open = script
+            .find(r#"html += '<div style="height:' + height + 'px;overflow:hidden;">';"#)
+            .expect("the per-line block");
+        let division = script
+            .find("Math.max(1, Math.round(height / lh))")
+            .expect("the cosmetic row count");
+        assert!(
+            division < block_open,
+            "the division decides how many ARROWS a block holds, never where the \
+             next block starts"
+        );
+    }
+
+    /// A silently-wrong gutter is worse than an absent one.
+    #[test]
+    fn the_wrap_gutter_withholds_numbers_it_cannot_verify() {
+        let script = DOCUMENT_WRAP_GUTTER_SCRIPT;
+        assert!(
+            script.contains("const delta = (sum + padTop + padBottom) - scrollHeight;"),
+            "the sum of the blocks must be checked against the textarea's own \
+             content height"
+        );
+        let drift = script
+            .find(r#"if (checked.status === "drift") {"#)
+            .expect("the drift branch");
+        let tail = &script[drift..];
+        assert!(
+            tail.starts_with(
+                &format!(
+                    "{}\n      // A silently-wrong gutter is worse than an absent one.\n      inner.innerHTML = \"\";",
+                    r#"if (checked.status === "drift") {"#
+                )
+            ),
+            "on a mismatch the numbers come OFF; drawing wrong ones is the failure \
+             this check exists to prevent"
+        );
+        assert!(
+            script.contains(r#"gutter.setAttribute("data-document-wrap-gutter-status", status);"#),
+            "the verdict must be observable, not merely visible"
+        );
+    }
+
+    /// Three verdicts, and `unverified` is not `ok`: a document that fits its box
+    /// clamps `scrollHeight` to the padding box, so the check genuinely did not
+    /// run and must not claim it did.
+    #[test]
+    fn the_wrap_gutter_names_the_case_where_it_could_not_check() {
+        let script = DOCUMENT_WRAP_GUTTER_SCRIPT;
+        for verdict in [r#""ok""#, r#""unverified""#, r#""drift""#] {
+            assert!(
+                script.contains(verdict),
+                "the self-check must be able to report {verdict}"
+            );
+        }
+        assert!(
+            script.contains("if (scrollHeight > clientHeight) {"),
+            "the strict comparison is only available while the editor is scrolling"
+        );
+    }
+
+    /// The verdict has to reach an agent, or it is a comment.
+    #[test]
+    fn app_control_reports_the_wrap_gutters_verdict() {
+        let product = product_source();
+        assert!(
+            product.contains("document_wrap_gutters: documentWrapGutters,"),
+            "the app-state DOM probe must carry the gutter's self-check"
+        );
+        let observe = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal_observe.rs"),
+        )
+        .expect("read terminal_observe.rs");
+        assert!(
+            observe.contains(r#""document_wrap_gutters": document_wrap_gutters,"#),
+            "app-control must republish it — a field the report drops is not observable"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // THE SURFACE SWITCH
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn document_session(hidden: bool) -> RenderSnapshot {
+        let session = "local://yedit";
+        let mut shell = ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
+            session,
+        ));
+        shell.upsert_sidebar_contribution(
+            session,
+            vec![SidebarPaneDeclaration {
+                id: "editor".to_string(),
+                icon: "✎".to_string(),
+                title: "Editor".to_string(),
+                placement: PanePlacement::Viewport,
+            }],
+            None,
+            Some("yedit".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            Some((
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )),
+        );
+        if hidden {
+            shell.document_surface_hidden.insert(session.to_string());
+        }
+        shell.snapshot()
+    }
+
+    /// THE DEFECT: the document surface grew its own Document|Terminal pill
+    /// because the titlebar slot only ever answered for agent CLIs. Two pills,
+    /// both `position:absolute`, over viewports that reserve no space for
+    /// chrome — so one of them drew over the first line of the document.
+    #[test]
+    fn a_declared_document_surface_owns_the_titlebar_switch() {
+        assert_eq!(
+            titlebar_surface_switch(&document_session(false)),
+            TitlebarSurfaceSwitch::Document {
+                document_visible: true
+            }
+        );
+        assert_eq!(
+            titlebar_surface_switch(&document_session(true)),
+            TitlebarSurfaceSwitch::Document {
+                document_visible: false
+            },
+            "hiding the surface must keep the SAME switch, with Terminal active — \
+             never degrade it to a lone button"
+        );
+    }
+
+    /// A yedit session is a SHELL hosting an app. `SessionKind` declines to
+    /// answer whether it has a second surface; the declared pane does.
+    #[test]
+    fn a_session_with_no_declared_pane_falls_back_to_the_rendered_toggle() {
+        let shell = ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
+            "local://codex",
+        ));
+        let snapshot = shell.snapshot();
+        assert!(
+            matches!(
+                titlebar_surface_switch(&snapshot),
+                TitlebarSurfaceSwitch::Rendered | TitlebarSurfaceSwitch::None
+            ),
+            "without a declared viewport pane the slot must not claim a document"
+        );
+    }
+
+    /// ⚠ THE DIOXUS STYLE-KEY TRAP: the slot's hidden arm sets `visibility` and
+    /// `pointer-events`, so the shown arm must set them back. An empty arm
+    /// leaves the first hidden render latched forever.
+    #[test]
+    fn the_surface_switch_slot_clears_the_keys_it_sets() {
+        let product = product_source();
+        assert!(
+            product.contains(" visibility:hidden; pointer-events:none;"),
+            "the inert arm"
+        );
+        assert!(
+            product.contains(" visibility:visible; pointer-events:auto;"),
+            "the live arm must NAME both keys; Dioxus never clears a key a later \
+             render stops emitting"
+        );
+    }
+
+    /// One switch, one home.
+    #[test]
+    fn the_document_switch_does_not_float_over_a_viewport() {
+        let product = product_source();
+        assert!(
+            !product.contains("data-document-terminal-toggle"),
+            "the pill that floated over the document editor is gone"
+        );
+        assert!(
+            !product.contains("data-document-show-toggle"),
+            "the pill that floated over the terminal is gone"
+        );
+        assert_eq!(
+            product.matches(r"\u{fe0e} Document").count(),
+            1,
+            "exactly ONE Document segment exists, and it is the titlebar's"
+        );
+        assert_eq!(
+            product
+                .matches(r#""data-titlebar-surface-switch-segment": "document","#)
+                .count(),
+            1,
+            "and it lives in the titlebar's surface-switch slot"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // THE TOASTS
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn toasts_sit_top_centre_over_a_terminal() {
+        let shell = ShellState::new(super::tests::test_shell_bootstrap_with_active_session(
+            "local://plain",
+        ));
+        assert_eq!(toast_anchor(&shell.snapshot()), ToastAnchor::TopCenter);
+    }
+
+    /// Over a document the top of the viewport is the title and the first line
+    /// being read, so the stack moves to the bottom corner — on the RAIL's edge,
+    /// because the chrome mirror moves everything directional with its edge.
+    #[test]
+    fn toasts_move_to_the_rails_bottom_corner_over_a_document() {
+        let mut snapshot = document_session(false);
+        snapshot.settings.chrome_orientation = ChromeOrientation::natural();
+        assert_eq!(toast_anchor(&snapshot), ToastAnchor::BottomRight);
+        snapshot.settings.chrome_orientation = ChromeOrientation::mirrored();
+        assert_eq!(
+            toast_anchor(&snapshot),
+            ToastAnchor::BottomLeft,
+            "a mirrored rail takes the toast corner with it"
+        );
+    }
+
+    /// Hiding the surface hands the viewport back to the terminal, and the
+    /// toasts go back with it.
+    #[test]
+    fn hiding_the_document_returns_the_toasts_to_the_top() {
+        assert_eq!(toast_anchor(&document_session(true)), ToastAnchor::TopCenter);
+    }
+}
 
 fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) -> String {
     format!(
@@ -118308,16 +118884,6 @@ fn DocumentSurfaceBody(
             .iter()
             .any(|w| matches!(w, AppPaneWidget::Markdown { .. }));
 
-    let on_hide_surface = {
-        let mut state = state;
-        let session_path = session_path.clone();
-        move |_| {
-            state.with_mut(|shell| {
-                shell.document_surface_hidden.insert(session_path.clone());
-            });
-        }
-    };
-
     rsx! {
         div {
             "data-document-surface": "{pane_id}",
@@ -118456,45 +119022,13 @@ fn DocumentSurfaceBody(
                         }
                     }
                     div { style: "flex:1 1 auto;" }
-                    // The Document↔Terminal switch on the ONE standard
-                    // segmented control (DESIGN.md "Control language") —
-                    // Document is where you are; Terminal hides the surface.
-                    div {
-                        style: segmented_control_track_style(snapshot.palette),
-                        button {
-                            style: segmented_control_segment_style(snapshot.palette, true, false, false),
-                            title: "The app's document view (you are here)",
-                            "📄\u{fe0e} Document"
-                        }
-                        button {
-                            "data-document-terminal-toggle": "1",
-                            style: segmented_control_segment_style(snapshot.palette, false, false, false),
-                            title: "Show the terminal (the app keeps running)",
-                            onclick: on_hide_surface.clone(),
-                            "⌨\u{fe0e} Terminal"
-                        }
-                    }
-                }
-            } else {
-                // Pure-body document: the switch floats so the app's
-                // content owns the whole viewport.
-                div {
-                    style: format!(
-                        "position:absolute; top:10px; right:16px; z-index:30; opacity:0.9; {}",
-                        segmented_control_track_style(snapshot.palette)
-                    ),
-                    button {
-                        style: segmented_control_segment_style(snapshot.palette, true, false, false),
-                        title: "The app's document view (you are here)",
-                        "📄\u{fe0e} Document"
-                    }
-                    button {
-                        "data-document-terminal-toggle": "1",
-                        style: segmented_control_segment_style(snapshot.palette, false, false, false),
-                        title: "Show the terminal (the app keeps running)",
-                        onclick: on_hide_surface.clone(),
-                        "⌨\u{fe0e} Terminal"
-                    }
+                    // ⛔ The Document|Terminal switch does NOT live here. It is
+                    // the titlebar's surface-switch slot
+                    // (`TitlebarSurfaceSwitch`), which is where every other
+                    // "what is this viewport showing" switch already lived.
+                    // A copy here floated over the editor on a pure-body
+                    // document — the surface reserves no space for chrome, so
+                    // the pill drew straight over the first line of the text.
                 }
             }
             if let Some(error) = error {
@@ -123919,10 +124453,6 @@ fn ThemeDialogButton(
             {children}
         }
     }
-}
-fn toast_center_offset(right_panel_mode: &RightPanelMode) -> i32 {
-    let _ = right_panel_mode;
-    0
 }
 fn normalize_theme_editor_axis(value: f64) -> f32 {
     ((value / THEME_EDITOR_PAD_SIZE).clamp(0.0, 1.0)) as f32
