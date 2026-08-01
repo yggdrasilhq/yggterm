@@ -1032,6 +1032,38 @@ A second test (`both_binaries_route_the_web_plane_to_its_one_owner`, in
 either binary grows a `web` dispatch of its own — a verb on one binary only is
 the split-dispatch trap, and this plane has already fallen into it once.
 
+### `web profile` — the picker card's row menu, addressable (2026-08-01)
+
+`server app web profile <list|show|avatar|protect|unprotect> [<name>]` is the
+one verb of this plane that does **not** round-trip through the GUI, and the
+reason is worth stating because the shape looks like an exception:
+
+- A profile's `profile.json` is **host state on disk**, and the picker card
+  re-reads it on every render rather than caching it (`web_surface_profile_meta`
+  in the shell: *"deliberately a plain read on every call rather than a memo"*).
+  So a CLI write IS visible to the card, and proxying it through the GUI would
+  add a second path to one file while making the verb unavailable on the many
+  hosts where no GUI runs at all.
+- Both writers — the card's row menu and this verb — call ONE core function,
+  `yggterm_core::web_profile::update_profile_meta_in`. That function is what
+  guarantees the read-modify-write, which is what keeps `agent_drive` (a key
+  ychrome owns and yggterm has no field for) alive across an avatar edit.
+  `the_shared_write_path_preserves_a_key_neither_writer_understands` locks it.
+- Every refusal is the card's refusal, in the card's words:
+  `protect default` answers *"default is always protected"* — the same
+  `WEB_PROFILE_PERMANENT_REASON` the card's DISABLED menu entry shows — and an
+  avatar the picker's own field would reject is rejected here too.
+- `list` and `show` report `unknown_keys`. **That field is the persistence
+  contract, made observable**: before this verb existed there was no way, from
+  outside the GUI, to see whether a write had preserved a key it did not
+  understand, and the 2.12.18 maiden-run checklist shipped with that clause
+  unverified (docs/pending-bugs.md, J8b).
+
+Every write response also carries `menu_id` — `web-profile-change-avatar`,
+`web-profile-reset-avatar`, `web-profile-protect`, `web-profile-unprotect` — the
+literal id of the card affordance it is, so the two halves are greppable from
+each other.
+
 ### App-control is a FILESYSTEM DROPBOX, not RPC
 
 The CLI writes `~/.yggterm/app-control-requests/<uuid>.json`; the GUI polls it.
