@@ -218,13 +218,6 @@ symptoms, and the last two are strongly suspected to share a root:
    `terminal_mount/forward_protocol_only_output` runs **75× higher** during
    storms (15.1/min vs 0.2/min) while `terminal_io/dispatch` is flat.
 
-   Adjacent, found in the same trace and NOT the judder: **remote PTY resize
-   never reaches remote CC sessions.** `terminal_resize/remote_pty_resize_failed`
-   for `remote-cc://dev/<uuid>` with `terminal session not found:
-   cc-runtime://<uuid>`, five retries then `will_retry: false`, while
-   `remote-cc://oc/<uuid>` resizes `ok: true` on the same tick. SIGWINCH is
-   silently not delivered to those agents. Separate bug, own lane.
-
 ## Standing traps / other open bugs
 
 - **⚠ TOOLING: `app state`'s DOM debug snapshot times out on jojo, so every DOM
@@ -521,30 +514,6 @@ symptoms, and the last two are strongly suspected to share a root:
   Not obviously ours to fix — the next step, if it ever matters, is whether
   `WebsiteDataManager`/`WebContext` disposal has an explicit terminate we are
   not calling, or whether webkit2gtk simply keeps them for reuse.
-
-- **★★ REMOTE-CC `session remove` REPORTS `verified:true` WHILE THE REMOTE AGENT
-  KEEPS RUNNING (found + reproduced end-to-end on jojo, 2.12.17, 2026-07-27).**
-  Removing a `remote-cc://` row reaps only the LOCAL ssh client and still
-  answers a clean verified removal:
-  ```
-  verified:true   live_processes:[]   row_still_listed:false
-  reaped_processes:[{"command":"ssh","pid":<local ssh client>}]
-  ```
-  The remote agent process was still alive on the remote host 90 s later, with
-  no row anywhere pointing at it. **Root cause, and it is not a race:** the
-  orphan's parent is the REMOTE host's own `yggterm-headless server daemon` —
-  the remote runtime is deliberately daemon-owned so it survives ssh drops, so
-  the local remove never asks the remote daemon to close its runtime. The remote
-  daemon is left holding a live runtime for a row that no longer exists.
-  **Why this one matters:** the teardown-honesty contract says a report must be
-  verified or honestly refuse, and the LOCAL path already implements it
-  perfectly — a local agent row removal names every pid it killed (shell, agent,
-  and the agent's own MCP children) and a local shell removal names the tenant
-  it reaped. The remote path simply does not cross the machine boundary, yet
-  claims the same verification. Fix: proxy the close to the owning remote daemon
-  and verify there, or refuse with a named reason when the remote half cannot be
-  confirmed. **Never report `verified:true` for work done on only one side of an
-  ssh hop.** Repro + evidence: jojo queue §DONE "J7 step 4 / Defect B".
 
 - **`server app open` on a REMOVED row times out instead of naming the reason
   (minor, jojo 2.12.17, 2026-07-27).** Opening a deleted session path correctly

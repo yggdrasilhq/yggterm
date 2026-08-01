@@ -1500,8 +1500,9 @@ job (the JSONL pretty-formatting surface).
 
 ## remote-cc-pty-never-resized
 
-**STATUS:** FIXED — **live-verified 2026-07-25 on jojo at 2.12.11**, on exactly
-the daemon changeover this entry was waiting for. A `remote-cc://dev/...` session
+**STATUS:** FIXED, in THREE layers — the third found 2026-08-01 and fixed the
+same day (see §Layer 3 below). **live-verified 2026-07-25 on jojo at 2.12.11**,
+on exactly the daemon changeover this entry was waiting for. A `remote-cc://dev/...` session
 whose PTY had been dropped by the 2.12.11 hot restart was re-opened (click =
 resume); it came back at client grid **168x63** with
 `blank_rows_below_cursor: 2` and `session_view_contract_violations: []`, i.e. the
@@ -1567,10 +1568,51 @@ Real fix: make the single writer kind-aware.
 
 No second writer is introduced — the size-war lesson still holds.
 
+### Layer 3 — the right host, the right key, the WRONG DAEMON (2026-08-01)
+
+Layers 1 and 2 got the forward addressed to the right machine with the right
+runtime key. It still did not arrive, and the reason is one line further down
+the stack.
+
+`resize_remote_agent_session_pty` delivers by running
+`~/.yggterm/bin/yggterm server terminal resize <key>` on the owning host. That
+verb resolved its endpoint with `cli_server_endpoint(home)` — **the socket for
+the invoking binary's own protocol version**. On a host running
+version-coexisting daemons that is not the daemon holding the PTY, and the owner
+is routinely the OLDER one, because the remote-binary bootstrap keeps
+`~/.yggterm/bin/yggterm` at the CLIENT's version while the constitution keeps
+older owning daemons alive. Both halves of that steady state are working as
+designed; the verb's assumption that "my version's daemon owns everything" is
+the bug.
+
+Measured on the live fleet, same tick, from one jojo (2.12.22) daemon:
+
+| host | `~/.yggterm/bin/yggterm` | daemon owning the CC runtimes | result |
+|---|---|---|---|
+| `oc` | 2.12.22 | 2.12.22 (pid 3226212) — **the same one** | `ok: true` |
+| `dev` | 2.12.22 | 2.12.19 (pid 797118); the 2.12.22 daemon owned **zero** sessions | `terminal session not found: cc-runtime://<uuid>`, 5 retries, dropped |
+
+Reproduced by hand on dev with the two binaries against one runtime key: the
+2.12.22 binary answers `terminal session not found`, the key is present in the
+2.12.19 daemon's `owned_terminal_session_keys`. Note the preserved-owner proxy
+inside the receiving daemon cannot save this: dev's 2.12.22 daemon preserved 23
+`local://` keys and no `cc-runtime://` key at all, so the proxy branch was never
+entered. Depending on that registry would also be non-deterministic — it is
+populated by a background recovery pass.
+
+Fix: `owning_daemon_endpoint_for_runtime_key` / `control_endpoint_for_runtime_key`
+(`crates/yggterm-server/src/lib.rs`). Ownership is `owned_terminal_session_keys`,
+version is not a filter, and a preserved-only daemon is explicitly not the owner
+(it holds a retained screen, not the PTY). The resize verb in **both** binaries
+resolves through it and reports the daemon it reached as `owner_endpoint`.
+
 ### Code locations
 - `crates/yggterm-server/src/lib.rs` — `remote_agent_pty_target_for_path`,
-  `resize_remote_agent_session_pty`
+  `resize_remote_agent_session_pty`, `owning_daemon_endpoint_for_runtime_key`,
+  `control_endpoint_for_runtime_key`
 - `crates/yggterm-server/src/daemon.rs` — `forward_remote_pty_resize`
+- `apps/yggterm/src/main.rs`, `apps/yggterm/src/bin/yggterm-headless.rs` —
+  the `server terminal resize` verb (the delivery endpoint)
 
 ### Tests
 - `remote_cc_session_pty_has_a_resize_target_and_uses_the_cc_runtime_key`
@@ -1580,12 +1622,24 @@ No second writer is introduced — the size-war lesson still holds.
 - `ensure_session_keeps_existing_grid_so_reattach_must_resize_to_client_grid`
   (pipeline integration) — already encoded this invariant; the remote forward
   just never implemented it for CC.
+- `the_owning_daemon_is_found_across_protocol_versions`,
+  `a_preserved_only_daemon_is_not_the_owner`, `no_owner_is_none_not_a_guess`,
+  `the_resize_verb_addresses_the_owning_daemon_in_both_binaries`
+  (`yggterm-server`) — layer 3. The first encodes the live dev/oc topologies
+  verbatim; the last is a source-shape lock on both CLI binaries.
 
 ### Telemetry
 - `remote_pty_resize_forwarded` (daemon/terminal_resize) — now carries `kind`.
   **Its total absence for a machine means no remote PTY has ever been resized.**
 - `remote_pty_resize_failed` (daemon/terminal_resize) — NEW; the forward failing
-  used to be silent.
+  used to be silent. **A run of these carrying `terminal session not found:
+  cc-runtime://…` for one host while another host answers `ok: true` on the same
+  tick is layer 3**, not a dead session: compare
+  `~/.yggterm/bin/yggterm --version` on that host against the daemon in
+  `owned_terminal_session_keys`.
+- `server terminal resize` now prints `owner_endpoint` — the socket it actually
+  reached. If that is not the daemon holding the key, the resolution is wrong,
+  whatever `resized: true` says.
 
 ### Related memory
 `[[campaign-render-pipeline-parity-rework]]` (this is that campaign's thesis

@@ -73,8 +73,9 @@ pub use app_control::{
     AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
-    ProbeTerminalViewportInputMode, ScreenshotTarget, SessionRemovalEvidence,
-    SessionRemovalRefusal, SessionRemovalVerdict, SessionTeardownProcess, VaultFieldSource,
+    ProbeTerminalViewportInputMode, RemoteRuntimeAfterRemoval, ScreenshotTarget,
+    SessionRemovalEvidence, SessionRemovalRefusal, SessionRemovalVerdict, SessionTeardownProcess,
+    VaultFieldSource,
     WebCookieDirection,
     WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
     WebSurfaceWaitUntil,
@@ -1449,17 +1450,33 @@ fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, sessi
 }
 
 #[cfg(target_os = "linux")]
-fn remote_codex_bridge_args_match(args: &[String], session_id: &str) -> bool {
+/// The wrapper verbs that BRIDGE a remote agent session's stdio, per kind. One
+/// table, never a fork — the codex-only version of this predicate is why a
+/// `remote-cc://` teardown left its `resume-cc` bridge behind.
+fn remote_agent_bridge_verbs(kind: SessionKind) -> &'static [&'static str] {
+    match kind {
+        SessionKind::ClaudeCode => &["resume-cc", "start-cc"],
+        _ => &["resume-codex", "start-codex"],
+    }
+}
+
+fn remote_agent_bridge_args_match(args: &[String], session_id: &str, kind: SessionKind) -> bool {
+    let verbs = remote_agent_bridge_verbs(kind);
     args.windows(4).any(|window| {
         window[0] == "server"
             && window[1] == "remote"
-            && matches!(window[2].as_str(), "resume-codex" | "start-codex")
+            && verbs.contains(&window[2].as_str())
             && window[3] == session_id
     })
 }
 
+#[cfg(test)]
+fn remote_codex_bridge_args_match(args: &[String], session_id: &str) -> bool {
+    remote_agent_bridge_args_match(args, session_id, SessionKind::Codex)
+}
+
 #[cfg(target_os = "linux")]
-fn linux_remote_codex_bridge_pids_for_session(session_id: &str) -> Vec<u32> {
+fn linux_remote_agent_bridge_pids_for_session(session_id: &str, kind: SessionKind) -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -1471,7 +1488,7 @@ fn linux_remote_codex_bridge_pids_for_session(session_id: &str) -> Vec<u32> {
         .filter(|pid| {
             linux_proc_cmdline_args(*pid)
                 .as_deref()
-                .is_some_and(|args| remote_codex_bridge_args_match(args, session_id))
+                .is_some_and(|args| remote_agent_bridge_args_match(args, session_id, kind))
         })
         .collect::<Vec<_>>();
     pids.sort_unstable();
@@ -1529,8 +1546,8 @@ fn terminate_linux_process_tree(root_pid: u32) {
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_remote_codex_bridge_processes(session_id: &str) -> usize {
-    let pids = linux_remote_codex_bridge_pids_for_session(session_id);
+fn terminate_remote_agent_bridge_processes(session_id: &str, kind: SessionKind) -> usize {
+    let pids = linux_remote_agent_bridge_pids_for_session(session_id, kind);
     for pid in &pids {
         terminate_linux_process_tree(*pid);
     }
@@ -1538,7 +1555,7 @@ fn terminate_remote_codex_bridge_processes(session_id: &str) -> usize {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminate_remote_codex_bridge_processes(_session_id: &str) -> usize {
+fn terminate_remote_agent_bridge_processes(_session_id: &str, _kind: SessionKind) -> usize {
     0
 }
 
@@ -3572,20 +3589,14 @@ impl YggtermServer {
         &self,
         path: &str,
     ) -> Option<(RemoteMachineRef, String, SessionKind)> {
+        // The Codex arm prefers the transcript id recorded in metadata over the
+        // one in the path (`docs/sessions.md` §Identity); everything else about
+        // the resolution — which machine, which kind — belongs to the ONE
+        // scheme table in `remote_agent_row_target`.
         if let Some((machine, session_id)) = self.remote_shutdown_target_for_path(path) {
             return Some((machine, session_id, SessionKind::Codex));
         }
-        let (raw_machine_key, session_id) = parse_remote_cc_session_path(path)?;
-        let machine_key = normalize_machine_key(raw_machine_key);
-        let machine = self
-            .remote_machines
-            .iter()
-            .find(|machine| machine.machine_key == machine_key)?;
-        Some((
-            machine.routing_ref(),
-            session_id.to_string(),
-            SessionKind::ClaudeCode,
-        ))
+        remote_agent_row_target(&self.remote_machines, path)
     }
 
     pub fn refresh_terminal_identity_launch_commands(&mut self) -> usize {
@@ -9033,6 +9044,78 @@ fn remote_runtime_cc_session_key(session_id: &str) -> String {
 
 fn parse_remote_runtime_cc_session_key(path: &str) -> Option<&str> {
     path.strip_prefix("cc-runtime://")
+}
+
+/// Resolve a remote AGENT ROW path to the machine that owns it, the session id
+/// on that machine, and the agent kind — **the row scheme alone implies the
+/// kind**, per [`yggterm_core::agent_scheme`].
+///
+/// This is the ONE table mapping `remote-session://` → Codex and `remote-cc://`
+/// → Claude Code for callers that hold a machine list rather than the daemon's
+/// state (the GUI's app-control handlers, the CLI). Every remote agent control
+/// op — resize, terminate, liveness — must resolve through here or through
+/// [`ServerState::remote_agent_pty_target_for_path`], never by re-parsing one
+/// scheme and treating the other as absent. Doing exactly that is what left
+/// remote Claude Code agents running after their row was removed.
+pub fn remote_agent_row_target(
+    remote_machines: &[RemoteMachineSnapshot],
+    path: &str,
+) -> Option<(RemoteMachineRef, String, SessionKind)> {
+    let (raw_machine_key, session_id, kind) =
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
+            (machine_key, session_id, SessionKind::Codex)
+        } else {
+            let (machine_key, session_id) = parse_remote_cc_session_path(path)?;
+            (machine_key, session_id, SessionKind::ClaudeCode)
+        };
+    let machine_key = normalize_machine_key(raw_machine_key);
+    let machine = remote_machines
+        .iter()
+        .find(|machine| machine.machine_key == machine_key)?;
+    Some((machine.routing_ref(), session_id.to_string(), kind))
+}
+
+/// Ask the owning machine whether a removed remote agent row's runtime is still
+/// alive, and answer in the vocabulary the removal verdict speaks.
+///
+/// A non-remote path is `NotApplicable`; a probe that fails for any reason is
+/// `Unverifiable`, never `ConfirmedGone`. See
+/// [`crate::app_control::RemoteRuntimeAfterRemoval`].
+pub fn remote_agent_row_runtime_after_removal(
+    remote_machines: &[RemoteMachineSnapshot],
+    path: &str,
+) -> crate::app_control::RemoteRuntimeAfterRemoval {
+    use crate::app_control::RemoteRuntimeAfterRemoval;
+    if !session_path_is_remote_agent(path) {
+        return RemoteRuntimeAfterRemoval::NotApplicable;
+    }
+    let Some((machine, session_id, kind)) = remote_agent_row_target(remote_machines, path) else {
+        // The scheme says remote but no machine in the model can be reached for
+        // it. That is precisely an unanswered question, not a clean teardown.
+        return RemoteRuntimeAfterRemoval::Unverifiable;
+    };
+    match remote_agent_session_runtime_alive(&machine, &session_id, kind) {
+        Ok(true) => RemoteRuntimeAfterRemoval::StillRunning,
+        Ok(false) => RemoteRuntimeAfterRemoval::ConfirmedGone,
+        Err(error) => {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "remote_agent_runtime_liveness_probe_failed",
+                    json!({
+                        "path": path,
+                        "machine_key": machine.machine_key,
+                        "session_id": session_id,
+                        "kind": format!("{kind:?}"),
+                        "error": format!("{error:#}"),
+                    }),
+                );
+            }
+            RemoteRuntimeAfterRemoval::Unverifiable
+        }
+    }
 }
 
 /// Machine key + per-kind daemon runtime key for the direct remote write
@@ -14951,6 +15034,73 @@ fn endpoint_with_live_remote_runtime(home: &Path, runtime_key: &str) -> Option<S
     endpoint_with_current_live_remote_runtime_key(home, runtime_key).map(|(endpoint, _)| endpoint)
 }
 
+/// Pure half of [`owning_daemon_endpoint_for_runtime_key`]: pick the daemon that
+/// OWNS `runtime_key` out of a host's coexisting daemons, **ignoring protocol
+/// version entirely**.
+///
+/// Ownership is `owned_terminal_session_keys` and nothing else.
+/// `terminal_session_keys` is the superset that also carries PRESERVED entries —
+/// a daemon that merely remembers a peer's runtime holds a retained screen, not
+/// the PTY, and pinning a grid there changes nothing the agent can feel. Same
+/// distinction [`remote_runtime_bridge_owner_from_statuses`] makes, for the same
+/// reason.
+///
+/// Version is deliberately NOT a filter. The constitution's rule is that daemon
+/// topology is our bookkeeping, never the caller's concern: a session owned by
+/// an older coexisting daemon is still a first-class row, and a control op
+/// addressed to it must reach it.
+fn owning_daemon_endpoint_from_statuses(
+    statuses: Vec<(ServerEndpoint, ServerRuntimeStatus)>,
+    runtime_key: &str,
+) -> Option<ServerEndpoint> {
+    statuses
+        .into_iter()
+        .find(|(_, runtime)| {
+            runtime
+                .owned_terminal_session_keys
+                .iter()
+                .any(|key| key == runtime_key)
+        })
+        .map(|(endpoint, _)| endpoint)
+}
+
+/// The daemon ON THIS HOST that owns `runtime_key`, whatever version it is.
+///
+/// **Why this exists (live-caught 2026-08-01, dev vs oc on the same tick).** A
+/// control verb that resolves its endpoint from the INVOKING BINARY's protocol
+/// version answers "the daemon I would spawn", not "the daemon that holds this
+/// PTY". Same host — different process. On `dev` the deployed
+/// `~/.yggterm/bin/yggterm` was 2.12.22 and the 2.12.22 daemon owned **zero**
+/// sessions, while a still-running 2.12.19 daemon held every `cc-runtime://`
+/// PTY, so `server terminal resize cc-runtime://<uuid>` answered `terminal
+/// session not found` for a session that was alive on the same machine. On `oc`
+/// the deployed binary's own daemon happened to BE the owner and the identical
+/// code answered `ok: true`. That is the whole difference, and it is exactly the
+/// steady state the design asks for: the remote-binary bootstrap keeps
+/// `~/.yggterm/bin/yggterm` at the CLIENT's version while the constitution keeps
+/// older owning daemons alive. Resolve by OWNERSHIP, never by version.
+///
+/// Returns `None` when no reachable daemon owns the key — an honest "nobody here
+/// holds it", and the caller must not silently substitute its own endpoint and
+/// report success.
+pub fn owning_daemon_endpoint_for_runtime_key(
+    home: &Path,
+    runtime_key: &str,
+) -> Option<ServerEndpoint> {
+    owning_daemon_endpoint_from_statuses(
+        daemon::reachable_versioned_daemon_statuses(home),
+        runtime_key,
+    )
+}
+
+/// Endpoint to address a control op for `runtime_key` at: the owning daemon when
+/// one is reachable, else this binary's own default endpoint (which is what the
+/// caller would have used anyway, and whose "not found" is then a true answer).
+pub fn control_endpoint_for_runtime_key(home: &Path, runtime_key: &str) -> ServerEndpoint {
+    owning_daemon_endpoint_for_runtime_key(home, runtime_key)
+        .unwrap_or_else(|| default_endpoint(home))
+}
+
 fn wait_for_current_live_remote_runtime_key(
     home: &Path,
     runtime_key: &str,
@@ -16731,6 +16881,25 @@ pub fn run_remote_cc_rename(session_id: &str, title: &str) -> anyhow::Result<()>
 }
 
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
+    run_remote_terminate_agent(session_id, SessionKind::Codex)
+}
+
+/// Claude Code twin of [`run_remote_terminate_codex`]. Its absence is the whole
+/// of the remote-CC teardown bug: with no verb on this side, the local remove
+/// had nothing to call even once it knew it should.
+pub fn run_remote_terminate_cc(session_id: &str) -> anyhow::Result<()> {
+    run_remote_terminate_agent(session_id, SessionKind::ClaudeCode)
+}
+
+/// Close an agent runtime on THIS host, whichever coexisting daemon owns it.
+///
+/// The daemon sweep here is deliberate and predates this fix: the owner may be
+/// an older daemon that a version bump left holding the PTY. Every other remote
+/// control op should resolve its endpoint the same way — see
+/// [`owning_daemon_endpoint_for_runtime_key`].
+fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow::Result<()> {
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("no daemon runtime lane for session kind {kind:?}"))?;
     if let Ok(home) = resolve_yggterm_home() {
         let current_endpoint = default_endpoint(&home);
         let mut endpoints = daemon::reachable_versioned_daemon_statuses(&home)
@@ -16747,7 +16916,7 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
         endpoints.sort_by_key(|endpoint| format!("{endpoint:?}"));
         endpoints.dedup();
         for endpoint in endpoints {
-            let _ = remove_session(&endpoint, &remote_runtime_codex_session_key(session_id));
+            let _ = remove_session(&endpoint, &runtime_key);
             if let Ok((daemon_snapshot, _)) = snapshot(&endpoint) {
                 for live in daemon_snapshot
                     .live_sessions
@@ -16762,23 +16931,25 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
             let _ = registry.transition_session(
                 session_id,
                 RemoteRuntimeSessionState::Stopped,
-                Some("terminate-codex requested"),
-                &json!({ "source": "run_remote_terminate_codex" }),
+                Some("terminate requested"),
+                &json!({ "source": "run_remote_terminate_agent", "kind": format!("{kind:?}") }),
             );
             let _ = registry.delete_session(session_id)?;
         }
     }
-    let terminated_bridge_count = terminate_remote_codex_bridge_processes(session_id);
+    let terminated_bridge_count = terminate_remote_agent_bridge_processes(session_id, kind);
     if terminated_bridge_count > 0
         && let Ok(home) = resolve_yggterm_home()
     {
         append_trace_event(
             &home,
             "remote",
-            "terminate_codex",
-            "terminated_remote_codex_bridge_processes",
+            "terminate_agent",
+            "terminated_remote_agent_bridge_processes",
             json!({
                 "session_id": session_id,
+                "kind": format!("{kind:?}"),
+                "runtime_key": runtime_key,
                 "count": terminated_bridge_count,
             }),
         );
@@ -21564,6 +21735,16 @@ pub fn run_app_control_probe_terminal_context_menu(
     Ok(())
 }
 
+/// `server app session remove` — and it EXITS NON-ZERO when the removal was not
+/// verified.
+///
+/// Printing a `verified:false` payload and returning `Ok(())` made the shell
+/// report success for a refusal: `$?` is what a script, a chore or an agent
+/// branches on, and it read 0 while the payload said the row's processes were
+/// still running. The verdict already had a name for what went wrong
+/// ([`crate::app_control::SessionRemovalRefusal`]); this makes the process exit
+/// status agree with it. The payload is still printed in full first — a refusal
+/// must be legible, not just fatal.
 pub fn run_app_control_remove_session(session_path: &str, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
@@ -21574,7 +21755,29 @@ pub fn run_app_control_remove_session(session_path: &str, timeout_ms: u64) -> an
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
-    Ok(())
+    let verified = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("verified"))
+        .and_then(serde_json::Value::as_bool);
+    match verified {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let refusal = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("verified_refusal"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unverified");
+            anyhow::bail!("session remove for {session_path} was not verified: {refusal}")
+        }
+        // A GUI too old to answer `verified` cannot be read as a pass either;
+        // say what is missing instead of inventing a verdict for it.
+        None => anyhow::bail!(
+            "session remove for {session_path} returned no verified verdict \
+             (the app-control host predates the teardown-honesty contract)"
+        ),
+    }
 }
 
 pub fn run_app_control_rename_session(
@@ -22234,6 +22437,102 @@ pub fn terminate_remote_codex_session(
     .map(|_| ())
 }
 
+/// The remote verb that closes an agent runtime on its OWNING host, per kind.
+/// One table, never a fork ([[spec-unify-local-remote]]).
+fn remote_terminate_agent_verb(kind: SessionKind) -> Option<&'static str> {
+    match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => Some("terminate-codex"),
+        SessionKind::ClaudeCode => Some("terminate-cc"),
+        _ => None,
+    }
+}
+
+/// Ask the machine that OWNS a remote agent session to close its runtime.
+///
+/// **Why this is parameterized by kind.** [`terminate_remote_codex_session`]
+/// speaks only `terminate-codex`, and the only resolver that fed it —
+/// `remote_shutdown_target_for_path` — parses `remote-session://` (the Codex ROW
+/// scheme) and returns `None` for `remote-cc://`. So a Claude Code row's close
+/// never crossed the ssh hop AT ALL: the local PTY died, the local ssh client
+/// died, the row left the live order, and the remote `claude` kept running under
+/// the remote host's own daemon with no row anywhere pointing at it. The teardown
+/// then reported `verified:true` because every fact it checked was a LOCAL fact.
+/// See `docs/sessions.md` §Closing a session that lives on another machine and
+/// [`crate::app_control::verify_session_removal`].
+pub fn terminate_remote_agent_session(
+    machine: &RemoteMachineRef,
+    session_id: &str,
+    kind: SessionKind,
+) -> anyhow::Result<()> {
+    let verb = remote_terminate_agent_verb(kind)
+        .with_context(|| format!("no remote terminate verb for session kind {kind:?}"))?;
+    run_remote_yggterm_command(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        &["server", "remote", verb, session_id],
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Whether the machine that owns a remote agent session still holds a LIVE
+/// runtime for it — the fact a remote teardown has to be verified against.
+///
+/// This is the other half of the honesty contract: the local side can prove it
+/// reaped the ssh client and dropped the row, and neither of those says anything
+/// about the process on the other end of the hop. An `Err` here means
+/// *unverifiable* (the probe failed, or the remote binary predates the verb),
+/// which is a refusal — never a clean bill of health.
+pub fn remote_agent_session_runtime_alive(
+    machine: &RemoteMachineRef,
+    session_id: &str,
+    kind: SessionKind,
+) -> anyhow::Result<bool> {
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("no daemon runtime lane for session kind {kind:?}"))?;
+    let output = run_remote_yggterm_command(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        &["server", "remote", "agent-runtime-alive", &runtime_key],
+        None,
+    )?;
+    parse_remote_agent_runtime_alive_output(&output)
+}
+
+/// Read the `agent-runtime-alive` answer. Strict on purpose: a remote binary too
+/// old to know the verb prints a usage/error line, and treating unparseable
+/// output as "not alive" would resurrect the exact lie this whole path exists to
+/// kill.
+fn parse_remote_agent_runtime_alive_output(output: &str) -> anyhow::Result<bool> {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(alive) = value.get("alive").and_then(serde_json::Value::as_bool)
+        {
+            return Ok(alive);
+        }
+    }
+    anyhow::bail!("unreadable agent-runtime-alive answer: {}", output.trim())
+}
+
+/// Remote-host side of [`remote_agent_session_runtime_alive`]. Sweeps every
+/// coexisting daemon on THIS host — an older daemon still owning the PTY is the
+/// normal case, not an error state.
+pub fn run_remote_agent_runtime_alive(runtime_key: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let owner = owning_daemon_endpoint_for_runtime_key(&home, runtime_key);
+    let payload = json!({
+        "runtime_key": runtime_key,
+        "alive": owner.is_some(),
+        "owner_endpoint": owner.as_ref().map(|endpoint| format!("{endpoint:?}")),
+    });
+    println!("{payload}");
+    Ok(())
+}
+
 /// Permanent squish fix (run #19, 2026-06-11): the implicit local↔remote PTY
 /// size chain (local attachment PTY SIGWINCH → ssh window-change → remote tty
 /// → bridge size poll → remote daemon resize) has several silent failure
@@ -22276,22 +22575,38 @@ pub fn request_remote_codex_session_shutdown(
     session_id: &str,
     force_after: Duration,
 ) -> anyhow::Result<()> {
-    request_remote_codex_session_quit(machine, session_id)?;
+    request_remote_agent_session_shutdown(machine, session_id, SessionKind::Codex, force_after)
+}
+
+/// Close a remote agent session on its owning host: one graceful request now,
+/// one force-terminate after `force_after`.
+///
+/// Kind-parameterized because the remote verb is per-kind. The Codex-only
+/// version of this call is what a `remote-cc://` row's teardown could not use,
+/// which is why it never crossed the hop at all.
+pub fn request_remote_agent_session_shutdown(
+    machine: &RemoteMachineRef,
+    session_id: &str,
+    kind: SessionKind,
+    force_after: Duration,
+) -> anyhow::Result<()> {
+    // Graceful quit goes through the daemon-native terminate path (idempotent
+    // with the scheduled force-terminate that follows). No tmux/screen anywhere.
+    terminate_remote_agent_session(machine, session_id, kind)?;
     let machine = machine.clone();
     let session_id = session_id.to_string();
     std::thread::spawn(move || {
         std::thread::sleep(force_after);
-        let _ = terminate_remote_codex_session(&machine, &session_id);
+        let _ = terminate_remote_agent_session(&machine, &session_id, kind);
     });
     Ok(())
 }
 
+#[cfg(test)]
 fn request_remote_codex_session_quit(
     machine: &RemoteMachineRef,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    // Graceful quit now goes through the daemon-native terminate path (idempotent
-    // with the scheduled force-terminate that follows). No tmux/screen anywhere.
     terminate_remote_codex_session(machine, session_id)
 }
 
@@ -24445,6 +24760,7 @@ mod tests {
     use super::app_control_open_path_ready;
     use super::{
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
+        owning_daemon_endpoint_from_statuses, parse_remote_agent_runtime_alive_output,
         select_claude_code_storage_candidate,
     };
 
@@ -25173,6 +25489,32 @@ mod tests {
             ],
             "target-session"
         ));
+
+        // The Claude Code arm. A `resume-cc` bridge is invisible to the Codex
+        // verb list and vice versa — which is exactly why the codex-only
+        // predicate left every remote-CC teardown's bridge process behind.
+        let cc_args = vec![
+            "/home/user/.yggterm/bin/yggterm".to_string(),
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-cc".to_string(),
+            "target-session".to_string(),
+        ];
+        assert!(super::remote_agent_bridge_args_match(
+            &cc_args,
+            "target-session",
+            SessionKind::ClaudeCode
+        ));
+        assert!(!super::remote_agent_bridge_args_match(
+            &cc_args,
+            "target-session",
+            SessionKind::Codex
+        ));
+        assert!(!super::remote_agent_bridge_args_match(
+            &args,
+            "target-session",
+            SessionKind::ClaudeCode
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -25196,17 +25538,19 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline
-            && !super::linux_remote_codex_bridge_pids_for_session(&session_id).contains(&child.id())
+            && !super::linux_remote_agent_bridge_pids_for_session(&session_id, SessionKind::Codex)
+                .contains(&child.id())
         {
             std::thread::sleep(Duration::from_millis(25));
         }
 
         assert!(
-            super::linux_remote_codex_bridge_pids_for_session(&session_id).contains(&child.id()),
+            super::linux_remote_agent_bridge_pids_for_session(&session_id, SessionKind::Codex)
+                .contains(&child.id()),
             "fake bridge process was not discoverable"
         );
         assert_eq!(
-            super::terminate_remote_codex_bridge_processes(&session_id),
+            super::terminate_remote_agent_bridge_processes(&session_id, SessionKind::Codex),
             1
         );
 
@@ -36186,6 +36530,232 @@ terminal_window_id: None,
                 .is_none(),
             "remote_shutdown_target_for_path is codex-only by construction"
         );
+    }
+
+    fn owner_status(version: &str, owned: &[&str]) -> ServerRuntimeStatus {
+        serde_json::from_value(serde_json::json!({
+            "server_version": version,
+            "server_pid": 1,
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": owned,
+            "owned_terminal_session_count": owned.len(),
+            "terminal_session_keys": owned,
+            "terminal_session_count": owned.len(),
+        }))
+        .expect("test ServerRuntimeStatus")
+    }
+
+    fn preserving_status(version: &str, preserved: &[&str]) -> ServerRuntimeStatus {
+        serde_json::from_value(serde_json::json!({
+            "server_version": version,
+            "server_pid": 2,
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": Vec::<String>::new(),
+            "owned_terminal_session_count": 0,
+            "preserved_terminal_owner_keys": preserved,
+            "preserved_terminal_owner_count": preserved.len(),
+            "terminal_session_keys": preserved,
+            "terminal_session_count": preserved.len(),
+        }))
+        .expect("test ServerRuntimeStatus")
+    }
+
+    fn socket(name: &str) -> ServerEndpoint {
+        ServerEndpoint::UnixSocket(PathBuf::from(format!("/tmp/{name}.sock")))
+    }
+
+    /// SIGWINCH stopped reaching remote Claude Code agents because a control
+    /// verb resolved its daemon by the INVOKING BINARY's protocol version.
+    ///
+    /// Live shape (2026-08-01, the same tick on two hosts): jojo forwarded a
+    /// remote PTY resize by running `~/.yggterm/bin/yggterm server terminal
+    /// resize cc-runtime://<uuid>` over ssh. On `dev` that binary was 2.12.22
+    /// and the 2.12.22 daemon owned ZERO sessions, while a still-running 2.12.19
+    /// daemon held every `cc-runtime://` PTY — so the answer was `terminal
+    /// session not found` for a session alive on the same machine, five retries,
+    /// then dropped. On `oc` the deployed binary's own daemon happened to be the
+    /// owner, so the identical code answered `ok: true`. Version is not the
+    /// question; OWNERSHIP is.
+    #[test]
+    fn the_owning_daemon_is_found_across_protocol_versions() {
+        let key = "cc-runtime://20c1f3c8-a0f0-4e19-96de-bad8ffcd60fb";
+        // The live `dev` topology: the newest daemon owns nothing, an older one
+        // owns the CC runtime.
+        let statuses = vec![
+            (socket("server-2-12-22"), owner_status("2.12.22", &[])),
+            (socket("server-2-12-19"), owner_status("2.12.19", &[key])),
+        ];
+        assert_eq!(
+            owning_daemon_endpoint_from_statuses(statuses, key),
+            Some(socket("server-2-12-19")),
+            "a control op must reach the daemon that HOLDS the PTY, whatever its version"
+        );
+
+        // The live `oc` topology: the current daemon is also the owner. Same
+        // code path, no special case.
+        let statuses = vec![(socket("server-2-12-22"), owner_status("2.12.22", &[key]))];
+        assert_eq!(
+            owning_daemon_endpoint_from_statuses(statuses, key),
+            Some(socket("server-2-12-22"))
+        );
+    }
+
+    /// PRESERVING a runtime is not OWNING it. A daemon that merely remembers a
+    /// peer's runtime holds a retained screen, not the PTY — pinning a grid
+    /// there changes nothing the agent can feel, and routing to it would hide
+    /// the real owner. Same distinction `remote_runtime_bridge_owner_from_statuses`
+    /// makes, for the same reason.
+    #[test]
+    fn a_preserved_only_daemon_is_not_the_owner() {
+        let key = "cc-runtime://33abb204";
+        let statuses = vec![(
+            socket("server-2-12-22"),
+            preserving_status("2.12.22", &[key]),
+        )];
+        assert_eq!(owning_daemon_endpoint_from_statuses(statuses, key), None);
+
+        // …and with the real owner present, the owner wins even though the
+        // preserving daemon is listed first.
+        let statuses = vec![
+            (
+                socket("server-2-12-22"),
+                preserving_status("2.12.22", &[key]),
+            ),
+            (socket("server-2-12-19"), owner_status("2.12.19", &[key])),
+        ];
+        assert_eq!(
+            owning_daemon_endpoint_from_statuses(statuses, key),
+            Some(socket("server-2-12-19"))
+        );
+    }
+
+    /// Nobody owning it is an honest answer, not a licence to substitute our own
+    /// endpoint and report success.
+    #[test]
+    fn no_owner_is_none_not_a_guess() {
+        let statuses = vec![
+            (socket("a"), owner_status("2.12.22", &["cc-runtime://other"])),
+            (socket("b"), preserving_status("2.12.19", &["local://x"])),
+        ];
+        assert_eq!(
+            owning_daemon_endpoint_from_statuses(statuses, "cc-runtime://missing"),
+            None
+        );
+    }
+
+    /// The `server terminal resize` verb — the one the local daemon reaches over
+    /// ssh to pin a remote agent's PTY — must resolve its endpoint by ownership.
+    /// Both binaries carry the verb, so both are checked: a fix in one and not
+    /// the other is how the wrapper and the manual case drift apart.
+    #[test]
+    fn the_resize_verb_addresses_the_owning_daemon_in_both_binaries() {
+        for (label, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            let block = source
+                .split(r#"args[1] == "terminal" && args[2] == "resize""#)
+                .nth(1)
+                .and_then(|suffix| suffix.split("return Ok(());").next())
+                .unwrap_or_else(|| panic!("{label}: server terminal resize handler present"));
+            assert!(
+                block.contains("control_endpoint_for_runtime_key"),
+                "{label}: the resize verb must address the daemon that OWNS the runtime key. \
+                 Resolving by this binary's own protocol version answers `terminal session \
+                 not found` whenever an older coexisting daemon holds the PTY, which is the \
+                 steady state the constitution asks for."
+            );
+            assert!(
+                !block.contains("cli_server_endpoint"),
+                "{label}: version-resolved endpoint is back in the resize verb"
+            );
+        }
+    }
+
+    /// A remote agent row's close must cross the ssh hop for BOTH agent kinds.
+    ///
+    /// `remote_shutdown_target_for_path` parses `remote-session://` only, so
+    /// every `remote-cc://` row resolved to None at each of the three daemon
+    /// close sites and its remote `claude` was never asked to stop. The row left
+    /// the live order, the local ssh client died with the local PTY, and the
+    /// teardown answered `verified:true   live_processes:[]` for an agent still
+    /// running on the other machine 90 s later (jojo 2.12.17, 2026-07-27).
+    #[test]
+    fn every_daemon_remote_close_site_resolves_both_agent_kinds() {
+        let source = include_str!("daemon.rs");
+        // (label, opening marker, closing marker) — each pair brackets exactly
+        // one close site, so a resolver elsewhere in the file cannot satisfy it.
+        for (label, open, close) in [
+            (
+                "close_live_session_row",
+                "fn close_live_session_row(&mut self, path: &str)",
+                "\n    fn ",
+            ),
+            (
+                "client close sweep",
+                "let paths = self.server.non_keep_alive_live_session_paths();",
+                "self.persist()?;",
+            ),
+            (
+                "TerminalRestart --force-remote",
+                "ServerRequest::TerminalRestart {\n                path,",
+                "ServerRequest::SyncExternalWindow",
+            ),
+        ] {
+            let block = source
+                .split(open)
+                .nth(1)
+                .and_then(|suffix| suffix.split(close).next())
+                .unwrap_or_else(|| panic!("{label} present"));
+            assert!(
+                block.contains(".remote_agent_pty_target_for_path("),
+                "{label} must resolve its remote close target for BOTH agent kinds"
+            );
+            assert!(
+                !block.contains(".remote_shutdown_target_for_path("),
+                "{label} is back on the Codex-only resolver — remote-cc:// rows will \
+                 silently leave their agent running"
+            );
+        }
+    }
+
+    /// The remote liveness answer is READ, never assumed. A remote binary too old
+    /// to know `agent-runtime-alive` prints something else entirely, and reading
+    /// that as "not alive" would resurrect the exact lie the probe exists to kill.
+    #[test]
+    fn an_unreadable_remote_liveness_answer_is_an_error_not_a_no() {
+        assert!(
+            parse_remote_agent_runtime_alive_output(
+                r#"{"runtime_key":"cc-runtime://x","alive":true}"#
+            )
+            .expect("readable")
+        );
+        assert!(
+            !parse_remote_agent_runtime_alive_output(
+                "some ssh banner\n{\"runtime_key\":\"cc-runtime://x\",\"alive\":false}"
+            )
+            .expect("readable after banner")
+        );
+        for unreadable in [
+            "",
+            "Error: unsupported server command: remote",
+            "{}",
+            r#"{"alive":"yes"}"#,
+        ] {
+            assert!(
+                parse_remote_agent_runtime_alive_output(unreadable).is_err(),
+                "unreadable answer must refuse, not report a clean teardown: {unreadable:?}"
+            );
+        }
     }
 
     #[test]
