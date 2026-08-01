@@ -86,10 +86,20 @@ and `set_throttled(false)` show first and place after. Locked structurally by
 (all three mutations proven red), and the GTK behaviour itself is measurable
 with `scripts/webview-shrink-probe.py`, which replays all eight paths.
 
-⚠ **Not verified live on jojo** — that host runs 2.12.23, which predates this.
-To verify: build and install the GUI, open any web surface, hide the cwd tree,
-switch away and back, show the tree, and read `innerWidth` back with the eval
-above. It must equal `dom.main_surface_body_rect.width`.
+✅ **VERIFIED LIVE ON JOJO, 2.12.24 (2026-08-01, 23:2x).** Driven end to end in a
+throwaway shadow client (`scripts/shadow-client.sh`) against a scratch Xvfb+VNC
+target, replaying the user's own sequence and reading the page each step:
+
+| step | page `innerWidth` | `main_surface_body_rect.width` |
+|---|---|---|
+| revealed, tree shown | 1396 | 1396 |
+| tree hidden while the surface was BACKGROUNDED, then switched back | 1661 | 1661 |
+| tree shown while watching | 1396 | 1396 |
+| switched away and back again | 1396 | 1396 |
+
+Row three is the one that used to stick at 1661 for the life of the surface.
+The instrument, for the next time: `server app web eval --session <path>
+--script 'innerWidth'` against `.data.dom.main_surface_body_rect.width`.
 
 ## ⭐ ychrome as the daily driver — WHAT IS LEFT (user-confirmed 2026-08-01)
 
