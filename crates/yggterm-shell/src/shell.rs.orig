@@ -42377,14 +42377,6 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   window.__yggtermChordFromHost = function(chord){
     if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ chord: chord }); }
   };
-  // A PAGE MENU entry the user chose, relayed by the vendored host with the
-  // click point in CSS pixels. Same sender, same terminus: the shell decides
-  // what the id means and this only carries it across the webview boundary.
-  window.__yggtermPageMenuFromHost = function(id, surface, x, y){
-    if (window.__yggtermAltTapSend) {
-      window.__yggtermAltTapSend({ page_menu: { id: id, surface: surface, x: x, y: y } });
-    }
-  };
   // --- KeyTip floating-badge painter (§9): central assignment in Rust (each
   // interactable carries data-keytip-tip = its assigned letter while the overlay
   // is up), local painting here. Badges are their own little blocks in a
@@ -42569,115 +42561,6 @@ const WEB_FIND_CHORD_ID: &str = "web.find";
 /// claimer checks before claiming.
 const WEB_FIND_CHORD: &str = "Ctrl+F";
 
-/// One legacy browser chord: what to press, what it means, and whether serving
-/// it needs the keyboard brought back to the shell's own DOM.
-struct WebPageChord {
-    chord: &'static str,
-    id: &'static str,
-    /// True only for a chord whose target is a shell DOM control. A page holds
-    /// the toplevel focus while these fire, and an `<input>` in the shell's
-    /// webview cannot take a keystroke until the keyboard comes home.
-    focus_shell: bool,
-}
-
-/// ⭐ **THE LEGACY BROWSER LAYER — the keys thirty years of browsers taught
-/// every user, and which yggterm's web surface did not have.**
-///
-/// Measured before this table existed: F5, Ctrl+R, Ctrl+T, Ctrl+L, Ctrl+W, F12
-/// and Ctrl+Shift+I ALL did nothing over a focused page. Reload was the ⟳
-/// button or the row menu; a new tab was the `+`; the address bar could not be
-/// reached from the keyboard at all; DevTools was agent-only. Every one of them
-/// is a verb this app already had, reachable only by mouse.
-///
-/// ## How this coexists with the ALT layer, which owns different keys
-///
-/// The two layers cannot collide, and the reason is structural rather than a
-/// convention someone has to remember:
-///
-/// - **The ALT layer owns a clean ALT TAP** (`keytip.rs`, and the JS/GTK tap
-///   observers) plus the registered ACCELERATORS in
-///   `keytip::DEFAULT_ACCELERATORS`, all of which are asserted PTY-safe by
-///   `assert_accels_pty_safe` — meaning none of them is a bare `Ctrl+<letter>`
-///   or a bare function key, because those belong to the terminal.
-/// - **This layer owns exactly the chords that layer is FORBIDDEN to hold**,
-///   and every row is `page_only`, so a chord here does not exist unless a
-///   browser genuinely owns the keyboard. `assert_no_legacy_chord_is_an_accel`
-///   holds the two disjoint by name rather than by hope.
-/// - A terminal never sees any of them: the window claimer asks the toplevel
-///   which widget has focus and stands a `page_only` row down unless the
-///   focused widget is one of this host's VISIBLE surface webviews.
-///
-/// So `Ctrl+R` is readline's reverse-search everywhere in the app, and a reload
-/// only while a page is in front — which is what a user pressing it means both
-/// times.
-///
-/// ## Why these and not others
-///
-/// The four the user named are here (F5, Ctrl+R, Ctrl+T, F12), plus the
-/// siblings a hand reaches for in the same breath: the second spelling of each
-/// (Ctrl+Shift+R, Ctrl+Shift+I), the address bar (Ctrl+L), and closing a tab
-/// (Ctrl+W). `Ctrl+N`/`Ctrl+Shift+N` are deliberately absent — this browser has
-/// no window to open — and `Ctrl+P` stays absent for the reason it always has:
-/// there is no print path to route it to.
-const WEB_PAGE_CHORDS: &[WebPageChord] = &[
-    // The find bar is in the SHELL's DOM, so it needs the keyboard home.
-    WebPageChord {
-        chord: WEB_FIND_CHORD,
-        id: WEB_FIND_CHORD_ID,
-        focus_shell: true,
-    },
-    // Reload, both spellings. The verb is the row menu's `webtab-reload` aimed
-    // at the ACTIVE tab — a difference in the aim, not in the verb.
-    WebPageChord {
-        chord: "F5",
-        id: "web.reload",
-        focus_shell: false,
-    },
-    WebPageChord {
-        chord: "Ctrl+R",
-        id: "web.reload",
-        focus_shell: false,
-    },
-    // Hard reload. A DIFFERENT verb, not a louder one: it bypasses the HTTP
-    // cache, which is the entire reason a user reaches for it.
-    WebPageChord {
-        chord: "Ctrl+Shift+R",
-        id: "web.reload.hard",
-        focus_shell: false,
-    },
-    // A new tab lands TYPING-READY in the address bar, which is the whole
-    // point of the key — and that promise is `open_web_surface_tab`'s, kept
-    // once for every door rather than re-remembered here.
-    WebPageChord {
-        chord: "Ctrl+T",
-        id: "web.tab.new",
-        focus_shell: true,
-    },
-    // The address bar itself: focus it and select what is in it.
-    WebPageChord {
-        chord: "Ctrl+L",
-        id: "web.address",
-        focus_shell: true,
-    },
-    WebPageChord {
-        chord: "Ctrl+W",
-        id: "web.tab.close",
-        focus_shell: false,
-    },
-    // DevTools, both spellings. Toggle, not open: a key that only opens leaves
-    // the user hunting for the panel's own close button.
-    WebPageChord {
-        chord: "F12",
-        id: "web.devtools",
-        focus_shell: false,
-    },
-    WebPageChord {
-        chord: "Ctrl+Shift+I",
-        id: "web.devtools",
-        focus_shell: false,
-    },
-];
-
 /// Which registered accelerators are claimed ABOVE a focused child.
 ///
 /// **Not all of them, and that is deliberate.** Every accelerator in
@@ -42723,25 +42606,21 @@ fn gdk_key_name_for_chord_key(key: &str) -> Option<String> {
 /// chord without a restart.
 fn claimed_chords_for(config: &KeymapConfig) -> Vec<dioxus::desktop::ClaimedChord> {
     let mut out = Vec::new();
-    for legacy in WEB_PAGE_CHORDS {
-        let Some(chord) = Chord::parse(legacy.chord) else {
-            continue;
-        };
-        let Some(key) = gdk_key_name_for_chord_key(&chord.key) else {
-            continue;
-        };
+    if let Some(chord) = Chord::parse(WEB_FIND_CHORD)
+        && let Some(key) = gdk_key_name_for_chord_key(&chord.key)
+    {
         out.push(dioxus::desktop::ClaimedChord {
             ctrl: chord.ctrl,
             shift: chord.shift,
             alt: chord.alt,
             key,
-            id: legacy.id.to_string(),
-            // ⚠ EVERY LEGACY BROWSER CHORD IS `page_only`, and that is what
-            // keeps this layer legal. Claimed app-wide, `Ctrl+R` would eat
-            // readline's reverse-search and `F5` would eat a TUI's refresh in
-            // every terminal in the app.
+            id: WEB_FIND_CHORD_ID.to_string(),
+            // A BROWSER key only. Claimed app-wide it would eat readline's
+            // forward-char in every terminal in the app.
             page_only: true,
-            focus_shell: legacy.focus_shell,
+            // The find field is in the SHELL's DOM and cannot take a keystroke
+            // while WebKit's child holds the toplevel focus.
+            focus_shell: true,
         });
     }
     for (id, chord) in keytip::effective_accelerators(config) {
@@ -42789,18 +42668,6 @@ async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
         // surface host's installation. Replacing the table with an identical one
         // is free.
         window().set_web_surface_claimed_chords(claimed_chords_for(&state.peek().keytip_config));
-        // …and the PAGE MENU's entries, on the same edge and for the same
-        // reason: a list armed once, before a surface host that installs later,
-        // is a list the user never sees. Re-pushing an identical one is free.
-        window().set_web_surface_page_menu_items(
-            WEB_PAGE_MENU_ITEMS
-                .iter()
-                .map(|(id, label)| dioxus::desktop::PageMenuItem {
-                    id: (*id).to_string(),
-                    label: (*label).to_string(),
-                })
-                .collect(),
-        );
         let mut eval = document::eval(&bridge_js);
         loop {
             match eval.recv::<serde_json::Value>().await {
@@ -42859,33 +42726,11 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             open_web_find_for_viewport(state);
             return;
         }
-        // The legacy browser layer. Asked BEFORE the keytip dispatch because
-        // these ids are not keytip commands — `dispatch_keytip_node` would find
-        // no node and the key would silently do nothing, which is the exact
-        // failure this layer exists to end.
-        if dispatch_web_page_chord(state, chord) {
-            return;
-        }
         // Every other claimed chord IS a keytip command id, and it lands on the
         // same dispatch the accelerator bridge above uses — so `window.fullscreen`
         // has ONE toggle whichever door the key came through.
         state.with_mut(|shell| shell.clear_alt_overlay());
         dispatch_keytip_node(state, chord);
-        return;
-    }
-    // A PAGE MENU entry the user chose, with the click point in CSS pixels.
-    // Its own message, like `chord`: an entry id is not a chord and not a
-    // character, and the point only means anything for this one.
-    if let Some(menu) = msg.get("page_menu") {
-        let Some(id) = menu.get("id").and_then(|value| value.as_str()) else {
-            return;
-        };
-        dispatch_web_page_menu(
-            state,
-            id,
-            menu.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            menu.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        );
         return;
     }
     // §12.3: a dialog key for an open modal, sent while the ALT overlay is
@@ -101160,420 +101005,6 @@ fn open_web_surface_tab(
     }
     opened
 }
-
-// ===== SCREENSHOT: THE PAGE'S OWN CONTEXT MENU ==============================
-
-/// The entries yggterm contributes to WebKit's page context menu.
-///
-/// ⭐ **A page had no yggterm menu at all until now, deliberately.** The shell
-/// does not `preventDefault` over `[data-ws-overlay]` because WebKit's own menu
-/// already offers Copy/Cut/Paste/Select-All/Open-Link, and a DOM reimplementation
-/// would be a second, worse copy of it. What was missing was any way to ADD one
-/// entry to it — so screenshot, which is a page verb a human reaches for with
-/// the mouse, had no mouse route and existed only as an agent-control command.
-///
-/// These four are the same four regions the ychrome engine's `/engine/shot`
-/// takes, in the same order, and that is not a coincidence: a human clicking
-/// "Full page" and an agent sending `region=full` must get the same picture, so
-/// the vocabulary is one vocabulary.
-const WEB_PAGE_MENU_ITEMS: &[(&str, &str)] = &[
-    ("web.shot.viewport", "Screenshot visible area"),
-    ("web.shot.full", "Screenshot full page"),
-    ("web.shot.element", "Screenshot this element"),
-    ("web.shot.area", "Screenshot an area…"),
-];
-
-/// The overlay a "Screenshot an area…" drag runs in, injected into the PAGE.
-///
-/// ⚠ **It has to live in the page, not in the shell's DOM.** A native child
-/// webview composites ABOVE all shell DOM, so a selection overlay drawn in the
-/// shell would be invisible under the very page it is selecting from. The page
-/// is the only layer above the page.
-///
-/// Reports through `window.__yggtermShotArea`, which the Rust side polls:
-/// `{state:'dragging'}` while the mouse is down, `{state:'done', rect}` on
-/// release in DOCUMENT coordinates, `{state:'cancelled'}` on Escape or a
-/// zero-size drag. Cancellation is a first-class answer, not a timeout — a user
-/// who pressed Escape must not wait out a poll budget to find out it worked.
-const WEB_SHOT_AREA_OVERLAY_JS: &str = r#"
-(() => {
-  if (window.__yggtermShotAreaLive) { return 'already'; }
-  window.__yggtermShotAreaLive = true;
-  window.__yggtermShotArea = { state: 'waiting' };
-  const doc = document.documentElement;
-  const layer = document.createElement('div');
-  layer.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:crosshair;' +
-    'background:rgba(10,14,20,0.28);';
-  const box = document.createElement('div');
-  box.style.cssText = 'position:fixed;border:1px solid #7cc4ff;background:rgba(124,196,255,0.16);' +
-    'box-shadow:0 0 0 9999px rgba(10,14,20,0.28);pointer-events:none;display:none;';
-  layer.appendChild(box);
-  const hint = document.createElement('div');
-  hint.textContent = 'Drag to select an area  ·  Esc to cancel';
-  hint.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);' +
-    'font:600 12px/1.6 system-ui,sans-serif;color:#e9eef5;background:rgba(14,20,28,0.92);' +
-    'padding:6px 12px;border-radius:6px;pointer-events:none;';
-  layer.appendChild(hint);
-  (document.body || doc).appendChild(layer);
-  let sx = 0, sy = 0, dragging = false;
-  const finish = (result) => {
-    window.__yggtermShotArea = result;
-    window.__yggtermShotAreaLive = false;
-    layer.remove();
-    window.removeEventListener('keydown', onKey, true);
-  };
-  const onKey = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish({ state: 'cancelled' }); }
-  };
-  window.addEventListener('keydown', onKey, true);
-  layer.addEventListener('mousedown', (e) => {
-    dragging = true; sx = e.clientX; sy = e.clientY;
-    box.style.display = 'block';
-    window.__yggtermShotArea = { state: 'dragging' };
-  });
-  layer.addEventListener('mousemove', (e) => {
-    if (!dragging) { return; }
-    const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
-    const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
-    box.style.left = x + 'px'; box.style.top = y + 'px';
-    box.style.width = w + 'px'; box.style.height = h + 'px';
-  });
-  layer.addEventListener('mouseup', (e) => {
-    if (!dragging) { return; }
-    dragging = false;
-    const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
-    const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
-    // A click with no drag is a CANCEL, not a 0x0 capture.
-    if (w < 4 || h < 4) { finish({ state: 'cancelled' }); return; }
-    finish({ state: 'done', rect: {
-      // DOCUMENT coordinates: the crop is cut from a full-document snapshot.
-      x: x + (window.scrollX || 0), y: y + (window.scrollY || 0), w: w, h: h
-    }});
-  });
-  return 'armed';
-})()
-"#;
-
-/// Read the area overlay's result without disturbing it.
-const WEB_SHOT_AREA_POLL_JS: &str = "JSON.stringify(window.__yggtermShotArea || {state:'gone'})";
-
-/// The page geometry a crop is computed against, and the element under a
-/// right-click. One read, so the rect and the width it is scaled by cannot come
-/// from two different instants.
-fn web_shot_element_probe_js(x: f64, y: f64) -> String {
-    format!(
-        r#"(() => {{
-  const d = document.documentElement, b = document.body;
-  const max = (...v) => v.reduce((a, n) => (n > a ? n : a), 0);
-  const doc_w = max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth || 0);
-  const el = document.elementFromPoint({x}, {y});
-  if (!el) {{ return JSON.stringify({{ found: false, doc_w: doc_w }}); }}
-  const r = el.getBoundingClientRect();
-  return JSON.stringify({{
-    found: r.width > 0 && r.height > 0,
-    doc_w: doc_w,
-    tag: el.tagName ? el.tagName.toLowerCase() : '',
-    x: r.left + (window.scrollX || 0),
-    y: r.top + (window.scrollY || 0),
-    w: r.width,
-    h: r.height
-  }});
-}})()"#
-    )
-}
-
-/// The document width a full-page crop is scaled against, on its own.
-const WEB_SHOT_DOC_WIDTH_JS: &str = r#"(() => {
-  const d = document.documentElement, b = document.body;
-  const max = (...v) => v.reduce((a, n) => (n > a ? n : a), 0);
-  return String(max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth || 0));
-})()"#;
-
-/// Where a screenshot the USER asked for lands.
-///
-/// The same directory the agent control plane writes captures to, because they
-/// are the same artifact and a user who takes one from the menu and then asks
-/// an agent for another should find both in one place. Named by the clock, not
-/// by a request id, because a human has to be able to pick theirs out.
-fn web_shot_output_path(home: &std::path::Path, kind: &str) -> std::path::PathBuf {
-    // Milliseconds since the epoch rather than a formatted local time: this
-    // crate has no date library, and a name that sorts is worth more here than
-    // one that reads — the toast carries the path, so nobody has to guess.
-    let stamp = current_millis();
-    home.join("screenshots")
-        .join(format!("page-{kind}-{stamp}.png"))
-}
-
-/// Serve one entry of the page context menu.
-///
-/// Every arm ends in `capture_web_page`, which is the ONE capture path — the
-/// four regions differ only in what they hand it, so "full page" and "this
-/// element" cannot drift into taking their pictures differently.
-fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
-    let Ok((_, native_id)) = resolve_live_web_surface(&state, None) else {
-        return;
-    };
-    let id = id.to_string();
-    spawn(async move {
-        let desktop = window();
-        let outcome = match id.as_str() {
-            "web.shot.viewport" => {
-                capture_web_page(
-                    state,
-                    &desktop,
-                    native_id,
-                    "viewport",
-                    dioxus::desktop::PageSnapshotRegion::Visible,
-                    None,
-                )
-                .await
-            }
-            "web.shot.full" => {
-                capture_web_page(
-                    state,
-                    &desktop,
-                    native_id,
-                    "full",
-                    dioxus::desktop::PageSnapshotRegion::FullDocument,
-                    None,
-                )
-                .await
-            }
-            "web.shot.element" => match web_shot_element_rect(&desktop, native_id, x, y).await {
-                Ok(crop) => {
-                    capture_web_page(
-                        state,
-                        &desktop,
-                        native_id,
-                        "element",
-                        dioxus::desktop::PageSnapshotRegion::FullDocument,
-                        Some(crop),
-                    )
-                    .await
-                }
-                Err(reason) => Err(reason),
-            },
-            "web.shot.area" => match web_shot_area_rect(&desktop, native_id).await {
-                // A cancelled selection is not a failure and must not toast
-                // like one: the user changed their mind, which is an answer.
-                Ok(None) => return,
-                Ok(Some(crop)) => {
-                    capture_web_page(
-                        state,
-                        &desktop,
-                        native_id,
-                        "area",
-                        dioxus::desktop::PageSnapshotRegion::FullDocument,
-                        Some(crop),
-                    )
-                    .await
-                }
-                Err(reason) => Err(reason),
-            },
-            _ => return,
-        };
-        let mut state = state;
-        state.with_mut(|shell| match outcome {
-            Ok((path, w, h)) => shell.push_notification(
-                NotificationTone::Success,
-                "Screenshot Saved",
-                format!("{w}x{h} · {path}"),
-            ),
-            // Named, never swallowed: a capture that silently did nothing is
-            // discovered later, in a directory that does not have the file.
-            Err(reason) => {
-                shell.push_notification(NotificationTone::Warning, "Screenshot Failed", reason)
-            }
-        });
-    });
-}
-
-/// THE capture path. One region, one optional crop, one PNG, one report.
-async fn capture_web_page(
-    state: Signal<ShellState>,
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    kind: &str,
-    region: dioxus::desktop::PageSnapshotRegion,
-    crop: Option<dioxus::desktop::PageCrop>,
-) -> Result<(String, i32, i32), String> {
-    // The SAME `~/.yggterm` the agent control plane writes captures to, from
-    // its one resolver — a screenshot a human takes and one an agent takes are
-    // the same artifact and belong in one place.
-    let home = resolve_yggterm_home().map_err(|error| error.to_string())?;
-    let path = web_shot_output_path(&home, kind);
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(i32, i32), String>>();
-    desktop.snapshot_web_surface_region(native_id, region, crop, path.clone(), move |outcome| {
-        let _ = tx.send(outcome);
-    })?;
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(Ok((w, h)))) => Ok((path.display().to_string(), w, h)),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) => Err("the surface went away mid-capture".to_string()),
-        Err(_) => Err("the capture timed out (30s)".to_string()),
-    }
-}
-
-/// One eval round trip against a page, awaited.
-async fn web_surface_eval_json(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    js: &str,
-) -> Result<String, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
-    desktop.eval_web_surface(native_id, js, move |outcome| {
-        let _ = tx.send(outcome.map_err(|failure| failure.message));
-    })?;
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("the surface went away mid-eval".to_string()),
-        Err(_) => Err("the page did not answer within 5s".to_string()),
-    }
-}
-
-/// The DOCUMENT-space rect of whatever was right-clicked.
-async fn web_shot_element_rect(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    x: f64,
-    y: f64,
-) -> Result<dioxus::desktop::PageCrop, String> {
-    let raw = web_surface_eval_json(desktop, native_id, &web_shot_element_probe_js(x, y)).await?;
-    // The eval answers a JSON *string* containing JSON, because the completion
-    // value is `JSON.stringify(...)`.
-    let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
-    let probe: Value = serde_json::from_str(&inner)
-        .map_err(|error| format!("the page's element probe was not JSON: {error}"))?;
-    if probe["found"].as_bool() != Some(true) {
-        return Err("nothing with a visible box was under the pointer".to_string());
-    }
-    Ok(dioxus::desktop::PageCrop {
-        x: probe["x"].as_f64().unwrap_or(0.0),
-        y: probe["y"].as_f64().unwrap_or(0.0),
-        w: probe["w"].as_f64().unwrap_or(0.0),
-        h: probe["h"].as_f64().unwrap_or(0.0),
-        css_width: probe["doc_w"].as_f64().unwrap_or(0.0),
-    })
-}
-
-/// Arm the in-page selection overlay and wait for the user's drag.
-///
-/// `Ok(None)` is a CANCEL — Escape, or a click with no drag — and it is a
-/// success, not a failure. Bounded at 60 s: an overlay left armed forever would
-/// hold the page under a scrim with nothing on screen explaining why.
-async fn web_shot_area_rect(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-) -> Result<Option<dioxus::desktop::PageCrop>, String> {
-    web_surface_eval_json(desktop, native_id, WEB_SHOT_AREA_OVERLAY_JS).await?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let raw = web_surface_eval_json(desktop, native_id, WEB_SHOT_AREA_POLL_JS).await?;
-        let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
-        let report: Value = match serde_json::from_str(&inner) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        match report["state"].as_str() {
-            Some("cancelled") | Some("gone") => return Ok(None),
-            Some("done") => {
-                let rect = &report["rect"];
-                let width =
-                    web_surface_eval_json(desktop, native_id, WEB_SHOT_DOC_WIDTH_JS).await?;
-                let width: String = serde_json::from_str(&width).unwrap_or(width);
-                return Ok(Some(dioxus::desktop::PageCrop {
-                    x: rect["x"].as_f64().unwrap_or(0.0),
-                    y: rect["y"].as_f64().unwrap_or(0.0),
-                    w: rect["w"].as_f64().unwrap_or(0.0),
-                    h: rect["h"].as_f64().unwrap_or(0.0),
-                    css_width: width.trim().parse().unwrap_or(0.0),
-                }));
-            }
-            _ => continue,
-        }
-    }
-    Err("the area selection timed out (60s)".to_string())
-}
-
-/// Serve one LEGACY BROWSER CHORD (`WEB_PAGE_CHORDS`). `true` when this layer
-/// owns the id, so the terminus knows not to hand it on to the keytip dispatch.
-///
-/// ⭐ **Every arm here routes to a verb this app ALREADY had**, and that is the
-/// design: none of these keys is a new capability, they are keyboard doors onto
-/// affordances that existed only for the mouse. `web.reload` lands on
-/// `web_surface_reload_active_tab` — THE reload owner, the same one the ⟳
-/// button uses; `web.tab.new` lands on `open_web_surface_tab`, THE UI opener,
-/// which is what makes "a new tab is typing-ready" true for the keyboard
-/// without anybody writing the focus call a fourth time; `web.tab.close` lands
-/// on the row menu's own close plan, so the app tab refuses to close from the
-/// keyboard exactly as it refuses from the menu.
-///
-/// A chord that finds no live surface does NOTHING and says so with `true`
-/// anyway. It is still this layer's key — handing it to `dispatch_keytip_node`
-/// would look up a command id that does not exist, which is a silent no-op with
-/// an extra step.
-fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
-    let Some(session) = state
-        .peek()
-        .server
-        .active_session_path()
-        .map(str::to_string)
-    else {
-        return WEB_PAGE_CHORDS.iter().any(|chord| chord.id == id);
-    };
-    match id {
-        "web.reload" => {
-            state.with_mut(|shell| shell.web_surface_reload_active_tab(&session));
-        }
-        "web.reload.hard" => {
-            // Straight to the engine, because the cache bypass has no `wry`
-            // spelling and therefore no reload-nonce spelling either. Named on
-            // failure rather than swallowed: a hard reload that silently did
-            // nothing is indistinguishable from a page that legitimately did
-            // not change.
-            if let Ok((_, native_id)) = resolve_live_web_surface(&state, None)
-                && let Err(error) = window().reload_web_surface_bypass_cache(native_id)
-            {
-                state.with_mut(|shell| {
-                    shell.push_notification(
-                        NotificationTone::Warning,
-                        "Could Not Hard Reload",
-                        error,
-                    )
-                });
-            }
-        }
-        "web.tab.new" => {
-            open_web_surface_tab(state, &session, WebTabOpenRequest::blank());
-        }
-        "web.address" => {
-            // Focus AND select, so the next keystroke replaces the URL rather
-            // than appending to it — which is what every other browser does and
-            // what `focus_web_omnibox` already implements for the "+" path.
-            focus_web_omnibox(state);
-        }
-        "web.tab.close" => {
-            let active = state
-                .peek()
-                .web_surfaces
-                .get(&session)
-                .map(|surface| surface.active_tab);
-            if let Some(tab) = active {
-                state.with_mut(|shell| {
-                    shell.apply_web_tab_menu_action(&session, &WebTabMenuAction::CloseTab(tab))
-                });
-            }
-        }
-        "web.devtools" => {
-            if let Ok((_, native_id)) = resolve_live_web_surface(&state, None) {
-                let _ = window().toggle_web_surface_devtools(native_id);
-            }
-        }
-        _ => return false,
-    }
-    true
-}
 fn terminal_should_accept_input(
     active_view_mode: WorkspaceViewMode,
     active_session_path: Option<&str>,
@@ -128524,13 +127955,11 @@ mod tests {
     /// The table the window claimer matches, as a VALUE — the behavioural half
     /// of the escape lock below.
     ///
-    /// TWO POPULATIONS, opposite policies, and the difference is the whole
-    /// design: every LEGACY BROWSER chord is `page_only` (a bare `Ctrl+<letter>`
-    /// or a bare function key belongs to the terminal unless a browser is in
-    /// front), while the fullscreen accelerator is claimed whatever holds the
-    /// keyboard because it is the way OUT.
+    /// Two rows, two opposite policies, and the difference is the whole design:
+    /// `Ctrl+F` is a browser key (`page_only`) that also needs the keyboard
+    /// brought home (`focus_shell`); the fullscreen accelerator is neither.
     #[test]
-    fn the_claim_table_is_two_populations_with_opposite_policies() {
+    fn the_claim_table_is_two_rows_with_opposite_policies() {
         let table = claimed_chords_for(&KeymapConfig::default());
 
         let find = table
@@ -128577,145 +128006,12 @@ mod tests {
             "leaving fullscreen must not also take the keyboard off the page"
         );
 
-        // EVERY legacy browser chord is `page_only`. This is the invariant
-        // that makes the layer legal at all: claimed app-wide, `Ctrl+R` would
-        // eat readline's reverse-search and `F5` a TUI's refresh, in every
-        // terminal in the app.
-        for chord in WEB_PAGE_CHORDS {
-            let row = table
-                .iter()
-                .find(|entry| entry.id == chord.id)
-                .unwrap_or_else(|| {
-                    panic!("{} must be claimed or {} is deaf", chord.chord, chord.id)
-                });
-            assert!(
-                row.page_only,
-                "{} is a BROWSER key and must never be claimed over a terminal",
-                chord.chord
-            );
-        }
-
-        // The four the user named are present under the ids the terminus
-        // serves, so a rename on one side alone cannot silently un-bind them.
-        for (spelling, id) in [
-            ("F5", "web.reload"),
-            ("Ctrl+R", "web.reload"),
-            ("Ctrl+T", "web.tab.new"),
-            ("F12", "web.devtools"),
-        ] {
-            assert!(
-                WEB_PAGE_CHORDS
-                    .iter()
-                    .any(|chord| chord.chord == spelling && chord.id == id),
-                "{spelling} must still mean {id}"
-            );
-        }
-
         assert_eq!(
             table.len(),
-            WEB_PAGE_CHORDS.len() + WINDOW_CLAIMED_ACCEL_COMMANDS.len(),
-            "the table is the WHOLE claimed set: the legacy browser layer plus \
-             the escape accelerators, and nothing else. Ctrl+P (print) is \
-             deliberately absent because there is no print path to route it \
-             to: {table:?}"
+            2,
+            "the table is the WHOLE claimed set — Ctrl+P (print) is deliberately \
+             absent because there is no print path to route it to: {table:?}"
         );
-    }
-
-    /// ⛔ **THE TWO KEYBOARD LAYERS MUST NOT OVERLAP**, and this holds them
-    /// apart by name rather than by anyone remembering to check.
-    ///
-    /// The ALT layer owns a clean ALT tap plus the registered accelerators,
-    /// every one of which `keytip::assert_accels_pty_safe` forbids from being a
-    /// bare `Ctrl+<letter>` or a bare function key. The legacy browser layer
-    /// owns exactly those forbidden shapes, `page_only`. If a legacy chord ever
-    /// became an accelerator too, one keypress would fire both layers — and the
-    /// user would see a shortcut that does two things.
-    #[test]
-    fn no_legacy_browser_chord_is_also_an_accelerator() {
-        let accels = keytip::effective_accelerators(&KeymapConfig::default());
-        for legacy in WEB_PAGE_CHORDS {
-            let chord =
-                Chord::parse(legacy.chord).unwrap_or_else(|| panic!("{} must parse", legacy.chord));
-            assert!(
-                !accels.iter().any(|(_, accel)| *accel == chord),
-                "{} is claimed by BOTH keyboard layers — one press would fire \
-                 the browser verb and the ALT layer's command",
-                legacy.chord
-            );
-        }
-    }
-
-    /// The page menu's entries and the terminus that serves them are ONE list.
-    ///
-    /// An entry with no arm is a menu item that does nothing when clicked,
-    /// which is the worst possible outcome for a contributed menu: the user
-    /// concludes the whole feature is broken. Source-read because the arms are
-    /// a `match` on `&str`.
-    #[test]
-    fn every_page_menu_entry_has_an_arm_at_the_terminus() {
-        let source = include_str!("shell.rs");
-        let dispatch = source
-            .split(
-                "fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {",
-            )
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("shell.rs must define the page-menu terminus");
-        for (id, label) in WEB_PAGE_MENU_ITEMS {
-            assert!(
-                dispatch.contains(&format!("{id:?} =>")),
-                "the page menu offers {label:?} ({id:?}) but the terminus has \
-                 no arm for it — the entry would do nothing:\n{dispatch}"
-            );
-            assert!(
-                !label.is_empty() && !id.is_empty(),
-                "a contributed entry needs both an id and a label; the empty id \
-                 is reserved for a separator"
-            );
-        }
-        // The four regions of the page menu are the four regions of the
-        // ychrome engine's `/engine/shot`, in one vocabulary — a human
-        // clicking "full page" and an agent sending `region=full` must get the
-        // same picture.
-        for region in ["viewport", "full", "element", "area"] {
-            assert!(
-                WEB_PAGE_MENU_ITEMS
-                    .iter()
-                    .any(|(id, _)| *id == format!("web.shot.{region}")),
-                "the page menu must offer the {region} region"
-            );
-        }
-    }
-
-    /// The terminus SERVES every id the table claims.
-    ///
-    /// A chord in the table with no arm at the terminus is a key that consumes
-    /// itself and does nothing, which is worse than never claiming it: the
-    /// page's own handler does not run either. Source-read because the arms are
-    /// a `match` on `&str` and there is no runtime list of them.
-    #[test]
-    fn every_claimed_legacy_chord_has_an_arm_at_the_terminus() {
-        let source = include_str!("shell.rs");
-        let dispatch = source
-            .split("fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("shell.rs must define the legacy chord terminus");
-        for legacy in WEB_PAGE_CHORDS {
-            if legacy.id == WEB_FIND_CHORD_ID {
-                // Find is served one branch EARLIER, at the bridge terminus,
-                // because it predates this layer and shares its opener with the
-                // shell's own Ctrl+F keydown.
-                continue;
-            }
-            assert!(
-                dispatch.contains(&format!("{:?} =>", legacy.id)),
-                "{} claims {:?} but the terminus has no arm for it — the key \
-                 would eat itself and do nothing:\n{dispatch}",
-                legacy.chord,
-                legacy.id
-            );
-        }
     }
 
     /// A REBIND is honoured, and an inexpressible chord is refused rather than

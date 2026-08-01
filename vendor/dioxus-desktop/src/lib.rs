@@ -36,7 +36,8 @@ pub use web_surface_clipboard_image_paste::CLIPBOARD_IMAGE_PASTE_SHIM_JS;
 )))]
 pub use web_surface::{
     ClaimedChord, CookieRecord, EvalFailure, EvalFailureKind, FindAction,
-    INJECTION_CREDIT_TTL_MS, SurfaceCloseRequest, SurfaceDownloadEvent, SurfaceDownloadPhase,
+    INJECTION_CREDIT_TTL_MS, PageCrop, PageMenuInvocation, PageMenuItem, PageSnapshotRegion,
+    SurfaceCloseRequest, SurfaceDownloadEvent, SurfaceDownloadPhase,
     SurfaceLiveness, SurfaceMediaPermissionKind, SurfaceMediaPermissionRequest, SurfacePopup,
     SurfaceUserscript, grant_injection_credits,
     grant_injection_credits_at, note_seat_input, note_seat_input_at, take_seat_input_count,

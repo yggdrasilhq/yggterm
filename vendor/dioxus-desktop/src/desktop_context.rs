@@ -1028,6 +1028,65 @@ impl DesktopService {
         }
     }
 
+    /// TOGGLE the inspector on an open web surface, answering its new state.
+    ///
+    /// One call rather than a read the caller then acts on, because the two
+    /// halves must not be separable: F12 pressed twice quickly with a read
+    /// between them can flip the same way twice.
+    pub fn toggle_web_surface_devtools(&self, id: u64) -> Result<bool, String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => {
+                    let open = host.devtools_open(id)?;
+                    host.set_devtools_open(id, !open)
+                }
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Reload an open web surface bypassing the HTTP cache (Ctrl+Shift+R).
+    pub fn reload_web_surface_bypass_cache(&self, id: u64) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.reload_bypass_cache(id),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Open/close the inspector (devtools) on an open web surface. Returns
     /// whether devtools are open after the call.
     pub fn set_web_surface_devtools(&self, id: u64, open: bool) -> Result<bool, String> {
@@ -1226,6 +1285,68 @@ impl DesktopService {
         {
             let _ = (id, path, callback);
             Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Capture one REGION of web surface `id`, optionally cropped, to a PNG.
+    /// The callback receives the written `(width, height)` in device pixels.
+    pub fn snapshot_web_surface_region(
+        &self,
+        id: u64,
+        region: crate::web_surface::PageSnapshotRegion,
+        crop: Option<crate::web_surface::PageCrop>,
+        path: std::path::PathBuf,
+        callback: impl FnOnce(Result<(i32, i32), String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.snapshot_region(id, region, crop, path, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, region, crop, path, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Replace the entries the shell contributes to every page's WebKit context
+    /// menu. Idempotent; re-pushed on every bridge (re)install.
+    pub fn set_web_surface_page_menu_items(
+        &self,
+        items: Vec<crate::web_surface::PageMenuItem>,
+    ) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            if let Some(host) = self.web_surface_host.borrow().as_ref() {
+                host.set_page_menu_items(items);
+            }
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = items;
         }
     }
 
