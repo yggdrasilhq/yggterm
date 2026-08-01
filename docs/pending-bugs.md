@@ -237,6 +237,35 @@ symptoms, and the last two are strongly suspected to share a root:
 
 ## Standing traps / other open bugs
 
+- **★★ THE APP ACTION POST DOES NOT NAME ITS SESSION, AND THE DOCUMENT CHANNEL IS
+  SESSION-SCOPED (oc, 2026-08-01). Cost: a 2.5-hour silent hang in yRDP.**
+  `document_pane_run_action` (`shell.rs:49802`) and `app_pane_run_action`
+  (`shell.rs:50203`) both send `{"pane", "action", "values", "value_keys"}` —
+  **no session** — and `app_pane_schema_url` adds none either. Yet the document
+  channel is session-scoped on OUR side and says so in its own doc comment: the
+  GUI resolves `control_url` *from* `session_path`
+  (`sidebar_control_url(&session_path)`), fetches per session, and applies the
+  reply per session. We know exactly which session acted and decline to say.
+  **What it costs an app.** A libyggterm app whose daemon is per-HOST but whose
+  view clients are per-SESSION cannot address its own answer. yRDP declares
+  `{"session": …}` on the OSC, does the work, and then has nowhere to send the
+  result: the connect outcome was filed under `""` while the client polled
+  `/events?session=<its id>`. The operator watched **"Connecting"** for two and a
+  half hours with the guest up, the RDP session live, and the viewer URL built
+  and finished in a mailbox with no reader. **No error, no log, nothing wrong to
+  find** — and the placeholder text ("a guest that is not running is started
+  first") actively pointed at the wrong subsystem.
+  **The fix**: echo the session the app declared back on the wire — the pane
+  fetch and the action POST of the document channel at minimum. It is page
+  context exactly like `host`/`zoom`/`secure`, which we already send, and it is
+  the one piece of context the app cannot derive.
+  ⚠ **Every future libyggterm app with a durable per-host daemon hits this**, and
+  it fails SILENTLY and looks like the app's bug. yRDP now works around it by
+  registering clients on their own poll and refusing by name when it is genuinely
+  ambiguous (`daemon.py:route` in github.com/yggdrasilhq/yRDP, and §5 of its
+  `docs/architecture.md`) — that fallback is written to go cold the moment this
+  is fixed, so it does not need removing first.
+
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
   refuse-exit landmine (user-reported 2026-07-30 night; live-diagnosed and
   CURED on the live host, the DESIGN fix still owed).** Deploying a new
