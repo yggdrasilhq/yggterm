@@ -47,7 +47,67 @@ fix) once the fix is verified live on jojo.
   **The habit stands regardless: before trusting ANY test in a report, mutate
   the production call site yourself.**
 
-## ⭐ A revealed web surface kept its OLD size — FIXED IN CODE, NOT YET LIVE (2026-08-01)
+## 💬 DISCUSSION for the dev agent — a remote desktop wears browser chrome, and the protocol cannot say otherwise (2026-08-01)
+
+**Not a bug report and not a decided fix — a design call that needs one.** Filed
+from an end-to-end UX pass over yRDP driven the way a person drives it (a
+throwaway shadow client, a scratch Xvfb+VNC target, real pointer clicks through
+`server app pointer`), because the thing that stood out was not broken, it was
+*wrong-looking*.
+
+**What you see.** Connect to a remote desktop from the yRDP chooser and the
+desktop is revealed as a web surface — correct, that IS the transport (x11vnc →
+websockify → a noVNC page on loopback). What comes with it is the whole browser:
+
+- an address bar reading `http://127.0.0.1:6102/index.html?quality=9&compression=0&bg=262a33`
+- back / forward / reload / history buttons
+- the tab rail, listing this "tab" beside unrelated ones
+
+None of that is addressable by the user in any useful way. The URL is a bridge
+detail — a port yRDP chose seconds ago — and it is the one piece of text in the
+window that looks like something you could type into. Reload re-dials the
+bridge; Back has nowhere to go. A Windows desktop is not a page you browse, and
+the frame says it is.
+
+**Why it cannot be fixed app-side today.** `TerminalEvent::WebSurface` carries
+`{action, session, url, title, profile, start_page}` — there is no presentation
+field, so an app has no way to say "this surface is not a web page". On the
+GUI's side `web_chrome_hidden` already exists and already does exactly the right
+thing (omnibox, find bar and tab strip all collapse) but it is wired to ONE
+input: `snapshot.page_fullscreen`, i.e. an element-fullscreen page. The
+mechanism is built; nothing but the engine can reach it.
+
+**The shape of the decision** (the dev agent's to make, and the reason this is
+here rather than in a commit):
+
+1. **A declared flag** — `bare: true` / `presentation: "surface"` on the
+   web-surface open, feeding the existing `web_chrome_hidden`. Smallest change,
+   and it puts the choice with the app that knows what the surface IS. Cost: a
+   protocol field, and a permanent question of who else gets to claim it (a page
+   that hides the address bar is also how a phishing surface would like to
+   render — worth stating that the flag comes off the PTY, which a page cannot
+   write, so the trust boundary is the same one the declare already has).
+2. **Infer it** — no chrome for a surface whose URL is loopback and whose opener
+   declared a viewport pane. No protocol change; a heuristic that will be wrong
+   for the next app, and inference is what the geometry contract's whole story
+   is about not doing.
+3. **A third surface kind** beside terminal and document — honest, and much more
+   work: it needs its own context menu, its own switch in the titlebar, its own
+   place in the presentation policy.
+4. **Leave it.** Defensible while yRDP is the only consumer and the operator is
+   the only user. It stops being defensible the moment a remote desktop is
+   something a customer sees.
+
+**What is NOT in question:** the surface plumbing itself is right — one canonical
+session, N viewers, scaled never resized. This is only about what the GUI draws
+around it.
+
+Evidence and repro live in this session's yRDP UX pass; the scratch target
+recipe (two `*.toml` files, Xvfb + x11vnc, `YRDP_TARGETS_DIR`/`YRDP_STATE_DIR`
+pointed at a temp dir) reproduces the whole flow on any host with no guest and
+no risk to a live one.
+
+## ⭐ A revealed web surface kept its OLD size — FIXED AND VERIFIED LIVE ON 2.12.24 (2026-08-01)
 
 User report, with a screenshot of a yRDP desktop sitting 132 px to the right of
 where it belongs and its far edge cut off: *"My viewport does not auto resize…
