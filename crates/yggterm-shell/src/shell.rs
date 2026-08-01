@@ -11529,6 +11529,70 @@ async fn web_surface_native_reconcile_loop(
                 }),
             );
         }
+        // CAMERA AND MICROPHONE. A page called `getUserMedia()` (or asked for
+        // device labels) and WebKitGTK is BLOCKED on the answer — the promise is
+        // neither resolved nor rejected until something here settles it.
+        //
+        // The owner lookup is best-effort ON PURPOSE. It decides only whether a
+        // remembered decision can be consulted and written; an unresolvable
+        // surface (a popup adopted after this tick, a session that just went
+        // away) still PROMPTS. That is the safe direction in both senses: it
+        // never auto-allows, and it never silently refuses a page the user is
+        // looking at because the shell lost track of which row it belongs to.
+        for request in desktop.take_web_surface_media_permission_requests() {
+            let session_path = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == request.surface_id)
+                .map(|((session_path, _), _)| session_path.clone());
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "media_permission_request",
+                json!({
+                    "request_id": request.request_id,
+                    "native_id": request.surface_id,
+                    "session_path": session_path,
+                    "kind": request.kind.as_str(),
+                    "audio": request.audio,
+                    "video": request.video,
+                    "uri": request.uri,
+                }),
+            );
+            spawn(begin_media_capture_decision(
+                state,
+                desktop.clone(),
+                trace_home.clone(),
+                request,
+                session_path,
+            ));
+        }
+        // Asks that ended without a human: the engine's deadline fired, or the
+        // surface closed under the prompt. Both already DENIED engine-side; what
+        // is left is to take down a dialog that no longer stands for anything.
+        for request_id in desktop.take_web_surface_retired_media_permissions() {
+            let mut writable = state;
+            let cleared = writable.with_mut(|shell| {
+                if shell
+                    .pending_media_capture
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    shell.pending_media_capture = None;
+                    return true;
+                }
+                false
+            });
+            if cleared {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "media_permission_retired",
+                    json!({ "request_id": request_id }),
+                );
+            }
+        }
         // Downloads. A link that saves a file used to be INVISIBLE, not inert:
         // wry's own default handler answered WebKit's `decide-destination` with
         // a path it guessed itself (`dirs::download_dir()`, or the GUI's CWD
@@ -13995,6 +14059,11 @@ struct ShellState {
     /// A libyggterm app's passkey ceremony awaiting the user's presence, or
     /// `None`. At most one dialog at a time — WebAuthn ceremonies are serial.
     pending_fido2: Option<PendingFido2Dialog>,
+    /// A page's camera/microphone ask awaiting the user's answer, or `None`.
+    /// At most ONE: a second ask arriving while this is up is DENIED outright
+    /// rather than queued, so a page cannot stack prompts until one is clicked
+    /// through by accident.
+    pending_media_capture: Option<PendingMediaCaptureDialog>,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct DockSignature {
@@ -14233,6 +14302,42 @@ struct PendingFido2Dialog {
     /// The page origin the ceremony runs on, shown so the user sees who is asking.
     origin: String,
 }
+/// A page asking for the CAMERA or the MICROPHONE, awaiting the user's answer.
+///
+/// WebKitGTK raised `permission-request` on a web surface; the engine layer
+/// parked it (`vendor/dioxus-desktop/src/web_surface.rs`, HARDWARE CAPTURE) and
+/// the page's `getUserMedia()` promise is hanging on this dialog. Every exit
+/// from here resolves it — approve, block, dismiss, Escape, backdrop click,
+/// timeout, or the surface closing underneath it.
+///
+/// ⛔ There is no "allow" default anywhere on this path. yggterm's window holds
+/// live ssh sessions and a password vault; a page that could open the camera
+/// without this dialog would be a serious defect, not a convenience.
+#[derive(Clone, PartialEq, Eq)]
+struct PendingMediaCaptureDialog {
+    /// The parked engine request's host-local id. The ONLY handle that answers
+    /// it; the engine object never crosses into the shell.
+    request_id: u64,
+    /// The native web surface the asking page lives on. Diagnostic — the answer
+    /// is routed by `request_id`, not by this.
+    surface_id: u64,
+    /// The session whose app owns the per-origin memory, or `None` when the
+    /// surface could not be resolved to one. `None` still PROMPTS (never
+    /// auto-denies and never auto-allows); it only means nothing is remembered.
+    session_path: Option<String>,
+    /// The origin the app normalised this page to, e.g. `https://meet.example.com`.
+    /// `None` ⇒ a document with no origin a decision could be keyed to (a
+    /// `file://` page, a blank tab): it can still be allowed ONCE, but nothing
+    /// about it is written down.
+    origin: Option<String>,
+    /// What the address bar shows, always non-empty even when `origin` is `None`,
+    /// because the human has to be told who is asking.
+    display: String,
+    /// The page asked for a microphone.
+    audio: bool,
+    /// The page asked for a camera.
+    video: bool,
+}
 #[derive(Clone, Debug)]
 struct PreviewSyncFailure {
     message: String,
@@ -14467,6 +14572,7 @@ struct RenderSnapshot {
     drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
     pending_fido2: Option<PendingFido2Dialog>,
+    pending_media_capture: Option<PendingMediaCaptureDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
     pending_classic_tabs_switch: bool,
     web_tab_rename: Option<(String, String)>,
@@ -15868,6 +15974,7 @@ impl ShellState {
             suppress_sidebar_autoscroll_until_ms: 0,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             pending_classic_tabs_switch: false,
             web_tab_rename: None,
@@ -16801,6 +16908,7 @@ impl ShellState {
             drag_pointer: self.drag_pointer,
             pending_delete: self.pending_delete.clone(),
             pending_fido2: self.pending_fido2.clone(),
+            pending_media_capture: self.pending_media_capture.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             pending_classic_tabs_switch: self.pending_classic_tabs_switch,
             web_tab_rename: self.web_tab_rename.clone(),
@@ -18239,6 +18347,7 @@ impl ShellState {
             // opened a dialog the ALT layer could not operate.
             self.keymap_editor_open,
             self.theme_editor_open,
+            self.pending_media_capture.is_some(),
             self.pending_fido2.is_some(),
             self.pending_delete.is_some(),
             self.copy_edit_dialog.is_some(),
@@ -37895,6 +38004,11 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
         // random access where Tab would be 34 presses. Enter belongs to the
         // rebind field it is typed in, so it is not advertised.
         TopModal::KeymapEditor => &[("Esc", "close")],
+        // Same contract as the passkey dialog and for the same reason: Escape
+        // declines (dismissing is always safe), and Enter is deliberately NOT
+        // advertised because approving hardware access must stay an explicit
+        // pointer gesture a stray keystroke cannot make.
+        TopModal::MediaCapture => &[("Esc", "block")],
         TopModal::Fido2 => &[("Esc", "dismiss")],
         TopModal::Delete => &[("Enter", "delete"), ("Esc", "cancel")],
         TopModal::ClassicTabsSwitch => &[("Enter", "switch"), ("Esc", "cancel")],
@@ -37928,6 +38042,28 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
             if dismiss {
                 state.with_mut(|shell| shell.set_theme_editor_open(false));
             }
+            true
+        }
+        TopModal::MediaCapture => {
+            let Some(dialog) = state.with(|shell| shell.pending_media_capture.clone()) else {
+                return false;
+            };
+            if dismiss {
+                // Escape DENIES. Not "close the dialog and leave the page
+                // waiting" — the engine is blocked on this and the page's
+                // promise has to settle, and the only settlement a dismissal can
+                // mean is a refusal.
+                resolve_media_capture_dialog(
+                    state,
+                    dioxus_desktop::window(),
+                    dialog,
+                    MediaCaptureAnswer::DenyOnce,
+                );
+                return true;
+            }
+            // Enter is SWALLOWED, never acted on. A page raises this prompt at a
+            // moment the user did not choose — possibly mid-typing — and a
+            // stray Enter must not be able to hand over a camera.
             true
         }
         TopModal::Fido2 => {
@@ -39595,6 +39731,11 @@ enum TopModal {
     KeymapEditor,
     /// The theme editor, raised over the whole window from Settings.
     ThemeEditor,
+    /// A page asking for the camera or the microphone. Above `Fido2` in the
+    /// stack for the same reason `Fido2` is above `Delete`: it is raised by a
+    /// PAGE, at a moment the user did not choose, and the keys must belong to
+    /// the thing that grants hardware.
+    MediaCapture,
     Fido2,
     Delete,
     CopyEdit,
@@ -39657,6 +39798,7 @@ impl TopModal {
             TopModal::ThemeEditor | TopModal::CopyEdit => ModalKeyboardMode::Form,
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
+            | TopModal::MediaCapture
             | TopModal::Fido2
             | TopModal::Delete
             | TopModal::ClassicTabsSwitch
@@ -39673,6 +39815,7 @@ impl TopModal {
         match self {
             TopModal::KeymapEditor => "keymap-editor",
             TopModal::ThemeEditor => "theme-editor",
+            TopModal::MediaCapture => "media-capture",
             TopModal::Fido2 => "fido2",
             TopModal::Delete => "delete",
             TopModal::CopyEdit => "copy-edit",
@@ -39688,6 +39831,7 @@ impl TopModal {
         match self {
             TopModal::KeymapEditor => "KeyTips",
             TopModal::ThemeEditor => "Theme",
+            TopModal::MediaCapture => "Camera",
             TopModal::Fido2 => "Passkey",
             TopModal::Delete => "Confirm",
             TopModal::CopyEdit => "Edit",
@@ -39720,6 +39864,7 @@ fn strip_dropdown_over_viewport(
 fn top_modal_of(
     keymap_editor: bool,
     theme_editor: bool,
+    media_capture: bool,
     fido2: bool,
     delete: bool,
     copy_edit: bool,
@@ -39734,6 +39879,11 @@ fn top_modal_of(
     }
     if theme_editor {
         return Some(TopModal::ThemeEditor);
+    }
+    // A capture ask outranks a passkey ceremony: both are page-initiated, and
+    // the one that hands over a microphone must be the one the keys reach.
+    if media_capture {
+        return Some(TopModal::MediaCapture);
     }
     if fido2 {
         return Some(TopModal::Fido2);
@@ -39758,6 +39908,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
     top_modal_of(
         snapshot.keymap_editor_open,
         snapshot.theme_editor_open,
+        snapshot.pending_media_capture.is_some(),
         snapshot.pending_fido2.is_some(),
         snapshot.pending_delete.is_some(),
         snapshot.copy_edit_dialog.is_some(),
@@ -39858,6 +40009,7 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         || snapshot.pending_classic_tabs_switch
         || snapshot.copy_edit_dialog.is_some()
         || snapshot.pending_fido2.is_some()
+        || snapshot.pending_media_capture.is_some()
         || snapshot.theme_editor_open
         // The ALT+ KeyTips editor is a full-window dialog like the theme editor
         // beside it; it joined `top_modal` (§4 — it owns the keys while it is up)
@@ -58380,6 +58532,317 @@ fn resolve_fido2_dialog(
         })
         .await;
     });
+}
+
+/// The route a capture decision is read from and written to on a libyggterm
+/// app's control endpoint. ONE spelling, beside `app_policy_url` and friends.
+fn app_media_permission_url(control_url: &str) -> String {
+    format!("{}/media-permission", control_url.trim_end_matches('/'))
+}
+
+/// The same route with the question attached: this origin, these devices.
+fn app_media_permission_query_url(control_url: &str, origin: &str, audio: bool, video: bool) -> String {
+    format!(
+        "{}?origin={}&audio={}&video={}",
+        app_media_permission_url(control_url),
+        ping_query_encode(origin),
+        if audio { 1 } else { 0 },
+        if video { 1 } else { 0 },
+    )
+}
+
+/// What the app remembers about an origin's camera/microphone, as the GUI reads
+/// it back. ⛔ `Ask` is the fallback for EVERY unrecognised state — a missing
+/// route, a 404, an unparseable body, a word this build does not know. Never
+/// `Allow`: an app that cannot answer must not be able to grant hardware.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MediaCaptureVerdict {
+    Allow,
+    Deny,
+    Ask,
+}
+
+impl MediaCaptureVerdict {
+    /// Read the app's `decision` word. Anything else is [`Self::Ask`].
+    fn from_reply(reply: &serde_json::Value) -> MediaCaptureVerdict {
+        match reply.get("decision").and_then(|value| value.as_str()) {
+            Some("allow") => MediaCaptureVerdict::Allow,
+            Some("deny") => MediaCaptureVerdict::Deny,
+            _ => MediaCaptureVerdict::Ask,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaCaptureVerdict::Allow => "allow",
+            MediaCaptureVerdict::Deny => "deny",
+            MediaCaptureVerdict::Ask => "ask",
+        }
+    }
+}
+
+/// What the human clicked on the capture dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MediaCaptureAnswer {
+    /// Allow, and ask the app to remember it for this origin.
+    Allow,
+    /// Refuse this one ask and remember nothing — Escape, the backdrop, "Not
+    /// now". The site is free to ask again.
+    DenyOnce,
+    /// Refuse and ask the app to remember it, so the site stops asking.
+    BlockSite,
+}
+
+impl MediaCaptureAnswer {
+    /// Does the page get the device? The one place this question is answered,
+    /// so a new answer variant cannot accidentally read as a grant.
+    fn allows(self) -> bool {
+        matches!(self, MediaCaptureAnswer::Allow)
+    }
+
+    /// The decision word to persist, or `None` to remember nothing.
+    fn remembered(self) -> Option<&'static str> {
+        match self {
+            MediaCaptureAnswer::Allow => Some("allow"),
+            MediaCaptureAnswer::BlockSite => Some("deny"),
+            MediaCaptureAnswer::DenyOnce => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaCaptureAnswer::Allow => "allow",
+            MediaCaptureAnswer::DenyOnce => "deny-once",
+            MediaCaptureAnswer::BlockSite => "block-site",
+        }
+    }
+}
+
+/// A page asked for the camera or the microphone: consult the app that owns the
+/// per-origin memory, then either answer straight away or put a dialog up.
+///
+/// The engine is BLOCKED on this ask the whole time (the page's `getUserMedia()`
+/// promise is neither resolved nor rejected), so every branch here ends in
+/// either a resolution or a dialog that will produce one. The engine's own
+/// deadline is the backstop if this task never finishes at all.
+///
+/// ⛔ The `Ask` fallback is load-bearing. No control endpoint, an app that does
+/// not implement the route, a timeout, a 403, a garbled body — all of them land
+/// on the dialog, never on a grant and never on a silent refusal. The GUI keeps
+/// no memory of its own: ychrome owns the decision, and a second copy here would
+/// be a second thing that can disagree with what the settings pane shows.
+async fn begin_media_capture_decision(
+    mut state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    trace_home: PathBuf,
+    request: dioxus_desktop::SurfaceMediaPermissionRequest,
+    session_path: Option<String>,
+) {
+    let is_capture = request.kind == dioxus_desktop::SurfaceMediaPermissionKind::Capture;
+    let control = session_path.as_deref().and_then(|path| {
+        state
+            .peek()
+            .sidebar_control_url(path)
+            .map(|url| (url, state.peek().sidebar_control_token(path)))
+    });
+    let mut origin: Option<String> = None;
+    let verdict = match (&control, request.uri.is_empty()) {
+        (Some((control_url, token)), false) => {
+            let url = app_media_permission_query_url(
+                control_url,
+                &request.uri,
+                request.audio,
+                request.video,
+            );
+            let token = token.clone();
+            let fetched =
+                task::spawn_blocking(move || control_request(&url, None, token.as_deref()))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("media policy fetch panicked: {error}")));
+            match fetched {
+                Ok(reply) => {
+                    origin = reply
+                        .get("origin")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    MediaCaptureVerdict::from_reply(&reply)
+                }
+                // The app could not be reached or refused. A human decides.
+                Err(_) => MediaCaptureVerdict::Ask,
+            }
+        }
+        // No app owns this surface's policy, or the page has no URL at all.
+        // Nothing is remembered, so a human decides every time.
+        _ => MediaCaptureVerdict::Ask,
+    };
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "web_surface",
+        "media_permission_policy",
+        json!({
+            "request_id": request.request_id,
+            "native_id": request.surface_id,
+            "session_path": session_path,
+            "kind": request.kind.as_str(),
+            "audio": request.audio,
+            "video": request.video,
+            "origin": origin,
+            "verdict": verdict.as_str(),
+        }),
+    );
+    // `enumerateDevices()` NEVER prompts. Device labels are the privacy leak the
+    // separate request type exists for, and the rule every browser follows is
+    // that they appear only where capture is ALREADY allowed for the site. So a
+    // standing grant reveals them and anything else hides them — which is a
+    // refusal of the LABELS, not of the device list: WebKit still enumerates,
+    // with the labels blanked.
+    if !is_capture {
+        desktop.resolve_web_surface_media_permission(
+            request.request_id,
+            verdict == MediaCaptureVerdict::Allow,
+        );
+        return;
+    }
+    match verdict {
+        MediaCaptureVerdict::Allow | MediaCaptureVerdict::Deny => {
+            desktop.resolve_web_surface_media_permission(
+                request.request_id,
+                verdict == MediaCaptureVerdict::Allow,
+            );
+        }
+        MediaCaptureVerdict::Ask => {
+            // One prompt at a time. A second ask arriving while one is up is
+            // DENIED rather than queued: a page that can stack prompts can wait
+            // for one to be clicked through by accident.
+            let displaced = state.with_mut(|shell| {
+                if shell.pending_media_capture.is_some() {
+                    return true;
+                }
+                shell.pending_media_capture = Some(PendingMediaCaptureDialog {
+                    request_id: request.request_id,
+                    surface_id: request.surface_id,
+                    session_path: session_path.clone(),
+                    origin: origin.clone(),
+                    display: media_capture_display_origin(&request.uri),
+                    audio: request.audio,
+                    video: request.video,
+                });
+                false
+            });
+            if displaced {
+                desktop.resolve_web_surface_media_permission(request.request_id, false);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "media_permission_denied_busy",
+                    json!({ "request_id": request.request_id }),
+                );
+            }
+        }
+    }
+}
+
+/// Answer the capture dialog: resolve the parked engine request, then persist
+/// the decision if the user asked for it to be remembered.
+///
+/// Order matters. The engine request is resolved FIRST and unconditionally — a
+/// failed or slow write to the app must never leave the page hanging, and a
+/// grant the user made must not depend on a network round trip succeeding.
+fn resolve_media_capture_dialog(
+    mut state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    dialog: PendingMediaCaptureDialog,
+    answer: MediaCaptureAnswer,
+) {
+    let (control_url, control_token) = state.with_mut(|shell| {
+        // Clear it whichever way the user answered, so a second click cannot
+        // double-answer and the modal closes immediately.
+        if shell
+            .pending_media_capture
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == dialog.request_id)
+        {
+            shell.pending_media_capture = None;
+        }
+        let control = dialog
+            .session_path
+            .as_deref()
+            .and_then(|path| shell.sidebar_control_url(path));
+        let token = dialog
+            .session_path
+            .as_deref()
+            .and_then(|path| shell.sidebar_control_token(path));
+        (control, token)
+    });
+    // FIRST, and unconditionally: the engine is blocked on this ask.
+    desktop.resolve_web_surface_media_permission(dialog.request_id, answer.allows());
+    // Nothing to remember, nowhere to remember it, or no origin to key it to.
+    // The first is a deliberate "not now"; the last two are the honest answer
+    // for a page with no site identity (a `file://` document): it was allowed
+    // once, and once is all it gets.
+    let (Some(decision), Some(control_url), Some(origin)) =
+        (answer.remembered(), control_url, dialog.origin.clone())
+    else {
+        return;
+    };
+    let url = app_media_permission_url(&control_url);
+    // Only the devices the page actually ASKED for. A microphone-only ask must
+    // not silently write a camera decision the user never saw a prompt about.
+    let mut body = json!({ "origin": origin });
+    if dialog.audio {
+        body["microphone"] = json!(decision);
+    }
+    if dialog.video {
+        body["camera"] = json!(decision);
+    }
+    spawn(async move {
+        let _ = task::spawn_blocking(move || {
+            control_request(&url, Some(&body), control_token.as_deref())
+        })
+        .await;
+    });
+}
+
+/// What the dialog SHOWS as the asking site.
+///
+/// Deliberately derived from the raw page URL rather than from the app's
+/// normalised origin: the app may not have answered at all (that is the whole
+/// `Ask`-on-error path), and a prompt that cannot name who is asking is a prompt
+/// nobody can answer honestly. Falls back to the whole URL, then to a plain
+/// admission that the page has no address.
+fn media_capture_display_origin(uri: &str) -> String {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return "this page".to_string();
+    }
+    match uri.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            let authority = authority.rsplit('@').next().unwrap_or_default();
+            if authority.is_empty() {
+                uri.to_string()
+            } else {
+                format!("{scheme}://{authority}")
+            }
+        }
+        None => uri.to_string(),
+    }
+}
+
+/// The one sentence naming what the page would get. Pure, because the wording is
+/// the entire safety surface of this dialog: a prompt that says "microphone"
+/// while the page asked for a camera is a lie the user acts on.
+fn media_capture_devices_phrase(audio: bool, video: bool) -> &'static str {
+    match (audio, video) {
+        (true, true) => "your camera and microphone",
+        (true, false) => "your microphone",
+        (false, true) => "your camera",
+        // The engine denies a no-device ask before it ever reaches the shell,
+        // so this is unreachable — and still must not read as harmless.
+        (false, false) => "a capture device",
+    }
 }
 
 /// POST `{pane, action, values}` to the app and apply whatever comes back.
@@ -78451,6 +78914,26 @@ fn app() -> Element {
                             }
                         },
                         on_decline: move |_| resolve_fido2_dialog(state, dialog.clone(), false, None),
+                    }
+                }
+                // The capture prompt, mounted AFTER the passkey dialog so it
+                // paints above it — the reverse of `TopModal`'s topmost-first
+                // list, which is the convention this tree already follows.
+                if let Some(dialog) = snapshot.pending_media_capture.clone() {
+                    MediaCapturePresenceOverlay {
+                        dialog: dialog.clone(),
+                        palette: snapshot.palette,
+                        on_answer: {
+                            let dialog = dialog.clone();
+                            move |answer: MediaCaptureAnswer| {
+                                resolve_media_capture_dialog(
+                                    state,
+                                    dioxus_desktop::window(),
+                                    dialog.clone(),
+                                    answer,
+                                )
+                            }
+                        },
                     }
                 }
                 if snapshot.theme_editor_open {
@@ -121195,6 +121678,124 @@ fn Fido2PresenceOverlay(
         }
     }
 }
+/// The camera/microphone prompt. A page called `getUserMedia()`; WebKitGTK is
+/// blocked on the answer and every exit from this dialog settles it.
+///
+/// ⛔ Three deliberate choices, all of them safety:
+///
+/// * **The default action is not a grant.** The dismissal paths (Escape, the
+///   backdrop, "Not now") all DENY, and Enter is swallowed by the dispatcher —
+///   so no keystroke and no stray click can hand over a device.
+/// * **The site is named in monospace, verbatim.** A prompt whose subject the
+///   user cannot read is a prompt they cannot answer, and the whole class of
+///   attack here is looking like a different site.
+/// * **The wording names exactly what was asked for.** "Camera" when the page
+///   asked for a camera; never a generic "media" that a microphone-only ask
+///   could hide inside.
+#[component]
+fn MediaCapturePresenceOverlay(
+    dialog: PendingMediaCaptureDialog,
+    palette: Palette,
+    on_answer: EventHandler<MediaCaptureAnswer>,
+) -> Element {
+    let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
+    let devices = media_capture_devices_phrase(dialog.audio, dialog.video);
+    let glyph = if dialog.video {
+        // A camera when video is involved; a microphone for an audio-only ask.
+        "\u{1f4f7}\u{fe0e}"
+    } else {
+        "\u{1f3a4}\u{fe0e}"
+    };
+    // Nothing can be remembered for a document with no origin — say so rather
+    // than offering a "block this site" that would silently do nothing.
+    let remembers = dialog.origin.is_some();
+    rsx! {
+        div {
+            "data-media-capture-overlay": "1",
+            // §4 scope root — see the passkey overlay's stamp.
+            "data-yggterm-modal-root": "media-capture",
+            style: format!(
+                "position:fixed; inset:0; z-index:97; display:flex; align-items:center; justify-content:center; \
+                 background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
+                overlay_blur,
+                overlay_blur
+            ),
+            // A backdrop click DENIES — never approves, and never just closes.
+            onclick: move |_| on_answer.call(MediaCaptureAnswer::DenyOnce),
+            div {
+                "data-media-capture-dialog": "1",
+                style: format!(
+                    "width:min(440px, calc(100vw - 40px)); display:flex; flex-direction:column; gap:16px; \
+                     padding:22px; border-radius:18px; background:rgba(250,252,255,0.96); color:{}; \
+                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9); \
+                     font-family:{};",
+                    palette.text,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; align-items:center; gap:10px;",
+                    div { style: "font-size:22px; line-height:1;", "{glyph}" }
+                    div {
+                        "data-media-capture-title": "1",
+                        style: format!(
+                            "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
+                            palette.text
+                        ),
+                        "Use {devices}?"
+                    }
+                }
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px;",
+                    div {
+                        "data-media-capture-origin": "1",
+                        style: format!(
+                            "font-size:12px; line-height:1.5; color:{}; \
+                             font-family:'JetBrains Mono', ui-monospace, monospace; \
+                             overflow-wrap:anywhere;",
+                            palette.muted
+                        ),
+                        "{dialog.display}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.5; color:{};", palette.muted),
+                        if remembers {
+                            "Allowing is remembered for this site until you revoke it in the browser's settings."
+                        } else {
+                            "This page has no site address, so nothing about it can be remembered — allowing applies to this request only."
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap;",
+                    // Remembered refusal, offered only where there is a site to
+                    // remember it against.
+                    if remembers {
+                        button {
+                            "data-media-capture-block": "1",
+                            style: cancel_confirm_button_style(palette),
+                            onclick: move |_| on_answer.call(MediaCaptureAnswer::BlockSite),
+                            "Block this site"
+                        }
+                    }
+                    button {
+                        "data-media-capture-decline": "1",
+                        style: cancel_confirm_button_style(palette),
+                        onclick: move |_| on_answer.call(MediaCaptureAnswer::DenyOnce),
+                        "Not now"
+                    }
+                    button {
+                        "data-media-capture-allow": "1",
+                        style: delete_confirm_button_style(palette, false),
+                        onclick: move |_| on_answer.call(MediaCaptureAnswer::Allow),
+                        "Allow"
+                    }
+                }
+            }
+        }
+    }
+}
 #[component]
 fn ThemeEditorOverlay(
     snapshot: SharedSnapshot,
@@ -133542,54 +134143,70 @@ mod tests {
     // ONE precedence list decides both "is a modal up" and "who gets the Enter".
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
-        assert_eq!(top_modal_of(false, false, false, false, false, false, false), None);
+        assert_eq!(
+            top_modal_of(false, false, false, false, false, false, false, false),
+            None
+        );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, true, false, false, false, false),
+            top_modal_of(false, false, true, false, false, false, false, false),
+            Some(TopModal::MediaCapture)
+        );
+        assert_eq!(
+            top_modal_of(false, false, false, true, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, true, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, false, true, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, true, true, true, true),
+            top_modal_of(true, true, true, true, true, true, true, true),
             Some(TopModal::KeymapEditor)
         );
+        // ⛔ A capture prompt outranks every dialog below the two editors. Both
+        // it and the passkey ceremony are raised by a PAGE at a moment the user
+        // did not choose; the one that hands over a camera has to be the one the
+        // keyboard reaches, or Escape would dismiss the wrong dialog and leave
+        // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, true, true, true, true, true),
+            top_modal_of(false, false, true, true, true, true, true, true),
+            Some(TopModal::MediaCapture)
+        );
+        assert_eq!(
+            top_modal_of(false, false, false, true, true, true, true, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, true, true, true),
+            top_modal_of(false, false, false, false, true, true, true, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, false, true, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -133610,6 +134227,24 @@ mod tests {
         assert!(!chrome_transient_over_viewport(&shell.snapshot()));
 
         let cases: Vec<(&str, Box<dyn Fn(&mut ShellState)>)> = vec![
+            // A capture prompt is raised over whatever is on screen, and under
+            // glass a native web surface composites ABOVE all DOM — so without
+            // the transient cover the "may this page use your camera?" dialog
+            // would be a click-through window the user cannot reach.
+            (
+                "pending_media_capture",
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_media_capture = Some(PendingMediaCaptureDialog {
+                        request_id: 7,
+                        surface_id: 1,
+                        session_path: Some("local://ws".to_string()),
+                        origin: Some("https://example.test".to_string()),
+                        display: "https://example.test".to_string(),
+                        audio: false,
+                        video: true,
+                    });
+                }),
+            ),
             (
                 "pending_delete",
                 Box::new(|shell: &mut ShellState| {
@@ -160703,6 +161338,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -161357,6 +161993,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -161546,6 +162183,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -161735,6 +162373,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -161927,6 +162566,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -162123,6 +162763,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -162311,6 +162952,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -162499,6 +163141,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -162721,6 +163364,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -162912,6 +163556,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -163135,6 +163780,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -163535,6 +164181,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             drag_pointer: None,
             pending_delete: None,
             pending_fido2: None,
+            pending_media_capture: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -174554,6 +175201,10 @@ mod menu_dismissal_locks {
     #[test]
     fn the_modal_hint_bar_promises_exactly_what_the_dispatcher_honours() {
         for (modal, enter_advertised) in [
+            // ⛔ A capture prompt joins Fido2 on the FALSE side, and for a
+            // sharper reason: Enter here would hand a page the camera. The
+            // dispatcher swallows it; the bar must not promise it.
+            (TopModal::MediaCapture, false),
             (TopModal::Fido2, false),
             (TopModal::Delete, true),
             (TopModal::CopyEdit, true),
@@ -175352,6 +176003,20 @@ mod menu_dismissal_locks {
         assert_eq!(render_top_modal(&shell.snapshot()), shell.top_modal());
 
         let cases: Vec<(TopModal, Box<dyn Fn(&mut ShellState)>)> = vec![
+            (
+                TopModal::MediaCapture,
+                Box::new(|shell: &mut ShellState| {
+                    shell.pending_media_capture = Some(PendingMediaCaptureDialog {
+                        request_id: 1,
+                        surface_id: 1,
+                        session_path: Some("local://ws".to_string()),
+                        origin: Some("https://example.test".to_string()),
+                        display: "https://example.test".to_string(),
+                        audio: true,
+                        video: true,
+                    });
+                }),
+            ),
             (
                 TopModal::Fido2,
                 Box::new(|shell: &mut ShellState| {
@@ -176398,6 +177063,324 @@ mod keytips_inversion_locks {
                  justification, or derive the element: {line}"
             );
         }
+    }
+}
+
+/// LOCKS for HARDWARE CAPTURE — the shell half of camera and microphone.
+///
+/// The engine half (turning the capability on, answering `permission-request`,
+/// parking and denying) is locked in `vendor/dioxus-desktop/src/web_surface.rs`,
+/// module `media_capture_locks`. THIS module locks what the shell does with the
+/// ask: who is consulted, what happens when nobody answers, what the human is
+/// shown, and — above all — the single narrow path by which a page ever gets a
+/// device.
+///
+/// The decisions are pure functions and are driven directly. The WIRING that
+/// reaches them runs inside a Dioxus reconcile loop and a GTK-backed
+/// `DesktopContext`, neither of which a test on this host can enter, so it is
+/// scanned out of the product source — the same split every other lock module in
+/// this file uses.
+#[cfg(test)]
+mod media_capture_locks {
+    use super::*;
+
+    fn product_source() -> Vec<String> {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let product: Vec<String> = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect();
+        assert!(
+            product.len() > 40_000,
+            "the product-line scan swallowed the file it is supposed to police",
+        );
+        assert!(
+            !product
+                .iter()
+                .any(|line| line.contains("mod media_capture_locks")),
+            "the scan is reading this test module, so every needle below would be \
+             satisfied by the assertion that names it",
+        );
+        product
+    }
+
+    fn function_body(product: &[String], signature: &str) -> String {
+        let start = product
+            .iter()
+            .position(|line| line.trim_start().starts_with(signature))
+            .unwrap_or_else(|| panic!("{signature} moved — move this lock with it"));
+        let indent = &product[start][..product[start].len() - product[start].trim_start().len()];
+        let close = format!("{indent}}}");
+        let end = product[start + 1..]
+            .iter()
+            .position(|line| *line == close)
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("{signature} has no close brace at its own indent"));
+        product[start..=end].join("\n")
+    }
+
+    /// ⛔ THE lock. Every way the app's answer can fail to be a clear `"allow"`
+    /// lands on ASK — a human — and never on a grant.
+    ///
+    /// The failure this defends against is quiet: an app that 404s the route, a
+    /// build that renames the word, a proxy that returns HTML. If any of those
+    /// read as `Allow`, a page gets the camera because the POLICY SERVER was
+    /// broken, which is the worst possible reason.
+    #[test]
+    fn only_the_exact_word_allow_grants_a_device() {
+        assert_eq!(
+            MediaCaptureVerdict::from_reply(&json!({ "decision": "allow" })),
+            MediaCaptureVerdict::Allow,
+        );
+        assert_eq!(
+            MediaCaptureVerdict::from_reply(&json!({ "decision": "deny" })),
+            MediaCaptureVerdict::Deny,
+        );
+        for reply in [
+            json!({ "decision": "ask" }),
+            json!({ "decision": "Allow" }),
+            json!({ "decision": "allowed" }),
+            json!({ "decision": true }),
+            json!({ "decision": 1 }),
+            json!({ "error": "unknown route" }),
+            json!({}),
+            json!(null),
+            json!("allow"),
+        ] {
+            assert_eq!(
+                MediaCaptureVerdict::from_reply(&reply),
+                MediaCaptureVerdict::Ask,
+                "{reply} must fall back to asking a human, never to a grant",
+            );
+        }
+    }
+
+    /// ⛔ Exactly ONE answer hands over a device, and the two refusals differ
+    /// only in what they REMEMBER — never in what they grant.
+    #[test]
+    fn exactly_one_answer_is_a_grant() {
+        assert!(MediaCaptureAnswer::Allow.allows());
+        assert!(!MediaCaptureAnswer::DenyOnce.allows());
+        assert!(!MediaCaptureAnswer::BlockSite.allows());
+        assert_eq!(MediaCaptureAnswer::Allow.remembered(), Some("allow"));
+        assert_eq!(MediaCaptureAnswer::BlockSite.remembered(), Some("deny"));
+        assert_eq!(
+            MediaCaptureAnswer::DenyOnce.remembered(),
+            None,
+            "\"Not now\" must remember nothing — it is the transient refusal, and \
+             persisting it would silently block a site the user only deferred",
+        );
+    }
+
+    /// The prompt names EXACTLY what the page asked for. A dialog that says
+    /// "microphone" while the page asked for a camera is a lie the user acts on.
+    #[test]
+    fn the_prompt_names_exactly_the_devices_that_were_asked_for() {
+        assert_eq!(
+            media_capture_devices_phrase(true, true),
+            "your camera and microphone",
+        );
+        assert_eq!(media_capture_devices_phrase(true, false), "your microphone");
+        assert_eq!(media_capture_devices_phrase(false, true), "your camera");
+        // Unreachable (the engine denies a no-device ask before the shell sees
+        // it) and still must not read as harmless.
+        assert_eq!(
+            media_capture_devices_phrase(false, false),
+            "a capture device",
+        );
+    }
+
+    /// The prompt always names a subject. A capture dialog the user cannot
+    /// attribute to a site is a dialog they cannot answer honestly.
+    #[test]
+    fn the_prompt_always_names_who_is_asking() {
+        assert_eq!(
+            media_capture_display_origin("https://meet.example.com/room/42?x=1#a"),
+            "https://meet.example.com",
+        );
+        assert_eq!(
+            media_capture_display_origin("http://127.0.0.1:8099/probe.html"),
+            "http://127.0.0.1:8099",
+        );
+        // Credentials never reach the label.
+        assert_eq!(
+            media_capture_display_origin("https://user:pw@example.com/"),
+            "https://example.com",
+        );
+        // A document with no origin still gets a subject, not a blank.
+        assert_eq!(
+            media_capture_display_origin("file:///home/user/probe.html"),
+            "file:///home/user/probe.html",
+        );
+        assert_eq!(media_capture_display_origin(""), "this page");
+        assert_eq!(media_capture_display_origin("  "), "this page");
+        for uri in [
+            "https://a.test/x",
+            "file:///tmp/x",
+            "about:blank",
+            "",
+            "://broken",
+        ] {
+            assert!(
+                !media_capture_display_origin(uri).trim().is_empty(),
+                "{uri} produced a blank subject line",
+            );
+        }
+    }
+
+    /// The consult's WIRING: an app that cannot answer sends the ask to a human,
+    /// and a device-LABEL request never reaches a dialog at all.
+    #[test]
+    fn an_unreachable_policy_owner_prompts_and_a_label_request_never_does() {
+        let product = product_source();
+        let body = function_body(&product, "async fn begin_media_capture_decision(");
+        assert!(
+            body.contains("Err(_) => MediaCaptureVerdict::Ask,"),
+            "a control-endpoint failure no longer falls back to asking a human — a \
+             404, a timeout or a garbled body now decides a camera grant on its own",
+        );
+        assert!(
+            body.contains("_ => MediaCaptureVerdict::Ask,"),
+            "a surface with no policy owner no longer falls back to asking — it \
+             either grants or refuses silently, and neither is honest",
+        );
+        // The device-LABEL branch resolves straight off the verdict and returns
+        // BEFORE the dialog can be raised.
+        let label_branch = body
+            .find("if !is_capture {")
+            .expect("the enumerateDevices branch is gone; label requests would now prompt");
+        let dialog_at = body
+            .find("shell.pending_media_capture = Some(")
+            .expect("nothing raises the capture dialog any more");
+        assert!(
+            label_branch < dialog_at,
+            "the device-label branch no longer returns before the prompt — \
+             `enumerateDevices()` would raise a camera dialog, which no browser does",
+        );
+        assert!(
+            body[label_branch..dialog_at].contains("return;"),
+            "the device-label branch falls through into the prompt",
+        );
+        // ⛔ The GUI keeps no memory of its own. `pending_media_capture` is a
+        // live dialog, not a cache; a second store here would be a second thing
+        // that can disagree with what the settings pane shows.
+        assert!(
+            !body.contains("insert(") && !body.contains("HashMap"),
+            "the decision path grew a store of its own; the per-origin memory has \
+             exactly one owner and it is the app's control endpoint",
+        );
+    }
+
+    /// The answer's WIRING: the engine is released FIRST and unconditionally,
+    /// and only the devices the page ASKED for are ever written down.
+    #[test]
+    fn answering_releases_the_engine_before_anything_can_fail() {
+        let product = product_source();
+        let body = function_body(&product, "fn resolve_media_capture_dialog(");
+        let resolve_at = body
+            .find("desktop.resolve_web_surface_media_permission(dialog.request_id, answer.allows());")
+            .expect("the dialog no longer answers the parked engine request at all");
+        let persist_at = body
+            .find("let url = app_media_permission_url(&control_url);")
+            .expect("the dialog no longer persists a remembered decision");
+        assert!(
+            resolve_at < persist_at,
+            "the engine is released AFTER the persist path; a slow or failing write \
+             to the app would leave the page's getUserMedia() promise hanging",
+        );
+        // The early return for "nothing to remember" must sit BELOW the resolve,
+        // or a "Not now" would never settle the page.
+        let early_return = body
+            .find("else {\n        return;\n    };")
+            .expect("the nothing-to-remember early return moved");
+        assert!(
+            resolve_at < early_return,
+            "the nothing-to-remember early return sits above the engine release — \
+             \"Not now\" would close the dialog and hang the page",
+        );
+        for needle in [
+            "if dialog.audio {",
+            "body[\"microphone\"] = json!(decision);",
+            "if dialog.video {",
+            "body[\"camera\"] = json!(decision);",
+        ] {
+            assert!(
+                body.contains(needle),
+                "the persist path lost `{needle}` — a microphone-only ask would \
+                 write a camera decision the user never saw a prompt for",
+            );
+        }
+    }
+
+    /// The reconcile tick drains BOTH queues. Dropping the first leaves every
+    /// `getUserMedia()` hanging until the engine's deadline; dropping the second
+    /// leaves a dialog on screen for a request that is already dead.
+    #[test]
+    fn the_reconcile_tick_drains_the_asks_and_the_retirements() {
+        let product = product_source();
+        let body = function_body(&product, "async fn web_surface_native_reconcile_loop(");
+        assert!(
+            body.contains("for request in desktop.take_web_surface_media_permission_requests()"),
+            "nothing drains the capture asks — every getUserMedia() would hang \
+             until the engine's own deadline denied it two minutes later",
+        );
+        assert!(
+            body.contains("spawn(begin_media_capture_decision("),
+            "a drained capture ask no longer reaches the decision path",
+        );
+        assert!(
+            body.contains("for request_id in desktop.take_web_surface_retired_media_permissions()"),
+            "nothing drains the retirements — a dialog would stay on screen after \
+             its request timed out or its surface closed under it",
+        );
+    }
+
+    /// ⛔ Every dismissal is a DENIAL. Escape, the backdrop and "Not now" all
+    /// settle the page; none of them may close the dialog and walk away, because
+    /// the engine is blocked on the answer.
+    #[test]
+    fn every_way_out_of_the_dialog_settles_the_page() {
+        let product = product_source();
+        let dispatch = function_body(&product, "fn modal_key_dispatch(");
+        let arm = dispatch
+            .find("TopModal::MediaCapture => {")
+            .expect("the capture dialog no longer answers the keyboard at all");
+        let next_arm = dispatch[arm..]
+            .find("TopModal::Fido2 => {")
+            .map(|offset| arm + offset)
+            .expect("the arm order changed — move this lock with it");
+        let arm_body = &dispatch[arm..next_arm];
+        assert!(
+            arm_body.contains("MediaCaptureAnswer::DenyOnce"),
+            "Escape no longer denies the capture ask — the dialog would close and \
+             the page's promise would hang until the engine's deadline",
+        );
+        assert!(
+            !arm_body.contains("MediaCaptureAnswer::Allow"),
+            "a keystroke can now approve a capture ask; approving hardware access \
+             must stay an explicit pointer gesture",
+        );
+        // The overlay's own exits.
+        let overlay = function_body(&product, "fn MediaCapturePresenceOverlay(");
+        assert!(
+            overlay.contains("onclick: move |_| on_answer.call(MediaCaptureAnswer::DenyOnce),"),
+            "the backdrop click no longer denies — it either approves or silently \
+             closes, and both are wrong",
+        );
+        assert!(
+            overlay.contains("\"data-media-capture-allow\": \"1\","),
+            "the Allow button lost the hook every live proof of this feature reads",
+        );
+        // ⛔ Exactly one control in the whole dialog is a grant.
+        let grants = overlay.matches("MediaCaptureAnswer::Allow").count();
+        assert_eq!(
+            grants, 1,
+            "the capture dialog offers {grants} ways to grant a device; there must \
+             be exactly one, on the button labelled Allow",
+        );
     }
 }
 
