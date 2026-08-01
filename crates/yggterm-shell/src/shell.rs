@@ -5121,6 +5121,63 @@ const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
 const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 16;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
+/// ⭐ **WHO HOLDS THE KEYBOARD OVER A WEB SURFACE — one rule, one answer.**
+///
+/// This is not a nicety. Every legacy browser chord (`WEB_PAGE_CHORDS`) is
+/// `page_only`, and the window claimer stands a `page_only` row down unless one
+/// of this host's VISIBLE surface webviews holds the toplevel's focus — that
+/// gate is what keeps `Ctrl+R` as readline's reverse-search in every terminal.
+/// So "does the page have the keyboard" IS "does Ctrl+T / Ctrl+R / F12 exist",
+/// and the user reported both halves of getting it wrong on 2026-08-01:
+///
+/// - **A revealed page had no keyboard until it was clicked.** THREE doors
+///   reveal a page — the create, the unhide, and the unstash re-attach — and only
+///   the unhide ever handed the keyboard over. Backgrounding a session
+///   soft-stashes its surface within one reclaim pass, so *switching back* (the
+///   common case, not the rare one) came in through the unstash door and every
+///   chord was dead until a click.
+/// - **Ctrl+T's omnibox focus lasted a split second.** A shell control can
+///   legitimately hold the keyboard over a shown page, and the new tab's webview
+///   took it back at birth.
+///
+/// One boolean answers both, so the doors cannot disagree: a reveal cannot be
+/// forgotten by a branch that did not think of it, and a shell control that has
+/// the keyboard cannot have it taken away by one that did.
+fn web_surface_page_holds_keyboard(want_visible: bool, shell_control_holds: bool) -> bool {
+    want_visible && !shell_control_holds
+}
+
+/// Is a SHELL control holding the keyboard over this surface right now?
+///
+/// Exactly two can, and naming them once is what stops a third being invented
+/// somewhere else:
+///
+/// - the **omnibox**, while the address bar is in EDIT MODE (`address_draft`).
+///   A Ctrl+T tab arms it SYNCHRONOUSLY (`web_surface_open_tab`, and
+///   `focus_web_omnibox` for every other door), which is why this answer is
+///   already true on the tick that builds the new tab's webview — an async
+///   `document::eval` reporting the DOM focus could not be.
+/// - the **find bar**, while its field is focused. An open-but-unfocused bar
+///   claims nothing, exactly as `web_find::find_bar_blocks_terminal_input` says.
+///
+/// Both are existing facts with existing owners; this only reads them. That is
+/// also why no timer is needed anywhere in this file: the claim stops being true
+/// the moment the user commits (Enter navigates, clearing the draft) or cancels
+/// (Escape), and the grant hands the page its keyboard back on that same edge.
+///
+/// ⚠ **Known gap, stated rather than papered over.** Edit mode is "the bar holds
+/// an uncommitted edit", which is exact when the omnibox takes the keyboard and
+/// goes stale if the user then clicks the PAGE without committing or cancelling:
+/// GTK gives the page the keyboard (a real seat event this cannot see) while the
+/// draft still says the bar has it, so a later reveal of that surface will not
+/// re-grant. The narrow fix is a blur that reverts the bar the way Chrome's does
+/// — deliberately NOT taken here, because the omnibox dropdown's own rows read
+/// the draft on click and a blur that clears it first would break choosing a
+/// suggestion. Escape, Enter, or one click on the page all recover it.
+fn web_surface_shell_control_holds_keyboard(surface: &WebSurfaceUiState) -> bool {
+    surface.address_draft.is_some() || surface.find.as_ref().is_some_and(|find| find.bar_focused)
+}
+
 /// A native surface as last applied to the compositor: the reconciler's
 /// record of what the vendored WebSurfaceHost currently holds for one
 /// (session, tab). Applied state lives OUTSIDE ShellState — mutating a Signal
@@ -5133,6 +5190,12 @@ struct AppliedWebSurface {
     url: String,
     bounds: (i32, i32, i32, i32),
     visible: bool,
+    /// What the reconciler last GRANTED: does this page hold the toplevel's
+    /// keyboard? The diff baseline for [`web_surface_page_holds_keyboard`], so
+    /// the grant fires on the EDGE only — re-taking the keyboard every tick
+    /// would fight a human who moved it to the omnibox or the find bar while the
+    /// page stayed up.
+    page_keyboard: bool,
     reload_nonce: u64,
     /// SOCKS proxy the surface's WebContext was created with. The proxy is
     /// fixed per WebContext, so a change means destroy + recreate.
@@ -5200,6 +5263,12 @@ impl AppliedWebSurface {
         url: String,
         bounds: (i32, i32, i32, i32),
         want_visible: bool,
+        // …and the keyboard is the ONE thing `want_visible` cannot decide: a
+        // Ctrl+T tab is shown AND typing-ready in the omnibox. The caller asks
+        // `web_surface_page_holds_keyboard`, and the `&&` below mirrors the
+        // vendored builder's own `visible && focused` so this record can never
+        // claim a surface nobody can see is holding the user's keys.
+        takes_keyboard: bool,
         reload_nonce: u64,
         socks_port: Option<u16>,
         profile: String,
@@ -5213,6 +5282,7 @@ impl AppliedWebSurface {
             url,
             bounds,
             visible: want_visible,
+            page_keyboard: want_visible && takes_keyboard,
             reload_nonce,
             socks_port,
             profile,
@@ -5251,6 +5321,11 @@ impl AppliedWebSurface {
             url,
             bounds,
             visible: !background,
+            // The webview WebKit already built carries `.with_focused(visible)`
+            // (`build_popup_webview`), so a FOREGROUND popup already took the
+            // keyboard at birth. Recording anything else here would make the
+            // grant's first edge a redundant re-grab.
+            page_keyboard: !background,
             reload_nonce: 0,
             socks_port,
             profile,
@@ -6300,6 +6375,7 @@ mod web_surface_reclaim_locks {
             url: "https://example.invalid/".to_string(),
             bounds: (0, 0, 800, 600),
             visible: true,
+            page_keyboard: true,
             reload_nonce: 0,
             socks_port: None,
             profile: "default".to_string(),
@@ -7304,9 +7380,15 @@ mod web_surface_reclaim_locks {
                 "rect.1,",
                 "rect.2,",
                 "rect.3,",
-                // Only a surface being SHOWN may take the window's keyboard
-                // focus, and the engine decides page visibility from this too.
+                // Is anyone being SHOWN this surface? The engine decides page
+                // visibility from this, and it bounds the focus below.
                 "want_visible,",
+                // …and is this page who the KEYBOARD belongs to? A separate
+                // question with a separate answer: a Ctrl+T tab is shown AND
+                // typing-ready in the omnibox, so passing `want_visible` for both
+                // is what took the omnibox focus back a split second after the
+                // user pressed the key.
+                "page_holds_keyboard,",
             ],
             "the create's arguments changed:\n{open_call}",
         );
@@ -9636,6 +9718,17 @@ fn web_history_data_url(profile: &str) -> String {
 fn web_surface_internal_page_label(url: &str) -> Option<&'static str> {
     url.starts_with("data:text/html").then_some("History")
 }
+/// What the address bar SHOWS for a tab nobody is editing.
+///
+/// One owner, because two things now need it: the overlay that renders the bar,
+/// and `begin_address_edit`, which puts that same text into the draft when the
+/// keyboard is sent to the omnibox. Deriving it twice would let Ctrl+L replace a
+/// clean "History" label with the multi-kilobyte `data:` blob it hides.
+fn web_surface_address_bar_text(url: &str) -> String {
+    web_surface_internal_page_label(url)
+        .map(str::to_string)
+        .unwrap_or_else(|| url.to_string())
+}
 /// A handle to one live web surface: WHICH webview, and WHICH incarnation of
 /// it. `native_id` alone is not a safe address for an agent — ids are reused
 /// when a surface is destroyed and recreated (reload, proxy/profile change,
@@ -11164,12 +11257,14 @@ async fn web_surface_native_reconcile_loop(
         let (
             desired,
             active_visible_sessions,
+            shell_keyboard_claims,
             split_pinned_tabs,
             modal_over_viewport,
             global_zoom_factor,
             zoom_overrides,
         ): (
             Vec<WebSurfaceDesiredSurface>,
+            std::collections::HashSet<String>,
             std::collections::HashSet<String>,
             std::collections::HashSet<(String, u64)>,
             bool,
@@ -11246,6 +11341,17 @@ async fn web_surface_native_reconcile_loop(
                     .cloned()
                     .collect()
             };
+            // WHICH sessions have a SHELL control holding the keyboard right now
+            // (the omnibox mid-edit, a focused find bar). Read from the SAME peek
+            // as the visibility authority above and for the same reason: the
+            // keyboard grant must not be built from two instants of the shell, or
+            // a tab created in one and revealed in the other gets two answers.
+            let shell_keyboard_claims: std::collections::HashSet<String> = shell_ref
+                .web_surfaces
+                .iter()
+                .filter(|(_, surface)| web_surface_shell_control_holds_keyboard(surface))
+                .map(|(session_path, _)| session_path.clone())
+                .collect();
             // Tabs pinned into a live split pane. Read from the SAME peek as the
             // visibility authority above so the reclaim domain below cannot be
             // built from two different instants of the shell.
@@ -11272,6 +11378,7 @@ async fn web_surface_native_reconcile_loop(
             (
                 desired,
                 active_visible_sessions,
+                shell_keyboard_claims,
                 split_pinned_tabs,
                 modal_over_viewport,
                 global_zoom_factor,
@@ -11560,6 +11667,14 @@ async fn web_surface_native_reconcile_loop(
                     // above the DOM the modal lives in). The reconciler re-shows it
                     // when the modal clears (has_modal_over_viewport flips back).
                     && !modal_over_viewport;
+                // …and WHO HOLDS THE KEYBOARD, from the one rule. Computed here,
+                // beside the visibility it depends on, so the create door and the
+                // reveal door below are answering the same question with the same
+                // answer instead of each deciding for itself.
+                let page_holds_keyboard = web_surface_page_holds_keyboard(
+                    want_visible,
+                    shell_keyboard_claims.contains(session_path.as_str()),
+                );
                 // Destroy-and-recreate cases (close + remove here; the
                 // lazy-create branch rebuilds a fresh webview the same tick):
                 //   - proxy or profile change: both are fixed per WebContext,
@@ -11647,15 +11762,31 @@ async fn web_surface_native_reconcile_loop(
                     if entry.visible != want_visible {
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
-                        if want_visible {
-                            // A page that is being SHOWN takes the keyboard. Only
-                            // on the EDGE: re-taking it every tick would fight a
-                            // human who moved focus to the omnibox or the find
-                            // bar while the page stayed up. Without this a
-                            // revealed page had no keyboard at all — build time
-                            // was the only thing that ever focused a surface —
-                            // so PageUp/PageDown/Home/End did nothing until the
-                            // user happened to click the page.
+                    }
+                    // ⭐ **THE KEYBOARD GRANT — the one place that hands a page the
+                    // keyboard**, and deliberately NOT inside any of the branches
+                    // above. It asks [`web_surface_page_holds_keyboard`], never
+                    // "which door did this tick come through", because the doors
+                    // are what got it wrong: this same block reveals a soft-stashed
+                    // surface by UNSTASHING it (which sets `visible` itself), so a
+                    // focus call living inside the `entry.visible != want_visible`
+                    // edge never fired for the commonest reveal there is — switching
+                    // back to a session — and every `page_only` chord was dead until
+                    // the user clicked the page.
+                    //
+                    // Edge-driven, so a page that is simply sitting there is never
+                    // re-grabbed: that would fight a human who moved the keyboard to
+                    // the omnibox or the find bar while the page stayed up.
+                    //
+                    // The other direction takes NO action on purpose. When the answer
+                    // turns false a shell control has the keyboard already — the user
+                    // clicked into the address bar, or a `focus_shell` chord brought
+                    // it home before this tick ever ran — so the only thing left to do
+                    // is remember it, which is what arms the giving-back edge when
+                    // they commit or cancel.
+                    if entry.page_keyboard != page_holds_keyboard {
+                        entry.page_keyboard = page_holds_keyboard;
+                        if page_holds_keyboard {
                             desktop.focus_web_surface(entry.native_id);
                         }
                     }
@@ -12011,6 +12142,13 @@ async fn web_surface_native_reconcile_loop(
                         // invisible agent surface swallowed the keystrokes the
                         // user was typing into their terminal (2026-07-26).
                         want_visible,
+                        // …and being shown is NOT enough on its own. A Ctrl+T tab
+                        // is born visible AND typing-ready in the omnibox, so its
+                        // webview must appear without taking the keyboard the
+                        // omnibox is holding — the "focus lands and is stolen back
+                        // a split second later" the user reported. Same rule as
+                        // the reveal grant below, asked once.
+                        page_holds_keyboard,
                     ) {
                         Ok(()) => {
                             append_trace_event(
@@ -12091,6 +12229,7 @@ async fn web_surface_native_reconcile_loop(
                                     effective_url,
                                     rect,
                                     want_visible,
+                                    page_holds_keyboard,
                                     reload_nonce,
                                     socks_port,
                                     profile,
@@ -19831,6 +19970,34 @@ impl ShellState {
             surface.address_suggestion_index = None;
         }
     }
+    /// Put the address bar into EDIT MODE holding what it already shows.
+    ///
+    /// ⭐ **The keyboard fact, not a cosmetic one.** Edit mode is how the model
+    /// says the OMNIBOX has the keyboard, and
+    /// [`web_surface_shell_control_holds_keyboard`] is what stops the reconciler
+    /// handing it straight back to the page. Ctrl+L used to focus the input
+    /// through an async `document::eval` and tell the model nothing, so the next
+    /// reveal tick could take the keyboard off a user who was mid-address.
+    ///
+    /// Idempotent and never destructive: a draft the user (or a blank open) has
+    /// already put there is exactly what edit mode means, so it is left alone.
+    fn web_surface_begin_address_edit(&mut self, session_path: &str) {
+        let Some(surface) = self.web_surfaces.get_mut(session_path) else {
+            return;
+        };
+        if surface.address_draft.is_some() {
+            return;
+        }
+        let text = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == surface.active_tab)
+            .map(|tab| web_surface_address_bar_text(&tab.url))
+            .unwrap_or_default();
+        surface.address_draft = Some(text);
+        surface.address_typed_len = None;
+        surface.address_suggestion_index = None;
+    }
     /// Handle a keystroke in the omnibox with Chrome-style inline autocomplete.
     /// `value` is the input's current text (the selected completion tail, if any,
     /// was already replaced by the browser). Returns `Some((completed, typed_len,
@@ -20099,13 +20266,14 @@ impl ShellState {
         Some(WebSurfaceOverlayView {
             tabs,
             active_tab_id,
-            address_text: surface.address_draft.clone().unwrap_or_else(|| {
-                // An internal page (history viewer) rides the tab as a multi-KB
-                // `data:` URL; the omnibox shows a clean label, never the blob.
-                web_surface_internal_page_label(&active.url)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| active.url.clone())
-            }),
+            // An internal page (history viewer) rides the tab as a multi-KB
+            // `data:` URL; the omnibox shows a clean label, never the blob —
+            // decided by `web_surface_address_bar_text`, which is also what an
+            // edit begins from.
+            address_text: surface
+                .address_draft
+                .clone()
+                .unwrap_or_else(|| web_surface_address_bar_text(&active.url)),
             address_editing: surface.address_draft.is_some(),
             back_target,
             forward_target,
@@ -64052,6 +64220,7 @@ mod web_do_verb_tests {
                 url: "https://example.invalid/".to_string(),
                 bounds: (0, 0, 800, 600),
                 visible: false,
+                page_keyboard: false,
                 reload_nonce: 0,
                 socks_port: None,
                 profile: "default".to_string(),
@@ -64143,6 +64312,7 @@ mod web_do_verb_tests {
                 native_id,
                 "https://example.invalid/".to_string(),
                 (0, 0, 800, 600),
+                want_visible,
                 want_visible,
                 0,
                 None,
@@ -64255,6 +64425,7 @@ mod web_do_verb_tests {
             9_321,
             "https://example.invalid/".to_string(),
             (0, 0, 1, 1),
+            false,
             false,
             0,
             None,
@@ -102794,10 +102965,28 @@ fn focus_web_omnibox_script(input_id: &str) -> String {
 ///
 /// Silent when no surface is mounted: there is no omnibox to focus, and
 /// inventing one to shout about would be worse than doing nothing.
-fn focus_web_omnibox(state: Signal<ShellState>) {
+///
+/// ⚠ The MODEL is armed first, and that ordering is the whole fix for "the new
+/// tab focuses the omnibox and unfocuses a split second later". The DOM focus
+/// below is an async `document::eval`; the web-surface reconciler runs on its own
+/// tick and can build the new tab's webview before that eval lands. Edit mode is
+/// what tells the reconciler the omnibox — not the page it is about to show —
+/// holds the keyboard (`web_surface_shell_control_holds_keyboard`), and setting
+/// it here, synchronously, is what makes that true in time. Arming it at this ONE
+/// door rather than at each caller is also what keeps every route to the omnibox
+/// (the "+", Ctrl+T, Ctrl+L) telling the same story.
+fn focus_web_omnibox(mut state: Signal<ShellState>) {
     let Some(input_id) = state.peek().active_web_omnibox_input_id() else {
         return;
     };
+    let session = state
+        .peek()
+        .server
+        .active_session_path()
+        .map(str::to_string);
+    if let Some(session) = session {
+        state.with_mut(|shell| shell.web_surface_begin_address_edit(&session));
+    }
     let _ = document::eval(&focus_web_omnibox_script(&input_id));
 }
 
@@ -103266,6 +103455,13 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
             // Focus AND select, so the next keystroke replaces the URL rather
             // than appending to it — which is what every other browser does and
             // what `focus_web_omnibox` already implements for the "+" path.
+            //
+            // That opener also puts the bar in EDIT MODE, which is not cosmetic:
+            // edit mode is how the model says the omnibox has the keyboard, so
+            // the reconciler's grant leaves it there instead of handing the keys
+            // back to the page on its next tick. Escape or Enter clears the draft
+            // and the page gets them back on that edge — Ctrl+L's whole life
+            // cycle, expressed in the one fact.
             focus_web_omnibox(state);
         }
         "web.tab.close" => {
@@ -152966,6 +153162,7 @@ mod tests {
                     "https://app".to_string(),
                     (0, 0, 800, 600),
                     true,
+                    true,
                     0,
                     None,
                     "default".to_string(),
@@ -177746,33 +177943,176 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// The reconciler hands a page the keyboard exactly when it reveals it —
-    /// inside the visibility EDGE, so nothing re-takes focus on a later tick.
+    /// ⭐ **ONE RULE DECIDES WHO HOLDS THE KEYBOARD OVER A PAGE, and every door
+    /// asks it** — the create, the reveal, and nothing else.
+    ///
+    /// Reported twice on 2026-08-01, and the two reports are one bug seen from
+    /// both ends: *"the legacy shortcuts of ychrome do not do anything unless I
+    /// click the viewport once"* (a reveal that never handed the keyboard over,
+    /// so every `page_only` chord stood down) and *"the new tab focus to omnibox
+    /// is a split second focus and it unfocuses"* (a create that took the keyboard
+    /// off a control that legitimately had it).
+    ///
+    /// ⚠ **The shape this replaces is why it is a lock.** The focus call used to
+    /// live INSIDE `if entry.visible != want_visible`, which reads like "the
+    /// reveal edge" and is not one: the same block also reveals a soft-stashed
+    /// surface by UNSTASHING it, and that branch assigns `entry.visible` itself —
+    /// so the commonest reveal in the product, switching back to a session that
+    /// was backgrounded (one reclaim pass soft-stashes it), skipped the focus
+    /// entirely. A branch cannot own a fact that three branches produce. So the
+    /// grant asks `web_surface_page_holds_keyboard` and never asks which door it
+    /// came through.
     #[test]
-    fn the_reveal_edge_is_where_a_page_is_given_the_keyboard() {
+    fn one_rule_decides_who_holds_the_keyboard_over_a_web_surface() {
         let product = product_source();
-        let at = product
-            .iter()
-            .position(|line| line.contains("desktop.focus_web_surface(entry.native_id);"))
-            .expect("the reveal focus call moved — move this lock with it");
-        let window = product[at.saturating_sub(12)..at].join("\n");
-        assert!(
-            window.contains("if entry.visible != want_visible {"),
-            "focus must be taken on the visibility EDGE, not every tick — a page \
-             that re-grabs focus each pass fights the omnibox and the find \
-             bar:\n{window}"
-        );
-        assert!(
-            window.contains("if want_visible {"),
-            "…and only when the page is being SHOWN:\n{window}"
-        );
         assert_eq!(
             product
                 .iter()
                 .filter(|line| line.contains("focus_web_surface("))
                 .count(),
             1,
-            "one place decides a page has the keyboard"
+            "one place hands a page the keyboard"
+        );
+        let at = product
+            .iter()
+            .position(|line| line.contains("desktop.focus_web_surface(entry.native_id);"))
+            .expect("the keyboard grant moved — move this lock with it");
+        let window = product[at.saturating_sub(4)..at].join("\n");
+        assert!(
+            window.contains("if entry.page_keyboard != page_holds_keyboard {"),
+            "the grant must fire on the EDGE of the RULE's answer — a page that \
+             re-grabs focus every tick fights the omnibox and the find bar:\n{window}"
+        );
+        assert!(
+            window.contains("if page_holds_keyboard {"),
+            "…and only when the rule says this page is who the keyboard belongs \
+             to:\n{window}"
+        );
+        assert!(
+            !window.contains("if entry.visible != want_visible {"),
+            "the grant must NOT sit inside the visibility branch: the unstash \
+             branch reveals a page without ever entering it, which is the reveal \
+             that had no keyboard:\n{window}"
+        );
+        // The answer has ONE origin (the definition line is not a call site)…
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("web_surface_page_holds_keyboard("))
+                .filter(|line| !line.contains("fn web_surface_page_holds_keyboard("))
+                .count(),
+            1,
+            "the rule is asked once per tab; a second call site is a second answer"
+        );
+        // …and the CREATE door spends that same answer rather than deciding for
+        // itself, which is what stops a Ctrl+T tab's webview taking the keyboard
+        // back off the omnibox at birth.
+        let create = product
+            .iter()
+            .position(|line| line.contains("match desktop.open_web_surface("))
+            .expect("the create door moved — move this lock with it");
+        let create_call = product[create..create + 40].join("\n");
+        assert!(
+            create_call.contains("want_visible,") && create_call.contains("page_holds_keyboard,"),
+            "the create must be told BOTH whether the page is shown and whether it \
+             holds the keyboard — they are different questions:\n{create_call}"
+        );
+        let born = product
+            .iter()
+            .position(|line| line.contains("AppliedWebSurface::created("))
+            .expect("the applied record's birth moved — move this lock with it");
+        assert!(
+            product[born..born + 12]
+                .iter()
+                .any(|line| line.contains("page_holds_keyboard,")),
+            "the applied record must be seeded with what the webview was actually \
+             built with, or the grant's first edge is a lie"
+        );
+    }
+
+    /// THE RULE ITSELF, both halves of the report, as arithmetic.
+    #[test]
+    fn a_shown_page_holds_the_keyboard_unless_a_shell_control_has_it() {
+        assert!(
+            web_surface_page_holds_keyboard(true, false),
+            "a page on screen with nothing else claiming the keys holds them — \
+             this is what makes Ctrl+R, Ctrl+T and F12 exist at all"
+        );
+        assert!(
+            !web_surface_page_holds_keyboard(true, true),
+            "…but a shown page must not take the keyboard off the omnibox of the \
+             tab that was just opened typing-ready"
+        );
+        assert!(
+            !web_surface_page_holds_keyboard(false, false),
+            "a page nobody can see never holds the keyboard: an invisible webview \
+             that grabbed it swallowed the user's terminal typing (2026-07-26)"
+        );
+        assert!(!web_surface_page_holds_keyboard(false, true));
+    }
+
+    /// WHICH shell controls can hold the keyboard over a page, read off the same
+    /// state the reconciler reads.
+    ///
+    /// The omnibox clause is the one that fixes Ctrl+T, and it is only exact
+    /// because a blank open arms edit mode SYNCHRONOUSLY — the reconciler can
+    /// build the new tab's webview before an async `document::eval` focuses
+    /// anything.
+    #[test]
+    fn the_omnibox_and_a_focused_find_bar_are_the_two_keyboard_claims() {
+        let mut shell = shell_with_surface(&[("https://a.example/", None)]);
+        let surface = |shell: &ShellState| -> bool {
+            web_surface_shell_control_holds_keyboard(&shell.web_surfaces["local://ws"])
+        };
+        shell.web_surface_set_address_draft("local://ws", None);
+        assert!(
+            !surface(&shell),
+            "a settled surface claims nothing — the page has the keyboard"
+        );
+
+        // Ctrl+T's tab: minted typing-ready, and the claim is true before any
+        // reconcile tick can create its webview.
+        shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+            .expect("a live surface opens a tab");
+        assert!(
+            surface(&shell),
+            "a blank tab is typing-ready in the omnibox, so the omnibox holds the \
+             keyboard the moment the tab exists"
+        );
+
+        // Committing (Enter navigates, clearing the draft) or cancelling hands it
+        // straight back — which is the edge the grant rides.
+        shell.web_surface_set_address_draft("local://ws", None);
+        assert!(
+            !surface(&shell),
+            "a cancelled edit gives the page its keyboard back"
+        );
+
+        // Ctrl+L takes the same door, so it tells the same story.
+        shell.web_surface_begin_address_edit("local://ws");
+        assert!(
+            surface(&shell),
+            "Ctrl+L puts the bar in edit mode, and edit mode IS the claim"
+        );
+        shell.web_surface_set_address_draft("local://ws", None);
+
+        // The find bar: focused claims, open-but-unfocused does not (the same
+        // rule `web_find::find_bar_blocks_terminal_input` states).
+        shell.open_web_find("local://ws", web_find::FindFocusOrigin::Page);
+        assert!(surface(&shell), "a focused find bar holds the keys");
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .expect("surface is live")
+            .find
+            .as_mut()
+            .expect("the bar is open")
+            .bar_focused = false;
+        assert!(
+            !surface(&shell),
+            "an open-but-unfocused find bar claims nothing, so the page keeps the \
+             keyboard"
         );
     }
 
