@@ -1,5 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// App-control round-trip budget for an `automation …` verb. The twin of the
+/// GUI binary's constant, and the same reasoning: the expensive call behind it
+/// is a session CREATE, which on a remote machine includes an ssh handshake and
+/// a managed-CLI check. Timing out would record `spawn_failed` for a session
+/// that then arrives anyway, leaving a row nothing in the store owns.
+const AUTOMATION_APP_CONTROL_TIMEOUT_MS: u64 = 60_000;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
@@ -1270,6 +1277,18 @@ fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+    // Automations — scheduled agent-CLI sessions. THIS is what a generated
+    // systemd timer's ExecStart invokes, so it is deliberately matched before
+    // anything that could need a daemon handshake: a timer firing at midnight
+    // must reach the executor without first negotiating a version.
+    // Accepted BOTH as `automation …` (what the unit writes) and
+    // `server automation …` (what fits the rest of this CLI's shape).
+    if args.first().is_some_and(|arg| arg == "automation") {
+        return yggterm_server::run_automation_cli(&args, AUTOMATION_APP_CONTROL_TIMEOUT_MS);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "automation" {
+        return yggterm_server::run_automation_cli(&args[1..], AUTOMATION_APP_CONTROL_TIMEOUT_MS);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
         // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant

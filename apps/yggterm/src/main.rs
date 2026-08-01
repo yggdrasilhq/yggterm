@@ -98,6 +98,13 @@ const ENV_MALLOC_ARENA_MAX: &str = "MALLOC_ARENA_MAX";
 const ENV_YGGTERM_RELAUNCH_AFTER_PID: &str = "YGGTERM_RELAUNCH_AFTER_PID";
 const ENV_YGGTERM_RELAUNCH_WAIT_TIMEOUT_MS: &str = "YGGTERM_RELAUNCH_WAIT_TIMEOUT_MS";
 const DEFAULT_RELAUNCH_WAIT_TIMEOUT_MS: u64 = 15_000;
+/// App-control round-trip budget for an `automation …` verb.
+///
+/// Longer than the ordinary 15 s because the expensive call behind it is a
+/// session CREATE, which on a remote machine includes an ssh handshake and a
+/// managed-CLI check. A timeout here would be recorded as `spawn_failed` for a
+/// session that then arrives anyway, leaving a row nothing in the store owns.
+const AUTOMATION_APP_CONTROL_TIMEOUT_MS: u64 = 60_000;
 
 fn app_control_client_for_pid(payload: &serde_json::Value, pid: u32) -> Option<serde_json::Value> {
     payload
@@ -1343,6 +1350,17 @@ fn main() -> Result<()> {
     // outgoing daemon request carries it. An unparseable role is fatal rather
     // than a silent downgrade to Active (eng-review D7).
     apply_client_identity_args(&args)?;
+    // Automations, on the GUI binary too. The generated unit invokes the
+    // headless one, but an agent driving `yggterm` should not have to know
+    // that a verb lives on the other binary — that is the mistake the whole
+    // web verb plane made and had to be undone. ONE owner
+    // (crates/yggterm-server/src/automation_cli.rs); do not inline a verb here.
+    if args.first().is_some_and(|arg| arg == "automation") {
+        return yggterm_server::run_automation_cli(&args, AUTOMATION_APP_CONTROL_TIMEOUT_MS);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "automation" {
+        return yggterm_server::run_automation_cli(&args[1..], AUTOMATION_APP_CONTROL_TIMEOUT_MS);
+    }
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
