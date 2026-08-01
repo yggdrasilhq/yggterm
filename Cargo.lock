@@ -7057,6 +7057,7 @@ name = "yggui-contract"
 version = "2.12.20"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
