@@ -1258,8 +1258,12 @@ mod tests {
     /// the other.
     #[test]
     fn the_profiles_root_is_the_documented_path() {
+        // Against the TESTABLE half. `web_profiles_root()` resolves the home
+        // itself and so cannot be asserted against a literal without an env
+        // var the rest of this binary would race on — which is exactly why the
+        // pair exists.
         assert_eq!(
-            web_profiles_root(Path::new("/home/user/.yggterm")),
+            web_profiles_root_in(Path::new("/home/user/.yggterm")),
             PathBuf::from("/home/user/.yggterm/web-profiles")
         );
     }
