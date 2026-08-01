@@ -29,3 +29,8 @@ tools/xterm-harness/package-lock.json
 
 # Local-only diagnostic ledgers (host-specific private details; never tracked)
 .docs/
+
+# Merge/patch backups. A 178k-line `shell.rs.orig` reached main once inside a
+# lane merge; nothing in this tree should ever track one.
+*.orig
+*.rej
