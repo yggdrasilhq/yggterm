@@ -1306,6 +1306,15 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "collection" {
         return yggterm_server::run_web_collection_cli(&args[1..]);
     }
+    // Browser import (history + bookmarks out of Chromium/Firefox profiles).
+    // Matched here for the same reason automations are: it is local file work
+    // and must not have to negotiate a daemon version to run.
+    if args.first().is_some_and(|arg| arg == "web-import") {
+        return yggterm_server::run_browser_import_cli(&args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "web-import" {
+        return yggterm_server::run_browser_import_cli(&args[1..]);
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
         // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant
         // class). Read-only and ON DEMAND — nothing polls, so asking costs one
