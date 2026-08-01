@@ -550,6 +550,12 @@ struct Surface {
     // in the burst and does nothing. Per surface, so two agents driving two
     // surfaces cannot re-hide each other's.
     wake_token: Cell<u64>,
+    // THE RECT THE SHELL LAST ASKED FOR — recorded whether or not GTK could
+    // take it. A hidden webview drops geometry (see [`apply_bounds`]), so a
+    // reveal has to re-assert this or the page comes back at the size it had
+    // when it was hidden. It is the shell's number, never GTK's: nothing here
+    // reads an allocation back.
+    bounds: Cell<(i32, i32, i32, i32)>,
 }
 
 /// What an injection has to do to a surface's webview before it may deliver an
@@ -3022,21 +3028,6 @@ fn rect_logical(w: i32, h: i32) -> Rect {
     }
 }
 
-/// Place a surface at `(x, y)` and size it to `w × h`.
-///
-/// The webview's own **size request** must be updated, not just the container's.
-/// `wry`'s `WebView::set_bounds` on a `GtkFixed` parent only `size_allocate`s the
-/// webview; it never touches the size request that `add_to_container` set when the
-/// webview was built. `GtkFixed` allocates children at their natural size, and the
-/// natural size of a widget with a size request IS that request — so the very next
-/// layout pass (the `queue_resize` every caller issues right after) snapped the
-/// webview straight back to the size it was born with.
-///
-/// The surface could therefore be MOVED but never RESIZED. Opening the right rail
-/// over a live web surface left the page painted across it, because a native child
-/// widget draws above all DOM; closing the rail left a gap. Neither was visible to
-/// `app screenshot`'s default backend, which composites the DOM and is blind to
-/// native children — only `--backend os` shows it.
 /// The glass input region, as a PURE function (the reconciler's rects in,
 /// cairo region out — unit-tested; the GdkWindow application is separate).
 /// Full window minus holes (page rects) plus covers (chrome declared over
@@ -3347,14 +3338,75 @@ fn attach_userscripts<'a>(
     builder
 }
 
+/// Place a surface at `(x, y)` and size it to `w × h`.
+///
+/// The webview's own **size request** must be updated, not just the container's.
+/// `wry`'s `WebView::set_bounds` on a `GtkFixed` parent only `size_allocate`s the
+/// webview; it never touches the size request that `add_to_container` set when the
+/// webview was built. `GtkFixed` allocates children at their natural size, and the
+/// natural size of a widget with a size request IS that request — so the very next
+/// layout pass (the `queue_resize` every caller issues right after) snapped the
+/// webview straight back to the size it was born with.
+///
+/// The surface could therefore be MOVED but never RESIZED. Opening the right rail
+/// over a live web surface left the page painted across it, because a native child
+/// widget draws above all DOM; closing the rail left a gap. Neither was visible to
+/// `app screenshot`'s default backend, which composites the DOM and is blind to
+/// native children — only `--backend os` shows it.
+///
+/// ⛔ **GEOMETRY IS NEVER WRITTEN TO A HIDDEN WEBVIEW.** It is recorded and
+/// re-asserted by whoever shows the surface, because a hidden widget does not
+/// merely ignore the write — it POISONS the next one, and the surface comes
+/// back at the size it had when it was hidden:
+///
+/// * GTK drops `size_allocate` on a widget whose visible flag is false, so the
+///   one call that actually resizes the page does nothing; and
+/// * a `WebKitWebViewBase` answers `get_preferred_width` with ITS OWN CURRENT
+///   VIEW SIZE, so once it is wider than the request, the natural size a layout
+///   pass reads is still the old, larger one. Growing is therefore free and
+///   shrinking is not: the only thing that ever breaks the loop is a
+///   `size_allocate` the widget can process, which is exactly what a hidden
+///   widget will not do.
+///
+/// Measured, not reasoned: `scripts/webview-shrink-probe.py` builds this exact
+/// widget tree (overlay → `GtkFixed` at `halign/valign: Start` with margins →
+/// `WebKitWebView`) and replays each path. Resizing a VISIBLE surface shrinks
+/// the page; resizing it hidden and then showing it leaves the page at the old
+/// width, *and so does a second apply in that same turn*. Showing first and
+/// placing after is the one order that lands.
+///
+/// The user's symptom, at 1400×1192 in a 1665 px window: the cwd tree comes
+/// back, the page keeps the width it had while the tree was hidden, noVNC
+/// centres its canvas in a viewport 265 px wider than the hole it is shown
+/// through, and the desktop sits 132 px to the right with its far edge cut off.
 fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
+    use gtk::prelude::WidgetExt as _;
     use wry::WebViewExtUnix as _;
     let (w, h) = (w.max(1), h.max(1));
+    // Record FIRST and unconditionally: this is what the reveal re-applies, and
+    // the shell must never be able to push a rect that is forgotten.
+    surface.bounds.set((x, y, w, h));
+    if !surface.webview.webview().get_visible() {
+        return;
+    }
     surface.container.set_margin_start(x.max(0));
     surface.container.set_margin_top(y.max(0));
     surface.container.set_size_request(w, h);
     surface.webview.webview().set_size_request(w, h);
     let _ = surface.webview.set_bounds(rect_logical(w, h));
+}
+
+/// Re-assert the rect the shell last asked for, now that the surface can take
+/// it. Every door that SHOWS a surface calls this as its last act — see
+/// [`apply_bounds`] for why a reveal has to place the surface again rather than
+/// trust the geometry it was given while hidden.
+///
+/// No flash: showing and placing happen in the same main-loop turn, so GTK has
+/// drawn no frame in between — the surface's first painted frame is already at
+/// the new rect.
+fn reapply_bounds(surface: &Surface) {
+    let (x, y, w, h) = surface.bounds.get();
+    apply_bounds(surface, x, y, w, h);
 }
 
 /// Everything a surface needs in order to answer "the page here asked for
@@ -3684,6 +3736,8 @@ fn build_popup_webview(
             // map it. So this is false even when the popup is invisible.
             engine_hidden: Cell::new(false),
             wake_token: Cell::new(0),
+            // The opener's rect, which is what a popup is built at.
+            bounds: Cell::new((x, y, w.max(1), h.max(1))),
         },
     );
     Some(webkit)
@@ -4578,6 +4632,10 @@ impl WebSurfaceHost {
                 // OURS so the agent drive path can wake it for a burst.
                 engine_hidden: Cell::new(!visible),
                 wake_token: Cell::new(0),
+                // The rect it was BUILT at. A surface born hidden is revealed
+                // by a door that re-applies this, so the seed has to be the
+                // real one rather than a placeholder nobody chose.
+                bounds: Cell::new((x, y, w.max(1), h.max(1))),
             },
         );
         Ok(())
@@ -4635,6 +4693,13 @@ impl WebSurfaceHost {
             let _ = s.webview.set_visible(visible);
             s.container.set_visible(visible);
             s.engine_hidden.set(!visible);
+            if visible {
+                // PLACE IT AGAIN, now that it can take a size. The shell sets
+                // bounds before visibility on purpose (never flash a surface at
+                // a stale rect), which means every rect pushed while this was
+                // hidden was recorded and not applied — see `apply_bounds`.
+                reapply_bounds(s);
+            }
         }
     }
 
@@ -4901,9 +4966,14 @@ impl WebSurfaceHost {
             self.overlay.reorder_overlay(&s.container, -1);
         }
         restack_glass(&self.overlay, &self.glass);
-        apply_bounds(s, x, y, w, h);
+        // SHOWN FIRST, PLACED SECOND — the order is load-bearing, not tidy.
+        // `apply_bounds` before the widget is visible cannot resize the page
+        // (GTK drops the allocation) and leaves it stuck at the size it had
+        // when it was hidden; the same call after the show lands. No frame is
+        // drawn between these two lines, so nothing flashes at the old rect.
         let _ = s.webview.set_visible(true);
         s.container.show_all();
+        apply_bounds(s, x, y, w, h);
         // Reveal clears the engine-hidden fact (as do `set_visible(true)` and
         // `set_throttled(false)`). Leaving it set would let a re-hide armed by
         // an in-flight agent burst blank the page the user just switched to.
@@ -4956,6 +5026,11 @@ impl WebSurfaceHost {
         let s = surfaces.get(&id).ok_or("no such surface")?;
         let _ = s.webview.set_visible(!throttled);
         s.engine_hidden.set(throttled);
+        if !throttled {
+            // Un-throttling is a reveal: the widget was hidden, so any rect the
+            // shell pushed meanwhile was recorded rather than applied.
+            reapply_bounds(s);
+        }
         Ok(())
     }
 
@@ -6461,6 +6536,74 @@ mod engine_visibility_locks {
             "the re-hide no longer honours the re-arm token, so a burst gives its \
              wake back part-way through",
         );
+    }
+
+    /// GEOMETRY AND VISIBILITY ARE ONE MECHANISM, and getting their ORDER wrong
+    /// is invisible in every instrument this repo owns: the page is the right
+    /// size to the shell, the rect is the right size in the reconciler's applied
+    /// map, `app screenshot`'s default backend cannot see native children at
+    /// all, and only the pixels — or `window.innerWidth` inside the page — say
+    /// otherwise.
+    ///
+    /// What is locked here is what `scripts/webview-shrink-probe.py` measured on
+    /// this widget tree (see [`apply_bounds`]): a hidden webview drops the one
+    /// call that resizes the page AND poisons the next one, so the rect has to
+    /// be recorded while hidden and re-asserted AFTER the show. The user's
+    /// symptom was a remote desktop 132 px off-centre with its right edge cut
+    /// off, every time the cwd tree came back over a backgrounded surface.
+    #[test]
+    fn a_revealed_surface_is_placed_after_it_is_shown_not_before() {
+        let product = product_lines();
+
+        let apply = body_of(&product, "fn apply_bounds(");
+        assert!(
+            apply.contains("surface.bounds.set((x, y, w, h));"),
+            "apply_bounds no longer records the rect, so a reveal has nothing to \
+             re-assert and a surface hidden at one size comes back at it",
+        );
+        let recorded = apply
+            .find("surface.bounds.set((x, y, w, h));")
+            .expect("the record is gone");
+        let guarded = apply
+            .find("if !surface.webview.webview().get_visible() {")
+            .expect(
+                "apply_bounds no longer refuses to size a HIDDEN webview: GTK \
+                 drops the allocation and WebKit keeps answering with its old \
+                 view size, so the next apply is poisoned too",
+            );
+        assert!(
+            recorded < guarded,
+            "the rect is recorded only when the surface is visible — the one \
+             case that needs recording is the hidden one",
+        );
+
+        for (door, body) in [
+            ("unstash", body_of(&product, "pub fn unstash(")),
+            ("set_visible", body_of(&product, "pub fn set_visible(")),
+            ("set_throttled", body_of(&product, "pub fn set_throttled(")),
+        ] {
+            let shown = body
+                .find("set_visible(true)")
+                .or_else(|| body.find("set_visible(visible)"))
+                .or_else(|| body.find("set_visible(!throttled)"))
+                .unwrap_or_else(|| panic!("`{door}` no longer shows the webview"));
+            let placed = body
+                .find("apply_bounds(")
+                .or_else(|| body.find("reapply_bounds("))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{door}` reveals a surface and never places it — every \
+                         rect pushed while it was hidden was recorded and not \
+                         applied, so it comes back at its old size",
+                    )
+                });
+            assert!(
+                shown < placed,
+                "`{door}` places the surface BEFORE showing it. GTK cannot \
+                 resize a hidden widget, so this order is the bug, not a style \
+                 choice — and it leaves no trace anywhere but the pixels",
+            );
+        }
     }
 }
 

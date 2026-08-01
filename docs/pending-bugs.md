@@ -47,6 +47,50 @@ fix) once the fix is verified live on jojo.
   **The habit stands regardless: before trusting ANY test in a report, mutate
   the production call site yourself.**
 
+## ⭐ A revealed web surface kept its OLD size — FIXED IN CODE, NOT YET LIVE (2026-08-01)
+
+User report, with a screenshot of a yRDP desktop sitting 132 px to the right of
+where it belongs and its far edge cut off: *"My viewport does not auto resize…
+hiding cwdtree does not repin/scale to the new viewport size."* Reached by
+hiding the cwd tree, switching INTO the surface's session, showing the tree
+again, and switching back.
+
+**Measured, not inferred.** The page itself is the only witness — `app
+screenshot`'s default backend cannot see native children, and the reconciler's
+applied map holds the rect the shell ASKED for:
+
+```
+yggterm server app web eval --session live::<uuid> --script 'innerWidth'
+→ 1665      # the viewport width with the cwd tree HIDDEN
+            # while `dom.main_surface_body_rect` said 1400 and the page's own
+            # x had already followed the tree back to 269
+```
+
+A rect that never existed as a measurement (fresh x, stale width) proved the
+shell had pushed the right rect and GTK had taken only half of it.
+
+**Root cause: geometry written to a HIDDEN webview is not merely ignored, it
+poisons the next write.** GTK drops `size_allocate` on an invisible widget, and
+a `WebKitWebViewBase` answers `get_preferred_width` with its own current view
+size — so once the view is wider than its size request, every later layout pass
+still reads the larger natural size. Growing is free; shrinking needs an
+allocation the widget can process. `WebSurfaceHost::unstash` placed the surface
+BEFORE showing it, so a reveal after the window narrowed dropped the new size
+and the shell's change-gate (`entry.bounds != rect`) then suppressed every
+retry: the surface was wrong for the rest of its life.
+
+**Fix (`vendor/dioxus-desktop/src/web_surface.rs`):** `apply_bounds` records the
+rect always and writes it only to a visible view; `unstash`, `set_visible(true)`
+and `set_throttled(false)` show first and place after. Locked structurally by
+`engine_visibility_locks::a_revealed_surface_is_placed_after_it_is_shown_not_before`
+(all three mutations proven red), and the GTK behaviour itself is measurable
+with `scripts/webview-shrink-probe.py`, which replays all eight paths.
+
+⚠ **Not verified live on jojo** — that host runs 2.12.23, which predates this.
+To verify: build and install the GUI, open any web surface, hide the cwd tree,
+switch away and back, show the tree, and read `innerWidth` back with the eval
+above. It must equal `dom.main_surface_body_rect.width`.
+
 ## ⭐ ychrome as the daily driver — WHAT IS LEFT (user-confirmed 2026-08-01)
 
 > **The user closed these himself on 2026-08-01, so do not re-open them without
