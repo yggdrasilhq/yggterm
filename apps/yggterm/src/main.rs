@@ -28,7 +28,8 @@ use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, ScreenshotPostProcess, SessionKind,
-    WorkspaceViewMode, YggtermServer, active_client_instance_records, default_endpoint,
+    WorkspaceViewMode, YggtermServer, active_client_instance_records,
+    control_endpoint_for_runtime_key, default_endpoint,
     detect_ghostty_host, ensure_local_daemon_running, focus_live_with_view,
     local_headless_companion_executable_from_current, open_remote_session_with_view,
     open_stored_session_with_view, ping, reorder_live_sessions_scoped,
@@ -1805,7 +1806,14 @@ fn main() -> Result<()> {
     // idle program won't re-emit on its own. Read-only-ish control op; skips the
     // is-current version gate so it works against an older running daemon.
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
-        let endpoint = cli_server_endpoint(store.home_dir());
+        // Address the daemon that OWNS this runtime key, not the one this
+        // binary's version would spawn. This is the entry point the local
+        // daemon's `forward_remote_pty_resize` reaches over ssh, and on a host
+        // running version-coexisting daemons the owner is routinely an OLDER
+        // daemon than the deployed binary. Resolving by version is why SIGWINCH
+        // silently stopped reaching remote CC agents on `dev` while the same
+        // tick resized `oc` fine — see `owning_daemon_endpoint_for_runtime_key`.
+        let endpoint = control_endpoint_for_runtime_key(store.home_dir(), &args[3]);
         let cols = cli_flag_value(&args, "--cols")
             .and_then(|v| v.parse::<u16>().ok())
             .context("missing/invalid --cols for server terminal resize")?;
@@ -1820,6 +1828,7 @@ fn main() -> Result<()> {
                 "session_path": args[3],
                 "cols": cols,
                 "rows": rows,
+                "owner_endpoint": format!("{endpoint:?}"),
             }))?
         );
         return Ok(());

@@ -228,13 +228,6 @@ symptoms, and the last two are strongly suspected to share a root:
    `terminal_mount/forward_protocol_only_output` runs **75× higher** during
    storms (15.1/min vs 0.2/min) while `terminal_io/dispatch` is flat.
 
-   Adjacent, found in the same trace and NOT the judder: **remote PTY resize
-   never reaches remote CC sessions.** `terminal_resize/remote_pty_resize_failed`
-   for `remote-cc://dev/<uuid>` with `terminal session not found:
-   cc-runtime://<uuid>`, five retries then `will_retry: false`, while
-   `remote-cc://oc/<uuid>` resizes `ok: true` on the same tick. SIGWINCH is
-   silently not delivered to those agents. Separate bug, own lane.
-
 ## Standing traps / other open bugs
 
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
@@ -478,9 +471,13 @@ symptoms, and the last two are strongly suspected to share a root:
   set (11 more processes). Then `session remove` answered `verified:true`,
   reaped the ACTIVE client's webviews, and left the shadow's **21 webviews
   (2.3 GB)** alive with no row anywhere — only `shadow-client.sh stop` freed
-  them. Same family as the remote-cc entry below: the teardown verifies one
-  side and claims the whole. Fix: the remove path must sweep every client's
-  applied set for the session, or refuse with the shadow named.
+  them. Same family as the remote-cc `session remove` defect (FIXED 2026-08-01 —
+  `docs/sessions.md` §Closing a session that lives on another machine): the
+  teardown verifies one side and claims the whole. **This half is still open**,
+  and its axis is per-CLIENT rather than per-machine, so the remote fix does not
+  reach it. Fix: the remove path must sweep every client's applied set for the
+  session, or refuse with the shadow named — the refusal vocabulary
+  (`SessionRemovalRefusal`) is now the place to add that name.
   **REPRODUCES on 2.12.18 (jojo, 2026-07-27 — J8b).** Two fixture sessions
   removed, both `verified:true` with reaped pids named: the GUI fell to **1**
   webview while the shadow kept **3** (952 MB total) for rows that existed
@@ -530,30 +527,6 @@ symptoms, and the last two are strongly suspected to share a root:
   is the design; contexts for torn-down profiles are not always reaped with
   their last webview. Small (network processes are lighter than web
   processes), but it is a leak shape — audit `web_context_key` retirement.
-
-- **★★ REMOTE-CC `session remove` REPORTS `verified:true` WHILE THE REMOTE AGENT
-  KEEPS RUNNING (found + reproduced end-to-end on jojo, 2.12.17, 2026-07-27).**
-  Removing a `remote-cc://` row reaps only the LOCAL ssh client and still
-  answers a clean verified removal:
-  ```
-  verified:true   live_processes:[]   row_still_listed:false
-  reaped_processes:[{"command":"ssh","pid":<local ssh client>}]
-  ```
-  The remote agent process was still alive on the remote host 90 s later, with
-  no row anywhere pointing at it. **Root cause, and it is not a race:** the
-  orphan's parent is the REMOTE host's own `yggterm-headless server daemon` —
-  the remote runtime is deliberately daemon-owned so it survives ssh drops, so
-  the local remove never asks the remote daemon to close its runtime. The remote
-  daemon is left holding a live runtime for a row that no longer exists.
-  **Why this one matters:** the teardown-honesty contract says a report must be
-  verified or honestly refuse, and the LOCAL path already implements it
-  perfectly — a local agent row removal names every pid it killed (shell, agent,
-  and the agent's own MCP children) and a local shell removal names the tenant
-  it reaped. The remote path simply does not cross the machine boundary, yet
-  claims the same verification. Fix: proxy the close to the owning remote daemon
-  and verify there, or refuse with a named reason when the remote half cannot be
-  confirmed. **Never report `verified:true` for work done on only one side of an
-  ssh hop.** Repro + evidence: jojo queue §DONE "J7 step 4 / Defect B".
 
 - **`server app open` on a REMOVED row times out instead of naming the reason
   (minor, jojo 2.12.17, 2026-07-27).** Opening a deleted session path correctly

@@ -12,8 +12,9 @@ use crate::{
     codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
     persist_remote_generated_copy, poll_remote_local_codex_identities,
-    remote_resume_runtime_output_requires_restart, request_remote_codex_session_shutdown,
-    spawn_hot_restart_daemon_process, terminate_remote_codex_session,
+    remote_resume_runtime_output_requires_restart, request_remote_agent_session_shutdown,
+    spawn_hot_restart_daemon_process, terminate_remote_agent_session,
+    terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -86,11 +87,22 @@ const ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL: &str =
 const PERF_INCIDENT_MONITOR_MS: u64 = 30_000;
 const PERF_INCIDENT_WINDOW_MS: u64 = 60_000;
 
+/// Ask the machine that OWNS a remote agent session to close it, off the request
+/// loop.
+///
+/// **Both agent kinds, and that is the fix.** The caller used to resolve its
+/// target through `remote_shutdown_target_for_path`, which parses
+/// `remote-session://` only — so a `remote-cc://` row never reached this
+/// function at all and its remote `claude` outlived the row. Kind is carried
+/// explicitly now because the remote verb differs per kind
+/// (`terminate-codex` / `terminate-cc`) and a default would be a silent Codex
+/// assumption all over again.
 fn spawn_explicit_remote_session_shutdown(
     home: &Path,
     path: &str,
     machine: RemoteMachineRef,
     session_id: String,
+    kind: SessionKind,
 ) {
     let home = home.to_path_buf();
     let path = path.to_string();
@@ -105,7 +117,8 @@ fn spawn_explicit_remote_session_shutdown(
         .spawn(move || {
             let force_after =
                 std::time::Duration::from_secs(EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS);
-            let result = request_remote_codex_session_shutdown(&machine, &session_id, force_after);
+            let result =
+                request_remote_agent_session_shutdown(&machine, &session_id, kind, force_after);
             append_trace_event(
                 &home,
                 "daemon",
@@ -120,6 +133,7 @@ fn spawn_explicit_remote_session_shutdown(
                     "machine_key": machine_key,
                     "ssh_target": machine.ssh_target,
                     "session_id": session_id,
+                    "kind": format!("{kind:?}"),
                     "force_after_seconds": EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS,
                     "error": result.err().map(|error| error.to_string()),
                 }),
@@ -135,6 +149,7 @@ fn spawn_explicit_remote_session_shutdown(
                 "path": spawn_failure_path,
                 "machine_key": spawn_failure_machine_key,
                 "session_id": spawn_failure_session_id,
+                "kind": format!("{kind:?}"),
                 "error": error.to_string(),
             }),
         );
@@ -6226,7 +6241,14 @@ impl DaemonRuntime {
         self.tombstone_live_row(path);
         let stop_command = self.server.terminal_stop_command(path);
         let runtime_path = self.server.terminal_runtime_key_for_path(path);
-        let remote_target = self.server.remote_shutdown_target_for_path(path);
+        // BOTH remote agent kinds. `remote_shutdown_target_for_path` parses
+        // `remote-session://` only, so every `remote-cc://` row returned None
+        // here and its remote claude was never asked to stop — the row left the
+        // live order, the local ssh client died with the local PTY, and the
+        // teardown reported a clean `verified:true` for an agent that was still
+        // running on the other machine. Same hole `forward_remote_pty_resize`
+        // had, same resolver that closes it.
+        let remote_target = self.server.remote_agent_pty_target_for_path(path);
         let removed_terminal = self
             .terminals
             .remove_session(&runtime_path, stop_command.as_deref())?;
@@ -6236,12 +6258,13 @@ impl DaemonRuntime {
         }
         self.prune_unrepresented_preserved_owners("live_session_removed");
         self.persist()?;
-        if let Some((machine, session_id)) = remote_target {
+        if let Some((machine, session_id, kind)) = remote_target {
             spawn_explicit_remote_session_shutdown(
                 self.store.home_dir(),
                 path,
                 machine,
                 session_id,
+                kind,
             );
         }
         Ok(ClosedLiveRow {
@@ -6505,13 +6528,17 @@ impl DaemonRuntime {
                 let mut remote_shutdowns = 0usize;
                 let mut errors = Vec::<String>::new();
                 for path in paths {
-                    let remote_target = self.server.remote_shutdown_target_for_path(&path);
+                    // Both agent kinds — a non-keep-alive `remote-cc://` row
+                    // used to lose its remote claude to the same Codex-only
+                    // resolver that broke `session remove`.
+                    let remote_target = self.server.remote_agent_pty_target_for_path(&path);
                     let stop_command = self.server.terminal_stop_command(&path);
                     let runtime_path = self.server.terminal_runtime_key_for_path(&path);
-                    if let Some((machine, session_id)) = remote_target {
-                        match request_remote_codex_session_shutdown(
+                    if let Some((machine, session_id, kind)) = remote_target {
+                        match request_remote_agent_session_shutdown(
                             &machine,
                             &session_id,
+                            kind,
                             force_after,
                         ) {
                             Ok(()) => remote_shutdowns += 1,
@@ -8215,13 +8242,16 @@ impl DaemonRuntime {
                     .with_context(|| format!("terminal session not found: {path}"))?;
                 let stop_command = self.server.terminal_stop_command(&path);
                 if force_remote {
-                    if let Some((machine, session_id)) =
-                        self.server.remote_shutdown_target_for_path(&path)
+                    // Both agent kinds: a forced restart of a `remote-cc://` row
+                    // used to leave the old remote claude running and then
+                    // resume alongside it.
+                    if let Some((machine, session_id, kind)) =
+                        self.server.remote_agent_pty_target_for_path(&path)
                     {
-                        terminate_remote_codex_session(&machine, &session_id).with_context(
+                        terminate_remote_agent_session(&machine, &session_id, kind).with_context(
                             || {
                                 format!(
-                                    "terminating remote codex session {session_id} before restart"
+                                    "terminating remote {kind:?} session {session_id} before restart"
                                 )
                             },
                         )?;
@@ -8299,6 +8329,14 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::Shutdown => {
+                // DELIBERATELY Codex-only, unlike the three ROW-close sites.
+                // Those close one row the user asked to close; this stops the
+                // whole daemon, and per the constitution a daemon going away
+                // must not destroy work that is still running. Remote Claude
+                // Code rows are daemon-owned on their own host precisely so they
+                // survive this. Do not "unify" it with
+                // `remote_agent_pty_target_for_path` without deciding that
+                // question first.
                 let remote_targets = self.server.remote_shutdown_targets();
                 let mut remote_errors = Vec::new();
                 let mut remote_stopped = 0usize;

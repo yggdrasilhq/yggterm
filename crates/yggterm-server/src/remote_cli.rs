@@ -5,7 +5,7 @@ use crate::{
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
     run_remote_resume_cc, run_remote_resume_codex, run_remote_saved_codex_session_exists,
     run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_cc, run_remote_start_codex,
-    run_remote_terminate_codex,
+    run_remote_agent_runtime_alive, run_remote_terminate_cc, run_remote_terminate_codex,
     run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
@@ -74,6 +74,19 @@ pub enum RemoteServerCommand {
     },
     TerminateCodex {
         session_id: String,
+    },
+    /// Claude Code twin of `TerminateCodex`. Its absence meant a `remote-cc://`
+    /// row's close had nothing to call across the ssh hop, so the remote claude
+    /// outlived the row that owned it while the teardown reported `verified:true`.
+    TerminateCc {
+        session_id: String,
+    },
+    /// Does a daemon on THIS host still own `runtime_key`? The fact a remote
+    /// teardown is verified against — the local side can only prove it reaped
+    /// its own ssh client. Sweeps every coexisting daemon, so an older daemon
+    /// still holding the PTY answers `alive: true` rather than going unseen.
+    AgentRuntimeAlive {
+        runtime_key: String,
     },
     UpsertGeneratedCopy {
         session_id: String,
@@ -173,6 +186,12 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "terminate-codex" if args.len() == 4 => RemoteServerCommand::TerminateCodex {
             session_id: args[3].clone(),
         },
+        "terminate-cc" if args.len() == 4 => RemoteServerCommand::TerminateCc {
+            session_id: args[3].clone(),
+        },
+        "agent-runtime-alive" if args.len() == 4 => RemoteServerCommand::AgentRuntimeAlive {
+            runtime_key: args[3].clone(),
+        },
         "upsert-generated-copy" if args.len() == 4 => RemoteServerCommand::UpsertGeneratedCopy {
             session_id: args[3].clone(),
         },
@@ -225,6 +244,10 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         }
         RemoteServerCommand::TerminateCodex { session_id } => {
             run_remote_terminate_codex(&session_id)
+        }
+        RemoteServerCommand::TerminateCc { session_id } => run_remote_terminate_cc(&session_id),
+        RemoteServerCommand::AgentRuntimeAlive { runtime_key } => {
+            run_remote_agent_runtime_alive(&runtime_key)
         }
         RemoteServerCommand::UpsertGeneratedCopy { session_id } => {
             run_remote_upsert_generated_copy(&session_id)

@@ -19,7 +19,8 @@ use yggterm_core::{
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-    ScreenshotPostProcess, SessionKind, SshConnectTarget, default_endpoint, detect_ghostty_host,
+    ScreenshotPostProcess, SessionKind, SshConnectTarget, control_endpoint_for_runtime_key,
+    default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, fetch_remote_generation_context,
     persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
@@ -1340,8 +1341,23 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
-        ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = cli_server_endpoint(store.home_dir());
+        // No `ensure_local_server_ready_for_cli` here, deliberately, and the
+        // sibling verb in `yggterm` never had one: SPAWNING a daemon cannot help
+        // a resize. Either some daemon already holds this PTY — in which case we
+        // want THAT one, not a fresh peer — or no PTY exists and the honest
+        // answer is a failure. The gate also actively broke the op: it insists
+        // the reachable daemon be the CURRENT build, so a binary built from a
+        // different tree than the running daemon died with "local yggterm daemon
+        // did not become reachable" before ever looking for the owner.
+        // Address the daemon that OWNS this runtime key, not the one this
+        // binary's version would spawn. On a host running version-coexisting
+        // daemons those are different processes, and the owner is routinely the
+        // OLDER one (the constitution keeps it alive while its sessions work).
+        // Resolving by version answered `terminal session not found` for a live
+        // remote CC session on `dev` while the identical call succeeded on `oc`
+        // purely because there the deployed binary's daemon happened to be the
+        // owner — see `owning_daemon_endpoint_for_runtime_key`.
+        let endpoint = control_endpoint_for_runtime_key(store.home_dir(), &args[3]);
         let cols = cli_flag_value(&args, "--cols")
             .and_then(|v| v.parse::<u16>().ok())
             .context("missing/invalid --cols for server terminal resize")?;
@@ -1373,6 +1389,7 @@ fn main() -> Result<()> {
                 "cols": cols,
                 "rows": rows,
                 "nudged": nudge,
+                "owner_endpoint": format!("{endpoint:?}"),
                 "message": message,
             }))?
         );

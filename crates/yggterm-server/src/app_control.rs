@@ -1566,6 +1566,29 @@ pub struct SessionTeardownProcess {
     pub command: String,
 }
 
+/// What the machine on the OTHER end of an ssh hop had to say after a remote
+/// agent row was removed.
+///
+/// **Why this is part of the evidence at all.** Every other field here is a
+/// LOCAL fact: our row order, our `/proc`. For a `remote-cc://` /
+/// `remote-session://` row the process that matters runs on another machine,
+/// under that machine's own daemon, deliberately outliving ssh drops. Judging
+/// such a removal on local facts alone is how a teardown came to answer
+/// `verified:true   live_processes:[]` while the remote agent was still running
+/// 90 s later with no row anywhere pointing at it (jojo, 2.12.17, 2026-07-27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRuntimeAfterRemoval {
+    /// Not a remote agent row — there is no second machine to account for.
+    NotApplicable,
+    /// The owning machine reports no daemon holds the runtime any more.
+    ConfirmedGone,
+    /// The owning machine still holds a live runtime for this session.
+    StillRunning,
+    /// We could not ask, or could not read the answer. NOT clean: an unanswered
+    /// question about another machine is a refusal, never a pass.
+    Unverifiable,
+}
+
 /// What was observed around a `session remove`, as facts rather than prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRemovalEvidence<'a> {
@@ -1583,6 +1606,8 @@ pub struct SessionRemovalEvidence<'a> {
     pub still_running_after: &'a [SessionTeardownProcess],
     /// Whether the post-remove snapshot still lists the row.
     pub row_still_listed: bool,
+    /// The far side of the ssh hop, for a remote agent row.
+    pub remote_runtime_after: RemoteRuntimeAfterRemoval,
 }
 
 /// Why a removal could not be verified. A machine-readable name, never prose:
@@ -1598,6 +1623,13 @@ pub enum SessionRemovalRefusal {
     /// nothing to check the teardown against. The owning daemon is older than
     /// this one, or does not report the pid at all.
     RuntimePidUnobservable,
+    /// The machine that owns this remote row still holds a live runtime for it.
+    /// The local half succeeded; the agent is still running over there.
+    RemoteRuntimeSurvived,
+    /// The owning machine could not be asked, so the far half of the teardown is
+    /// unaccounted for. Never report a removal that crossed an ssh hop as clean
+    /// when only this side was checked.
+    RemoteRuntimeUnverifiable,
 }
 
 impl SessionRemovalRefusal {
@@ -1606,6 +1638,8 @@ impl SessionRemovalRefusal {
             Self::RowStillListed => "row_still_listed",
             Self::ProcessesSurvived => "processes_survived",
             Self::RuntimePidUnobservable => "runtime_pid_unobservable",
+            Self::RemoteRuntimeSurvived => "remote_runtime_survived",
+            Self::RemoteRuntimeUnverifiable => "remote_runtime_unverifiable",
         }
     }
 }
@@ -1628,9 +1662,15 @@ pub struct SessionRemovalVerdict {
 /// itself was saying "no live session for this path", and while the app the
 /// session hosted was still running. Verified means all of: the row left the
 /// live order, every process the session owned is gone, and there was a
-/// runtime pid to check against in the first place. Anything short of that is
-/// `verified: false` with a NAMED refusal and the surviving pids attached, so
-/// an agent cannot truthfully-but-wrongly report a clean exit.
+/// runtime pid to check against in the first place, AND — when the row lived on
+/// another machine — that machine confirmed its runtime is gone too. Anything
+/// short of that is `verified: false` with a NAMED refusal and the surviving
+/// pids attached, so an agent cannot truthfully-but-wrongly report a clean exit.
+///
+/// **The remote clause is the whole point of the fourth check.** Reaping the
+/// local ssh client proves the hop was cut, not that the agent stopped: a remote
+/// runtime is daemon-owned on its own host precisely so it survives ssh drops.
+/// Never report `verified:true` for work done on only one side of an ssh hop.
 pub fn verify_session_removal(evidence: &SessionRemovalEvidence<'_>) -> SessionRemovalVerdict {
     let still_running = evidence.still_running_after.to_vec();
     let reaped = evidence
@@ -1643,6 +1683,10 @@ pub fn verify_session_removal(evidence: &SessionRemovalEvidence<'_>) -> SessionR
         Some(SessionRemovalRefusal::RowStillListed)
     } else if !still_running.is_empty() {
         Some(SessionRemovalRefusal::ProcessesSurvived)
+    } else if evidence.remote_runtime_after == RemoteRuntimeAfterRemoval::StillRunning {
+        Some(SessionRemovalRefusal::RemoteRuntimeSurvived)
+    } else if evidence.remote_runtime_after == RemoteRuntimeAfterRemoval::Unverifiable {
+        Some(SessionRemovalRefusal::RemoteRuntimeUnverifiable)
     } else if evidence.row_was_live && evidence.runtime_pid_before.is_none() {
         Some(SessionRemovalRefusal::RuntimePidUnobservable)
     } else {
@@ -3023,6 +3067,7 @@ mod tests {
             observed_before: &census,
             still_running_after: &[],
             row_still_listed: false,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::NotApplicable,
         });
         assert!(clean.verified);
         assert_eq!(clean.refusal, None);
@@ -3036,6 +3081,7 @@ mod tests {
             observed_before: &census,
             still_running_after: &[],
             row_still_listed: true,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::NotApplicable,
         });
         assert!(!row_alive.verified);
         assert_eq!(
@@ -3051,6 +3097,7 @@ mod tests {
             observed_before: &census,
             still_running_after: &survivors,
             row_still_listed: false,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::NotApplicable,
         });
         assert!(!app_alive.verified);
         assert_eq!(
@@ -3069,6 +3116,7 @@ mod tests {
             observed_before: &[],
             still_running_after: &[],
             row_still_listed: false,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::NotApplicable,
         });
         assert!(!unobservable.verified);
         assert_eq!(
@@ -3085,9 +3133,85 @@ mod tests {
             observed_before: &[],
             still_running_after: &[],
             row_still_listed: false,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::NotApplicable,
         });
         assert!(stored.verified);
         assert_eq!(stored.refusal, None);
+    }
+
+    /// THE remote-CC teardown lie, pinned.
+    ///
+    /// Live shape (jojo 2.12.17, 2026-07-27): removing a `remote-cc://` row
+    /// reaped only the LOCAL ssh client and answered
+    /// `verified:true  live_processes:[]  row_still_listed:false` with the ssh
+    /// pid named in `reaped_processes` — while the remote agent was still
+    /// running 90 s later with no row anywhere pointing at it. Every local fact
+    /// in that report was TRUE. The report was still a lie, because the process
+    /// that mattered was on the other machine.
+    #[test]
+    fn a_remote_row_whose_agent_survived_is_never_verified() {
+        // Exactly the live evidence: the local ssh client was reaped, the row is
+        // gone, nothing local survives.
+        let census = [teardown_process(4242, "ssh")];
+        let local_facts_all_clean = |remote| SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: Some(4242),
+            observed_before: &census,
+            still_running_after: &[],
+            row_still_listed: false,
+            remote_runtime_after: remote,
+        };
+
+        let survived =
+            verify_session_removal(&local_facts_all_clean(RemoteRuntimeAfterRemoval::StillRunning));
+        assert!(
+            !survived.verified,
+            "the local half being spotless is exactly the condition that produced \
+             the false `verified:true`"
+        );
+        assert_eq!(
+            survived.refusal,
+            Some(SessionRemovalRefusal::RemoteRuntimeSurvived)
+        );
+        // The reap report stays honest about what it DID kill.
+        assert_eq!(survived.reaped, census.to_vec());
+
+        // Could not ask is a refusal too — an unanswered question about another
+        // machine is not a clean teardown.
+        let unverifiable = verify_session_removal(&local_facts_all_clean(
+            RemoteRuntimeAfterRemoval::Unverifiable,
+        ));
+        assert!(!unverifiable.verified);
+        assert_eq!(
+            unverifiable.refusal,
+            Some(SessionRemovalRefusal::RemoteRuntimeUnverifiable)
+        );
+
+        // …and the owning machine confirming its runtime is gone is what earns
+        // the pass.
+        let confirmed = verify_session_removal(&local_facts_all_clean(
+            RemoteRuntimeAfterRemoval::ConfirmedGone,
+        ));
+        assert!(confirmed.verified);
+        assert_eq!(confirmed.refusal, None);
+    }
+
+    /// A surviving remote agent outranks the "no local pid" refusal: naming the
+    /// machine-boundary failure is more actionable than naming ours.
+    #[test]
+    fn the_remote_refusal_is_named_ahead_of_the_local_pid_one() {
+        let verdict = verify_session_removal(&SessionRemovalEvidence {
+            row_was_live: true,
+            runtime_pid_before: None,
+            observed_before: &[],
+            still_running_after: &[],
+            row_still_listed: false,
+            remote_runtime_after: RemoteRuntimeAfterRemoval::StillRunning,
+        });
+        assert_eq!(
+            verdict.refusal,
+            Some(SessionRemovalRefusal::RemoteRuntimeSurvived)
+        );
     }
 
     /// Every refusal must carry a distinct machine-readable name: the caller
@@ -3098,6 +3222,8 @@ mod tests {
             SessionRemovalRefusal::RowStillListed,
             SessionRemovalRefusal::ProcessesSurvived,
             SessionRemovalRefusal::RuntimePidUnobservable,
+            SessionRemovalRefusal::RemoteRuntimeSurvived,
+            SessionRemovalRefusal::RemoteRuntimeUnverifiable,
         ];
         let mut names = refusals
             .iter()
