@@ -1175,3 +1175,245 @@ cost.
 of this section.** The one containment shim that looked obvious was measured
 and does nothing (falsification 4). Any future shim needs the same A/B before
 it ships.
+
+## 11. "Same pages on reload look like they are reloading afresh": a ten-minute timer, not a cache (2026-08-01)
+
+**The report:** *"ychrome does not cache so well as chromium based browser. Same
+pages on reload look like they are reloading afresh. We should use aggressive
+caching like chrome with a local CDN override."*
+
+Same shape as §9: the observation is right and the named cause is wrong. §9
+settled that the HTTP disk cache works; this section settles what the user is
+actually watching rebuild. **It is our own reaper, destroying pages on a wall
+clock while the machine has memory to spare.**
+
+⚠ Do not merge this with §9 or §10. §9's ~650 ms is per-surface WebProcess
+startup, §10 is open-webui's forced layouts, and this is a page that no longer
+exists being built again from a URL. Different mechanisms, and only this one is
+ours to fix.
+
+### 11a. The evidence, from the live host's own trace
+
+Every retained `event-trace.*.jsonl` on jojo, all `category: web_surface`:
+
+| | |
+|---|---|
+| `native_close` events | 182 |
+| ...of them `background_hold_expired` | **134 (74%)** |
+| ...of those with `reclaim_pressured: true` | **0** |
+| `hold_ms` on every one | 600000 |
+| machine state while they fired | 9.2 GB of 15.1 GB available (61%), PSI `full avg60` 0.16% |
+
+And they were not abandoned pages. Pairing each timer-kill with the next
+`native_open` on the same `(session_path, tab_id)`:
+
+| | |
+|---|---|
+| surfaces killed by the timer | 132 |
+| **the user came back to** | **109 (83%)** |
+| within 30 minutes | 49 |
+| median time to return | 2,389 s |
+
+The reaper's own stated purpose is to reclaim memory. On this host it reclaimed
+memory nobody was short of, from pages the user was demonstrably still using.
+
+**The falsification that mattered.** `reclaim_pressured: false` on those 134
+events only proves the machine was above the 15% floor; it does NOT prove it was
+above the 30% line where the fix changes anything. So the honest question is
+"would the fix actually have kept those pages?", and the trace can answer it:
+403 recorded `MemoryPressureSnapshot`s ride the reveal-latency path in the same
+corpus.
+
+| | |
+|---|---|
+| memory snapshots recorded | 403 |
+| ...classified `Comfortable` under the new posture | **403 (100%)** |
+| available headroom | min **30.6%**, p05 47.5%, **p50 59.8%**, max 75.0% |
+| timer-kills with a snapshot within 10 min | 112 of 140 |
+| ...where the machine was `Comfortable` | **112 (100%)** |
+
+So on this host every single measured destroy happened on a machine the fix
+classifies as comfortable, and none of them would have fired. ⚠ Note the
+minimum: **30.6%**, barely above the `Comfortable` line. The threshold is not
+generous, and a slightly heavier day puts jojo back on the ten-minute clock by
+design.
+
+### 11b. What each of those returns costs
+
+`yggterm-webprobe` on the deterministic fixture (8 bundles, 2.95 MB of real
+minified JS), Xvfb on `dev`, median of 3. ⚠ Host carried `loadavg ~21` from
+other lanes, so absolutes are inflated; the shape is the result.
+
+| arm | nav→loadStart | loadStart→load | **nav→load** | network bytes | cache bytes written |
+|---|---|---|---|---|---|
+| cold (first-ever visit) | 725 | 264 | **989** | 2,947,452 | 5,898,384 |
+| warm (new process, warm cache) | 687 | 265 | **949** | **0** | **0** |
+| **second surface in a LIVE process** | **222** | 256 | **496** | **0** | – |
+
+Two readings, and the second is the one this section is about:
+
+1. **The cache is not the deficit, again.** The warm arm pulls **zero bytes** off
+   the network and writes zero new records: the entire 2.95 MB comes off disk.
+   Cold→warm buys 40 ms here only because the fixture is on loopback, where
+   bytes are free; the point is that the bytes ARE being served from cache.
+2. **Rebuilding a destroyed surface inside a live GUI costs ~496 ms on a trivial
+   page with everything cached**, 222 ms of which is spent waiting for the
+   WebProcess before the navigation even starts. That is the floor. A real app
+   adds its own render bill on top — §9e measured khanacademy.org's page half at
+   1,638 ms warm — plus scroll position, form state and SPA state, which no cache
+   restores at all.
+
+⚠ **A number here disagrees with §9c and is recorded rather than reconciled.**
+§9c reports a second surface in a live process still waiting ~710–790 ms before
+`load` starts; the same flag on the same tool measured **222 ms** here. Different
+day, different host load. Neither figure has been re-run against the other, so
+treat the per-surface wait as "somewhere between 200 and 800 ms" until someone
+holds the load constant and settles it.
+
+### 11c. The root cause
+
+> **`web_surface_background_hold_ms_for` returned a ten-minute deadline that
+> consulted no memory reading at all.** `MemoryPressureSnapshot::reclaim_pressured`
+> decided whether to DETACH a backgrounded surface and how short the hold should
+> be under pressure — but with no pressure the destroy still ran, off a wall
+> clock, on a machine with 61% of its RAM free.
+
+The rule it was breaking was already written down in this codebase, on
+`RECLAIM_AVAILABLE_FLOOR_PCT`: *"Above it, reclaiming a user's pages costs them
+work to buy memory nobody is asking for."* The pressure path obeyed it. The
+clock never read it.
+
+### 11d. The fix, and the ceiling it does not remove
+
+`ReclaimPosture` (`terminal_observe.rs`) is now the ONE answer to "how badly does
+this machine need a page's memory back", and `reclaim_pressured` is its top band:
+
+| posture | reading | destroy clock |
+|---|---|---|
+| `Pressured` | available < 15%, or PSI `full avg60` ≥ 10% while available < 30% | 5 s (unchanged) |
+| `Tight` | available < 30% | the configured hold, default 600 s (unchanged) |
+| `Comfortable` | available ≥ 30% | **none** |
+
+- **An explicit knob always wins**, in every posture, including
+  `background_hold_secs: 0`. Only an ABSENT knob lets the posture decide, which
+  is why `web_surface_config_hold_ms` now returns `Option` instead of folding the
+  default in: "they chose ten minutes" and "they chose nothing" had become the
+  same value, and they are the difference the fix turns on.
+- **`Comfortable` starts at `RECLAIM_PSI_HEADROOM_CEILING_PCT`, not a new
+  number.** 30% is already this codebase's line for "a memory stall here is not
+  our problem"; it is therefore also the line for "our backgrounded pages are not
+  what this machine is short of".
+- **The memory ceiling is re-imposed by the posture, with hysteresis for free.**
+  As live surfaces accumulate, headroom falls, the posture goes `Tight` and the
+  600 s clock resumes; below the floor it collapses to 5 s. Memory decides, not a
+  clock — which is the mechanism Chromium's tab discarding uses, and the reason
+  its background tabs come back instantly.
+- **Nothing about backgrounding changed.** The surface is still demoted and
+  throttled, so the page is `document.hidden`, its rAF is paused and its timers
+  are throttled. §5 constraint 1 holds: the axis is PAINT, not existence. Only
+  the destroy is gone.
+- The trace now carries `memory_posture` on `native_close` and `native_stash`, so
+  a pass that reaped nothing SAYS why. A destroy recorded as `comfortable` is
+  this bug, back.
+
+**The measured cost.** One live `WebKitWebProcess` on jojo holds **674 MB PSS**;
+§8 records a single Meta surface at ~1.3 GB. So keeping background surfaces is
+expensive, and the honest bound is arithmetic: jojo has 9.2 GB available against
+a `Comfortable`→`Tight` boundary at 30% of 15.1 GB = 4.53 GB, i.e. **~4.7 GB of
+slack, roughly 7 to 15 additional live surfaces**, before the old ten-minute
+behaviour resumes by itself.
+⚠ **Per-surface CPU is not measurable on this substrate** (WS1's correction:
+contexts are shared, and webkit2gtk exposes no web-process id), so "a kept
+surface is idle" rests on the throttle mechanism being unchanged by this patch,
+not on a per-surface reading. Do not quote one.
+
+### 11e. The local CDN override: measured, and the recommendation is DON'T
+
+The user asked for "aggressive caching like chrome with a local CDN override".
+The first half is already true. The second was costed rather than argued.
+
+Across all 15 profiles on jojo that have a cache, hashing every blob's CONTENTS
+(the file NAMES cannot answer this — each profile has its own random 8-byte
+`salt`, so byte-identical bodies get different filenames):
+
+| | |
+|---|---|
+| cached blob bytes | 276.0 MB |
+| distinct contents | 1,955 |
+| contents present in more than one profile | 173 |
+| **redundant bytes** | **29.6 MB (10.7%)** |
+
+So a shared local mirror would save ~10.7% of cache DISK, and would save LATENCY
+only on the first visit to a given asset in a given profile — after that the
+profile's own cache already serves it at zero network bytes (§11b). Against that:
+
+- **It is a cross-profile timing side channel**, and profiles exist here
+  precisely to separate identities. Chromium has spent since 2020 moving the
+  other way, partitioning its HTTP cache by top-level site to close exactly this
+  class of probe. "Cache like Chrome" and "share one cache across identities" are
+  opposite requests.
+- Intercepting CDN assets over HTTPS means terminating TLS with our own
+  certificate for hosts we do not own.
+- It puts a new component in the path of every request, with its own failure
+  mode, to re-solve a problem `NetworkCache` is already solving.
+
+**Recommendation: do not build it.** If the 29.6 MB ever matters it is a disk
+problem with a disk answer (filesystem-level dedupe / reflinks), which costs no
+protocol change and opens no side channel.
+
+### 11f. What is NOT proven: the fix has never been observed running
+
+Honest status, because the deploy protocol says to say this rather than "shipped".
+
+The GUI binary on the live host is a SHARED, contended resource, and during this
+lane's window `~/.local/bin/yggterm` changed identity four times in twenty-three
+minutes as other lanes deployed over it (md5 `29df3685` mine 13:51 → `19681422`
+13:53 → `29df3685` mine ~14:04 → `9cccf654` 14:14). In the one window where the
+running GUI was confirmed by md5 to be this lane's build (pid 1943396), a
+backgrounded surface was watched from 100 s to **587,471 ms of its 600,000 ms
+hold** — and then that GUI generation was replaced at 14:14:28 by another lane's
+restart, 13 seconds short of the crossing that would have settled it.
+
+So: suggestive, not proof. What IS proven is everything except the last step —
+the bug (§11a), the cost (§11b), the posture arithmetic against the live host's
+own 403 memory snapshots (§11a), and 1,718 green tests including a behavioural
+lock built from those numbers.
+
+⚠ **A lane build must not be forced onto the live host to close this.** Doing so
+un-ships whatever else landed on `main` in the meantime, which is how the binary
+kept flipping in the first place. The verification belongs to the deploy that
+carries this lane's merge to `main`, and the check takes one command: watch a
+backgrounded surface past 600 s in `server app state`'s `web_surface_tabs`, and
+confirm `memory_posture: "comfortable"` on its `native_stash` trace line.
+
+⚠ **The event trace is not a reliable instrument for this on jojo.** The GUI
+generation running at 14:04 wrote no `web_surface` events to any readable
+`event-trace.*.jsonl` at all, so "no `memory_posture` in the trace" was a blind
+instrument, not a negative result. `server app state` → `web_surface_tabs` is
+the reliable read: it reports `state`, `stashed_for_ms` and `reaps_in_window`
+per surface.
+⚠ And `stashed_for_ms: null` is AMBIGUOUS — it means "not stashed", which covers
+both "destroyed" and "the user just revealed it". Disambiguate on the ROW's
+existence and on the GUI's pid, or a routine GUI restart reads exactly like a
+reap. It did once here.
+⚠⚠ **Compare `stashed_for_ms` NUMERICALLY, never with a shell glob.** A watcher
+written here matched `*stashed_for_ms=6[5-9]*` intending "650,000 ms or more"
+and fired on **65,846 ms** — 65 seconds — then printed `PASSED 600s STILL
+ALIVE`. It was a wrong answer to the exact question this section exists to
+settle, and it would have read as confirmation of the fix. `[ "$v" -gt 640000 ]`
+is the test. Three instrument ambiguities in one measurement is the standing
+warning: on this host, verify the verifier before quoting it.
+
+### 11g. Still open after this section
+
+- **The per-surface WebProcess wait**, 222 vs 790 ms unreconciled (§11b). It is
+  the largest single term in a rebuild and nobody has held host load constant
+  across the two measurements.
+- **PSON / `WebProcessCache`** remains the only route to removing that wait, and
+  §9f's reasons for leaving it alone are unchanged.
+- **`Comfortable` is a headroom reading, and jojo swaps.** `MemAvailable` stays
+  healthy while the kernel swaps other things out, so a host that is thrashing
+  for reasons of its own can still read `Comfortable`. The PSI route is vetoed by
+  headroom by design (see `RECLAIM_PSI_HEADROOM_CEILING_PCT`), so this is
+  deliberate, not an oversight — but it is the assumption to check first if
+  kept-alive surfaces are ever implicated in a freeze.
