@@ -95,6 +95,10 @@ pub const WEB_ACTIONS: &[(&str, &str)] = &[
         "find",
         "  {bin} server app web find --text <needle> [--next|--prev|--close] [--session <path>]\n    find-in-page through WebKit's own find controller — the same mechanism the\n    Ctrl+F bar drives, so what this reports is what the user sees.\n    answers {match_count, position, label} — the count is the ENGINE's and is\n    UNCAPPED (a capped count is reported as if it were the total), the position\n    is 1-based and wraps. case-insensitive. --close finishes the search, which\n    is what clears the highlights, and closes any bar the user had open.\n",
     ),
+    (
+        "profile",
+        "  {bin} server app web profile <list|show|avatar|protect|unprotect> [<name>] [--emoji <e>|--default]\n    THE picker card's row menu, reachable. Those verbs — \"Change avatar…\",\n    \"Use the default avatar\", \"Protect profile\" — lived only on a card an\n    agent had no way to raise, so the avatar sidecar's persistence contract\n    could not be verified at all (docs/pending-bugs.md, J8b).\n    `list`/`show` report `unknown_keys`, which IS that contract: a key another\n    process owns (ychrome's `agent_drive`) must survive every write here.\n    Reads and writes the host's own `~/.yggterm/web-profiles/<name>/profile.json`\n    through the same core owner the card writes with, so no GUI need be running.\n    `avatar <name> --default` clears a stored avatar back to the derived one;\n    flags come AFTER the name. `protect` refuses a permanent profile with the\n    same sentence the card's disabled entry shows.\n",
+    ),
     ("code", ""),
     ("capture", ""),
 ];
@@ -180,6 +184,192 @@ fn parse_web_element_ref(
         }));
     }
     Ok(None)
+}
+
+/// The picker card's row-menu ids, as `crates/yggterm-shell/src/shell.rs`
+/// spells them. Every write verb below echoes the id of the card affordance it
+/// IS, so an agent reading a response and a user reading the menu are looking
+/// at the same thing under two names — and so a future reader can find the
+/// other half by grepping one string.
+const WEB_PROFILE_MENU_CHANGE_AVATAR: &str = "web-profile-change-avatar";
+const WEB_PROFILE_MENU_RESET_AVATAR: &str = "web-profile-reset-avatar";
+const WEB_PROFILE_MENU_PROTECT: &str = "web-profile-protect";
+const WEB_PROFILE_MENU_UNPROTECT: &str = "web-profile-unprotect";
+
+/// What the picker card KNOWS about one profile, as JSON.
+///
+/// Every derived field comes from `yggterm_core::web_profile`, the same
+/// functions the card calls, so this is a report of the card rather than a
+/// second opinion about it. `unknown_keys` is the field that matters most: it
+/// is the ONLY way to see, from outside the GUI, that a write preserved a key
+/// this build does not understand.
+fn web_profile_record(root: &std::path::Path, name: &str) -> serde_json::Value {
+    use yggterm_core::web_profile as profile;
+    let dir = root.join(name);
+    let meta = profile::ProfileMeta::read(&dir);
+    let meta_path = profile::ProfileMeta::path_in(&dir);
+    serde_json::json!({
+        "name": name,
+        "avatar": profile::web_profile_avatar(name, &meta),
+        "stored_avatar": profile::web_profile_stored_avatar(&meta),
+        "default_avatar": profile::default_web_profile_emoji(name),
+        "protected": profile::web_profile_is_protected(name, &meta),
+        "permanent": profile::web_profile_is_protected_by_construction(name),
+        "display_name": meta.display_name,
+        "unknown_keys": meta.unknown_keys(),
+        "meta_path": meta_path.display().to_string(),
+        "meta_file_exists": meta_path.exists(),
+    })
+}
+
+/// One `server app web profile …` invocation, already validated.
+///
+/// Parsed apart from execution so every REFUSAL — a bad avatar, a permanent
+/// profile, a name that could escape the jar root — is decided from argv alone
+/// and can be tested without a yggterm home, a daemon or a GUI. The `do` verb's
+/// [`parse_web_surface_do_action`] splits the same way for the same reason.
+#[derive(Debug, PartialEq, Eq)]
+enum WebProfileRequest {
+    List,
+    Show(String),
+    /// `Some` sets a stored avatar, `None` clears it back to the derived one.
+    Avatar {
+        name: String,
+        emoji: Option<String>,
+    },
+    Protection {
+        name: String,
+        protect: bool,
+    },
+}
+
+/// `server app web profile <verb> [<name>] [flags]` → a validated request.
+fn parse_web_profile_request(args: &[String]) -> anyhow::Result<WebProfileRequest> {
+    use yggterm_core::web_profile as profile;
+    let positional = cli_positional_args(args, 4);
+    let action = positional.first().copied().unwrap_or("list");
+
+    // The name is the FIRST positional after the action, so flags go last:
+    // `profile avatar work --default`. `--default work` would be read as a
+    // flag with a value, and a silently-wrong target is worse than a refusal.
+    let name = || -> anyhow::Result<String> {
+        let raw = positional.get(1).copied().with_context(|| {
+            format!(
+                "missing <name> for server app web profile {action} \
+                 (try `profile list`; flags go after the name)"
+            )
+        })?;
+        // Normalization is CORE's, so the CLI cannot address a jar the picker
+        // cannot — and cannot escape the profiles root.
+        let normalized = profile::normalize_web_profile(Some(raw));
+        anyhow::ensure!(
+            normalized == raw.trim(),
+            "`{raw}` is not a profile name this host can address"
+        );
+        Ok(normalized)
+    };
+
+    match action {
+        "list" | "ls" => Ok(WebProfileRequest::List),
+        "show" => Ok(WebProfileRequest::Show(name()?)),
+        "avatar" => {
+            let name = name()?;
+            let reset = args.iter().any(|arg| arg == "--default");
+            let emoji = cli_flag_value(args, "--emoji");
+            anyhow::ensure!(
+                reset != emoji.is_some(),
+                "server app web profile avatar needs exactly one of --emoji <e> or --default"
+            );
+            let emoji = match emoji {
+                Some(raw) => {
+                    // The SAME predicate the picker's avatar field applies, so
+                    // a value the card would reject cannot enter the file by
+                    // the back door.
+                    anyhow::ensure!(
+                        profile::web_profile_emoji_is_valid(raw),
+                        "an avatar is one emoji (two at most) — no spaces"
+                    );
+                    Some(raw.trim().to_string())
+                }
+                None => None,
+            };
+            Ok(WebProfileRequest::Avatar { name, emoji })
+        }
+        "protect" | "unprotect" => {
+            let name = name()?;
+            // The card DISABLES this entry on a permanent profile rather than
+            // hiding it. The verb must refuse for the same reason and in the
+            // same words, or the plane and the UI describe different products.
+            anyhow::ensure!(
+                !profile::web_profile_is_protected_by_construction(&name),
+                "{}",
+                profile::WEB_PROFILE_PERMANENT_REASON
+            );
+            Ok(WebProfileRequest::Protection {
+                name,
+                protect: action == "protect",
+            })
+        }
+        other => anyhow::bail!(
+            "unsupported web profile action: {other} (list|show|avatar|protect|unprotect)"
+        ),
+    }
+}
+
+/// `server app web profile <list|show|avatar|protect|unprotect>` — the picker
+/// card's row menu, addressable.
+///
+/// ⛔ **No app-control round trip, and that is deliberate.** A profile's
+/// `profile.json` is HOST state under `~/.yggterm/web-profiles/`, and the card
+/// re-reads it on every render rather than caching it (see
+/// `web_surface_profile_meta` in the shell: "deliberately a plain read on every
+/// call"). Proxying the write through the GUI would add a second path to the
+/// same file and make the verb unavailable on a host with no GUI running —
+/// which is most hosts an agent works on. The card and this verb call ONE core
+/// function, [`yggterm_core::web_profile::update_profile_meta_in`].
+fn run_web_profile_cli(args: &[String]) -> anyhow::Result<()> {
+    use yggterm_core::web_profile as profile;
+    let request = parse_web_profile_request(args)?;
+    let home = yggterm_core::resolve_yggterm_home()?;
+    let root = profile::web_profiles_root(&home);
+
+    let payload = match request {
+        WebProfileRequest::List => serde_json::json!({
+            "command": "web_profile_list",
+            "root": root.display().to_string(),
+            "profiles": profile::list_web_profiles_in(&root)
+                .into_iter()
+                .map(|name| web_profile_record(&root, &name))
+                .collect::<Vec<_>>(),
+        }),
+        WebProfileRequest::Show(name) => serde_json::json!({
+            "command": "web_profile_show",
+            "root": root.display().to_string(),
+            "profile": web_profile_record(&root, &name),
+        }),
+        WebProfileRequest::Avatar { name, emoji } => {
+            let menu_id = if emoji.is_some() {
+                WEB_PROFILE_MENU_CHANGE_AVATAR
+            } else {
+                WEB_PROFILE_MENU_RESET_AVATAR
+            };
+            profile::update_profile_meta_in(&root, &name, |meta| meta.emoji = emoji)?;
+            serde_json::json!({
+                "command": "web_profile_avatar",
+                "menu_id": menu_id,
+                "profile": web_profile_record(&root, &name),
+            })
+        }
+        WebProfileRequest::Protection { name, protect } => {
+            profile::update_profile_meta_in(&root, &name, |meta| meta.protected = protect)?;
+            serde_json::json!({
+                "command": "web_profile_protection",
+                "menu_id": if protect { WEB_PROFILE_MENU_PROTECT } else { WEB_PROFILE_MENU_UNPROTECT },
+                "profile": web_profile_record(&root, &name),
+            })
+        }
+    };
+    crate::write_stdout_payload(&serde_json::to_string_pretty(&payload)?)
 }
 
 /// Escape a literal so it matches itself as a regex.
@@ -510,6 +700,11 @@ pub fn run_app_control_web_cli(args: &[String], timeout_ms: u64) -> anyhow::Resu
                 .transpose()?
                 .unwrap_or(15_000);
             run_app_control_web_surface_await(session_path, &script, await_timeout_ms)
+        }
+        "profile" => {
+            // The picker card's row menu, addressable. Host state on disk, not
+            // a GUI round trip — see `run_web_profile_cli`.
+            run_web_profile_cli(args)
         }
         "frames" => {
             // What frames this page has, and how much is IN each:
@@ -1021,5 +1216,136 @@ mod tests {
             .expect_err("`server app web` with no verb must fail")
             .to_string();
         assert_eq!(error, "missing action for server app web");
+    }
+
+    fn profile_argv(rest: &[&str]) -> Vec<String> {
+        ["server", "app", "web", "profile"]
+            .iter()
+            .chain(rest.iter())
+            .map(|part| (*part).to_string())
+            .collect()
+    }
+
+    /// The picker card's row menu, parsed. Every id here is a string the shell
+    /// also spells (`WEB_PROFILE_MENU_*` in `crates/yggterm-shell/src/shell.rs`);
+    /// the verbs exist so that menu is reachable at all.
+    #[test]
+    fn the_profile_verb_parses_every_card_affordance() {
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&[])).unwrap(),
+            WebProfileRequest::List,
+            "a bare `profile` lists, so an agent with no name yet has a way in"
+        );
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&["show", "work"])).unwrap(),
+            WebProfileRequest::Show("work".to_string())
+        );
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&["avatar", "work", "--emoji", "🚀"])).unwrap(),
+            WebProfileRequest::Avatar {
+                name: "work".to_string(),
+                emoji: Some("🚀".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&["avatar", "work", "--default"])).unwrap(),
+            WebProfileRequest::Avatar {
+                name: "work".to_string(),
+                emoji: None,
+            },
+            "`--default` is the card's \"Use the default avatar\""
+        );
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&["protect", "work"])).unwrap(),
+            WebProfileRequest::Protection {
+                name: "work".to_string(),
+                protect: true,
+            }
+        );
+        assert_eq!(
+            parse_web_profile_request(&profile_argv(&["unprotect", "work"])).unwrap(),
+            WebProfileRequest::Protection {
+                name: "work".to_string(),
+                protect: false,
+            }
+        );
+    }
+
+    /// ⚠ THE PARITY REFUSALS. A verb that answers where the card refuses is
+    /// not a control plane for the card — it is a second product. Each of
+    /// these is decided from argv alone: no home, no daemon, no GUI.
+    #[test]
+    fn the_profile_verb_refuses_exactly_what_the_card_refuses() {
+        // The card's "Protect profile" is DISABLED on a permanent profile,
+        // with this sentence. The verb must say the same thing.
+        for action in ["protect", "unprotect"] {
+            let error = parse_web_profile_request(&profile_argv(&[action, "default"]))
+                .expect_err("a permanent profile's protection is not editable")
+                .to_string();
+            assert_eq!(
+                error,
+                yggterm_core::web_profile::WEB_PROFILE_PERMANENT_REASON,
+                "the CLI refusal and the card's disabled reason are ONE string"
+            );
+        }
+        // …but its AVATAR is editable, exactly as the card allows.
+        assert!(
+            parse_web_profile_request(&profile_argv(&["avatar", "default", "--emoji", "🦊"]))
+                .is_ok(),
+            "the card offers \"Change avatar…\" on the default profile; so must the verb"
+        );
+
+        // A name that could leave the profiles root is refused, never
+        // normalized into a different jar.
+        for escape in ["../default", "a/b", ".."] {
+            let error = parse_web_profile_request(&profile_argv(&["show", escape]))
+                .expect_err("an unsafe name must be refused")
+                .to_string();
+            assert!(
+                error.contains("is not a profile name this host can address"),
+                "{escape:?} gave {error}"
+            );
+        }
+
+        // The avatar predicate is core's, so the CLI cannot write a value the
+        // picker's own field would reject.
+        let error = parse_web_profile_request(&profile_argv(&[
+            "avatar",
+            "work",
+            "--emoji",
+            "not an emoji",
+        ]))
+        .expect_err("a sentence is not an avatar")
+        .to_string();
+        assert_eq!(error, "an avatar is one emoji (two at most) — no spaces");
+
+        // Exactly one of --emoji / --default. Neither is a no-op write; both
+        // is an ambiguous one.
+        for flags in [
+            vec!["avatar", "work"],
+            vec!["avatar", "work", "--emoji", "🚀", "--default"],
+        ] {
+            let error = parse_web_profile_request(&profile_argv(&flags))
+                .expect_err("ambiguous avatar arguments must be refused")
+                .to_string();
+            assert!(
+                error.contains("exactly one of --emoji <e> or --default"),
+                "{flags:?} gave {error}"
+            );
+        }
+
+        // A missing name names the fix rather than defaulting to some profile.
+        let error = parse_web_profile_request(&profile_argv(&["show"]))
+            .expect_err("no name, no target")
+            .to_string();
+        assert!(error.contains("missing <name>"), "{error}");
+
+        let error = parse_web_profile_request(&profile_argv(&["frobnicate", "work"]))
+            .expect_err("an unknown sub-verb must be refused by name")
+            .to_string();
+        assert_eq!(
+            error,
+            "unsupported web profile action: frobnicate (list|show|avatar|protect|unprotect)"
+        );
     }
 }

@@ -266,7 +266,29 @@ yggterm server app web fill-card --item 'HDFC Regalia' --field expiry  --selecto
 yggterm server app web fill-card --item 'HDFC Regalia' --field code    --selector '#cvv2'   --session <path>
 yggterm server app web fill-card --item 'HDFC Regalia' --field holder  --selector '#name'   --session <path>
 # also: --field exp-month (MM) / exp-year (as stored, usually YYYY) for split forms
+
+# The profile PICKER CARD's row menu, addressable (added 2026-08-01). Those
+# verbs used to exist ONLY on a card an agent had no way to raise, so the
+# avatar sidecar's persistence contract could not be verified at all.
+yggterm server app web profile list
+yggterm server app web profile show work
+yggterm server app web profile avatar work --emoji 🚀      # "Change avatar…"
+yggterm server app web profile avatar work --default       # "Use the default avatar"
+yggterm server app web profile protect work                # "Protect profile"
+yggterm server app web profile unprotect work
 ```
+
+**`profile` reads and writes host state on disk, not a GUI round trip** — the
+card re-reads `~/.yggterm/web-profiles/<name>/profile.json` on every render, so
+the verb works with no GUI running and the card shows the change on its next
+render. Both go through ONE core function
+(`yggterm_core::web_profile::update_profile_meta_in`), which is what keeps
+`agent_drive` — a key ychrome owns and yggterm has no field for — alive across
+a write. **`list`/`show` report `unknown_keys`, and that field IS the
+persistence proof**; a write that empties it is the regression. Refusals match
+the card exactly: `protect default` answers *"default is always protected"*, the
+same sentence the card's disabled entry shows, and an avatar the picker's own
+field would reject is refused here too. Flags go AFTER the name.
 
 **`fill-card`'s only gate is the vault UNLOCK.** Every Bitwarden client can read
 a card cipher and `ychrome-vault` is one, so there is no grant and no per-use

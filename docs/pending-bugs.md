@@ -496,21 +496,17 @@ symptoms, and the last two are strongly suspected to share a root:
   if a fresh GUI dies again near a large applied-webview count, this becomes
   the top entry; the webview budget above is the mitigation either way.
 
-- **The profile PICKER CARD is unreachable from the agent control plane (jojo,
-  2.12.18, 2026-07-27 — J8b).** 2.12.18's avatar/permanence verbs — "Change
-  avatar…", "Use the default avatar", "Protect profile" (disabled reason
-  *"default is always protected"*) — live only on the picker card's row menu
-  (`web_profile_menu_items`, ids `web-profile-change-avatar` /
-  `web-profile-protect`). Nothing an agent can drive reaches that surface: the
-  rail/strip badge opens the profile SWITCHER menu (`webprofile:<name>` entries
-  only), a sidebar profile chip opens the shared session row menu,
-  `server app command list` carries **0** profile/avatar commands, and
-  `server app start-page` reports no profile cards. Consequence: the avatar
-  PERSISTENCE contract — a "Change avatar…" write must preserve unknown sidecar
-  keys such as `agent_drive` — **could not be live-verified at all**, and it is
-  the one clause of the 2.12.18 maiden-run checklist with no live proof. Fix:
-  give the picker an addressable entry point (a command-plane id, or a
-  documented route), or expose the avatar/protect writes as `server app` verbs.
+- **The profile picker CARD ITSELF still cannot be raised or photographed from
+  the plane (successor to the J8b entry closed 2026-08-01).** Its row-menu
+  WRITES are now reachable — `server app web profile <list|show|avatar|protect|
+  unprotect>`, which is what closed the avatar-persistence hole — but nothing an
+  agent can drive opens the picker SURFACE, so the card's rendered avatar cannot
+  be screenshot-verified. The write is provable; the paint is not. Small, and
+  strictly narrower than the entry it replaces: `unknown_keys` in the verb's
+  answer covers the contract that had no proof at all. Fix when convenient: an
+  addressable route that reveals a picker surface (the rail/strip badge opens
+  the profile SWITCHER menu, `webprofile:<name>` entries only), after which the
+  existing `app screenshot --client <shadow>` does the rest.
 
 - **`WebKitNetworkProcess` accumulates per profile churn (jojo, 2026-07-27 —
   J8a: 3 → 10 across one baseline run).** One network process per WebContext
