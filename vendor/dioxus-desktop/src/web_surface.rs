@@ -4627,6 +4627,32 @@ impl WebSurfaceHost {
         })
     }
 
+    /// WHERE the engine's back (or forward) step would land: that history
+    /// item's URL.
+    ///
+    /// The twin of [`nav_state`](Self::nav_state), and it exists for the same
+    /// reason: the shell's own URL stack only ever recorded navigations the
+    /// SHELL drove, so on a site browsed by clicking links it does not know the
+    /// previous address at all — asking it "where does back go" gets the
+    /// CURRENT page back. The engine's back/forward list has always known.
+    ///
+    /// Only a gesture that opens the target somewhere ELSE needs this; stepping
+    /// in place must keep going through [`go_back`](Self::go_back), which
+    /// preserves the page's scroll and form state where a re-navigation to the
+    /// same URL would throw it away. `None` == no surface, or nothing that way.
+    pub fn nav_target_url(&self, id: u64, forward: bool) -> Option<String> {
+        use webkit2gtk::{BackForwardListExt as _, BackForwardListItemExt as _, WebViewExt as _};
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let list = surfaces.get(&id)?.webview.webview().back_forward_list()?;
+        let item = if forward {
+            list.forward_item()
+        } else {
+            list.back_item()
+        }?;
+        item.uri().map(|uri| uri.to_string())
+    }
+
     /// Step the ENGINE's history. Returns false when the surface is gone.
     pub fn go_back(&self, id: u64) -> bool {
         use webkit2gtk::WebViewExt as _;

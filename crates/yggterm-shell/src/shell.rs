@@ -116483,6 +116483,79 @@ fn web_chrome_input_style(foreground: &str, compact: bool, border: &str, flex: &
          color:{foreground}; font-size:{font_size}; outline:none;",
     )
 }
+// ===== MIDDLE-CLICK ON A NAV CONTROL: THE SAME ACTION, IN A NEW TAB =========
+//
+// The grammar every browser already taught the user: a middle-click does what a
+// left-click does, but somewhere ELSE. Back, forward, reload and history each
+// had exactly one behaviour — in place — so the only way to see the previous
+// page without losing this one was to duplicate the tab first and step the copy.
+//
+// "Somewhere else" is NOT a new destination. `WebTabOrigin::Opener` already
+// means "below this tab, after the children it already has" — it is what the
+// row menu's "New tab below this one" uses and what a middle-clicked LINK uses —
+// so these route through that same owner. A second middle-click therefore
+// cascades after the first instead of shoving in between them.
+
+/// Is this the middle button?
+///
+/// One spelling, so the four controls cannot disagree about what a middle-click
+/// is — and so the `onclick` refusal below is testably the same question the
+/// `onmouseup` action asks.
+fn web_nav_middle_click(evt: &MouseEvent) -> bool {
+    evt.trigger_button() == Some(MouseButton::Auxiliary)
+}
+
+/// WHERE a middle-clicked Back or Forward would land: that entry's URL, from the
+/// ENGINE's own history list.
+///
+/// ⚠ **Not `WebSurfaceOverlayView::back_target`'s URL.** That pair carries the
+/// ACTIVE tab's own address — it is the button's ENABLEMENT, which is all that
+/// stepping in place ever needed, because `go_back` needs no URL to act on.
+/// Opening it would hand the user a second copy of the page they are already on.
+/// The engine is the only thing that knows the previous address on a site
+/// browsed by clicking links, which is every site.
+fn web_surface_nav_target_url(session_path: &str, tab_id: u64, forward: bool) -> Option<String> {
+    // The ONE owner of (session, tab) -> native id, the same one the stepper
+    // resolves through.
+    let native_id = web_surface_native_id_for(session_path, tab_id)?;
+    dioxus_desktop::window().web_surface_nav_target_url(native_id, forward)
+}
+
+/// Do a nav control's action in a NEW TAB below the active one.
+///
+/// BACKGROUND, deliberately: Chrome's grammar and this codebase's own (see
+/// [`WebTabOpenRequest::opened_by`]) is that a middle-click opens something
+/// without going there, so the tab the user is reading keeps the front — and
+/// the tab it minted carries a URL, so it never steals the keyboard either.
+fn open_web_nav_target_in_new_tab(
+    state: Signal<ShellState>,
+    session_path: &str,
+    opener_tab_id: u64,
+    url: String,
+    ssh_target: Option<String>,
+) {
+    if url.is_empty() {
+        return;
+    }
+    // THE placement owner — `Opener` is "below this tab, after its existing
+    // children". Nothing here decides placement for itself.
+    let Some(tab_id) = open_web_surface_tab(
+        state,
+        session_path,
+        WebTabOpenRequest::opened_by(opener_tab_id, true),
+    ) else {
+        return;
+    };
+    navigate_web_surface_tab(
+        state,
+        session_path.to_string(),
+        tab_id,
+        url,
+        ssh_target,
+        None,
+    );
+}
+
 /// The browser omnibox with its navigation controls: back / forward / reload,
 /// the address input (Chrome-style inline history completion + a keyboard-driven
 /// suggestion dropdown), and the history-viewer button. ONE implementation for
@@ -116558,7 +116631,13 @@ fn WebOmniboxBar(
                 onclick: {
                     let nav_path = nav_path.clone();
                     let back_target = back_target.clone();
-                    move |_| {
+                    move |evt: MouseEvent| {
+                        // The middle button is `onmouseup`'s, and it opens a new
+                        // tab. If the engine ever routes one here as well, it
+                        // must not ALSO step this tab — the user would get both.
+                        if web_nav_middle_click(&evt) {
+                            return;
+                        }
                         // Step the ENGINE's history, not a URL the shell
                         // remembered: a re-navigation to the previous address is
                         // not "back" (it loses the page's scroll and form state,
@@ -116567,6 +116646,29 @@ fn WebOmniboxBar(
                         if back_target.is_some() {
                             web_surface_step_history(state, &nav_path, active_tab_id, false);
                         }
+                    }
+                },
+                onmouseup: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    move |evt: MouseEvent| {
+                        if !web_nav_middle_click(&evt) {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        let Some(url) =
+                            web_surface_nav_target_url(&nav_path, active_tab_id, false)
+                        else {
+                            return;
+                        };
+                        open_web_nav_target_in_new_tab(
+                            state,
+                            &nav_path,
+                            active_tab_id,
+                            url,
+                            nav_ssh.clone(),
+                        );
                     }
                 },
                 "←"
@@ -116578,10 +116680,35 @@ fn WebOmniboxBar(
                 onclick: {
                     let nav_path = nav_path.clone();
                     let forward_target = forward_target.clone();
-                    move |_| {
+                    move |evt: MouseEvent| {
+                        if web_nav_middle_click(&evt) {
+                            return;
+                        }
                         if forward_target.is_some() {
                             web_surface_step_history(state, &nav_path, active_tab_id, true);
                         }
+                    }
+                },
+                onmouseup: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    move |evt: MouseEvent| {
+                        if !web_nav_middle_click(&evt) {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        let Some(url) = web_surface_nav_target_url(&nav_path, active_tab_id, true)
+                        else {
+                            return;
+                        };
+                        open_web_nav_target_in_new_tab(
+                            state,
+                            &nav_path,
+                            active_tab_id,
+                            url,
+                            nav_ssh.clone(),
+                        );
                     }
                 },
                 "→"
@@ -116591,8 +116718,44 @@ fn WebOmniboxBar(
                 title: "Reload",
                 onclick: {
                     let nav_path = nav_path.clone();
-                    move |_| {
+                    move |evt: MouseEvent| {
+                        if web_nav_middle_click(&evt) {
+                            return;
+                        }
                         state.with_mut(|shell| shell.web_surface_reload_active_tab(&nav_path));
+                    }
+                },
+                onmouseup: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    move |evt: MouseEvent| {
+                        if !web_nav_middle_click(&evt) {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        // "Reload, elsewhere" is this page in a new tab. The
+                        // tab's own URL is the honest answer: the reconciler
+                        // follows the ENGINE onto it, so it is the address the
+                        // user is looking at, not the one they last typed.
+                        let Some(url) = state.with(|shell| {
+                            shell.web_surfaces.get(nav_path.as_str()).and_then(|surface| {
+                                surface
+                                    .tabs
+                                    .iter()
+                                    .find(|tab| tab.id == active_tab_id)
+                                    .map(|tab| tab.url.clone())
+                            })
+                        }) else {
+                            return;
+                        };
+                        open_web_nav_target_in_new_tab(
+                            state,
+                            &nav_path,
+                            active_tab_id,
+                            url,
+                            nav_ssh.clone(),
+                        );
                     }
                 },
                 "⟳"
@@ -116706,8 +116869,30 @@ fn WebOmniboxBar(
                     let nav_path = nav_path.clone();
                     let nav_ssh = nav_ssh.clone();
                     let nav_profile = nav_profile.clone();
-                    move |_| {
+                    move |evt: MouseEvent| {
+                        if web_nav_middle_click(&evt) {
+                            return;
+                        }
                         navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, web_history_data_url(&nav_profile), nav_ssh.clone(), None);
+                    }
+                },
+                onmouseup: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    let nav_profile = nav_profile.clone();
+                    move |evt: MouseEvent| {
+                        if !web_nav_middle_click(&evt) {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        open_web_nav_target_in_new_tab(
+                            state,
+                            &nav_path,
+                            active_tab_id,
+                            web_history_data_url(&nav_profile),
+                            nav_ssh.clone(),
+                        );
                     }
                 },
                 "🕘"
@@ -176077,6 +176262,135 @@ mod webtabs_menu_switcher_locks {
             window.contains("if entry.engine_nav != engine_nav {")
                 && window.contains("set_web_tab_engine_nav("),
             "the poll must write through on the EDGE only:\n{window}"
+        );
+    }
+
+    /// A MIDDLE-CLICK ON A NAV CONTROL DOES THE ACTION IN A NEW TAB BELOW THIS
+    /// ONE.
+    ///
+    /// The grammar every browser already taught the user, and all four controls
+    /// lacked it: back, forward, reload and history each did exactly one thing,
+    /// in place, so seeing the previous page without losing this one meant
+    /// duplicating the tab first and stepping the copy.
+    ///
+    /// The lock is as much about WHERE the tab goes as that one appears.
+    /// "Below this one" is a destination this codebase already owns
+    /// (`WebTabOrigin::Opener`, which the row menu and a middle-clicked link go
+    /// through); a second rule spelled here would drift from it the first time
+    /// either changed.
+    #[test]
+    fn middle_click_on_a_nav_control_opens_a_new_tab_below_this_one() {
+        let product = product_source();
+
+        // 1. ALL FOUR controls, one shape: gated on the middle button, default
+        //    suppressed, and every one of them ending at the same opener.
+        for (anchor, target) in [
+            (
+                "title: \"Back\",",
+                "web_surface_nav_target_url(&nav_path,active_tab_id,false)",
+            ),
+            (
+                "title: \"Forward\",",
+                "web_surface_nav_target_url(&nav_path,active_tab_id,true)",
+            ),
+            // Reload, elsewhere: THIS page in a new tab, so the URL comes off
+            // the active tab rather than from the engine's history.
+            ("title: \"Reload\",", ".find(|tab|tab.id==active_tab_id)"),
+            ("title: \"History\",", "web_history_data_url(&nav_profile)"),
+        ] {
+            let body = handler_body(&product, anchor, "onmouseup:");
+            assert!(
+                body.contains("if!web_nav_middle_click(&evt){return;}"),
+                "{anchor}'s onmouseup must act for the MIDDLE button and no \
+                 other — a plain click still belongs to onclick:\n{body}"
+            );
+            assert!(
+                body.contains("evt.prevent_default();") && body.contains("evt.stop_propagation();"),
+                "{anchor}'s middle-click must swallow the gesture, or the \
+                 engine's own default runs alongside it:\n{body}"
+            );
+            assert!(
+                body.contains(target),
+                "{anchor}'s middle-click must open ITS OWN target ({target}):\n{body}"
+            );
+            assert!(
+                body.contains("open_web_nav_target_in_new_tab(state,&nav_path,active_tab_id,"),
+                "{anchor}'s middle-click must go through the one new-tab route, \
+                 opened by the ACTIVE tab:\n{body}"
+            );
+        }
+
+        // 2. …and the ordinary click must REFUSE the middle button, or a stack
+        //    that routes one to both handlers would step this tab AND open a new
+        //    one. The user asked for one thing; they get one thing.
+        for anchor in [
+            "title: \"Back\",",
+            "title: \"Forward\",",
+            "title: \"Reload\",",
+            "title: \"History\",",
+        ] {
+            let body = handler_body(&product, anchor, "onclick:");
+            assert!(
+                body.contains("ifweb_nav_middle_click(&evt){return;}"),
+                "{anchor}'s onclick must hand the middle button back to \
+                 onmouseup:\n{body}"
+            );
+        }
+
+        // 3. THE PLACEMENT OWNER, not a second copy of it. The route names an
+        //    origin and stops; it never reaches for the arithmetic itself.
+        let route = function_body(&product, "fn open_web_nav_target_in_new_tab(");
+        assert!(
+            route.contains("WebTabOpenRequest::opened_by(opener_tab_id, true)")
+                && route.contains("open_web_surface_tab("),
+            "the new tab must be minted by the UI opener from an Opener origin \
+             — that IS \"below this one\":\n{route}"
+        );
+        assert!(
+            !route.contains("web_tab_placement") && !route.contains("tabs.insert("),
+            "placement has an owner; this must not compute one:\n{route}"
+        );
+        assert!(
+            route.contains("navigate_web_surface_tab("),
+            "the minted tab is blank until something navigates it:\n{route}"
+        );
+
+        // 4. And the origin it names really does mean "below the active tab,
+        //    cascading, without moving the front".
+        let mut shell = shell_with_surface(&[
+            ("https://a.example/", None),
+            ("https://b.example/", None),
+        ]);
+        let active = shell.web_surfaces["local://ws"].tabs[1].id;
+        shell.web_surface_select_tab("local://ws", active, WebTabSelect::User);
+        let index_of = |shell: &ShellState, id: u64| {
+            shell.web_surfaces["local://ws"]
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .expect("the opened tab is in the list")
+        };
+        let first = shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::opened_by(active, true))
+            .expect("a live surface opens a tab");
+        assert_eq!(
+            index_of(&shell, first),
+            2,
+            "the middle-clicked tab lands DIRECTLY below the active tab, not at \
+             the end of the list"
+        );
+        assert_eq!(
+            shell.web_surfaces["local://ws"].active_tab, active,
+            "a middle-click opens without going there: the front must not move"
+        );
+        let second = shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::opened_by(active, true))
+            .expect("a live surface opens a tab");
+        assert_eq!(
+            (index_of(&shell, first), index_of(&shell, second)),
+            (2, 3),
+            "a second middle-click CASCADES after the first, rather than \
+             shoving in between the active tab and it"
         );
     }
 
