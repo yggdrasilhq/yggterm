@@ -37,8 +37,14 @@ pub fn DragGhostCard(
     };
     rsx! {
         div {
+            // The ghost trails the pointer down-and-right, CLAMPED so its widest
+            // form (260px + the stack's 10px lean) still fits. Without the clamp
+            // a drag begun near the right window edge pushes the card off screen
+            // — which is what a tree dragged on the RIGHT edge does every time
+            // once the chrome is mirrored. Geometry, not orientation: the clamp
+            // is right in both, so nothing here has to know about the mirror.
             style: format!(
-                "position:fixed; left:{}px; top:{}px; z-index:1600; pointer-events:none; \
+                "position:fixed; left:min({}px, calc(100vw - 288px)); top:{}px; z-index:1600; pointer-events:none; \
                  transform:translate(16px, 10px); display:flex; flex-direction:column; gap:4px;",
                 x, y
             ),
