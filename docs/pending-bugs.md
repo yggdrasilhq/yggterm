@@ -133,9 +133,18 @@ symbol rather than trusting a line number:**
   per-origin; the adblock filter may be eating `/cdn-cgi/challenge-platform/` or
   `challenges.cloudflare.com` (zero-build test: disable adblock for that profile;
   durable: an `ignore-previous-rules` allowlist entry); and **a profile whose
-  write-lock is held elsewhere silently opens EPHEMERAL**, so cookies never
-  persist and the challenge loops forever — make that refusal open the jar
-  READ-ONLY as its own comment claims, and stop degrading silently. Nothing is
+  write-lock is held elsewhere silently opened EPHEMERAL**, so cookies never
+  persist and the challenge loops forever. ✅ **The SILENCE is fixed**
+  (`WebSurfaceJarMode`): the mode is decided, spelled and traced in one place,
+  and a degraded profile now raises one notice per profile saying it starts
+  logged out and will not remember a bot-check cookie — the misleading
+  "READ-ONLY" comment is gone, since `profile_dir: None` never was read-only.
+  ⚠ **Making it a genuinely read-only jar is still open and is a DESIGN CALL,
+  not a mechanical fix** — WebKitGTK has no such mode, so it means giving the
+  loser a private copy of the profile's cookies, and every agent shadow surface
+  would then duplicate the user's live session cookies to a second place on
+  disk. Options are costed in `ychrome/docs/pending-bugs.md`. The UA half and
+  the engine's own jar were fixed in ychrome (`89d83b3`, `f8bef43`). Nothing is
   diagnosable today because no main-frame load status is traced.
 - **False/stale gates.** `runtime_status_handoff_active()` is
   `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
