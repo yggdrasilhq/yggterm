@@ -160,31 +160,46 @@ the same switch `HardwareAccelerationPolicy::Always` flips. Both `always-*` arms
 are as clean as their `ON_DEMAND` counterparts. Setting `Always` is not a fix for
 this symptom, and shipping it would be a change with no evidence behind it.
 
-### 4.4 The under-glass "recent change" lead — the premise was stale
+### 4.4 The under-glass lead — the real finding is that the setting is NOT STABLE
 
-The brief said under-glass is armed (`=1`) on the live host. **It is not, and the
-authority is the GUI's own startup trace:**
+The brief said under-glass is armed (`=1`) on the live host. The honest answer
+turned out to be *sometimes*. Every one of these is the GUI's own startup trace
+(`linux_desktop_backend_policy`), filtered to real windowed launches:
 
 | GUI pid | started | `web_surface_under_glass` | `webkit_gl_policy` |
 |---|---|---|---|
 | 155552 | 11:52:52 | `0` | `hardware_gl_probed` |
 | 190181 | 12:15:49 | **`1`** | `hardware_gl_probed` |
 | 204893 | 12:29:38 | **`1`** | `hardware_gl_probed` |
-| **313747** | **13:40:08** | **`0`** | **`hardware_gl_forced`** |
+| 313747 | 13:40:08 | `0` | `hardware_gl_forced` |
+| **440481** | **15:03:52** | **`1`** | `hardware_gl_forced` |
 
-`under_glass_default_armed` (`apps/yggterm/src/main.rs:4569-4615`) arms only on an
-explicit `YGGTERM_WEB_SURFACE_UNDER_GLASS=1`; the 13:40 restart did not inherit
-it, so the GUI the user is looking at **now** is on the legacy opaque stack. It
-also reads `hardware_gl_forced`, not `hardware_gl_probed`, because
-`YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` is in the launcher environment and takes
-precedence over the probe — so on the live host **the GL probe never runs.**
+⚠ **`event-trace.jsonl` rotated at 14:27:56**, so the first four rows can no
+longer be re-derived from it. They were read during this investigation and are
+recorded here because that is now the only record.
 
-⚠ **This matters for the report itself:** the user's tearing report may have been
-made while under-glass was armed (12:15–13:40) and the GUI has since restarted
-without it. Whoever relays this must ask whether the symptom is still present
-*right now*, because the answer changes which window we are talking about. In
-any case `guihost-glass-jsscroll` measured under-glass `=1` on guihost's own GPU and
-found nothing.
+**The finding is the instability itself.** Same host, same binary, no user
+action: the GUI restarted five times in ~3 hours and the web-surface compositing
+path flipped `0 → 1 → 1 → 0 → 1`. `under_glass_default_armed`
+(`apps/yggterm/src/main.rs:4569-4615`) arms only on an explicit
+`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`, so whether Phase F is on comes down to
+whether the *environment that happened to launch this GUI* carried the variable
+— which differs between a desktop-file launch, a supervised relaunch, and an
+agent-driven one. That is a direct violation of CLAUDE.md's "No non-determinism"
+rule, and it is a strong explanation for **why an intermittent visual complaint
+is so hard to pin down**: the user's render path is not the same from one
+restart to the next, and they never touched anything.
+
+`webkit_gl_policy: hardware_gl_forced` (not `probed`) is the second half: the
+launcher exports `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1`, which outranks the probe,
+so **on the live host the GL probe never runs at all.**
+
+⚠ **Consequences for how the symptom is discussed.** Any question of the form
+"is it still tearing?" is ambiguous unless the GUI's *current* arming is read
+first, and the answer may change on the next restart without warning. In any
+case the tear measurement is not sensitive to it: `guihost-glass-jsscroll` measured
+under-glass `=1` on guihost's own GPU and found nothing, as did every `noglass-*`
+arm on dev.
 
 ## 5. What remains, ranked
 
@@ -223,8 +238,10 @@ In priority order. The first item is worth more than everything else here.
    KDE's own overview animation. If yes, the cause is the compositor/panel and
    not yggterm at all, and this whole lane is misdirected. If no, it is our
    surface. Ten seconds of the user's time replaces days of ours.
-2. **Ask whether it is still happening on the current GUI** (pid 313747, started
-   13:40, under-glass `0`) or whether the report predates that restart.
+2. **Ask whether it is still happening on the current GUI** — but read its
+   arming first, because it is not stable (§4.4). As of 15:03:52 that is pid
+   440481 with under-glass **`1`**; three GUI generations earlier it was `0`.
+   "Is it still tearing?" is not a well-formed question without that reading.
 3. **Ask what it looks like**: a horizontal line where the picture is offset (a
    true tear) versus the content lurching/stuttering (judder). Those have
    disjoint causes and the word does not distinguish them.
