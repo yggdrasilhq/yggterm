@@ -119970,7 +119970,17 @@ fn DocumentSurfaceBody(
                                         "{label}"
                                     }
                                 },
-                                AppPaneWidget::TextInput { id, placeholder, value, action, .. } => rsx! {
+                                // A SEARCH BOX IS A TEXT INPUT HERE, and it has to
+                                // be, because a widget this placement does not
+                                // match is dropped in SILENCE — no error, no
+                                // fallback, nothing in the app's transcript. The
+                                // rail rendered `search-box` and the document
+                                // surface did not, so yRDP's chooser had a filter
+                                // in the rail and none in the viewport; the moment
+                                // the rail went away the filter went with it, and
+                                // the app had no way to find that out.
+                                AppPaneWidget::TextInput { id, placeholder, value, action, .. }
+                                | AppPaneWidget::SearchBox { id, placeholder, value, action } => rsx! {
                                     input {
                                         key: "{widget_key}",
                                         "data-document-input": "{id}",
@@ -120007,6 +120017,79 @@ fn DocumentSurfaceBody(
                                         },
                                     }
                                 },
+                                // Several buttons the app groups together. The bar
+                                // is already a row, so a toolbar is its buttons
+                                // wearing the bar's own skin rather than a second
+                                // container inside it.
+                                AppPaneWidget::Toolbar { id, buttons } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        "data-document-toolbar": "{id}",
+                                        style: "display:flex; align-items:center; gap:6px; flex-wrap:wrap;",
+                                        for toolbar_button in buttons.iter().cloned() {
+                                            button {
+                                                key: "{toolbar_button.action}",
+                                                "data-document-button": "{toolbar_button.action}",
+                                                style: if toolbar_button.primary {
+                                                    bar_button_primary_style.clone()
+                                                } else {
+                                                    bar_button_style.clone()
+                                                },
+                                                title: "{toolbar_button.title}",
+                                                onclick: {
+                                                    let run_action = run_action.clone();
+                                                    let action = toolbar_button.action.clone();
+                                                    move |_| run_action(action.clone(), None)
+                                                },
+                                                "{toolbar_button.label}"
+                                            }
+                                        }
+                                    }
+                                },
+                                AppPaneWidget::NumberInput { id, label, value, min, max } => rsx! {
+                                    div {
+                                        key: "{widget_key}",
+                                        style: "display:flex; align-items:center; gap:6px;",
+                                        if !label.is_empty() {
+                                            span { style: "{bar_label_style}", "{label}" }
+                                        }
+                                        input {
+                                            "data-document-input": "{id}",
+                                            style: format!(
+                                                "padding:4px 8px; border:1px solid {}; border-radius:7px; \
+                                                 background:{}; color:{}; font-size:11px; outline:none; \
+                                                 max-width:88px;",
+                                                doc.border, doc.bg, doc.fg
+                                            ),
+                                            r#type: "number",
+                                            min: "{min}",
+                                            max: "{max}",
+                                            initial_value: "{value}",
+                                            oninput: {
+                                                let mut state = state;
+                                                let id = id.clone();
+                                                let session_path = session_path.clone();
+                                                move |evt: FormEvent| {
+                                                    state.with_mut(|shell| {
+                                                        shell.set_document_pane_value(
+                                                            &session_path,
+                                                            &id,
+                                                            evt.value(),
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                        }
+                                    }
+                                },
+                                // ⛔ The silent drop. Everything a document surface
+                                // can be handed is matched ABOVE — locked by
+                                // `every_app_pane_widget_reaches_the_document_surface`
+                                // — so this arm exists for the variant somebody
+                                // adds next, and it is the reason that lock has to
+                                // be structural: an unmatched widget renders as an
+                                // empty span, which looks exactly like an app that
+                                // never declared it.
                                 _ => rsx! { span { key: "{widget_key}" } },
                             }
                         }
@@ -182572,6 +182655,59 @@ mod web_surface_immersion_locks {
                 !scanned.contains(forbidden),
                 "a chrome surface went back to the distraction-free-only gate \
                  ({forbidden}) — under glass that paints it over a fullscreen page"
+            );
+        }
+    }
+
+    /// A WIDGET THIS PLACEMENT DOES NOT MATCH IS DROPPED IN SILENCE — no error
+    /// to the app, nothing in its transcript, an empty span where the control
+    /// should be. So "the document surface renders every widget kind" cannot be
+    /// left to whoever adds the next variant to remember.
+    ///
+    /// It has already cost a real one: the rail rendered `search-box` and
+    /// `DocumentSurfaceBody` did not, so yRDP's chooser had a working filter in
+    /// the rail and none in the viewport — invisible while the app declared both
+    /// panes, and a hole the moment the rail went away.
+    ///
+    /// Scanned over PRODUCT lines: the variant list comes from the enum itself,
+    /// so a new `AppPaneWidget` reds this test until the document surface knows
+    /// what to do with it.
+    #[test]
+    fn every_app_pane_widget_reaches_the_document_surface() {
+        let source = shell_source();
+        let scanned = product(&source);
+
+        let enum_body = scanned
+            .split_once("enum AppPaneWidget {")
+            .map(|(_, rest)| rest.split_once("\n}").map(|(body, _)| body).unwrap_or(rest))
+            .expect("the AppPaneWidget enum is gone from this file");
+        let variants: Vec<String> = enum_body
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().trim_end_matches(" {").trim_end_matches(',');
+                let first = name.chars().next()?;
+                (first.is_ascii_uppercase()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric())
+                    && line.starts_with("    "))
+                .then(|| name.to_string())
+            })
+            .collect();
+        assert!(
+            variants.len() >= 8,
+            "the variant scan found only {variants:?} — it is reading the wrong \
+             block, so every assertion below would pass vacuously",
+        );
+
+        let body = scanned
+            .split_once("fn DocumentSurfaceBody(")
+            .map(|(_, rest)| rest.split_once("\n}\n").map(|(body, _)| body).unwrap_or(rest))
+            .expect("DocumentSurfaceBody is gone from this file");
+        for variant in variants {
+            assert!(
+                body.contains(&format!("AppPaneWidget::{variant}")),
+                "the document surface never names `{variant}`, so an app that \
+                 declares one gets an empty span and no way to find out. Render \
+                 it in the bar or the body — silence is not a fallback",
             );
         }
     }
