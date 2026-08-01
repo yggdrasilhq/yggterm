@@ -149,11 +149,12 @@ Yggdrasil shells should support a reusable visual theme editor.
 - **The card's corner radius matches the viewport's** (`SIDEBAR_OVERLAY_RADIUS_PX`
   == `terminal_frame_style` host_radius, 10px). The floating panel and the
   terminal it floats over must read as the same rounded language (user 2026-07-21).
-- **Both sidebars are independently draggable.** The left tree resizes from its
-  right edge (`tree_width`), the right rail from its inner/left edge
-  (`rail_width`) — each with its own clamp and its own persisted setting. The
-  rail's drag delta is negated because its grip is on the inner edge (drag left
-  ⇒ wider).
+- **Both sidebars are independently draggable.** Each resizes from its INNER
+  edge — the one facing the workspace — with its own clamp and its own persisted
+  setting (`tree_width`, `rail_width`). A drag widens a panel when it moves AWAY
+  from the edge that panel is docked against, so the sign belongs to the edge
+  (`SidebarEdge::resize_delta_sign`) and not to the panel; that is what lets the
+  chrome mirror flip both drags without either panel learning about it.
 - A revealed sidebar overlay must never resize the workspace. It is positioned
   out of flow, so the terminal keeps its exact `cols × rows` before, during and
   after a reveal. This is a correctness rule, not a preference: a reflowing
@@ -172,6 +173,55 @@ Yggdrasil shells should support a reusable visual theme editor.
 - The main workspace should remain calmer and more neutral than the shell chrome.
 - Theme accent can be derived from the dominant gradient stop for lightweight emphasis.
 - The theme modal itself should not blur the background. The surrounding UI should remain clearly visible, with a calm blue active-state halo around the modal to signal focused editing.
+
+#### Mirrored chrome (the vertical-axis flip)
+
+The app chrome can be reflected about the window's vertical centre line, as a
+persisted user preference (Settings → Window Chrome → **Mirror Chrome**). Some
+people want the tree under their dominant hand; this is a taste, so it is a
+setting rather than a redesign.
+
+- **ONE owner decides which side anything is on:** `ChromeOrientation` in
+  `yggui-contract`, persisted as `AppSettings::chrome_orientation`. Surfaces ASK
+  it a question — `orientation.edge(ChromeSlot::Tree)` — and are handed a
+  `SidebarEdge`. Nothing else may test the mirror to pick a side. If two places
+  could answer "which side is the sidebar on?", collapse them into this type.
+- **`ChromeSlot` names WHAT, `SidebarEdge` names WHERE.** A slot is `Tree` or
+  `Rail`; an edge is `Left` or `Right` of the *screen*. Any identifier that
+  fuses the two ("LeftSidebar", "sidebar-right") is a lie waiting for the first
+  user who flips the toggle, in a place the compiler cannot see.
+- **The search box is the axis and never moves.** Everything left of it goes
+  right and everything right of it goes left: the cwd tree with its `☰` toggle,
+  the two-phase Web View/Terminal toggle, the `+` menu and the session chip on
+  one side; the metadata/settings/notifications/app-pane rail with its trigger
+  buttons on the other.
+- **A mirror reflects the ARRANGEMENT of controls, not the inside of a
+  control.** The titlebar clusters swap edges *and* reverse, so the button
+  nearest the search box stays nearest the search box and the `☰` stays against
+  the tree it opens. A single control's own parts keep their order — the
+  segmented Web View | Terminal toggle, the window-button strip, a row's label
+  and its trailing actions. Those are one thing, not an arrangement.
+- **The window buttons do not mirror.** Minimise / maximise / close belong to
+  the platform and stay where the platform puts them, physically outermost on
+  their own edge, riding whichever app cluster shares it. The macOS traffic-light
+  inset follows the physical left edge for the same reason.
+- **Everything directional follows the edge, not the panel**: the panel's
+  anchor, its collapse slide, its drop shadow, its resize grip and drag sign,
+  the side a titlebar popover grows toward, the square corner of a panel
+  attached under a tab, and which panel a page-edge hover reveals. A page-edge
+  claim is read off the panel's OWN RECT rather than its selector, so the
+  geometry the web surface is placed against can never disagree with the DOM.
+- **Every mirrored style must emit an identical property-key set in both
+  orientations** — `left` *and* `right`, `flex-direction` in both arms. Dioxus
+  applies `style` property-by-property and never clears a key the next render
+  drops, so a one-sided anchor survives un-mirroring forever. This is the same
+  trap as `SidebarPanelMode`, and it bites harder here because the toggle is
+  designed to be flipped back and forth.
+- **Content is not mirrored.** The interface stays left-to-right: tree rows
+  indent from their leading edge, disclosure chevrons still mean down-is-open
+  and right-is-closed, back/forward arrows keep their browser meaning, and text
+  stays left-aligned. This is a chrome preference, not an RTL locale, and
+  treating it as one would make every label read wrong.
 
 ### Typography
 
