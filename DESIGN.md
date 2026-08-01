@@ -1270,6 +1270,25 @@ path makes for itself:
   re-declared where they are, and the next link belongs beside that tab. The
   front moving because a verb the user ran finished its work is not that
 
+**The middle button does the same action, somewhere else.** It is not a separate
+verb and it does not get a separate menu entry — it is the modifier the user
+already owns from every browser, and it applies to the nav controls beside the
+omnibox exactly as it applies to a link:
+
+- **back** and **forward** open the entry they would have stepped to. In a new
+  tab, so the page you are on stays where it is — which is the whole reason to
+  reach for the middle button rather than the left one
+- **reload** opens this page again, in a new tab. **History** opens the history
+  page in one
+- every one of them lands **below the active tab** and joins its group, so a
+  second middle-click cascades after the first. Same destination, same owner as
+  a middle-clicked link — a nav control does not get a placement rule of its own
+- and it is a **background** open, per the rule above: the user asked to have
+  the page, not to go to it
+
+A control that has an in-place action and no middle-click is an unfinished
+control, not a deliberate one.
+
 **Where the keyboard goes** on a new tab is the other half, and it is decided by
 the tab's DESTINATION:
 
