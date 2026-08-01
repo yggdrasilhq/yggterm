@@ -1726,6 +1726,14 @@ pub struct WebSurfaceHost {
     /// keymap on every bridge (re)install, so an accelerator the user rebinds
     /// is claimed at its NEW chord without a restart.
     claimed_chords: Rc<RefCell<Vec<ClaimedChord>>>,
+    /// The entries the shell contributes to every page's WebKit context menu,
+    /// as DATA — the same shape as `claimed_chords`, and for the same reason:
+    /// this layer appends labels and relays ids, and knows what none of them
+    /// mean.
+    page_menu_items: Rc<RefCell<Vec<PageMenuItem>>>,
+    /// Where a chosen page-menu entry is relayed. One registration serves every
+    /// current and future page webview.
+    page_menu: Rc<RefCell<Option<Rc<dyn Fn(PageMenuInvocation)>>>>,
     /// THE surface WebKit has taken into element fullscreen, or `None`.
     ///
     /// One owner for "is a page on the whole screen right now", written only by
@@ -2540,6 +2548,205 @@ fn connect_seat_input_observer(webkit: &webkit2gtk::WebView, surface_id: u64) {
     webkit.connect_scroll_event(move |_, _| {
         note_seat_input(surface_id);
         gtk::glib::Propagation::Proceed
+    });
+}
+
+// ===== THE PAGE CONTEXT MENU ================================================
+//
+// A web surface's page menu is WebKit's own — the shell deliberately does not
+// preventDefault over `[data-ws-overlay]`, because WebKit's menu already offers
+// Copy/Cut/Paste/Select-All/Open-Link and reimplementing that in DOM would be a
+// second, worse copy of it. What was missing was any way to add ONE entry to
+// it, so an app-level page verb (screenshot) had no mouse route at all.
+//
+// **The item list is DATA, pushed from the shell** ([`WebSurfaceHost::
+// set_page_menu_items`]), exactly like the claimed-chord table. Nothing here
+// knows what any entry MEANS: this layer appends the labels it was given and
+// relays the id that was clicked, with the click point in CSS pixels. Adding an
+// entry is a row in the shell's list plus an arm at the shell's terminus;
+// nothing in this file changes.
+
+/// Which region of a page a capture covers. Both are native
+/// (`WebKitSnapshotRegion`); see [`WebSurfaceHost::snapshot_region`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSnapshotRegion {
+    /// What is on screen.
+    Visible,
+    /// The whole scrollable document, however far below the fold it runs.
+    FullDocument,
+}
+
+impl PageSnapshotRegion {
+    fn webkit(self) -> webkit2gtk::SnapshotRegion {
+        match self {
+            PageSnapshotRegion::Visible => webkit2gtk::SnapshotRegion::Visible,
+            PageSnapshotRegion::FullDocument => webkit2gtk::SnapshotRegion::FullDocument,
+        }
+    }
+}
+
+/// A crop, in the CSS pixels the PAGE speaks, plus the CSS width it was
+/// measured against so the device scale can be derived rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageCrop {
+    /// Left edge, CSS px.
+    pub x: f64,
+    /// Top edge, CSS px.
+    pub y: f64,
+    /// Width, CSS px.
+    pub w: f64,
+    /// Height, CSS px.
+    pub h: f64,
+    /// The CSS width of the region this rect is relative to — the document
+    /// width for a full-document capture, the viewport width for a visible one.
+    /// The scale is the snapshot's real width divided by this.
+    pub css_width: f64,
+}
+
+/// Cut a crop out of a snapshot surface.
+///
+/// Rounds OUTWARD so a 1 px border is never shaved by rounding, and CLAMPS
+/// rather than refusing a rect that merely overhangs (an element flush with the
+/// right edge legitimately measures a fraction wider than the document). An
+/// EMPTY intersection is refused BY NAME: a blank PNG looks like a rendering
+/// bug and gets debugged as one.
+fn crop_image(image: &cairo::ImageSurface, crop: &PageCrop) -> Result<cairo::ImageSurface, String> {
+    let (max_w, max_h) = (image.width(), image.height());
+    let scale = if crop.css_width > 0.0 {
+        max_w as f64 / crop.css_width
+    } else {
+        1.0
+    };
+    let x = ((crop.x * scale).floor() as i64).clamp(0, max_w as i64);
+    let y = ((crop.y * scale).floor() as i64).clamp(0, max_h as i64);
+    let w = (((crop.x + crop.w) * scale).ceil() as i64).clamp(0, max_w as i64) - x;
+    let h = (((crop.y + crop.h) * scale).ceil() as i64).clamp(0, max_h as i64) - y;
+    if w <= 0 || h <= 0 {
+        return Err(format!(
+            "the requested crop ({:.0},{:.0} {:.0}x{:.0} CSS px at scale {scale:.3}) does not \
+             overlap the {max_w}x{max_h} capture",
+            crop.x, crop.y, crop.w, crop.h
+        ));
+    }
+    let out = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32)
+        .map_err(|e| format!("cairo surface for crop: {e}"))?;
+    {
+        let ctx = cairo::Context::new(&out).map_err(|e| format!("cairo context: {e}"))?;
+        ctx.set_source_surface(image, -x as f64, -y as f64)
+            .map_err(|e| format!("cairo source: {e}"))?;
+        ctx.paint().map_err(|e| format!("cairo paint: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// One entry the shell contributes to WebKit's page menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageMenuItem {
+    /// The shell's own id for what this entry means, relayed back verbatim.
+    /// Empty means a separator, which is the one shape this layer does
+    /// interpret — a separator has no id to relay and no action to fire.
+    pub id: String,
+    /// What the user reads on the menu.
+    pub label: String,
+}
+
+impl PageMenuItem {
+    /// A divider — no id to relay and no action to fire.
+    pub fn separator() -> PageMenuItem {
+        PageMenuItem {
+            id: String::new(),
+            label: String::new(),
+        }
+    }
+}
+
+/// A page-menu entry the user chose, and WHERE they opened the menu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageMenuInvocation {
+    /// Which surface's page menu this came from.
+    pub surface_id: u64,
+    /// The shell's own id for the entry, relayed verbatim.
+    pub item_id: String,
+    /// The right-click point in **CSS viewport pixels**, which is the space the
+    /// page speaks and therefore the only space `document.elementFromPoint` can
+    /// be asked in.
+    ///
+    /// ⚠ The GDK event carries WIDGET pixels. The page zoom is divided out
+    /// HERE, next to the webview, for the same reason the injection path does
+    /// it here: this is the only layer that knows the zoom, and a caller that
+    /// had to remember would eventually forget on a zoomed page and address the
+    /// wrong element while everything looked fine at 100%.
+    pub x: f64,
+    /// The right-click point's Y, CSS viewport pixels. See `x`.
+    pub y: f64,
+    /// The link this menu was opened on, when it was opened on one.
+    pub link_uri: Option<String>,
+}
+
+/// Append the shell's entries to a page's WebKit context menu.
+///
+/// Returning `false` from the signal means "show the menu", which is what keeps
+/// WebKit's own items — an entry is ADDED to the page menu, never a replacement
+/// for it.
+fn connect_page_menu_contributor(
+    webkit: &webkit2gtk::WebView,
+    surface_id: u64,
+    items: &Rc<RefCell<Vec<PageMenuItem>>>,
+    notify: &Rc<RefCell<Option<Rc<dyn Fn(PageMenuInvocation)>>>>,
+) {
+    use webkit2gtk::{ContextMenuExt as _, HitTestResultExt as _, WebViewExt as _};
+    let items = items.clone();
+    let notify = notify.clone();
+    webkit.connect_context_menu(move |view, menu, event, hit| {
+        let contributed = items.borrow().clone();
+        if contributed.is_empty() {
+            return false;
+        }
+        // Widget pixels -> CSS pixels, once, here.
+        let zoom = view.zoom_level();
+        let zoom = if zoom > 0.0 { zoom } else { 1.0 };
+        let (raw_x, raw_y) = event.coords().unwrap_or((0.0, 0.0));
+        let (x, y) = (raw_x / zoom, raw_y / zoom);
+        let link_uri = hit.link_uri().map(|uri: gtk::glib::GString| uri.to_string());
+
+        menu.append(&webkit2gtk::ContextMenuItem::new_separator());
+        for item in contributed {
+            if item.id.is_empty() {
+                menu.append(&webkit2gtk::ContextMenuItem::new_separator());
+                continue;
+            }
+            // A fresh action per invocation. The name only has to be unique
+            // within this menu; the MEANING travels in the captured id, so a
+            // label the user reads and the id the shell serves can never drift
+            // apart through a name someone had to keep in step.
+            let action = gtk::gio::SimpleAction::new(&format!("ygg-{}", item.id), None);
+            {
+                let notify = notify.clone();
+                let id = item.id.clone();
+                let link_uri = link_uri.clone();
+                action.connect_activate(move |_, _| {
+                    // Cloned out of the cell BEFORE the call: the notifier
+                    // reaches into the shell webview, and a borrow held across
+                    // that is a borrow held across re-entry.
+                    let Some(notify) = notify.borrow().clone() else {
+                        return;
+                    };
+                    notify(PageMenuInvocation {
+                        surface_id,
+                        item_id: id.clone(),
+                        x,
+                        y,
+                        link_uri: link_uri.clone(),
+                    });
+                });
+            }
+            menu.append(&webkit2gtk::ContextMenuItem::from_gaction(
+                &action,
+                &item.label,
+                None,
+            ));
+        }
+        false
     });
 }
 
@@ -3618,6 +3825,8 @@ impl WebSurfaceHost {
             alt_tap: Rc::new(RefCell::new(None)),
             chord: Rc::new(RefCell::new(None)),
             claimed_chords: Rc::new(RefCell::new(Vec::new())),
+            page_menu_items: Rc::new(RefCell::new(Vec::new())),
+            page_menu: Rc::new(RefCell::new(None)),
             fullscreen: Rc::new(Cell::new(None)),
             theme_colors: Rc::new(RefCell::new(HashMap::new())),
             media_permission_requests: Rc::new(RefCell::new(Vec::new())),
@@ -3660,6 +3869,24 @@ impl WebSurfaceHost {
     /// Install the CHORD notifier (see the `chord` field and [`ClaimedChord`]).
     /// One registration serves every chord: the notifier is handed WHICH chord
     /// fired rather than being one callback per key.
+    /// Install the PAGE MENU notifier. One registration serves every entry:
+    /// the notifier is handed WHICH entry fired and where, rather than being
+    /// one callback per item.
+    pub(crate) fn set_page_menu_notifier(&self, notify: impl Fn(PageMenuInvocation) + 'static) {
+        *self.page_menu.borrow_mut() = Some(Rc::new(notify));
+    }
+
+    /// Replace the entries contributed to every page's context menu.
+    ///
+    /// Idempotent and cheap, so the shell re-pushes an identical list on every
+    /// bridge (re)install rather than tracking whether it already did — the
+    /// same discipline the claimed-chord table follows, and for the same
+    /// reason: a table armed once, before a host that installs later, is a
+    /// table the user never gets.
+    pub(crate) fn set_page_menu_items(&self, items: Vec<PageMenuItem>) {
+        *self.page_menu_items.borrow_mut() = items;
+    }
+
     pub(crate) fn set_chord_notifier(&self, notify: impl Fn(ClaimedChord) + 'static) {
         *self.chord.borrow_mut() = Some(Rc::new(notify));
     }
@@ -4264,6 +4491,17 @@ impl WebSurfaceHost {
             // The ALT KeyTips layer must open from a focused page too — the
             // shell's own listeners are deaf while WebKit holds the keyboard.
             connect_alt_tap_observer(&webview.webview(), &self.alt_tap);
+            // ⭐ The shell's own entries on WebKit's page menu. Attached on the
+            // MAIN surface path only: a popup is a transient script-opened
+            // window whose page verbs address the session's active tab, so an
+            // entry there would name a target that is not the one under the
+            // pointer.
+            connect_page_menu_contributor(
+                &webview.webview(),
+                id,
+                &self.page_menu_items,
+                &self.page_menu,
+            );
             // A page dialog must never be able to wedge this surface (and every
             // sibling on its profile) just because nothing is on screen to
             // answer it.
@@ -4425,6 +4663,32 @@ impl WebSurfaceHost {
         if let Some(s) = self.surfaces.borrow().get(&id) {
             let _ = s.webview.reload();
         }
+    }
+
+    /// Reload surface `id` **bypassing the HTTP cache** — Ctrl+Shift+R.
+    ///
+    /// A genuinely different verb from [`reload`](Self::reload), not a louder
+    /// one, and it goes to the ENGINE rather than to `wry`: `wry`'s `reload()`
+    /// is `webkit_web_view_reload`, which honours the cache, and there is no
+    /// `wry` spelling of the bypass. Mapping the hard chord onto the soft verb
+    /// would answer the key with something the user can already do, which is
+    /// worse than not claiming it.
+    pub fn reload_bypass_cache(&self, id: u64) -> Result<(), String> {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        surface.webview.webview().reload_bypass_cache();
+        Ok(())
+    }
+
+    /// Is the inspector open on surface `id`? The read that makes F12 a TOGGLE
+    /// rather than an open — a key that only opens leaves the user hunting for
+    /// the panel's own close button, which is not where they are looking.
+    pub fn devtools_open(&self, id: u64) -> Result<bool, String> {
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        Ok(surface.webview.is_devtools_open())
     }
 
     /// Set the WebKit zoom factor for surface `id` (1.0 == 100%). This is the
@@ -4981,6 +5245,39 @@ impl WebSurfaceHost {
         path: std::path::PathBuf,
         callback: impl FnOnce(Result<(), String>) + 'static,
     ) -> Result<(), String> {
+        self.snapshot_region(id, PageSnapshotRegion::FullDocument, None, path, |outcome| {
+            callback(outcome.map(|_| ()))
+        })
+    }
+
+    /// Capture one REGION of surface `id`, optionally cropped, to a PNG.
+    ///
+    /// ⭐ **Both regions are native.** `WebKitSnapshotRegion` renders either the
+    /// visible viewport or the whole laid-out document in one call, so there is
+    /// no scroll-and-stitch here and there must not be: a stitch seams at every
+    /// step, repeats every `position: fixed` header once per tile, and leaves
+    /// the page scrolled somewhere the user did not put it.
+    ///
+    /// A crop is cut from the pixels this snapshot already produced, never from
+    /// a second snapshot — two snapshots taken an animation frame apart would
+    /// let "this element" and "the full page" show different content.
+    ///
+    /// ⚠ **The CSS→device scale is MEASURED, not assumed.** The caller hands in
+    /// the CSS width its rect was measured against (`PageCrop::css_width`) and
+    /// the scale is this snapshot's real width divided by it. `devicePixelRatio`
+    /// and the page zoom both move that number, and a crop computed from the
+    /// wrong one produces a plausible image of the wrong part of the page —
+    /// which no amount of looking at the image will reveal.
+    ///
+    /// The callback receives the written `(width, height)` in device pixels.
+    pub fn snapshot_region(
+        &self,
+        id: u64,
+        region: PageSnapshotRegion,
+        crop: Option<PageCrop>,
+        path: std::path::PathBuf,
+        callback: impl FnOnce(Result<(i32, i32), String>) + 'static,
+    ) -> Result<(), String> {
         use webkit2gtk::WebViewExt as _;
         let surfaces = self.surfaces.borrow();
         let surface = surfaces.get(&id).ok_or("no such surface")?;
@@ -4990,18 +5287,28 @@ impl WebSurfaceHost {
         };
         let cancellable: Option<&gtk::gio::Cancellable> = None;
         webkit.snapshot(
-            webkit2gtk::SnapshotRegion::FullDocument,
+            region.webkit(),
             webkit2gtk::SnapshotOptions::empty(),
             cancellable,
             move |result| {
-                let outcome = result.map_err(|e| e.to_string()).and_then(|surface| {
-                    let image = cairo::ImageSurface::try_from(surface)
+                let outcome = result.map_err(|e| e.to_string()).and_then(|snapshot| {
+                    let image = cairo::ImageSurface::try_from(snapshot)
                         .map_err(|_| "snapshot is not an image surface".to_string())?;
+                    let image = match &crop {
+                        None => image,
+                        Some(crop) => crop_image(&image, crop)?,
+                    };
+                    let (w, h) = (image.width(), image.height());
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    }
                     let mut file = std::fs::File::create(&path)
                         .map_err(|e| format!("create {}: {e}", path.display()))?;
                     image
                         .write_to_png(&mut file)
-                        .map_err(|e| format!("encode png: {e}"))
+                        .map_err(|e| format!("encode png: {e}"))?;
+                    Ok((w, h))
                 });
                 callback(outcome);
             },

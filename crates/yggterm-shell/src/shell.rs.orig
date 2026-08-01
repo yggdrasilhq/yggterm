@@ -241,9 +241,7 @@ use yggui::{
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
 };
-use yggui_contract::{
-    ChromeOrientation, ChromeSlot, SidebarEdge, UiTheme, YgguiClipboardContents, YgguiThemeSpec,
-};
+use yggui_contract::{UiTheme, YgguiClipboardContents, YgguiThemeSpec};
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
@@ -1035,22 +1033,12 @@ const TITLEBAR_RESPONSIVE_CSS: &str = r#"
     [data-yggterm-workspace-row="1"] > [data-yggui-side-rail="1"] {
         position: absolute !important;
         top: 0 !important;
-        left: auto !important;
         right: 0 !important;
         bottom: 0 !important;
         height: auto !important;
         z-index: 170 !important;
         background: var(--yggterm-panel-color, rgba(255,255,255,0.98)) !important;
         box-shadow: -12px 0 28px rgba(30, 42, 55, 0.12), inset 1px 0 0 var(--yggterm-border-color, rgba(201,214,226,0.70)) !important;
-    }
-    /* Mirrored, the rail is the LEFT panel: it floats over the workspace from
-       the other edge, so its depth shadow and its inset hairline both fall on
-       the opposite side. Every property the base rule sets is re-set here —
-       a partial override would leave the rail shadowed from the wrong side. */
-    [data-yggterm-workspace-row="1"][data-chrome-mirrored="true"] > [data-yggui-side-rail="1"] {
-        left: 0 !important;
-        right: auto !important;
-        box-shadow: 12px 0 28px rgba(30, 42, 55, 0.12), inset -1px 0 0 var(--yggterm-border-color, rgba(201,214,226,0.70)) !important;
     }
 }
 @media (max-width: 620px) {
@@ -5290,20 +5278,13 @@ impl AppliedWebSurface {
 fn web_surface_reap_due(
     now_ms: u64,
     stashed_at_ms: Option<u64>,
-    hold_ms: Option<u64>,
+    hold_ms: u64,
     lease_until_ms: Option<u64>,
     media_active: bool,
 ) -> bool {
     if media_active {
         return false;
     }
-    // `None` = no clock at all. On a machine with memory to spare there is
-    // nothing to reclaim FOR, and a destroy costs the user a full page rebuild
-    // on the next look (see `ReclaimPosture`). The surface is still stashed and
-    // still throttled; only the destroy is off.
-    let Some(hold_ms) = hold_ms else {
-        return false;
-    };
     let hold_due = match stashed_at_ms {
         Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
         // Not yet marked stashed this tick: only a zero hold reaps immediately.
@@ -5513,51 +5494,15 @@ fn web_surface_socks_egress_donor(tabs: &[(u64, Option<u16>)], tab_id: u64) -> O
         .min()
 }
 
-/// THE destroy clock for one backgrounded surface, or `None` for "no clock".
-///
-/// `configured_hold_ms` is the user's EXPLICIT knob out of
-/// `~/.yggterm/web-surface.json`, or `None` when they set nothing. The
-/// distinction is load-bearing in both directions: an explicit `0` means
-/// "destroy the moment it leaves the screen" and must survive a comfortable
-/// machine, and an ABSENT knob is what lets a comfortable machine keep the page
-/// instead of running a default clock against memory nobody wants.
 fn web_surface_background_hold_ms_for(
-    configured_hold_ms: Option<u64>,
-    posture: crate::terminal_observe::ReclaimPosture,
+    configured_hold_ms: u64,
+    reclaim_pressured: bool,
     recent_reaps: u32,
-) -> Option<u64> {
-    // Pressure first and unchanged: when the machine is genuinely short, the
-    // hold collapses whatever was configured — unless this surface is on the
-    // treadmill, in which case reaping it again reclaims nothing and costs a
-    // fresh web process.
-    if posture.is_pressured() && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
-        return Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS);
+) -> u64 {
+    if reclaim_pressured && recent_reaps < WEB_SURFACE_THRASH_REOPEN_LIMIT {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
     }
-    // ⭐ THE DESTROY IS A RECLAIM, SO IT NEEDS SOMETHING TO RECLAIM FOR.
-    //
-    // A comfortable machine with no explicit knob keeps the page. Everything
-    // that made backgrounding cheap has ALREADY happened by the time this is
-    // asked — the surface is stashed, demoted and throttled, so its page is
-    // `document.hidden`, its rAF is paused and its timers are throttled (§5
-    // constraint 1 of docs/optimization-pass.md: the axis is PAINT, not
-    // existence). Destroying it on top of that buys exactly one thing, memory,
-    // and by construction this branch is the case where nothing is asking for
-    // any. What it costs is the whole §9 launch bill on the next look.
-    //
-    // The ceiling this removes is re-imposed by the posture itself, with
-    // hysteresis for free: as live surfaces accumulate, headroom falls, the
-    // posture goes Tight and the configured hold resumes; below the floor it
-    // goes Pressured and the hold collapses to seconds. Memory, not a clock, is
-    // what decides — which is the mechanism Chromium's tab discarding uses and
-    // the reason its background tabs come back instantly.
-    if matches!(
-        posture,
-        crate::terminal_observe::ReclaimPosture::Comfortable
-    ) && configured_hold_ms.is_none()
-    {
-        return None;
-    }
-    Some(configured_hold_ms.unwrap_or(WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS.saturating_mul(1000)))
+    configured_hold_ms
 }
 
 /// The default for BOTH holds below. One number, because a backgrounded SESSION
@@ -5586,34 +5531,33 @@ fn web_surface_config_raw() -> Option<String> {
 /// PURE — the file read is [`web_surface_config_raw`]'s job — so which KEY a
 /// hold reads and what it falls back to are answerable by a test instead of by
 /// the test machine's `$HOME`.
-/// Read one `*_secs` hold out of an already-read `web-surface.json` body, in ms.
-///
-/// `None` = the user set nothing, and that is now a DECISION rather than a
-/// missing value: [`web_surface_background_hold_ms_for`] keeps a page alive on a
-/// comfortable machine only when nobody asked for a clock. Returning the default
-/// here would erase the difference between "they chose ten minutes" and "they
-/// chose nothing", which is exactly the difference the fix turns on.
-fn web_surface_config_hold_ms(raw: Option<&str>, key: &str) -> Option<u64> {
+fn web_surface_config_hold_ms(raw: Option<&str>, key: &str, default_secs: u64) -> u64 {
+    let default_ms = default_secs.saturating_mul(1000);
     raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|config| config.get(key).and_then(Value::as_u64))
         .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or(default_ms)
 }
 
-/// The SESSION hold's configured value over an already-read config body.
-/// [`web_surface_background_hold_ms`] is the adapter that supplies the body.
-///
-/// No pressure logic here any more. The pressure override used to live in BOTH
-/// this function and [`web_surface_background_hold_ms_for`], and the live call
-/// site passed a hardcoded `false` to switch this copy off — two encodings of
-/// one rule, with the caller compensating for one of them. The pass owns it now,
-/// which is what the pass's own doc comment already claimed ("the reconcile loop
-/// keeps NO policy").
-fn web_surface_background_hold_ms_from(raw: Option<&str>) -> Option<u64> {
-    web_surface_config_hold_ms(raw, "background_hold_secs")
+/// The SESSION hold's whole policy — pressure override, key, default — over an
+/// already-read config body. [`web_surface_background_hold_ms`] is the adapter
+/// that supplies the body.
+fn web_surface_background_hold_ms_from(raw: Option<&str>, reclaim_pressured: bool) -> u64 {
+    // Under memory pressure, reclaim aggressively regardless of the configured
+    // hold — the whole point of pressure-triggered reclaim is to give the ~1.3 GB
+    // back to the system before it thrashes swap.
+    if reclaim_pressured {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+    }
+    web_surface_config_hold_ms(
+        raw,
+        "background_hold_secs",
+        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
+    )
 }
 
-fn web_surface_background_hold_ms() -> Option<u64> {
-    web_surface_background_hold_ms_from(web_surface_config_raw().as_deref())
+fn web_surface_background_hold_ms(reclaim_pressured: bool) -> u64 {
+    web_surface_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)
 }
 
 /// The TAB hold's whole policy over an already-read config body: its OWN key,
@@ -5622,8 +5566,15 @@ fn web_surface_background_hold_ms() -> Option<u64> {
 /// while every behavioural test still passed — which is exactly why the policy
 /// lives in a function a test can hand a config body to
 /// (`the_tab_hold_reads_its_own_config_key_and_defaults_to_ten_minutes`).
-fn web_surface_tab_background_hold_ms_from(raw: Option<&str>) -> Option<u64> {
-    web_surface_config_hold_ms(raw, "tab_background_hold_secs")
+fn web_surface_tab_background_hold_ms_from(raw: Option<&str>, reclaim_pressured: bool) -> u64 {
+    if reclaim_pressured {
+        return WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS;
+    }
+    web_surface_config_hold_ms(
+        raw,
+        "tab_background_hold_secs",
+        WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS,
+    )
 }
 
 /// How long a BACKGROUND TAB of a session the user IS looking at stays alive
@@ -5638,8 +5589,8 @@ fn web_surface_tab_background_hold_ms_from(raw: Option<&str>) -> Option<u64> {
 /// lazy-create path a never-visited one does (its URL and title live in the tab
 /// model and on disk — see [`SavedWebTab`] — so what returns is the page, not a
 /// blank).
-fn web_surface_tab_background_hold_ms() -> Option<u64> {
-    web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref())
+fn web_surface_tab_background_hold_ms(reclaim_pressured: bool) -> u64 {
+    web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)
 }
 
 /// The engine's live "is this page playing audio" answer, as the reclaim plan
@@ -5826,10 +5777,7 @@ struct WebSurfaceBackgroundDecision {
     key: (String, u64),
     native_id: u64,
     action: WebSurfaceBackgroundAction,
-    /// The destroy clock this surface is on, or `None` for "no clock" — a
-    /// comfortable machine with no configured hold. Traced as `null`, which is
-    /// the honest reading: not "zero milliseconds", but "no deadline".
-    hold_ms: Option<u64>,
+    hold_ms: u64,
     media_active: bool,
     /// Which domain claimed it (and therefore which configured hold produced
     /// `hold_ms`). Carried into the trace so per-tab reclaim is answerable from
@@ -5843,10 +5791,6 @@ struct WebSurfaceBackgroundDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSurfaceBackgroundPlan {
     reclaim_pressured: bool,
-    /// The three-state read `reclaim_pressured` is the top band of. Traced so a
-    /// pass that reaped nothing SAYS why, instead of leaving a reader to
-    /// re-derive the thresholds from `/proc`.
-    posture: crate::terminal_observe::ReclaimPosture,
     decisions: Vec<WebSurfaceBackgroundDecision>,
 }
 
@@ -5870,20 +5814,15 @@ fn web_surface_background_plan(
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
-    configured_hold_ms: Option<u64>,
-    configured_tab_hold_ms: Option<u64>,
+    configured_hold_ms: u64,
+    configured_tab_hold_ms: u64,
     surfaces: &[WebSurfaceBackgroundInput],
     media: &dyn WebSurfaceMediaProbe,
 ) -> WebSurfaceBackgroundPlan {
     // CURRENT headroom plus the kernel's own thrash accounting — never
     // `swap_pressured`, which latches TRUE after one bad afternoon and never
-    // clears. See `MemoryPressureSnapshot::reclaim_posture`.
-    let posture = if forced_pressure {
-        crate::terminal_observe::ReclaimPosture::Pressured
-    } else {
-        pressure.reclaim_posture()
-    };
-    let reclaim_pressured = posture.is_pressured();
+    // clears. See `MemoryPressureSnapshot::reclaim_pressured`.
+    let reclaim_pressured = pressure.reclaim_pressured() || forced_pressure;
     let detach = web_surface_background_detach(under_glass, reclaim_pressured);
     let decisions = surfaces
         .iter()
@@ -5895,8 +5834,11 @@ fn web_surface_background_plan(
                 WebSurfaceBackgroundReason::Session => configured_hold_ms,
                 WebSurfaceBackgroundReason::Tab => configured_tab_hold_ms,
             };
-            let hold_ms =
-                web_surface_background_hold_ms_for(configured, posture, surface.recent_reaps);
+            let hold_ms = web_surface_background_hold_ms_for(
+                configured,
+                reclaim_pressured,
+                surface.recent_reaps,
+            );
             // Engine truth, read at the moment of the decision and for THIS
             // surface — a stale flag, or one read for a different surface, would
             // be worse than none.
@@ -5940,7 +5882,6 @@ fn web_surface_background_plan(
         .collect();
     WebSurfaceBackgroundPlan {
         reclaim_pressured,
-        posture,
         decisions,
     }
 }
@@ -5988,8 +5929,8 @@ fn web_surface_reclaim_background_pass(
     under_glass: bool,
     pressure: &crate::terminal_observe::MemoryPressureSnapshot,
     forced_pressure: bool,
-    configured_hold_ms: Option<u64>,
-    configured_tab_hold_ms: Option<u64>,
+    configured_hold_ms: u64,
+    configured_tab_hold_ms: u64,
     backgrounded: &[((String, u64), WebSurfaceBackgroundReason)],
     applied: &mut HashMap<(String, u64), AppliedWebSurface>,
     lease_until_ms: &dyn Fn(&(String, u64)) -> Option<u64>,
@@ -6024,7 +5965,6 @@ fn web_surface_reclaim_background_pass(
         &*host,
     );
     let reclaim_pressured = plan.reclaim_pressured;
-    let posture = plan.posture.label();
     for decision in &plan.decisions {
         let key = &decision.key;
         let hold_ms = decision.hold_ms;
@@ -6057,11 +5997,6 @@ fn web_surface_reclaim_background_pass(
                             // something keeps re-creating.
                             "reaps_in_window": reap_count,
                             "reclaim_pressured": reclaim_pressured,
-                            // WHY the machine wanted the memory back. A destroy
-                            // recorded as `comfortable` is the 2026-08-01 bug
-                            // (a ten-minute clock reaping a page on a host with
-                            // 61% of its RAM free) and must not reappear.
-                            "memory_posture": posture,
                             "hold_ms": hold_ms,
                         }),
                     );
@@ -6111,7 +6046,6 @@ fn web_surface_reclaim_background_pass(
                         "detached": detach,
                         "domain": decision.reason.label(),
                         "reclaim_pressured": reclaim_pressured,
-                        "memory_posture": posture,
                         "media_active": decision.media_active,
                     }),
                 );
@@ -6338,8 +6272,8 @@ mod web_surface_reclaim_locks {
             under_glass,
             pressure,
             false,
-            Some(configured_hold_ms),
-            Some(TAB_HOLD_SENTINEL_MS),
+            configured_hold_ms,
+            TAB_HOLD_SENTINEL_MS,
             &backgrounded,
             applied,
             &|key| leases.get(key).copied(),
@@ -6408,8 +6342,7 @@ mod web_surface_reclaim_locks {
             host.stashed
         );
         assert_eq!(
-            plan.decisions[0].hold_ms,
-            Some(777_000),
+            plan.decisions[0].hold_ms, 777_000,
             "the CONFIGURED hold must survive the pass, not a hardcoded default"
         );
 
@@ -6431,8 +6364,7 @@ mod web_surface_reclaim_locks {
         assert_eq!(host.stashed, vec![9], "genuine shortage detaches");
         assert!(host.demoted.is_empty());
         assert_eq!(
-            plan.decisions[0].hold_ms,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            plan.decisions[0].hold_ms, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "genuine shortage collapses the hold — that is the feature"
         );
     }
@@ -6544,9 +6476,9 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             holds,
             vec![
-                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
-                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
-                Some(600_000)
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                600_000
             ],
             "the first {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps under pressure are fast \
              (the feature); after that the surface has demonstrated it is wanted and \
@@ -6768,8 +6700,8 @@ mod web_surface_reclaim_locks {
             true,
             &comfortable,
             true,
-            Some(600_000),
-            Some(TAB_HOLD_SENTINEL_MS),
+            600_000,
+            TAB_HOLD_SENTINEL_MS,
             &backgrounded,
             &mut applied,
             &|_key| None,
@@ -6782,153 +6714,8 @@ mod web_surface_reclaim_locks {
         assert_eq!(host.stashed, vec![61], "forced pressure hard-detaches");
         assert_eq!(
             plan.decisions[0].hold_ms,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
         );
-    }
-
-    /// ⭐⭐ THE 2026-08-01 BUG, AT THE CALL SITE: A COMFORTABLE MACHINE MUST NOT
-    /// DESTROY THE USER'S PAGE ON A WALL CLOCK.
-    ///
-    /// What the user reported: *"Same pages on reload look like they are
-    /// reloading afresh."* What the live host's own trace said, read across
-    /// every retained `event-trace.*.jsonl` on guihost: **134 of 182
-    /// `native_close` events were `background_hold_expired`, every one of them
-    /// `reclaim_pressured: false` and `hold_ms: 600000`** — pages destroyed by a
-    /// ten-minute timer on a laptop with 9.2 GB of 15.1 GB available. And they
-    /// were not abandoned pages: of the 132 surfaces killed that way, **the user
-    /// reopened 109**, 49 of them within half an hour. Every one of those reopens
-    /// pays a fresh `WebKitWebProcess`, a fresh navigation, a fresh JS
-    /// parse+compile against a JSC with no bytecode cache, and loses scroll
-    /// position, form state and SPA state. The HTTP disk cache was never the
-    /// problem: it was populated (33 MB in one profile) and serving.
-    ///
-    /// So this is a BEHAVIOURAL lock at the pass, not a helper unit test. The
-    /// surface below is 24 hours past a ten-minute hold on a comfortable
-    /// machine, which is the exact shape that used to reap, and it must be
-    /// stashed and kept. Its sibling assertion is that genuine pressure still
-    /// reaps the identical surface — a fix that simply stopped reclaiming would
-    /// pass half of this test and reintroduce the 3.9 GB freeze.
-    #[test]
-    fn a_comfortable_machine_stashes_a_long_backgrounded_page_and_never_destroys_it() {
-        let key = ("live::cache-and-snappiness".to_string(), 0_u64);
-        let backgrounded = vec![(key.clone(), WebSurfaceBackgroundReason::Session)];
-        // Stashed a full day ago: past the ten-minute default by two orders of
-        // magnitude, so nothing here turns on the arithmetic.
-        let day_ms = 24 * 60 * 60 * 1000;
-        let now = 2_000_000 + day_ms;
-
-        let mut applied = HashMap::new();
-        // NOT yet stashed: the pass has to background it first, so this drives
-        // the whole lifecycle rather than asserting against a hand-set
-        // `stashed_at_ms`. The first cut of this test asserted demote+throttle
-        // on an ALREADY-stashed surface and failed, because such a surface is a
-        // `Wait` — a fair reminder that the stash happens once.
-        applied.insert(key.clone(), applied_surface(71, None));
-        let mut host = FakeHost::default();
-        let comfortable = comfortable();
-        assert_eq!(
-            comfortable.reclaim_posture(),
-            crate::terminal_observe::ReclaimPosture::Comfortable,
-            "the fixture must be comfortable, or this test proves nothing"
-        );
-        let first = web_surface_reclaim_background_pass(
-            2_000_000,
-            true,
-            &comfortable,
-            false,
-            None,
-            None,
-            &backgrounded,
-            &mut applied,
-            &|_key| None,
-            &mut host,
-        );
-        assert!(host.closed.is_empty(), "backgrounding must not destroy");
-        assert!(matches!(
-            first.decisions[0].action,
-            WebSurfaceBackgroundAction::Stash { .. }
-        ));
-        // It IS still backgrounded, and that half must not regress: demoted and
-        // throttled, so the page is `document.hidden` and stops painting. The
-        // axis is paint, not existence (docs/optimization-pass.md §5).
-        assert_eq!(host.demoted, vec![71], "it must still be demoted");
-        assert_eq!(
-            host.throttled,
-            vec![(71, true)],
-            "it must still be throttled — keeping the page must not keep it PAINTING"
-        );
-
-        // A DAY later, on the same comfortable machine. This is the shape that
-        // used to reap.
-        let mut host = FakeHost::default();
-        let plan = web_surface_reclaim_background_pass(
-            now,
-            true,
-            &comfortable,
-            false,
-            // NOTHING CONFIGURED. That is the case 100% of the live host's
-            // destroys came from — there is no `~/.yggterm/web-surface.json` on
-            // guihost — and it is the only case the posture is allowed to decide.
-            None,
-            None,
-            &backgrounded,
-            &mut applied,
-            &|_key| None,
-            &mut host,
-        );
-        assert!(
-            host.closed.is_empty(),
-            "a page nobody is short of memory for was destroyed anyway: {:?}",
-            host.closed
-        );
-        assert!(
-            applied.contains_key(&key),
-            "the surface must survive the pass — a reclaimed entry is a page the \
-             user has to watch rebuild"
-        );
-        assert_eq!(
-            plan.decisions[0].hold_ms, None,
-            "a comfortable machine with no configured hold must be on NO destroy \
-             clock; any number here is a deadline on the user's page"
-        );
-        assert!(matches!(
-            plan.decisions[0].action,
-            WebSurfaceBackgroundAction::Wait
-        ));
-
-        // ...and the same surface, on a machine that is genuinely short, still
-        // dies. Reclaim is not switched off; it is moved onto the signal that
-        // means something.
-        let mut applied = HashMap::new();
-        applied.insert(key.clone(), applied_surface(71, Some(2_000_000)));
-        let mut host = FakeHost::default();
-        let plan = web_surface_reclaim_background_pass(
-            now,
-            true,
-            &short(),
-            false,
-            None,
-            None,
-            &backgrounded,
-            &mut applied,
-            &|_key| None,
-            &mut host,
-        );
-        assert_eq!(
-            host.closed,
-            vec![71],
-            "genuine shortage must still reclaim — a fix that only ever keeps \
-             pages is the 3.9 GB freeze coming back"
-        );
-        assert_eq!(
-            plan.decisions[0].hold_ms,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
-        );
-        // The trace has to SAY which of the two it was, or the next reader is
-        // back to inferring pressure from a timestamp.
-        let closes = host.trace_named("native_close");
-        assert_eq!(closes.len(), 1);
-        assert_eq!(closes[0]["memory_posture"], "pressured");
     }
 
     /// THE RESIDUAL SEAM. Everything above drives
@@ -7017,16 +6804,14 @@ mod web_surface_reclaim_locks {
                 // reclaim on a healthy machine.
                 "web_surface_force_background_pressure(),",
                 // The user's configured SESSION hold, from
-                // ~/.yggterm/web-surface.json — `None` when they configured
-                // nothing, which is the reading that lets a comfortable machine
-                // keep the page. It takes no pressure argument: the PASS owns
-                // that, and a caller that could pre-apply pressure here is a
-                // second encoding of the rule.
-                "web_surface_background_hold_ms(),",
+                // ~/.yggterm/web-surface.json. `false` here is deliberate: the
+                // PASS decides pressure, so the caller must ask for the
+                // UNPRESSURED (configured) value.
+                "web_surface_background_hold_ms(false),",
                 // ...and the TAB hold, its own knob. Passing the session hold
                 // twice would silently give background tabs the session
                 // schedule, which is exactly the knob this lane added.
-                "web_surface_tab_background_hold_ms(),",
+                "web_surface_tab_background_hold_ms(false),",
                 // The reclaim DOMAIN: (session, tab) candidates with the reason
                 // that produced each one.
                 "&backgrounded,",
@@ -7449,8 +7234,8 @@ mod web_surface_reclaim_locks {
             true,
             pressure,
             false,
-            Some(session_hold_ms),
-            Some(tab_hold_ms),
+            session_hold_ms,
+            tab_hold_ms,
             domain,
             applied,
             &|key| leases.get(key).copied(),
@@ -7578,7 +7363,7 @@ mod web_surface_reclaim_locks {
                 .iter()
                 .map(|decision| decision.hold_ms)
                 .collect::<Vec<_>>(),
-            vec![Some(300_000), Some(300_000)],
+            vec![300_000, 300_000],
             "a background TAB must be charged the tab hold, not the session hold"
         );
         assert_eq!(
@@ -7881,10 +7666,10 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             holds,
             vec![
-                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
-                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
+                WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
                 // Demonstrably wanted: back to the configured TAB hold.
-                Some(300_000),
+                300_000,
             ],
             "after {WEB_SURFACE_THRASH_REOPEN_LIMIT} reaps in the window the tab has \
              shown it is wanted and must keep its configured hold"
@@ -7911,90 +7696,75 @@ mod web_surface_reclaim_locks {
         let tab_only = r#"{"tab_background_hold_secs": 42}"#;
         let session_only = r#"{"background_hold_secs": 42}"#;
 
-        use crate::terminal_observe::ReclaimPosture;
-        // ⭐ ABSENT IS NOT THE DEFAULT ANY MORE — it is `None`, and the
-        // difference is the whole 2026-08-01 fix. The default still EXISTS and
-        // is still ten minutes; it is applied by the hold policy, and only on a
-        // machine that has something to reclaim for.
+        // No file, no key, or a body that is not JSON at all ⇒ the shared
+        // default. Ten minutes: a tab has to be off screen that long before a
+        // reclaim can cost the user their scroll position.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(None),
-            None,
-            "an unset knob must read as unset; folding the default in here \
-             erases the difference between 'they chose ten minutes' and 'they \
-             chose nothing', which is what decides whether a comfortable \
-             machine keeps the page"
-        );
-        assert_eq!(web_surface_background_hold_ms_from(None), None);
-        assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some("not json at all")),
-            None
+            web_surface_tab_background_hold_ms_from(None, false),
+            TEN_MINUTES_MS,
+            "the tab hold's default changed; the docs and the CHANGELOG say ten \
+             minutes, and a shorter one trades the user's page state"
         );
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(r#"{"tab_background_hold_secs": "5"}"#)),
-            None,
+            web_surface_background_hold_ms_from(None, false),
+            TEN_MINUTES_MS
+        );
+        assert_eq!(
+            web_surface_tab_background_hold_ms_from(Some("not json at all"), false),
+            TEN_MINUTES_MS
+        );
+        assert_eq!(
+            web_surface_tab_background_hold_ms_from(
+                Some(r#"{"tab_background_hold_secs": "5"}"#),
+                false
+            ),
+            TEN_MINUTES_MS,
             "a string is not a number of seconds; guessing at it would be a second \
              parse with a different unit"
         );
-        // ...and the ten minutes the CHANGELOG promises is still what an unset
-        // knob resolves to wherever a clock applies at all.
-        for posture in [ReclaimPosture::Tight, ReclaimPosture::Pressured] {
-            assert_eq!(
-                web_surface_background_hold_ms_for(
-                    None,
-                    posture,
-                    WEB_SURFACE_THRASH_REOPEN_LIMIT
-                ),
-                Some(TEN_MINUTES_MS),
-                "the hold's default changed; the docs and the CHANGELOG say ten \
-                 minutes, and a shorter one trades the user's page state"
-            );
-        }
 
         // The knob itself, in seconds, converted once.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(tab_only)),
-            Some(42_000),
+            web_surface_tab_background_hold_ms_from(Some(tab_only), false),
+            42_000,
             "`tab_background_hold_secs` is the key the user is told to set"
         );
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(r#"{"tab_background_hold_secs": 0}"#)),
-            Some(0),
+            web_surface_tab_background_hold_ms_from(
+                Some(r#"{"tab_background_hold_secs": 0}"#),
+                false
+            ),
+            0,
             "0 is a real setting — reclaim the moment a tab leaves the screen — \
              not a missing value"
-        );
-        // ...and an explicit 0 must survive a COMFORTABLE machine. The user
-        // asked for immediate reclaim on their own box; keeping the page
-        // because memory looks fine would silently ignore them.
-        assert_eq!(
-            web_surface_background_hold_ms_for(Some(0), ReclaimPosture::Comfortable, 0),
-            Some(0),
-            "an explicit hold is the user's decision and outranks the posture"
         );
 
         // TWO knobs, not one wearing two names. Each hold must ignore the
         // other's key, in both directions.
         assert_eq!(
-            web_surface_tab_background_hold_ms_from(Some(session_only)),
-            None,
+            web_surface_tab_background_hold_ms_from(Some(session_only), false),
+            TEN_MINUTES_MS,
             "the TAB hold followed the SESSION key: the new knob has collapsed \
              onto the old one and setting it does nothing"
         );
         assert_eq!(
-            web_surface_background_hold_ms_from(Some(session_only)),
-            Some(42_000)
+            web_surface_background_hold_ms_from(Some(session_only), false),
+            42_000
         );
         assert_eq!(
-            web_surface_background_hold_ms_from(Some(tab_only)),
-            None,
+            web_surface_background_hold_ms_from(Some(tab_only), false),
+            TEN_MINUTES_MS,
             "the SESSION hold followed the TAB key"
         );
 
-        // Pressure still overrides a configured hold — but it is the POLICY
-        // that applies it now, not the config reader. It used to live in both,
-        // with the live call site passing `false` to switch one copy off.
+        // Pressure still overrides both, before any config is consulted.
         assert_eq!(
-            web_surface_background_hold_ms_for(Some(42_000), ReclaimPosture::Pressured, 0),
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+            web_surface_tab_background_hold_ms_from(Some(tab_only), true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
+        assert_eq!(
+            web_surface_background_hold_ms_from(Some(session_only), true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
         );
 
         // ...and the adapters the loop actually calls are wired to the ONE file
@@ -8028,8 +7798,8 @@ mod web_surface_reclaim_locks {
                 "fn web_surface_config_raw() -> Option<String> {",
                 // ...and its three readers: the hold parser's adapter pair, and
                 // the string-knob reader that used to open the file itself.
-                "web_surface_background_hold_ms_from(web_surface_config_raw().as_deref())",
-                "web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref())",
+                "web_surface_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)",
+                "web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref(), reclaim_pressured)",
                 "let raw = web_surface_config_raw()?;",
             ],
             "the web-surface config readers changed. A hold that no longer reads \
@@ -10109,33 +9879,14 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // (context menu, rename, drag, resize, KeyTips) rather than by the
     // pointer merely resting on the edge — Rust resizes for the first
     // and translates for the second.
-    // WHICH EDGE a side panel claims is read off its OWN RECT, never off which
-    // panel it is. The chrome mirror can put the cwd tree on the right and the
-    // rail on the left; a selector-to-edge map would then inset the page on the
-    // wrong side and the page would sit under the panel. Geometry cannot
-    // disagree with the DOM, so geometry decides.
-    const edgeOf = (selector, fallback) => {
-        const el = document.querySelector(selector);
-        if (!el) { return fallback; }
-        const r = el.getBoundingClientRect();
-        if (r.width < 1 || r.height < 1) { return fallback; }
-        return r.left <= (window.innerWidth - r.right) ? 'left' : 'right';
-    };
-    const reach = (edge) => edge === 'left'
-        ? (r) => r.right
-        : (r) => window.innerWidth - r.left;
-    const treeEdge = edgeOf('[data-sidebar-auto-hide="true"]', 'left');
-    const railEdge = edgeOf('[data-yggui-side-rail-auto-hide="1"]', 'right');
     const chrome = {
         top: claim('[data-yggterm-titlebar="1"]', 'data-titlebar-revealed', 'true',
                    'data-titlebar-autohide-pin', (r) => r.bottom),
-        left: [0, 0],
-        right: [0, 0],
+        left: claim('[data-sidebar-auto-hide="true"]', 'data-sidebar-autohide-revealed', 'true',
+                    'data-sidebar-autohide-pin', (r) => r.right),
+        right: claim('[data-yggui-side-rail-auto-hide="1"]', 'data-yggui-side-rail-autohide-revealed', '1',
+                     'data-yggui-side-rail-autohide-pin', (r) => window.innerWidth - r.left),
     };
-    chrome[treeEdge] = claim('[data-sidebar-auto-hide="true"]', 'data-sidebar-autohide-revealed', 'true',
-                    'data-sidebar-autohide-pin', reach(treeEdge));
-    chrome[railEdge] = claim('[data-yggui-side-rail-auto-hide="1"]', 'data-yggui-side-rail-autohide-revealed', '1',
-                     'data-yggui-side-rail-autohide-pin', reach(railEdge));
     const rawBox = (r) => {
         const left = Math.round(r.left);
         const top = Math.round(r.top);
@@ -10301,14 +10052,11 @@ fn web_surface_reveal_edge_from_name(name: &str) -> Option<SidebarEdge> {
 /// setting gate included — is a pure function the immersion locks DRIVE. The
 /// loop holds a live eval channel no test can enter; anything decided inline
 /// there could be made to swallow edges without a test noticing.
-/// Named by PANEL, not by side: after a chrome mirror the tree is the
-/// right-edge panel, and a variant called `LeftSidebar` would be a lie the
-/// compiler cannot catch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebSurfaceEdgeReveal {
     Titlebar,
-    Tree,
-    Rail,
+    LeftSidebar,
+    RightRail,
 }
 
 /// Which panel an engine edge-motion named `edge_name` reveals, if any.
@@ -10322,21 +10070,13 @@ enum WebSurfaceEdgeReveal {
 /// flashing the titlebar for an edge the shell cannot place is chrome the user
 /// never went near (the same rule `web_surface_reveal_edge_from_name` states
 /// for the sides).
-/// The engine reports a PHYSICAL edge the pointer reached; which panel lives
-/// there is [`ChromeOrientation`]'s answer, so a mirrored window reveals the
-/// rail from the left edge and the tree from the right. Hard-coding
-/// left⇒tree here would make the mirror unreachable over any native page —
-/// the one place a user cannot fall back to the shell's own hover sensors.
 fn web_surface_edge_motion_reveal_target(
     edge_name: &str,
     auto_hide_titlebar: bool,
-    orientation: ChromeOrientation,
 ) -> Option<WebSurfaceEdgeReveal> {
     match web_surface_reveal_edge_from_name(edge_name) {
-        Some(edge) => Some(match orientation.slot(edge) {
-            ChromeSlot::Tree => WebSurfaceEdgeReveal::Tree,
-            ChromeSlot::Rail => WebSurfaceEdgeReveal::Rail,
-        }),
+        Some(SidebarEdge::Left) => Some(WebSurfaceEdgeReveal::LeftSidebar),
+        Some(SidebarEdge::Right) => Some(WebSurfaceEdgeReveal::RightRail),
         None if edge_name == "top" => auto_hide_titlebar.then_some(WebSurfaceEdgeReveal::Titlebar),
         None => None,
     }
@@ -10357,8 +10097,8 @@ fn web_surface_edge_motion_reveal_target(
 async fn web_surface_edge_motion_reveal_loop(
     state: Signal<ShellState>,
     titlebar: AutoHideSignals,
-    tree_sidebar: AutoHideSignals,
-    rail: AutoHideSignals,
+    left_sidebar: AutoHideSignals,
+    right_rail: AutoHideSignals,
 ) {
     loop {
         let mut eval =
@@ -10372,11 +10112,10 @@ async fn web_surface_edge_motion_reveal_loop(
             match web_surface_edge_motion_reveal_target(
                 &edge,
                 state.peek().settings.auto_hide_titlebar,
-                state.peek().settings.chrome_orientation,
             ) {
                 Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),
-                Some(WebSurfaceEdgeReveal::Tree) => tree_sidebar.reveal(),
-                Some(WebSurfaceEdgeReveal::Rail) => rail.reveal(),
+                Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),
+                Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),
                 None => {}
             }
         }
@@ -10594,10 +10333,6 @@ async fn web_surface_native_reconcile_loop(
     // opened READ-ONLY because another live client held the lock is NOT recorded
     // here (we hold nothing to release), so a later surface re-attempts acquire.
     let mut held_profile_write_locks: std::collections::HashSet<String> = HashSet::new();
-    // Profiles this client has ALREADY told the user it opened without a jar.
-    // Per profile, not per surface: a ten-tab surface degrades ten times and
-    // owes exactly one sentence about it.
-    let mut announced_jarless_profiles: std::collections::HashSet<String> = HashSet::new();
     // The daemon endpoint + this process's pid, for the write-lock round-trips.
     // Stable for the process lifetime, so read once. pid ties the lock to this
     // process so a GUI crash cannot wedge the profile (daemon reclaims a dead
@@ -10952,8 +10687,8 @@ async fn web_surface_native_reconcile_loop(
                 under_glass,
                 &read_memory_pressure_snapshot(),
                 web_surface_force_background_pressure(),
-                web_surface_background_hold_ms(),
-                web_surface_tab_background_hold_ms(),
+                web_surface_background_hold_ms(false),
+                web_surface_tab_background_hold_ms(false),
                 &backgrounded,
                 &mut applied,
                 &|key| web_surface_lease_until_ms(&state, &key.0, key.1),
@@ -11403,21 +11138,13 @@ async fn web_surface_native_reconcile_loop(
                     // this profile's jar BEFORE opening a WebContext on it. Two
                     // WebContexts writing one jar corrupt it, so when another live
                     // client (a shadow view, a second GUI) already holds the lock
-                    // this surface opens with NO JAR instead of as a second
-                    // writer. The user's Active GUI preempts a Shadow holder
-                    // (4.1a PreemptedShadow => writable), so this path only bites
-                    // Active-vs-Active — a rare second GUI on the same profile —
-                    // and every shadow that tries to write a profile the user
-                    // holds. Ephemeral profiles keep their own in-memory context
-                    // and need no lock.
-                    //
-                    // ⛔ This comment used to say "READ-ONLY". It never was:
-                    // `profile_dir: None` is an EPHEMERAL context, which reads
-                    // nothing from the jar as well as writing nothing back. The
-                    // word is now [`WebSurfaceJarMode`]'s, which also says the
-                    // degradation out loud instead of leaving the user to
-                    // discover it as "the login will not stick".
-                    let mut surface_jar_mode = WebSurfaceJarMode::EphemeralByRequest;
+                    // this surface opens READ-ONLY (ephemeral, no jar: profile_dir
+                    // None) instead of a second writer. The user's Active GUI
+                    // preempts a Shadow holder (4.1a PreemptedShadow => writable),
+                    // so this read-only path only bites Active-vs-Active — a rare
+                    // second GUI on the same profile — and every shadow that tries
+                    // to write a profile the user holds. Ephemeral profiles keep
+                    // their own in-memory context and need no lock.
                     let surface_profile_dir: Option<std::path::PathBuf> = match &profile_dir {
                         None => None,
                         Some(jar) => {
@@ -11460,39 +11187,15 @@ async fn web_surface_native_reconcile_loop(
                                     json!({
                                         "profile": lock_key,
                                         "writable": writable,
-                                        "jar_mode": WebSurfaceJarMode::decide(true, writable)
-                                            .as_str(),
                                         "session_path": session_path,
                                         "tab_id": tab_id,
                                     }),
                                 );
                                 writable
                             };
-                            surface_jar_mode = WebSurfaceJarMode::decide(true, writable);
-                            // Say it, once per profile. A degradation nobody is
-                            // told about is indistinguishable from a site that
-                            // simply refuses to log you in, which is how this
-                            // one survived as "the login will not stick".
-                            if let Some((title, body)) = surface_jar_mode.notice(&lock_key)
-                                && announced_jarless_profiles.insert(lock_key.clone())
-                            {
-                                let mut writable_state = state;
-                                writable_state.with_mut(|shell| {
-                                    shell.push_notification(
-                                        NotificationTone::Warning,
-                                        title,
-                                        body,
-                                    );
-                                });
-                            }
                             if writable { Some(jar.clone()) } else { None }
                         }
                     };
-                    debug_assert_eq!(
-                        surface_jar_mode.keeps_cookies(),
-                        surface_profile_dir.is_some(),
-                        "the mode and the jar it describes must never disagree"
-                    );
                     // Adblock + userscripts belong to the APP, which serves the
                     // effective policy from its own host. No contribution ⇒ no
                     // policy, and that is right: adblock is browsing config, and
@@ -12116,93 +11819,6 @@ fn web_surface_url_scheme_allowed(url: &str) -> bool {
 fn normalize_web_surface_profile(profile: Option<&str>) -> String {
     yggterm_core::web_profile::normalize_web_profile(profile)
 }
-/// Which jar a web surface actually opened on, once the one-writer-per-profile
-/// rule has had its say.
-///
-/// ⛔ **The bug this names.** The degradation used to be invisible: a surface
-/// whose profile write-lock was held elsewhere was handed `profile_dir: None`,
-/// which is an EPHEMERAL context — it reads nothing from the jar and writes
-/// nothing back — while the code beside it said it opened "READ-ONLY". Those are
-/// not the same thing, and the difference is exactly what a user meets: the
-/// surface starts logged OUT and cannot keep a cookie, including a bot-check
-/// clearance cookie, so a challenged login loops forever with **nothing on
-/// screen explaining it**. Reported against ychrome as "the login will not
-/// stick".
-///
-/// This enum does not fix the jar. It fixes the SILENCE, which is the half that
-/// can be fixed without a design call: the mode is named, traced, and said out
-/// loud once per profile.
-///
-/// ⚠ **Why the other half is not done here, so it is not attempted casually.**
-/// Making the degradation genuinely read-only means giving the surface a
-/// private COPY of the profile's cookies and local storage — WebKitGTK has no
-/// read-only jar mode, and cookies are a Netscape text file, so a copy is
-/// mechanically easy. It is not editorially easy: every shadow surface an agent
-/// opens on a profile the user holds would then duplicate that profile's live
-/// session cookies to a second place on disk. In a browser that carries the
-/// operator's brokerage sessions, spreading cookie jars is a security decision
-/// and belongs to him, not to a bug fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebSurfaceJarMode {
-    /// The profile's own jar, read and written. What the user expects.
-    Persistent,
-    /// No jar because none was asked for: the reserved ephemeral profile, whose
-    /// whole point is to leave no trace. Not a degradation, and never announced.
-    EphemeralByRequest,
-    /// No jar because another live client holds this profile's write lock. Two
-    /// WebContexts writing one jar corrupt it, so refusing to be the second
-    /// writer is right; opening with NO jar is the part that surprises.
-    NoJarLockHeldElsewhere,
-}
-
-impl WebSurfaceJarMode {
-    /// The ONE decision. Pure, so the rule is testable without a webview.
-    fn decide(has_profile_jar: bool, writable: bool) -> Self {
-        match (has_profile_jar, writable) {
-            (false, _) => Self::EphemeralByRequest,
-            (true, true) => Self::Persistent,
-            (true, false) => Self::NoJarLockHeldElsewhere,
-        }
-    }
-
-    /// The wire/trace name. One spelling, so a trace line and a notice can never
-    /// disagree about which mode a surface opened in.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Persistent => "persistent",
-            Self::EphemeralByRequest => "ephemeral_by_request",
-            Self::NoJarLockHeldElsewhere => "no_jar_lock_held_elsewhere",
-        }
-    }
-
-    /// Does the surface keep the profile's cookies? The field the degradation
-    /// is actually ABOUT, kept separate from the mode name so a future fourth
-    /// mode has to answer it rather than inherit an answer.
-    fn keeps_cookies(self) -> bool {
-        matches!(self, Self::Persistent)
-    }
-
-    /// What the user is owed, in their own terms: not "the write lock is held"
-    /// but "you will be logged out and it will not stick". `None` when nothing
-    /// surprising happened.
-    fn notice(self, profile: &str) -> Option<(String, String)> {
-        match self {
-            Self::Persistent | Self::EphemeralByRequest => None,
-            Self::NoJarLockHeldElsewhere => Some((
-                format!("\"{profile}\" opened without its cookies"),
-                format!(
-                    "Another window or client already holds the \"{profile}\" profile, and two \
-                     of them writing one cookie jar corrupts it. This surface therefore opened \
-                     with NO jar: it starts logged out, and anything you sign in to here will \
-                     not be remembered — including the clearance cookie a bot check sets, which \
-                     is why such a login can loop. Close the other holder and reopen the page to \
-                     get the profile back."
-                ),
-            )),
-        }
-    }
-}
-
 /// Reserved profile name for an ephemeral (private-browsing) surface: no jar
 /// on disk, all website data in memory, gone when the surface closes. Owned
 /// here and mirrored by ychrome's picker/standalone handling — a
@@ -20376,21 +19992,11 @@ impl ShellState {
         });
         self.last_action = "sidebar resize started".to_string();
     }
-    /// The edge a chrome slot is docked against, from the ONE owner. Every
-    /// shell-side geometry decision that used to hard-code a side goes through
-    /// here.
-    fn chrome_edge(&self, slot: ChromeSlot) -> SidebarEdge {
-        self.settings.chrome_orientation.edge(slot)
-    }
     fn update_sidebar_resize(&mut self, client_x: f64) {
         let Some(drag) = self.sidebar_resize_drag else {
             return;
         };
-        // The grip is on the panel's inner edge, so which pointer direction
-        // WIDENS it is a property of the edge — mirrored, dragging LEFT grows
-        // the tree. Hard-coding the sign per panel is what would break here.
-        let sign = self.chrome_edge(ChromeSlot::Tree).resize_delta_sign();
-        let delta = sign * (client_x - drag.origin_client_x) as f32;
+        let delta = (client_x - drag.origin_client_x) as f32;
         let next_width = clamp_sidebar_width(drag.origin_width + delta);
         if (next_width - self.sidebar_width).abs() < 0.5 {
             return;
@@ -20414,10 +20020,9 @@ impl ShellState {
                 format!("sidebar resized to {}px", self.sidebar_width.round() as i64);
         }
     }
-    // The rail's resize is the mirror image of the tree's: same drag record, and
-    // the sign now comes from the EDGE it is docked against
-    // (`SidebarEdge::resize_delta_sign`) rather than from a comment-justified
-    // negation, so flipping the chrome flips both panels' drags for free.
+    // The right rail's resize is the MIRROR of the left tree's: same drag record,
+    // but the handle lives on the rail's INNER (left) edge, so dragging LEFT (a
+    // negative x delta) makes it WIDER — hence the negated delta below.
     fn start_rail_resize(&mut self, client_x: f64) {
         // Grabbing a HIDDEN rail's grip docks it (to the last mode it showed) and
         // resizes — exactly as the left tree's grip re-opens the tree. So the
@@ -20438,8 +20043,7 @@ impl ShellState {
         let Some(drag) = self.rail_resize_drag else {
             return;
         };
-        let sign = self.chrome_edge(ChromeSlot::Rail).resize_delta_sign();
-        let delta = sign * (client_x - drag.origin_client_x) as f32;
+        let delta = (drag.origin_client_x - client_x) as f32;
         let next_width = clamp_rail_width(drag.origin_width + delta);
         if (next_width - self.rail_width).abs() < 0.5 {
             return;
@@ -26442,22 +26046,6 @@ impl ShellState {
             "titlebar auto-hide enabled".to_string()
         } else {
             "titlebar auto-hide disabled".to_string()
-        };
-    }
-    /// The ONE writer of the chrome mirror. Everything else in the shell READS
-    /// `settings.chrome_orientation` through [`ChromeOrientation`]'s questions;
-    /// nothing else assigns it, and nothing else keeps a copy that could drift.
-    fn set_chrome_mirrored(&mut self, mirrored: bool) {
-        let next = ChromeOrientation::new(mirrored);
-        if self.settings.chrome_orientation == next {
-            return;
-        }
-        self.settings.chrome_orientation = next;
-        self.persist_settings_async("chrome_orientation");
-        self.last_action = if mirrored {
-            "chrome mirrored (tree right, rail left)".to_string()
-        } else {
-            "chrome restored (tree left, rail right)".to_string()
         };
     }
     fn adjust_ui_zoom(&mut self, delta_steps: i32) {
@@ -40491,16 +40079,14 @@ fn rail_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
 fn rail_autohide_pinned_flags(alt_overlay_active: bool, theme_editor_open: bool) -> bool {
     alt_overlay_active || theme_editor_open
 }
-/// Which window edge an auto-hidden sidebar reveals from is `SidebarEdge`, and
-/// which panel is on which edge is [`ChromeOrientation`] — both owned by
-/// `yggui-contract` so the shell, the shared yggui chrome and the persisted
-/// settings all read one answer. There used to be a shell-local copy of the
-/// edge enum; a second copy is how two edges start behaving differently.
-///
-/// Never write `SidebarEdge::Left` for "the tree" or `Right` for "the rail".
-/// Ask `snapshot.settings.chrome_orientation.edge(ChromeSlot::Tree)`.
-fn chrome_slot_edge(snapshot: &RenderSnapshot, slot: ChromeSlot) -> SidebarEdge {
-    snapshot.settings.chrome_orientation.edge(slot)
+/// Which window edge an auto-hidden sidebar reveals from. The reveal STATE
+/// MACHINE is shared with the titlebar (`AutoHideSignals` + the `autohide_*`
+/// functions); only the geometry differs, and it differs by exactly this enum —
+/// a second copy is how two edges start behaving differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SidebarEdge {
+    Left,
+    Right,
 }
 fn autohide_revealed(
     auto_hide_enabled: bool,
@@ -40742,24 +40328,6 @@ fn sidebar_edge_anchor(edge: SidebarEdge) -> &'static str {
         SidebarEdge::Left => "left:0; right:auto;",
         SidebarEdge::Right => "right:0; left:auto;",
     }
-}
-/// A panel's width grip lives on its INNER edge — the one facing the workspace
-/// — so it is always the OPPOSITE of the edge the panel is docked against. One
-/// helper for the tree and the rail alike: before the mirror they each hard-
-/// coded their own side, which is two places answering one question.
-///
-/// Both `left` and `right` are emitted in every branch (the Dioxus style-key
-/// trap): a grip that flipped side by dropping a key would keep the stale
-/// anchor and end up spanning the whole panel.
-fn sidebar_resize_handle_style(edge: SidebarEdge) -> String {
-    let grip = edge.opposite();
-    format!(
-        "position:absolute; top:0; {}:0; {}:auto; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
-         background:transparent;",
-        grip.css_near(),
-        grip.css_far(),
-        SIDEBAR_RESIZE_HANDLE_WIDTH
-    )
 }
 /// The CARD — the visible panel. In-flow it fills the outer transparently (the
 /// docked look, unchanged: `palette.sidebar` is transparent and the app-bg
@@ -41031,37 +40599,17 @@ fn titlebar_inner_style(auto_hide_enabled: bool, revealed: bool) -> String {
         transition
     )
 }
-/// The workspace row: tree | viewport | rail, in DOM order.
-///
-/// The MIRROR lives here and nowhere else in the flow layout — one
-/// `flex-direction` reverses the docked order of all three children at once,
-/// which is why no component has to know its neighbour's side. The out-of-flow
-/// (auto-hidden) panels are anchored by `SidebarEdge` instead, because
-/// `row-reverse` cannot move a `position:absolute` box.
-///
-/// `flex-direction` is emitted in BOTH branches (the Dioxus style-key trap): a
-/// key present in one arm and dropped in the other never clears, so un-mirroring
-/// would leave the workspace reversed forever.
-fn titlebar_autohide_content_offset_style(
-    auto_hide_enabled: bool,
-    revealed: bool,
-    orientation: ChromeOrientation,
-) -> String {
+fn titlebar_autohide_content_offset_style(auto_hide_enabled: bool, revealed: bool) -> String {
     let top_padding = 0.0;
     let transition = if auto_hide_enabled && revealed {
         emphasized_enter_transition(&["opacity"])
     } else {
         emphasized_exit_transition(&["opacity"])
     };
-    let flex_direction = if orientation.is_mirrored() {
-        "row-reverse"
-    } else {
-        "row"
-    };
     format!(
-        "position:relative; display:flex; flex-direction:{}; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
+        "position:relative; display:flex; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
          will-change:auto; transition:{};",
-        flex_direction, top_padding, transition
+        top_padding, transition
     )
 }
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
@@ -42829,14 +42377,6 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   window.__yggtermChordFromHost = function(chord){
     if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ chord: chord }); }
   };
-  // A PAGE MENU entry the user chose, relayed by the vendored host with the
-  // click point in CSS pixels. Same sender, same terminus: the shell decides
-  // what the id means and this only carries it across the webview boundary.
-  window.__yggtermPageMenuFromHost = function(id, surface, x, y){
-    if (window.__yggtermAltTapSend) {
-      window.__yggtermAltTapSend({ page_menu: { id: id, surface: surface, x: x, y: y } });
-    }
-  };
   // --- KeyTip floating-badge painter (§9): central assignment in Rust (each
   // interactable carries data-keytip-tip = its assigned letter while the overlay
   // is up), local painting here. Badges are their own little blocks in a
@@ -43021,115 +42561,6 @@ const WEB_FIND_CHORD_ID: &str = "web.find";
 /// claimer checks before claiming.
 const WEB_FIND_CHORD: &str = "Ctrl+F";
 
-/// One legacy browser chord: what to press, what it means, and whether serving
-/// it needs the keyboard brought back to the shell's own DOM.
-struct WebPageChord {
-    chord: &'static str,
-    id: &'static str,
-    /// True only for a chord whose target is a shell DOM control. A page holds
-    /// the toplevel focus while these fire, and an `<input>` in the shell's
-    /// webview cannot take a keystroke until the keyboard comes home.
-    focus_shell: bool,
-}
-
-/// ⭐ **THE LEGACY BROWSER LAYER — the keys thirty years of browsers taught
-/// every user, and which yggterm's web surface did not have.**
-///
-/// Measured before this table existed: F5, Ctrl+R, Ctrl+T, Ctrl+L, Ctrl+W, F12
-/// and Ctrl+Shift+I ALL did nothing over a focused page. Reload was the ⟳
-/// button or the row menu; a new tab was the `+`; the address bar could not be
-/// reached from the keyboard at all; DevTools was agent-only. Every one of them
-/// is a verb this app already had, reachable only by mouse.
-///
-/// ## How this coexists with the ALT layer, which owns different keys
-///
-/// The two layers cannot collide, and the reason is structural rather than a
-/// convention someone has to remember:
-///
-/// - **The ALT layer owns a clean ALT TAP** (`keytip.rs`, and the JS/GTK tap
-///   observers) plus the registered ACCELERATORS in
-///   `keytip::DEFAULT_ACCELERATORS`, all of which are asserted PTY-safe by
-///   `assert_accels_pty_safe` — meaning none of them is a bare `Ctrl+<letter>`
-///   or a bare function key, because those belong to the terminal.
-/// - **This layer owns exactly the chords that layer is FORBIDDEN to hold**,
-///   and every row is `page_only`, so a chord here does not exist unless a
-///   browser genuinely owns the keyboard. `assert_no_legacy_chord_is_an_accel`
-///   holds the two disjoint by name rather than by hope.
-/// - A terminal never sees any of them: the window claimer asks the toplevel
-///   which widget has focus and stands a `page_only` row down unless the
-///   focused widget is one of this host's VISIBLE surface webviews.
-///
-/// So `Ctrl+R` is readline's reverse-search everywhere in the app, and a reload
-/// only while a page is in front — which is what a user pressing it means both
-/// times.
-///
-/// ## Why these and not others
-///
-/// The four the user named are here (F5, Ctrl+R, Ctrl+T, F12), plus the
-/// siblings a hand reaches for in the same breath: the second spelling of each
-/// (Ctrl+Shift+R, Ctrl+Shift+I), the address bar (Ctrl+L), and closing a tab
-/// (Ctrl+W). `Ctrl+N`/`Ctrl+Shift+N` are deliberately absent — this browser has
-/// no window to open — and `Ctrl+P` stays absent for the reason it always has:
-/// there is no print path to route it to.
-const WEB_PAGE_CHORDS: &[WebPageChord] = &[
-    // The find bar is in the SHELL's DOM, so it needs the keyboard home.
-    WebPageChord {
-        chord: WEB_FIND_CHORD,
-        id: WEB_FIND_CHORD_ID,
-        focus_shell: true,
-    },
-    // Reload, both spellings. The verb is the row menu's `webtab-reload` aimed
-    // at the ACTIVE tab — a difference in the aim, not in the verb.
-    WebPageChord {
-        chord: "F5",
-        id: "web.reload",
-        focus_shell: false,
-    },
-    WebPageChord {
-        chord: "Ctrl+R",
-        id: "web.reload",
-        focus_shell: false,
-    },
-    // Hard reload. A DIFFERENT verb, not a louder one: it bypasses the HTTP
-    // cache, which is the entire reason a user reaches for it.
-    WebPageChord {
-        chord: "Ctrl+Shift+R",
-        id: "web.reload.hard",
-        focus_shell: false,
-    },
-    // A new tab lands TYPING-READY in the address bar, which is the whole
-    // point of the key — and that promise is `open_web_surface_tab`'s, kept
-    // once for every door rather than re-remembered here.
-    WebPageChord {
-        chord: "Ctrl+T",
-        id: "web.tab.new",
-        focus_shell: true,
-    },
-    // The address bar itself: focus it and select what is in it.
-    WebPageChord {
-        chord: "Ctrl+L",
-        id: "web.address",
-        focus_shell: true,
-    },
-    WebPageChord {
-        chord: "Ctrl+W",
-        id: "web.tab.close",
-        focus_shell: false,
-    },
-    // DevTools, both spellings. Toggle, not open: a key that only opens leaves
-    // the user hunting for the panel's own close button.
-    WebPageChord {
-        chord: "F12",
-        id: "web.devtools",
-        focus_shell: false,
-    },
-    WebPageChord {
-        chord: "Ctrl+Shift+I",
-        id: "web.devtools",
-        focus_shell: false,
-    },
-];
-
 /// Which registered accelerators are claimed ABOVE a focused child.
 ///
 /// **Not all of them, and that is deliberate.** Every accelerator in
@@ -43175,25 +42606,21 @@ fn gdk_key_name_for_chord_key(key: &str) -> Option<String> {
 /// chord without a restart.
 fn claimed_chords_for(config: &KeymapConfig) -> Vec<dioxus::desktop::ClaimedChord> {
     let mut out = Vec::new();
-    for legacy in WEB_PAGE_CHORDS {
-        let Some(chord) = Chord::parse(legacy.chord) else {
-            continue;
-        };
-        let Some(key) = gdk_key_name_for_chord_key(&chord.key) else {
-            continue;
-        };
+    if let Some(chord) = Chord::parse(WEB_FIND_CHORD)
+        && let Some(key) = gdk_key_name_for_chord_key(&chord.key)
+    {
         out.push(dioxus::desktop::ClaimedChord {
             ctrl: chord.ctrl,
             shift: chord.shift,
             alt: chord.alt,
             key,
-            id: legacy.id.to_string(),
-            // ⚠ EVERY LEGACY BROWSER CHORD IS `page_only`, and that is what
-            // keeps this layer legal. Claimed app-wide, `Ctrl+R` would eat
-            // readline's reverse-search and `F5` would eat a TUI's refresh in
-            // every terminal in the app.
+            id: WEB_FIND_CHORD_ID.to_string(),
+            // A BROWSER key only. Claimed app-wide it would eat readline's
+            // forward-char in every terminal in the app.
             page_only: true,
-            focus_shell: legacy.focus_shell,
+            // The find field is in the SHELL's DOM and cannot take a keystroke
+            // while WebKit's child holds the toplevel focus.
+            focus_shell: true,
         });
     }
     for (id, chord) in keytip::effective_accelerators(config) {
@@ -43241,18 +42668,6 @@ async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
         // surface host's installation. Replacing the table with an identical one
         // is free.
         window().set_web_surface_claimed_chords(claimed_chords_for(&state.peek().keytip_config));
-        // …and the PAGE MENU's entries, on the same edge and for the same
-        // reason: a list armed once, before a surface host that installs later,
-        // is a list the user never sees. Re-pushing an identical one is free.
-        window().set_web_surface_page_menu_items(
-            WEB_PAGE_MENU_ITEMS
-                .iter()
-                .map(|(id, label)| dioxus::desktop::PageMenuItem {
-                    id: (*id).to_string(),
-                    label: (*label).to_string(),
-                })
-                .collect(),
-        );
         let mut eval = document::eval(&bridge_js);
         loop {
             match eval.recv::<serde_json::Value>().await {
@@ -43311,33 +42726,11 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             open_web_find_for_viewport(state);
             return;
         }
-        // The legacy browser layer. Asked BEFORE the keytip dispatch because
-        // these ids are not keytip commands — `dispatch_keytip_node` would find
-        // no node and the key would silently do nothing, which is the exact
-        // failure this layer exists to end.
-        if dispatch_web_page_chord(state, chord) {
-            return;
-        }
         // Every other claimed chord IS a keytip command id, and it lands on the
         // same dispatch the accelerator bridge above uses — so `window.fullscreen`
         // has ONE toggle whichever door the key came through.
         state.with_mut(|shell| shell.clear_alt_overlay());
         dispatch_keytip_node(state, chord);
-        return;
-    }
-    // A PAGE MENU entry the user chose, with the click point in CSS pixels.
-    // Its own message, like `chord`: an entry id is not a chord and not a
-    // character, and the point only means anything for this one.
-    if let Some(menu) = msg.get("page_menu") {
-        let Some(id) = menu.get("id").and_then(|value| value.as_str()) else {
-            return;
-        };
-        dispatch_web_page_menu(
-            state,
-            id,
-            menu.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            menu.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        );
         return;
     }
     // §12.3: a dialog key for an open modal, sent while the ALT overlay is
@@ -49732,48 +49125,28 @@ fn ui_zoom_factor(ui_font_size: f32) -> f64 {
 /// unclickable. That is the user's reported clipping, in the mirror image of the
 /// rail case: the rail's menu grows leftward out of the rail, the tree's grows
 /// rightward out of the tree.
-/// The strip a docked panel of `panel_width` occupies when it is against
-/// `edge`. ONE piece of band arithmetic for both panels — the two callers below
-/// differ only in which edge they are told, which is how the chrome mirror
-/// moves a menu's band without either caller learning that the mirror exists.
-fn panel_context_menu_band(
-    edge: SidebarEdge,
-    window_width: f64,
-    panel_width: f64,
-    ui_zoom: f64,
-) -> ContextMenuBand {
+fn sidebar_context_menu_band(sidebar_width: f64, ui_zoom: f64) -> ContextMenuBand {
     let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
         ui_zoom
     } else {
         1.0
     };
-    let on_screen_width = (panel_width * zoom).max(0.0);
-    match edge {
-        SidebarEdge::Left => ContextMenuBand {
-            left: 0.0,
-            right: on_screen_width,
-        },
-        SidebarEdge::Right => ContextMenuBand {
-            left: (window_width - on_screen_width).max(0.0),
-            right: window_width,
-        },
+    ContextMenuBand {
+        left: 0.0,
+        right: (sidebar_width * zoom).max(0.0),
     }
 }
-fn sidebar_context_menu_band(
-    edge: SidebarEdge,
-    window_width: f64,
-    sidebar_width: f64,
-    ui_zoom: f64,
-) -> ContextMenuBand {
-    panel_context_menu_band(edge, window_width, sidebar_width, ui_zoom)
-}
-fn rail_context_menu_band(
-    edge: SidebarEdge,
-    window_width: f64,
-    rail_width: f64,
-    ui_zoom: f64,
-) -> ContextMenuBand {
-    panel_context_menu_band(edge, window_width, rail_width, ui_zoom)
+fn rail_context_menu_band(window_width: f64, rail_width: f64, ui_zoom: f64) -> ContextMenuBand {
+    let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
+        ui_zoom
+    } else {
+        1.0
+    };
+    let on_screen_width = (rail_width * zoom).max(0.0);
+    ContextMenuBand {
+        left: (window_width - on_screen_width).max(0.0),
+        right: window_width,
+    }
 }
 /// Physical window pixels → CSS pixels.
 ///
@@ -51268,18 +50641,6 @@ fn describe_app_state_snapshot(
                 clamp_theme_spec(&shell.settings.yggui_theme)
             },
             "titlebar_auto_hide_enabled": shell.settings.auto_hide_titlebar,
-            // The mirror, reported as the two ANSWERS it gives rather than as a
-            // raw flag: an agent asking "which side is the tree on?" gets the
-            // same value the renderer used, not a boolean it has to interpret.
-            "chrome_mirrored": shell.settings.chrome_orientation.is_mirrored(),
-            "chrome_tree_edge": match shell.settings.chrome_orientation.edge(ChromeSlot::Tree) {
-                SidebarEdge::Left => "left",
-                SidebarEdge::Right => "right",
-            },
-            "chrome_rail_edge": match shell.settings.chrome_orientation.edge(ChromeSlot::Rail) {
-                SidebarEdge::Left => "left",
-                SidebarEdge::Right => "right",
-            },
             "titlebar_auto_hide_pinned": titlebar_autohide_pinned_flags(
                 shell.search_focused,
                 titlebar_search_dropdown_open(&snapshot),
@@ -60042,38 +59403,16 @@ const WEB_DO_SCROLL_PIN_JS: &str = "(function(){var el=__YGG_REF__;\
 /// contract token: [`web_do_resolved_from_info`] REFUSES a payload that does
 /// not carry it, so collapsing the two phases back into one cannot pass
 /// silently.
-///
-/// ⛔ **`hit.contains(el)` IS NOT HITTABILITY, AND BELIEVING IT WAS IS THE BUG.**
-/// This test used to read `hit===el || el.contains(hit) || hit.contains(el)`.
-/// `elementFromPoint` over a `visibility:hidden` element returns whatever paints
-/// there — on a plain page, `<body>` — and **`<body>` contains every element on
-/// the page**, so the third clause accepted ANY candidate on ANY normal page.
-/// The occlusion check was therefore a no-op wherever it mattered, and the click
-/// went to a point where nothing listens while the response said `onTarget`.
-/// A click reaches an element only when the point lands ON it or on a
-/// DESCENDANT of it, because only then does the event path run through it; an
-/// ancestor hit means the ancestor was clicked, not this node. Found in the
-/// engine plane first (`ychrome` `c547aa6`), fixed here 2026-08-01.
-///
-/// The viewport guard is the second half: `elementFromPoint` outside the
-/// viewport is specified to answer `null`, but reading a rect that is off-screen
-/// and then asking anyway invites a browser-specific accident. A point nobody
-/// can reach is refused by construction, and the payload says WHICH node
-/// intercepted so `target_moved` is actionable instead of merely true.
 const WEB_DO_RESOLVE_PINNED_JS: &str = "(function(){__YGG_PATH_FN__\
     var el=(window.__YGG_PIN_KEY__||[])[0];\
     if(!el)return{found:false,phase:'post_scroll',handle:'lost'};\
     var connected=(el.isConnected!==undefined)?!!el.isConnected\
     :!!(document.contains&&document.contains(el));\
     var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;\
-    var inView=cx>=0&&cy>=0&&cx<=(window.innerWidth||0)&&cy<=(window.innerHeight||0);\
-    var hit=inView?document.elementFromPoint(cx,cy):null;\
-    var onTarget=!!(hit&&(hit===el||(el.contains&&el.contains(hit))));\
-    var name=function(n){return n?(String(n.tagName||'').toLowerCase()\
-    +(n.id?'#'+n.id:'')):null;};\
+    var hit=document.elementFromPoint(cx,cy);\
+    var onTarget=hit===el||(el.contains&&el.contains(hit))||(hit&&hit.contains&&hit.contains(el));\
     return{found:true,phase:'post_scroll',x:cx,y:cy,w:r.width,h:r.height,\
-    onTarget:onTarget,inViewport:inView,hit:name(hit),\
-    visible:r.width>0&&r.height>0,isConnected:connected,\
+    onTarget:!!onTarget,visible:r.width>0&&r.height>0,isConnected:connected,\
     cssPath:__yggPath(el),tag:el.tagName};})()";
 
 /// Focus the PINNED element (index 0 unless composed otherwise).
@@ -60135,48 +59474,21 @@ const WEB_DO_LIVE_FN_JS: &str = "\
     if(t&&__yggLive(t))found=t;}\
     return found;};";
 
-/// The ONE css resolution rule: classify every match with `__yggLive`, keep the
-/// hittable ones, and answer `live[nth]` — with the counts reported.
+/// The ONE css resolution rule: `querySelectorAll(sel)[nth]`, with the match
+/// COUNT reported.
 ///
-/// `querySelector` was the FIRST rule and it is the duplicate-id defect: a page
+/// `querySelector` was the old rule and it is the duplicate-id defect: a page
 /// that renders two form blocks with the same ids answers with the first, every
-/// time, and says nothing about the other eight. Counting fixed the silence.
-///
-/// ⛔ **Counting was not enough, and the gap was measured.** Until 2026-08-01
-/// this arm took `querySelectorAll(sel)[nth]` off the RAW pool and hard-coded
-/// `hidden:0` — the liveness predicate ran only in the `Role` arm. On a page
-/// that carries a `visibility:hidden` duplicate AHEAD of the real control
-/// (IBKR's login page has six-plus `button[type=submit]`, five of them dead)
-/// the decoy measures a real rect, so nothing geometric refuses it, and the
-/// click was dispatched into the void and reported as a success. A hidden
-/// duplicate is NOISE, not ambiguity: it never reaches the pool, so `nth`
-/// counts hittable matches and `matches` reports how many survived. This is the
-/// same predicate and the same vocabulary the engine plane uses
-/// (`ychrome` `src/engine/js.rs::CLICK_POOL`) — one word per refusal across
-/// both planes is the invariant, not a coincidence.
-///
-/// ⚠ **This changes `fill`/`type`/`key` too, deliberately, and here is the
-/// reasoning so it is not undone by surprise.** One [`WebElementRef`] has ONE
-/// matcher, so a node the click plane will not touch is not addressable by the
-/// typing plane either. That is the right default: a `display:none`,
-/// `visibility:hidden` or `0x0` field is one a human cannot focus or type into,
-/// so a fill that "succeeded" into it was already a lie-of-success — and the
-/// resolver refused `zero_size_element` on the click path for that exact reason
-/// long before this change. The pattern people worry about, a real `<input>`
-/// hidden behind styled OTP boxes, is normally `opacity: 0` with a real rect,
-/// and `__yggLive` deliberately does NOT filter opacity, so it still resolves.
-/// Anything genuinely undisplayable now refuses BY NAME (`no_hittable_match`),
-/// which is recoverable — `web eval` writes a value the DOM will not accept
-/// from a keyboard — rather than silently doing nothing.
+/// time, and says nothing about the other eight. Counting is not optional here —
+/// an ambiguous resolution that reports nothing is the same class of lie as a
+/// stale rect.
 fn web_css_matcher_js(selector: &str, nth: usize) -> String {
     format!(
-        "(function(){{var all=document.querySelectorAll({sel});\
-         __YGG_LIVE_FN__\
-         var live=[],dead=0;\
-         for(var i=0;i<all.length;i++){{if(__yggLive(all[i]))live.push(all[i]);else dead++;}}\
-         window.__YGG_MATCH_KEY__={{n:live.length,nth:{nth},hidden:dead}};\
-         return live[{nth}]||null;}})()",
+        "(function(){{var els=document.querySelectorAll({sel});\
+         window.{key}={{n:els.length,nth:{nth},hidden:0}};\
+         return els[{nth}]||null;}})()",
         sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()),
+        key = WEB_DO_MATCH_KEY,
     )
 }
 
@@ -60207,15 +59519,11 @@ fn web_element_ref_js_raw(target: &WebElementRef) -> String {
             tag,
             nth,
         } => {
-            // Candidate pool, match, DROP THE DEAD, then drop any survivor that
-            // CONTAINS another survivor: on a substring match the whole ancestor
-            // chain up to <body> matches, and clicking <body> is never what was
-            // meant. Document order + liveness + innermost-wins + `nth` is fully
+            // Candidate pool, match, then drop any candidate that CONTAINS
+            // another candidate: on a substring match the whole ancestor chain
+            // up to <body> matches, and clicking <body> is never what was
+            // meant. Document order + innermost-wins + `nth` is fully
             // deterministic — the same page always yields the same node.
-            //
-            // Liveness runs BEFORE innermost-wins on purpose: a hidden inner
-            // span must not suppress the visible ancestor that is the only thing
-            // a human can actually click.
             let pool = tag.clone().unwrap_or_else(|| {
                 "a,button,input,select,textarea,label,summary,\
                  [role],[onclick],[tabindex],div,span,td,th,li,p,h1,h2,h3,h4"
@@ -60232,15 +59540,12 @@ fn web_element_ref_js_raw(target: &WebElementRef) -> String {
                  if(!t)t=norm(e.innerText||e.textContent);\
                  if(!t)continue;\
                  if(exact?(t===want):(t.indexOf(want)!==-1))out.push(e);}}\
-                 __YGG_LIVE_FN__\
-                 var alive=[],dead=0;\
-                 for(var j=0;j<out.length;j++){{if(__yggLive(out[j]))alive.push(out[j]);else dead++;}}\
                  var inner=[];\
-                 for(var j=0;j<alive.length;j++){{var keep=true;\
-                 for(var k=0;k<alive.length;k++){{if(k!==j&&alive[j].contains&&alive[j].contains(alive[k]))\
+                 for(var j=0;j<out.length;j++){{var keep=true;\
+                 for(var k=0;k<out.length;k++){{if(k!==j&&out[j].contains&&out[j].contains(out[k]))\
                  {{keep=false;break;}}}}\
-                 if(keep)inner.push(alive[j]);}}\
-                 window.__YGG_MATCH_KEY__={{n:inner.length,nth:nth,hidden:dead}};\
+                 if(keep)inner.push(out[j]);}}\
+                 window.__YGG_MATCH_KEY__={{n:inner.length,nth:nth,hidden:0}};\
                  return inner[nth]||null;}})()",
                 pool = quote(&pool),
                 want = quote(text),
@@ -60406,8 +59711,7 @@ impl MatchDiag {
 
     /// Everything the matcher found was hidden or stale. A pick that lands here
     /// must refuse — clicking a dead MUI option is exactly the silent no-op the
-    /// filing agent hit, and clicking a `visibility:hidden` submit duplicate is
-    /// the same no-op on a login page.
+    /// filing agent hit.
     fn only_stale(&self) -> bool {
         self.matches == 0 && self.hidden > 0
     }
@@ -60415,33 +59719,15 @@ impl MatchDiag {
 
 /// The ONE refusal message for a matcher that produced no usable element.
 ///
-/// Three diagnoses, because the caller acts differently on each: dismiss the
-/// dead popper (`stale_listbox_only`), stop believing the page has a clickable
-/// copy of this thing (`no_hittable_match`), or fix the selector
-/// (`no element matches`). One owner, so a click and a fill can never phrase the
-/// same failure two ways.
-///
-/// `no_hittable_match` is the engine plane's word for exactly this state
-/// (`ychrome` `src/engine/api.rs`), and it is spelled the same here on purpose.
-/// It only became reachable on this plane once the CSS and text matchers started
-/// filtering for liveness — before that an all-hidden pool was answered WITH one
-/// of the hidden nodes, which is the bug, not a refusal.
+/// `stale_listbox_only` and `no element matches` are different diagnoses and the
+/// caller acts differently on them (dismiss the dead popper vs. fix the
+/// selector), so they are different messages — from one owner, so a click and a
+/// fill can never phrase the same failure two ways.
 fn web_do_match_refusal(target: &WebElementRef, diag: Option<MatchDiag>) -> String {
-    let picking_from_a_popper = matches!(
-        target,
-        WebElementRef::Role { role, .. }
-            if role.eq_ignore_ascii_case("option") || role.eq_ignore_ascii_case("menuitem")
-    );
     match diag {
-        Some(diag) if diag.only_stale() && picking_from_a_popper => format!(
+        Some(diag) if diag.only_stale() => format!(
             "stale_listbox_only ({} matched {} hidden/stale node(s) and nothing live — \
              dismiss the open popper and retry)",
-            target.describe(),
-            diag.hidden
-        ),
-        Some(diag) if diag.only_stale() => format!(
-            "no_hittable_match ({} matched {} element(s) and NONE could receive a click \
-             (hidden, zero-size or aria-hidden) — refusing rather than dispatching into the void)",
             target.describe(),
             diag.hidden
         ),
@@ -60616,29 +59902,15 @@ fn web_do_resolved_from_info(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Err(format!(
-            "zero_size_element ({} matched a zero-size element)",
-            target.describe()
-        ));
+        return Err(format!("{} matched a zero-size element", target.describe()));
     }
     if !info
         .get("onTarget")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        // Name what intercepted, because "it moved" and "an overlay is over it"
-        // are different problems with different remedies and the caller cannot
-        // tell them apart from the refusal alone.
-        let landed = match (
-            info.get("inViewport").and_then(Value::as_bool),
-            info.get("hit").and_then(Value::as_str),
-        ) {
-            (Some(false), _) => " — its centre is outside the viewport".to_string(),
-            (_, Some(hit)) => format!(" — the point lands on {hit}"),
-            _ => String::new(),
-        };
         return Err(format!(
-            "target_moved (the resolved point no longer hits {}{landed})",
+            "target_moved (the resolved point no longer hits {})",
             target.describe()
         ));
     }
@@ -64644,9 +63916,7 @@ mod web_do_verb_tests {
             css.contains("document.querySelectorAll(\"#login\")"),
             "{css}"
         );
-        // Indexed out of the LIVE pool, not the raw node list — see
-        // `every_matcher_filters_for_liveness_not_only_the_role_arm`.
-        assert!(css.contains("live[0]"), "{css}");
+        assert!(css.contains("els[0]"), "{css}");
 
         let by_text = web_element_ref_js(&WebElementRef::Text {
             text: "Proceed to Pay".into(),
@@ -64662,10 +63932,8 @@ mod web_do_verb_tests {
             "{by_text}"
         );
         assert!(by_text.contains("exact=true"), "{by_text}");
-        // Innermost-wins is what stops a substring match selecting <body>, and
-        // it runs over the LIVE survivors so a hidden inner span cannot suppress
-        // the visible ancestor a human would actually click.
-        assert!(by_text.contains("contains(alive[k])"), "{by_text}");
+        // Innermost-wins is what stops a substring match selecting <body>.
+        assert!(by_text.contains("contains(out[k])"), "{by_text}");
 
         let by_role = web_element_ref_js(&WebElementRef::Role {
             role: "BUTTON".into(),
@@ -65057,25 +64325,9 @@ mod web_do_verb_tests {
             scroll.contains(&format!("window.{WEB_DO_PIN_KEY}=[el]")),
             "phase A must PIN what it scrolled to: {scroll}"
         );
-        // Phase A DOES read a rect now — the liveness predicate has to, or a
-        // `display:none` decoy is indistinguishable from a real control — so
-        // the invariant is not "no measurement", it is **no measurement the
-        // injector can act on**. Two locks hold that: phase A's payload carries
-        // no geometry at all, and every rect it reads belongs to the shared
-        // liveness predicate, which spends it on a boolean and nothing else.
         assert!(
-            scroll.contains("return{found:true,isConnected:connected,scrollTopBefore:top,match:m};"),
-            "phase A's payload must stay geometry-free — any rect in it would be \
-             pre-scroll: {scroll}"
-        );
-        assert!(
-            !scroll.contains("elementFromPoint"),
-            "hit-testing a pre-scroll point is the same lie as reporting one: {scroll}"
-        );
-        assert_eq!(
-            scroll.matches("getBoundingClientRect").count(),
-            WEB_DO_LIVE_FN_JS.matches("getBoundingClientRect").count(),
-            "the only rect phase A may read is the liveness predicate's: {scroll}"
+            !scroll.contains("getBoundingClientRect"),
+            "phase A must not measure — any rect it took would be pre-scroll: {scroll}"
         );
 
         let measure = web_do_script_common(WEB_DO_RESOLVE_PINNED_JS);
@@ -65105,21 +64357,19 @@ mod web_do_verb_tests {
             first.contains("querySelectorAll(\"#Name\")"),
             "counting requires querySelectorAll: {first}"
         );
-        assert!(first.contains("live[0]"), "{first}");
+        assert!(first.contains("els[0]"), "{first}");
         assert!(
             first.contains(&format!("window.{WEB_DO_MATCH_KEY}")),
             "{first}"
         );
 
         // `--nth 1` reaches the second block. `Css(s)` IS `CssNth{s,0}`: same
-        // matcher, same description. The index counts HITTABLE matches, because
-        // a `visibility:hidden` duplicate is noise rather than a block anyone
-        // meant to address.
+        // matcher, same description.
         let second = web_element_ref_js(&WebElementRef::CssNth {
             css: "#Name".into(),
             nth: 1,
         });
-        assert!(second.contains("live[1]"), "{second}");
+        assert!(second.contains("els[1]"), "{second}");
         assert_eq!(
             web_element_ref_js(&WebElementRef::CssNth {
                 css: "#Name".into(),
@@ -65238,265 +64488,6 @@ mod web_do_verb_tests {
             !role.contains("return pool[nth]||null"),
             "answering straight out of the unfiltered pool is the defect: {role}"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // THE HIDDEN-DUPLICATE FAMILY (found on the engine plane 2026-07-31,
-    // fixed there in `ychrome` c547aa6, fixed HERE 2026-08-01).
-    //
-    // One page shape produced both halves: a `visibility:hidden` duplicate
-    // ahead of the real control. It measures a real rect, so the CSS matcher
-    // handed it over; its centre hits `<body>`, and `<body>` contains every
-    // element, so the occlusion check waved it through. Success, reported,
-    // into the void.
-    // ------------------------------------------------------------------
-
-    // Half one: every matcher classifies for liveness, not just the role arm.
-    // A hidden duplicate must never enter the pool, so `nth` counts things a
-    // human could click and `matches` reports how many survived.
-    #[test]
-    fn every_matcher_filters_for_liveness_not_only_the_role_arm() {
-        for target in [
-            WebElementRef::Css("button[type=submit]".into()),
-            WebElementRef::CssNth {
-                css: "button[type=submit]".into(),
-                nth: 2,
-            },
-            WebElementRef::Text {
-                text: "Login".into(),
-                exact: false,
-                tag: None,
-                nth: None,
-            },
-            WebElementRef::Role {
-                role: "button".into(),
-                label: "Login".into(),
-                nth: None,
-            },
-            WebElementRef::Role {
-                role: "option".into(),
-                label: "PASSPORT".into(),
-                nth: None,
-            },
-        ] {
-            // Read the arm BEFORE substitution: there, `__YGG_LIVE_FN__` is
-            // still a placeholder, so every `__yggLive(` left in the text is a
-            // CALL the arm makes rather than one inside the shared definition.
-            // Asserting on the substituted script would pass for an arm that
-            // merely pastes the predicate in and never applies it — which is
-            // exactly the mutation this lock exists to catch.
-            let raw = web_element_ref_js_raw(&target);
-            assert!(
-                raw.contains("__YGG_LIVE_FN__"),
-                "{} must pull in the ONE liveness predicate: {raw}",
-                target.describe()
-            );
-            assert!(
-                raw.contains("if(__yggLive("),
-                "{} must APPLY the predicate to each candidate, not merely \
-                 define it: {raw}",
-                target.describe()
-            );
-            assert!(
-                raw.contains("else dead++;"),
-                "{} must COUNT what the predicate rejected, or an all-hidden pool \
-                 is indistinguishable from an empty page: {raw}",
-                target.describe()
-            );
-
-            let js = web_element_ref_js(&target);
-            assert!(
-                js.contains("hidden:dead"),
-                "{} must report how many candidates it dropped, or `no_hittable_match` \
-                 can never be reached: {js}",
-                target.describe()
-            );
-            assert!(
-                !js.contains("hidden:0"),
-                "a hard-coded drop count is the defect — it made every pool look clean: {js}"
-            );
-        }
-
-        // And the CSS arm specifically must not index the RAW node list. That
-        // expression IS the reported bug: `querySelectorAll(sel)[nth]` answers
-        // with the decoy on any page that carries one.
-        let css = web_element_ref_js(&WebElementRef::Css("button[type=submit]".into()));
-        assert!(
-            !css.contains("return els[0]||null") && !css.contains("return all[0]||null"),
-            "the css arm must answer out of the LIVE pool, never the raw one: {css}"
-        );
-        assert!(
-            css.contains("return live[0]||null"),
-            "the css arm must answer `live[nth]`: {css}"
-        );
-    }
-
-    // Half two: an ancestor hit is not a hit. `<body>` contains everything, so
-    // accepting `hit.contains(el)` accepted every candidate on every normal
-    // page and made the whole occlusion check a no-op.
-    #[test]
-    fn an_ancestor_hit_is_not_a_hit() {
-        let js = WEB_DO_RESOLVE_PINNED_JS;
-        assert!(
-            !js.contains("hit.contains(el)"),
-            "an ancestor hit means the ANCESTOR was clicked, not this node: {js}"
-        );
-        assert!(
-            js.contains("hit===el||(el.contains&&el.contains(hit))"),
-            "the point must land ON the node or on a DESCENDANT of it: {js}"
-        );
-        assert!(
-            js.contains("inView?document.elementFromPoint"),
-            "a centre outside the viewport must refuse by construction, not by \
-             trusting elementFromPoint to answer null: {js}"
-        );
-
-        // …and the refusal has to say WHICH node intercepted, or the caller
-        // cannot tell an overlay from a node that moved.
-        let target = WebElementRef::Css("#login".into());
-        let err = web_do_resolved_from_info(
-            &target,
-            &resolved_info(json!({"onTarget": false, "hit": "div#cookie-wall"})),
-            None,
-        )
-        .expect_err("an occluded target must refuse");
-        assert!(err.starts_with("target_moved"), "{err}");
-        assert!(err.contains("div#cookie-wall"), "{err}");
-
-        let err = web_do_resolved_from_info(
-            &target,
-            &resolved_info(json!({"onTarget": false, "inViewport": false})),
-            None,
-        )
-        .expect_err("an off-screen centre must refuse");
-        assert!(err.contains("outside the viewport"), "{err}");
-    }
-
-    // Half three: one word per refusal across both planes. An all-hidden CSS
-    // pool is `no_hittable_match` — the engine's spelling — while the popper
-    // diagnosis stays reserved for the pick that actually has a popper.
-    #[test]
-    fn an_all_hidden_pool_refuses_with_the_engines_word_for_it() {
-        let only_hidden = Some(MatchDiag {
-            matches: 0,
-            nth: 0,
-            hidden: 6,
-        });
-
-        let css = web_do_match_refusal(&WebElementRef::Css("button[type=submit]".into()), only_hidden);
-        assert!(css.starts_with("no_hittable_match"), "{css}");
-        assert!(css.contains('6'), "the drop count is the evidence: {css}");
-
-        let text = web_do_match_refusal(
-            &WebElementRef::Text {
-                text: "Login".into(),
-                exact: false,
-                tag: None,
-                nth: None,
-            },
-            only_hidden,
-        );
-        assert!(text.starts_with("no_hittable_match"), "{text}");
-
-        // A non-popper role is not a popper either.
-        let button = web_do_match_refusal(
-            &WebElementRef::Role {
-                role: "button".into(),
-                label: "Login".into(),
-                nth: None,
-            },
-            only_hidden,
-        );
-        assert!(button.starts_with("no_hittable_match"), "{button}");
-
-        // The popper diagnosis survives where it belongs, and only there.
-        for role in ["option", "menuitem", "MenuItem"] {
-            let popper = web_do_match_refusal(
-                &WebElementRef::Role {
-                    role: role.into(),
-                    label: "PASSPORT".into(),
-                    nth: None,
-                },
-                only_hidden,
-            );
-            assert!(popper.starts_with("stale_listbox_only"), "{popper}");
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // THE JAR A SURFACE ACTUALLY OPENED ON (ychrome: "the login will not
-    // stick", 2026-07-31).
-    //
-    // The one-writer-per-profile rule is right. Handing the loser an
-    // EPHEMERAL context while calling it "read-only" in the comment beside
-    // it was not, and neither was doing it in silence.
-    // ------------------------------------------------------------------
-    #[test]
-    fn a_surface_that_lost_the_profile_lock_says_so_once_and_in_the_users_terms() {
-        use WebSurfaceJarMode as Mode;
-
-        // The rule.
-        assert_eq!(Mode::decide(true, true), Mode::Persistent);
-        assert_eq!(Mode::decide(true, false), Mode::NoJarLockHeldElsewhere);
-        assert_eq!(Mode::decide(false, true), Mode::EphemeralByRequest);
-        assert_eq!(
-            Mode::decide(false, false),
-            Mode::EphemeralByRequest,
-            "a profile with no jar was never asking for one — the lock cannot \
-             degrade what does not exist"
-        );
-
-        // The field the degradation is actually about.
-        assert!(Mode::Persistent.keeps_cookies());
-        assert!(
-            !Mode::NoJarLockHeldElsewhere.keeps_cookies(),
-            "this is the whole bug: no jar means no cookies, which is NOT \
-             read-only"
-        );
-        assert!(!Mode::EphemeralByRequest.keeps_cookies());
-
-        // Only the surprising mode speaks, and it speaks about cookies and
-        // logins rather than about write locks.
-        assert!(Mode::Persistent.notice("work").is_none());
-        assert!(
-            Mode::EphemeralByRequest.notice("temp").is_none(),
-            "private browsing leaving no trace is the FEATURE — announcing it \
-             would train the user to dismiss the notice that matters"
-        );
-        let (title, body) = Mode::NoJarLockHeldElsewhere
-            .notice("finance")
-            .expect("the degradation the user meets must be announced");
-        assert!(title.contains("finance"), "{title}");
-        for owed in ["logged out", "not be remembered", "bot check"] {
-            assert!(
-                body.contains(owed),
-                "the notice must name the symptom the user will actually hit \
-                 ({owed}): {body}"
-            );
-        }
-        assert!(
-            body.contains("Close the other holder"),
-            "a notice with no remedy is just an apology: {body}"
-        );
-
-        // One spelling per mode, shared by the trace line and the notice.
-        assert_eq!(Mode::NoJarLockHeldElsewhere.as_str(), "no_jar_lock_held_elsewhere");
-        assert_eq!(Mode::Persistent.as_str(), "persistent");
-        assert_eq!(Mode::EphemeralByRequest.as_str(), "ephemeral_by_request");
-    }
-
-    // A zero-size match is `zero_size_element` on both planes. It used to be a
-    // bare English sentence here, which is how one refusal came to have two
-    // names.
-    #[test]
-    fn a_zero_size_match_refuses_by_the_shared_name() {
-        let err = web_do_resolved_from_info(
-            &WebElementRef::Css("#file".into()),
-            &resolved_info(json!({"visible": false})),
-            None,
-        )
-        .expect_err("a zero-size element must refuse");
-        assert!(err.starts_with("zero_size_element"), "{err}");
     }
 
     // DEFECT 1's other half: WHICH mechanism runs. Per-key GTK injection is
@@ -65779,7 +64770,7 @@ mod web_do_verb_tests {
     // could reap a surface the user was about to switch back to.
     #[test]
     fn lease_extends_the_hold_and_never_shortens_it() {
-        let hold = Some(600_000);
+        let hold = 600_000;
         let stashed = Some(1_000_u64);
         // Hold not yet up, no lease: keep.
         assert!(!web_surface_reap_due(2_000, stashed, hold, None, false));
@@ -65810,12 +64801,8 @@ mod web_do_verb_tests {
             false
         ));
         // Zero hold still honors a live lease.
-        assert!(!web_surface_reap_due(2_000, None, Some(0), Some(9_000), false));
-        assert!(web_surface_reap_due(2_000, None, Some(0), None, false));
-        // NO hold at all — a comfortable machine — never reaps, whatever the
-        // clocks say. This is the branch the destroy-on-a-wall-clock bug had no
-        // way to express.
-        assert!(!web_surface_reap_due(999_999_000, stashed, None, None, false));
+        assert!(!web_surface_reap_due(2_000, None, 0, Some(9_000), false));
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
     }
 
     /// ONE TUNNEL PER SESSION, NOT PER TAB. `ssh -N -D` is the session's egress:
@@ -65890,7 +64877,7 @@ mod web_do_verb_tests {
     /// to cut off what the user is listening to.
     #[test]
     fn an_audible_background_surface_is_never_reaped() {
-        let hold = Some(600_000);
+        let hold = 600_000;
         let stashed = Some(1_000_u64);
         // Hold long expired, no lease — the exact case that reaps today.
         assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
@@ -65899,20 +64886,20 @@ mod web_do_verb_tests {
         assert!(web_surface_reap_due(
             9_000,
             stashed,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             None,
             false
         ));
         assert!(!web_surface_reap_due(
             9_000,
             stashed,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             None,
             true
         ));
         // Nor does a zero hold, the destroy-immediately configuration.
-        assert!(web_surface_reap_due(2_000, None, Some(0), None, false));
-        assert!(!web_surface_reap_due(2_000, None, Some(0), None, true));
+        assert!(web_surface_reap_due(2_000, None, 0, None, false));
+        assert!(!web_surface_reap_due(2_000, None, 0, None, true));
         // And silence restores the ordinary clocks — the veto is a veto, not a
         // permanent pin. A page that finished playing reaps on the next tick.
         assert!(web_surface_reap_due(999_000, stashed, hold, None, false));
@@ -78025,17 +77012,10 @@ fn app() -> Element {
         (inner.width as f64, inner.height as f64),
         desktop.scale_factor(),
     );
-    // ★ THE MIRROR, asked ONCE per render. Every side-dependent decision below —
-    // workspace order, panel edges, resize signs, menu bands, page-edge reveal —
-    // reads this and nothing else. Adding a second place that tests
-    // `settings.chrome_orientation` to decide a side is the SSOT violation this
-    // whole type exists to prevent.
-    let chrome_orientation = snapshot.settings.chrome_orientation;
     // The RAIL's band, derived once, handed to the mounts whose menus are raised
     // from the rail. See [`ContextMenuBand`]: in legacy stacking anything that
     // spills out of the rail is eaten by the native page beside it.
     let context_menu_rail_band = rail_context_menu_band(
-        chrome_orientation.edge(ChromeSlot::Rail),
         context_menu_window_size.0,
         snapshot.rail_width as f64,
         ui_zoom_factor(snapshot.settings.ui_font_size),
@@ -78047,8 +77027,6 @@ fn app() -> Element {
     // tree is eaten.
     let context_menu_sidebar_band = snapshot.active_web_surface_overlay.as_ref().map(|_| {
         sidebar_context_menu_band(
-            chrome_orientation.edge(ChromeSlot::Tree),
-            context_menu_window_size.0,
             snapshot.sidebar_width as f64,
             ui_zoom_factor(snapshot.settings.ui_font_size),
         )
@@ -79303,11 +78281,9 @@ fn app() -> Element {
                     "data-yggterm-workspace-row": "1",
                     "data-titlebar-auto-hide-enabled": if titlebar_auto_hide_enabled { "true" } else { "false" },
                     "data-titlebar-revealed": if titlebar_revealed { "true" } else { "false" },
-                    "data-chrome-mirrored": if chrome_orientation.is_mirrored() { "true" } else { "false" },
                     style: titlebar_autohide_content_offset_style(
                         titlebar_auto_hide_enabled,
                         titlebar_revealed,
-                        chrome_orientation,
                     ),
                     if !chrome_hidden {
                         Sidebar {
@@ -79591,9 +78567,6 @@ fn app() -> Element {
                                 if !enabled {
                                     titlebar_autohide_hovered.set(false);
                                 }
-                            },
-                            on_set_chrome_mirrored: move |mirrored: bool| {
-                                state.with_mut(|shell| shell.set_chrome_mirrored(mirrored));
                             },
                             on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                             on_set_ui_zoom: move |percent: i32| state.with_mut(|shell| shell.set_ui_zoom_percent(percent)),
@@ -80236,30 +79209,19 @@ fn Titlebar(
         search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette))
     };
     let titlebar_session_panel_background = floating_panel_background;
-    // The mirror's ONE question, asked once per titlebar render. Everything the
-    // titlebar flips — which cluster is on which edge, which way each cluster
-    // reads, which side its menus hang from — comes from this answer.
-    let orientation = snapshot.settings.chrome_orientation;
-    let tree_edge = orientation.edge(ChromeSlot::Tree);
-    let rail_edge = orientation.edge(ChromeSlot::Rail);
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
             zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
-            leading_edge: tree_edge,
-            leading_inset_px: titlebar_leading_inset,
             on_request_window_drag: on_request_window_drag,
             on_toggle_maximized: on_toggle_maximized,
-            leading: rsx! {
+            left: rsx! {
                 div {
-                    // ⚠ LEGACY NAME. This is the TREE cluster, which the chrome
-                    // mirror can put on the right; the honest, side-free stamp is
-                    // `data-yggui-titlebar-cluster="leading"` on the box around
-                    // it. Kept because the responsive CSS and the app-control
-                    // probes select on it — those selectors mean "the tree's
-                    // half", not "the left half".
                     "data-yggterm-titlebar-left": "1",
-                    style: titlebar_cluster_row_style(orientation, 12, ""),
+                    style: format!(
+                        "display:flex; align-items:center; gap:12px; min-width:0; max-width:100%; padding-left:{}px;",
+                        titlebar_leading_inset
+                    ),
                     button {
                         "data-titlebar-sidebar-button": "1",
                         style: icon_button_style(snapshot.palette),
@@ -80326,7 +79288,10 @@ fn Titlebar(
                         }
                     }
                     div {
-                        style: titlebar_cluster_row_style(orientation, 6, " flex:1 1 auto;"),
+                        style: format!(
+                            "display:flex; align-items:center; gap:{}px; min-width:0; flex:1 1 auto;",
+                            6
+                        ),
                         div {
                             class: "yggterm-titlebar-new-shell",
                             style: "position:relative; display:flex; align-items:flex-start; height:100%; overflow:visible;",
@@ -80375,10 +79340,8 @@ fn Titlebar(
                                 div {
                                     "data-titlebar-new-menu": "1",
                                     style: format!(
-                                        "position:absolute; {} top:1px; z-index:210; display:flex; flex-direction:column; align-items:{}; \
+                                        "position:absolute; left:0; top:1px; z-index:210; display:flex; flex-direction:column; align-items:flex-start; \
                                          min-width:184px; background:transparent; overflow:visible; pointer-events:none;",
-                                        titlebar_menu_anchor_style(tree_edge, 0.0),
-                                        tree_edge.css_justify(),
                                     ),
                                     div {
                                         "data-titlebar-new-button": "1",
@@ -80403,9 +79366,8 @@ fn Titlebar(
                                         "data-titlebar-new-menu-shell": "1",
                                         "data-yggterm-menu-surface": "1",
                                         style: format!(
-                                            "display:flex; flex-direction:column; gap:8px; width:min(292px, 72vw); margin-top:-1px; padding:12px; border-radius:{}; \
+                                            "display:flex; flex-direction:column; gap:8px; width:min(292px, 72vw); margin-top:-1px; padding:12px; border-radius:0 16px 16px 16px; \
                                              background:{}; box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
-                                            titlebar_attached_menu_radius(tree_edge),
                                             floating_panel_background,
                                             floating_panel_attached_box_shadow,
                                         ),
@@ -80610,8 +79572,7 @@ fn Titlebar(
                                 div {
                                     "data-titlebar-summary-shell": "1",
                                     style: format!(
-                                        "position:absolute; {} top:{}px; z-index:240; width:{}; min-width:max(100%, 352px); height:1px; overflow:visible; pointer-events:none;",
-                                        titlebar_menu_anchor_style(tree_edge, 0.0),
+                                        "position:absolute; left:0; top:{}px; z-index:240; width:{}; min-width:max(100%, 352px); height:1px; overflow:visible; pointer-events:none;",
                                         titlebar_modal_tab_height - 1,
                                         titlebar_modal_width,
                                     ),
@@ -80619,10 +79580,9 @@ fn Titlebar(
                                         "data-titlebar-summary-menu": "1",
                                         style: format!(
                                             "display:flex; flex-direction:column; gap:12px; width:{}; min-width:max(100%, 352px); margin-top:-1px; \
-                                             padding:14px; border:none; border-radius:{}; background:{}; \
+                                             padding:14px; border:none; border-radius:0 16px 16px 16px; background:{}; \
                                              box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
                                             titlebar_modal_width,
-                                            titlebar_attached_menu_radius(tree_edge),
                                             titlebar_session_panel_background,
                                             floating_panel_attached_box_shadow,
                                         ),
@@ -80924,15 +79884,10 @@ fn Titlebar(
                     }
                 }
             },
-            trailing: rsx! {
+            right: rsx! {
                 div {
-                    // ⚠ LEGACY NAME, as above: this is the RAIL cluster, and the
-                    // mirror can put it on the left.
                     "data-yggterm-titlebar-right": "1",
-                    style: format!(
-                        "position:relative; justify-content:flex-end; {}",
-                        titlebar_cluster_row_style(orientation, 8, "")
-                    ),
+                    style: "position:relative; display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; max-width:100%;",
                     onclick: |evt| evt.stop_propagation(),
                     style { "{TITLEBAR_RESPONSIVE_CSS}" }
                     if let Some(update) = snapshot.pending_update_restart.clone() {
@@ -81144,12 +80099,8 @@ fn Titlebar(
                         div {
                             "data-titlebar-overflow-menu": "1",
                             style: format!(
-                                "position:absolute; {} top:34px; z-index:220; min-width:196px; padding:8px; border-radius:14px; \
+                                "position:absolute; right:110px; top:34px; z-index:220; min-width:196px; padding:8px; border-radius:14px; \
                                  background:{}; box-shadow:{}; display:flex; flex-direction:column; gap:6px;",
-                                // The overflow menu hangs off the RAIL cluster's
-                                // edge, not off its own trigger box, so its inset
-                                // follows the rail.
-                                titlebar_menu_anchor_style(rail_edge, 110.0),
                                 if palette_is_dark(snapshot.palette) {
                                     "rgba(14,19,24,0.98)"
                                 } else {
@@ -81206,17 +80157,6 @@ fn Titlebar(
                             }
                         }
                     }
-                }
-            },
-            // NOT mirrored: the window buttons belong to the platform. The
-            // mirror is an app-chrome preference; where the compositor expects
-            // minimise/maximise/close is not ours to flip, so this slot rides
-            // whichever cluster shares the physical right edge and stays
-            // outermost on it.
-            window_controls: rsx! {
-                div {
-                    "data-yggterm-titlebar-window-controls": "1",
-                    style: "display:flex; align-items:center; height:100%;",
                     div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
                     if native_macos_titlebar {
                         WindowControlsStrip {
@@ -81410,18 +80350,14 @@ fn Sidebar(
     // revealed floating card). Fixed keys are load-bearing — see
     // `SidebarPanelMode`: diverging keys left overlay props lingering when the
     // panel toggled back to docked.
-    // ASK the orientation, never assume the tree is on the left: the mirror
-    // toggle moves this whole panel — its card, its shadow, its collapse slide
-    // and its resize grip — to the other edge in one answer.
-    let tree_edge = chrome_slot_edge(&snapshot, ChromeSlot::Tree);
     let outer_style = sidebar_panel_outer_style(
-        tree_edge,
+        SidebarEdge::Left,
         mode,
         snapshot.sidebar_width,
         zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
     );
     let content_style =
-        sidebar_panel_card_style(tree_edge, mode, snapshot.sidebar_width, snapshot.palette);
+        sidebar_panel_card_style(SidebarEdge::Left, mode, snapshot.sidebar_width, snapshot.palette);
     rsx! {
         div {
             id: "yggterm-sidebar",
@@ -81439,10 +80375,7 @@ fn Sidebar(
             // gets its rect back, and the legacy native-webview path clamps the
             // page beside it (`WEB_SURFACE_GEOMETRY_EVAL_JS`). Collapsed, the
             // 6px sensor stays UNdeclared: the page owns its own left edge.
-            // Named by PANEL, not by side. The reconciler consumes the RECT, so
-            // this string is only ever read by a human — and after a mirror
-            // "sidebar-left" would be that human's first wrong turn.
-            "data-covers-web-surface": if auto_hide && autohide_revealed { "sidebar-tree" },
+            "data-covers-web-surface": if auto_hide && autohide_revealed { "sidebar-left" },
             "data-sidebar-width": "{snapshot.sidebar_width.round() as i64}",
             style: outer_style,
             tabindex: "0",
@@ -81853,7 +80786,11 @@ fn Sidebar(
                 }
                 div {
                     "data-sidebar-resize-handle": "1",
-                    style: sidebar_resize_handle_style(tree_edge),
+                    style: format!(
+                        "position:absolute; top:0; right:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+                         background:transparent;",
+                        SIDEBAR_RESIZE_HANDLE_WIDTH
+                    ),
                     onmousedown: move |evt| {
                         evt.stop_propagation();
                         on_start_sidebar_resize.call(evt.client_coordinates().x);
@@ -82803,24 +81740,20 @@ fn session_row_label_style(density: SessionRowDensity, color: &str, bold: bool) 
     )
 }
 
-// The revealed verbs' chip-feather width used to live here. The chip is gone
-// (the user rejected it — DESIGN.md, "NO BACKGROUND BEHIND THE VERBS"), and so
-// is the constant: a number nothing reads is the seed the next chip grows from.
+/// How far the revealed verbs' frosted chip FEATHERS in from its left edge, and
+/// therefore how much clear room its first glyph has above the title running
+/// under it. One number for every row family.
+const SESSION_ROW_ACTIONS_FADE_PX: u32 = 22;
 
-/// The in-flow cell the trailing verbs hang off.
+/// The zero-width, full-height IN-FLOW anchor the trailing verbs hang off.
 ///
-/// This is the whole of "the label gets the width back", and it works by the
-/// child being `display:none` at rest rather than by floating: a `display:none`
-/// child gives the cell zero width, so the title track measures the full row
-/// whenever no verbs are showing. Measured on the live cwdtree 2026-08-01: an
-/// `opacity:0` ✕ still claimed 18px of layout plus its 6px gap on every
-/// live-session row, so a truncated title stopped 24px short of the row it was
-/// in — hiding is not enough, only leaving the flex line is.
-///
-/// Revealed, the cell DOES take its width and the title ellipsizes. That reflow
-/// is deliberate: the alternative was floating the verbs on a frosted chip, and
-/// the user rejected it because the title ran underneath and the ✕ read as a
-/// smudge. See DESIGN.md, "NO BACKGROUND BEHIND THE VERBS".
+/// This is the whole of "the label gets the width back". The verbs themselves
+/// are absolutely positioned against this anchor, so they cost the flex row
+/// NOTHING: the title track measures the full row at rest AND while the verbs
+/// are showing, and no title ever jumps sideways as the pointer walks the list.
+/// Measured on the live cwdtree 2026-08-01: an `opacity:0` ✕ still claimed 18px
+/// of layout plus its 6px gap on every live-session row, so a truncated title
+/// stopped 24px short of the row it was in.
 ///
 /// It is an anchor rather than the row itself so the verbs land to the LEFT of
 /// the always-visible `expander` — a hover must never cover the disclosure
@@ -83053,24 +81986,26 @@ fn SessionStyleRow(
             }
             if let Some(actions) = actions {
                 // Revealed by hover / selection / keyboard focus
-                // (session_row_hover_css) and IN FLOW. At rest the child is
-                // `display:none`, so this cell is zero-width and the title gets
-                // the whole row; revealed, the cell grows and the title
-                // ellipsizes to fit.
-                //
-                // It USED to float out of flow on a frosted chip so the title
-                // never reflowed. The user rejected that on sight, on every
-                // cwdtree at once: the title ran under the chip and the verbs
-                // read as a smudge rather than as buttons.
+                // (session_row_hover_css) and OUT OF FLOW: a zero-width anchor
+                // holds the place, the verbs float over the title's trailing
+                // edge on a frosted chip. So the title track is the full row
+                // WHENEVER, and the verbs cost it nothing.
                 //
                 // Ahead of the `expander` on purpose: an expander is permanent
                 // chrome (DESIGN.md — "always visible, unlike `actions`"), so
-                // the verbs land to its LEFT and never cover it.
+                // the floating verbs must land to its LEFT and never cover it.
                 span {
                     "data-session-row-actions-anchor": "1",
                     style: session_row_actions_anchor_style(metrics.gap_px),
                     span {
                         "data-session-row-actions": "1",
+                        // Bled over the row's OWN padding, so the chip wears the
+                        // row's rounded edges instead of floating inside it —
+                        // but ONLY when nothing follows it. A row that also has
+                        // an expander has the chevron 6px to the right, and the
+                        // bleed put the chip 2px ON it (measured live on a rail
+                        // folder row, 2026-08-01). The expander is permanent
+                        // chrome; a hover may never cover it.
                         style: session_row_actions_style(
                             metrics.pad_v_px,
                             if expander_present { 0 } else { metrics.pad_h_px },
@@ -83826,12 +82761,10 @@ fn SidebarRow(
                     }
                 }
                 if show_live_close {
-                    // IN FLOW on the shared anchor: the ✕ appears when the row
-                    // is hovered, selected or holding the keyboard, takes its
-                    // width from the title at that moment, and costs nothing at
-                    // rest. Same reveal owner as every other row family — see
-                    // the twin above for why the frosted chip this used to wear
-                    // was rejected.
+                    // OUT OF FLOW, on the shared anchor + frosted chip: the ✕
+                    // floats over the title's trailing edge when the row is
+                    // hovered, selected or holding the keyboard, and costs the
+                    // title nothing the rest of the time.
                     span {
                     "data-session-row-actions-anchor": "1",
                     // 6, because the cluster this anchor sits in is the row's
@@ -83839,6 +82772,8 @@ fn SidebarRow(
                     style: session_row_actions_anchor_style(6),
                     span {
                     "data-session-row-actions": "1",
+                    // 5/9, the cwdtree row's own `padding:5px 9px` — the chip
+                    // bleeds over it and the row clips it back to its radius.
                     style: session_row_actions_style(5, 9),
                     button {
                         "data-sidebar-live-session-close": "1",
@@ -101782,10 +100717,6 @@ fn reclaim_active_terminal_input_after_search_blur(mut state: Signal<ShellState>
 /// One owner: the renderer stamps this same constant as the row's
 /// `data-settings-field-key`, so the focus target cannot drift from the DOM.
 const SETTINGS_FIRST_FIELD_KEY: &str = "auto-hide-titlebar";
-/// The chrome-mirror toggle's field key, same one-owner rule as above: the
-/// renderer stamps this constant and the app-control probe queries it, so the
-/// two cannot drift.
-const SETTINGS_MIRROR_CHROME_FIELD_KEY: &str = "mirror-chrome";
 fn focus_settings_field(mut state: Signal<ShellState>, field_key: &str) {
     let active_session_path = {
         let mut shell = state.write();
@@ -102073,420 +101004,6 @@ fn open_web_surface_tab(
         focus_web_omnibox(state);
     }
     opened
-}
-
-// ===== SCREENSHOT: THE PAGE'S OWN CONTEXT MENU ==============================
-
-/// The entries yggterm contributes to WebKit's page context menu.
-///
-/// ⭐ **A page had no yggterm menu at all until now, deliberately.** The shell
-/// does not `preventDefault` over `[data-ws-overlay]` because WebKit's own menu
-/// already offers Copy/Cut/Paste/Select-All/Open-Link, and a DOM reimplementation
-/// would be a second, worse copy of it. What was missing was any way to ADD one
-/// entry to it — so screenshot, which is a page verb a human reaches for with
-/// the mouse, had no mouse route and existed only as an agent-control command.
-///
-/// These four are the same four regions the ychrome engine's `/engine/shot`
-/// takes, in the same order, and that is not a coincidence: a human clicking
-/// "Full page" and an agent sending `region=full` must get the same picture, so
-/// the vocabulary is one vocabulary.
-const WEB_PAGE_MENU_ITEMS: &[(&str, &str)] = &[
-    ("web.shot.viewport", "Screenshot visible area"),
-    ("web.shot.full", "Screenshot full page"),
-    ("web.shot.element", "Screenshot this element"),
-    ("web.shot.area", "Screenshot an area…"),
-];
-
-/// The overlay a "Screenshot an area…" drag runs in, injected into the PAGE.
-///
-/// ⚠ **It has to live in the page, not in the shell's DOM.** A native child
-/// webview composites ABOVE all shell DOM, so a selection overlay drawn in the
-/// shell would be invisible under the very page it is selecting from. The page
-/// is the only layer above the page.
-///
-/// Reports through `window.__yggtermShotArea`, which the Rust side polls:
-/// `{state:'dragging'}` while the mouse is down, `{state:'done', rect}` on
-/// release in DOCUMENT coordinates, `{state:'cancelled'}` on Escape or a
-/// zero-size drag. Cancellation is a first-class answer, not a timeout — a user
-/// who pressed Escape must not wait out a poll budget to find out it worked.
-const WEB_SHOT_AREA_OVERLAY_JS: &str = r#"
-(() => {
-  if (window.__yggtermShotAreaLive) { return 'already'; }
-  window.__yggtermShotAreaLive = true;
-  window.__yggtermShotArea = { state: 'waiting' };
-  const doc = document.documentElement;
-  const layer = document.createElement('div');
-  layer.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:crosshair;' +
-    'background:rgba(10,14,20,0.28);';
-  const box = document.createElement('div');
-  box.style.cssText = 'position:fixed;border:1px solid #7cc4ff;background:rgba(124,196,255,0.16);' +
-    'box-shadow:0 0 0 9999px rgba(10,14,20,0.28);pointer-events:none;display:none;';
-  layer.appendChild(box);
-  const hint = document.createElement('div');
-  hint.textContent = 'Drag to select an area  ·  Esc to cancel';
-  hint.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);' +
-    'font:600 12px/1.6 system-ui,sans-serif;color:#e9eef5;background:rgba(14,20,28,0.92);' +
-    'padding:6px 12px;border-radius:6px;pointer-events:none;';
-  layer.appendChild(hint);
-  (document.body || doc).appendChild(layer);
-  let sx = 0, sy = 0, dragging = false;
-  const finish = (result) => {
-    window.__yggtermShotArea = result;
-    window.__yggtermShotAreaLive = false;
-    layer.remove();
-    window.removeEventListener('keydown', onKey, true);
-  };
-  const onKey = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish({ state: 'cancelled' }); }
-  };
-  window.addEventListener('keydown', onKey, true);
-  layer.addEventListener('mousedown', (e) => {
-    dragging = true; sx = e.clientX; sy = e.clientY;
-    box.style.display = 'block';
-    window.__yggtermShotArea = { state: 'dragging' };
-  });
-  layer.addEventListener('mousemove', (e) => {
-    if (!dragging) { return; }
-    const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
-    const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
-    box.style.left = x + 'px'; box.style.top = y + 'px';
-    box.style.width = w + 'px'; box.style.height = h + 'px';
-  });
-  layer.addEventListener('mouseup', (e) => {
-    if (!dragging) { return; }
-    dragging = false;
-    const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
-    const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
-    // A click with no drag is a CANCEL, not a 0x0 capture.
-    if (w < 4 || h < 4) { finish({ state: 'cancelled' }); return; }
-    finish({ state: 'done', rect: {
-      // DOCUMENT coordinates: the crop is cut from a full-document snapshot.
-      x: x + (window.scrollX || 0), y: y + (window.scrollY || 0), w: w, h: h
-    }});
-  });
-  return 'armed';
-})()
-"#;
-
-/// Read the area overlay's result without disturbing it.
-const WEB_SHOT_AREA_POLL_JS: &str = "JSON.stringify(window.__yggtermShotArea || {state:'gone'})";
-
-/// The page geometry a crop is computed against, and the element under a
-/// right-click. One read, so the rect and the width it is scaled by cannot come
-/// from two different instants.
-fn web_shot_element_probe_js(x: f64, y: f64) -> String {
-    format!(
-        r#"(() => {{
-  const d = document.documentElement, b = document.body;
-  const max = (...v) => v.reduce((a, n) => (n > a ? n : a), 0);
-  const doc_w = max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth || 0);
-  const el = document.elementFromPoint({x}, {y});
-  if (!el) {{ return JSON.stringify({{ found: false, doc_w: doc_w }}); }}
-  const r = el.getBoundingClientRect();
-  return JSON.stringify({{
-    found: r.width > 0 && r.height > 0,
-    doc_w: doc_w,
-    tag: el.tagName ? el.tagName.toLowerCase() : '',
-    x: r.left + (window.scrollX || 0),
-    y: r.top + (window.scrollY || 0),
-    w: r.width,
-    h: r.height
-  }});
-}})()"#
-    )
-}
-
-/// The document width a full-page crop is scaled against, on its own.
-const WEB_SHOT_DOC_WIDTH_JS: &str = r#"(() => {
-  const d = document.documentElement, b = document.body;
-  const max = (...v) => v.reduce((a, n) => (n > a ? n : a), 0);
-  return String(max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0, window.innerWidth || 0));
-})()"#;
-
-/// Where a screenshot the USER asked for lands.
-///
-/// The same directory the agent control plane writes captures to, because they
-/// are the same artifact and a user who takes one from the menu and then asks
-/// an agent for another should find both in one place. Named by the clock, not
-/// by a request id, because a human has to be able to pick theirs out.
-fn web_shot_output_path(home: &std::path::Path, kind: &str) -> std::path::PathBuf {
-    // Milliseconds since the epoch rather than a formatted local time: this
-    // crate has no date library, and a name that sorts is worth more here than
-    // one that reads — the toast carries the path, so nobody has to guess.
-    let stamp = current_millis();
-    home.join("screenshots")
-        .join(format!("page-{kind}-{stamp}.png"))
-}
-
-/// Serve one entry of the page context menu.
-///
-/// Every arm ends in `capture_web_page`, which is the ONE capture path — the
-/// four regions differ only in what they hand it, so "full page" and "this
-/// element" cannot drift into taking their pictures differently.
-fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
-    let Ok((_, native_id)) = resolve_live_web_surface(&state, None) else {
-        return;
-    };
-    let id = id.to_string();
-    spawn(async move {
-        let desktop = window();
-        let outcome = match id.as_str() {
-            "web.shot.viewport" => {
-                capture_web_page(
-                    state,
-                    &desktop,
-                    native_id,
-                    "viewport",
-                    dioxus::desktop::PageSnapshotRegion::Visible,
-                    None,
-                )
-                .await
-            }
-            "web.shot.full" => {
-                capture_web_page(
-                    state,
-                    &desktop,
-                    native_id,
-                    "full",
-                    dioxus::desktop::PageSnapshotRegion::FullDocument,
-                    None,
-                )
-                .await
-            }
-            "web.shot.element" => match web_shot_element_rect(&desktop, native_id, x, y).await {
-                Ok(crop) => {
-                    capture_web_page(
-                        state,
-                        &desktop,
-                        native_id,
-                        "element",
-                        dioxus::desktop::PageSnapshotRegion::FullDocument,
-                        Some(crop),
-                    )
-                    .await
-                }
-                Err(reason) => Err(reason),
-            },
-            "web.shot.area" => match web_shot_area_rect(&desktop, native_id).await {
-                // A cancelled selection is not a failure and must not toast
-                // like one: the user changed their mind, which is an answer.
-                Ok(None) => return,
-                Ok(Some(crop)) => {
-                    capture_web_page(
-                        state,
-                        &desktop,
-                        native_id,
-                        "area",
-                        dioxus::desktop::PageSnapshotRegion::FullDocument,
-                        Some(crop),
-                    )
-                    .await
-                }
-                Err(reason) => Err(reason),
-            },
-            _ => return,
-        };
-        let mut state = state;
-        state.with_mut(|shell| match outcome {
-            Ok((path, w, h)) => shell.push_notification(
-                NotificationTone::Success,
-                "Screenshot Saved",
-                format!("{w}x{h} · {path}"),
-            ),
-            // Named, never swallowed: a capture that silently did nothing is
-            // discovered later, in a directory that does not have the file.
-            Err(reason) => {
-                shell.push_notification(NotificationTone::Warning, "Screenshot Failed", reason)
-            }
-        });
-    });
-}
-
-/// THE capture path. One region, one optional crop, one PNG, one report.
-async fn capture_web_page(
-    state: Signal<ShellState>,
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    kind: &str,
-    region: dioxus::desktop::PageSnapshotRegion,
-    crop: Option<dioxus::desktop::PageCrop>,
-) -> Result<(String, i32, i32), String> {
-    // The SAME `~/.yggterm` the agent control plane writes captures to, from
-    // its one resolver — a screenshot a human takes and one an agent takes are
-    // the same artifact and belong in one place.
-    let home = resolve_yggterm_home().map_err(|error| error.to_string())?;
-    let path = web_shot_output_path(&home, kind);
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(i32, i32), String>>();
-    desktop.snapshot_web_surface_region(native_id, region, crop, path.clone(), move |outcome| {
-        let _ = tx.send(outcome);
-    })?;
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(Ok((w, h)))) => Ok((path.display().to_string(), w, h)),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) => Err("the surface went away mid-capture".to_string()),
-        Err(_) => Err("the capture timed out (30s)".to_string()),
-    }
-}
-
-/// One eval round trip against a page, awaited.
-async fn web_surface_eval_json(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    js: &str,
-) -> Result<String, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
-    desktop.eval_web_surface(native_id, js, move |outcome| {
-        let _ = tx.send(outcome.map_err(|failure| failure.message));
-    })?;
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("the surface went away mid-eval".to_string()),
-        Err(_) => Err("the page did not answer within 5s".to_string()),
-    }
-}
-
-/// The DOCUMENT-space rect of whatever was right-clicked.
-async fn web_shot_element_rect(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-    x: f64,
-    y: f64,
-) -> Result<dioxus::desktop::PageCrop, String> {
-    let raw = web_surface_eval_json(desktop, native_id, &web_shot_element_probe_js(x, y)).await?;
-    // The eval answers a JSON *string* containing JSON, because the completion
-    // value is `JSON.stringify(...)`.
-    let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
-    let probe: Value = serde_json::from_str(&inner)
-        .map_err(|error| format!("the page's element probe was not JSON: {error}"))?;
-    if probe["found"].as_bool() != Some(true) {
-        return Err("nothing with a visible box was under the pointer".to_string());
-    }
-    Ok(dioxus::desktop::PageCrop {
-        x: probe["x"].as_f64().unwrap_or(0.0),
-        y: probe["y"].as_f64().unwrap_or(0.0),
-        w: probe["w"].as_f64().unwrap_or(0.0),
-        h: probe["h"].as_f64().unwrap_or(0.0),
-        css_width: probe["doc_w"].as_f64().unwrap_or(0.0),
-    })
-}
-
-/// Arm the in-page selection overlay and wait for the user's drag.
-///
-/// `Ok(None)` is a CANCEL — Escape, or a click with no drag — and it is a
-/// success, not a failure. Bounded at 60 s: an overlay left armed forever would
-/// hold the page under a scrim with nothing on screen explaining why.
-async fn web_shot_area_rect(
-    desktop: &dioxus::desktop::DesktopContext,
-    native_id: u64,
-) -> Result<Option<dioxus::desktop::PageCrop>, String> {
-    web_surface_eval_json(desktop, native_id, WEB_SHOT_AREA_OVERLAY_JS).await?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let raw = web_surface_eval_json(desktop, native_id, WEB_SHOT_AREA_POLL_JS).await?;
-        let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
-        let report: Value = match serde_json::from_str(&inner) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        match report["state"].as_str() {
-            Some("cancelled") | Some("gone") => return Ok(None),
-            Some("done") => {
-                let rect = &report["rect"];
-                let width =
-                    web_surface_eval_json(desktop, native_id, WEB_SHOT_DOC_WIDTH_JS).await?;
-                let width: String = serde_json::from_str(&width).unwrap_or(width);
-                return Ok(Some(dioxus::desktop::PageCrop {
-                    x: rect["x"].as_f64().unwrap_or(0.0),
-                    y: rect["y"].as_f64().unwrap_or(0.0),
-                    w: rect["w"].as_f64().unwrap_or(0.0),
-                    h: rect["h"].as_f64().unwrap_or(0.0),
-                    css_width: width.trim().parse().unwrap_or(0.0),
-                }));
-            }
-            _ => continue,
-        }
-    }
-    Err("the area selection timed out (60s)".to_string())
-}
-
-/// Serve one LEGACY BROWSER CHORD (`WEB_PAGE_CHORDS`). `true` when this layer
-/// owns the id, so the terminus knows not to hand it on to the keytip dispatch.
-///
-/// ⭐ **Every arm here routes to a verb this app ALREADY had**, and that is the
-/// design: none of these keys is a new capability, they are keyboard doors onto
-/// affordances that existed only for the mouse. `web.reload` lands on
-/// `web_surface_reload_active_tab` — THE reload owner, the same one the ⟳
-/// button uses; `web.tab.new` lands on `open_web_surface_tab`, THE UI opener,
-/// which is what makes "a new tab is typing-ready" true for the keyboard
-/// without anybody writing the focus call a fourth time; `web.tab.close` lands
-/// on the row menu's own close plan, so the app tab refuses to close from the
-/// keyboard exactly as it refuses from the menu.
-///
-/// A chord that finds no live surface does NOTHING and says so with `true`
-/// anyway. It is still this layer's key — handing it to `dispatch_keytip_node`
-/// would look up a command id that does not exist, which is a silent no-op with
-/// an extra step.
-fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
-    let Some(session) = state
-        .peek()
-        .server
-        .active_session_path()
-        .map(str::to_string)
-    else {
-        return WEB_PAGE_CHORDS.iter().any(|chord| chord.id == id);
-    };
-    match id {
-        "web.reload" => {
-            state.with_mut(|shell| shell.web_surface_reload_active_tab(&session));
-        }
-        "web.reload.hard" => {
-            // Straight to the engine, because the cache bypass has no `wry`
-            // spelling and therefore no reload-nonce spelling either. Named on
-            // failure rather than swallowed: a hard reload that silently did
-            // nothing is indistinguishable from a page that legitimately did
-            // not change.
-            if let Ok((_, native_id)) = resolve_live_web_surface(&state, None)
-                && let Err(error) = window().reload_web_surface_bypass_cache(native_id)
-            {
-                state.with_mut(|shell| {
-                    shell.push_notification(
-                        NotificationTone::Warning,
-                        "Could Not Hard Reload",
-                        error,
-                    )
-                });
-            }
-        }
-        "web.tab.new" => {
-            open_web_surface_tab(state, &session, WebTabOpenRequest::blank());
-        }
-        "web.address" => {
-            // Focus AND select, so the next keystroke replaces the URL rather
-            // than appending to it — which is what every other browser does and
-            // what `focus_web_omnibox` already implements for the "+" path.
-            focus_web_omnibox(state);
-        }
-        "web.tab.close" => {
-            let active = state
-                .peek()
-                .web_surfaces
-                .get(&session)
-                .map(|surface| surface.active_tab);
-            if let Some(tab) = active {
-                state.with_mut(|shell| {
-                    shell.apply_web_tab_menu_action(&session, &WebTabMenuAction::CloseTab(tab))
-                });
-            }
-        }
-        "web.devtools" => {
-            if let Ok((_, native_id)) = resolve_live_web_surface(&state, None) {
-                let _ = window().toggle_web_surface_devtools(native_id);
-            }
-        }
-        _ => return false,
-    }
-    true
 }
 fn terminal_should_accept_input(
     active_view_mode: WorkspaceViewMode,
@@ -116121,8 +114638,6 @@ fn RightRail(
     on_set_terminal_telemetry: EventHandler<bool>,
     on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
-    /// Flip the whole app chrome about the window's vertical centre line.
-    on_set_chrome_mirrored: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -116194,33 +114709,32 @@ fn RightRail(
         SidebarPanelMode::Collapsed
     };
     let rail_width = snapshot.rail_width;
-    // Same rule as the tree: ASK which edge this panel is on. Mirrored, the rail
-    // is the LEFT panel and everything about it — anchor, shadow, collapse
-    // slide, grip side, drag sign — follows from this one answer.
-    let rail_edge = chrome_slot_edge(&snapshot, ChromeSlot::Rail);
     let outer_style = sidebar_panel_outer_style(
-        rail_edge,
+        SidebarEdge::Right,
         mode,
         rail_width,
         zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
     );
-    let content_style = sidebar_panel_card_style(rail_edge, mode, rail_width, snapshot.palette);
+    let content_style = sidebar_panel_card_style(SidebarEdge::Right, mode, rail_width, snapshot.palette);
     let rail_reveal = (!visible).then(|| SideRailReveal {
         on_reveal: EventHandler::new(move |_| autohide.reveal()),
         on_reveal_if_idle: EventHandler::new(move |_| autohide.reveal_if_idle()),
         on_mouse_leave: EventHandler::new(move |_| autohide.handle_mouse_leave()),
         on_focus_within: EventHandler::new(move |focused: bool| autohide.set_focus_within(focused)),
     });
-    // A grip on the rail's INNER edge, mirroring the tree's grip on ITS inner
-    // edge — same helper, so the mirror moves both without either being told
-    // about the other. Rendered in EVERY mode so a hidden rail is draggable too
-    // (the grip lives inside the card; a fully-collapsed card is un-clickable,
-    // so you hover-reveal first, then drag, and the drag docks + resizes).
-    // `start_rail_resize` un-hides to the last shown mode.
+    // A grip on the rail's INNER (left) edge, mirroring the tree's grip on its
+    // right edge — rendered in EVERY mode so a hidden rail is draggable too (the
+    // grip lives inside the card; a fully-collapsed card is un-clickable, so you
+    // hover-reveal first, then drag, and the drag docks + resizes). `start_rail_
+    // resize` un-hides to the last shown mode.
     let rail_resize_handle = Some(rsx! {
         div {
             "data-rail-resize-handle": "1",
-            style: sidebar_resize_handle_style(rail_edge),
+            style: format!(
+                "position:absolute; top:0; left:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+                 background:transparent;",
+                SIDEBAR_RESIZE_HANDLE_WIDTH
+            ),
             onmousedown: move |evt| {
                 evt.stop_propagation();
                 on_start_rail_resize.call(evt.client_coordinates().x);
@@ -116238,7 +114752,6 @@ fn RightRail(
             content_style: content_style,
             reveal: rail_reveal,
             resize_handle: rail_resize_handle,
-            cover_label: "sidebar-rail",
             body: rsx!{
             if rendered_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone(), on_daemon_hot_restart }
@@ -116260,7 +114773,6 @@ fn RightRail(
                     on_set_terminal_telemetry,
                     on_set_perf_profiling,
                     on_set_titlebar_auto_hide,
-                    on_set_chrome_mirrored,
                     on_adjust_ui_zoom,
                     on_set_ui_zoom,
                     on_adjust_main_zoom,
@@ -119879,7 +118391,6 @@ fn SettingsRailBody(
     on_set_terminal_telemetry: EventHandler<bool>,
     on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
-    on_set_chrome_mirrored: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -119912,9 +118423,7 @@ fn SettingsRailBody(
             ChromeBehaviorSettingsSection {
                 palette: snapshot.palette,
                 auto_hide_titlebar: snapshot.settings.auto_hide_titlebar,
-                chrome_mirrored: snapshot.settings.chrome_orientation.is_mirrored(),
                 on_change: on_set_titlebar_auto_hide,
-                on_change_mirror: on_set_chrome_mirrored,
             }
             style { "{UPDATE_CTA_CSS}" }
             InstallUpdateRow {
@@ -123938,9 +122447,7 @@ fn KeytipsSettingsSection(
 fn ChromeBehaviorSettingsSection(
     palette: Palette,
     auto_hide_titlebar: bool,
-    chrome_mirrored: bool,
     on_change: EventHandler<bool>,
-    on_change_mirror: EventHandler<bool>,
 ) -> Element {
     rsx! {
         div {
@@ -123958,14 +122465,6 @@ fn ChromeBehaviorSettingsSection(
                     enabled: auto_hide_titlebar,
                     palette,
                     on_change,
-                }
-                InlineSettingsToggleRow {
-                    field_key: SETTINGS_MIRROR_CHROME_FIELD_KEY.to_string(),
-                    label: "Mirror Chrome".to_string(),
-                    description: "Reflect the window about its centre: the session tree, its ☰ toggle, the view toggle and + move right; the rail and its buttons move left. The search box stays put.".to_string(),
-                    enabled: chrome_mirrored,
-                    palette,
-                    on_change: on_change_mirror,
                 }
             }
         }
@@ -126662,60 +125161,6 @@ fn primary_action_style(palette: Palette) -> String {
 /// App/Both/System. NOT for binary on/off switches — those use the
 /// `inline_toggle_*` track+thumb (e.g. Auto-hide Titlebar, Sound).
 /// See DESIGN.md "Segmented controls".
-/// A row of titlebar controls that REFLECTS with the chrome mirror.
-///
-/// The rule ([[DESIGN.md]] §Mirrored chrome): a mirror reflects the
-/// ARRANGEMENT of controls, not the inside of a control. So the cluster rows
-/// either side of the search box reverse — the `☰` that opens the tree stays
-/// against the tree's own edge, and the button nearest the search box stays
-/// nearest the search box — while a single control's own parts (the
-/// segmented Web View/Terminal toggle, the window-button strip) keep their
-/// order, because they are one thing rather than an arrangement.
-///
-/// `flex-direction` is emitted in BOTH branches: Dioxus applies `style`
-/// property-by-property and never clears a dropped key, so a one-sided
-/// `row-reverse` would survive un-mirroring forever.
-fn titlebar_cluster_row_style(orientation: ChromeOrientation, gap_px: u32, extra: &str) -> String {
-    format!(
-        "display:flex; flex-direction:{}; align-items:center; gap:{}px; min-width:0; max-width:100%;{}",
-        if orientation.is_mirrored() {
-            "row-reverse"
-        } else {
-            "row"
-        },
-        gap_px,
-        extra,
-    )
-}
-/// Where a titlebar popover hangs from its trigger.
-///
-/// A menu grows AWAY from the window edge its cluster is anchored to, so it
-/// stays on screen in both orientations: the `+` menu drops down-and-right from
-/// a left-hand cluster and down-and-LEFT from a mirrored one. `offset_px` is the
-/// distance from that edge (0 for a menu pinned to its trigger, a fixed inset
-/// for the overflow menu, which hangs from the titlebar rather than a box).
-///
-/// Both `left` and `right` are emitted every time — the style-key trap again: a
-/// popover that anchored by omission would keep the previous orientation's
-/// anchor and be pinned to both edges at once.
-fn titlebar_menu_anchor_style(edge: SidebarEdge, offset_px: f64) -> String {
-    format!(
-        "{}:{}px; {}:auto;",
-        edge.css_near(),
-        offset_px,
-        edge.css_far()
-    )
-}
-/// The corner radius of a panel ATTACHED under a tab at one end of its top
-/// edge: square where the tab meets it, rounded everywhere else. The square
-/// corner follows the cluster's edge, so the seam stays under the tab after a
-/// mirror instead of appearing on the far side of the menu.
-fn titlebar_attached_menu_radius(edge: SidebarEdge) -> &'static str {
-    match edge {
-        SidebarEdge::Left => "0 16px 16px 16px",
-        SidebarEdge::Right => "16px 0 16px 16px",
-    }
-}
 fn segmented_control_track_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; transition:{};",
@@ -129510,13 +127955,11 @@ mod tests {
     /// The table the window claimer matches, as a VALUE — the behavioural half
     /// of the escape lock below.
     ///
-    /// TWO POPULATIONS, opposite policies, and the difference is the whole
-    /// design: every LEGACY BROWSER chord is `page_only` (a bare `Ctrl+<letter>`
-    /// or a bare function key belongs to the terminal unless a browser is in
-    /// front), while the fullscreen accelerator is claimed whatever holds the
-    /// keyboard because it is the way OUT.
+    /// Two rows, two opposite policies, and the difference is the whole design:
+    /// `Ctrl+F` is a browser key (`page_only`) that also needs the keyboard
+    /// brought home (`focus_shell`); the fullscreen accelerator is neither.
     #[test]
-    fn the_claim_table_is_two_populations_with_opposite_policies() {
+    fn the_claim_table_is_two_rows_with_opposite_policies() {
         let table = claimed_chords_for(&KeymapConfig::default());
 
         let find = table
@@ -129563,145 +128006,12 @@ mod tests {
             "leaving fullscreen must not also take the keyboard off the page"
         );
 
-        // EVERY legacy browser chord is `page_only`. This is the invariant
-        // that makes the layer legal at all: claimed app-wide, `Ctrl+R` would
-        // eat readline's reverse-search and `F5` a TUI's refresh, in every
-        // terminal in the app.
-        for chord in WEB_PAGE_CHORDS {
-            let row = table
-                .iter()
-                .find(|entry| entry.id == chord.id)
-                .unwrap_or_else(|| {
-                    panic!("{} must be claimed or {} is deaf", chord.chord, chord.id)
-                });
-            assert!(
-                row.page_only,
-                "{} is a BROWSER key and must never be claimed over a terminal",
-                chord.chord
-            );
-        }
-
-        // The four the user named are present under the ids the terminus
-        // serves, so a rename on one side alone cannot silently un-bind them.
-        for (spelling, id) in [
-            ("F5", "web.reload"),
-            ("Ctrl+R", "web.reload"),
-            ("Ctrl+T", "web.tab.new"),
-            ("F12", "web.devtools"),
-        ] {
-            assert!(
-                WEB_PAGE_CHORDS
-                    .iter()
-                    .any(|chord| chord.chord == spelling && chord.id == id),
-                "{spelling} must still mean {id}"
-            );
-        }
-
         assert_eq!(
             table.len(),
-            WEB_PAGE_CHORDS.len() + WINDOW_CLAIMED_ACCEL_COMMANDS.len(),
-            "the table is the WHOLE claimed set: the legacy browser layer plus \
-             the escape accelerators, and nothing else. Ctrl+P (print) is \
-             deliberately absent because there is no print path to route it \
-             to: {table:?}"
+            2,
+            "the table is the WHOLE claimed set — Ctrl+P (print) is deliberately \
+             absent because there is no print path to route it to: {table:?}"
         );
-    }
-
-    /// ⛔ **THE TWO KEYBOARD LAYERS MUST NOT OVERLAP**, and this holds them
-    /// apart by name rather than by anyone remembering to check.
-    ///
-    /// The ALT layer owns a clean ALT tap plus the registered accelerators,
-    /// every one of which `keytip::assert_accels_pty_safe` forbids from being a
-    /// bare `Ctrl+<letter>` or a bare function key. The legacy browser layer
-    /// owns exactly those forbidden shapes, `page_only`. If a legacy chord ever
-    /// became an accelerator too, one keypress would fire both layers — and the
-    /// user would see a shortcut that does two things.
-    #[test]
-    fn no_legacy_browser_chord_is_also_an_accelerator() {
-        let accels = keytip::effective_accelerators(&KeymapConfig::default());
-        for legacy in WEB_PAGE_CHORDS {
-            let chord =
-                Chord::parse(legacy.chord).unwrap_or_else(|| panic!("{} must parse", legacy.chord));
-            assert!(
-                !accels.iter().any(|(_, accel)| *accel == chord),
-                "{} is claimed by BOTH keyboard layers — one press would fire \
-                 the browser verb and the ALT layer's command",
-                legacy.chord
-            );
-        }
-    }
-
-    /// The page menu's entries and the terminus that serves them are ONE list.
-    ///
-    /// An entry with no arm is a menu item that does nothing when clicked,
-    /// which is the worst possible outcome for a contributed menu: the user
-    /// concludes the whole feature is broken. Source-read because the arms are
-    /// a `match` on `&str`.
-    #[test]
-    fn every_page_menu_entry_has_an_arm_at_the_terminus() {
-        let source = include_str!("shell.rs");
-        let dispatch = source
-            .split(
-                "fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {",
-            )
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("shell.rs must define the page-menu terminus");
-        for (id, label) in WEB_PAGE_MENU_ITEMS {
-            assert!(
-                dispatch.contains(&format!("{id:?} =>")),
-                "the page menu offers {label:?} ({id:?}) but the terminus has \
-                 no arm for it — the entry would do nothing:\n{dispatch}"
-            );
-            assert!(
-                !label.is_empty() && !id.is_empty(),
-                "a contributed entry needs both an id and a label; the empty id \
-                 is reserved for a separator"
-            );
-        }
-        // The four regions of the page menu are the four regions of the
-        // ychrome engine's `/engine/shot`, in one vocabulary — a human
-        // clicking "full page" and an agent sending `region=full` must get the
-        // same picture.
-        for region in ["viewport", "full", "element", "area"] {
-            assert!(
-                WEB_PAGE_MENU_ITEMS
-                    .iter()
-                    .any(|(id, _)| *id == format!("web.shot.{region}")),
-                "the page menu must offer the {region} region"
-            );
-        }
-    }
-
-    /// The terminus SERVES every id the table claims.
-    ///
-    /// A chord in the table with no arm at the terminus is a key that consumes
-    /// itself and does nothing, which is worse than never claiming it: the
-    /// page's own handler does not run either. Source-read because the arms are
-    /// a `match` on `&str` and there is no runtime list of them.
-    #[test]
-    fn every_claimed_legacy_chord_has_an_arm_at_the_terminus() {
-        let source = include_str!("shell.rs");
-        let dispatch = source
-            .split("fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("shell.rs must define the legacy chord terminus");
-        for legacy in WEB_PAGE_CHORDS {
-            if legacy.id == WEB_FIND_CHORD_ID {
-                // Find is served one branch EARLIER, at the bridge terminus,
-                // because it predates this layer and shares its opener with the
-                // shell's own Ctrl+F keydown.
-                continue;
-            }
-            assert!(
-                dispatch.contains(&format!("{:?} =>", legacy.id)),
-                "{} claims {:?} but the terminus has no arm for it — the key \
-                 would eat itself and do nothing:\n{dispatch}",
-                legacy.chord,
-                legacy.id
-            );
-        }
     }
 
     /// A REBIND is honoured, and an inexpressible chord is refused rather than
@@ -136122,39 +134432,30 @@ mod tests {
     /// surface that has demonstrated it comes back must stop being a target.
     #[test]
     fn the_thrash_hold_helper_escalates_at_the_reopen_limit() {
-        use crate::terminal_observe::ReclaimPosture::Pressured;
-        let pressured_hold = web_surface_background_hold_ms_for(Some(600_000), Pressured, 0);
+        let pressured_hold = web_surface_background_hold_ms_for(600_000, true, 0);
         assert_eq!(
-            pressured_hold,
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            pressured_hold, WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "first reap under pressure must still be fast — that is the feature"
         );
         assert_eq!(
-            web_surface_background_hold_ms_for(
-                Some(600_000),
-                Pressured,
-                WEB_SURFACE_THRASH_REOPEN_LIMIT - 1
-            ),
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT - 1),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "below the limit it is still an ordinary reclaim candidate"
         );
-        let thrashing = web_surface_background_hold_ms_for(
-            Some(600_000),
-            Pressured,
-            WEB_SURFACE_THRASH_REOPEN_LIMIT,
-        );
+        let thrashing =
+            web_surface_background_hold_ms_for(600_000, true, WEB_SURFACE_THRASH_REOPEN_LIMIT);
         assert!(
-            thrashing.is_some_and(|ms| ms > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            thrashing > WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "a surface reaped {} times in the window is demonstrably wanted; \
-             reaping it again is the treadmill — got {thrashing:?} ms",
+             reaping it again is the treadmill — got {thrashing} ms",
             WEB_SURFACE_THRASH_REOPEN_LIMIT,
         );
         // And the escalation must be per-surface, not global: a DIFFERENT
         // surface with no history is still reclaimed promptly, or one busy page
         // would switch reclaim off for everything.
         assert_eq!(
-            web_surface_background_hold_ms_for(Some(600_000), Pressured, 0),
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            web_surface_background_hold_ms_for(600_000, true, 0),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "one thrashing surface must not spare every other surface"
         );
     }
@@ -136205,19 +134506,12 @@ mod tests {
         // unaffected (always detaches).
         assert!(web_surface_background_detach(true, true));
         assert!(web_surface_background_detach(false, true));
-        // The pressured hold is the short reclaim window, whatever was
-        // configured — asked of the POLICY, which is where the override lives
-        // now (the config reader used to carry a second copy of it).
-        for configured in [None, Some(600_000), Some(0)] {
-            assert_eq!(
-                web_surface_background_hold_ms_for(
-                    configured,
-                    crate::terminal_observe::ReclaimPosture::Pressured,
-                    0
-                ),
-                Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
-            );
-        }
+        // The pressured hold is the short reclaim window (deterministic — the
+        // pressured branch returns before reading any config file).
+        assert_eq!(
+            web_surface_background_hold_ms(true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS
+        );
     }
 
     /// ⚠ NOT A CALL-SITE LOCK, despite what it used to claim. It computes
@@ -136238,6 +134532,10 @@ mod tests {
         assert!(live.swap_pressured(), "swap history is deep on this host");
         // The argument both policy functions are handed. This is the defect: it
         // was `swap_pressured()` (true here) and must be `reclaim_pressured()`.
+        // `web_surface_background_hold_ms(false)` reads
+        // `~/.yggterm/web-surface.json`, so asserting its RESULT would depend on
+        // the test machine's config — the deterministic statement is about the
+        // input, plus the pressured branch which returns before any file read.
         assert!(
             !live.reclaim_pressured(),
             "45% of RAM available and 0.06% stall time is not reclaim pressure"
@@ -136248,32 +134546,9 @@ mod tests {
             true,
             live.reclaim_pressured()
         ));
-        // ⭐ AND ON THIS SAME READING THE PAGE IS NOT DESTROYED EITHER.
-        //
-        // 45% headroom is COMFORTABLE, so a surface the user configured no hold
-        // for gets no destroy clock at all. This is the fixture that makes the
-        // 2026-08-01 finding a regression test rather than a story: the live
-        // host was reading almost exactly this while 134 of 182 recorded
-        // destroys fired anyway, `reclaim_pressured: false`, and the user
-        // reopened 109 of the 132 pages killed.
         assert_eq!(
-            live.reclaim_posture(),
-            crate::terminal_observe::ReclaimPosture::Comfortable
-        );
-        assert_eq!(
-            web_surface_background_hold_ms_for(None, live.reclaim_posture(), 0),
-            None,
-            "a ten-minute clock on a host with 45% of its RAM free destroys \
-             pages to buy memory nobody is asking for"
-        );
-        // The five-second window is still what genuine pressure selects.
-        assert_eq!(
-            web_surface_background_hold_ms_for(
-                None,
-                crate::terminal_observe::ReclaimPosture::Pressured,
-                0
-            ),
-            Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS),
+            web_surface_background_hold_ms(true),
+            WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS,
             "the five-second window is what the wrong argument used to select"
         );
     }
@@ -138263,114 +136538,12 @@ mod tests {
     }
     #[test]
     fn titlebar_autohide_content_offset_only_applies_while_revealed() {
-        let natural = ChromeOrientation::natural();
-        let collapsed = titlebar_autohide_content_offset_style(true, false, natural);
+        let collapsed = titlebar_autohide_content_offset_style(true, false);
         assert!(collapsed.contains("padding-top:0px"));
-        let revealed = titlebar_autohide_content_offset_style(true, true, natural);
+        let revealed = titlebar_autohide_content_offset_style(true, true);
         assert!(revealed.contains("padding-top:0px"));
-        let always_visible = titlebar_autohide_content_offset_style(false, true, natural);
+        let always_visible = titlebar_autohide_content_offset_style(false, true);
         assert!(always_visible.contains("padding-top:0px"));
-    }
-    /// THE workspace mirror: one `flex-direction` reverses tree | viewport |
-    /// rail. Both arms must emit the key — Dioxus never clears a dropped style
-    /// property, so a one-sided `row-reverse` would survive un-mirroring and
-    /// leave the workspace backwards for the rest of the session.
-    #[test]
-    fn the_workspace_row_reverses_only_when_the_chrome_is_mirrored() {
-        for (auto_hide, revealed) in [(true, false), (true, true), (false, true)] {
-            let natural = titlebar_autohide_content_offset_style(
-                auto_hide,
-                revealed,
-                ChromeOrientation::natural(),
-            );
-            let mirrored = titlebar_autohide_content_offset_style(
-                auto_hide,
-                revealed,
-                ChromeOrientation::mirrored(),
-            );
-            assert!(
-                natural.contains("flex-direction:row;"),
-                "the natural workspace must SAY row, not imply it: {natural}"
-            );
-            assert!(
-                mirrored.contains("flex-direction:row-reverse;"),
-                "a mirrored workspace must reverse tree | viewport | rail: {mirrored}"
-            );
-            assert_eq!(
-                style_property_keys(&natural),
-                style_property_keys(&mirrored),
-                "the two orientations must emit an IDENTICAL key set (the Dioxus \
-                 style-key trap); only values may differ"
-            );
-        }
-    }
-    /// A panel's grip is on its INNER edge in both orientations, and both
-    /// horizontal anchors are always spelled out.
-    #[test]
-    fn a_resize_grip_moves_to_the_panels_inner_edge() {
-        let on_left = sidebar_resize_handle_style(SidebarEdge::Left);
-        let on_right = sidebar_resize_handle_style(SidebarEdge::Right);
-        assert!(on_left.contains("right:0;") && on_left.contains("left:auto;"), "{on_left}");
-        assert!(on_right.contains("left:0;") && on_right.contains("right:auto;"), "{on_right}");
-        assert_eq!(
-            style_property_keys(&on_left),
-            style_property_keys(&on_right),
-            "the grip must emit the same keys on both edges"
-        );
-    }
-    /// A titlebar popover grows AWAY from its cluster's window edge, and the
-    /// attached panel's square corner follows the tab it hangs from.
-    #[test]
-    fn titlebar_popovers_hang_from_their_clusters_edge() {
-        let natural = titlebar_menu_anchor_style(SidebarEdge::Left, 0.0);
-        let mirrored = titlebar_menu_anchor_style(SidebarEdge::Right, 0.0);
-        assert_eq!(natural, "left:0px; right:auto;");
-        assert_eq!(mirrored, "right:0px; left:auto;");
-        assert_eq!(
-            titlebar_menu_anchor_style(SidebarEdge::Right, 110.0),
-            "right:110px; left:auto;"
-        );
-        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Left), "0 16px 16px 16px");
-        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Right), "16px 0 16px 16px");
-    }
-    /// The mirror reflects the ARRANGEMENT of titlebar controls, never the
-    /// inside of a single control.
-    #[test]
-    fn a_mirrored_titlebar_cluster_reads_the_other_way() {
-        let natural = titlebar_cluster_row_style(ChromeOrientation::natural(), 12, "");
-        let mirrored = titlebar_cluster_row_style(ChromeOrientation::mirrored(), 12, "");
-        assert!(natural.contains("flex-direction:row;"), "{natural}");
-        assert!(mirrored.contains("flex-direction:row-reverse;"), "{mirrored}");
-        assert_eq!(style_property_keys(&natural), style_property_keys(&mirrored));
-    }
-    /// Both panels' resize drags widen when the pointer moves AWAY from the
-    /// edge the panel is docked against — in both orientations, from one owner.
-    #[test]
-    fn mirroring_the_chrome_flips_both_resize_drags() {
-        for mirrored in [false, true] {
-            let mut shell =
-                ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
-            shell.settings.chrome_orientation = ChromeOrientation::new(mirrored);
-            shell.sidebar_width = 300.0;
-            shell.settings.tree_width = 300.0;
-            shell.rail_width = 300.0;
-            shell.settings.rail_width = 300.0;
-
-            // Drag 40px toward the middle of the window from each panel's grip.
-            shell.start_sidebar_resize(500.0);
-            shell.handle_sidebar_resize_pointer(if mirrored { 460.0 } else { 540.0 }, true);
-            assert_eq!(
-                shell.sidebar_width, 340.0,
-                "the tree must WIDEN when dragged away from its own edge (mirrored={mirrored})"
-            );
-
-            shell.start_rail_resize(500.0);
-            shell.handle_rail_resize_pointer(if mirrored { 540.0 } else { 460.0 });
-            assert_eq!(
-                shell.rail_width, 340.0,
-                "the rail must WIDEN when dragged away from its own edge (mirrored={mirrored})"
-            );
-        }
     }
     #[test]
     fn sidebar_resize_pointer_without_primary_button_keeps_drag_until_release() {
@@ -145990,7 +144163,7 @@ mod tests {
         // the menu's left edge at 1100-90-224 = 786 — 22px INTO the page rect,
         // which in legacy stacking is the clipped slice the user photographed.
         // The band pulls it back inside the rail.
-        let rail = rail_context_menu_band(SidebarEdge::Right, 1100.0, 292.0, 1.0);
+        let rail = rail_context_menu_band(1100.0, 292.0, 1.0);
         let banded =
             context_menu_placement((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0), Some(rail));
         assert_eq!(banded.left, None);
@@ -174472,7 +172645,6 @@ mod webtabs_menu_switcher_locks {
         // name on the move page — are exempt: their length is not ours to
         // choose, which is exactly what the ellipsis and the tooltip are for.
         let drawable = context_menu_width(Some(rail_context_menu_band(
-            SidebarEdge::Right,
             1920.0,
             RAIL_MIN_WIDTH as f64,
             1.0,
@@ -175492,7 +173664,7 @@ mod webtabs_menu_switcher_locks {
     fn a_rail_row_menu_is_placed_fully_inside_the_rail_band() {
         let window = (1600.0, 900.0);
         let rail_width = SIDE_RAIL_WIDTH as f64;
-        let band = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 1.0);
+        let band = rail_context_menu_band(window.0, rail_width, 1.0);
         let width = context_menu_width(Some(band));
 
         // Every column of the rail: hard against the right edge, just past the
@@ -175551,7 +173723,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn a_narrow_rail_narrows_the_menu_in_the_placement_and_in_the_box() {
         let window = (1280.0, 800.0);
-        let band = rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, 1.0);
+        let band = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         assert_eq!(
             width,
@@ -175597,7 +173769,7 @@ mod webtabs_menu_switcher_locks {
         // A rail with room gets the full design width from the same owner, and
         // an unbanded menu is unchanged.
         assert_eq!(
-            context_menu_width(Some(rail_context_menu_band(SidebarEdge::Right, window.0, 400.0, 1.0))),
+            context_menu_width(Some(rail_context_menu_band(window.0, 400.0, 1.0))),
             CONTEXT_MENU_WIDTH_PX,
         );
         assert_eq!(context_menu_width(None), CONTEXT_MENU_WIDTH_PX);
@@ -175952,7 +174124,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn the_tree_menu_lands_inside_the_tree_when_a_page_owns_the_viewport() {
         // A 270px tree at 100% zoom, a click 143px in — the screenshot's shape.
-        let band = sidebar_context_menu_band(SidebarEdge::Left, 1920.0, 270.0, 1.0);
+        let band = sidebar_context_menu_band(270.0, 1.0);
         assert_eq!((band.left, band.right), (0.0, 270.0));
         // The drawn box, whichever edge it anchors from: `right` is a distance
         // from the WINDOW's right edge, so the box's own left edge is
@@ -175975,7 +174147,7 @@ mod webtabs_menu_switcher_locks {
         );
         // …and the UI-zoom control cannot push it out: at 50% the tree is half
         // as wide on screen, so the band must halve with it.
-        let zoomed = sidebar_context_menu_band(SidebarEdge::Left, 1920.0, 270.0, 0.5);
+        let zoomed = sidebar_context_menu_band(270.0, 0.5);
         assert_eq!(zoomed.right, 135.0, "the band follows the tree ON SCREEN");
         let zoomed_placement =
             context_menu_placement((100.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(zoomed));
@@ -175999,50 +174171,6 @@ mod webtabs_menu_switcher_locks {
     /// Which menus are banded is decided AT THE MOUNT, and there is exactly one
     /// derivation of the rail band. A global "is a web surface open" sniff would
     /// silently re-band the cwd tree's menu the day the user opens ychrome.
-    /// ★ THE MIRROR'S SSOT LOCK. A panel's edge must come from
-    /// `ChromeOrientation`, never from a literal written at the call site: a
-    /// hard-coded `SidebarEdge::Left` for "the tree" is exactly the second
-    /// answer to "which side is the sidebar on?" that the type exists to
-    /// prevent, and it fails silently — the panel simply does not move.
-    #[test]
-    fn no_panel_geometry_call_hard_codes_its_own_edge() {
-        let product = product_source();
-        for (line_no, line) in product.iter().enumerate() {
-            for helper in [
-                "sidebar_panel_outer_style(",
-                "sidebar_panel_card_style(",
-                "sidebar_resize_handle_style(",
-            ] {
-                let Some(at) = line.find(helper) else { continue };
-                // The definitions themselves take `edge` as a parameter.
-                if line.trim_start().starts_with("fn ") {
-                    continue;
-                }
-                let args = &line[at + helper.len()..];
-                assert!(
-                    !args.contains("SidebarEdge::"),
-                    "line {}: a panel's edge must be ASKED for \
-                     (`chrome_slot_edge(&snapshot, ChromeSlot::…)`), never written down:\n{}",
-                    line_no + 1,
-                    line
-                );
-            }
-        }
-    }
-    /// The render body resolves the mirror ONCE. A second derivation is a
-    /// second reader of the setting, and two readers can disagree mid-render.
-    #[test]
-    fn the_render_body_reads_the_chrome_orientation_once() {
-        let product = product_source();
-        assert_eq!(
-            product
-                .iter()
-                .filter(|line| line.contains("let chrome_orientation = snapshot.settings.chrome_orientation"))
-                .count(),
-            1,
-            "the workspace render must resolve the mirror exactly once"
-        );
-    }
     #[test]
     fn each_menu_mount_names_its_own_band() {
         let product = product_source();
@@ -176506,7 +174634,7 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(zoom, 0.5);
         let on_screen = rail_width * zoom;
 
-        let band = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, zoom);
+        let band = rail_context_menu_band(window.0, rail_width, zoom);
         assert_eq!(
             band.left,
             window.0 - on_screen,
@@ -176532,7 +174660,7 @@ mod webtabs_menu_switcher_locks {
 
         // The regression this lock exists for: the UNZOOMED width, which is what
         // `snapshot.rail_width` is.
-        let unzoomed = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 1.0);
+        let unzoomed = rail_context_menu_band(window.0, rail_width, 1.0);
         let unzoomed_width = context_menu_width(Some(unzoomed));
         let (left, _) = drawn_x(
             context_menu_placement(
@@ -176553,19 +174681,19 @@ mod webtabs_menu_switcher_locks {
 
         // 100% is the identity, so nothing about the default host moved…
         assert_eq!(
-            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, ui_zoom_factor(14.0)),
+            rail_context_menu_band(window.0, rail_width, ui_zoom_factor(14.0)),
             unzoomed,
         );
         // …and a nonsense zoom cannot mint a zero-width band.
-        assert_eq!(rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 0.0), unzoomed);
+        assert_eq!(rail_context_menu_band(window.0, rail_width, 0.0), unzoomed);
         assert_eq!(
-            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, f64::NAN),
+            rail_context_menu_band(window.0, rail_width, f64::NAN),
             unzoomed
         );
         // The narrowest rail at the lowest zoom still holds a real menu: 240 ×
         // 0.5 = 120 on screen, 96 after the margins, which is where the floor is
         // set — so the floor never bites and the box never crosses the band.
-        let narrowest = rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, zoom);
+        let narrowest = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, zoom);
         let narrow_width = context_menu_width(Some(narrowest));
         assert_eq!(narrow_width, CONTEXT_MENU_MIN_BAND_WIDTH_PX);
         let (left, right) = drawn_x(
@@ -176639,7 +174767,7 @@ mod webtabs_menu_switcher_locks {
         // The consequence: on a scale-2 host a click at the CSS right edge still
         // flips to a right anchor and still lands inside the rail.
         let window = window_css_size((2560.0, 1600.0), 2.0);
-        let band = rail_context_menu_band(SidebarEdge::Right, window.0, SIDE_RAIL_WIDTH as f64, 1.0);
+        let band = rail_context_menu_band(window.0, SIDE_RAIL_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         let placement = context_menu_placement(
             (window.0 - 8.0, 700.0),
@@ -176661,7 +174789,7 @@ mod webtabs_menu_switcher_locks {
             (window.0 - 8.0, 700.0),
             (2560.0, 1600.0),
             (width, CONTEXT_MENU_HEIGHT_PX),
-            Some(rail_context_menu_band(SidebarEdge::Right, 2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
+            Some(rail_context_menu_band(2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
         );
         assert!(
             unconverted.left.expect("no flip happened") > window.0,
@@ -179563,53 +177691,36 @@ mod web_surface_immersion_locks {
     // performance of it stopped).
     #[test]
     fn each_engine_edge_reveals_its_own_panel_and_unknown_edges_reveal_nothing() {
-        let natural = ChromeOrientation::natural();
-        let mirrored = ChromeOrientation::mirrored();
         for auto_hide_titlebar in [false, true] {
             assert_eq!(
-                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar, natural),
-                Some(WebSurfaceEdgeReveal::Tree),
+                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar),
+                Some(WebSurfaceEdgeReveal::LeftSidebar),
                 "the hidden tree must be revealable over a page whatever the titlebar setting"
             );
             assert_eq!(
-                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar, natural),
-                Some(WebSurfaceEdgeReveal::Rail),
+                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar),
+                Some(WebSurfaceEdgeReveal::RightRail),
                 "the hidden rail must be revealable over a page whatever the titlebar setting"
             );
-            // MIRRORED: the physical edge is unchanged, the panel behind it is
-            // not. Getting this backwards makes a mirrored panel unreachable
-            // over a native page — the one surface with no fallback sensor.
-            assert_eq!(
-                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar, mirrored),
-                Some(WebSurfaceEdgeReveal::Rail),
-                "mirrored, the LEFT window edge belongs to the rail"
-            );
-            assert_eq!(
-                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar, mirrored),
-                Some(WebSurfaceEdgeReveal::Tree),
-                "mirrored, the RIGHT window edge belongs to the tree"
-            );
         }
-        for orientation in [natural, mirrored] {
-            assert_eq!(
-                web_surface_edge_motion_reveal_target("top", true, orientation),
-                Some(WebSurfaceEdgeReveal::Titlebar),
-                "top-edge motion must reveal the auto-hidden titlebar"
-            );
-            assert_eq!(
-                web_surface_edge_motion_reveal_target("top", false, orientation),
-                None,
-                "a titlebar the user did NOT auto-hide must not be revealed by edge motion"
-            );
-            for junk in ["bottom", "", "TOP", "player"] {
-                for auto_hide_titlebar in [false, true] {
-                    assert_eq!(
-                        web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar, orientation),
-                        None,
-                        "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
-                         flashing the titlebar for it is chrome the user never went near"
-                    );
-                }
+        assert_eq!(
+            web_surface_edge_motion_reveal_target("top", true),
+            Some(WebSurfaceEdgeReveal::Titlebar),
+            "top-edge motion must reveal the auto-hidden titlebar"
+        );
+        assert_eq!(
+            web_surface_edge_motion_reveal_target("top", false),
+            None,
+            "a titlebar the user did NOT auto-hide must not be revealed by edge motion"
+        );
+        for junk in ["bottom", "", "TOP", "player"] {
+            for auto_hide_titlebar in [false, true] {
+                assert_eq!(
+                    web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar),
+                    None,
+                    "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
+                     flashing the titlebar for it is chrome the user never went near"
+                );
             }
         }
     }
@@ -179716,48 +177827,11 @@ mod web_surface_immersion_locks {
                 },
             })
         };
-        // The SAME chrome after a mirror: the tree is now the right-edge panel
-        // and the rail the left-edge one. The eval must read each panel's edge
-        // off its own rect, or a mirrored window insets the page on the wrong
-        // side and the page hides under the panel.
-        let mirrored_chrome = |revealed: bool| {
-            json!({
-                "[data-yggterm-titlebar=\"1\"]": {
-                    "attrs": {
-                        "data-titlebar-revealed": if revealed { "true" } else { "false" },
-                        "data-titlebar-autohide-pin": "0",
-                    },
-                    "rect": [0, 0, 1920, 40],
-                },
-                "[data-sidebar-auto-hide=\"true\"]": {
-                    "attrs": {
-                        "data-sidebar-autohide-revealed": if revealed { "true" } else { "false" },
-                        "data-sidebar-autohide-pin": "0",
-                    },
-                    "rect": if revealed { json!([1600, 0, 1920, 1080]) } else { json!([1914, 0, 1920, 1080]) },
-                },
-                "[data-yggui-side-rail-auto-hide=\"1\"]": {
-                    "attrs": {
-                        "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
-                        "data-yggui-side-rail-autohide-pin": "0",
-                    },
-                    "rect": if revealed { json!([0, 0, 320, 1080]) } else { json!([0, 0, 6, 1080]) },
-                },
-            })
-        };
         let page = json!([{ "name": "ws", "rect": [0, 0, 1920, 1080] }]);
         let scenarios = json!({
             "collapsed": {
                 "underGlass": false, "viewport": [1920, 1080],
                 "chrome": chrome(false, false), "pages": page,
-            },
-            "mirrored_collapsed": {
-                "underGlass": false, "viewport": [1920, 1080],
-                "chrome": mirrored_chrome(false), "pages": page,
-            },
-            "mirrored_revealed": {
-                "underGlass": false, "viewport": [1920, 1080],
-                "chrome": mirrored_chrome(true), "pages": page,
             },
             "revealed_hover": {
                 "underGlass": false, "viewport": [1920, 1080],
@@ -179807,24 +177881,11 @@ mod web_surface_immersion_locks {
         };
         // THE regression this lock exists for: collapsed chrome — including
         // the 6px sensors, which HAVE nonzero rects — claims nothing.
-        for scenario in ["collapsed", "mirrored_collapsed"] {
-            for edge in ["top", "left", "right"] {
-                assert_eq!(
-                    claim(scenario, edge),
-                    vec![0, 0],
-                    "collapsed {edge} chrome ({scenario}) claimed a strip — the reserved strip is back"
-                );
-            }
-        }
-        // MIRRORED: the tree is the right-edge claim and the rail the left one,
-        // and both still measure their true reach. A selector-to-edge map would
-        // put 320px in the wrong slot here and the page would sit under a panel.
-        for (edge, px) in [("top", 40), ("left", 320), ("right", 320)] {
+        for edge in ["top", "left", "right"] {
             assert_eq!(
-                claim("mirrored_revealed", edge),
-                vec![px, 0],
-                "mirrored, a revealed {edge} must still claim [{px}, 0] — the eval \
-                 must read each panel's edge off its own rect, not off its selector"
+                claim("collapsed", edge),
+                vec![0, 0],
+                "collapsed {edge} chrome claimed a strip — the reserved strip is back"
             );
         }
         // Revealed chrome claims exactly its reach, and the pin stamp rides.
@@ -179964,17 +178025,11 @@ mod web_surface_immersion_locks {
             // the loop (freezing the toggle at spawn, until app restart)
             // necessarily rewrites the argument to a binding — and reddens
             // here.
-            // The chrome ORIENTATION is read at message time too, for the same
-            // reason: a mirror flipped after app start must move which panel
-            // the left window edge reveals, or the panel becomes unreachable
-            // over every native page.
-            "match web_surface_edge_motion_reveal_target(\n                &edge,\n                state.peek().settings.auto_hide_titlebar,\n                state.peek().settings.chrome_orientation,\n            ) {",
-            // ...and performs every arm of its answer. The arms are named by
-            // PANEL, not by side — the mirror can put either panel on either
-            // edge, and the dispatch above is what decides which.
+            "match web_surface_edge_motion_reveal_target(\n                &edge,\n                state.peek().settings.auto_hide_titlebar,\n            ) {",
+            // ...and performs every arm of its answer.
             "Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),",
-            "Some(WebSurfaceEdgeReveal::Tree) => tree_sidebar.reveal(),",
-            "Some(WebSurfaceEdgeReveal::Rail) => rail.reveal(),",
+            "Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),",
+            "Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),",
         ] {
             assert!(
                 scanned.contains(needle),
