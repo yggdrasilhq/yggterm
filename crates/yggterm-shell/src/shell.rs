@@ -112461,10 +112461,55 @@ fn terminal_eval_script_with_canvas_renderer(
                 // sync). See [[audit-viewport-scroll-control-flow]].
                 // The pin MUST stay immediate — it is what keeps streaming
                 // output from yanking the viewport mid-drag.
+                // ⭐ AND THE RELEASE, which is what was missing. A selection made
+                // while the viewport is ALREADY AT THE BOTTOM pinned it with no
+                // way back: the documented escape is "scroll back to the
+                // bottom", and there is no scrolling to do when you never left.
+                // So the session sat on `UserScrollback` forever, showing
+                // "N new messages (ctrl+End)" while output kept arriving, and
+                // only a session switch — which remounts and resets the intent —
+                // brought it back. User-reported with a screenshot, 2026-08-01.
+                //
+                // The release is deliberately narrow, because the pin's original
+                // purpose is real: it must survive for someone who scrolled UP
+                // to read. So it fires only when all three hold — the selection
+                // is now EMPTY, the pin is the one this handler set
+                // (`selection_active`, not a wheel or a key), and the viewport
+                // is within the pin threshold of the base. Someone who scrolled
+                // up and then selected keeps their place.
                 try {{
-                    if (term && typeof term.hasSelection === 'function' && term.hasSelection()
-                        && scrollbackIntent !== 'UserScrollback') {{
+                    const selecting = Boolean(
+                        term && typeof term.hasSelection === 'function' && term.hasSelection()
+                    );
+                    if (selecting && scrollbackIntent !== 'UserScrollback') {{
                         setScrollbackIntent('UserScrollback', 'selection_active');
+                    }} else if (
+                        !selecting
+                        && scrollbackIntent === 'UserScrollback'
+                        && lastScrollbackIntentReason === 'selection_active'
+                    ) {{
+                        const buf = term && term.buffer ? term.buffer.active : null;
+                        if (buf) {{
+                            // The SAME effective-viewport reading the follow
+                            // executor and the settle watchdog use — raw
+                            // buf.viewportY can sit permanently below base under
+                            // the visual-beyond-base clamp.
+                            const vy = Math.max(0, Number(
+                                (typeof effectiveXtermViewportY === 'function'
+                                    ? effectiveXtermViewportY(buf)
+                                    : buf.viewportY) || 0
+                            ));
+                            const by = Math.max(0, Number(buf.baseY || 0));
+                            // 2 = scroll_mode::PIN_THRESHOLD_LINES, the same
+                            // literal the settle watchdog above uses; output
+                            // jitter of a row or two is not "the user left".
+                            if (by - vy < 2) {{
+                                setScrollbackIntent(
+                                    'PromptFollow',
+                                    'selection_cleared_at_bottom'
+                                );
+                            }}
+                        }}
                     }}
                 }} catch (_selectionIntentError) {{}}
                 // CC-DRAG-STALL: everything else (the O(selected-cells)
@@ -137004,6 +137049,54 @@ mod tests {
     }
     // A DRAG'S COST MUST NOT GROW WITH THE SELECTION — PER FRAME EITHER.
     //
+    /// The selection pin must RELEASE when the selection clears at the bottom.
+    ///
+    /// A selection made while the viewport is already at the bottom used to pin
+    /// it with no way back: the documented escape is "scroll back to the
+    /// bottom", and there is nothing to scroll when you never left. The session
+    /// then sat on `UserScrollback` forever showing "N new messages (ctrl+End)"
+    /// while output arrived, and only a session switch — a remount, which
+    /// resets the intent — recovered it. User-reported with a screenshot,
+    /// 2026-08-01.
+    ///
+    /// The release is narrow on purpose, and the three conditions are the whole
+    /// design: selection now EMPTY, the pin is the one the selection handler
+    /// set, and the viewport is within the pin threshold of base. Someone who
+    /// scrolled up to read and then selected must keep their place.
+    #[test]
+    fn a_selection_cleared_at_the_bottom_releases_its_own_pin() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let handler = script
+            .split("term.onSelectionChange(() => {")
+            .nth(1)
+            .and_then(|rest| rest.split("schedulePrimarySelectionSync();").next())
+            .expect("the selection handler");
+        assert!(
+            handler.contains("setScrollbackIntent('UserScrollback', 'selection_active')"),
+            "the pin itself must survive — it is what stops output yanking a live drag"
+        );
+        assert!(
+            handler.contains("selection_cleared_at_bottom"),
+            "and it must be able to release, or the viewport is stuck until a remount"
+        );
+        // All three guards, or the release is wrong in one of the two
+        // directions that matter.
+        assert!(
+            handler.contains("lastScrollbackIntentReason === 'selection_active'"),
+            "a wheel/key pin must NOT be released by a selection clearing"
+        );
+        assert!(
+            handler.contains("by - vy < 2"),
+            "a user who scrolled UP and then selected must keep their place"
+        );
+        assert!(
+            handler.contains("effectiveXtermViewportY"),
+            "must use the SAME effective-viewport reading as the follow executor \
+             and the settle watchdog, not raw buf.viewportY"
+        );
+    }
+
     // 2.12.19 made the onSelectionChange handler O(1) by deferring the
     // expensive half to a trailing edge. The user still reported the freeze,
     // because that trailing edge was requestAnimationFrame: during a live drag
