@@ -47,58 +47,28 @@ fix) once the fix is verified live on jojo.
   **The habit stands regardless: before trusting ANY test in a report, mutate
   the production call site yourself.**
 
-## ⭐ USER-REPORTED, ychrome-as-main-browser (2026-07-30) — OPEN
+## ⭐ USER-REPORTED, ychrome as the daily driver — WHAT IS LEFT
 
-The user made ychrome their daily driver and reported a list. **Ten of those are
-FIXED and deployed** (see CHANGELOG 2.12.18 and campaign ROUND 28: the app tab's
-✕ quitting the app, left-neighbour close selection, duplicate→about:blank, blank
-overwriting a real tab, the row menu clipping over a page, disabled caching,
-ungranted clipboard, the 320 MB memory cap that distorted video audio, a revealed
-page never taking the keyboard, dead back/forward). **These remain, each already
-root-caused — read the mechanism before opening the file, and grep the named
-symbol rather than trusting a line number:**
+> **Compressed 2026-08-01.** Two rounds of user reports (2026-07-30 and 07-31)
+> ran to ~310 lines, nearly all of it describing fixes that have since shipped.
+> Everything closed is in the CHANGELOG (2.12.18 → 2.12.22) and in
+> `campaign-yggterm-unified`; what follows is only what a user can still hit.
+>
+> **Closed since those rounds** (do not re-open without a fresh symptom): the
+> tab rail becoming the cwdtree, with folder icons, arbitrary nesting, the whole
+> drag gesture and the density pass; Cloudflare challenges; userscripts not
+> injecting (and the YouTube 2x-ads symptom behind it); adblock/SponsorBlock
+> exhaustiveness; open-webui sidebar switching; fullscreen chrome over the
+> picture; tab placement and the row context menu; the app tab's ✕ quitting the
+> app; close-selection; duplicate→about:blank; the row menu clipping; disabled
+> caching; ungranted clipboard; the 320 MB cap that distorted video audio; a
+> revealed page never taking the keyboard; dead back/forward; the mis-clicked
+> hidden duplicate; `ychrome-vault totp` on a skewed clock; the two HTTP caches;
+> the frosted close-button chip; and background tabs being destroyed on a clock.
 
-- ~~**The vertical tab rail is not the cwdtree.**~~ **FIXED** on
-  `lane/dev/rail-is-the-cwdtree` — awaiting the user's own eyes. There is ONE
-  row-tree ordering engine now (`yggui::reorder_row_tree`; the flat helper is
-  gone, a flat list being the degenerate case), `AppPaneWidget::ListRow` carries
-  `depth`/`expanded`/`expand_action` so contributed panes are trees too, and
-  `WebTabsRailBody` draws every row — folder and tab alike — through
-  `SessionStyleRow` + the shared `RowDisclosureChevron`. Folders sit above tabs,
-  drag both reorders and re-parents, folders and tabs rename in place by
-  double-click or the row menu, and "New folder" opens with its placeholder
-  selected.
-  **The user's three follow-up gaps are also FIXED**, on
-  `lane/dev/rail-folder-icons-nesting`: (1) a group row now wears the cwd
-  tree's FOLDER GLYPH (`RowFolderIcon`, filled = open / outline = shut) in its
-  leading slot with the chevron in a new always-visible trailing `expander`
-  slot, exactly as the cwd tree does — one owner, and contributed panes
-  inherit it; (2) the whole drag EXPERIENCE is one object,
-  `yggui::RowDragGesture`, which every row list drives: ghost card, dim, drop
-  line/ring, spring-loaded auto-expand, Escape-to-cancel, release-over-nothing,
-  and a committed drop no longer also clicking the row. yedit gets all of it
-  with zero app-side change; (3) `WebTabFolder::parent` makes rail folders
-  nest arbitrarily deep, with the descendant-drop refusal proven on the rail
-  path and the nesting round-tripping through `tabs.json`.
-  **Known limit, stated honestly:** spring-load and every hover rule are driven
-  by pointer MOVE events, so a pointer held perfectly still (zero motion, not
-  even sub-pixel jitter) over a shut folder never re-fires the hover and the
-  folder does not spring. Real pointers jitter; an automated pointer that
-  issues exactly one move does not. If this ever bites a user, the fix is a
-  render-loop tick that re-evaluates the dwell, not a second hover path.
-  **The user's DENSITY follow-up is also FIXED**, on `lane/dev/rail-density`
-  ("significant waste of horizontal space on each row … 2 spaces worth of more
-  indentation in the folder"). Measured on the live rail: 51px of leading
-  gutter, of which 26px was an icon box every TAB row reserved and never
-  filled, plus a 6px gap for an expander it never drew — because the rail
-  handed those slots `rsx!{}` (an empty element) where `None` means an absent
-  slot. `SessionRowDensity::Rail` now declares `status_column_px: None` (ONE
-  20px mark column: the folder glyph or the loading dot, with the dot riding
-  the icon as a corner badge when a contributed row has both) and
-  `indent_step_px: 19` (12 + two space-advances of the row's own 12px Inter).
-  Gutter 51px → 34px; every rail row gains label width at every depth
-  (+23px at depth 0, +16 at depth 1, +9 at depth 2). The cwdtree is
-  byte-identical — it draws into both its columns, so it keeps them.
+**These remain, each already root-caused — read the mechanism before opening the
+file, and grep the named symbol rather than trusting a line number:**
+
 - **Downloads have no destination choice, no progress, and lie about history.**
   `decide-destination` is SYNCHRONOUS, so a blocking save dialog there freezes
   every terminal in the app (staged destination + async picker is the shape).
@@ -107,45 +77,32 @@ symbol rather than trusting a line number:**
   (`upsert_job_notification("download:<id>")` + `finish_job_notification`).
   Dismissing a toast DELETES it from the panel — one `Vec<ToastNotification>` is
   both queue and history; add `dismissed`, split the verbs, and move the
-  visibility predicate into yggui as ONE exported fn (the app-control snapshot
-  re-encodes it today). **And a download that outlives its last tab emits
-  nothing at all** — the drain sits after two early `continue`s in the reconcile
-  loop; move it above them.
+  visibility predicate into yggui as ONE exported fn. **And a download that
+  outlives its last tab emits nothing at all** — the drain sits after two early
+  `continue`s in the reconcile loop; move it above them.
+
 - **No printing at all.** `WebSurfaceHost::print` modelled on `find` + GTK
   `PrintOperation::run_dialog` (its "Print to File" is the PDF destination users
   actually want). Do NOT build a Chrome-style preview: nothing in the tree can
   display a PDF, and every settings change would mean re-rendering the document.
-- ⚠ **Cross-cutting, now SOLVED for the mechanism, still open for print:** a
-  browser accelerator claimed in the shell's DOM keydown cannot fire while a page
-  holds GTK focus. The claimer exists — `connect_window_chord_claimer` on the
-  TOPLEVEL window (`web_surface.rs`), matching a table the shell pushes
-  (`claimed_chords_for` in `shell.rs`). Adding `Ctrl+P` is ONE row in that table
-  plus one arm at the terminus; it is left out only because there is no print
-  path to route it to yet.
+  `Ctrl+P` is now ONE row in `WEB_PAGE_CHORDS` plus one arm at the terminus — it
+  is left out only because there is no print path to route it to yet.
+
 - **Fullscreen video takes the WINDOW fullscreen** (KDE then hides its panels
-  until the video is un-fullscreened, even from another session). User-settled
-  design: fullscreen fills the VIEWPORT by default, with an ychrome setting for
-  the "real fullscreen" experience. WebKit's enter/leave-fullscreen signals are
-  not bound at all yet.
-- **Cloudflare managed challenges fail (brilliant.org login).** THREE converging
-  causes, all ours: the passkey shim replaces `navigator.credentials` on EVERY
-  page (a fingerprint mismatch a challenge can see) — install it lazily and
-  per-origin; the adblock filter may be eating `/cdn-cgi/challenge-platform/` or
-  `challenges.cloudflare.com` (zero-build test: disable adblock for that profile;
-  durable: an `ignore-previous-rules` allowlist entry); and **a profile whose
-  write-lock is held elsewhere silently opened EPHEMERAL**, so cookies never
-  persist and the challenge loops forever. ✅ **The SILENCE is fixed**
-  (`WebSurfaceJarMode`): the mode is decided, spelled and traced in one place,
-  and a degraded profile now raises one notice per profile saying it starts
-  logged out and will not remember a bot-check cookie — the misleading
-  "READ-ONLY" comment is gone, since `profile_dir: None` never was read-only.
-  ⚠ **Making it a genuinely read-only jar is still open and is a DESIGN CALL,
-  not a mechanical fix** — WebKitGTK has no such mode, so it means giving the
-  loser a private copy of the profile's cookies, and every agent shadow surface
-  would then duplicate the user's live session cookies to a second place on
-  disk. Options are costed in `ychrome/docs/pending-bugs.md`. The UA half and
-  the engine's own jar were fixed in ychrome (`89d83b3`, `f8bef43`). Nothing is
-  diagnosable today because no main-frame load status is traced.
+  until it is un-fullscreened, even from another session). User-settled design:
+  fullscreen fills the VIEWPORT by default, with an ychrome setting for the
+  "real fullscreen" experience. WebKit's enter/leave-fullscreen signals are not
+  bound at all yet.
+
+- **A degraded profile still cannot be made genuinely READ-ONLY** — and this is
+  a DESIGN CALL, not a mechanical fix. The silence is fixed (`WebSurfaceJarMode`
+  decides, spells and traces the mode in one place, and raises one notice per
+  profile saying it starts logged out and will not remember a bot-check cookie).
+  But WebKitGTK has no read-only jar mode, so a real one means giving the loser a
+  private copy of the profile's cookies — and every agent shadow surface would
+  then duplicate the user's live session cookies to a second place on disk.
+  Options are costed in `ychrome/docs/pending-bugs.md`.
+
 - **False/stale gates.** `runtime_status_handoff_active()` is
   `preserved_terminal_owner_count > 0` — a STEADY STATE, true for 65+ h because
   two sessions are parked on an older daemon, so any mount arms the veil. Arm on
@@ -156,208 +113,41 @@ symbol rather than trusting a line number:**
   terminal is paused". ⚠ **The self-check must run IN-PROCESS on the 2.5 s tick:
   `server app state` REFRESHES the observation, so an external probe cannot
   measure staleness and can itself arm the gate.**
+
 - **yedit: the wrap gutter drifts, and chrome draws over text.** The gutter takes
   one fractional `getComputedStyle(...).lineHeight` and uses it for BOTH the
   per-entry height and the row count, so error accumulates down the file — emit
   one gutter block per LOGICAL line at the MIRROR child's measured
   `offsetHeight`, and make the gutter self-verifying (sum === `scrollHeight -
   padding`; on mismatch stop drawing numbers and stamp an observable field). The
-  "Document | Terminal" pill floats over an editor with no reserved space —
-  recommended fix is to move it into the titlebar's existing surface-switch slot
-  and delete both floating pills. Toasts need an anchor owned by the active
-  viewport kind (top-center over a terminal, bottom-right over a document).
+  "Document | Terminal" pill floats over an editor with no reserved space — move
+  it into the titlebar's existing surface-switch slot and delete both floating
+  pills. Toasts need an anchor owned by the active viewport kind.
 
-## ⭐ USER-REPORTED, ychrome round 2 (2026-07-31)
+- **Webapp launch speed** — root-caused, partly fixed. ~650 ms of it is WebKit
+  **WebProcess startup**, which no cache can remove; process pre-warming is the
+  remaining lever. See `docs/optimization-pass.md` §9.
 
-**Five of these are CLOSED by the user's own eyes** and removed per this file's
-rule. What they were, so a reader of the git log can find the fixes: the F11
-fullscreen trap with no escape (same deaf-chord root cause as the missing
-Ctrl+F — claimed at the toplevel window, not per-surface); Ctrl+F itself;
-"the viewport recomputes / ychrome does not sit flush" (under-glass is now the
-DEFAULT, `5b0280a` — no flag); clipboard image paste (WebKitGTK never puts the
-image in the paste event's DataTransfer, proven in a vanilla webkit2gtk process,
-so a shim re-delivers it); and screen tearing, which was **XWayland** — see
-[[finding-yggterm-must-run-wayland-native]], and note the 21-arm/1,190-frame
-detector found nothing precisely because on Wayland there is nothing to find.
+- **The WPE agent engine** — `lane/dev/wpe-engine-phase-a`. ⛔ Debian ships WPE
+  WebKit with WPEPlatform OFF, so the substrate is WebKitGTK + an engine-owned
+  Xvfb. Believe `ychrome engine probe`, never the spec prose.
 
-**Shipped but NOT yet confirmed by the user:**
+- **⚠ FLAKY UNDER LOAD:
+  `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
+  — fails on a busy host, passes in isolation. It is the test, not the code.
 
-- **Fullscreen video drew the chrome over the picture.** Fixed and pixel-proven
-  (172,645 chrome pixels over a flat test page → **123**, all inside the 10 px
-  corner radius; restore after a distraction-free → fullscreen → exit cycle is
-  zero differing pixels). ⚠ **This was a regression from making under-glass the
-  default**, and the shape is worth remembering: `web_surface_place_page_rect`
-  had promised for months that "a page on the whole screen owns every pixel of
-  the window" and delivered only the GEOMETRIC half — it suppressed chrome
-  *claims* and never stopped the shell *painting*, because an opaque page above
-  the DOM used to occlude chrome for free.
-- **Tab placement + context menu.** One owner (`web_tab_placement`) replaces
-  three independent `push` sites; spawn-below-opener with cascade; omnibox focus
-  on `foreground && Blank` only, so a middle-clicked link never steals the caret.
-  ⚠ **My screenshot diagnosis was WRONG and the lane corrected it**: the menu was
-  not clipping off-screen (it sat 12 px clear of the edge, flipping correctly) —
-  `RowMenuItem::disabled` was appending its *reason* to the *label*, so
-  `Close tab` became a 60-character sentence in a 216 px box. Six existing locks
-  had been asserting the reason belongs in the label, pinning the bug in place.
+### Two entries CLOSED here by measurement, 2026-08-01
 
-**STILL OPEN:**
-
-- **★★★ ychrome's userscripts never inject, so YouTube plays ads and
-  SponsorBlock is silent.** Lane `lane/dev/userscript-injection`.
-  **Proven live**: yggterm's own shims (`__yggtermClipboardImagePasteShim`,
-  `__yggtermCloseShim`, `__yggtermScrollNavShim`, `__yggtermThemeColorShim`) are
-  ALL present in the page while `window.__ytAdDefense` and `window.__ysb` are
-  `undefined` and `window.fetch` is still native. The policy endpoint serves all
-  five scripts correctly (right worlds, right matches, `document-start`) and the
-  **adblock half of the same policy works** — the 146,748-rule set compiled and
-  attached (95 MB). So the loss is specific to the userscript path.
-  ⚠ **Two of my theories were falsified**: "born before policy, so recreate it"
-  (the user reopened the tab and ads returned) and "re-arm exhausted
-  `policy_attempts` when the app respawns" (deployed, no effect — kept as an
-  unmerged candidate patch, not discarded, since it may be a real latent bug).
-  ⭐ Strongest untested suspicion: **a NAME is what makes a world isolated** —
-  the plain userscript constructor IS the main world, and a NULL world name
-  fails `assertion 'worldName' failed` and refuses the script. The ychrome
-  engine lane hit exactly that. Check the attach path first.
-  Note YouTube pre-rolls come from **googlevideo.com, the same host as the
-  video**, so no network rule can touch them; the main-world `adPlacements`
-  strip is the only defence, which is why this presents as "adblock is broken".
-
-- **open-webui is slow when switching chats from its sidebar.** Untouched, and
-  deliberately NOT folded into the launch-speed work: that is SPA navigation, no
-  new process and no page load, so the ~650 ms WebProcess startup finding does
-  not explain it. Needs its own diagnosis.
-
-- ~~**"ychrome does not cache; same pages on reload look like they are reloading
-  afresh."**~~ **ROOT-CAUSED AND FIXED** on `lane/dev/cache-and-snappiness`
-  (2026-08-01), and it was not the cache. jojo's own trace: **134 of 182
-  `native_close` events were `background_hold_expired`, every one
-  `reclaim_pressured: false`, `hold_ms: 600000`** — the web-surface reaper
-  destroying pages on a ten-minute wall clock while 9.2 GB of 15.1 GB was
-  available. Of the 132 surfaces it killed **the user reopened 109**. Each reopen
-  is a full rebuild: measured 496 ms on a trivial fully-cached page, 222 ms of it
-  waiting for a WebProcess, plus the app's own render bill and the loss of
-  scroll/form/SPA state. The HTTP cache was working the whole time (0 network
-  bytes on a warm arm). Fixed by making the destroy read memory instead of a
-  clock (`ReclaimPosture`: comfortable ⇒ no clock; tight ⇒ the configured hold;
-  pressured ⇒ 5 s, all unchanged), with an explicit knob always winning. Full
-  measurement, the memory cost, and the **DON'T** verdict on the local-CDN-override
-  idea: `docs/optimization-pass.md` §11. ⚠ **GUI-side, so it needs a GUI restart,
-  not a daemon bump — and it has NOT been observed running yet** (§11f: the live
-  binary changed identity four times in 23 minutes as other lanes deployed, and
-  the one confirmed window ended 13 s short of the 600 s crossing). Verify on the
-  deploy that carries this to `main`; do not force a lane build onto the host.
-
-- **Webapp launch speed.** Root-caused, partly fixed. **Caching was the wrong
-  hypothesis** — the HTTP disk cache already works and contributes 0 ms (0 bytes
-  off the network on a warm arm). ~650 ms is WebKit **WebProcess startup**, per
-  surface, and a second surface in a live process does NOT skip it, so
-  prewarming one spare would not help. Second term is JS parse/compile with no
-  code cache (~174 ms) — **JavaScriptCore has no persistent bytecode cache in
-  the GTK port at all**, so that gap versus Chromium's V8 code cache is
-  structural, not a setting. The adblock compile (17,180 ms → 3.7 ms via
-  load-first keyed on a content hash) IS fixed. PSON / `WebProcessCache` is the
-  only route to the 650 ms and is deliberately untouched: `process-swap-on-
-  cross-site-navigation-enabled` is construct-only and the GTK constructor
-  shadows it, and `prewarmGlobally()` is Cocoa-only.
-
-
-- **Adblock/SponsorBlock not exhaustive; YouTube ads played at 2x.**
-  `lane/dev/adblock-exhaustive`. ✅ **The 2x symptom is root-caused and cured on
-  jojo (2026-07-31).** The deployed `youtube-adblock.js` was the pre-`d05a871`
-  copy lacking its `// ==UserScript==` block, so `@world main` defaulted to
-  `Isolated`, where its `window.fetch`/XHR/`ytInitialPlayerResponse` patches are
-  invisible to the page — leaving only the fallback that sets
-  `playbackRate = 16` (WebKit clamps it, hence "2x"). `idcac.js` and
-  `sponsorblock.js` were stale the same way; all three redeployed. ⚠ Injection
-  is per-webview at creation, so an existing tab keeps the script it was born
-  with — a NEW tab is required, not a reload.
-  **Still owed (the durable half):** a freshness check with ONE owner so a
-  bundled asset newer than the installed copy cannot sit dead; a LOUD refusal on
-  an unparseable/absent metadata block instead of the silent `Isolated` default
-  that caused this; and a real filter-list pipeline — today's ruleset is
-  `assets/web-adblock/rules.json`, **10 KB / 59 hand-written domain regexes plus
-  exactly ONE `css-display-none` rule with 8 selectors, referenced by no code
-  path at all** (a human must `cp` it into `~/.yggterm/web-adblock/`; done on
-  jojo, never on dev). No ABP/uBO syntax parser exists anywhere — no `##`, no
-  `##+js()`, no `$redirect=`. WebKit content blockers offer no redirect action,
-  so surrogates are impossible and untranslatable rules must be COUNTED and
-  reported, never silently dropped. SponsorBlock EXISTS and is real; idcac is a
-  hand-written ~140-line approximation, not the upstream ruleset.
-
-  ✅ **The RE-REPORT (ads still playing after the ychrome-side cure) was a
-  SECOND, yggterm-side bug, root-caused and fixed on `lane/dev/userscript-injection`
-  (2026-07-31).** Nothing was wrong with the wire, the engine, or the scripts:
-  `/policy` served all five with the right `@world`/`@match`, and staging them on
-  a webview through the vendored wry injects all four placement quadrants
-  (verified against the byte-identical live wire on a standalone WebKitGTK
-  harness). The break was upstream of all of it — the session had **no sidebar
-  contribution at all**, so `web_surface_policy_gate()` answered `Absent` and
-  every webview it ever built got `userscripts: []`, no ruleset, no UA and no
-  signer bridge. `app_surface_restore_targets` asked the daemon ONCE per
-  (session, PTY pid) whether an app had declared; a row exists ~3 s before
-  `ychrome` declares, so the one ask legitimately missed and was never repeated.
-  It is per SESSION, which is why closing and reopening the TAB never helped.
-  Fixed by a backoff re-ask (2.5 s doubling to a 60 s ceiling) and by splitting
-  the candidate filter's AND over the rail and web halves — a session that had
-  its web surface but not its contribution was excluded from the sweep forever.
-  ⚠ **Two instrument traps this cost a day to:** `window.__ytAdDefense` and
-  `window.__ysb` do not exist in any script (the real globals are `__yga_*` and
-  `__ysb_*`), and an isolated-world global is invisible to `web eval`, which runs
-  in the page's world — so probe main-world scripts by their global and
-  isolated-world ones by a DOM effect.
-
-- **The WPE agent engine.** `lane/dev/wpe-engine-phase-a`.
-  ⛔ **The spec's core premise is factually wrong and §3 has been corrected:
-  Debian's WPE WebKit 2.52.5 ships NO WPEPlatform at all** — not "gaps in it".
-  Independently verified: `wpe-platform-1.0`/`-2.0` `.pc` absent, zero headers
-  declaring `wpe_display_headless_new`, **zero** `wpe_display` symbols exported
-  from `libWPEWebKit-2.0.so.1`, and `/usr/include/wpe-webkit-2.0/` holds only
-  `jsc` and `wpe`. WPEPlatform is an upstream build flag Debian leaves off, so
-  the version number in the spec was doing all the persuading and none of the
-  deciding. §9's sanctioned fallback fired: the substrate is **WebKitGTK + an
-  engine-owned Xvfb** behind the same verbs, and it delivered the two things the
-  risk register feared it would not — trusted input and faithful snapshots.
-  Phase A gate PASSES on dev (`ychrome engine gate`, five journaled proofs,
-  re-runnable). Bindings decision recorded in a new §9.1: **the gir crates**, no
-  bindgen, no `build.rs`. Phase B started: `/engine/*` router, 10 pages opened
-  concurrently in 1340 ms. Owed: `/nav` `/wait` `/dom` and the input events
-  (refused BY NAME today, never silently dropped), the socket plumbing is
-  unit-tested but never run against a deployed daemon, the gate has not been
-  re-run on jojo, and phases C/D/E remain. **Phase F stays out of scope.**
-
-- **⚠ `WEBKIT_DISABLE_COMPOSITING_MODE=1` BREAKS THE WEB SURFACE OUTRIGHT** (found
-  2026-07-31 by the tearing lane, reproduced twice: the page never appeared).
-  This is the **top-precedence GL escape hatch** per `docs/optimization-pass.md:222`
-  (`WEBKIT_DISABLE_COMPOSITING_MODE` › `YGGTERM_FORCE_SOFTWARE_GL` ›
-  `YGGTERM_ENABLE_WEBKIT_COMPOSITING` › the EGL child probe), so the documented
-  way to force software presentation currently costs the user every web surface.
-  Either fix it or stop documenting it as the escape hatch — a hatch that
-  destroys the thing it is meant to rescue is worse than none.
-
-- **⚠ THE GL PROBE NEVER RUNS ON THE LIVE HOST.** jojo reports
-  `webkit_gl_policy: hardware_gl_forced`, not `probed`, because
-  `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1` sits in the launcher env and outranks
-  the probe. Any reasoning that assumes the live host measured its own GL is
-  wrong. Noted while investigating tearing; not itself known to be a defect,
-  but it silently invalidates a premise agents keep reusing.
-
-- **⚠ FLAKY UNDER LOAD: `render_probe::tests::process_still_running_answers_from_proc_and_refuses_a_recycled_pid`**
-  (seen 2026-07-31 at load average **37.5**, with seven lanes building in
-  parallel). It spawns `sleep 30` and asserts the child reads as running;
-  the failing assertion is `render_probe.rs:1905`, the FIRST one. Re-run in
-  isolation: **5/5 green**, and the full suite was green 20 minutes earlier, so
-  it is load-induced, not a regression — no lane touched this file.
-  **Not diagnosed, and worth diagnosing rather than retrying.**
-  `process_still_running` (`render_probe.rs:741-749`) is narrow: it fails only if
-  `/proc/<pid>/stat` is unreadable, `stat.pid != pid`, `stat.comm != comm`, or the
-  state is `Z`/`X`. The test reads `comm` from `/proc` itself at :1901 and then
-  passes it straight back, so a comm mismatch implies the value CHANGED between
-  two adjacent reads — i.e. the first read caught the child mid-`spawn`, before
-  `exec` replaced its `comm`. If that is it, the product code is fine and the
-  TEST is racy; but this is a **liveness probe** in a project whose central
-  lesson is that instruments lie, so "probably just flaky" is not an acceptable
-  resting place. Prove which side is wrong before trusting either.
+- ~~**`WEBKIT_DISABLE_COMPOSITING_MODE=1` breaks the web surface outright.**~~
+  Still true, and no longer a loose trap: it is now a row in the sanctioned
+  table (`crates/yggterm-core/src/presentation_policy.rs`, value **absent**,
+  with the reason in the row) and agents are forbidden from setting it by
+  `AGENTS.md`. See `docs/presentation-policy.md`.
+- ~~**THE GL PROBE NEVER RUNS ON THE LIVE HOST.**~~ **FALSIFIED.** jojo's own
+  startup trace on 2026-08-01 reports `gl_probe_class=hardware`,
+  `gl_probe_driver=radeonsi`, `gl_probe_reason=egl_driver_name`,
+  `gl_probe_elapsed_ms=86`, with `libgl_always_software` and `gallium_driver`
+  both absent. The probe runs and it finds the real GPU.
 
 ## Standing traps / other open bugs
 
