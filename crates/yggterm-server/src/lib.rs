@@ -5,6 +5,9 @@ mod app_control;
 // takes `now_ms`, and the cleanup half is the EXISTING ephemeral reaper in
 // session_tenancy.rs rather than a second one here.
 pub mod automation;
+// The OS timer files an automation GENERATES. Separate from `automation` so the
+// record cannot grow a dependency on how any one platform spells a schedule.
+pub mod automation_units;
 // THE `server app web …` CLI, owned once for BOTH binaries. It lived in
 // apps/yggterm/src/main.rs, which made the whole verb plane answer
 // "unsupported app control command: web" on yggterm-headless — the binary
