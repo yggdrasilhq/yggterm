@@ -81740,20 +81740,24 @@ fn session_row_label_style(density: SessionRowDensity, color: &str, bold: bool) 
     )
 }
 
-/// How far the revealed verbs' frosted chip FEATHERS in from its left edge, and
-/// therefore how much clear room its first glyph has above the title running
-/// under it. One number for every row family.
-const SESSION_ROW_ACTIONS_FADE_PX: u32 = 22;
+// The revealed verbs' chip-feather width used to live here. The chip is gone
+// (the user rejected it — DESIGN.md, "NO BACKGROUND BEHIND THE VERBS"), and so
+// is the constant: a number nothing reads is the seed the next chip grows from.
 
-/// The zero-width, full-height IN-FLOW anchor the trailing verbs hang off.
+/// The in-flow cell the trailing verbs hang off.
 ///
-/// This is the whole of "the label gets the width back". The verbs themselves
-/// are absolutely positioned against this anchor, so they cost the flex row
-/// NOTHING: the title track measures the full row at rest AND while the verbs
-/// are showing, and no title ever jumps sideways as the pointer walks the list.
-/// Measured on the live cwdtree 2026-08-01: an `opacity:0` ✕ still claimed 18px
-/// of layout plus its 6px gap on every live-session row, so a truncated title
-/// stopped 24px short of the row it was in.
+/// This is the whole of "the label gets the width back", and it works by the
+/// child being `display:none` at rest rather than by floating: a `display:none`
+/// child gives the cell zero width, so the title track measures the full row
+/// whenever no verbs are showing. Measured on the live cwdtree 2026-08-01: an
+/// `opacity:0` ✕ still claimed 18px of layout plus its 6px gap on every
+/// live-session row, so a truncated title stopped 24px short of the row it was
+/// in — hiding is not enough, only leaving the flex line is.
+///
+/// Revealed, the cell DOES take its width and the title ellipsizes. That reflow
+/// is deliberate: the alternative was floating the verbs on a frosted chip, and
+/// the user rejected it because the title ran underneath and the ✕ read as a
+/// smudge. See DESIGN.md, "NO BACKGROUND BEHIND THE VERBS".
 ///
 /// It is an anchor rather than the row itself so the verbs land to the LEFT of
 /// the always-visible `expander` — a hover must never cover the disclosure
@@ -81986,26 +81990,24 @@ fn SessionStyleRow(
             }
             if let Some(actions) = actions {
                 // Revealed by hover / selection / keyboard focus
-                // (session_row_hover_css) and OUT OF FLOW: a zero-width anchor
-                // holds the place, the verbs float over the title's trailing
-                // edge on a frosted chip. So the title track is the full row
-                // WHENEVER, and the verbs cost it nothing.
+                // (session_row_hover_css) and IN FLOW. At rest the child is
+                // `display:none`, so this cell is zero-width and the title gets
+                // the whole row; revealed, the cell grows and the title
+                // ellipsizes to fit.
+                //
+                // It USED to float out of flow on a frosted chip so the title
+                // never reflowed. The user rejected that on sight, on every
+                // cwdtree at once: the title ran under the chip and the verbs
+                // read as a smudge rather than as buttons.
                 //
                 // Ahead of the `expander` on purpose: an expander is permanent
                 // chrome (DESIGN.md — "always visible, unlike `actions`"), so
-                // the floating verbs must land to its LEFT and never cover it.
+                // the verbs land to its LEFT and never cover it.
                 span {
                     "data-session-row-actions-anchor": "1",
                     style: session_row_actions_anchor_style(metrics.gap_px),
                     span {
                         "data-session-row-actions": "1",
-                        // Bled over the row's OWN padding, so the chip wears the
-                        // row's rounded edges instead of floating inside it —
-                        // but ONLY when nothing follows it. A row that also has
-                        // an expander has the chevron 6px to the right, and the
-                        // bleed put the chip 2px ON it (measured live on a rail
-                        // folder row, 2026-08-01). The expander is permanent
-                        // chrome; a hover may never cover it.
                         style: session_row_actions_style(
                             metrics.pad_v_px,
                             if expander_present { 0 } else { metrics.pad_h_px },
@@ -82761,10 +82763,12 @@ fn SidebarRow(
                     }
                 }
                 if show_live_close {
-                    // OUT OF FLOW, on the shared anchor + frosted chip: the ✕
-                    // floats over the title's trailing edge when the row is
-                    // hovered, selected or holding the keyboard, and costs the
-                    // title nothing the rest of the time.
+                    // IN FLOW on the shared anchor: the ✕ appears when the row
+                    // is hovered, selected or holding the keyboard, takes its
+                    // width from the title at that moment, and costs nothing at
+                    // rest. Same reveal owner as every other row family — see
+                    // the twin above for why the frosted chip this used to wear
+                    // was rejected.
                     span {
                     "data-session-row-actions-anchor": "1",
                     // 6, because the cluster this anchor sits in is the row's
@@ -82772,8 +82776,6 @@ fn SidebarRow(
                     style: session_row_actions_anchor_style(6),
                     span {
                     "data-session-row-actions": "1",
-                    // 5/9, the cwdtree row's own `padding:5px 9px` — the chip
-                    // bleeds over it and the row clips it back to its radius.
                     style: session_row_actions_style(5, 9),
                     button {
                         "data-sidebar-live-session-close": "1",

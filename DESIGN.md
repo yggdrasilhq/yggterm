@@ -542,37 +542,40 @@ functions and the `SessionStyleRow` component in shell.rs.
 - Trailing actions use `session_row_action_button_style`; a trailing pill uses
   `session_row_badge_style` (ychrome profile badges live here).
 - **THE TITLE TRACK IS THE WHOLE ROW, AT REST AND ON HOVER ALIKE.** The trailing
-  `actions` are OUT OF FLOW — a zero-width in-flow anchor
-  (`session_row_actions_anchor_style`) holds their place and the verbs float
-  against it (`session_row_actions_style`), so they cost the flex line nothing
-  and the title measures the full row whether they are showing or not. Hiding
-  them with `opacity:0` is NOT enough and never was: an invisible button is
-  still a layout box, and on the cwdtree the hidden ✕ was taking 18px plus its
-  6px gap off every live-session row's title (user report + measurement,
-  2026-08-01: *"rows [should] use the horizontal real estate to display the
-  heading occupied by the 'X' to the entire width"*).
-  - **They must not REFLOW the title on reveal either.** Letting the verbs push
-    the label in and out makes every title jump sideways under the pointer as
-    it walks the list, which trades one irritation for a worse one. They
-    overlay; Chrome's tab strip and VS Code's explorer do the same.
-  - **The fade behind them is a FROSTED CHIP**, not an opaque swatch:
-    `backdrop-filter: blur(…)` plus a light wash of the surface's own colour,
-    feathered in by a mask. yggterm's window is transparent and the backdrop
-    under a row is `[data-yggterm-app-bg]`'s gradient, so a flat fade of any one
-    palette colour reads as a bright rectangle sliding down the list. The blur
-    takes its colour from whatever is actually behind — gradient, selection
-    tint, dark theme — and the wash is the graceful degradation where
-    `backdrop-filter` is unavailable. Both are declared in the REVEALED rule
-    only: `backdrop-filter` forces a compositing layer wherever it appears, and
-    a sidebar of twenty rows should not each carry one for a chip nobody is
-    looking at.
-  - **The chip BLEEDS over the row's own padding, so it wears the row's rounded
-    edge** — a chip that stopped at the content box read as a white sticker
-    floating inside the row, with a strip of the selection tint past it. The
-    row's `overflow:hidden` clips it back to the radius, so the feathered left
-    edge is the only edge meant to be seen. **It does not bleed when an expander
-    follows it**: the chevron sits one gap to the right and the bleed put the
-    chip 2px on top of it, which inverts the rule above.
+  `actions` are IN FLOW and `display:none` at rest. Hiding them with
+  `opacity:0` is NOT enough and never was: an invisible button is still a layout
+  box, and on the cwdtree the hidden ✕ was taking 18px plus its 6px gap off
+  every live-session row's title (user report + measurement, 2026-08-01: *"rows
+  [should] use the horizontal real estate to display the heading occupied by the
+  'X' to the entire width"*). `display:none` costs no width at all, so the title
+  still gets the whole row at rest — which was the ask. Revealed, the verbs take
+  their space and the title ellipsizes to fit.
+  - **⛔ NO BACKGROUND BEHIND THE VERBS. Not a chip, not a fade, not a
+    `backdrop-filter`, not a `linear-gradient`, not a `color-mix` wash.** This
+    is a settled user decision and it has been reverted once already, so it is
+    written as a prohibition rather than a preference.
+    The first cut floated the verbs OUT of flow on a frosted chip precisely so
+    the title would never reflow on reveal — blur plus a wash of the surface
+    colour, feathered by a mask, bled over the row's padding to wear its rounded
+    edge. The reasoning was sound and the result was rejected on sight, on every
+    cwdtree at once (user, 2026-08-01, with a screenshot): *"the white bg effect
+    on the close buttons in both cwdtrees look so ugly. Let us not have a close
+    button bg like it used to and truncate the row line to make room for the
+    button."* The title ran UNDER the chip and the ✕ read as a smudge rather
+    than a button.
+  - **The reflow-on-hover is the POINT, not a regression.** Yes, revealing the
+    verbs re-measures the title; that is what a truncating row is supposed to
+    do and what every file tree does. It is what makes the ✕ legible against the
+    row rather than against the text under it. Do not "fix" it by floating the
+    verbs again — that is this exact bug, and `session_row_hover_css` carries a
+    test (`the_row_reveal_rule_has_one_owner_and_reaches_every_surface`) that
+    bans `backdrop-filter`, `linear-gradient` and `color-mix` from the rule by
+    name so the chip cannot come back quietly.
+  - **The rule reaches every row family from ONE owner**, which is why this bug
+    presented in three places at once: the yggterm sidebar cwdtree, ychrome's
+    tab-rail folder rows (whose expand / new-folder / + / delete buttons sit in
+    the same `actions` container) and yedit's tree all wear it. Fix the owner,
+    every surface inherits; there is no per-app copy to chase.
   - **THREE reveal triggers, and all three are required**: row `:hover`, the row
     being active/selected, and `:focus-within` on the ROW. Mouse-only would
     strand the ALT/KeyTip keyboard layer — a row reached by keyboard would offer
