@@ -98,6 +98,16 @@ above. It must equal `dom.main_surface_body_rect.width`.
 > the Chrome-style preview was correctly NOT built: "not like chrome (desired)
 > but to native handling done"), webapp launch speed, the WPE lane, and
 > `ctl --help`. **Dropped by the user:** fullscreen-takes-the-window.
+
+- **Agent engine: `ctl fill` is documented but has no route** (found 2026-08-01
+  while an agent filed a GitHub support ticket headlessly). `agent-engine.md`
+  §4 documents `ychrome ctl fill`, but the daemon exposes no `/engine/fill`,
+  so vault autofill does not exist on the engine plane — the agent had to post
+  raw input events to the daemon socket with the secret in a 0600 file to keep
+  it off the command line. Either ship `/engine/fill` (vault-item → field, the
+  engine-plane sibling of `web fill --entry`) or fix the doc; shipping it is
+  the right call, the workaround is fragile and every credentialed engine run
+  will need it.
 >
 > Earlier rounds closed: the tab rail becoming the cwdtree with folder icons,
 > nesting, the drag gesture and the density pass; Cloudflare challenges;
