@@ -1,124 +1,298 @@
-# Automations — spec
+# Automations — the yggui automation layer
 
-> **Status, 2026-08-01: this is the FIRST DRAFT (2026-05-31), rescued from the
-> retired `experimental/automations` branch, and it is not yet the spec of
-> record.** The branch it lived on drifted 1545 commits behind `main` and its
-> code reached increment 2 only — a data model and a JSON store, no UI, no
-> scheduler. That code is retired, not deleted: `git checkout
-> retired/experimental-automations`.
->
-> The reasoning here survives the branch and is kept for exactly that reason —
-> the SSOT rule, the E1/E2/E3 edge cases, the daemon-owns-the-scheduler
-> conclusion and the per-platform autostart survey below are all still the right
-> answers, and re-deriving them would be waste.
->
-> What it does NOT yet cover is the second half of the ask: injecting a prompt
-> into a session that already exists, attached vs detached spawning, and — the
-> load-bearing one — the obligation that every automated session either gets
-> **cleaned up** or raises a **persisting notification** to clean it up.
-> An automation layer that leaks sessions is a fan-and-memory bug with a
-> scheduler attached. That section is being written now and will supersede this
-> header.
+> **Spec of record, 2026-08-01.** Supersedes the 2026-05-31 first draft that
+> lived on `experimental/automations`. That branch is retired, not deleted:
+> `git checkout retired/experimental-automations` recovers its increments 1–2
+> (an `Automation` data model and an `automations.json` store). Its reasoning
+> survives here; its code does not.
 
 ## What it is
 
-**Automations** is a new top-level section — a sibling to **Live Sessions** — that runs agent-CLI sessions on a schedule, like cron / systemd timers, but driven through **yggui app control** programmatically. An automation opens a session of a chosen kind (Codex or Claude Code) at a cadence (e.g. monthly ± random days), sends it a prompt, and lets the session finish on its own. The resulting keep-alive session persists in the **Automated Sessions** list so the user can watch it work if they're around, and inspect the result afterward.
+An **automation** runs an agent-CLI session on a schedule, unattended, and then
+either cleans the session up or tells you it could not.
 
-**Motivating example (user):** a Codex session opened ~monthly (± random days) with *"some time has passed, can you upgrade again"* that upgrades the whole infrastructure (jojo, main, practice, …) looking into update nuances and package-registry flaws. Today the user does this by hand; the automation does it on a timer and leaves the finished session as a keep-alive in Automated Sessions.
+The user's case, in their words, is the whole spec in one sentence: *a Claude
+Code session spawned in a particular path in the middle of midnight for a
+particular upgrade-infra job — midnight because then no work gets impacted and
+the agent gets ample time to upgrade the infras meticulously — every 2 weeks on
+Sunday, without me having to worry about it.*
 
-## Core model — SSOT, no second store
+The second half of that sentence is load-bearing and is where the first draft
+stopped: **without cleanup, an automation layer is a session leak with a timer
+in front of it.** The user has the receipts — "otherwise we have angry jojo fan
+and leaks throughout the system."
 
-The **session object is the single source of truth** (same rule as [[spec-active-sessions-dual-presence]] / [[spec-unify-local-remote]]). "Live Sessions" and "Automated Sessions" are **pins / shortcuts at the top of the cwd tree**, NOT separate session stores. A session is never "dissolved from the cwd tree and re-created in a list" — it stays in the cwd tree; the Live/Automated groups are filtered *views* (presence flags) over the same sessions. (The user tightened the Live spec precisely to kill the "session moves between stores" thinking error; the same discipline applies to Automated.)
+## The one thing to understand before reading further
 
-Two distinct concepts:
-
-1. **Automation** — a schedule definition (the cron/timer entry). Fields:
-   - `id`
-   - `agent_kind`: `Codex | ClaudeCode`
-   - `target`: machine + cwd (where the session launches)
-   - `prompt`: the text sent after the session is open
-   - `schedule`: cadence (`Weekly | Monthly | …`) + timing (`specific` time/day, or `random` hours/days within the cadence) + jitter (± random days)
-   - `enabled`
-   - `last_run_at`, `next_run_at`
-   - `linked_session_id`: the keep-alive session it most recently spawned (if any)
-
-2. **Session** — the actual agent-CLI session an automation spawns. It is a normal keep-alive session, plus an `automated: bool` (or `automation_id: Option<…>`) flag that places it in the **Automated Sessions** group instead of **Live Sessions**.
-
-## Lifecycle & state transitions
-
-When a timer fires:
-1. The daemon scheduler opens/creates the session via the app-control path (`app open` / create) — the same surface agents use.
-2. Sends `prompt` via `app terminal send`.
-3. The session runs to completion on its own and **persists as keep-alive** in **Automated Sessions** (`automated = true`).
-
-**Automated vs Live placement is decided by the `automated` flag, not by which code opened it.**
-
-### Edge cases (user-specified)
-
-- **E1 — manual session in an automated slot.** If the user manually closes the keep-alive in the Automated list, OR manually spawns a session that *is* configured as automated, that session spawns in **Live Sessions** normally (`automated = false`). When the automation's timer next fires, the scheduler **transfers** that Live session into **Automated Sessions** (sets `automated = true` / links it) rather than spawning a duplicate.
-- **E2 — un-automate a running session.** If the user un-automates a running keep-alive in the Automated list, it **transfers** to **Live Sessions** (`automated = false`). The session itself is untouched (same PTY, same cwd-tree node) — only the pin/flag changes.
-- **E3 — cwd tree is untouched in ALL cases.** Live ⇄ Automated transfers are flag flips on the session; the cwd-tree node never moves, dissolves, or re-appears.
-
-## UX (from the whiteboard)
-
-Minimal modification to the existing **start page**. The Automated Sessions start page reuses the start-page list, but composes each entry as a **sentence** rather than a plain session row, with a **New Automation** button (boxed, top, like a section header action):
+**Almost none of this is new session machinery.** The agent CLI already spawns
+sessions the way an automation needs to:
 
 ```
-Automations
-[ New Automation ]
-
-1. Launch [Codex ▾] on [ <timer spec> ]
-   ────────────────────────────────────
-2. Launch [ CC ] on [ Weekly ] at [ Random hours ]
-   ────────────────────────────────────
-   ⋮
+server app terminal new --kind claude-code --cwd <dir> --machine-key <host> \
+    --no-activate --purpose "automation:<id>" \
+    --ephemeral --ephemeral-idle-ttl-secs <n>
+server app terminal send <session> --data <prompt>
 ```
 
-- The kind selector is a dropdown/button — **Codex or CC**; **CC is rendered as an orange button** (per the sketch).
-- The timer spec is a cadence (`Weekly`, `Monthly`, …) + timing (`specific` or `Random hours` / random days).
-- Each automation is one composed list entry; the list lives under the Automations header like Live Sessions does.
+`--no-activate` IS detached. `--purpose` IS the tenancy record. `--ephemeral
+--ephemeral-idle-ttl-secs` IS the reaper, already running on an existing daemon
+chore tick, already closing through the daemon's one graceful close path, and
+already refusing to touch a row the user made by hand (the flag exists only on
+the agent-CLI create path, so a hand-made row carries no declaration and never
+reaches `ephemeral_reap_reason` at all — see `session_tenancy.rs`).
 
-## Mechanism — yggui app control IS the automation runtime
+So an automation is **a schedule, a durable record, and the notification half**.
+It calls the verbs above; it does not grow a second way to open a session. That
+is the single-source-of-truth rule applied to this feature: if two places could
+answer "how does a session get created", they have already diverged.
 
-Automations are scheduled invocations of the **yggui app control** surface: open a session, send a prompt, leave it keep-alive. This is the programmatic, cron-like use of app control the user envisioned (and the same surface agents use to drive/verify the app). The scheduler lives in the daemon (`yggterm-headless`) so automations fire even when the GUI is closed, consistent with the keep-alive / daemon-owns-PTYs model.
+## Settled decisions (user, 2026-08-01 — do not relitigate)
 
-## Open design questions (resolve during implementation)
+**D1 — yggterm owns the schedule; the OS fires it.** The automation record in
+`~/.yggterm/automations.json` is the SSOT. From it yggterm **generates** a
+systemd user timer (Linux), a launchd agent (macOS), or a Task Scheduler entry
+(Windows). Those files are **derived artifacts**: regenerated on every change,
+reconciled by `automation sync`, and never hand-edited. The OS fires the
+trigger; `yggterm-headless automation run <id>` executes it.
 
-- ~~Persistence: server-state.json vs separate file~~ → **RESOLVED: separate `~/.yggterm/automations.json`** (atomic write-temp-rename). Chosen for clean separation + to avoid churn across 52 `PersistedLiveSession` / 23 `PersistedDaemonState` literal sites.
-- ~~Deterministic jitter~~ → **RESOLVED**: `compute_next_run_at_ms` seeds jitter from `(id, run-window)`; computed once into `next_run_at_ms`, never re-rolled per tick.
-- ~~`agent_kind` general?~~ → **RESOLVED**: it IS `SessionKind` (future first-class CLIs, not a Codex/CC binary).
-- ~~Automated-flag on session~~ → **RESOLVED: DERIVED** — `automation_for_session(id)` (an automation's `linked_session_id == session.id`). No duplicated flag on the session; the link on the automation is SSOT. E1/E2 = link add/remove.
-- Still open (scheduler increment): daemon-down catch-up = run-on-next-start (planned); concurrency when a prior automated session still runs = transfer/attach, never duplicate (E1).
+Rejected: a daemon-thread scheduler as the only mechanism (fires only while the
+daemon is alive, invisible to OS tooling, and needs an autostart install step
+anyway). Rejected: hand-authored units with no yggterm record (nothing in the
+GUI could then list, edit or disable an automation).
 
-## Implementation status (experimental/automations)
+**D2 — close on idle-TTL, notify on deadline.** A run's session is closed
+automatically when its PTY has been silent for the automation's `idle_ttl_secs`.
+A separate wall-clock `deadline_secs` **never closes anything**; it raises the
+persisting notice instead. A noisy session is never touched.
 
-- ✅ **Increment 1 — scheduling foundation** (`b072d63`): `automation.rs` — `Automation`, `AutomationCadence`, deterministic `compute_next_run_at_ms` + `automation_is_due`. 6 tests.
-- ✅ **Increment 2 — persistence + server CRUD + derived grouping** (`577f8bd`): `automations.json` load/save; `YggtermServer.automations` + CRUD; `automation_for_session` / `session_is_automated`. 7 tests.
-- ⬜ **Increment 3 — daemon scheduler chore**: load automations at startup; periodic chore fires due automations → opens/re-prompts the linked keep-alive session via the app-control session-open + `terminal send` path; updates `last_run_at`/`next_run_at` + saves. E1 transfer-not-duplicate.
-- ⬜ **Increment 4 — UI**: Automated Sessions sidebar group (filtered by `session_is_automated`) + start-page "Automations" entries ("Launch [Codex/CC] on [cadence] at [time]") + New Automation create flow + E2 un-automate action.
-- ⬜ **Increment 5 — live verify** on jojo.
+**D3 — catch up within a grace window, else skip.** A run missed because the
+machine was off or asleep is executed late only if it can still *start* within
+`grace_secs` of when it was due (default 6 h). Past that it is skipped and
+rescheduled to the next window. This honours both halves of the user's intent:
+the job runs unattended, and it never ambushes them at 2 pm on a Wednesday.
 
-## Build / verify
+## ⚠ The known risk in D2, stated plainly
 
-Implementation goes on `experimental/automations` (worktree `~/gh/yggterm--automations`). Verify live via yggui app control on jojo (now faithful on Wayland post-2.8.0): create an automation with a short test cadence, confirm it fires, opens the session, sends the prompt, and the finished session lands in Automated Sessions (not Live), with the cwd-tree node unchanged.
+`idle_secs` in the existing reaper means **seconds since the PTY last produced
+output**. On an agent session that is precisely the measurement this project
+knows to be unreliable: an agent spinner IS output, which is why the hot-restart
+idle gate never opened once in 40 samples (`campaign-yggterm-unified` ROUND 33,
+§THE QUIET-GATE PATTERN). See also
+`finding-agent-session-liveness-is-invisible-to-os-signals`.
 
-## Scheduling architecture (how/where automations actually run)
+The safe direction holds — a working, spinning agent is never reaped. **The
+unsafe direction is real**: a Claude Code session paused on a question is
+silent, and D2 will close it. The user accepted that risk knowingly. Three
+things bound it, and all three are requirements, not nice-to-haves:
 
-**The scheduler lives in the DAEMON (`yggterm-headless`), not the GUI.** The daemon already runs in the background, owns PTYs, and persists independently of the GUI (the keep-alive model). So the scheduler is a daemon chore — a `std::thread` loop in `run_daemon`, like the existing `run_remote_codex_identity_poll_chore` — that periodically (e.g. every 30–60 s) checks for due automations and fires them. Automations therefore fire **whenever the daemon is alive**, GUI open or not.
+1. **The default TTL is generous** (30 min), and it is per-automation.
+2. **The close is graceful and the transcript survives.** The reaper goes
+   through the daemon's ordinary tombstone-then-remove, and the agent CLI's own
+   JSONL is untouched, so a wrongly-closed run is *resumable* — `claude -r
+   <uuid>` still works. A wrong close costs a resume, not the work.
+3. **Every reap is traced and recorded on the run** (`ephemeral_idle_ttl`), so
+   "why did my session vanish" has an answer in `automation runs`.
 
-- **Does yggterm run in the background?** Its daemon does — it survives GUI close. The GUI is just a viewer/controller. So yes, scheduling runs in the background via the daemon.
-- **Idle-shutdown interaction:** the daemon self-retires when there's no live work (see `bug-class-old-daemon-never-retires`). For automations to fire reliably, **≥1 enabled automation must count as "live work"** so the daemon doesn't idle-shutdown while automations are scheduled. (Implemented in increment 3.)
-- **Will headless collide with the running GUI?** No, when versions match. The GUI's `ensure_local_daemon_running` CONNECTS to an existing daemon on the version-pinned socket (`server-<version>.sock`) if present, else spawns one. So a separately-started daemon = the GUI attaches to it; one daemon, no collision. **The only collision is version mismatch** (GUI binary vs running daemon differ → GUI spawns its own → two daemons, the old session-loss trap). Mitigation: keep the always-on daemon binary and the GUI binary the same version (they're the same `~/.local/bin/yggterm-headless`; updates bump both; the hot-update/version-pinned-socket machinery handles same-version handoff).
-- **Catch-up:** if the daemon was down when a run was due, **run-on-next-start** (on load, any automation with `next_run_at_ms <= now` fires once, then reschedules).
+When the parked positive-liveness signal (`lane/dev/agent-liveness`) lands, it
+becomes the better input for this decision and D2's TTL rule becomes the
+fallback rather than the primary. **Do not build a second liveness inference
+here**; that lane is the owner of that question.
 
-**Keeping the daemon alive 24/7 (so automations fire even when you never open the GUI, and across reboots)** is OS-specific autostart of the *same* daemon — an OPT-IN "always-on automations" install step, not required for the first cut (without it, automations fire whenever the daemon is up, i.e. whenever you've used yggterm recently / have keep-alive sessions):
-- **Linux:** a **systemd *user* service** running `yggterm-headless server daemon`, `WantedBy=default.target`, plus `loginctl enable-linger <user>` so it runs without an active login session.
-- **macOS:** a **launchd LaunchAgent** plist (`~/Library/LaunchAgents/dev.yggterm.daemon.plist`, `RunAtLoad`+`KeepAlive`).
-- **Windows:** **Task Scheduler** at-logon trigger (or a thin service) running the daemon.
-- These installers ship later as "enable always-on" per platform. The in-daemon scheduler itself is platform-agnostic (works wherever the daemon runs). The daemon must be **idempotent about a single instance** (the existing socket-lock already prevents double-spawn) so the autostart-daemon and a GUI-spawned daemon never both run at the same version.
+## The record
 
-## Implementation status (experimental/automations)
+`~/.yggterm/automations.json`, atomic write-temp-then-rename. Kept out of
+`server-state.json` deliberately: automations are a distinct concern from
+per-session runtime state, and folding them in would churn the 52
+`PersistedLiveSession` / 23 `PersistedDaemonState` literal sites for nothing.
 
-(see the Implementation status list above; increment 3 = this scheduler.)
+| field | meaning |
+| --- | --- |
+| `id` | stable slug; also the generated unit's filename, so it must be filesystem- and systemd-safe |
+| `enabled` | disabled automations keep their record and lose their OS unit |
+| `agent_kind` | `SessionKind` — shell / codex / claude-code / future first-class CLIs. Never a binary Codex-or-CC flag |
+| `machine_key`, `cwd` | where the session launches; the same addressing `terminal new` takes |
+| `prompt` | injected after the session is open |
+| `schedule` | calendar expression + `every_n_weeks` (see below) |
+| `grace_secs` | D3 catch-up window. Default 21600 (6 h) |
+| `attach` | false ⇒ `--no-activate`. **Default false**: at midnight nobody is watching, and a scheduled run that steals focus is a bug |
+| `idle_ttl_secs` | D2 auto-close rule. Default 1800 |
+| `deadline_secs` | D2 notify-only rule. Default 21600 (6 h) |
+| `title` | optional row title; absent means the row is named for the automation |
+| `created_at_ms`, `last_run_at_ms`, `next_run_at_ms` | |
+| `runs` | bounded history (last 20), each with outcome — see below |
 
-Related: [[spec-active-sessions-dual-presence]], [[spec-unify-local-remote]], [[spec-cwd-tree-agent-cli-unified]], [[session-keep-alive-spec]], [[bug-class-old-daemon-never-retires]], [[spec-iteratively-tighten-specs]].
+A **run** records `run_id`, `due_at_ms`, `started_at_ms`, `session_path`,
+`outcome` (`ran` / `skipped_out_of_grace` / `skipped_off_cadence` /
+`reused_live_session` / `spawn_failed`), `closed_at_ms` and `close_reason`
+(`ephemeral_idle_ttl` / `ephemeral_owner_gone` / `user` / `never`).
+
+**There is no `automated` flag on the session.** Whether a session is automated
+is DERIVED: `automation_for_session(id)` finds the automation whose current run
+holds that `session_path`. One owner for the answer; the cwd tree never moves a
+node, and Live vs Automated are filtered views over one store. (This was settled
+in the first draft and survives unchanged — E1/E2/E3 below.)
+
+## Scheduling
+
+**The calendar expression is systemd's `OnCalendar` syntax**, on every platform.
+It is the most expressive of the three, it is what the user already thinks in,
+and the macOS/Windows renderers translate *from* it rather than each inventing a
+dialect. `Sun *-*-* 00:00:00` is the motivating case.
+
+**`every_n_weeks` is a parity guard, not a calendar term.** `OnCalendar` cannot
+express "every second Sunday". So the timer fires every Sunday and the executor
+no-ops on the off weeks, deterministically, from the ISO-8601 week number of the
+due instant:
+
+```
+honoured  ⇔  (iso_week_number(due) % every_n_weeks) == (anchor_week % every_n_weeks)
+```
+
+`anchor_week` is stored on the automation at create time. Same input, same
+answer, forever — no counter to drift, no state to lose, and an off-week fire
+costs one process start. An off-week fire records `skipped_off_cadence`.
+
+**Jitter** (the first draft's "± random days") is retained and stays
+deterministic: seeded from `(id, run-window)` via FNV-1a, computed once into
+`next_run_at_ms`, never re-rolled per tick. It is not randomness the scheduler
+observes; it is a pure function of the record.
+
+## What a run actually does
+
+`yggterm-headless automation run <id>` — the generated unit's `ExecStart`:
+
+1. **Grace guard (D3).** If `now > due + grace_secs`, record
+   `skipped_out_of_grace`, reschedule, exit 0. Success, not failure: a skipped
+   run is the designed behaviour, and a unit that exits non-zero on it would
+   have systemd reporting a permanently failed timer.
+2. **Cadence parity guard.** Off-week ⇒ `skipped_off_cadence`, exit 0.
+3. **Reuse before spawn (E1).** If the automation's last run holds a session
+   that is still live, **re-prompt that session** and record
+   `reused_live_session`. Never spawn a duplicate. This is the case where the
+   previous fortnight's job is somehow still open.
+4. **Spawn**, through the existing verb, with the tenancy declaration that arms
+   the reaper:
+   `terminal new --kind <agent_kind> --cwd <cwd> --machine-key <machine_key>
+   [--no-activate] --purpose "automation:<id>" --ephemeral
+   --ephemeral-idle-ttl-secs <idle_ttl_secs>`
+5. **Inject** the prompt via `terminal send`.
+6. **Record** the run and its deadline; persist.
+
+Cleanup needs no new code: the row carries an ephemeral declaration and the
+existing `ephemeral_session_reap_pass` closes it. The automation layer's only
+cleanup job is to **notice** the close and stamp the run.
+
+## The notification half (the genuinely new part)
+
+A **notice** is raised when a run reaches its `deadline_secs` with its session
+still open, or when a spawn fails. Notices live in the automations store and are
+**persisting** in the strict sense: they survive a GUI restart, a daemon
+restart, and a reboot, and are cleared only by the user acting on them — never
+by a timeout and never by being displayed.
+
+Surfaces (all three, per the check-all-affected-surfaces rule):
+
+- the automation's row in the Automated group,
+- the start page's Automations section,
+- `automation notices [--json]` for the agent plane.
+
+`automation dismiss <run-id>` is the clear. A desktop notification may echo a
+notice, but an echo is not the notice — the durable record is.
+
+## Per-platform renderers
+
+The daemon must count ≥1 enabled automation as live work so it does not
+self-retire out from under a scheduled run.
+
+**Linux — systemd user units.** `~/.config/systemd/user/yggterm-automation-<id>.{service,timer}`, plus
+`loginctl enable-linger <user>` so timers fire without an active login session.
+`Persistent=true` (D3's late fire), with our grace guard deciding whether the
+late fire is honoured. The unit carries a `# GENERATED BY yggterm — do not edit`
+header and a hash of the record it came from, so `automation sync` can detect a
+hand-edit and say so rather than silently overwrite.
+
+**macOS — launchd.** `~/Library/LaunchAgents/dev.yggterm.automation.<id>.plist`,
+`StartCalendarInterval` translated from the calendar expression, `RunAtLoad`
+false. launchd's own missed-run behaviour is coarser than systemd's, which is
+fine: the grace guard is ours and runs identically on every platform.
+
+**Windows — Task Scheduler.** A logon/calendar trigger invoking the same
+`automation run <id>`. ⚠ Windows is a **3.0.0** concern and the product does not
+build there yet (`docs/pending-bugs.md` §3.0.0). The renderer is specified here
+so the trait has three implementations by design rather than two plus a
+retrofit; it is not in the first cut.
+
+## Edge cases (settled in the first draft, unchanged)
+
+- **E1 — a live session in an automated slot.** Re-prompt and link it; never
+  spawn a duplicate. (Step 3 above.)
+- **E2 — un-automate a running session.** The link is removed; the session is
+  untouched — same PTY, same cwd-tree node. Only the derived grouping changes.
+- **E3 — the cwd tree is untouched in ALL cases.** Live ⇄ Automated is a derived
+  view. A node never moves, dissolves, or re-appears.
+
+## The verbs
+
+Both binaries expose them and **neither carries a copy of the parser** — the
+same discipline `agent_cli_create_terminal_tenancy` already enforces for
+`terminal new`, for the same reason: a flag must mean one thing on either
+binary.
+
+```
+automation list [--json]
+automation show <id> [--json]
+automation create --kind <shell|codex|claude-code> --cwd <dir> --machine-key <host>
+                  (--prompt <text> | --prompt-stdin)
+                  --calendar <OnCalendar-expr> [--every-n-weeks <n>]
+                  [--grace <dur>] [--idle-ttl <dur>] [--deadline <dur>]
+                  [--attach] [--title <t>] [--id <slug>] [--jitter-days <n>]
+automation edit <id> [same flags]
+automation enable <id> | disable <id> | delete <id>
+automation run <id> [--force]        # the unit's ExecStart; --force ignores both guards
+automation runs [<id>] [--json]      # run history + outcomes + close reasons
+automation notices [--json] | dismiss <run-id>
+automation sync [--json]             # reconcile generated OS units against the store
+```
+
+`--force` exists for exactly one reason: the user pressing "Run now" in the GUI,
+and an agent testing an automation without waiting a fortnight.
+
+## Build plan
+
+- **I1 — record, store, guards.** `automation.rs`: record, run history, the
+  grace guard, the ISO-week parity guard, deterministic jitter. Pure, fully
+  unit-tested. Lifts the retired branch's `compute_next_run_at_ms` and its 6
+  tests.
+- **I2 — the verbs**, on both binaries through one parser.
+- **I3 — the executor.** `automation run <id>` driving the existing
+  `terminal new` / `terminal send` verbs, with E1 reuse.
+- **I4 — the systemd renderer** + `automation sync` + the hand-edit detector.
+- **I5 — notices**: deadline chore, the durable store, the three surfaces.
+- **I6 — the GUI**: the Automated group (filtered by the derived predicate) and
+  the start-page Automations section with New Automation.
+- **I7 — launchd renderer.** Windows deferred to 3.0.0 with the platform build.
+
+## Acceptance
+
+The feature is done when, on the live host and without the user touching
+anything:
+
+1. `automation create` for the user's real case writes the record AND the
+   systemd timer, and `systemctl --user list-timers` shows it.
+2. `automation run <id> --force` opens a Claude Code session at the named path
+   on the named machine, detached, and the prompt arrives in it.
+3. The row appears under Automated, not Live, and its cwd-tree node did not
+   move (E3).
+4. Left alone past its idle TTL, the session is closed by the existing reaper
+   and `automation runs` names `ephemeral_idle_ttl` as the reason.
+5. A run held open past its deadline raises a notice that survives a GUI
+   restart and a daemon restart, and only `dismiss` clears it.
+6. A run fired outside its grace window records `skipped_out_of_grace` and the
+   unit exits 0.
+7. An off-parity Sunday records `skipped_off_cadence`.
+
+Related: [[spec-active-sessions-dual-presence]], [[spec-unify-local-remote]],
+[[spec-cwd-tree-agent-cli-unified]], [[session-keep-alive-spec]],
+[[spec-agent-shadow-client-control]],
+[[finding-agent-session-liveness-is-invisible-to-os-signals]],
+[[spec-terminal-notifications-richness]], [[spec-iteratively-tighten-specs]].
