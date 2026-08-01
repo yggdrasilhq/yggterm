@@ -265,20 +265,26 @@ symptoms, and the last two are strongly suspected to share a root:
 ## Standing traps / other open bugs
 
 - **⛔⛔ PRE-REWRITE GIT LINEAGE — read before merging ANY old branch/worktree
-  (2026-08-01).** All public yggdrasilhq histories were rewritten in place so
-  GPL-3.0-or-later holds from commit zero, and force-pushed (yggterm tip moved
-  `4227e645` → `e7cf1e36`; all hashes changed). Anything still on the OLD
-  lineage will silently REINTRODUCE Apache-era commits if merged or pushed —
-  `git merge-base --is-ancestor <rewritten-root> HEAD` failing is the tell.
-  Known carriers, rebase each onto rewritten `origin/main` before use:
-  `lane/dev/agent-liveness` (1 unique commit), dev worktrees `chord-focus` and
-  `hover-context-menu` (real WIP, left dirty), oc's yggterm clone (tracked
-  edits, left un-reset), and dev's `~/gh/yggdocs` (4 dirty files) + `~/gh/
-  yggdrasil` (13 dirty files) — those two also had their `origin` repointed
-  from the deleted Forgejo mirrors to GitHub but are NOT yet reset. Pre-rewrite
-  bundles of everything: `/home/user/repo-bundles-pre-gpl0-20260801/`. Also:
-  yggterm's 185 historical GitHub releases were deleted (Apache-era binaries,
-  user-ordered); the live release lane starts at v2.12.23.
+  (2026-08-01, updated after the SECOND churn).** All public yggdrasilhq
+  histories were rewritten in place so GPL-3.0-or-later holds from commit
+  zero, and force-pushed. yggterm's hashes then changed a SECOND time the same
+  night (user-ordered root-commit-message fix: the root no longer claims
+  apache; root `c92495da`, tip `53995093` at the time of writing). Anything on
+  an older lineage silently REINTRODUCES the old history if merged or pushed —
+  `git merge-base --is-ancestor c92495da HEAD` failing is the tell for
+  yggterm. Fleet state after cleanup: dev main + 9 lane worktrees + jojo + oc
+  all on the final lineage (merged lanes reset; tree-identical proof used, so
+  nothing was lost). STILL ON OLD LINEAGE, rebase before ANY use:
+  `lane/dev/chord-focus` (dirty WIP worktree), `lane/dev/agent-liveness`
+  (1 unique commit, replay with cherry-pick onto new main), oc's yggterm
+  spare edits if any reappear, and dev's `~/gh/yggdocs` (4 dirty files) +
+  `~/gh/yggdrasil` (13 dirty files) — both repointed from the deleted Forgejo
+  mirrors to GitHub origins but NOT yet reset. Pre-rewrite bundles:
+  `/home/user/repo-bundles-pre-gpl0-20260801/`. Releases: yggterm's 185 +
+  yggsync's 4 + yggcli's 6 Apache-era releases deleted (user-ordered); live
+  lanes start at yggterm v2.12.23 and yggsync v0.3.2 (yggclient fetch pins
+  bumped to v0.3.2 in `bc59617` — yggsync releases are LOAD-BEARING for phone
+  provisioning, never delete without a replacement release first).
 
 - **A HOVER-REVEALED CONTRIBUTED RAIL PANE DRAWS ITS HEADER AND NONE OF ITS ROWS**
   (found 2026-08-01 while live-verifying the hover-reveal context-menu fix; NOT
