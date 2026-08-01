@@ -21,6 +21,11 @@ mod hot_update_policy;
 #[allow(dead_code)]
 mod keytip;
 mod netscape_cookie_jar;
+// The ONE owner of "how long may the remote-resume readiness gate keep the
+// user's terminal blank and un-typeable". The 60 s failure timer is armed per
+// BOOTSTRAP identity; the gate is re-armed per RECOVERY, so every re-arm after
+// the first used to be uncapped. This ceiling follows the gate.
+mod resume_gate;
 // Phase 1 of the consolidated scroll-controller: the canonical, regression-locked
 // DECISION spec (mode + transitions). The JS wiring (Phase 2) mirrors it. Marked
 // allow(dead_code) until the JS migration consults it. See scroll_mode.rs.

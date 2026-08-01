@@ -20,6 +20,10 @@ use crate::hot_update_policy::{
     startup_daemon_hot_update_pending_reason, startup_stale_daemon_hot_swap_target,
     startup_stale_daemon_hot_swap_target_with_client_counter,
 };
+use crate::resume_gate::{
+    NON_PROMPT_WAIT_MAX_HOLD_MS, RemoteResumeGateCeiling, ResumeGateTransition,
+    non_prompt_wait_should_hold,
+};
 use crate::session_copy_policy::{
     background_copy_retry_key, copy_generation_start_allowed, env_copy_generation_enabled,
     humanized_terminal_title, implicit_copy_generation_enabled_from_env, shell_title_case_words,
@@ -493,6 +497,16 @@ const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
 const REMOTE_TERMINAL_CAREFUL_RESTORE_AFTER_MS: u64 = 60_000;
 const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = REMOTE_TERMINAL_CAREFUL_RESTORE_AFTER_MS;
 const REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS: u64 = 30_000;
+/// How often the readiness-gate ceiling watchdog samples the gate. Cheap (a
+/// signal read, no IPC) and deliberately much shorter than the ceiling, so the
+/// release lands within a poll of the deadline rather than a poll of the mount.
+const REMOTE_RESUME_GATE_CEILING_POLL_MS: u64 = 2_000;
+/// How many times the 60 s resume-failure timer may be deferred by recent PTY
+/// output before it stops deferring and decides. Each deferral costs one
+/// [`REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS`] window; the deferral
+/// predicate measures from the attempt's FIRST output, so a single re-check
+/// already settles one attempt and this bound only covers attempt churn.
+const REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS: u32 = 4;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_BLANK_RUNTIME_OUTPUT_RECOVERY_MS: u64 = 1_100;
 const REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS: u64 = 18_000;
@@ -88911,6 +88925,12 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let timeout_timer_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    // ⛔ The ceiling that follows the GATE, not the mount. The two timers above
+    // are keyed on the bootstrap identity, which the read loop's own recovery
+    // paths never change when they re-arm `terminal_live_host_connected` — so
+    // without this every re-arm was uncapped. See `crate::resume_gate`.
+    let resume_gate_ceiling_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let apply_host_theme_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let apply_session_theme_identity =
@@ -89190,19 +89210,49 @@ fn TerminalCanvas(
             let session_host_label = session_host_label.clone();
             spawn(async move {
                 sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;
-                let still_waiting_for_resume = safe_shell_read(
-                    state,
-                    "terminal_resume_timeout_timer_still_waiting",
-                    |shell| {
-                        shell
-                            .terminal_session_resume_notification_should_stay_visible(&session_path)
-                    },
-                )
-                .unwrap_or(true);
-                if *timer_last_bootstrap_identity.borrow() == timer_mount_identity
-                    && !timer_terminal_live_host_connected()
-                    && still_waiting_for_resume
-                {
+                // ⛔ A DEFERRAL MUST NOT CONSUME THE CEILING. This used to
+                // `return` on the first deferral, and the timer is armed once
+                // per bootstrap identity — so a session whose first PTY output
+                // happened to land inside the grace window at the 60 s mark lost
+                // its failure path outright and could hold the "Restoring Remote
+                // Terminal" toast forever. Defer the DECISION, never the timer.
+                let mut deferrals = 0_u32;
+                loop {
+                    let still_waiting_for_resume = safe_shell_read(
+                        state,
+                        "terminal_resume_timeout_timer_still_waiting",
+                        |shell| {
+                            shell.terminal_session_resume_notification_should_stay_visible(
+                                &session_path,
+                            )
+                        },
+                    )
+                    .unwrap_or(true);
+                    if *timer_last_bootstrap_identity.borrow() != timer_mount_identity
+                        || timer_terminal_live_host_connected()
+                    {
+                        return;
+                    }
+                    if !still_waiting_for_resume {
+                        // The shell's own predicate says this notification should
+                        // NOT be on screen. Acting on that means CLEARING it —
+                        // the old code read the same predicate and then silently
+                        // did nothing, which left the 1.2 s "the viewport will
+                        // switch in once the session is truly interactive" toast
+                        // up with nothing left to take it down.
+                        clear_terminal_resume_notification(state, &session_path);
+                        append_trace_event(
+                            &timer_trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "resume_timeout_cleared_stale_notification",
+                            json!({
+                                "session_path": session_path,
+                                "bootstrap_identity": timer_bootstrap_lease_identity,
+                            }),
+                        );
+                        return;
+                    }
                     let deferred_for_output_progress = safe_shell_mut(
                         state,
                         "terminal_resume_timeout_defer_output_progress",
@@ -89214,7 +89264,10 @@ fn TerminalCanvas(
                         },
                     )
                     .unwrap_or(false);
-                    if deferred_for_output_progress {
+                    if deferred_for_output_progress
+                        && deferrals < REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS
+                    {
+                        deferrals = deferrals.saturating_add(1);
                         append_trace_event(
                             &timer_trace_home,
                             "ui",
@@ -89223,9 +89276,18 @@ fn TerminalCanvas(
                             json!({
                                 "session_path": session_path,
                                 "bootstrap_identity": timer_bootstrap_lease_identity,
+                                "deferral": deferrals,
+                                "max_deferrals": REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS,
                             }),
                         );
-                        return;
+                        // The deferral predicate measures from the attempt's
+                        // FIRST output, so waiting out one grace window is enough
+                        // for this attempt to stop qualifying.
+                        sleep(Duration::from_millis(
+                            REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS,
+                        ))
+                        .await;
+                        continue;
                     }
                     // If the wrapper has already told us the saved Codex
                     // session is gone from the remote machine, surface a
@@ -89284,6 +89346,112 @@ fn TerminalCanvas(
                             "bootstrap_identity": timer_bootstrap_lease_identity,
                         }),
                     );
+                    return;
+                }
+            });
+        }
+        // ⛔ THE FAIL-SAFE CEILING ON THE READINESS GATE ITSELF.
+        //
+        // The two timers above are one-shots keyed on the bootstrap identity.
+        // `terminal_live_host_connected` is re-armed from inside the terminal
+        // read loop — retained-empty-surface recovery, dead-resume-instruction
+        // recovery, the non-prompt wait, the post-write-error retry — and none
+        // of those change the bootstrap identity, so no replacement timer is
+        // ever spawned and every re-arm after the first is uncapped. That is the
+        // 2026-08-01 report: a blank, un-typeable viewport under a "Restoring
+        // Remote Terminal" toast, beside a metadata pane reading `running ·
+        // working` with a live PID.
+        //
+        // This watchdog measures the CONTINUOUS hold on its own wall clock, so a
+        // read loop that stops producing evidence — or produces evidence that
+        // never satisfies the prompt heuristic — cannot keep the surface. The
+        // decision lives in `crate::resume_gate`; this is only its wiring.
+        let ceiling_key = format!("resume-gate-ceiling:{bootstrap_identity}");
+        if *resume_gate_ceiling_identity.borrow() != ceiling_key {
+            *resume_gate_ceiling_identity.borrow_mut() = ceiling_key;
+            let timer_mount_identity = mount_identity.clone();
+            let timer_last_bootstrap_identity = last_bootstrap_identity.clone();
+            let timer_terminal_live_host_connected = terminal_live_host_connected;
+            let ceiling_terminal_live_host_connected = terminal_live_host_connected;
+            let ceiling_terminal_overlay_dismissed = terminal_overlay_dismissed;
+            let ceiling_terminal_resume_surface_staged = terminal_resume_surface_staged;
+            let ceiling_resume_overlay_slow = resume_overlay_slow;
+            // ⚠ These two are NOT optional in the release set. `resume_overlay_
+            // timed_out` is set by the 60 s failure timer, which fires BEFORE
+            // this 90 s ceiling, and every branch of `host_should_accept_input`
+            // requires both to be false — so a ceiling that released the
+            // connected-gate and left these latched would hand back a terminal
+            // the render body immediately re-locks. The one wall-clock ceiling
+            // on this path used to make the gate STRICTER; it now releases it.
+            let ceiling_resume_overlay_timed_out = resume_overlay_timed_out;
+            let ceiling_resume_overlay_failed = resume_overlay_failed;
+            let timer_trace_home = trace_home.clone();
+            let state = state;
+            let session_path = session_path.clone();
+            let host_id_for_ceiling = host_id.clone();
+            spawn(async move {
+                let mut ceiling = RemoteResumeGateCeiling::default();
+                loop {
+                    sleep(Duration::from_millis(REMOTE_RESUME_GATE_CEILING_POLL_MS)).await;
+                    if *timer_last_bootstrap_identity.borrow() != timer_mount_identity {
+                        // The mount moved on; the next bootstrap identity arms a
+                        // fresh watchdog.
+                        return;
+                    }
+                    // Fail-safe 2: the reading is the GATE SIGNAL ITSELF, not a
+                    // fallible state read that could be defaulted to "still
+                    // waiting". Anything that cannot answer must resolve to
+                    // "not held" — paint and input are never withheld on an
+                    // absence of evidence.
+                    let held = !timer_terminal_live_host_connected();
+                    let now_ms = current_millis();
+                    let Some(transition) = ceiling.observe(held, now_ms) else {
+                        continue;
+                    };
+                    // Trace EVERY edge, not just the release: "why was my
+                    // terminal blank for a minute" has to be answerable from the
+                    // trace alone, and a held→released_connected pair is the
+                    // shape of a slow-but-healthy resume.
+                    append_trace_event(
+                        &timer_trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "resume_gate_ceiling",
+                        json!({
+                            "session_path": session_path.clone(),
+                            "mount_identity": timer_mount_identity.clone(),
+                            "transition": transition.as_str(),
+                            "gate": ceiling.to_app_state_json(now_ms),
+                        }),
+                    );
+                    if !matches!(transition, ResumeGateTransition::ReleasedCeiling) {
+                        continue;
+                    }
+                    // Give the terminal back. Same shape as the read loop's own
+                    // success paths, because "the gate released" has to mean the
+                    // same thing however it was reached — a second spelling of
+                    // "released" is how the surfaces drift apart.
+                    set_signal_if_changed(ceiling_terminal_live_host_connected, true);
+                    set_signal_if_changed(ceiling_terminal_overlay_dismissed, true);
+                    set_signal_if_changed(ceiling_terminal_resume_surface_staged, true);
+                    set_signal_if_changed(ceiling_resume_overlay_slow, false);
+                    set_signal_if_changed(ceiling_resume_overlay_timed_out, false);
+                    set_signal_if_changed(ceiling_resume_overlay_failed, false);
+                    let _ =
+                        safe_shell_mut(state, "terminal_resume_gate_ceiling_release", |shell| {
+                            shell.retain_terminal_session_path(&session_path);
+                            shell
+                                .terminal_resume_ready_paths
+                                .insert(session_path.clone());
+                            shell.terminal_attach_in_flight.remove(&session_path);
+                            shell.maybe_finish_terminal_surface_request_for_session(&session_path);
+                        });
+                    clear_terminal_resume_notification(state, &session_path);
+                    let _ = document::eval(&terminal_set_input_enabled_script(
+                        &host_id_for_ceiling,
+                        true,
+                        false,
+                    ));
                 }
             });
         }
@@ -93538,6 +93706,78 @@ fn TerminalCanvas(
                                         true
                                     }
                                 };
+                                // ⛔ CEILING ON A SELF-FEEDING GATE. This wait's
+                                // own arm condition includes `poisoned_by_retry`
+                                // — and the branch below SETS both halves of it
+                                // — so once entered it manufactures its own
+                                // reason to stay. Its only disarm is a prompt
+                                // TEXT HEURISTIC, which a streaming agent frame
+                                // may never satisfy. With both recovery budgets
+                                // spent the old code re-raised "Restoring Remote
+                                // Terminal" every 120 ms with input disabled,
+                                // forever, over a session the daemon reported
+                                // running. Release instead.
+                                if retained_non_prompt_settled
+                                    && !non_prompt_wait_should_hold(
+                                        retained_non_prompt_first_seen_ms,
+                                        current_millis(),
+                                        non_prompt_snapshot_replay_attempts < 2,
+                                        non_prompt_retained_recovery_attempts < 2,
+                                    )
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "retained_non_prompt_surface_wait_released",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "hold_ceiling_ms": NON_PROMPT_WAIT_MAX_HOLD_MS,
+                                            "snapshot_replay_attempts": non_prompt_snapshot_replay_attempts,
+                                            "recovery_attempts": non_prompt_retained_recovery_attempts,
+                                            "cursor_line_text": cursor_line_text.clone(),
+                                            "text_tail": text_tail.clone(),
+                                        }),
+                                    );
+                                    // Hand the terminal back: the surface has
+                                    // TEXT (that is what "non-prompt" means), it
+                                    // is just text we could not classify. A
+                                    // possibly-stale terminal the user can type
+                                    // into beats a hostage one.
+                                    set_signal_if_changed(terminal_resume_surface_staged, true);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    retained_non_prompt_first_seen_ms = None;
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: false,
+                                    });
+                                    clear_terminal_resume_notification(state, &session_path);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_release_non_prompt_wait",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell
+                                                .terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.terminal_attach_in_flight.remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "non_prompt_wait_ceiling",
+                                            );
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(read_poll_ms);
+                                    continue;
+                                }
                                 if retained_non_prompt_settled {
                                     append_trace_event(
                                         &trace_home,
@@ -97452,6 +97692,31 @@ fn TerminalCanvas(
                         }
                     }
                 }
+            }
+            // ⛔ A VEIL WHOSE ONLY CLEARER IS THIS LOOP.
+            //
+            // `handoverPaintSuspended` in the host script stops ALL visible
+            // paint and drops an opaque cover over the viewport. It is a pure
+            // mirror of the Rust gate, and the only thing that ever sends the
+            // falling edge is the tick above. The Rust gate has its own 90 s
+            // wall-clock ceiling — but a read loop that BREAKS while the veil is
+            // up (a read error after attach, retries exhausted) takes the
+            // messenger with it, and the cover then outlives the handover with
+            // nothing left able to lift it. Lift it on the way out.
+            if last_handover_paint_suspended {
+                let _ = eval.send(TerminalJsCommand::SetHandoverPaintSuspended {
+                    suspended: false,
+                });
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "daemon_handover",
+                    "handover_paint_resumed_on_read_loop_exit",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "surface": "terminal_bridge",
+                    }),
+                );
             }
         });
     }
@@ -181637,6 +181902,248 @@ mod media_capture_locks {
             grants, 1,
             "the capture dialog offers {grants} ways to grant a device; there must \
              be exactly one, on the button labelled Allow",
+        );
+    }
+}
+
+/// Structural locks on the remote-resume gate's CEILINGS.
+///
+/// The decisions themselves are pure and unit-tested in `crate::resume_gate`.
+/// What no pure test can see is whether the shell still ASKS them, and that is
+/// exactly what broke: the 60 s failure timer was armed once per bootstrap
+/// identity while the read loop re-armed the gate per recovery, so the ceiling
+/// existed and simply did not apply. These scans are over PRODUCT lines only,
+/// with the same self-check the module below uses.
+///
+/// ⚠ This module is deliberately NOT last in the file: `web_surface_immersion_locks`
+/// below owns a canary that requires it to be the final item.
+#[cfg(test)]
+mod resume_gate_wiring_locks {
+    use super::*;
+
+    fn shell_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shell.rs"))
+            .expect("shell.rs is readable")
+    }
+
+    fn product(source: &str) -> String {
+        yggterm_core::agent_cli::product_lines(source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn slice_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let from = source
+            .find(start)
+            .unwrap_or_else(|| panic!("anchor `{start}` is gone — the wiring it names was removed"));
+        let rest = &source[from..];
+        let to = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("closing anchor `{end}` is gone"));
+        &rest[..to]
+    }
+
+    #[test]
+    fn the_scan_is_not_reading_this_test_module() {
+        let scanned = product(&shell_source());
+        assert!(
+            !scanned.contains("the_scan_is_not_reading_this_test_module_resume_gate_canary"),
+            "product_lines stopped skipping this module — every scan below self-satisfies"
+        );
+    }
+
+    /// THE CEILING FOLLOWS THE GATE. A watchdog that samples the readiness gate
+    /// on its own wall clock, so a re-arm that never changes the bootstrap
+    /// identity is still bounded.
+    #[test]
+    fn the_readiness_gate_has_a_wall_clock_watchdog_of_its_own() {
+        let source = product(&shell_source());
+        let block = slice_between(
+            &source,
+            "let ceiling_key = format!(\"resume-gate-ceiling:",
+            "let active_host_selected",
+        );
+        for needle in [
+            "RemoteResumeGateCeiling::default()",
+            "REMOTE_RESUME_GATE_CEILING_POLL_MS",
+            "ceiling.observe(held, now_ms)",
+            "ResumeGateTransition::ReleasedCeiling",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the readiness-gate watchdog lost `{needle}` — without it the gate \
+                 is capped only by the per-bootstrap timer it already outlives"
+            );
+        }
+        assert!(
+            block.contains("let held = !timer_terminal_live_host_connected();"),
+            "the watchdog must read the GATE SIGNAL itself; a fallible state read \
+             defaulted to `still waiting` is how a hold survives an absence of evidence"
+        );
+    }
+
+    /// A CEILING MUST RELEASE, NOT TIGHTEN. Every `resume_overlay_*` latch that
+    /// `host_should_accept_input` requires false has to be cleared when the
+    /// ceiling fires — otherwise the release hands back a terminal the render
+    /// body immediately re-locks. (The 60 s timer sets `resume_overlay_timed_out`
+    /// and fires BEFORE the 90 s ceiling, so this is not hypothetical.)
+    #[test]
+    fn the_ceiling_release_clears_every_latch_the_input_gate_requires_false() {
+        let source = product(&shell_source());
+        let input_gate = slice_between(
+            &source,
+            "let host_should_accept_input = {",
+            "let input_enable_key",
+        );
+        let mut required_false: Vec<String> = Vec::new();
+        for fragment in input_gate.split("!resume_overlay_").skip(1) {
+            let name: String = fragment
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if fragment[name.len()..].starts_with("()") && !required_false.contains(&name) {
+                required_false.push(name);
+            }
+        }
+        assert!(
+            required_false.len() >= 2,
+            "expected the input gate to still require resume_overlay latches to be \
+             false; found {required_false:?} — if that changed, re-derive this lock"
+        );
+        let release = slice_between(
+            &source,
+            "ResumeGateTransition::ReleasedCeiling) {",
+            "let active_host_selected",
+        );
+        for name in &required_false {
+            assert!(
+                release.contains(&format!("ceiling_resume_overlay_{name}, false")),
+                "the ceiling release does not clear `resume_overlay_{name}`, which \
+                 `host_should_accept_input` requires false — the release would be \
+                 undone on the next render"
+            );
+        }
+        assert!(
+            release.contains("ceiling_terminal_live_host_connected, true")
+                && release.contains("clear_terminal_resume_notification")
+                && release.contains("terminal_set_input_enabled_script"),
+            "a ceiling release means: believe the session, drop the toast, let the \
+             user type. All three, or it is not a release."
+        );
+    }
+
+    /// A DEFERRAL DEFERS THE DECISION, NEVER THE TIMER. The failure timer is
+    /// armed once per bootstrap identity, so a `return` on the deferral path
+    /// destroyed the only ceiling that mount would ever get.
+    #[test]
+    fn the_resume_failure_timer_survives_a_deferral() {
+        let source = product(&shell_source());
+        let timer = slice_between(
+            &source,
+            "sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;",
+            "\"resume_timeout_cleared_inflight\"",
+        );
+        assert!(
+            timer.contains("REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS"),
+            "the deferral path lost its bound"
+        );
+        let deferral = slice_between(
+            timer,
+            "\"resume_timeout_deferred_after_output_progress\"",
+            "continue;",
+        );
+        assert!(
+            !deferral.contains("return;"),
+            "a deferral that returns consumes the mount's only ceiling — re-check \
+             instead, the deferral predicate measures from the attempt's FIRST output"
+        );
+    }
+
+    /// A PREDICATE THAT SAYS "THIS TOAST SHOULD NOT BE ON SCREEN" MUST TAKE IT
+    /// DOWN. Reading `terminal_session_resume_notification_should_stay_visible`
+    /// and then doing nothing left the 1.2 s slow toast up with nothing else
+    /// able to clear it.
+    #[test]
+    fn the_failure_timer_clears_a_notification_its_own_predicate_disowns() {
+        let source = product(&shell_source());
+        let timer = slice_between(
+            &source,
+            "sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;",
+            "\"resume_timeout_cleared_inflight\"",
+        );
+        let disowned = slice_between(timer, "if !still_waiting_for_resume {", "return;");
+        assert!(
+            disowned.contains("clear_terminal_resume_notification(state, &session_path)"),
+            "the timer read the predicate that disowns the toast and left it up"
+        );
+    }
+
+    /// A VEIL NEEDS A CLEARER THAT OUTLIVES ITS MESSENGER. The JS
+    /// `handoverPaintSuspended` mirror stops all visible paint and covers the
+    /// viewport; the only falling edge is sent from the terminal read loop, so a
+    /// loop that breaks while suspended leaves the cover up with nothing able to
+    /// lift it — the Rust gate's own 90 s ceiling never reaches the host.
+    #[test]
+    fn the_handover_veil_is_lifted_when_the_read_loop_exits() {
+        let source = product(&shell_source());
+        let exit = slice_between(
+            &source,
+            "if last_handover_paint_suspended {",
+            "let resume_overlay_effective_failed",
+        );
+        assert!(
+            exit.contains("TerminalJsCommand::SetHandoverPaintSuspended")
+                && exit.contains("suspended: false"),
+            "the read loop must lift the JS veil on its way out"
+        );
+        // ...and it has to be on the loop's EXIT path, not inside the tick that
+        // already sends the edge: the tick cannot run after a break.
+        let tick = slice_between(
+            &source,
+            "if js_ready && handover_paint_suspended != last_handover_paint_suspended {",
+            "let bridge_reads_paused",
+        );
+        assert!(
+            !tick.contains("if last_handover_paint_suspended {"),
+            "the exit lift was folded back into the tick, where a break bypasses it"
+        );
+    }
+
+    /// THE SELF-FEEDING GATE HAS A CEILING. The non-prompt wait's arm condition
+    /// includes `poisoned_by_retry`, and entering it sets both halves of that —
+    /// so it manufactures its own reason to stay while its only disarm is a
+    /// prompt text heuristic a streaming agent frame may never satisfy.
+    ///
+    /// The needle is the WHOLE conjunction, not just the call: a guard weakened
+    /// to `if false && !non_prompt_wait_should_hold(..)` would leave the call
+    /// site textually present while never releasing anything.
+    #[test]
+    fn the_non_prompt_wait_asks_the_ceiling_before_it_holds_the_terminal() {
+        let source = product(&shell_source());
+        let guard = "if retained_non_prompt_settled\n                                    && !non_prompt_wait_should_hold(";
+        let hold_ask = source
+            .find(guard)
+            .expect("the non-prompt wait no longer consults its ceiling on the settled path");
+        let hold_branch = source
+            .find("\"retained_non_prompt_surface_wait\",")
+            .expect("the non-prompt hold branch is findable");
+        assert!(
+            hold_ask < hold_branch,
+            "the ceiling must be asked BEFORE the branch that disables input, not after"
+        );
+        let release = slice_between(
+            &source,
+            "\"retained_non_prompt_surface_wait_released\"",
+            "\"retained_non_prompt_surface_wait\",",
+        );
+        assert!(
+            release.contains("terminal_live_host_connected, true")
+                && release.contains("enabled: true")
+                && release.contains("clear_terminal_resume_notification"),
+            "releasing the non-prompt wait means believing the session, enabling \
+             input and dropping the toast — a partial release is still a hostage"
         );
     }
 }
