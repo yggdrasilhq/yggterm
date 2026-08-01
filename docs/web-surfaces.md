@@ -657,6 +657,64 @@ filter.
   than showing the base64 blob; clicking a row navigates to the real URL normally.
 - Capped at `WEB_HISTORY_PAGE_LIMIT` entries so the `data:` URL stays bounded.
 
+## Collections — history organised into things worth keeping (2026-08-01)
+
+Spec of record: **`ychrome/docs/collections.md`**. Read its §Correction first —
+the verbs are written there as `ychrome collection …`, but the implementation
+lives HERE, because ychrome does not depend on `yggterm-core` and the store sits
+under `~/.yggterm/web-profiles/<profile>/`, beside the `history.jsonl` above.
+
+A **collection** is a Markdown file at
+`~/.yggterm/web-profiles/<profile>/collections/<id>.md`: frontmatter, prose
+notes, folders as `##` headings, items as list links. A **snapshot** is the same
+file with `kind: snapshot` — one object, one set of verbs, so promoting one is a
+field edit and not a migration.
+
+| concern | owner |
+| --- | --- |
+| what a collection FILE is (parse/render, never loses a link) | `yggterm_core::web_collection` |
+| where the files live, ids, atomic writes, dedupe + prune rules | `yggterm_core::web_collection_store` |
+| the `history.jsonl` reader — for the omnibox, the viewer AND the verbs | `yggterm_core::web_history` |
+| the `collection …` / `snapshot now` verbs, on BOTH binaries | `yggterm_server::web_collection_cli` |
+
+Shipped: **I1** (the format), **I2** (the store), **I3** (the verbs). Still open:
+I4 (the close hook and cadence chore that feed `snapshot now` the open tabs),
+I5 (import), I6/I7 (the rail, selection, drag-and-drop).
+
+Two rules carry the whole design, and both are enforced twice:
+
+- **An identical snapshot is not written.** Identity is the ITEM SET
+  (`snapshot_signature` — sorted unique URLs), never the file bytes: two
+  snapshots of the same tabs differ in `created_at` by construction, so a byte
+  comparison would answer "different" every time and an idle browser would
+  produce twenty-four snapshots a day instead of one. Reordering or retitling a
+  tab is not a new session; one URL more or fewer is.
+- **A collection is never pruned.** `plan_snapshot_prune` never puts a
+  non-snapshot in its prune list (it reports them under `protected_collections`,
+  so the guarantee is visible in the output), and the store's ONLY delete —
+  `CollectionStore::remove_snapshot` — re-reads the file's own `kind` immediately
+  before unlinking. There is no blanket `remove`, so a stale plan or a
+  hand-rolled list cannot reach past the guard. Defaults: 30 days, 200 per
+  profile, both overridable with `--max-age-days` / `--max-count`.
+
+Every decision takes `now_ms` (and, where a timestamp is rendered, the UTC
+offset) as an argument — the same rule `docs/automations.md` runs on, so the
+rules are exercised against fixed instants rather than against whatever time the
+suite happens to run at.
+
+`yggterm collection --help` (or `yggterm-headless collection --help`) prints the
+whole plane. Notes on two verbs:
+
+- **`export`** with no `--out` prints the Markdown to stdout, because the file
+  already IS the export format — a second serialisation would be a second source
+  of truth for what a collection says. `--as json` is a *view*, not the record.
+- **`open`** resolves the collection (or one folder, nested folders included) to
+  its ordered targets and stops there. There is no app-control command that
+  opens a URL into the tab-placement owner today — that owner is GUI-side — and
+  inventing a second placement path here is exactly what the spec forbids. The
+  rail in I6 calls this same resolver; until then the answer carries
+  `"placement": "unwired_until_i6"` rather than pretending.
+
 ## Renderer and security
 
 Each tab's page is a **native child webview** (wry `build_gtk` into the main
