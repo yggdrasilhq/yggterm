@@ -3269,6 +3269,14 @@ fn anchored_on_strip(anchor: Option<WebSurfaceChromeAnchor>) -> bool {
     anchor == Some(WebSurfaceChromeAnchor::Strip)
 }
 
+/// …and is it hanging off the RAIL? The other half of the same reading, written
+/// beside it so the two answers can never be derived from different rules.
+///
+/// Not `!anchored_on_strip(..)`: `None` is "no menu at all", which is neither.
+fn anchored_on_rail(anchor: Option<WebSurfaceChromeAnchor>) -> bool {
+    anchor == Some(WebSurfaceChromeAnchor::Rail)
+}
+
 /// The open ychrome-profile dropdown for a web surface.
 ///
 /// ONE of these for BOTH surfaces (check-all-surfaces law): the rail badge and
@@ -40996,12 +41004,59 @@ fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
 fn sidebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
     sidebar_autohide_pinned_flags(
         snapshot.alt_overlay_active,
-        snapshot.context_menu_row.is_some(),
+        panel_menu_open(snapshot, ChromeSlot::Tree),
         snapshot.tree_rename_path.is_some(),
         snapshot.pending_delete.is_some(),
         snapshot.sidebar_resizing,
         !snapshot.drag_paths.is_empty(),
     )
+}
+/// **Is a floating menu RAISED FROM this panel open right now?**
+///
+/// ONE owner for the question both auto-hidden panels have to ask, because a
+/// panel that collapses out from under the menu it just raised has aborted the
+/// very gesture that needed it. It was asked in ONE place before: the tree
+/// counted its row menu, and the rail counted NOTHING — so a right-click on a
+/// hover-revealed rail row had nothing holding the rail open, and moving the
+/// pointer toward the menu started the linger and collapsed the panel under it.
+///
+/// Ask by SLOT, never by side: the mirror ([`ChromeOrientation`]) moves both
+/// panels, and a menu belongs to the panel that raised it wherever that panel
+/// sits. A STRIP-anchored menu is deliberately absent from the rail's answer —
+/// the classic strip hangs over pure page, not over the rail, so it is not the
+/// rail's to hold ([`anchored_on_rail`]).
+fn panel_menu_open(snapshot: &RenderSnapshot, slot: ChromeSlot) -> bool {
+    panel_menu_open_flags(
+        slot,
+        // The cwd tree's row menu. Read through the SNAPSHOT's already-resolved
+        // slot, so a menu whose anchor row has gone does not pin a panel open
+        // (`ShellState::live_context_menu_row`).
+        snapshot.context_menu_row.is_some(),
+        // A contributed pane's row menu (yedit's Rename / Close). Contributed
+        // panes are rail-only, so there is no anchor to ask about.
+        snapshot.app_pane_context_menu.is_some(),
+        anchored_on_rail(snapshot.web_tab_context_menu.as_ref().map(|menu| menu.anchor)),
+        anchored_on_rail(
+            snapshot
+                .web_profile_switcher
+                .as_ref()
+                .map(|switcher| switcher.anchor),
+        ),
+    )
+}
+/// The mapping itself, pure so the parity lock can run it without a Dioxus
+/// runtime — the same `*_flags` shape the two pin predicates already use.
+fn panel_menu_open_flags(
+    slot: ChromeSlot,
+    tree_row_menu: bool,
+    rail_pane_menu: bool,
+    rail_tab_menu: bool,
+    rail_profile_menu: bool,
+) -> bool {
+    match slot {
+        ChromeSlot::Tree => tree_row_menu,
+        ChromeSlot::Rail => rail_pane_menu || rail_tab_menu || rail_profile_menu,
+    }
 }
 fn sidebar_autohide_pinned_flags(
     alt_overlay_active: bool,
@@ -41019,13 +41074,26 @@ fn sidebar_autohide_pinned_flags(
         || dragging
 }
 /// Hold the overlay metadata/settings rail open while a modal it launched owns
-/// the screen. Focus inside the rail is handled generically by
-/// `AutoHideSignals::focus_within`, not here.
+/// the screen, or while a menu one of its rows raised is up. Focus inside the
+/// rail is handled generically by `AutoHideSignals::focus_within`, not here.
+///
+/// The `context_menu_open` parameter is the SAME shape as the tree's
+/// ([`sidebar_autohide_pinned_flags`]) and comes from the same owner
+/// ([`panel_menu_open`]) — two panels, one answer to "does an open menu hold me
+/// open", so they cannot drift.
 fn rail_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
-    rail_autohide_pinned_flags(snapshot.alt_overlay_active, snapshot.theme_editor_open)
+    rail_autohide_pinned_flags(
+        snapshot.alt_overlay_active,
+        panel_menu_open(snapshot, ChromeSlot::Rail),
+        snapshot.theme_editor_open,
+    )
 }
-fn rail_autohide_pinned_flags(alt_overlay_active: bool, theme_editor_open: bool) -> bool {
-    alt_overlay_active || theme_editor_open
+fn rail_autohide_pinned_flags(
+    alt_overlay_active: bool,
+    context_menu_open: bool,
+    theme_editor_open: bool,
+) -> bool {
+    alt_overlay_active || context_menu_open || theme_editor_open
 }
 /// Which window edge an auto-hidden sidebar reveals from is `SidebarEdge`, and
 /// which panel is on which edge is [`ChromeOrientation`] — both owned by
@@ -111192,6 +111260,13 @@ fn terminal_eval_script_with_canvas_renderer(
         // — the very defect class (`pointer-events:none` made a handler
         // unreachable) the dismissal owner was written to remove — and the user
         // would be left with TWO menus and two stacked backdrops on screen.
+        //
+        // AN AUTO-HIDDEN SIDEBAR OR RAIL is the same class again, and was the
+        // one still missing: out of flow, its hover-revealed card floats INSIDE
+        // the full-width host rect, so every right-click on a revealed row was
+        // eaten here and no row menu could open. The whole list is
+        // `TERMINAL_SECONDARY_COVER_SELECTORS` — ONE owner, so the next cover
+        // is added in one place instead of to a literal buried in a JS string.
         const terminalSecondaryIsCoveredBySurface = (event) => {{
             try {{
                 if (
@@ -111201,7 +111276,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     return true;
                 }}
                 const target = event && event.target;
-                if (target && target.closest && target.closest('[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker], [data-yggterm-menu-backdrop], [data-context-menu]')) {{
+                if (target && target.closest && target.closest({TERMINAL_SECONDARY_COVER_SELECTORS:?})) {{
                     return true;
                 }}
             }} catch (_error) {{}}
@@ -114357,6 +114432,30 @@ fn terminal_stable_epoch_reveal_nudge_script(host_id: &str) -> String {
 /// else is yggterm chrome, where the platform menu is noise and stays suppressed.
 const NATIVE_CONTEXT_MENU_OWNER_SELECTORS: &str =
     "[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker], [data-document-editor]";
+
+/// Chrome that COVERS the terminal host and owns the right-click landing on it.
+///
+/// The sibling list to [`NATIVE_CONTEXT_MENU_OWNER_SELECTORS`], and a different
+/// question: that one asks "whose menu is this — the engine's or ours?", this
+/// one asks "whose menu is this — the terminal's or some other piece of OUR
+/// chrome's?". The terminal claims a secondary click by pure GEOMETRY
+/// (`pointerEventFallsWithinHost`), during the DOCUMENT CAPTURE phase, with
+/// `stopImmediatePropagation()` — so anything drawn over the host rect that is
+/// not in this list has its right-click eaten before the target phase ever
+/// runs, and its own `oncontextmenu` is unreachable code.
+///
+/// ★ AN AUTO-HIDDEN SIDEBAR IS ALWAYS SUCH A COVER. Hidden, a panel leaves the
+/// flow (`sidebar_panel_outer_style` ⇒ `position:absolute`) precisely so a
+/// hover-reveal never re-fits the xterm — which means the terminal host keeps
+/// the FULL window width and the revealed floating card sits geometrically
+/// INSIDE it. Docked, the same panel is in flow and the host rect starts after
+/// it, so geometry alone happened to give the right answer and hid the defect:
+/// right-clicking a row on a hover-revealed panel opened no row menu at all
+/// (user report; root-caused 2026-08-01). Named by PANEL, never by side — the
+/// mirror (`ChromeOrientation`) swaps which edge each one is on.
+const TERMINAL_SECONDARY_COVER_SELECTORS: &str = "[data-document-surface], [data-ws-overlay], \
+     [data-yggterm-web-picker], [data-yggterm-menu-backdrop], [data-context-menu], \
+     #yggterm-sidebar, [data-yggui-side-rail]";
 
 /// App-wide right-click policy: suppress the platform menu over yggterm chrome,
 /// ALLOW it over content that owns its own menu.
@@ -139347,9 +139446,115 @@ mod tests {
                 "sidebar pin {index} stopped holding the overlay open"
             );
         }
-        assert!(!rail_autohide_pinned_flags(false, false));
-        assert!(rail_autohide_pinned_flags(true, false));
-        assert!(rail_autohide_pinned_flags(false, true));
+        assert!(!rail_autohide_pinned_flags(false, false, false));
+        assert!(rail_autohide_pinned_flags(true, false, false));
+        assert!(rail_autohide_pinned_flags(false, false, true));
+    }
+    // ★ PIN PARITY. Both auto-hidden panels must answer "does a menu I raised
+    // hold me open" the SAME way. The rail used to answer "no menu can" — so a
+    // right-click on a hover-revealed rail row raised a menu with nothing
+    // holding the rail open, and the pointer moving toward that menu started
+    // the linger and collapsed the panel out from under it.
+    #[test]
+    fn autohide_both_panels_pin_on_their_own_menu() {
+        for slot in [ChromeSlot::Tree, ChromeSlot::Rail] {
+            let pinned = match slot {
+                ChromeSlot::Tree => sidebar_autohide_pinned_flags(false, true, false, false, false, false),
+                ChromeSlot::Rail => rail_autohide_pinned_flags(false, true, false),
+            };
+            assert!(pinned, "{slot:?} does not pin on its own open menu");
+        }
+    }
+    // …and each panel counts ITS OWN menus, not the other's.
+    // `panel_menu_open_flags` is the one owner of that mapping.
+    #[test]
+    fn panel_menu_open_maps_each_menu_to_the_panel_that_raised_it() {
+        assert!(!panel_menu_open_flags(
+            ChromeSlot::Tree,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!panel_menu_open_flags(
+            ChromeSlot::Rail,
+            false,
+            false,
+            false,
+            false
+        ));
+        // The cwd tree's row menu pins the TREE and nothing else.
+        assert!(panel_menu_open_flags(
+            ChromeSlot::Tree,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(
+            !panel_menu_open_flags(ChromeSlot::Rail, true, false, false, false),
+            "the cwd tree's row menu must not pin the RAIL open"
+        );
+        // Each of the rail's three menus pins the RAIL and nothing else.
+        for index in 0..3 {
+            let mut rail = [false; 3];
+            rail[index] = true;
+            assert!(
+                panel_menu_open_flags(ChromeSlot::Rail, false, rail[0], rail[1], rail[2]),
+                "rail menu {index} does not hold the rail open"
+            );
+            assert!(
+                !panel_menu_open_flags(ChromeSlot::Tree, false, rail[0], rail[1], rail[2]),
+                "rail menu {index} must not pin the TREE open"
+            );
+        }
+    }
+    // A STRIP-anchored menu hangs over pure page, not over the rail, so it is
+    // not the rail's to hold open. `anchored_on_rail` is the one reader of that
+    // meaning, beside `anchored_on_strip`; `None` is "no menu", never either.
+    #[test]
+    fn rail_anchor_reading_excludes_the_classic_strip() {
+        assert!(anchored_on_rail(Some(WebSurfaceChromeAnchor::Rail)));
+        assert!(!anchored_on_rail(Some(WebSurfaceChromeAnchor::Strip)));
+        assert!(!anchored_on_rail(None));
+        assert!(!anchored_on_strip(None));
+    }
+    // ★ THE REPORTED BUG (2026-08-01): right-clicking a row on a hover-revealed
+    // panel opened NO menu. An auto-hidden panel is out of flow, so the terminal
+    // host keeps the full window width and the revealed card floats INSIDE its
+    // rect — and the host's document-CAPTURE listener claims a secondary click
+    // by pure geometry, `stopImmediatePropagation()`s it, and the row's
+    // `oncontextmenu` never runs. Both panels must be in the cover list, by the
+    // identifiers that do not name a side (the mirror moves them).
+    #[test]
+    fn terminal_secondary_cover_list_includes_both_autohide_panels() {
+        for needle in [
+            "#yggterm-sidebar",
+            "[data-yggui-side-rail]",
+            "[data-yggterm-menu-backdrop]",
+            "[data-context-menu]",
+            "[data-document-surface]",
+        ] {
+            assert!(
+                TERMINAL_SECONDARY_COVER_SELECTORS.contains(needle),
+                "{needle} left the terminal's right-click cover list"
+            );
+        }
+        for side in ["left", "right"] {
+            assert!(
+                !TERMINAL_SECONDARY_COVER_SELECTORS.contains(side),
+                "the cover list must name panels, never sides — the mirror moves them"
+            );
+        }
+        // …and the guard must READ that list rather than carry its own literal.
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains(&format!(
+                "target.closest({TERMINAL_SECONDARY_COVER_SELECTORS:?})"
+            )),
+            "terminalSecondaryIsCoveredBySurface stopped reading the shared cover list"
+        );
     }
     // The geometry eval SAMPLES both auto-hide edges and the titlebar, and
     // reports each as a `[px, pinned]` claim keyed on the element's REVEALED
