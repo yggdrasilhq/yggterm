@@ -227,6 +227,25 @@ symptoms, and the last two are strongly suspected to share a root:
 
 ## Standing traps / other open bugs
 
+- **⚠ TOOLING: `app state`'s DOM debug snapshot times out on jojo, so every DOM
+  probe field is unreadable there** (found 2026-08-01 while verifying the yedit
+  gutter). `dom_debug_snapshot_timeout` comes back on BOTH a shadow client and
+  the user's own GUI, and it takes the pre-existing `document_editor_count` with
+  it, so this is not new and not caused by any one lane. The cost is that a
+  field wired into the snapshot cannot be verified through the documented
+  instrument — the gutter's `document_wrap_gutters` had to be proven through
+  `dom-eval` instead. **Fix the timeout, or `app state` quietly stops being the
+  probe the field guide says it is.**
+
+- **⚠ TOOLING: `server app dom-eval` ignores `--client` / `--pid` placed before
+  the script.** It takes the script positionally at `args[3]`, so
+  `dom-eval --client shadow '<script>'` silently evaluates the STRING
+  `--client` — a successful-looking eval of the wrong thing, which is the
+  lie-of-success shape. The global override works only with the script FIRST.
+  Either parse the flags or refuse a script that looks like a flag; the skill's
+  example should be reordered either way.
+
+
 - **★★ "YCHROME SUDDENLY QUIT TO TERMINAL" — a fleet binary deploy arms a
   refuse-exit landmine (user-reported 2026-07-30 night; live-diagnosed and
   CURED on the live host, the DESIGN fix still owed).** Deploying a new
