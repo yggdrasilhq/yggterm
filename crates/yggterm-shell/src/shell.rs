@@ -191,7 +191,8 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
-    SessionPreviewBlock, SessionRemovalEvidence, SessionRenderedSection, SessionSource,
+    RemoteRuntimeAfterRemoval, SessionPreviewBlock, SessionRemovalEvidence,
+    SessionRenderedSection, SessionSource,
     SessionTeardownProcess, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
     WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
@@ -219,7 +220,8 @@ use yggterm_server::{
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
-    verify_session_removal, wait_for_app_control_response,
+    remote_agent_row_runtime_after_removal, verify_session_removal,
+    wait_for_app_control_response,
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
@@ -8548,6 +8550,16 @@ mod teardown_honesty_locks {
             // And the answer is the verdict, not the round trip.
             "\"accepted\": verdict.verified,",
             "\"verified\": verdict.verified,",
+            // The OTHER machine is asked. A `remote-cc://` row's agent runs
+            // under the remote host's own daemon, built to outlive ssh drops,
+            // so reaping the local ssh client proves nothing about it — and
+            // judging the teardown on local facts alone is how `verified:true`
+            // came to be printed over a still-running remote agent.
+            "remote_agent_row_runtime_after_removal(",
+            // …its answer reaches the verdict…
+            "remote_runtime_after,",
+            // …and the ssh round trip stays OFF the render loop.
+            "\"app_control_remove_session_remote_liveness\",",
         ] {
             assert!(
                 arm.contains(needle),
@@ -73709,33 +73721,39 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::RemoveSession { session_path } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
-            let (pending, close_redirect_target, runtime_pid_before) = state.with_mut(|shell| {
-                let pending = app_control_remove_session_pending(shell, &session_path);
-                // Read the PTY pid BEFORE the removal: afterwards the row is
-                // gone and nothing can say what the session was running.
-                // `None` on a live row is not "no processes" — it is "nobody
-                // here can see the runtime", which is the preserved-owner
-                // (older daemon) case and must be answered as unverifiable.
-                let runtime_pid_before = shell
-                    .server
-                    .live_sessions()
-                    .into_iter()
-                    .find(|session| session.session_path == session_path)
-                    .and_then(|session| session.terminal_process_id)
-                    .map(|pid| pid as i32);
-                let close_redirect_target = shell.close_redirect_target_for_pending(&pending);
-                shell.prepare_live_session_close_locally(
-                    &pending,
-                    "app_control_live_session_close_preflight",
-                );
-                if let Some(target) = close_redirect_target.as_ref() {
-                    shell.apply_viewport_history_entry_locally(
-                        target,
-                        "app_control_live_session_close_redirect",
+            let (pending, close_redirect_target, runtime_pid_before, remote_machines_for_removal) =
+                state.with_mut(|shell| {
+                    let pending = app_control_remove_session_pending(shell, &session_path);
+                    // Read the PTY pid BEFORE the removal: afterwards the row is
+                    // gone and nothing can say what the session was running.
+                    // `None` on a live row is not "no processes" — it is "nobody
+                    // here can see the runtime", which is the preserved-owner
+                    // (older daemon) case and must be answered as unverifiable.
+                    let runtime_pid_before = shell
+                        .server
+                        .live_sessions()
+                        .into_iter()
+                        .find(|session| session.session_path == session_path)
+                        .and_then(|session| session.terminal_process_id)
+                        .map(|pid| pid as i32);
+                    let close_redirect_target = shell.close_redirect_target_for_pending(&pending);
+                    shell.prepare_live_session_close_locally(
+                        &pending,
+                        "app_control_live_session_close_preflight",
                     );
-                }
-                (pending, close_redirect_target, runtime_pid_before)
-            });
+                    if let Some(target) = close_redirect_target.as_ref() {
+                        shell.apply_viewport_history_entry_locally(
+                            target,
+                            "app_control_live_session_close_redirect",
+                        );
+                    }
+                    (
+                        pending,
+                        close_redirect_target,
+                        runtime_pid_before,
+                        shell.server.remote_machines().to_vec(),
+                    )
+                });
             let teardown_census = session_teardown_census(runtime_pid_before);
             let session_path_for_task = session_path.clone();
             let close_redirect_target_for_task = close_redirect_target.clone();
@@ -73783,12 +73801,39 @@ async fn process_pending_app_control_requests(
                         sleep(Duration::from_millis(SESSION_TEARDOWN_SETTLE_INTERVAL_MS)).await;
                         still_running = surviving_teardown_processes(&teardown_census);
                     }
+                    // The far side of the hop. A `remote-cc://` / `remote-session://`
+                    // row's agent runs under the OTHER machine's daemon and is
+                    // built to outlive ssh drops, so reaping the local ssh
+                    // client proves nothing about it. Ask the owning machine
+                    // before calling this clean.
+                    //
+                    // OFF the UI thread: this is an ssh round trip, and a
+                    // blocking one on the render loop is a bug in its own right
+                    // (AGENTS.md — synchronous IPC on the UI thread). It costs
+                    // nothing for a local row, which resolves to
+                    // `NotApplicable` without touching the network.
+                    let probe_path = session_path.clone();
+                    let remote_runtime_after = run_dedicated_interactive_request_io(
+                        "app_control_remove_session_remote_liveness",
+                        &home,
+                        move || {
+                            Ok(remote_agent_row_runtime_after_removal(
+                                &remote_machines_for_removal,
+                                &probe_path,
+                            ))
+                        },
+                    )
+                    .await
+                    // A probe we could not even dispatch is unverifiable, which
+                    // is a refusal — never a pass.
+                    .unwrap_or(RemoteRuntimeAfterRemoval::Unverifiable);
                     let verdict = verify_session_removal(&SessionRemovalEvidence {
                         row_was_live: pending.live_session_close,
                         runtime_pid_before,
                         observed_before: &teardown_census,
                         still_running_after: &still_running,
                         row_still_listed,
+                        remote_runtime_after,
                     });
                     let active_session_path = state.with_mut(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
@@ -73821,6 +73866,7 @@ async fn process_pending_app_control_requests(
                             "live_session_close": pending.live_session_close,
                             "row_still_listed": row_still_listed,
                             "runtime_process_id": runtime_pid_before,
+                            "remote_runtime_after": format!("{remote_runtime_after:?}"),
                             "reaped_processes": session_teardown_process_values(&verdict.reaped),
                             "live_processes": session_teardown_process_values(&verdict.still_running),
                             "redirect_target": close_redirect_target
