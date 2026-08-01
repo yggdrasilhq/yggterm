@@ -275,30 +275,65 @@ symptoms, and the last two are strongly suspected to share a root:
 ## Standing traps / other open bugs
 
 - **⭐ GATE BUG #2 — "Restoring Remote Terminal" holds a BLANK viewport over a
-  session that is already running (user screenshot, 2026-08-01).** A DIFFERENT
-  gate from the handover veil fixed in 2.12.23; do not assume that fix covers
-  this. The toast says *"The viewport will switch in once the session is truly
-  interactive"* while the metadata pane beside it reads **`Status: running ·
-  working`**, PTY 174x65, a live PID — i.e. the session IS interactive and the
-  gate does not believe it.
-  **Where to look:** the toast and the blank viewport hang off
-  `timer_terminal_live_host_connected()` (`shell.rs`, the
-  `REMOTE_TERMINAL_RESUME_SLOW_MS` timer near the "Restoring Remote Terminal"
-  literal). That predicate — not the daemon's report of the session — decides
-  whether the user sees their terminal.
-  ⚠ **Suspect the instrument, not the session.** This codebase has been bitten
-  twice by a readiness field whose NAME did not mean what it appeared to
-  (`input_enabled` meant "this host holds stdin", renamed to
-  `host_stdin_enabled` / `foreground_input_ready`). Read what SETS
-  `terminal_live_host_connected` before theorising.
-  **Context that may matter:** the screenshot has **Client 2.12.23 / daemon
-  2.12.22 (older than this client)** and the session is `remote-cc://dev/…` with
-  2 preserved owners — so a readiness signal that a remote-CC session on an
-  OLDER owning daemon never emits is a live candidate, adjacent to the
-  owning-daemon resolution bug fixed in 2.12.23.
-  **The user's words: "GATE BUG".** Same family as the veil: a gate waiting on a
-  condition that is already true, or that can never become true, while showing
-  the user nothing.
+  session that is already running. ROOT-CAUSED AND FIXED IN CODE 2026-08-01
+  (`lane/dev/gate-bugs`), NOT YET LIVE-VERIFIED.** A DIFFERENT gate from the
+  handover veil fixed in 2.12.23. The toast said *"The viewport will switch in
+  once the session is truly interactive"* while the metadata pane beside it read
+  **`Status: running · working`**, PTY 174x65, a live PID.
+
+  **The root cause is not the predicate. It is that the ceiling was attached to
+  the wrong thing.** `terminal_live_host_connected` starts false for every
+  remote resume and is the client's belief that the session is interactive;
+  while it is false the mount disables input, keeps the toast up, and one
+  recovery path `terminal_reset_command`s the viewport to blank on the way in.
+  Its only ceiling was the 60 s `REMOTE_TERMINAL_RESUME_FAIL_MS` timer, and that
+  timer is armed **once per BOOTSTRAP IDENTITY** — while the gate is re-armed
+  from **inside the terminal read loop** (retained-empty-surface recovery,
+  dead-resume-instruction recovery, the non-prompt wait, the post-write-error
+  retry), none of which change the bootstrap identity. **Every re-arm after the
+  first was uncapped.** Falsified along the way: this is not a signal a remote-CC
+  session on an older daemon fails to emit — jojo's own traces show the identical
+  session kind reaching `attach_ready` in ~1 s, repeatedly, across the daemon
+  version split. The gate is version-blind; it is the *hold* that had no bound.
+
+  **Four holes, all closed, `crate::resume_gate` now owning the decisions:**
+  1. **No ceiling on the gate itself.** A watchdog now samples the gate on its
+     own wall clock (2 s poll, 90 s continuous-hold ceiling) and releases it —
+     believe the session, drop the toast, enable input.
+  2. **The 60 s timer's deferral consumed the ceiling.** `deferred_for_output_
+     progress` did `return`, and no replacement timer is ever armed for that
+     mount. It now re-checks (bounded by
+     `REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS`) instead of dying.
+  3. **The timer read "this toast should not be visible" and did nothing.** With
+     `still_waiting_for_resume == false` it silently no-oped, leaving the 1.2 s
+     slow toast up with nothing else able to take it down. It now clears it.
+  4. **The one wall-clock ceiling on this path made the gate STRICTER.**
+     `resume_overlay_timed_out` is set at 60 s and every branch of
+     `host_should_accept_input` requires it false, so the "ceiling" permanently
+     force-disabled input. The 90 s release now clears it and
+     `resume_overlay_failed`, and a lock derives that requirement from the input
+     gate's own text so a new latch cannot be added to one side only.
+
+  **Two sibling gates of the same shape, also fixed:** the **non-prompt wait**
+  (`retained_remote_surface_should_wait_for_prompt_ready`) is SELF-FEEDING — its
+  arm includes `poisoned_by_retry` and entering it sets both halves — and once
+  its two recovery budgets were spent it re-raised "Restoring Remote Terminal"
+  every 120 ms with input disabled forever, disarmed only by a prompt TEXT
+  heuristic a streaming agent frame may never satisfy; it now releases
+  (`NON_PROMPT_WAIT_MAX_HOLD_MS`, 30 s). And the JS **handover veil** mirror is
+  cleared only by the terminal read loop, so a loop that breaks while suspended
+  left an opaque cover over the viewport that the Rust gate's own 90 s ceiling
+  could never reach; the loop now lifts it on exit.
+
+  ⚠ **Not live-verified.** 17 mutations proven red across `resume_gate::tests`
+  and `shell::resume_gate_wiring_locks`; `cargo test -p yggterm-shell --lib` is
+  green at 1783. After deploy, confirm on jojo by grepping the trace for
+  `terminal_mount/resume_gate_ceiling` (every hold edge is traced with its
+  `held_for_ms` and `hold_ceiling_ms`), and for
+  `retained_non_prompt_surface_wait_released` /
+  `resume_timeout_cleared_stale_notification` /
+  `handover_paint_resumed_on_read_loop_exit`. A `released_ceiling` transition in
+  normal use is itself a bug report: it means some path held the gate for 90 s.
 
 
 - **⛔⛔ PRE-REWRITE GIT LINEAGE — read before merging ANY old branch/worktree
