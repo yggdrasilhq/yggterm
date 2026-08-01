@@ -108803,16 +108803,24 @@ fn terminal_eval_script_with_canvas_renderer(
             }}, waitMs);
         }};
         const requestVisiblePaint = (forceFullRefresh = false) => {{
-            // Daemon handover: every repaint here is a full-window blit on a
-            // software-GL host, and the frame it would present is the re-resume
-            // churn behind the veil. Drop the request outright — the resume path
-            // repaints from the daemon's own bytes.
-            if (handoverPaintSuspended) {{
-                return;
-            }}
+            // A full-refresh DEMAND is latched before anything can drop the
+            // request, because the latch is the only thing that survives
+            // coalescing. This assignment used to sit BELOW the suspension
+            // return, which meant a suspended host DESTROYED every full-refresh
+            // it was asked for instead of deferring it — see the suspension
+            // note below.
             pendingVisiblePaintForceFullRefresh = Boolean(
                 pendingVisiblePaintForceFullRefresh || forceFullRefresh
             );
+            // Daemon handover: every repaint here is a full-window blit on a
+            // software-GL host, and the frame it would present is the re-resume
+            // churn behind the veil. Drop the FRAME — never the demand: the
+            // resume path (`set_handover_paint_suspended` -> false) is the one
+            // and only site that repaints this host afterwards, and it now does
+            // a full redraw of the client's own buffer.
+            if (handoverPaintSuspended) {{
+                return;
+            }}
             if (visiblePaintFramePending) {{
                 scheduleVisiblePaintRecovery(pendingVisiblePaintForceFullRefresh, 0);
                 return;
@@ -113323,10 +113331,33 @@ fn terminal_eval_script_with_canvas_renderer(
                         message: `handover_paint_${{nextSuspended ? 'suspended' : 'resumed'}} host=${{hostId}}`
                     }});
                     if (!nextSuspended) {{
-                        // Resume through the NORMAL path: one paint of whatever the
-                        // read loop has since written. Never a daemon-screen replay
-                        // (field guide §5 — it collapses scrollback).
-                        requestVisiblePaint(false);
+                        // THE VEIL OWES A FULL REDRAW (user-reported 2026-08-01:
+                        // "Claude Code ALWAYS starts with a broken bottom", plus
+                        // glyph corruption on switch-in).
+                        //
+                        // While suspended this host did NO visible paint at all,
+                        // for up to `suspend_ceiling_ms` (90 s). Every row the
+                        // read loop wrote in that window landed in the buffer
+                        // with its damage already consumed, so `requestVisiblePaint(false)`
+                        // — which is what used to run here — repaints only what
+                        // xterm still believes is dirty and presents LESS than
+                        // the client holds. That is the broken bottom, and it is
+                        // deterministic because the gate arms on every mount.
+                        // The glyph half is the same line: the atlas heal lives
+                        // inside the forced-refresh branch, so a non-forced
+                        // resume also skips `clearTerminalTextureAtlas()` and
+                        // paints switch-in cells against a stale WebGL atlas.
+                        //
+                        // `redrawTerminal` IS the repaint the user performs by
+                        // hand to fix this ("a TUI refresh fixes it every time"):
+                        // atlas clear + `term.refresh(0, rows-1)` over the
+                        // CLIENT's own buffer. It is emphatically NOT a
+                        // daemon-screen replay (field guide §5 — that collapses
+                        // scrollback and is destructive), and it is NOT gated on
+                        // output silence, because an agent CLI is never silent
+                        // and this is not speculative correction: it is the
+                        // settle of a window WE blanked.
+                        redrawTerminal('handover-paint-resume');
                     }}
                 }}
             }} else if (message.kind === "redraw") {{
@@ -160977,7 +161008,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
         assert!(
             script.contains(
-                "            if (handoverPaintSuspended) {\n                return;\n            }\n            pendingVisiblePaintForceFullRefresh = Boolean("
+                "            if (handoverPaintSuspended) {\n                return;\n            }\n"
             ),
             "the visible-paint scheduler must drop requests while paint is suspended"
         );
@@ -160985,6 +161016,88 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // animation, no spinner, no timer.
         assert!(script.contains("veil.className = 'yggterm-handover-veil';"));
         assert!(!script.contains("yggterm-handover-veil-spin"));
+    }
+
+    /// THE VEIL MAY DROP FRAMES, NEVER THE DEMAND (user-reported 2026-08-01:
+    /// "Claude Code ALWAYS starts with a broken bottom", plus glyph corruption
+    /// on switch-in; the suspension was live-traced on guihost 2.12.22 holding a
+    /// terminal unpainted for 91 s with no daemon update in flight).
+    ///
+    /// `pendingVisiblePaintForceFullRefresh` is the ONLY thing that carries a
+    /// full-refresh demand across coalescing. It used to be assigned BELOW the
+    /// suspended early-return, so a suspended host destroyed every demand it
+    /// was handed. Red-proven by swapping the two statements back.
+    #[test]
+    fn a_suspended_host_defers_a_full_refresh_demand_instead_of_destroying_it() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let funnel = "const requestVisiblePaint = (forceFullRefresh = false) => {";
+        let funnel_at = script
+            .find(funnel)
+            .expect("the visible-paint funnel must exist");
+        let body = &script[funnel_at..];
+        let latch_at = body
+            .find("pendingVisiblePaintForceFullRefresh = Boolean(")
+            .expect("the funnel must latch the full-refresh demand");
+        let suspended_at = body
+            .find("if (handoverPaintSuspended) {")
+            .expect("the funnel must still drop the FRAME while suspended");
+        assert!(
+            latch_at < suspended_at,
+            "the full-refresh demand must be latched BEFORE the suspension can \
+             return, or a repaint owed during the veil is silently destroyed and \
+             the resume presents less than the client holds"
+        );
+    }
+
+    /// THE RESUME REPAINTS EVERYTHING (same report).
+    ///
+    /// A suspended host does no visible paint for up to the 90 s ceiling, so on
+    /// resume every row on screen is potentially stale and xterm's own damage
+    /// tracking cannot know it. The resume must therefore run the same repaint
+    /// the user performs by hand — `redrawTerminal`, which clears the WebGL
+    /// glyph atlas and refreshes every row of the CLIENT's buffer — and must
+    /// NOT settle for `requestVisiblePaint(false)`, which repaints only what
+    /// xterm still believes is dirty. Red-proven by restoring that call.
+    #[test]
+    fn a_handover_paint_resume_redraws_the_whole_client_buffer() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let handler_at = script
+            .find(r#"} else if (message.kind === "set_handover_paint_suspended") {"#)
+            .expect("the veil command handler must exist");
+        let handler = &script[handler_at..];
+        let handler_end = handler
+            .find(r#"} else if (message.kind === "redraw") {"#)
+            .expect("the handler chain must continue past the veil command");
+        let handler = &handler[..handler_end];
+        assert!(
+            handler.contains("redrawTerminal('handover-paint-resume');"),
+            "resuming from the veil must redraw the whole client buffer"
+        );
+        assert!(
+            !handler.contains("requestVisiblePaint(false);"),
+            "a damage-tracked partial paint cannot settle a window in which the \
+             host painted nothing — that IS the broken bottom"
+        );
+        // The redraw primitive it leans on must keep carrying the atlas heal:
+        // the glyph-corruption half of the same report is cells painted against
+        // a stale WebGL atlas after a switch-in that never forced a refresh.
+        let redraw_at = script
+            .find("const redrawTerminal = (reason = 'manual') => {")
+            .expect("the redraw primitive must exist");
+        let redraw_body = &script[redraw_at..];
+        let atlas_at = redraw_body
+            .find("clearTerminalTextureAtlas();")
+            .expect("redrawTerminal must clear the glyph atlas");
+        let refresh_at = redraw_body
+            .find("term.refresh(0, Math.max(0, term.rows - 1));")
+            .expect("redrawTerminal must refresh every row");
+        assert!(
+            atlas_at < refresh_at,
+            "the atlas must be cleared BEFORE the refresh rebuilds glyphs, or the \
+             resume repaints against the stale atlas it was meant to heal"
+        );
     }
 
     #[test]
