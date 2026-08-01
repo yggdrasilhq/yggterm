@@ -25,6 +25,13 @@ pub use web_collection_cli::{run_web_collection_cli, web_collection_usage_block}
 // been a second encoding of one concept; there is now one owner and both
 // binaries route to it.
 mod app_control_web_cli;
+// THE `web-import …` verb plane — history and bookmarks out of other browsers.
+// A thin shell over `yggterm_core::browser_import`; every decision (epoch,
+// copy-then-open, dedupe) belongs to the library so the GUI, ychrome and the
+// future `collection import` arm all reach the same behaviour. Owned once for
+// both binaries, like the automation and web planes beside it.
+mod browser_import_cli;
+pub use browser_import_cli::{browser_import_usage_block, run_browser_import_cli};
 pub mod app_declare;
 mod attach;
 mod clipboard_sweep;

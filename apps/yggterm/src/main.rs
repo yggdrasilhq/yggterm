@@ -1374,6 +1374,15 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "collection" {
         return yggterm_server::run_web_collection_cli(&args[1..]);
     }
+    // Browser import — local file work, so it is matched before anything that
+    // could need a daemon or a GUI. Same ONE-owner rule as the automation arm
+    // above: route, never inline a verb.
+    if args.first().is_some_and(|arg| arg == "web-import") {
+        return yggterm_server::run_browser_import_cli(&args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "web-import" {
+        return yggterm_server::run_browser_import_cli(&args[1..]);
+    }
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
