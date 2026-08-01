@@ -907,6 +907,25 @@ Acceptance gate 12.
   bogus-name` was refused (name-gated). A grim capture showed the shadow's own
   full viewport. This is the recipe the gate-11 / gate-16 live proofs now build on
   (both need to aim a verb at a specific view client).
+  **✅ USABLE FROM INSIDE A YGGTERM SESSION AGAIN (2026-08-01).** For a while it
+  was not, and nobody noticed because the launcher works fine from a clean login
+  shell: `scripts/shadow-client.sh` defaulted through `YGGTERM_BIN`, which the
+  daemon exports into every PTY it owns as **its own executable**. In any
+  daemon-owned row that names `yggterm-headless`, so the script launched a build
+  with no GUI and got `this yggterm build only supports server subcommands`; on a
+  hot-restarted daemon the exported value is `…/yggterm-headless (deleted)` (it
+  comes from `/proc/self/exe`) and the script chased a path that names no file.
+  Every in-session agent hit this, and the only surface left to them was the
+  user's live GUI — which is the failure mode the shadow client and
+  `docs/presentation-policy.md` both exist to prevent, so the cost was paid in
+  other lanes declining to live-verify at all. Resolution now has one owner,
+  `scripts/lib/gui-binary.sh`, which probes a candidate's own `--help` for a
+  GUI-only command (`--version` cannot tell the builds apart — both print a bare
+  number) and refuses a headless build by name. **Override with
+  `YGGTERM_GUI_BIN`, never `YGGTERM_BIN`.** Locked by
+  `check_gui_binary_resolution_contract` in
+  `scripts/check_architecture_contracts.py`, which also fails if the two Rust
+  help printers stop disagreeing about `install` and thereby blind the probe.
 - Both clients read the **same daemon truth** (Phase-2 doctrine: daemon = truth,
   view client = disposable); the shadow adds a view, never a second source of
   state.
