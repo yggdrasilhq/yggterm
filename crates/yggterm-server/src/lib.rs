@@ -13,6 +13,11 @@ mod automation_cli;
 // record cannot grow a dependency on how any one platform spells a schedule.
 pub mod automation_units;
 pub use automation_cli::{automation_usage_block, run_automation_cli};
+// THE `collection …` / `snapshot now` verb plane, owned once for BOTH binaries.
+// Spec: ychrome/docs/collections.md (I3). The store and every decision it makes
+// live in yggterm-core; this is argv and a clock.
+mod web_collection_cli;
+pub use web_collection_cli::{run_web_collection_cli, web_collection_usage_block};
 // THE `server app web …` CLI, owned once for BOTH binaries. It lived in
 // apps/yggterm/src/main.rs, which made the whole verb plane answer
 // "unsupported app control command: web" on yggterm-headless — the binary
