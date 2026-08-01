@@ -3,7 +3,7 @@ name = "yggui-contract"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "GPL-3.0-or-later"
+license.workspace = true
 
 [dependencies]
 serde.workspace = true
