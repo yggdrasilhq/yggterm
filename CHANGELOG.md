@@ -37,6 +37,25 @@ This file tracks user-visible changes in `yggterm`.
   the collections it protected so you can see that rather than take it on
   trust. Promoting a snapshot you want to keep is one verb and changes one
   line in the file.
+- **New: bring your history and bookmarks in from your other browsers.**
+  `yggterm-headless web-import browsers` lists what is installed (Chrome, Brave,
+  Vivaldi, Chromium, Helium, Edge, Firefox, LibreWolf, Zen, Waterfox), `…
+  web-import profiles --browser <id>` lists that browser's profiles, and `…
+  web-import run --browser <id>` imports one. History arrives as visits in your
+  timeline, in the right place in it, so the history page still opens on what
+  you did most recently. Bookmarks arrive as one collection with the folders you
+  filed them into, still nested. Running it again is safe and is how you pick up
+  what the browser has done since — nothing is doubled, and nothing you have
+  edited in the collection is moved. `--dry-run` tells you what it would take
+  without writing anything.
+
+  The dates are the part worth trusting: Chromium counts from 1601 and Firefox
+  from 1970, and getting that wrong would file a decade of browsing under the
+  year 2390 while looking perfectly ordinary. Both are converted through one
+  guarded path that refuses any date that could not be real. Your browser
+  profile is never opened for writing and never even opened in place — the
+  import reads a private copy and deletes it, so it works while that browser is
+  running.
 
 ## 2.12.22
 
