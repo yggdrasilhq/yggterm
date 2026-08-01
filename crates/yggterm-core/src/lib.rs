@@ -38,7 +38,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use titles::settings_ready as litellm_settings_ready;
-pub use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
+pub use yggui_contract::{
+    ChromeOrientation, ChromeSlot, SidebarEdge, UiTheme, YgguiThemeColorStop, YgguiThemeSpec,
+};
 
 pub use agent_cli::{
     AGENT_CLIS, AgentCliDescriptor, AgentStoreEntry, CODEX_FAMILY, RecordedStoreLiteral,
@@ -390,6 +392,12 @@ pub struct AppSettings {
     pub show_tree: bool,
     pub show_settings: bool,
     pub auto_hide_titlebar: bool,
+    /// Which side of the window each half of the app chrome sits on. THE single
+    /// source of truth for "which side is the sidebar on?" — every surface asks
+    /// this value a question rather than re-testing a boolean, so the tree, the
+    /// rail, their titlebar triggers, their resize grips and their reveal
+    /// directions can never disagree about the mirror.
+    pub chrome_orientation: ChromeOrientation,
     pub window_maximized: bool,
     pub tree_width: f32,
     /// Width of the right metadata/settings rail, in px. Independently draggable
@@ -460,6 +468,7 @@ impl Default for AppSettings {
             show_tree: true,
             show_settings: false,
             auto_hide_titlebar: false,
+            chrome_orientation: ChromeOrientation::natural(),
             window_maximized: false,
             tree_width: 300.0,
             rail_width: 292.0,
@@ -1112,6 +1121,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.auto_hide_titlebar =
             serde_json::from_value(value.clone()).context("failed to parse auto_hide_titlebar")?;
     }
+    if let Some(value) = object.get("chrome_orientation") {
+        settings.chrome_orientation =
+            serde_json::from_value(value.clone()).context("failed to parse chrome_orientation")?;
+    }
     if let Some(value) = object.get("window_maximized") {
         settings.window_maximized =
             serde_json::from_value(value.clone()).context("failed to parse window_maximized")?;
@@ -1242,6 +1255,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "show_tree": settings.show_tree,
         "show_settings": settings.show_settings,
         "auto_hide_titlebar": settings.auto_hide_titlebar,
+        "chrome_orientation": settings.chrome_orientation,
         "window_maximized": settings.window_maximized,
         "tree_width": settings.tree_width,
         "rail_width": settings.rail_width,
@@ -3039,6 +3053,7 @@ mod tests {
         original.show_tree = false;
         original.show_settings = true;
         original.auto_hide_titlebar = true;
+        original.chrome_orientation = ChromeOrientation::mirrored();
         original.window_maximized = true;
         original.tree_width = 411.5;
         original.rendered_font_size = 11.5;
@@ -3266,6 +3281,31 @@ mod tests {
             serialize_settings_value(&settings).get("auto_hide_titlebar"),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[test]
+    fn settings_default_to_the_natural_chrome_orientation() {
+        // A settings file written before the mirror existed has no
+        // `chrome_orientation` key at all, and must read as tree-left.
+        let parsed = parse_settings_value(&serde_json::json!({ "show_tree": true }))
+            .expect("settings should parse");
+        assert!(!parsed.chrome_orientation.is_mirrored());
+        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Tree), SidebarEdge::Left);
+        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Rail), SidebarEdge::Right);
+    }
+
+    #[test]
+    fn settings_round_trip_the_mirrored_chrome_orientation() {
+        let mut settings = AppSettings::default();
+        settings.chrome_orientation = ChromeOrientation::mirrored();
+        let encoded = serialize_settings_value(&settings);
+        assert_eq!(
+            encoded.get("chrome_orientation"),
+            Some(&serde_json::json!({ "mirrored": true }))
+        );
+        let parsed = parse_settings_value(&encoded).expect("settings should parse");
+        assert_eq!(parsed.chrome_orientation, ChromeOrientation::mirrored());
+        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Tree), SidebarEdge::Right);
     }
 
     #[test]
