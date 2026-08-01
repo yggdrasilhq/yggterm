@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.12.22
+
+- **Fixed: video judder in the browser.** A YouTube video lurching and dropping
+  frames turned out not to be compositing at all. WebKitGTK decodes through
+  GStreamer, which loads both the hardware (VA) and software (ffmpeg) decoders
+  and picks between them by **rank** — and nothing was ranking the hardware ones
+  up. Measured on the live host with a video playing: both decoders mapped into
+  the video process while it burned a steady 58–61% of one CPU core. The
+  hardware decoders are now ranked first by default.
+
+- **New: `Ctrl+Shift+C` copies the current page's address**, and says so. It
+  copies the address of the page you are actually on — not whatever is typed in
+  the address bar, which may be half-finished or a search you never ran. A
+  clipboard write is invisible, so a silent copy is indistinguishable from a key
+  that did nothing; you now get a notification naming the URL that was taken. In
+  a terminal `Ctrl+Shift+C` still copies the selection, exactly as before: these
+  browser keys only exist while a page has the keyboard.
+
+- **Internal, but it protects you: yggterm now has one sanctioned set of display
+  defaults per platform.** Which display backend, whether GL is real, whether
+  frames reach the screen zero-copy, and how video is decoded are now a single
+  table rather than a decision scattered across three functions that each
+  deferred to whatever environment variable it happened to find. This is what
+  stops a session from silently coming back as XWayland with software rendering
+  after somebody tests something.
+
+
 ## 2.12.21
 
 - **New: you can put the sidebars on the other side.** Settings → Window Chrome
