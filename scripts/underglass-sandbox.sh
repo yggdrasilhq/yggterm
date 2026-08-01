@@ -85,13 +85,15 @@ DISPLAY_FILE="$RUN_DIR/wayland-display"
 SWAY_PID_FILE="$RUN_DIR/sway.pid"
 CLIENT_PID_FILE="$RUN_DIR/client.pid"
 
-# ⚠ Daemon-owned rows export YGGTERM_BIN=<yggterm-headless> (pending-bugs:
-# "shadow-client.sh is broken for every in-session agent"). A headless binary
-# cannot be a GUI; refuse it rather than launch usage-text into the log.
-YGGTERM_BIN="${YGGTERM_BIN:-}"
-case "$YGGTERM_BIN" in
-  ""|*-headless) YGGTERM_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/yggterm" ;;
-esac
+# ⛔ ONE owner for "which binary can be a GUI" — see scripts/lib/gui-binary.sh.
+# The `*-headless` case statement that used to live here was half right: it
+# caught the plain headless path but not `…/yggterm-headless (deleted)`, which
+# is what a hot-restarted daemon actually exports, nor a GUI-named binary that
+# is a headless build. The override is YGGTERM_GUI_BIN; YGGTERM_BIN belongs to
+# the daemon.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/gui-binary.sh
+. "$REPO_ROOT/scripts/lib/gui-binary.sh"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 3; }; }
 
@@ -129,7 +131,9 @@ sandbox_env() {
 case "$CMD" in
   start)
     need sway; need grim
-    [ -x "$YGGTERM_BIN" ] || { echo "yggterm binary not found: $YGGTERM_BIN" >&2; exit 3; }
+    # Resolved here, not at load time, so `stop`/`env` keep working on a host
+    # with no GUI build at all.
+    YGGTERM_GUI_BINARY="$(yggterm_resolve_gui_binary "$REPO_ROOT")" || exit 3
     if is_running "$SWAY_PID_FILE"; then
       echo "sandbox '$NAME' already running (sway pid $(cat "$SWAY_PID_FILE"))"
       exit 0
@@ -178,7 +182,7 @@ EOF
       YGGTERM_WEB_SURFACE_UNDER_GLASS="$UNDER_GLASS" \
       YGGTERM_DESKTOP_APP_ID_SUFFIX="uglass-$NAME" \
       "${EXTRA_ENV[@]}" \
-      setsid "$YGGTERM_BIN" > "$CLIENT_LOG" 2>&1 &
+      setsid "$YGGTERM_GUI_BINARY" > "$CLIENT_LOG" 2>&1 &
     echo $! > "$CLIENT_PID_FILE"
     printf '%s\n' "${EXTRA_ENV[@]}" > "$RUN_DIR/arm-env"
     echo "under_glass=$UNDER_GLASS" >> "$RUN_DIR/arm-env"

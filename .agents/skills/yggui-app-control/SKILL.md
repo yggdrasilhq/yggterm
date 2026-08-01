@@ -89,6 +89,16 @@ ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh capture /tmp/sha
 ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh stop --name agent-1'
 ```
 
+- ✅ **IT WORKS FROM INSIDE A YGGTERM SESSION AGAIN (fixed 2026-08-01).** The
+  launcher used to default through `YGGTERM_BIN`, which the daemon exports into
+  every PTY it owns as ITS OWN executable — so in any agent's row it launched
+  `yggterm-headless` and died with "only supports server subcommands" (or, on a
+  hot-restarted daemon, chased a `… (deleted)` path and reported "yggterm binary
+  not found"). Every in-session agent hit this, and the only alternative left
+  was the user's live GUI — the exact thing this law forbids. Resolution now has
+  one owner, `scripts/lib/gui-binary.sh`: it probes each candidate's own
+  `--help` for a GUI-only command and refuses a headless build by name.
+  **Override with `YGGTERM_GUI_BIN=<path>`, never `YGGTERM_BIN`.**
 - The shadow has its OWN active session and viewport — live-proven 2026-07-23:
   `open --client agent-1` switched the shadow while the user's worker stayed on
   their session (verify with pid-targeted `state --pid <user-gui-pid>`).

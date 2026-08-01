@@ -23,6 +23,10 @@
 #
 # Requires: sway (wlroots headless backend) and grim. Both must be on PATH.
 #
+# The GUI binary is found automatically and is safe to run from inside a
+# yggterm session; override it with YGGTERM_GUI_BIN=<path>, never YGGTERM_BIN
+# (that one belongs to the daemon — read scripts/lib/gui-binary.sh).
+#
 # ⚠ Two yggterm clients on one home resolve the SAME GTK application id, and the
 # second silently becomes a GApplication *remote*: it exits 0 with no window and
 # no error, which looks exactly like a broken headless GL stack. `start` below
@@ -97,11 +101,13 @@ DISPLAY_FILE="$RUN_DIR/wayland-display"
 SWAY_PID_FILE="$RUN_DIR/sway.pid"
 CLIENT_PID_FILE="$RUN_DIR/client.pid"
 
-# Prefer the deployed binary, fall back to a local release build.
-YGGTERM_BIN="${YGGTERM_BIN:-$HOME/.local/bin/yggterm}"
-if [ ! -x "$YGGTERM_BIN" ]; then
-  YGGTERM_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/yggterm"
-fi
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# ⛔ Which binary can be a GUI view client has ONE owner, and it is not this
+# script. `YGGTERM_BIN` is the DAEMON's own exe (headless in every daemon-owned
+# row); this script's override is YGGTERM_GUI_BIN. Read scripts/lib/gui-binary.sh
+# before touching the launch line — that file is where the bug this fixed lives.
+# shellcheck source=lib/gui-binary.sh
+. "$REPO_ROOT/scripts/lib/gui-binary.sh"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 3; }; }
 
@@ -134,7 +140,10 @@ wayland_sockets() {
 case "$CMD" in
   start)
     need sway; need grim
-    [ -x "$YGGTERM_BIN" ] || { echo "yggterm binary not found: $YGGTERM_BIN" >&2; exit 3; }
+    # Resolved HERE, not at load time: `stop` is how a stranded shadow's
+    # webviews get freed (pending-bugs, J8a) and it must keep working on a host
+    # with no GUI binary at all.
+    YGGTERM_GUI_BINARY="$(yggterm_resolve_gui_binary "$REPO_ROOT")" || exit 3
     if is_running "$SWAY_PID_FILE"; then
       echo "shadow '$NAME' already running (sway pid $(cat "$SWAY_PID_FILE"))"
       exit 0
@@ -184,7 +193,7 @@ EOF
     # run alongside the user's GUI on one daemon, so it must carry its own id.
     WAYLAND_DISPLAY="$display" GDK_BACKEND=wayland \
       YGGTERM_DESKTOP_APP_ID_SUFFIX="shadow-$NAME" \
-      setsid "$YGGTERM_BIN" --client-role shadow --client-id "$NAME" \
+      setsid "$YGGTERM_GUI_BINARY" --client-role shadow --client-id "$NAME" \
       > "$CLIENT_LOG" 2>&1 &
     echo $! > "$CLIENT_PID_FILE"
     # Watch long enough to catch a startup failure. The fail-closed role gate
@@ -200,7 +209,7 @@ EOF
       tail -5 "$CLIENT_LOG" >&2
       exit 5
     fi
-    echo "shadow '$NAME' up: WAYLAND_DISPLAY=$display sway=$(cat "$SWAY_PID_FILE") client=$(cat "$CLIENT_PID_FILE")"
+    echo "shadow '$NAME' up: WAYLAND_DISPLAY=$display sway=$(cat "$SWAY_PID_FILE") client=$(cat "$CLIENT_PID_FILE") binary=$YGGTERM_GUI_BINARY"
     ;;
 
   capture)
@@ -243,7 +252,9 @@ EOF
     ;;
 
   *)
-    sed -n '2,30p' "$0"
+    # Through the YGGTERM_GUI_BIN note — the one thing a caller hitting the
+    # usage text most often needs, since that is where the launcher fails.
+    sed -n '2,28p' "$0"
     exit 2
     ;;
 esac

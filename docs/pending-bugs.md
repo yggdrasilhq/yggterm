@@ -496,19 +496,6 @@ symptoms, and the last two are strongly suspected to share a root:
   if a fresh GUI dies again near a large applied-webview count, this becomes
   the top entry; the webview budget above is the mitigation either way.
 
-- **`scripts/shadow-client.sh` is broken for every in-session agent (jojo,
-  2026-07-27 — J8a).** The daemon exports `YGGTERM_BIN=<yggterm-headless>`
-  into rows it owns; the script defaults through `YGGTERM_BIN`, so inside any
-  daemon-owned row it launches the headless binary and dies with "only
-  supports server subcommands". Workaround, verbatim:
-  `YGGTERM_BIN=$HOME/.local/bin/yggterm scripts/shadow-client.sh …`. Fix: the
-  script must refuse a headless binary (probe `--version` output) or default
-  to the GUI binary path explicitly.
-  **STILL OPEN on 2.12.18 (jojo, 2026-07-27 — J8b):** `/proc/<shell>/environ`
-  of a daemon-owned row still carries `YGGTERM_BIN=/home/user/.local/bin/yggterm-headless`.
-  ⚠ Verify this one from `/proc`, not from `echo $YGGTERM_BIN` after an `unset`
-  in the same shell — that self-polluted probe reads "fixed" and is a lie.
-
 - **The profile PICKER CARD is unreachable from the agent control plane (jojo,
   2.12.18, 2026-07-27 — J8b).** 2.12.18's avatar/permanence verbs — "Change
   avatar…", "Use the default avatar", "Protect profile" (disabled reason
