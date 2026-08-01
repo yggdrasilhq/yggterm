@@ -220,6 +220,22 @@ symptoms, and the last two are strongly suspected to share a root:
 
 ## Standing traps / other open bugs
 
+- **⛔⛔ PRE-REWRITE GIT LINEAGE — read before merging ANY old branch/worktree
+  (2026-08-01).** All public yggdrasilhq histories were rewritten in place so
+  GPL-3.0-or-later holds from commit zero, and force-pushed (yggterm tip moved
+  `4227e645` → `e7cf1e36`; all hashes changed). Anything still on the OLD
+  lineage will silently REINTRODUCE Apache-era commits if merged or pushed —
+  `git merge-base --is-ancestor <rewritten-root> HEAD` failing is the tell.
+  Known carriers, rebase each onto rewritten `origin/main` before use:
+  `lane/dev/agent-liveness` (1 unique commit), dev worktrees `chord-focus` and
+  `hover-context-menu` (real WIP, left dirty), oc's yggterm clone (tracked
+  edits, left un-reset), and dev's `~/gh/yggdocs` (4 dirty files) + `~/gh/
+  yggdrasil` (13 dirty files) — those two also had their `origin` repointed
+  from the deleted Forgejo mirrors to GitHub but are NOT yet reset. Pre-rewrite
+  bundles of everything: `/home/user/repo-bundles-pre-gpl0-20260801/`. Also:
+  yggterm's 185 historical GitHub releases were deleted (Apache-era binaries,
+  user-ordered); the live release lane starts at v2.12.23.
+
 - **⚠ TOOLING: `app state`'s DOM debug snapshot times out on jojo, so every DOM
   probe field is unreadable there** (found 2026-08-01 while verifying the yedit
   gutter). `dom_debug_snapshot_timeout` comes back on BOTH a shadow client and
