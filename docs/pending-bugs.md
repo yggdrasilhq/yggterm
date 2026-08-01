@@ -219,6 +219,26 @@ detector found nothing precisely because on Wayland there is nothing to find.
   new process and no page load, so the ~650 ms WebProcess startup finding does
   not explain it. Needs its own diagnosis.
 
+- ~~**"ychrome does not cache; same pages on reload look like they are reloading
+  afresh."**~~ **ROOT-CAUSED AND FIXED** on `lane/dev/cache-and-snappiness`
+  (2026-08-01), and it was not the cache. jojo's own trace: **134 of 182
+  `native_close` events were `background_hold_expired`, every one
+  `reclaim_pressured: false`, `hold_ms: 600000`** — the web-surface reaper
+  destroying pages on a ten-minute wall clock while 9.2 GB of 15.1 GB was
+  available. Of the 132 surfaces it killed **the user reopened 109**. Each reopen
+  is a full rebuild: measured 496 ms on a trivial fully-cached page, 222 ms of it
+  waiting for a WebProcess, plus the app's own render bill and the loss of
+  scroll/form/SPA state. The HTTP cache was working the whole time (0 network
+  bytes on a warm arm). Fixed by making the destroy read memory instead of a
+  clock (`ReclaimPosture`: comfortable ⇒ no clock; tight ⇒ the configured hold;
+  pressured ⇒ 5 s, all unchanged), with an explicit knob always winning. Full
+  measurement, the memory cost, and the **DON'T** verdict on the local-CDN-override
+  idea: `docs/optimization-pass.md` §11. ⚠ **GUI-side, so it needs a GUI restart,
+  not a daemon bump — and it has NOT been observed running yet** (§11f: the live
+  binary changed identity four times in 23 minutes as other lanes deployed, and
+  the one confirmed window ended 13 s short of the 600 s crossing). Verify on the
+  deploy that carries this to `main`; do not force a lane build onto the host.
+
 - **Webapp launch speed.** Root-caused, partly fixed. **Caching was the wrong
   hypothesis** — the HTTP disk cache already works and contributes 0 ms (0 bytes
   off the network on a warm arm). ~650 ms is WebKit **WebProcess startup**, per
